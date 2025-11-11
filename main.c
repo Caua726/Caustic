@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "semantic.h"
 #include "ir.h"
+#include "codegen.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +16,6 @@ int main(int argc, char *argv[]) {
 
     const char *filename = argv[1];
 
-    // Verificar flags de debug
     int debug_lexer = 0;
     int debug_parser = 0;
     int debug_ir = 0;
@@ -59,7 +59,6 @@ int main(int argc, char *argv[]) {
         fclose(file);
     }
 
-    // Parsing (reabre o arquivo para parsing)
     FILE *file = fopen(filename, "r");
     if (!file) {
         printf("Não foi possível abrir o arquivo: %s\n", filename);
@@ -78,7 +77,6 @@ int main(int argc, char *argv[]) {
             printf("==========================\n\n");
         }
 
-        // Gerar IR
         IRProgram *ir = gen_ir(ast);
         if (!ir) {
             printf("Erro ao gerar IR.\n");
@@ -90,10 +88,12 @@ int main(int argc, char *argv[]) {
             ir_print(ir);
         }
 
-        printf("Arquivo compilado com sucesso!\n");
-        printf("  - Parsing: OK\n");
-        printf("  - Análise semântica: OK\n");
-        printf("  - Geração de IR: OK\n");
+        char output[256];
+        snprintf(output, sizeof(output), "%s.s", filename);
+
+        codegen(ir, output);
+
+        printf("Compilado com sucesso: %s\n", output);
 
         ir_free(ir);
     } else {
