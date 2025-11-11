@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <string.h>
 
 static FILE *src;
 static int current_char;
@@ -39,29 +40,7 @@ Token lexer_next() {
         }
         t.text[i] = '\0';
 
-        switch (keyword) {
-            case KW_RETURN:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-            case KW_DOT:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-            case KW_SEMICOLON:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-            case KW_DOT:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-            case KW_SEMICOLON:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-            case KW_DOT:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-            case KW_SEMICOLON:
-                t.type = TOKEN_TYPE_KEYWORD;
-                return t;
-        }
+        if (strcmp(t.text, "return") == 0) {t.type = TOKEN_TYPE_RETURN;}
 
         t.type = TOKEN_TYPE_IDENTIFIER;
         return t;
@@ -76,6 +55,12 @@ Token lexer_next() {
         t.text[i] = '\0';
         t.type = TOKEN_TYPE_INTEGER;
         t.int_value = atoll(t.text);
+        return t;
+    }
+
+    if (current_char == ';') {
+        t.type = TOKEN_TYPE_SEMICOLON;
+        next_char();
         return t;
     }
 
