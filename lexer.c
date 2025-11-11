@@ -28,11 +28,13 @@ Token lexer_next() {
 	}
 
 	if (current_char == EOF) {
+		t.line = line;
 		t.type = TOKEN_TYPE_EOF;
 		return t;
 	}
 
     if (isalpha(current_char)) {
+        t.line = line;
         int i = 0;
         while (isalnum(current_char)) {
             t.text[i++] = current_char;
@@ -42,11 +44,12 @@ Token lexer_next() {
 
         if (strcmp(t.text, "return") == 0) {t.type = TOKEN_TYPE_RETURN;}
 
-        t.type = TOKEN_TYPE_IDENTIFIER;
+        else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
     }
 
     if (isdigit(current_char)) {
+        t.line = line;
         int i = 0;
         while (isdigit(current_char)) {
             t.text[i++] = current_char;
@@ -59,6 +62,9 @@ Token lexer_next() {
     }
 
     if (current_char == ';') {
+        int i = 0;
+        t.line = line;
+        t.text[i++] = ';';
         t.type = TOKEN_TYPE_SEMICOLON;
         next_char();
         return t;
