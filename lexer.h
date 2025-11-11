@@ -1,0 +1,42 @@
+#pragma once
+#include <stdio.h>
+
+typedef enum {
+	TOKEN_TYPE_EOF,
+	TOKEN_TYPE_IDENTIFIER,
+	TOKEN_TYPE_INTEGER,
+
+	TOKEN_TYPE_RETURN,
+
+	TOKEN_TYPE_PLUS,
+	TOKEN_TYPE_MINUS,
+	TOKEN_TYPE_STAR,
+	TOKEN_TYPE_SLASH,
+	TOKEN_TYPE_EQ,
+	TOKEN_TYPE_EQEQ,
+	TOKEN_TYPE_LT,
+	TOKEN_TYPE_GT,
+	TOKEN_TYPE_LPAREN,
+	TOKEN_TYPE_RPAREN,
+	TOKEN_TYPE_LBRACE,
+	TOKEN_TYPE_RBRACE,
+	TOKEN_TYPE_LBRACKET,
+	TOKEN_TYPE_RBRACKET,
+	TOKEN_TYPE_COMMA,
+	TOKEN_TYPE_DOT,
+	TOKEN_TYPE_SEMICOLON,
+} TokenType;
+
+typedef struct {
+	TokenType type;
+	const char *start;
+	int length;
+	int line;
+
+	long long int_value;
+
+	char text[256];
+} Token;
+
+void lexer_init(FILE *file);
+Token lexer_next();
