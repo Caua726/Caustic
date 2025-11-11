@@ -85,11 +85,29 @@ static void ast_print_recursive(Node *node, int depth) {
 
     switch (node->kind) {
         case NODE_RETURN:
-            printf("ReturnStmt\n");
+            printf("ReturnStmt");
+            if (node->ty) {
+                printf(" [tipo: ");
+                switch (node->ty->kind) {
+                    case TY_INT: printf("int"); break;
+                    default: printf("desconhecido"); break;
+                }
+                printf("]");
+            }
+            printf("\n");
             ast_print_recursive(node->expr, depth + 1);
             break;
         case NODE_NUM:
-            printf("NumberLiteral(%ld)\n", node->val);
+            printf("NumberLiteral(%ld)", node->val);
+            if (node->ty) {
+                printf(" [tipo: ");
+                switch (node->ty->kind) {
+                    case TY_INT: printf("int"); break;
+                    default: printf("desconhecido"); break;
+                }
+                printf("]");
+            }
+            printf("\n");
             break;
         default:
             printf("Nó Desconhecido\n");
