@@ -1,6 +1,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "semantic.h"
+#include "ir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,12 +18,15 @@ int main(int argc, char *argv[]) {
     // Verificar flags de debug
     int debug_lexer = 0;
     int debug_parser = 0;
+    int debug_ir = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-debuglexer") == 0) {
             debug_lexer = 1;
         } else if (strcmp(argv[i], "-debugparser") == 0) {
             debug_parser = 1;
+        } else if (strcmp(argv[i], "-debugir") == 0) {
+            debug_ir = 1;
         }
     }
 
@@ -71,9 +75,27 @@ int main(int argc, char *argv[]) {
         if (debug_parser) {
             printf("=== DEBUG PARSER - AST ===\n");
             ast_print(ast);
-            printf("==========================\n");
+            printf("==========================\n\n");
         }
-        printf("Arquivo parseado com sucesso!\n");
+
+        // Gerar IR
+        IRProgram *ir = gen_ir(ast);
+        if (!ir) {
+            printf("Erro ao gerar IR.\n");
+            fclose(file);
+            return 1;
+        }
+
+        if (debug_ir) {
+            ir_print(ir);
+        }
+
+        printf("Arquivo compilado com sucesso!\n");
+        printf("  - Parsing: OK\n");
+        printf("  - Análise semântica: OK\n");
+        printf("  - Geração de IR: OK\n");
+
+        ir_free(ir);
     } else {
         printf("Erro ao fazer parsing do arquivo.\n");
     }
