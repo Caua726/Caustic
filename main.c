@@ -1,8 +1,10 @@
+#include "lexer.h"
+#include "parser.h"
+#include "semantic.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "lexer.h"
-#include "parser.h"
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -65,6 +67,7 @@ int main(int argc, char *argv[]) {
     Node *ast = parse();
 
     if (ast) {
+        analyze(ast);
         if (debug_parser) {
             printf("=== DEBUG PARSER - AST ===\n");
             ast_print(ast);
