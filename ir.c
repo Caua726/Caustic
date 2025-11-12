@@ -84,38 +84,38 @@ static int gen_expr(Node *node) {
     }
 
     switch (node->kind) {
-        case NODE_NUM:
+        case NODE_KIND_NUM:
             return emit_imm(node->val, node->tok ? node->tok->line : 0);
 
-        case NODE_ADD: {
+        case NODE_KIND_ADD: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             return emit_binary(IR_ADD, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
-        case NODE_SUBTRACTION: {
+        case NODE_KIND_SUBTRACTION: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             return emit_binary(IR_SUB, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
-        case NODE_MULTIPLIER: {
+        case NODE_KIND_MULTIPLIER: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             return emit_binary(IR_MUL, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
-        case NODE_DIVIDER: {
+        case NODE_KIND_DIVIDER: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
-        case NODE_IDENTIFIER:
+        case NODE_KIND_IDENTIFIER:
             fprintf(stderr, "Erro: variáveis ainda não implementadas\n");
             exit(1);
 
-        case NODE_ASSIGN:
+        case NODE_KIND_ASSIGN:
             fprintf(stderr, "Erro: atribuição ainda não implementada\n");
             exit(1);
 
@@ -131,13 +131,13 @@ static void gen_stmt(Node *node) {
     }
 
     switch (node->kind) {
-        case NODE_RETURN: {
+        case NODE_KIND_RETURN: {
             int result_reg = gen_expr(node->expr);
             emit_return(result_reg, node->tok ? node->tok->line : 0);
             break;
         }
 
-        case NODE_EXPR_STMT: {
+        case NODE_KIND_EXPR_STMT: {
             gen_expr(node->expr);
             break;
         }
