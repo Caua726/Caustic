@@ -4,18 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static Token current_token;
-static Token lookahead_token;
-
-static Node *parse_expr();
-static Node *parse_stmt();
-static Node *new_node(NodeKind kind);
-static Node *new_node_num(long val);
-static Node *new_node_return(Node *expr);
-static void consume();
-
 void parser_init() {
-    consume();
+    lookahead_token = lexer_next();
     consume();
 }
 
@@ -35,24 +25,64 @@ static Node *new_node(NodeKind kind) {
 }
 
 static Node *new_node_num(long val) {
-    Node *node = new_node(NODE_NUM);
+    Node *node = new_node(NODE_KIND_NUM);
     node->val = val;
     return node;
 }
 
 static Node *new_node_return(Node *expr) {
-    Node *node = new_node(NODE_RETURN);
+    Node *node = new_node(NODE_KIND_RETURN);
     node->expr = expr;
     return node;
 }
 
 static Node *parse_expr() {
-    if (current_token.type != TOKEN_TYPE_INTEGER) {
-        fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um numero, mas encontrou '%s'\n", current_token.line, current_token.text);
-        exit(1);
+    return parse_add();
+}
+
+static Node *new_binary_node(NodeKind kind, Node *lhs, Node *rhs) {
+    Node *node = new_node(kind);
+    node->lhs = lhs;
+    node->rhs = rhs;
+    return node;
+}
+
+static Node *parse_primary() {
+    if (current_token.type == TOKEN_TYPE_INTEGER) {
+        Node *node = new_node_num(current_token.int_value);
+        consume();
+        return node;
     }
-    Node *node = new_node_num(current_token.int_value);
-    consume();
+
+    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um numero, mas encontrou '%s'\n", current_token.line, current_token.text);
+    exit(1);
+}
+
+static Node *parse_mul() {
+    Node *node = parse_primary();
+    while (current_token.type == TOKEN_TYPE_MULTIPLIER || current_token.type == TOKEN_TYPE_DIVIDER) {
+        if (current_token.type == TOKEN_TYPE_MULTIPLIER) {
+            consume();
+            node = new_binary_node(NODE_KIND_MULTIPLIER, node, parse_primary());
+        } else if (current_token.type == TOKEN_TYPE_DIVIDER) {
+            consume();
+            node = new_binary_node(NODE_KIND_DIVIDER, node, parse_primary());
+        }
+    }
+    return node;
+}
+
+static Node *parse_add() {
+    Node *node = parse_mul();
+    while (current_token.type == TOKEN_TYPE_PLUS || current_token.type == TOKEN_TYPE_MINUS) {
+        if (current_token.type == TOKEN_TYPE_PLUS) {
+            consume();
+            node = new_binary_node(NODE_KIND_ADD, node, parse_mul());
+        } else if (current_token.type == TOKEN_TYPE_MINUS) {
+            consume();
+            node = new_binary_node(NODE_KIND_SUBTRACTION, node, parse_mul());
+        }
+    }
     return node;
 }
 
@@ -84,7 +114,7 @@ static void ast_print_recursive(Node *node, int depth) {
     }
 
     switch (node->kind) {
-        case NODE_RETURN:
+        case NODE_KIND_RETURN:
             printf("ReturnStmt");
             if (node->ty) {
                 printf(" [tipo: ");
@@ -97,7 +127,7 @@ static void ast_print_recursive(Node *node, int depth) {
             printf("\n");
             ast_print_recursive(node->expr, depth + 1);
             break;
-        case NODE_NUM:
+        case NODE_KIND_NUM:
             printf("NumberLiteral(%ld)", node->val);
             if (node->ty) {
                 printf(" [tipo: ");
@@ -109,11 +139,31 @@ static void ast_print_recursive(Node *node, int depth) {
             }
             printf("\n");
             break;
+        case NODE_KIND_ADD:
+            printf("BinaryOp(+)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_SUBTRACTION:
+            printf("BinaryOp(-)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_MULTIPLIER:
+            printf("BinaryOp(*)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_DIVIDER:
+            printf("BinaryOp(/)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
         default:
             printf("Nó Desconhecido\n");
             break;
+
     }
-    ast_print_recursive(node->next, depth);
 }
 
 void ast_print(Node *node) {

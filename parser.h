@@ -2,15 +2,15 @@
 #include "lexer.h"
 
 typedef enum {
-    NODE_NUM,
-    NODE_IDENTIFIER,
-    NODE_ADD,
-    NODE_SUBTRACTION,
-    NODE_MULTIPLIER,
-    NODE_DIVIDER,
-    NODE_ASSIGN,
-    NODE_EXPR_STMT,
-    NODE_RETURN,
+    NODE_KIND_NUM,
+    NODE_KIND_IDENTIFIER,
+    NODE_KIND_ADD,
+    NODE_KIND_SUBTRACTION,
+    NODE_KIND_MULTIPLIER,
+    NODE_KIND_DIVIDER,
+    NODE_KIND_ASSIGN,
+    NODE_KIND_EXPR_STMT,
+    NODE_KIND_RETURN,
 } NodeKind;
 
 typedef struct Node {
@@ -41,3 +41,16 @@ typedef struct Type {
 void ast_print(Node *node);
 void parser_init();
 Node *parse();
+
+static Token current_token;
+static Token lookahead_token;
+
+static Node *parse_expr();
+static Node *parse_stmt();
+static Node *new_node(NodeKind kind);
+static Node *new_node_num(long val);
+static Node *new_node_return(Node *expr);
+static void consume();
+static Node *parse_expr();
+static Node *parse_add();
+static Node *parse_mul();

@@ -61,6 +61,42 @@ Token lexer_next() {
         return t;
     }
 
+    if (current_char == '+') {
+        int i = 0;
+        t.line = line;
+        t.text[i++] = '+';
+        t.type = TOKEN_TYPE_PLUS;
+        next_char();
+        return t;
+    }
+
+    if (current_char == '-') {
+        int i = 0;
+        t.line = line;
+        t.text[i++] = '-';
+        t.type = TOKEN_TYPE_MINUS;
+        next_char();
+        return t;
+    }
+
+    if (current_char == '*') {
+        int i = 0;
+        t.line = line;
+        t.text[i++] = '*';
+        t.type = TOKEN_TYPE_MULTIPLIER;
+        next_char();
+        return t;
+    }
+
+    if (current_char == '/') {
+        int i = 0;
+        t.line = line;
+        t.text[i++] = '/';
+        t.type = TOKEN_TYPE_DIVIDER;
+        next_char();
+        return t;
+    }
+
     if (current_char == ';') {
         int i = 0;
         t.line = line;

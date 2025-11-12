@@ -15,11 +15,24 @@ static void walk(Node *node) {
         return;
     }
     switch (node->kind) {
-        case NODE_NUM:
+        case NODE_KIND_NUM:
             node->ty = ty_int;
             return;
-        case NODE_RETURN:
+        case NODE_KIND_RETURN:
             walk(node->expr);
+            return;
+
+        case NODE_KIND_ADD:
+        case NODE_KIND_SUBTRACTION:
+        case NODE_KIND_MULTIPLIER:
+        case NODE_KIND_DIVIDER:
+            walk(node->lhs);
+            walk(node->rhs);
+            if (node->lhs->ty != ty_int || node->rhs->ty != ty_int) {
+                fprintf(stderr, "Erro semântico: operação aritmética requer inteiros.\n");
+                exit(1);
+            }
+            node->ty = ty_int;
             return;
     }
 }
