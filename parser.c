@@ -3,6 +3,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+static Node *parse_block();
+static Node *parse_fn();
 
 void parser_init() {
     lookahead_token = lexer_next();
@@ -10,7 +14,7 @@ void parser_init() {
 }
 
 Node *parse() {
-    return parse_stmt();
+    return parse_fn();
 }
 
 static void consume() {
@@ -56,6 +60,60 @@ static Node *parse_primary() {
 
     fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um numero, mas encontrou '%s'\n", current_token.line, current_token.text);
     exit(1);
+}
+
+static void expect(TokenType type) {
+    if (current_token.type == type) {
+        consume();
+    } else {
+        fprintf(stderr, "Erro na linha %d: esperado '%s' mas encontrou '%s'\n",
+                current_token.line, TOKEN_NAMES[type], TOKEN_NAMES[current_token.type]);
+        exit(1);
+    }
+}
+
+static Node *parse_block() {
+    Node *node = new_node(NODE_KIND_BLOCK);
+    expect(TOKEN_TYPE_LBRACE);
+
+    Node head = {};
+    Node *cur = &head;
+
+    while (current_token.type != TOKEN_TYPE_RBRACE) {
+        cur->next = parse_stmt();
+        cur = cur->next;
+    }
+    expect(TOKEN_TYPE_RBRACE);
+
+    node->stmts = head.next;
+    return node;
+}
+
+static Node *parse_fn() {
+    expect(TOKEN_TYPE_FN);
+
+    Node *fn_node = new_node(NODE_KIND_FN);
+
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        fprintf(stderr, "Erro na linha %d: esperado nome da função.\n", current_token.line);
+        exit(1);
+    }
+    fn_node->name = strdup(current_token.text);
+    consume();
+
+    expect(TOKEN_TYPE_LPAREN);
+    expect(TOKEN_TYPE_RPAREN);
+
+    if (current_token.type == TOKEN_TYPE_ARROW) {
+        consume();
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            fprintf(stderr, "Erro na linha %d: esperado tipo de retorno.\n", current_token.line);
+            exit(1);
+        }
+        consume(); // Consome o tipo de retorno
+    }
+    fn_node->body = parse_block();
+    return fn_node;
 }
 
 static Node *parse_mul() {
@@ -114,6 +172,16 @@ static void ast_print_recursive(Node *node, int depth) {
     }
 
     switch (node->kind) {
+        case NODE_KIND_FN:
+            printf("Function(%s)\n", node->name);
+            ast_print_recursive(node->body, depth + 1);
+            break;
+        case NODE_KIND_BLOCK:
+            printf("Block\n");
+            for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
+                ast_print_recursive(stmt, depth + 1);
+            }
+            break;
         case NODE_KIND_RETURN:
             printf("ReturnStmt");
             if (node->ty) {
@@ -162,7 +230,6 @@ static void ast_print_recursive(Node *node, int depth) {
         default:
             printf("Nó Desconhecido\n");
             break;
-
     }
 }
 
