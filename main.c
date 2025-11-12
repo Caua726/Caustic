@@ -57,8 +57,10 @@ int main(int argc, char *argv[]) {
         }
         printf("===================\n\n");
         fclose(file);
+        // IMPORTANTE: Não retornar aqui, continuar com o parsing normal
     }
 
+    // Reabrir o arquivo para o parsing real
     FILE *file = fopen(filename, "r");
     if (!file) {
         printf("Não foi possível abrir o arquivo: %s\n", filename);

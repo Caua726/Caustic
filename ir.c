@@ -155,11 +155,23 @@ IRProgram *gen_ir(Node *ast) {
 
     IRProgram *prog = calloc(1, sizeof(IRProgram));
 
+    // ast deve ser um NODE_KIND_FN
+    if (!ast || ast->kind != NODE_KIND_FN) {
+        fprintf(stderr, "Erro: AST deve ser uma função\n");
+        exit(1);
+    }
+
     IRFunction *func = calloc(1, sizeof(IRFunction));
-    strcpy(func->name, "main");
+    strcpy(func->name, ast->name);
     ctx.current_func = func;
 
-    gen_stmt(ast);
+    // Processar o body da função (NODE_KIND_BLOCK)
+    if (ast->body && ast->body->kind == NODE_KIND_BLOCK) {
+        gen_stmt(ast->body->stmts);
+    } else {
+        fprintf(stderr, "Erro: função deve ter um bloco\n");
+        exit(1);
+    }
 
     func->instructions = ctx.inst_head;
     func->vreg_count = ctx.vreg_count;

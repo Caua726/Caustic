@@ -11,6 +11,8 @@ typedef enum {
     NODE_KIND_ASSIGN,
     NODE_KIND_EXPR_STMT,
     NODE_KIND_RETURN,
+    NODE_KIND_FN,
+    NODE_KIND_BLOCK,
 } NodeKind;
 
 typedef struct Node {
@@ -28,6 +30,10 @@ typedef struct Node {
     char ident[64];
 
     struct Node *expr;
+
+    char *name;
+    struct Node *body;
+    struct Node *stmts;
 } Node;
 
 typedef enum {
