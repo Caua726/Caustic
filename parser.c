@@ -1,6 +1,5 @@
 #include "parser.h"
 #include "lexer.h"
-#include "semantic.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,14 +141,10 @@ static Node* parse_var_decl() {
         }
     }
 
-    Variable *var = symtab_declare(var_name, var_type, var_flags);
-
     Node *node = new_node(NODE_KIND_LET);
     node->name = var_name;
     node->flags = var_flags;
     node->ty = var_type;
-    node->var = var;
-    node->offset = var->offset;
 
     if (current_token.type == TOKEN_TYPE_EQUAL) {
         consume();
@@ -175,19 +170,8 @@ static Node *parse_primary() {
     }
 
     if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
-        char *name = strdup(current_token.text);
-        Variable *var = symtab_lookup(name);
-
-        if (!var) {
-            fprintf(stderr, "Erro: variável '%s' não declarada\n", name);
-            exit(1);
-        }
-
         Node *node = new_node(NODE_KIND_IDENTIFIER);
-        node->name = name;
-        node->var = var;
-        node->ty = var->type;
-        node->offset = var->offset;
+        node->name = strdup(current_token.text);
         consume();
         return node;
     }
@@ -200,8 +184,6 @@ static Node *parse_block() {
     Node *node = new_node(NODE_KIND_BLOCK);
     expect(TOKEN_TYPE_LBRACE);
 
-    symtab_enter_scope_public();
-
     Node head = {};
     Node *cur = &head;
 
@@ -210,8 +192,6 @@ static Node *parse_block() {
         cur = cur->next;
     }
     expect(TOKEN_TYPE_RBRACE);
-
-    symtab_exit_scope_public();
 
     node->stmts = head.next;
     return node;
@@ -273,12 +253,10 @@ static Node *parse_add() {
 }
 
 static Node *parse_stmt() {
-    // Verificar se é uma declaração de variável
     if (current_token.type == TOKEN_TYPE_LET) {
         return parse_var_decl();
     }
 
-    // Verificar se é um return
     if (current_token.type == TOKEN_TYPE_RETURN) {
         consume();
         Node *expr_node = parse_expr();
@@ -292,8 +270,11 @@ static Node *parse_stmt() {
         return new_node_return(expr_node);
     }
 
-    // Se não for nenhum dos anteriores, erro
-    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let' ou 'return', mas encontrou '%s'\n", current_token.line, current_token.text);
+    if (current_token.type == TOKEN_TYPE_LBRACE) {
+        return parse_block();
+    }
+
+    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
     exit(1);
 }
 

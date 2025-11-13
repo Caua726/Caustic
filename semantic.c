@@ -40,7 +40,7 @@ static void symtab_exit_scope() {
     free(old_scope);
 }
 
-Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
+static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     if (!current_scope) {
         fprintf(stderr, "Erro interno: sem escopo ativo\n");
         exit(1);
@@ -66,7 +66,7 @@ Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     return var;
 }
 
-Variable *symtab_lookup(char *name) {
+static Variable *symtab_lookup(char *name) {
     for (Scope *scope = current_scope; scope; scope = scope->parent) {
         for (Variable *v = scope->vars; v; v = v->next) {
             if (strcmp(v->name, name) == 0) {
@@ -75,14 +75,6 @@ Variable *symtab_lookup(char *name) {
         }
     }
     return NULL;
-}
-
-void symtab_enter_scope_public() {
-    symtab_enter_scope();
-}
-
-void symtab_exit_scope_public() {
-    symtab_exit_scope();
 }
 
 Type *new_type(TypeKind kind) {
@@ -95,28 +87,52 @@ static void walk(Node *node) {
     if (!node) {
         return;
     }
+
     switch (node->kind) {
         case NODE_KIND_NUM:
             node->ty = ty_int;
             return;
-        case NODE_KIND_IDENTIFIER:
+
+        case NODE_KIND_IDENTIFIER: {
+            Variable *var = symtab_lookup(node->name);
+            if (!var) {
+                fprintf(stderr, "Erro: variavel '%s' nao declarada\n", node->name);
+                exit(1);
+            }
+            node->var = var;
+            node->ty = var->type;
+            node->offset = var->offset;
             return;
+        }
+
         case NODE_KIND_RETURN:
             walk(node->expr);
             return;
+
         case NODE_KIND_FN:
+            symtab_enter_scope();
             walk(node->body);
+            symtab_exit_scope();
             return;
+
         case NODE_KIND_BLOCK:
+            symtab_enter_scope();
             for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
                 walk(stmt);
             }
+            symtab_exit_scope();
             return;
-        case NODE_KIND_LET:
+
+        case NODE_KIND_LET: {
             if (node->init_expr) {
                 walk(node->init_expr);
             }
+            Variable *var = symtab_declare(node->name, node->ty, node->flags);
+            node->var = var;
+            node->offset = var->offset;
             return;
+        }
+
         case NODE_KIND_ADD:
         case NODE_KIND_SUBTRACTION:
         case NODE_KIND_MULTIPLIER:
