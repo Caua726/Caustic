@@ -14,6 +14,7 @@ typedef enum {
     NODE_KIND_FN,
     NODE_KIND_BLOCK,
     NODE_KIND_LET,
+    NODE_KIND_IF,
 } NodeKind;
 
 typedef enum {
@@ -42,6 +43,13 @@ typedef struct Node {
 
     int offset;
     struct Variable *var;
+
+    // Campos para IF statement
+    struct {
+        struct Node *cond;      // Condição
+        struct Node *then_b;    // Bloco then
+        struct Node *else_b;    // Bloco else (pode ser NULL ou outro IF)
+    } if_stmt;
 } Node;
 
 typedef enum {

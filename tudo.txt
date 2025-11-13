@@ -1,0 +1,2196 @@
+======================================================================
+Arquivo: codegen.c
+======================================================================
+#include "codegen.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <limits.h>
+
+typedef struct {
+    int vreg;
+    int start;
+    int end;
+    int reg;
+    int spill_loc;
+    int use_count;
+    int spill_cost;
+} LiveInterval;
+
+typedef struct RegState {
+    int vreg;
+    int dirty;
+    int last_use;
+} RegState;
+
+typedef struct {
+    LiveInterval *intervals;
+    int count;
+    RegState *regs;
+    int *vreg_to_loc;
+    int stack_slots;
+    int next_spill;
+} AllocCtx;
+
+static FILE *out;
+static const char *regs[] = {"rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+static const int num_regs = 14;
+static const int rax_idx = 0;
+static const int rcx_idx = 1;
+static const int rdx_idx = 2;
+
+static void emit(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(out, "  ");
+    vfprintf(out, fmt, args);
+    fprintf(out, "\n");
+    va_end(args);
+}
+
+static void liveness_analysis(IRFunction *func, unsigned long *live_in, unsigned long *live_out) {
+    int n = 0;
+    for (IRInst *inst = func->instructions; inst; inst = inst->next) n++;
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        int i = n - 1;
+        for (IRInst *inst = func->instructions; inst; inst = inst->next, i--) {
+            unsigned long old_in = live_in[i];
+            unsigned long old_out = live_out[i];
+
+            unsigned long use = 0, def = 0;
+            if (inst->src1.type == OPERAND_VREG && inst->src1.vreg < 64) use |= (1UL << inst->src1.vreg);
+            if (inst->src2.type == OPERAND_VREG && inst->src2.vreg < 64) use |= (1UL << inst->src2.vreg);
+            if (inst->dest.type == OPERAND_VREG && inst->dest.vreg < 64) def |= (1UL << inst->dest.vreg);
+
+            live_in[i] = use | (live_out[i] & ~def);
+            live_out[i] = inst->next ? live_in[i + 1] : 0;
+
+            if (old_in != live_in[i] || old_out != live_out[i]) changed = 1;
+        }
+    }
+}
+
+static int interval_cmp(const void *a, const void *b) {
+    LiveInterval *ia = (LiveInterval *)a;
+    LiveInterval *ib = (LiveInterval *)b;
+    if (ia->start != ib->start) return ia->start - ib->start;
+    return ia->end - ib->end;
+}
+
+static void build_intervals(IRFunction *func, AllocCtx *ctx) {
+    ctx->intervals = calloc(func->vreg_count, sizeof(LiveInterval));
+    ctx->count = func->vreg_count;
+
+    for (int i = 0; i < func->vreg_count; i++) {
+        ctx->intervals[i].vreg = i;
+        ctx->intervals[i].start = INT_MAX;
+        ctx->intervals[i].end = -1;
+        ctx->intervals[i].reg = -1;
+        ctx->intervals[i].spill_loc = -1;
+        ctx->intervals[i].use_count = 0;
+        ctx->intervals[i].spill_cost = 0;
+    }
+
+    int pos = 0;
+    for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
+        if (inst->src1.type == OPERAND_VREG) {
+            int v = inst->src1.vreg;
+            if (ctx->intervals[v].start > pos) ctx->intervals[v].start = pos;
+            ctx->intervals[v].end = pos;
+            ctx->intervals[v].use_count++;
+            ctx->intervals[v].spill_cost += 10;
+        }
+        if (inst->src2.type == OPERAND_VREG) {
+            int v = inst->src2.vreg;
+            if (ctx->intervals[v].start > pos) ctx->intervals[v].start = pos;
+            ctx->intervals[v].end = pos;
+            ctx->intervals[v].use_count++;
+            ctx->intervals[v].spill_cost += 10;
+        }
+        if (inst->dest.type == OPERAND_VREG) {
+            int v = inst->dest.vreg;
+            if (ctx->intervals[v].start > pos) ctx->intervals[v].start = pos;
+            ctx->intervals[v].end = pos;
+            ctx->intervals[v].spill_cost += 1;
+        }
+    }
+
+    for (int i = 0; i < func->vreg_count; i++) {
+        if (ctx->intervals[i].use_count > 0) {
+            ctx->intervals[i].spill_cost = ctx->intervals[i].spill_cost * 100 /
+                (ctx->intervals[i].end - ctx->intervals[i].start + 1);
+        }
+    }
+
+    qsort(ctx->intervals, ctx->count, sizeof(LiveInterval), interval_cmp);
+}
+
+static int find_free_reg(AllocCtx *ctx, int pos) {
+    for (int i = 3; i < num_regs; i++) {
+        if (i == rax_idx || i == rcx_idx || i == rdx_idx) continue;
+        if (ctx->regs[i].vreg == -1) return i;
+        if (ctx->regs[i].last_use < pos) return i;
+    }
+    return -1;
+}
+
+static int spill_register(AllocCtx *ctx, int pos) {
+    int max_cost = -1;
+    int victim = -1;
+
+    for (int i = 3; i < num_regs; i++) {
+        if (i == rax_idx || i == rcx_idx || i == rdx_idx) continue;
+        if (ctx->regs[i].vreg != -1) {
+            LiveInterval *iv = NULL;
+            for (int j = 0; j < ctx->count; j++) {
+                if (ctx->intervals[j].vreg == ctx->regs[i].vreg) {
+                    iv = &ctx->intervals[j];
+                    break;
+                }
+            }
+            if (iv && iv->spill_cost > max_cost) {
+                max_cost = iv->spill_cost;
+                victim = i;
+            }
+        }
+    }
+
+    if (victim != -1) {
+        int v = ctx->regs[victim].vreg;
+        ctx->vreg_to_loc[v] = -(ctx->next_spill++);
+        ctx->regs[victim].vreg = -1;
+        return victim;
+    }
+
+    return -1;
+}
+
+static void linear_scan_alloc(IRFunction *func, AllocCtx *ctx) {
+    ctx->regs = calloc(num_regs, sizeof(RegState));
+    ctx->vreg_to_loc = calloc(func->vreg_count, sizeof(int));
+    ctx->next_spill = 1;
+
+    for (int i = 0; i < num_regs; i++) {
+        ctx->regs[i].vreg = -1;
+        ctx->regs[i].last_use = -1;
+    }
+
+    for (int i = 0; i < func->vreg_count; i++) {
+        ctx->vreg_to_loc[i] = -1000;
+    }
+
+    for (int i = 0; i < ctx->count; i++) {
+        LiveInterval *iv = &ctx->intervals[i];
+        if (iv->start == INT_MAX) continue;
+
+        for (int j = 0; j < num_regs; j++) {
+            if (ctx->regs[j].vreg != -1) {
+                LiveInterval *active = NULL;
+                for (int k = 0; k < ctx->count; k++) {
+                    if (ctx->intervals[k].vreg == ctx->regs[j].vreg) {
+                        active = &ctx->intervals[k];
+                        break;
+                    }
+                }
+                if (active && active->end < iv->start) {
+                    ctx->regs[j].vreg = -1;
+                }
+            }
+        }
+
+        int reg = find_free_reg(ctx, iv->start);
+        if (reg == -1) {
+            reg = spill_register(ctx, iv->start);
+        }
+
+        if (reg != -1) {
+            ctx->regs[reg].vreg = iv->vreg;
+            ctx->regs[reg].last_use = iv->end;
+            ctx->vreg_to_loc[iv->vreg] = reg;
+            iv->reg = reg;
+        } else {
+            ctx->vreg_to_loc[iv->vreg] = -(ctx->next_spill++);
+            iv->spill_loc = ctx->next_spill - 1;
+        }
+    }
+
+    ctx->stack_slots = ctx->next_spill - 1;
+}
+
+static void get_operand_loc(int vreg, AllocCtx *ctx, char *buf, int size) {
+    int loc = ctx->vreg_to_loc[vreg];
+    if (loc >= 0) {
+        snprintf(buf, size, "%s", regs[loc]);
+    } else if (loc < -1) {
+        int offset = (-loc) * 8;
+        snprintf(buf, size, "QWORD PTR [rbp-%d]", offset);
+    } else {
+        snprintf(buf, size, "rax");
+    }
+}
+
+static int is_mem(int vreg, AllocCtx *ctx) {
+    return ctx->vreg_to_loc[vreg] < 0;
+}
+
+static void load_operand(int vreg, AllocCtx *ctx, const char *target) {
+    char src[64];
+    get_operand_loc(vreg, ctx, src, sizeof(src));
+    if (strcmp(src, target) != 0) {
+        emit("mov %s, %s", target, src);
+    }
+}
+
+static void store_operand(int vreg, AllocCtx *ctx, const char *source) {
+    char dst[64];
+    get_operand_loc(vreg, ctx, dst, sizeof(dst));
+    if (strcmp(dst, source) != 0) {
+        emit("mov %s, %s", dst, source);
+    }
+}
+
+static void gen_binary_op(IRInst *inst, AllocCtx *ctx, const char *op) {
+    char dst[64], src1[64], src2[64];
+    get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+    get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
+    get_operand_loc(inst->src2.vreg, ctx, src2, sizeof(src2));
+
+    int dst_mem = is_mem(inst->dest.vreg, ctx);
+    int src1_mem = is_mem(inst->src1.vreg, ctx);
+    int src2_mem = is_mem(inst->src2.vreg, ctx);
+
+    if (strcmp(dst, src1) == 0) {
+        if (src2_mem) {
+            emit("mov r15, %s", src2);
+            emit("%s %s, r15", op, dst);
+        } else {
+            emit("%s %s, %s", op, dst, src2);
+        }
+    } else {
+        if (dst_mem) {
+            if (src1_mem) {
+                emit("mov r15, %s", src1);
+                if (src2_mem) {
+                    emit("mov r14, %s", src2);
+                    emit("%s r15, r14", op);
+                } else {
+                    emit("%s r15, %s", op, src2);
+                }
+                emit("mov %s, r15", dst);
+            } else {
+                emit("mov r15, %s", src1);
+                if (src2_mem) {
+                    emit("mov r14, %s", src2);
+                    emit("%s r15, r14", op);
+                } else {
+                    emit("%s r15, %s", op, src2);
+                }
+                emit("mov %s, r15", dst);
+            }
+        } else {
+            if (src1_mem) {
+                emit("mov %s, %s", dst, src1);
+            } else {
+                if (strcmp(dst, src1) != 0) {
+                    emit("mov %s, %s", dst, src1);
+                }
+            }
+            if (src2_mem) {
+                emit("mov r15, %s", src2);
+                emit("%s %s, r15", op, dst);
+            } else {
+                emit("%s %s, %s", op, dst, src2);
+            }
+        }
+    }
+}
+
+static void gen_inst(IRInst *inst, AllocCtx *ctx) {
+    char dst[64], src1[64], src2[64];
+
+    switch (inst->op) {
+        case IR_IMM:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            emit("mov %s, %ld", dst, inst->src1.imm);
+            break;
+
+        case IR_MOV:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
+            if (strcmp(dst, src1) != 0) {
+                if (is_mem(inst->dest.vreg, ctx) && is_mem(inst->src1.vreg, ctx)) {
+                    emit("mov r15, %s", src1);
+                    emit("mov %s, r15", dst);
+                } else {
+                    emit("mov %s, %s", dst, src1);
+                }
+            }
+            break;
+
+        case IR_ADD:
+            gen_binary_op(inst, ctx, "add");
+            break;
+
+        case IR_SUB:
+            gen_binary_op(inst, ctx, "sub");
+            break;
+
+        case IR_MUL:
+            gen_binary_op(inst, ctx, "imul");
+            break;
+
+        case IR_DIV:
+            load_operand(inst->src1.vreg, ctx, "rax");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("cqo");
+            emit("idiv r15");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_NEG:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
+            if (strcmp(dst, src1) != 0) {
+                if (is_mem(inst->dest.vreg, ctx) && is_mem(inst->src1.vreg, ctx)) {
+                    emit("mov r15, %s", src1);
+                    emit("neg r15");
+                    emit("mov %s, r15", dst);
+                } else {
+                    emit("mov %s, %s", dst, src1);
+                    emit("neg %s", dst);
+                }
+            } else {
+                emit("neg %s", dst);
+            }
+            break;
+
+        case IR_RET:
+            load_operand(inst->src1.vreg, ctx, "rax");
+            emit("mov rsp, rbp");
+            emit("pop rbp");
+            emit("ret");
+            break;
+
+        case IR_LABEL:
+            fprintf(out, ".L%d:\n", inst->dest.label);
+            break;
+
+        case IR_JMP:
+            emit("jmp .L%d", inst->dest.label);
+            break;
+
+        case IR_JZ:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            emit("test r15, r15");
+            emit("jz .L%d", inst->dest.label);
+            break;
+
+        case IR_JNZ:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            emit("test r15, r15");
+            emit("jnz .L%d", inst->dest.label);
+            break;
+
+        case IR_EQ:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            load_operand(inst->src2.vreg, ctx, "r14");
+            emit("xor rax, rax");
+            emit("cmp r15, r14");
+            emit("sete al");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_NE:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            load_operand(inst->src2.vreg, ctx, "r14");
+            emit("xor rax, rax");
+            emit("cmp r15, r14");
+            emit("setne al");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_LT:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            load_operand(inst->src2.vreg, ctx, "r14");
+            emit("xor rax, rax");
+            emit("cmp r15, r14");
+            emit("setl al");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_LE:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            load_operand(inst->src2.vreg, ctx, "r14");
+            emit("xor rax, rax");
+            emit("cmp r15, r14");
+            emit("setle al");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_GT:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            load_operand(inst->src2.vreg, ctx, "r14");
+            emit("xor rax, rax");
+            emit("cmp r15, r14");
+            emit("setg al");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_GE:
+            load_operand(inst->src1.vreg, ctx, "r15");
+            load_operand(inst->src2.vreg, ctx, "r14");
+            emit("xor rax, rax");
+            emit("cmp r15, r14");
+            emit("setge al");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_LOAD:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+            break;
+
+        case IR_STORE:
+            get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
+            emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void gen_func(IRFunction *func) {
+    AllocCtx ctx = {0};
+
+    build_intervals(func, &ctx);
+    linear_scan_alloc(func, &ctx);
+
+    fprintf(out, "%s:\n", func->name);
+    emit("push rbp");
+    emit("mov rbp, rsp");
+
+    int stack_size = ctx.stack_slots * 8;
+    if (stack_size > 0) {
+        stack_size = (stack_size + 15) & ~15;
+        emit("sub rsp, %d", stack_size);
+    }
+
+    for (IRInst *inst = func->instructions; inst; inst = inst->next) {
+        gen_inst(inst, &ctx);
+    }
+
+    free(ctx.intervals);
+    free(ctx.regs);
+    free(ctx.vreg_to_loc);
+}
+
+void codegen(IRProgram *prog, const char *filename) {
+    out = fopen(filename, "w");
+    if (!out) {
+        fprintf(stderr, "Erro ao abrir arquivo de saida: %s\n", filename);
+        return;
+    }
+
+    fprintf(out, ".intel_syntax noprefix\n");
+    fprintf(out, ".global main\n\n");
+
+    for (IRFunction *func = prog->functions; func; func = func->next) {
+        gen_func(func);
+        fprintf(out, "\n");
+    }
+
+    fclose(out);
+}
+
+
+======================================================================
+Arquivo: ir.c
+======================================================================
+#include "ir.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    IRFunction *current_func;
+    IRInst *inst_head;
+    IRInst *inst_tail;
+    int vreg_count;
+    int label_count;
+} IRGenContext;
+
+static IRGenContext ctx;
+
+static IRInst *new_inst(IROp op) {
+    IRInst *inst = calloc(1, sizeof(IRInst));
+    inst->op = op;
+    return inst;
+}
+
+static void emit(IRInst *inst) {
+    if (!ctx.inst_head) {
+        ctx.inst_head = inst;
+        ctx.inst_tail = inst;
+    } else {
+        ctx.inst_tail->next = inst;
+        ctx.inst_tail = inst;
+    }
+}
+
+static int new_vreg() {
+    return ctx.vreg_count++;
+}
+
+static int new_label() {
+    return ctx.label_count++;
+}
+
+static int emit_imm(long value, int line) {
+    int dest = new_vreg();
+    IRInst *inst = new_inst(IR_IMM);
+    inst->dest = op_vreg(dest);
+    inst->src1 = op_imm(value);
+    inst->line = line;
+    emit(inst);
+    return dest;
+}
+
+static int emit_binary(IROp op, int lhs_reg, int rhs_reg, int line) {
+    int dest = new_vreg();
+    IRInst *inst = new_inst(op);
+    inst->dest = op_vreg(dest);
+    inst->src1 = op_vreg(lhs_reg);
+    inst->src2 = op_vreg(rhs_reg);
+    inst->line = line;
+    emit(inst);
+    return dest;
+}
+
+static int emit_unary(IROp op, int src_reg, int line) {
+    int dest = new_vreg();
+    IRInst *inst = new_inst(op);
+    inst->dest = op_vreg(dest);
+    inst->src1 = op_vreg(src_reg);
+    inst->line = line;
+    emit(inst);
+    return dest;
+}
+
+static void emit_return(int src_reg, int line) {
+    IRInst *inst = new_inst(IR_RET);
+    inst->src1 = op_vreg(src_reg);
+    inst->line = line;
+    emit(inst);
+}
+
+static int gen_expr(Node *node);
+
+static int gen_expr(Node *node) {
+    if (!node) {
+        fprintf(stderr, "Erro interno: nó de expressão nulo\n");
+        exit(1);
+    }
+
+    switch (node->kind) {
+        case NODE_KIND_NUM:
+            return emit_imm(node->val, node->tok ? node->tok->line : 0);
+
+        case NODE_KIND_ADD: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_ADD, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_SUBTRACTION: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_SUB, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_MULTIPLIER: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_MUL, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_DIVIDER: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_IDENTIFIER: {
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_LOAD);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_imm(node->offset);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
+        case NODE_KIND_ASSIGN:
+            fprintf(stderr, "Erro: atribuição ainda não implementada\n");
+            exit(1);
+
+        default:
+            fprintf(stderr, "Erro interno: tipo de nó não suportado em expressão: %d\n", node->kind);
+            exit(1);
+    }
+}
+
+static void gen_stmt(Node *node) {
+    if (!node) {
+        return;
+    }
+
+    switch (node->kind) {
+        case NODE_KIND_RETURN: {
+            int result_reg = gen_expr(node->expr);
+            emit_return(result_reg, node->tok ? node->tok->line : 0);
+            break;
+        }
+
+        case NODE_KIND_EXPR_STMT: {
+            gen_expr(node->expr);
+            break;
+        }
+
+        case NODE_KIND_LET: {
+            if (node->init_expr) {
+                int val_reg = gen_expr(node->init_expr);
+                IRInst *inst = new_inst(IR_STORE);
+                inst->dest = op_imm(node->offset);
+                inst->src1 = op_vreg(val_reg);
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            }
+            break;
+        }
+
+        case NODE_KIND_BLOCK: {
+            for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
+                gen_stmt(stmt);
+            }
+            break;
+        }
+
+        case NODE_KIND_IF: {
+            int else_label = new_label();
+            int end_label = new_label();
+
+            // 1. Gera IR para a condição
+            int cond_reg = gen_expr(node->if_stmt.cond);
+
+            // 2. Salto condicional (JZ = Jump if Zero)
+            IRInst *jz = new_inst(IR_JZ);
+            jz->src1 = op_vreg(cond_reg);
+            jz->dest = op_label(else_label);
+            jz->line = node->tok ? node->tok->line : 0;
+            emit(jz);
+
+            // 3. Gera IR para o bloco 'then'
+            gen_stmt(node->if_stmt.then_b);
+
+            // 4. Salto incondicional para o fim (pula o bloco 'else')
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(end_label);
+            jmp->line = node->tok ? node->tok->line : 0;
+            emit(jmp);
+
+            // 5. Emite o label do 'else'
+            IRInst *else_lbl = new_inst(IR_LABEL);
+            else_lbl->dest = op_label(else_label);
+            emit(else_lbl);
+
+            // 6. Gera IR para o bloco 'else', se existir
+            if (node->if_stmt.else_b) {
+                gen_stmt(node->if_stmt.else_b);
+            }
+
+            // 7. Emite o label do fim
+            IRInst *end_lbl = new_inst(IR_LABEL);
+            end_lbl->dest = op_label(end_label);
+            emit(end_lbl);
+
+            break;
+        }
+
+        default:
+            fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
+            exit(1);
+    }
+
+    gen_stmt(node->next);
+}
+
+IRProgram *gen_ir(Node *ast) {
+    memset(&ctx, 0, sizeof(ctx));
+
+    IRProgram *prog = calloc(1, sizeof(IRProgram));
+
+    // ast deve ser um NODE_KIND_FN
+    if (!ast || ast->kind != NODE_KIND_FN) {
+        fprintf(stderr, "Erro: AST deve ser uma função\n");
+        exit(1);
+    }
+
+    IRFunction *func = calloc(1, sizeof(IRFunction));
+    strcpy(func->name, ast->name);
+    ctx.current_func = func;
+
+    // Processar o body da função (NODE_KIND_BLOCK)
+    if (ast->body && ast->body->kind == NODE_KIND_BLOCK) {
+        gen_stmt(ast->body->stmts);
+    } else {
+        fprintf(stderr, "Erro: função deve ter um bloco\n");
+        exit(1);
+    }
+
+    func->instructions = ctx.inst_head;
+    func->vreg_count = ctx.vreg_count;
+    func->label_count = ctx.label_count;
+
+    prog->functions = func;
+    prog->main_func = func;
+
+    return prog;
+}
+
+void ir_free(IRProgram *prog) {
+    if (!prog) return;
+
+    IRFunction *func = prog->functions;
+    while (func) {
+        IRInst *inst = func->instructions;
+        while (inst) {
+            IRInst *next = inst->next;
+            free(inst);
+            inst = next;
+        }
+        IRFunction *next_func = func->next;
+        free(func);
+        func = next_func;
+    }
+    free(prog);
+}
+
+static void print_operand(Operand op) {
+    switch (op.type) {
+        case OPERAND_NONE:
+            break;
+        case OPERAND_VREG:
+            printf("v%d", op.vreg);
+            break;
+        case OPERAND_IMM:
+            printf("%ld", op.imm);
+            break;
+        case OPERAND_LABEL:
+            printf("L%d", op.label);
+            break;
+    }
+}
+
+void ir_print(IRProgram *prog) {
+    if (!prog) {
+        printf("(programa IR vazio)\n");
+        return;
+    }
+
+    printf("=== IR GERADO ===\n\n");
+
+    for (IRFunction *func = prog->functions; func; func = func->next) {
+        printf("function %s():\n", func->name);
+        printf("  vregs: %d, labels: %d\n\n", func->vreg_count, func->label_count);
+
+        int inst_num = 0;
+        for (IRInst *inst = func->instructions; inst; inst = inst->next) {
+            printf("  %3d: ", inst_num++);
+
+            printf("%-6s ", IR_OP_NAMES[inst->op]);
+
+            switch (inst->op) {
+                case IR_IMM:
+                    print_operand(inst->dest);
+                    printf(" = ");
+                    print_operand(inst->src1);
+                    break;
+
+                case IR_MOV:
+                    print_operand(inst->dest);
+                    printf(" = ");
+                    print_operand(inst->src1);
+                    break;
+
+                case IR_ADD:
+                case IR_SUB:
+                case IR_MUL:
+                case IR_DIV:
+                case IR_EQ:
+                case IR_NE:
+                case IR_LT:
+                case IR_LE:
+                case IR_GT:
+                case IR_GE:
+                    print_operand(inst->dest);
+                    printf(" = ");
+                    print_operand(inst->src1);
+                    printf(", ");
+                    print_operand(inst->src2);
+                    break;
+
+                case IR_NEG:
+                    print_operand(inst->dest);
+                    printf(" = -");
+                    print_operand(inst->src1);
+                    break;
+
+                case IR_RET:
+                    print_operand(inst->src1);
+                    break;
+
+                case IR_LABEL:
+                    printf(":");
+                    print_operand(inst->dest);
+                    break;
+
+                case IR_JMP:
+                    print_operand(inst->dest);
+                    break;
+
+                case IR_JZ:
+                case IR_JNZ:
+                    print_operand(inst->dest);
+                    printf(" if ");
+                    print_operand(inst->src1);
+                    break;
+
+                case IR_LOAD:
+                    print_operand(inst->dest);
+                    printf(" = [rbp-");
+                    print_operand(inst->src1);
+                    printf("-8]");
+                    break;
+
+                case IR_STORE:
+                    printf("[rbp-");
+                    print_operand(inst->dest);
+                    printf("-8] = ");
+                    print_operand(inst->src1);
+                    break;
+
+                default:
+                    printf("(?)");
+                    break;
+            }
+
+            if (inst->line > 0) {
+                printf("  ; linha %d", inst->line);
+            }
+
+            printf("\n");
+        }
+
+        printf("\n");
+    }
+
+    printf("=================\n");
+}
+
+
+======================================================================
+Arquivo: lexer.c
+======================================================================
+#include "lexer.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <string.h>
+
+static FILE *src;
+static int current_char;
+static int ahead_char;
+static int line = 1;
+
+static void next_char(void) {
+	current_char = fgetc(src);
+	if (current_char == '\n') {
+		line++;
+	}
+}
+
+static int lookhead_char() {
+    int c = fgetc(src);
+    ungetc(c, src);
+    return c;
+}
+
+void lexer_init(FILE *file) {
+	src = file;
+	next_char();
+}
+
+Token lexer_next() {
+	Token t = {0};
+
+	while (isspace(current_char)) {
+		next_char();
+	}
+
+	if (current_char == EOF) {
+		t.line = line;
+		t.type = TOKEN_TYPE_EOF;
+		return t;
+	}
+
+    if (isalpha(current_char)) {
+        t.line = line;
+        int i = 0;
+        while (isalnum(current_char)) {
+            t.text[i++] = current_char;
+            next_char();
+        }
+        t.text[i] = '\0';
+
+        if (strcmp(t.text, "return") == 0) {t.type = TOKEN_TYPE_RETURN;}
+        else if (strcmp(t.text, "fn") == 0) {t.type = TOKEN_TYPE_FN;}
+        else if (strcmp(t.text, "let") == 0) {t.type = TOKEN_TYPE_LET;}
+        else if (strcmp(t.text, "is") == 0) {t.type = TOKEN_TYPE_IS;}
+        else if (strcmp(t.text, "as") == 0) {t.type = TOKEN_TYPE_AS;}
+        else if (strcmp(t.text, "with") == 0) {t.type = TOKEN_TYPE_WITH;}
+        else if (strcmp(t.text, "if") == 0) {t.type = TOKEN_TYPE_IF;}
+        else if (strcmp(t.text, "else") == 0) {t.type = TOKEN_TYPE_ELSE;}
+
+        else {t.type = TOKEN_TYPE_IDENTIFIER;}
+        return t;
+    }
+
+    if (isdigit(current_char)) {
+        t.line = line;
+        int i = 0;
+        while (isdigit(current_char)) {
+            t.text[i++] = current_char;
+            next_char();
+        }
+        t.text[i] = '\0';
+        t.type = TOKEN_TYPE_INTEGER;
+        t.int_value = atoll(t.text);
+        return t;
+    }
+
+    t.line = line;
+    switch (current_char) {
+        case '+':
+            t.text[0] = '+';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_PLUS;
+            next_char();
+            return t;
+        case '-':
+            if (lookhead_char() == '>') {
+                strcpy(t.text, "->");
+                t.type = TOKEN_TYPE_ARROW;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '-';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_MINUS;
+                next_char();
+                return t;
+            }
+        case '*':
+            t.text[0] = '*';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_MULTIPLIER;
+            next_char();
+            return t;
+        case '/':
+            t.text[0] = '/';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_DIVIDER;
+            next_char();
+            return t;
+        case ';':
+            t.text[0] = ';';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_SEMICOLON;
+            next_char();
+            return t;
+        case ':':
+            if (lookhead_char() == '=') {
+                strcpy(t.text, ":=");
+                t.type = TOKEN_TYPE_ASSIGN;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = ':';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_COLON;
+                next_char();
+                return t;
+            }
+        case '=':
+            t.text[0] = '=';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_EQUAL;
+            next_char();
+            return t;
+        case '!':
+            t.text[0] = '!';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_NOT;
+            next_char();
+            return t;
+        case '&':
+            t.text[0] = '&';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_AND;
+            next_char();
+            return t;
+        case '|':
+            t.text[0] = '|';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_OR;
+            next_char();
+            return t;
+        case '(':
+            t.text[0] = '(';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_LPAREN;
+            next_char();
+            return t;
+        case ')':
+            t.text[0] = ')';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_RPAREN;
+            next_char();
+            return t;
+        case '[':
+            t.text[0] = '[';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_LBRACKET;
+            next_char();
+            return t;
+        case ']':
+            t.text[0] = ']';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_RBRACKET;
+            next_char();
+            return t;
+        case '{':
+            t.text[0] = '{';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_LBRACE;
+            next_char();
+            return t;
+        case '}':
+            t.text[0] = '}';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_RBRACE;
+            next_char();
+            return t;
+    }
+
+    printf("caractere inesperado: %c", current_char);
+    next_char();
+    return lexer_next();
+}
+
+
+======================================================================
+Arquivo: main.c
+======================================================================
+#include "lexer.h"
+#include "parser.h"
+#include "semantic.h"
+#include "ir.h"
+#include "codegen.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("É necessario colocar um arquivo, exemplo: ./caustic main.cst\n");
+        return 1;
+    }
+
+    const char *filename = argv[1];
+
+    int debug_lexer = 0;
+    int debug_parser = 0;
+    int debug_ir = 0;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-debuglexer") == 0) {
+            debug_lexer = 1;
+        } else if (strcmp(argv[i], "-debugparser") == 0) {
+            debug_parser = 1;
+        } else if (strcmp(argv[i], "-debugir") == 0) {
+            debug_ir = 1;
+        }
+    }
+
+    // Se debug_lexer estiver ativo, mostrar tokens
+    if (debug_lexer) {
+        FILE *file = fopen(filename, "r");
+        if (!file) {
+            printf("Não foi possível abrir o arquivo: %s\n", filename);
+            return 1;
+        }
+
+        printf("=== DEBUG LEXER ===\n");
+        lexer_init(file);
+
+        while (1) {
+            Token t = lexer_next();
+            printf("LINE: %d\n", t.line);
+            printf("  TOKEN: %d  (linha %d) \n", t.type, t.line);
+            printf("    TOKENTYPE: %s\n", TOKEN_NAMES[t.type]);
+            if (t.text[0] != '\0') {
+                printf("    TOKENTEXT: %s\n", t.text);
+            }
+            if (t.type != TOKEN_TYPE_EOF) {
+                printf("    TOKENID: %d\n", t.type);
+            }
+            if (t.type == TOKEN_TYPE_EOF)
+                break;
+        }
+        printf("===================\n\n");
+        fclose(file);
+        // IMPORTANTE: Não retornar aqui, continuar com o parsing normal
+    }
+
+    // Reabrir o arquivo para o parsing real
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        printf("Não foi possível abrir o arquivo: %s\n", filename);
+        return 1;
+    }
+
+    lexer_init(file);
+    parser_init();
+    Node *ast = parse();
+
+    if (ast) {
+        analyze(ast);
+        if (debug_parser) {
+            printf("=== DEBUG PARSER - AST ===\n");
+            ast_print(ast);
+            printf("==========================\n\n");
+        }
+
+        IRProgram *ir = gen_ir(ast);
+        if (!ir) {
+            printf("Erro ao gerar IR.\n");
+            fclose(file);
+            return 1;
+        }
+
+        if (debug_ir) {
+            ir_print(ir);
+        }
+
+        char output[256];
+        snprintf(output, sizeof(output), "%s.s", filename);
+
+        codegen(ir, output);
+
+        printf("Compilado com sucesso: %s\n", output);
+
+        ir_free(ir);
+    } else {
+        printf("Erro ao fazer parsing do arquivo.\n");
+    }
+
+    fclose(file);
+    return 0;
+}
+
+
+======================================================================
+Arquivo: parser.c
+======================================================================
+#include "parser.h"
+#include "lexer.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static Token current_token;
+static Token lookahead_token;
+
+static void consume();
+static Node *parse_block();
+static Node *parse_fn();
+static void expect(TokenType type);
+static Node *parse_var_decl();
+static Node *parse_expr();
+static Node *parse_stmt();
+static Node *parse_if_stmt();
+static Node *parse_add();
+static Node *parse_mul();
+static Node *parse_primary();
+static Type *parse_type();
+
+
+void parser_init() {
+    lookahead_token = lexer_next();
+    consume();
+}
+
+Node *parse() {
+    return parse_fn();
+}
+
+static void consume() {
+    current_token = lookahead_token;
+    lookahead_token = lexer_next();
+}
+
+static void expect(TokenType type) {
+    if (current_token.type == type) {
+        consume();
+    } else {
+        fprintf(stderr, "Erro na linha %d: esperado '%s' mas encontrou '%s'\n",
+                current_token.line, TOKEN_NAMES[type], TOKEN_NAMES[current_token.type]);
+        exit(1);
+    }
+}
+
+static Node *new_node(NodeKind kind) {
+    Node *node = calloc(1, sizeof(Node));
+    node->kind = kind;
+    return node;
+}
+
+static Node *new_node_num(long val) {
+    Node *node = new_node(NODE_KIND_NUM);
+    node->val = val;
+    return node;
+}
+
+static Node *new_node_return(Node *expr) {
+    Node *node = new_node(NODE_KIND_RETURN);
+    node->expr = expr;
+    return node;
+}
+
+static Node *parse_expr() {
+    return parse_add();
+}
+
+static Type *parse_type() {
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        fprintf(stderr, "Erro de sintaxe na linha %d: esperado um tipo\n", current_token.line);
+        exit(1);
+    }
+
+    Type *ty = calloc(1, sizeof(Type));
+
+    if (strcmp(current_token.text, "int") == 0 || strcmp(current_token.text, "i32") == 0) {
+        ty->kind = TY_I32;
+    } else if (strcmp(current_token.text, "i8") == 0) {
+        ty->kind = TY_I8;
+    } else if (strcmp(current_token.text, "i16") == 0) {
+        ty->kind = TY_I16;
+    } else if (strcmp(current_token.text, "i64") == 0) {
+        ty->kind = TY_I64;
+    } else if (strcmp(current_token.text, "u8") == 0) {
+        ty->kind = TY_U8;
+    } else if (strcmp(current_token.text, "u16") == 0) {
+        ty->kind = TY_U16;
+    } else if (strcmp(current_token.text, "u32") == 0) {
+        ty->kind = TY_U32;
+    } else if (strcmp(current_token.text, "u64") == 0) {
+        ty->kind = TY_U64;
+    } else if (strcmp(current_token.text, "float") == 0 || strcmp(current_token.text, "f32") == 0) {
+        ty->kind = TY_F32;
+    } else if (strcmp(current_token.text, "f64") == 0) {
+        ty->kind = TY_F64;
+    } else if (strcmp(current_token.text, "bool") == 0) {
+        ty->kind = TY_BOOL;
+    } else if (strcmp(current_token.text, "char") == 0) {
+        ty->kind = TY_CHAR;
+    } else if (strcmp(current_token.text, "string") == 0) {
+        ty->kind = TY_STRING;
+    } else if (strcmp(current_token.text, "void") == 0) {
+        ty->kind = TY_VOID;
+    } else {
+        fprintf(stderr, "Erro: tipo desconhecido '%s'\n", current_token.text);
+        exit(1);
+    }
+
+    consume();
+    return ty;
+}
+
+
+static Node* parse_var_decl() {
+    expect(TOKEN_TYPE_LET);
+    expect(TOKEN_TYPE_IS);
+
+    Type *var_type = parse_type();
+
+    expect(TOKEN_TYPE_AS);
+
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um nome de variável, mas encontrou '%s'\n", current_token.line, current_token.text);
+        exit(1);
+    }
+    char *var_name = strdup(current_token.text);
+    consume();
+
+    VarFlags var_flags = VAR_FLAG_NONE;
+    if (current_token.type == TOKEN_TYPE_WITH) {
+        consume();
+        while (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+            if (strcmp(current_token.text, "mut") == 0) {
+                var_flags |= VAR_FLAG_MUT;
+            } else if (strcmp(current_token.text, "imut") == 0) {
+                var_flags |= VAR_FLAG_IMUT;
+            }
+            consume();
+        }
+    }
+
+    Node *node = new_node(NODE_KIND_LET);
+    node->name = var_name;
+    node->flags = var_flags;
+    node->ty = var_type;
+
+    if (current_token.type == TOKEN_TYPE_EQUAL) {
+        consume();
+        node->init_expr = parse_expr();
+    }
+
+    expect(TOKEN_TYPE_SEMICOLON);
+    return node;
+}
+
+static Node *new_binary_node(NodeKind kind, Node *lhs, Node *rhs) {
+    Node *node = new_node(kind);
+    node->lhs = lhs;
+    node->rhs = rhs;
+    return node;
+}
+
+static Node *parse_primary() {
+    if (current_token.type == TOKEN_TYPE_INTEGER) {
+        Node *node = new_node_num(current_token.int_value);
+        consume();
+        return node;
+    }
+
+    if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+        Node *node = new_node(NODE_KIND_IDENTIFIER);
+        node->name = strdup(current_token.text);
+        consume();
+        return node;
+    }
+
+    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um numero ou identificador, mas encontrou '%s'\n", current_token.line, current_token.text);
+    exit(1);
+}
+
+static Node *parse_block() {
+    Node *node = new_node(NODE_KIND_BLOCK);
+    expect(TOKEN_TYPE_LBRACE);
+
+    Node head = {};
+    Node *cur = &head;
+
+    while (current_token.type != TOKEN_TYPE_RBRACE) {
+        cur->next = parse_stmt();
+        cur = cur->next;
+    }
+    expect(TOKEN_TYPE_RBRACE);
+
+    node->stmts = head.next;
+    return node;
+}
+
+static Node *parse_fn() {
+    expect(TOKEN_TYPE_FN);
+
+    Node *fn_node = new_node(NODE_KIND_FN);
+
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        fprintf(stderr, "Erro na linha %d: esperado nome da função.\n", current_token.line);
+        exit(1);
+    }
+    fn_node->name = strdup(current_token.text);
+    consume();
+
+    expect(TOKEN_TYPE_LPAREN);
+    expect(TOKEN_TYPE_RPAREN);
+
+    if (current_token.type == TOKEN_TYPE_ARROW) {
+        consume();
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            fprintf(stderr, "Erro na linha %d: esperado tipo de retorno.\n", current_token.line);
+            exit(1);
+        }
+        consume(); // Consome o tipo de retorno
+    }
+    fn_node->body = parse_block();
+    return fn_node;
+}
+
+static Node *parse_mul() {
+    Node *node = parse_primary();
+    while (current_token.type == TOKEN_TYPE_MULTIPLIER || current_token.type == TOKEN_TYPE_DIVIDER) {
+        if (current_token.type == TOKEN_TYPE_MULTIPLIER) {
+            consume();
+            node = new_binary_node(NODE_KIND_MULTIPLIER, node, parse_primary());
+        } else if (current_token.type == TOKEN_TYPE_DIVIDER) {
+            consume();
+            node = new_binary_node(NODE_KIND_DIVIDER, node, parse_primary());
+        }
+    }
+    return node;
+}
+
+static Node *parse_add() {
+    Node *node = parse_mul();
+    while (current_token.type == TOKEN_TYPE_PLUS || current_token.type == TOKEN_TYPE_MINUS) {
+        if (current_token.type == TOKEN_TYPE_PLUS) {
+            consume();
+            node = new_binary_node(NODE_KIND_ADD, node, parse_mul());
+        } else if (current_token.type == TOKEN_TYPE_MINUS) {
+            consume();
+            node = new_binary_node(NODE_KIND_SUBTRACTION, node, parse_mul());
+        }
+    }
+    return node;
+}
+
+static Node *parse_if_stmt() {
+    expect(TOKEN_TYPE_IF);
+
+    Node *if_node = new_node(NODE_KIND_IF);
+
+    // 1. Parsear a condição
+    expect(TOKEN_TYPE_LPAREN);
+    if_node->if_stmt.cond = parse_expr();
+    expect(TOKEN_TYPE_RPAREN);
+
+    // 2. Parsear o bloco 'then' (obrigatório)
+    if_node->if_stmt.then_b = parse_block();
+
+    // 3. Parsear o 'else' ou 'else if' (opcional)
+    if (current_token.type == TOKEN_TYPE_ELSE) {
+        consume(); // Consome 'else'
+        if (current_token.type == TOKEN_TYPE_IF) {
+            // É um 'else if', então o ramo 'else' é outro 'if'
+            if_node->if_stmt.else_b = parse_if_stmt();
+        } else {
+            // É um 'else' normal, seguido por um bloco
+            if_node->if_stmt.else_b = parse_block();
+        }
+    } else {
+        if_node->if_stmt.else_b = NULL; // Não tem ramo 'else'
+    }
+
+    return if_node;
+}
+
+static Node *parse_stmt() {
+    if (current_token.type == TOKEN_TYPE_LET) {
+        return parse_var_decl();
+    }
+
+    if (current_token.type == TOKEN_TYPE_IF) {
+        return parse_if_stmt();
+    }
+
+    if (current_token.type == TOKEN_TYPE_RETURN) {
+        consume();
+        Node *expr_node = parse_expr();
+
+        if (current_token.type != TOKEN_TYPE_SEMICOLON) {
+            fprintf(stderr, "Erro de sintaxe na linha %d: era esperado ';' depois da expressao.\n", current_token.line);
+            exit(1);
+        }
+        consume();
+
+        return new_node_return(expr_node);
+    }
+
+    if (current_token.type == TOKEN_TYPE_LBRACE) {
+        return parse_block();
+    }
+
+    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'if', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
+    exit(1);
+}
+
+static void ast_print_recursive(Node *node, int depth) {
+    if (!node) {
+        return;
+    }
+
+    for (int i = 0; i < depth; i++) {
+        printf("  ");
+    }
+
+    switch (node->kind) {
+        case NODE_KIND_FN:
+            printf("Function(%s)\n", node->name);
+            ast_print_recursive(node->body, depth + 1);
+            break;
+        case NODE_KIND_BLOCK:
+            printf("Block\n");
+            for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
+                ast_print_recursive(stmt, depth + 1);
+            }
+            break;
+        case NODE_KIND_RETURN:
+            printf("ReturnStmt");
+            if (node->ty) {
+                printf(" [tipo: ");
+                switch (node->ty->kind) {
+                    case TY_INT: printf("int"); break;
+                    default: printf("desconhecido"); break;
+                }
+                printf("]");
+            }
+            printf("\n");
+            ast_print_recursive(node->expr, depth + 1);
+            break;
+        case NODE_KIND_LET:
+            printf("LetStmt(name='%s', offset=%d", node->name ? node->name : "NULL", node->offset);
+            if (node->flags & VAR_FLAG_MUT) {
+                printf(", mut");
+            }
+            if (node->flags & VAR_FLAG_IMUT) {
+                printf(", imut");
+            }
+            if (node->ty) {
+                printf(", tipo=");
+                switch (node->ty->kind) {
+                    case TY_I32: printf("i32"); break;
+                    case TY_I64: printf("i64"); break;
+                    default: printf("?"); break;
+                }
+            }
+            printf(")\n");
+            if (node->init_expr) {
+                for (int i = 0; i < depth + 1; i++) {
+                    printf("  ");
+                }
+                printf("InitExpr:\n");
+                ast_print_recursive(node->init_expr, depth + 2);
+            }
+            break;
+        case NODE_KIND_IDENTIFIER:
+            printf("Identifier(%s, offset=%d)\n", node->name, node->offset);
+            break;
+        case NODE_KIND_NUM:
+            printf("NumberLiteral(%ld)", node->val);
+            if (node->ty) {
+                printf(" [tipo: ");
+                switch (node->ty->kind) {
+                    case TY_INT: printf("int"); break;
+                    default: printf("desconhecido"); break;
+                }
+                printf("]");
+            }
+            printf("\n");
+            break;
+        case NODE_KIND_ADD:
+            printf("BinaryOp(+)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_SUBTRACTION:
+            printf("BinaryOp(-)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_MULTIPLIER:
+            printf("BinaryOp(*)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_DIVIDER:
+            printf("BinaryOp(/)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_IF:
+            printf("IfStmt\n");
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Cond:\n");
+            ast_print_recursive(node->if_stmt.cond, depth + 2);
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Then:\n");
+            ast_print_recursive(node->if_stmt.then_b, depth + 2);
+            if (node->if_stmt.else_b) {
+                for (int i = 0; i < depth + 1; i++) printf("  ");
+                printf("Else:\n");
+                ast_print_recursive(node->if_stmt.else_b, depth + 2);
+            }
+            break;
+        default:
+            printf("Nó Desconhecido\n");
+            break;
+    }
+}
+
+void ast_print(Node *node) {
+    ast_print_recursive(node, 0);
+}
+
+
+======================================================================
+Arquivo: semantic.c
+======================================================================
+#include "semantic.h"
+#include "parser.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+typedef struct Scope {
+    Variable *vars;
+    struct Scope *parent;
+} Scope;
+
+static Scope *current_scope = NULL;
+static int stack_offset = 0;
+
+Type *ty_int;
+
+static void symtab_init() {
+    current_scope = NULL;
+    stack_offset = 0;
+}
+
+static void symtab_enter_scope() {
+    Scope *new_scope = calloc(1, sizeof(Scope));
+    new_scope->parent = current_scope;
+    current_scope = new_scope;
+}
+
+static void symtab_exit_scope() {
+    if (!current_scope) return;
+
+    Scope *old_scope = current_scope;
+    current_scope = current_scope->parent;
+
+    Variable *var = old_scope->vars;
+    while (var) {
+        Variable *next = var->next;
+        free(var);
+        var = next;
+    }
+    free(old_scope);
+}
+
+static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
+    if (!current_scope) {
+        fprintf(stderr, "Erro interno: sem escopo ativo\n");
+        exit(1);
+    }
+
+    for (Variable *v = current_scope->vars; v; v = v->next) {
+        if (strcmp(v->name, name) == 0) {
+            fprintf(stderr, "Erro: variavel '%s' ja declarada neste escopo\n", name);
+            exit(1);
+        }
+    }
+
+    Variable *var = calloc(1, sizeof(Variable));
+    var->name = strdup(name);
+    var->type = type;
+    var->flags = flags;
+    var->offset = stack_offset;
+    stack_offset += 8;
+
+    var->next = current_scope->vars;
+    current_scope->vars = var;
+
+    return var;
+}
+
+static Variable *symtab_lookup(char *name) {
+    for (Scope *scope = current_scope; scope; scope = scope->parent) {
+        for (Variable *v = scope->vars; v; v = v->next) {
+            if (strcmp(v->name, name) == 0) {
+                return v;
+            }
+        }
+    }
+    return NULL;
+}
+
+Type *new_type(TypeKind kind) {
+    Type *ty = calloc(1, sizeof(Type));
+    ty->kind = kind;
+    return ty;
+}
+
+static void walk(Node *node) {
+    if (!node) {
+        return;
+    }
+
+    switch (node->kind) {
+        case NODE_KIND_NUM:
+            node->ty = ty_int;
+            return;
+
+        case NODE_KIND_IDENTIFIER: {
+            Variable *var = symtab_lookup(node->name);
+            if (!var) {
+                fprintf(stderr, "Erro: variavel '%s' nao declarada\n", node->name);
+                exit(1);
+            }
+            node->var = var;
+            node->ty = var->type;
+            node->offset = var->offset;
+            return;
+        }
+
+        case NODE_KIND_RETURN:
+            walk(node->expr);
+            return;
+
+        case NODE_KIND_FN:
+            symtab_enter_scope();
+            walk(node->body);
+            symtab_exit_scope();
+            return;
+
+        case NODE_KIND_BLOCK:
+            symtab_enter_scope();
+            for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
+                walk(stmt);
+            }
+            symtab_exit_scope();
+            return;
+
+        case NODE_KIND_LET: {
+            if (node->init_expr) {
+                walk(node->init_expr);
+            }
+            Variable *var = symtab_declare(node->name, node->ty, node->flags);
+            node->var = var;
+            node->offset = var->offset;
+            return;
+        }
+
+        case NODE_KIND_ADD:
+        case NODE_KIND_SUBTRACTION:
+        case NODE_KIND_MULTIPLIER:
+        case NODE_KIND_DIVIDER:
+            walk(node->lhs);
+            walk(node->rhs);
+            node->ty = node->lhs->ty;
+            return;
+
+        case NODE_KIND_IF: {
+            // 1. Analisa a condição
+            walk(node->if_stmt.cond);
+
+            // 2. Valida o tipo da condição (aceita i32 como booleano por enquanto)
+            if (node->if_stmt.cond->ty->kind != TY_I32 &&
+                node->if_stmt.cond->ty->kind != TY_BOOL &&
+                node->if_stmt.cond->ty->kind != TY_INT) {
+                fprintf(stderr, "Erro: condição do if deve ser um booleano ou inteiro.\n");
+                exit(1);
+            }
+
+            // 3. Analisa o bloco 'then'
+            walk(node->if_stmt.then_b);
+
+            // 4. Analisa o bloco 'else', se existir
+            if (node->if_stmt.else_b) {
+                walk(node->if_stmt.else_b);
+            }
+            return;
+        }
+    }
+}
+
+void analyze(Node *node) {
+    ty_int = new_type(TY_INT);
+    symtab_init();
+    walk(node);
+}
+
+
+======================================================================
+Arquivo: codegen.h
+======================================================================
+#pragma once
+#include "ir.h"
+
+void codegen(IRProgram *prog, const char *output_file);
+
+
+======================================================================
+Arquivo: ir.h
+======================================================================
+#pragma once
+#include "parser.h"
+
+typedef enum {
+    IR_IMM,
+    IR_MOV,
+    IR_ADD,
+    IR_SUB,
+    IR_MUL,
+    IR_DIV,
+    IR_NEG,
+    IR_EQ,
+    IR_NE,
+    IR_LT,
+    IR_LE,
+    IR_GT,
+    IR_GE,
+    IR_JMP,
+    IR_JZ,
+    IR_JNZ,
+    IR_LABEL,
+    IR_CALL,
+    IR_RET,
+    IR_LOAD,
+    IR_STORE,
+    IR_ADDR,
+    IR_PHI,
+} IROp;
+
+typedef enum {
+    OPERAND_NONE,
+    OPERAND_VREG,
+    OPERAND_IMM,
+    OPERAND_LABEL,
+} OperandType;
+
+typedef struct {
+    OperandType type;
+    union {
+        int vreg;
+        long imm;
+        int label;
+    };
+} Operand;
+
+typedef struct IRInst {
+    IROp op;
+    struct IRInst *next;
+    Operand dest;
+    Operand src1;
+    Operand src2;
+    int line;
+    int is_dead;
+    unsigned long live_in;
+    unsigned long live_out;
+} IRInst;
+
+typedef struct IRFunction {
+    char name[64];
+    IRInst *instructions;
+    int vreg_count;
+    int label_count;
+    struct IRFunction *next;
+} IRFunction;
+
+typedef struct {
+    IRFunction *functions;
+    IRFunction *main_func;
+} IRProgram;
+
+static inline Operand op_none() {
+    Operand op;
+    op.type = OPERAND_NONE;
+    op.vreg = 0;
+    return op;
+}
+
+static inline Operand op_vreg(int vreg) {
+    Operand op;
+    op.type = OPERAND_VREG;
+    op.vreg = vreg;
+    return op;
+}
+
+static inline Operand op_imm(long imm) {
+    Operand op;
+    op.type = OPERAND_IMM;
+    op.imm = imm;
+    return op;
+}
+
+static inline Operand op_label(int label) {
+    Operand op;
+    op.type = OPERAND_LABEL;
+    op.label = label;
+    return op;
+}
+
+static const char *IR_OP_NAMES[] = {
+    "IMM", "MOV",
+    "ADD", "SUB", "MUL", "DIV", "NEG",
+    "EQ", "NE", "LT", "LE", "GT", "GE",
+    "JMP", "JZ", "JNZ", "LABEL",
+    "CALL", "RET",
+    "LOAD", "STORE", "ADDR",
+    "PHI",
+};
+
+IRProgram *gen_ir(Node *ast);
+void ir_free(IRProgram *prog);
+void ir_print(IRProgram *prog);
+
+
+======================================================================
+Arquivo: lexer.h
+======================================================================
+#pragma once
+#include <stdio.h>
+
+typedef enum {
+	TOKEN_TYPE_EOF,
+	TOKEN_TYPE_IDENTIFIER,
+	TOKEN_TYPE_INTEGER,
+
+	TOKEN_TYPE_RETURN,
+
+	TOKEN_TYPE_PLUS,
+	TOKEN_TYPE_MINUS,
+	TOKEN_TYPE_MULTIPLIER,
+	TOKEN_TYPE_DIVIDER,
+	TOKEN_TYPE_EQ,
+	TOKEN_TYPE_EQEQ,
+	TOKEN_TYPE_LT,
+	TOKEN_TYPE_GT,
+	TOKEN_TYPE_LPAREN,
+	TOKEN_TYPE_RPAREN,
+	TOKEN_TYPE_LBRACE,
+	TOKEN_TYPE_RBRACE,
+	TOKEN_TYPE_LBRACKET,
+	TOKEN_TYPE_RBRACKET,
+	TOKEN_TYPE_COMMA,
+	TOKEN_TYPE_DOT,
+	TOKEN_TYPE_SEMICOLON,
+	TOKEN_TYPE_COLON,
+	TOKEN_TYPE_FN,
+	TOKEN_TYPE_ARROW,
+	TOKEN_TYPE_EQUAL,
+	TOKEN_TYPE_NOT,
+	TOKEN_TYPE_AND,
+	TOKEN_TYPE_OR,
+	TOKEN_TYPE_LET,
+	TOKEN_TYPE_IS,
+	TOKEN_TYPE_AS,
+	TOKEN_TYPE_WITH,
+	TOKEN_TYPE_ASSIGN,
+	TOKEN_TYPE_IF,
+	TOKEN_TYPE_ELSE,
+} TokenType;
+
+static const char *TOKEN_NAMES[] = {
+    "TOKEN_TYPE_EOF",
+	"TOKEN_TYPE_IDENTIFIER",
+	"TOKEN_TYPE_INTEGER",
+
+	"TOKEN_TYPE_RETURN",
+
+	"TOKEN_TYPE_PLUS",
+	"TOKEN_TYPE_MINUS",
+	"TOKEN_TYPE_MULTIPLIER",
+	"TOKEN_TYPE_DIVIDER",
+	"TOKEN_TYPE_EQ",
+	"TOKEN_TYPE_EQEQ",
+	"TOKEN_TYPE_LT",
+	"TOKEN_TYPE_GT",
+	"TOKEN_TYPE_LPAREN",
+	"TOKEN_TYPE_RPAREN",
+	"TOKEN_TYPE_LBRACE",
+	"TOKEN_TYPE_RBRACE",
+	"TOKEN_TYPE_LBRACKET",
+	"TOKEN_TYPE_RBRACKET",
+	"TOKEN_TYPE_COMMA",
+	"TOKEN_TYPE_DOT",
+	"TOKEN_TYPE_SEMICOLON",
+	"TOKEN_TYPE_COLON",
+	"TOKEN_TYPE_FN",
+	"TOKEN_TYPE_ARROW",
+	"TOKEN_TYPE_EQUAL",
+	"TOKEN_TYPE_NOT",
+	"TOKEN_TYPE_AND",
+	"TOKEN_TYPE_OR",
+	"TOKEN_TYPE_LET",
+	"TOKEN_TYPE_IS",
+	"TOKEN_TYPE_AS",
+	"TOKEN_TYPE_WITH",
+	"TOKEN_TYPE_ASSIGN",
+	"TOKEN_TYPE_IF",
+	"TOKEN_TYPE_ELSE",
+	"TOKEN_TYPE_UNKNOWN",
+};
+
+typedef struct {
+	TokenType type;
+	const char *start;
+	int length;
+	int line;
+
+	long long int_value;
+
+	char text[256];
+} Token;
+
+void lexer_init(FILE *file);
+Token lexer_next();
+
+
+======================================================================
+Arquivo: parser.h
+======================================================================
+#pragma once
+#include "lexer.h"
+
+typedef enum {
+    NODE_KIND_NUM,
+    NODE_KIND_IDENTIFIER,
+    NODE_KIND_ADD,
+    NODE_KIND_SUBTRACTION,
+    NODE_KIND_MULTIPLIER,
+    NODE_KIND_DIVIDER,
+    NODE_KIND_ASSIGN,
+    NODE_KIND_EXPR_STMT,
+    NODE_KIND_RETURN,
+    NODE_KIND_FN,
+    NODE_KIND_BLOCK,
+    NODE_KIND_LET,
+    NODE_KIND_IF,
+} NodeKind;
+
+typedef enum {
+    VAR_FLAG_NONE,
+    VAR_FLAG_MUT,
+    VAR_FLAG_IMUT,
+} VarFlags;
+
+typedef struct Node {
+    NodeKind kind;
+    struct Node *next;
+    struct Type *ty;
+    Token *tok;
+
+    struct Node *lhs;
+    struct Node *rhs;
+    long val;
+
+    struct Node *expr;
+    struct Node *init_expr;
+
+    char *name;
+    VarFlags flags;
+    struct Node *body;
+    struct Node *stmts;
+
+    int offset;
+    struct Variable *var;
+
+    // Campos para IF statement
+    struct {
+        struct Node *cond;      // Condição
+        struct Node *then_b;    // Bloco then
+        struct Node *else_b;    // Bloco else (pode ser NULL ou outro IF)
+    } if_stmt;
+} Node;
+
+typedef enum {
+    TY_INT,
+    TY_I8,
+    TY_I16,
+    TY_I32,
+    TY_I64,
+    TY_U8,
+    TY_U16,
+    TY_U32,
+    TY_U64,
+    TY_FLOAT,
+    TY_F32,
+    TY_F64,
+    TY_BOOL,
+    TY_CHAR,
+    TY_STRING,
+    TY_VOID,
+    TY_PTR,
+} TypeKind;
+
+typedef struct Type {
+    TypeKind kind;
+} Type;
+
+void ast_print(Node *node);
+void parser_init();
+Node *parse();
+
+
+======================================================================
+Arquivo: semantic.h
+======================================================================
+#pragma once
+#include "parser.h"
+
+typedef struct Variable {
+    char *name;
+    Type *type;
+    VarFlags flags;
+    int offset;
+    struct Variable *next;
+} Variable;
+
+void analyze(Node *node);
+
+
+======================================================================
+Arquivo: return.cst
+======================================================================
+fn main() -> int {
+    let is i32 as x = 10;
+    {
+        let is i32 as x = 20;
+    }
+    return x;
+}
+
+
+======================================================================
+Arquivo: return.cst.s
+======================================================================
+.intel_syntax noprefix
+.global main
+
+main:
+  push rbp
+  mov rbp, rsp
+  mov rbx, 10
+  mov QWORD PTR [rbp-8], rbx
+  mov rbx, 20
+  mov QWORD PTR [rbp-16], rbx
+  mov rbx, QWORD PTR [rbp-8]
+  mov rax, rbx
+  mov rsp, rbp
+  pop rbp
+  ret
+
+
+
