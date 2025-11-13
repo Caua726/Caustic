@@ -111,9 +111,15 @@ static int gen_expr(Node *node) {
             return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
-        case NODE_KIND_IDENTIFIER:
-            fprintf(stderr, "Erro: variáveis ainda não implementadas\n");
-            exit(1);
+        case NODE_KIND_IDENTIFIER: {
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_LOAD);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_imm(node->offset);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
 
         case NODE_KIND_ASSIGN:
             fprintf(stderr, "Erro: atribuição ainda não implementada\n");
@@ -139,6 +145,18 @@ static void gen_stmt(Node *node) {
 
         case NODE_KIND_EXPR_STMT: {
             gen_expr(node->expr);
+            break;
+        }
+
+        case NODE_KIND_LET: {
+            if (node->init_expr) {
+                int val_reg = gen_expr(node->init_expr);
+                IRInst *inst = new_inst(IR_STORE);
+                inst->dest = op_imm(node->offset);
+                inst->src1 = op_vreg(val_reg);
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            }
             break;
         }
 

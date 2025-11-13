@@ -4,14 +4,13 @@
 main:
   push rbp
   mov rbp, rsp
-  mov rbx, 1
-  mov rsi, 3
-  mov rdi, 6
-  mov r8, rsi
-  imul r8, rdi
-  mov rsi, rbx
-  add rsi, r8
-  mov rax, rsi
+  mov rbx, 5
+  mov QWORD PTR [rbp-8], rbx
+  mov rbx, QWORD PTR [rbp-8]
+  mov rsi, 1
+  mov rdi, rbx
+  add rdi, rsi
+  mov rax, rdi
   mov rsp, rbp
   pop rbp
   ret

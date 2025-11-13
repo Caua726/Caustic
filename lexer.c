@@ -51,6 +51,10 @@ Token lexer_next() {
 
         if (strcmp(t.text, "return") == 0) {t.type = TOKEN_TYPE_RETURN;}
         else if (strcmp(t.text, "fn") == 0) {t.type = TOKEN_TYPE_FN;}
+        else if (strcmp(t.text, "let") == 0) {t.type = TOKEN_TYPE_LET;}
+        else if (strcmp(t.text, "is") == 0) {t.type = TOKEN_TYPE_IS;}
+        else if (strcmp(t.text, "as") == 0) {t.type = TOKEN_TYPE_AS;}
+        else if (strcmp(t.text, "with") == 0) {t.type = TOKEN_TYPE_WITH;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
@@ -110,11 +114,19 @@ Token lexer_next() {
             next_char();
             return t;
         case ':':
-            t.text[0] = ':';
-            t.text[1] = '\0';
-            t.type = TOKEN_TYPE_COLON;
-            next_char();
-            return t;
+            if (lookhead_char() == '=') {
+                strcpy(t.text, ":=");
+                t.type = TOKEN_TYPE_ASSIGN;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = ':';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_COLON;
+                next_char();
+                return t;
+            }
         case '=':
             t.text[0] = '=';
             t.text[1] = '\0';
