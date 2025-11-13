@@ -160,6 +160,13 @@ static void gen_stmt(Node *node) {
             break;
         }
 
+        case NODE_KIND_BLOCK: {
+            for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
+                gen_stmt(stmt);
+            }
+            break;
+        }
+
         default:
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
             exit(1);
@@ -306,6 +313,20 @@ void ir_print(IRProgram *prog) {
                 case IR_JNZ:
                     print_operand(inst->dest);
                     printf(" if ");
+                    print_operand(inst->src1);
+                    break;
+
+                case IR_LOAD:
+                    print_operand(inst->dest);
+                    printf(" = [rbp-");
+                    print_operand(inst->src1);
+                    printf("-8]");
+                    break;
+
+                case IR_STORE:
+                    printf("[rbp-");
+                    print_operand(inst->dest);
+                    printf("-8] = ");
                     print_operand(inst->src1);
                     break;
 
