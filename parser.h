@@ -13,31 +13,55 @@ typedef enum {
     NODE_KIND_RETURN,
     NODE_KIND_FN,
     NODE_KIND_BLOCK,
+    NODE_KIND_LET,
 } NodeKind;
+
+typedef enum {
+    VAR_FLAG_NONE,
+    VAR_FLAG_MUT,
+    VAR_FLAG_IMUT,
+} VarFlags;
 
 typedef struct Node {
     NodeKind kind;
     struct Node *next;
     struct Type *ty;
-
     Token *tok;
 
     struct Node *lhs;
     struct Node *rhs;
-
     long val;
 
-    char ident[64];
-
     struct Node *expr;
+    struct Node *init_expr;
 
     char *name;
+    VarFlags flags;
     struct Node *body;
     struct Node *stmts;
+
+    int offset;
+    struct Variable *var;
 } Node;
 
 typedef enum {
-    TY_INT
+    TY_INT,
+    TY_I8,
+    TY_I16,
+    TY_I32,
+    TY_I64,
+    TY_U8,
+    TY_U16,
+    TY_U32,
+    TY_U64,
+    TY_FLOAT,
+    TY_F32,
+    TY_F64,
+    TY_BOOL,
+    TY_CHAR,
+    TY_STRING,
+    TY_VOID,
+    TY_PTR,
 } TypeKind;
 
 typedef struct Type {
@@ -47,16 +71,3 @@ typedef struct Type {
 void ast_print(Node *node);
 void parser_init();
 Node *parse();
-
-static Token current_token;
-static Token lookahead_token;
-
-static Node *parse_expr();
-static Node *parse_stmt();
-static Node *new_node(NodeKind kind);
-static Node *new_node_num(long val);
-static Node *new_node_return(Node *expr);
-static void consume();
-static Node *parse_expr();
-static Node *parse_add();
-static Node *parse_mul();

@@ -446,6 +446,16 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
+        case IR_LOAD:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+            break;
+
+        case IR_STORE:
+            get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
+            emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+            break;
+
         default:
             break;
     }
