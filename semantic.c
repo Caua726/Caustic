@@ -141,6 +141,28 @@ static void walk(Node *node) {
             walk(node->rhs);
             node->ty = node->lhs->ty;
             return;
+
+        case NODE_KIND_IF: {
+            // 1. Analisa a condição
+            walk(node->if_stmt.cond);
+
+            // 2. Valida o tipo da condição (aceita i32 como booleano por enquanto)
+            if (node->if_stmt.cond->ty->kind != TY_I32 &&
+                node->if_stmt.cond->ty->kind != TY_BOOL &&
+                node->if_stmt.cond->ty->kind != TY_INT) {
+                fprintf(stderr, "Erro: condição do if deve ser um booleano ou inteiro.\n");
+                exit(1);
+            }
+
+            // 3. Analisa o bloco 'then'
+            walk(node->if_stmt.then_b);
+
+            // 4. Analisa o bloco 'else', se existir
+            if (node->if_stmt.else_b) {
+                walk(node->if_stmt.else_b);
+            }
+            return;
+        }
     }
 }
 

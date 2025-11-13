@@ -167,6 +167,47 @@ static void gen_stmt(Node *node) {
             break;
         }
 
+        case NODE_KIND_IF: {
+            int else_label = new_label();
+            int end_label = new_label();
+
+            // 1. Gera IR para a condição
+            int cond_reg = gen_expr(node->if_stmt.cond);
+
+            // 2. Salto condicional (JZ = Jump if Zero)
+            IRInst *jz = new_inst(IR_JZ);
+            jz->src1 = op_vreg(cond_reg);
+            jz->dest = op_label(else_label);
+            jz->line = node->tok ? node->tok->line : 0;
+            emit(jz);
+
+            // 3. Gera IR para o bloco 'then'
+            gen_stmt(node->if_stmt.then_b);
+
+            // 4. Salto incondicional para o fim (pula o bloco 'else')
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(end_label);
+            jmp->line = node->tok ? node->tok->line : 0;
+            emit(jmp);
+
+            // 5. Emite o label do 'else'
+            IRInst *else_lbl = new_inst(IR_LABEL);
+            else_lbl->dest = op_label(else_label);
+            emit(else_lbl);
+
+            // 6. Gera IR para o bloco 'else', se existir
+            if (node->if_stmt.else_b) {
+                gen_stmt(node->if_stmt.else_b);
+            }
+
+            // 7. Emite o label do fim
+            IRInst *end_lbl = new_inst(IR_LABEL);
+            end_lbl->dest = op_label(end_label);
+            emit(end_lbl);
+
+            break;
+        }
+
         default:
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
             exit(1);

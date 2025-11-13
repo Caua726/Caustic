@@ -15,6 +15,7 @@ static void expect(TokenType type);
 static Node *parse_var_decl();
 static Node *parse_expr();
 static Node *parse_stmt();
+static Node *parse_if_stmt();
 static Node *parse_add();
 static Node *parse_mul();
 static Node *parse_primary();
@@ -252,9 +253,43 @@ static Node *parse_add() {
     return node;
 }
 
+static Node *parse_if_stmt() {
+    expect(TOKEN_TYPE_IF);
+
+    Node *if_node = new_node(NODE_KIND_IF);
+
+    // 1. Parsear a condição
+    expect(TOKEN_TYPE_LPAREN);
+    if_node->if_stmt.cond = parse_expr();
+    expect(TOKEN_TYPE_RPAREN);
+
+    // 2. Parsear o bloco 'then' (obrigatório)
+    if_node->if_stmt.then_b = parse_block();
+
+    // 3. Parsear o 'else' ou 'else if' (opcional)
+    if (current_token.type == TOKEN_TYPE_ELSE) {
+        consume(); // Consome 'else'
+        if (current_token.type == TOKEN_TYPE_IF) {
+            // É um 'else if', então o ramo 'else' é outro 'if'
+            if_node->if_stmt.else_b = parse_if_stmt();
+        } else {
+            // É um 'else' normal, seguido por um bloco
+            if_node->if_stmt.else_b = parse_block();
+        }
+    } else {
+        if_node->if_stmt.else_b = NULL; // Não tem ramo 'else'
+    }
+
+    return if_node;
+}
+
 static Node *parse_stmt() {
     if (current_token.type == TOKEN_TYPE_LET) {
         return parse_var_decl();
+    }
+
+    if (current_token.type == TOKEN_TYPE_IF) {
+        return parse_if_stmt();
     }
 
     if (current_token.type == TOKEN_TYPE_RETURN) {
@@ -274,7 +309,7 @@ static Node *parse_stmt() {
         return parse_block();
     }
 
-    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
+    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'if', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
     exit(1);
 }
 
@@ -370,6 +405,20 @@ static void ast_print_recursive(Node *node, int depth) {
             printf("BinaryOp(/)\n");
             ast_print_recursive(node->lhs, depth + 1);
             ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_IF:
+            printf("IfStmt\n");
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Cond:\n");
+            ast_print_recursive(node->if_stmt.cond, depth + 2);
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Then:\n");
+            ast_print_recursive(node->if_stmt.then_b, depth + 2);
+            if (node->if_stmt.else_b) {
+                for (int i = 0; i < depth + 1; i++) printf("  ");
+                printf("Else:\n");
+                ast_print_recursive(node->if_stmt.else_b, depth + 2);
+            }
             break;
         default:
             printf("Nó Desconhecido\n");
