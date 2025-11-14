@@ -5,9 +5,7 @@ typedef enum {
 	TOKEN_TYPE_EOF,
 	TOKEN_TYPE_IDENTIFIER,
 	TOKEN_TYPE_INTEGER,
-
 	TOKEN_TYPE_RETURN,
-
 	TOKEN_TYPE_PLUS,
 	TOKEN_TYPE_MINUS,
 	TOKEN_TYPE_MULTIPLIER,
@@ -45,9 +43,7 @@ static const char *TOKEN_NAMES[] = {
     "TOKEN_TYPE_EOF",
 	"TOKEN_TYPE_IDENTIFIER",
 	"TOKEN_TYPE_INTEGER",
-
 	"TOKEN_TYPE_RETURN",
-
 	"TOKEN_TYPE_PLUS",
 	"TOKEN_TYPE_MINUS",
 	"TOKEN_TYPE_MULTIPLIER",
@@ -87,9 +83,7 @@ typedef struct {
 	const char *start;
 	int length;
 	int line;
-
 	long long int_value;
-
 	char text[256];
 } Token;
 

@@ -28,27 +28,21 @@ typedef struct Node {
     struct Node *next;
     struct Type *ty;
     Token *tok;
-
     struct Node *lhs;
     struct Node *rhs;
     long val;
-
     struct Node *expr;
     struct Node *init_expr;
-
     char *name;
     VarFlags flags;
     struct Node *body;
     struct Node *stmts;
-
     int offset;
     struct Variable *var;
-
-    // Campos para IF statement
     struct {
-        struct Node *cond;      // Condição
-        struct Node *then_b;    // Bloco then
-        struct Node *else_b;    // Bloco else (pode ser NULL ou outro IF)
+        struct Node *cond;
+        struct Node *then_b;
+        struct Node *else_b;
     } if_stmt;
 } Node;
 
