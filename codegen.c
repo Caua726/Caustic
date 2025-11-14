@@ -22,6 +22,11 @@ typedef struct RegState {
 } RegState;
 
 typedef struct {
+    int *successors;
+    int num_successors;
+} CFGNode;
+
+typedef struct {
     LiveInterval *intervals;
     int count;
     RegState *regs;
@@ -46,29 +51,81 @@ static void emit(const char *fmt, ...) {
     va_end(args);
 }
 
+static CFGNode *build_cfg(IRFunction *func, int n) {
+    CFGNode *cfg = calloc(n, sizeof(CFGNode));
+    int *label_to_pos = calloc(func->label_count + 1, sizeof(int));
+
+    int pos = 0;
+    for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
+        if (inst->op == IR_LABEL) {
+            label_to_pos[inst->dest.label] = pos;
+        }
+    }
+
+    pos = 0;
+    for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
+        cfg[pos].successors = calloc(2, sizeof(int));
+        cfg[pos].num_successors = 0;
+
+        if (inst->op == IR_JMP) {
+            cfg[pos].successors[0] = label_to_pos[inst->dest.label];
+            cfg[pos].num_successors = 1;
+        } else if (inst->op == IR_JZ || inst->op == IR_JNZ) {
+            cfg[pos].successors[0] = label_to_pos[inst->dest.label];
+            if (inst->next) {
+                cfg[pos].successors[1] = pos + 1;
+                cfg[pos].num_successors = 2;
+            } else {
+                cfg[pos].num_successors = 1;
+            }
+        } else if (inst->op == IR_RET) {
+            cfg[pos].num_successors = 0;
+        } else {
+            if (inst->next) {
+                cfg[pos].successors[0] = pos + 1;
+                cfg[pos].num_successors = 1;
+            }
+        }
+    }
+
+    free(label_to_pos);
+    return cfg;
+}
+
 static void liveness_analysis(IRFunction *func, unsigned long *live_in, unsigned long *live_out) {
     int n = 0;
     for (IRInst *inst = func->instructions; inst; inst = inst->next) n++;
 
+    CFGNode *cfg = build_cfg(func, n);
+
     int changed = 1;
     while (changed) {
         changed = 0;
-        int i = n - 1;
-        for (IRInst *inst = func->instructions; inst; inst = inst->next, i--) {
-            unsigned long old_in = live_in[i];
-            unsigned long old_out = live_out[i];
+        int pos = 0;
+        for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
+            unsigned long old_in = live_in[pos];
+            unsigned long old_out = live_out[pos];
 
             unsigned long use = 0, def = 0;
             if (inst->src1.type == OPERAND_VREG && inst->src1.vreg < 64) use |= (1UL << inst->src1.vreg);
             if (inst->src2.type == OPERAND_VREG && inst->src2.vreg < 64) use |= (1UL << inst->src2.vreg);
             if (inst->dest.type == OPERAND_VREG && inst->dest.vreg < 64) def |= (1UL << inst->dest.vreg);
 
-            live_in[i] = use | (live_out[i] & ~def);
-            live_out[i] = inst->next ? live_in[i + 1] : 0;
+            live_out[pos] = 0;
+            for (int i = 0; i < cfg[pos].num_successors; i++) {
+                live_out[pos] |= live_in[cfg[pos].successors[i]];
+            }
 
-            if (old_in != live_in[i] || old_out != live_out[i]) changed = 1;
+            live_in[pos] = use | (live_out[pos] & ~def);
+
+            if (old_in != live_in[pos] || old_out != live_out[pos]) changed = 1;
         }
     }
+
+    for (int i = 0; i < n; i++) {
+        free(cfg[i].successors);
+    }
+    free(cfg);
 }
 
 static int interval_cmp(const void *a, const void *b) {
@@ -92,7 +149,15 @@ static void build_intervals(IRFunction *func, AllocCtx *ctx) {
         ctx->intervals[i].spill_cost = 0;
     }
 
+    int *label_to_pos = calloc(func->label_count + 1, sizeof(int));
     int pos = 0;
+    for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
+        if (inst->op == IR_LABEL) {
+            label_to_pos[inst->dest.label] = pos;
+        }
+    }
+
+    pos = 0;
     for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
         if (inst->src1.type == OPERAND_VREG) {
             int v = inst->src1.vreg;
@@ -114,7 +179,23 @@ static void build_intervals(IRFunction *func, AllocCtx *ctx) {
             ctx->intervals[v].end = pos;
             ctx->intervals[v].spill_cost += 1;
         }
+
+        if (inst->op == IR_JMP || inst->op == IR_JZ || inst->op == IR_JNZ) {
+            int target_pos = label_to_pos[inst->dest.label];
+            if (target_pos <= pos) {
+                for (int v = 0; v < func->vreg_count; v++) {
+                    if (ctx->intervals[v].start != INT_MAX &&
+                        ctx->intervals[v].start < pos &&
+                        ctx->intervals[v].end >= target_pos) {
+                        if (ctx->intervals[v].start > target_pos) ctx->intervals[v].start = target_pos;
+                        if (ctx->intervals[v].end < pos) ctx->intervals[v].end = pos;
+                    }
+                }
+            }
+        }
     }
+
+    free(label_to_pos);
 
     for (int i = 0; i < func->vreg_count; i++) {
         if (ctx->intervals[i].use_count > 0) {
@@ -375,7 +456,22 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 
         case IR_RET:
             load_operand(inst->src1.vreg, ctx, "rax");
-            emit("mov rsp, rbp");
+
+            // Desfaz a alocação de stack para variáveis de spill
+            int stack_size = ctx->stack_slots * 8;
+            if (stack_size > 0) {
+                stack_size = (stack_size + 15) & ~15;
+                emit("add rsp, %d", stack_size);
+            }
+
+            // Restaura os registradores na ordem INVERSA do push
+            emit("pop r15");
+            emit("pop r14");
+            emit("pop r13");
+            emit("pop r12");
+            emit("pop rbx");
+
+            // Restaura o base pointer e retorna
             emit("pop rbp");
             emit("ret");
             break;
@@ -483,6 +579,11 @@ static void gen_func(IRFunction *func) {
     fprintf(out, "%s:\n", func->name);
     emit("push rbp");
     emit("mov rbp, rsp");
+    emit("push rbx");
+    emit("push r12");
+    emit("push r13");
+    emit("push r14");
+    emit("push r15");
 
     int stack_size = ctx.stack_slots * 8;
     if (stack_size > 0) {
