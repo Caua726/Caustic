@@ -173,7 +173,16 @@ static int gen_expr(Node *node) {
     }
 }
 
+static void gen_stmt_single(Node *node);
+
 static void gen_stmt(Node *node) {
+    while (node) {
+        gen_stmt_single(node);
+        node = node->next;
+    }
+}
+
+static void gen_stmt_single(Node *node) {
     if (!node) {
         return;
     }
@@ -203,9 +212,7 @@ static void gen_stmt(Node *node) {
         }
 
         case NODE_KIND_BLOCK: {
-            for (Node *stmt = node->stmts; stmt; stmt = stmt->next) {
-                gen_stmt(stmt);
-            }
+            gen_stmt(node->stmts);
             break;
         }
 
@@ -244,8 +251,6 @@ static void gen_stmt(Node *node) {
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
             exit(1);
     }
-
-    gen_stmt(node->next);
 }
 
 IRProgram *gen_ir(Node *ast) {
