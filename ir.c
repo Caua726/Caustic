@@ -234,7 +234,12 @@ static void gen_stmt(Node *node) {
             emit(end_lbl);
             break;
         }
-
+        case NODE_KIND_ASM:
+            IRInst *inst = new_inst(IR_ASM);
+            inst->asm_str = strdup(node->name);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            break;
         default:
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
             exit(1);
@@ -248,7 +253,6 @@ IRProgram *gen_ir(Node *ast) {
 
     IRProgram *prog = calloc(1, sizeof(IRProgram));
 
-    // ast deve ser um NODE_KIND_FN
     if (!ast || ast->kind != NODE_KIND_FN) {
         fprintf(stderr, "Erro: AST deve ser uma função\n");
         exit(1);
@@ -258,7 +262,6 @@ IRProgram *gen_ir(Node *ast) {
     strcpy(func->name, ast->name);
     ctx.current_func = func;
 
-    // Processar o body da função (NODE_KIND_BLOCK)
     if (ast->body && ast->body->kind == NODE_KIND_BLOCK) {
         gen_stmt(ast->body->stmts);
     } else {
@@ -396,6 +399,9 @@ void ir_print(IRProgram *prog) {
                     print_operand(inst->dest);
                     printf("-8] = ");
                     print_operand(inst->src1);
+                    break;
+                case IR_ASM:
+                    printf("\"%s\"", inst->asm_str ? inst->asm_str : "");
                     break;
 
                 default:

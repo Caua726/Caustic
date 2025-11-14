@@ -305,6 +305,26 @@ static Node *parse_if_stmt() {
     return if_node;
 }
 
+static Node *parse_asm_stmt() {
+    consume();
+    expect(TOKEN_TYPE_LPAREN);
+
+    if (current_token.type != TOKEN_TYPE_STRING) {
+        fprintf(stderr, "Erro na linha %d: esperado string apos 'asm('\n",
+                current_token.line);
+        exit(1);
+    }
+
+    Node *asm_node = new_node(NODE_KIND_ASM);
+    asm_node->name = strdup(current_token.text);
+    consume();
+
+    expect(TOKEN_TYPE_RPAREN);
+    expect(TOKEN_TYPE_SEMICOLON);
+
+    return asm_node;
+}
+
 static Node *parse_stmt() {
     if (current_token.type == TOKEN_TYPE_LET) {
         return parse_var_decl();
@@ -329,6 +349,10 @@ static Node *parse_stmt() {
 
     if (current_token.type == TOKEN_TYPE_LBRACE) {
         return parse_block();
+    }
+
+    if (current_token.type == TOKEN_TYPE_ASM) {
+        return parse_asm_stmt();
     }
 
     fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
@@ -476,6 +500,9 @@ static void ast_print_recursive(Node *node, int depth) {
                 printf("Else:\n");
                 ast_print_recursive(node->if_stmt.else_b, depth + 2);
             }
+            break;
+        case NODE_KIND_ASM:
+            printf("AsmStmt(\"%s\")\n", node->name ? node->name : "");
             break;
         default:
             printf("Nó Desconhecido\n");
