@@ -8,6 +8,7 @@ typedef enum {
     IR_SUB,
     IR_MUL,
     IR_DIV,
+    IR_MOD,
     IR_NEG,
     IR_EQ,
     IR_NE,
@@ -98,7 +99,7 @@ static inline Operand op_label(int label) {
 
 static const char *IR_OP_NAMES[] = {
     "IMM", "MOV",
-    "ADD", "SUB", "MUL", "DIV", "NEG",
+    "ADD", "SUB", "MUL", "DIV", "MOD", "NEG",
     "EQ", "NE", "LT", "LE", "GT", "GE",
     "JMP", "JZ", "JNZ", "LABEL",
     "CALL", "RET",

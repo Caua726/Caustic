@@ -137,6 +137,13 @@ static void walk(Node *node) {
         case NODE_KIND_SUBTRACTION:
         case NODE_KIND_MULTIPLIER:
         case NODE_KIND_DIVIDER:
+        case NODE_KIND_MOD:
+        case NODE_KIND_EQ:
+        case NODE_KIND_NE:
+        case NODE_KIND_LT:
+        case NODE_KIND_LE:
+        case NODE_KIND_GT:
+        case NODE_KIND_GE:
             walk(node->lhs);
             walk(node->rhs);
             node->ty = node->lhs->ty;
@@ -144,9 +151,10 @@ static void walk(Node *node) {
 
         case NODE_KIND_IF: {
             walk(node->if_stmt.cond);
-            if (node->if_stmt.cond->ty->kind != TY_I32 &&
-                node->if_stmt.cond->ty->kind != TY_BOOL &&
-                node->if_stmt.cond->ty->kind != TY_INT) {
+            TypeKind tk = node->if_stmt.cond->ty->kind;
+            if (tk != TY_I8 && tk != TY_I16 && tk != TY_I32 && tk != TY_I64 &&
+                tk != TY_U8 && tk != TY_U16 && tk != TY_U32 && tk != TY_U64 &&
+                tk != TY_BOOL && tk != TY_INT) {
                 fprintf(stderr, "Erro: condição do if deve ser um booleano ou inteiro.\n");
                 exit(1);
             }

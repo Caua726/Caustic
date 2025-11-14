@@ -8,6 +8,13 @@ typedef enum {
     NODE_KIND_SUBTRACTION,
     NODE_KIND_MULTIPLIER,
     NODE_KIND_DIVIDER,
+    NODE_KIND_MOD,
+    NODE_KIND_EQ,
+    NODE_KIND_NE,
+    NODE_KIND_LT,
+    NODE_KIND_LE,
+    NODE_KIND_GT,
+    NODE_KIND_GE,
     NODE_KIND_ASSIGN,
     NODE_KIND_EXPR_STMT,
     NODE_KIND_RETURN,
@@ -28,15 +35,19 @@ typedef struct Node {
     struct Node *next;
     struct Type *ty;
     Token *tok;
+
     struct Node *lhs;
     struct Node *rhs;
     long val;
+
     struct Node *expr;
     struct Node *init_expr;
+
     char *name;
     VarFlags flags;
     struct Node *body;
     struct Node *stmts;
+
     int offset;
     struct Variable *var;
     struct {

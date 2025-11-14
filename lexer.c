@@ -57,6 +57,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "with") == 0) {t.type = TOKEN_TYPE_WITH;}
         else if (strcmp(t.text, "if") == 0) {t.type = TOKEN_TYPE_IF;}
         else if (strcmp(t.text, "else") == 0) {t.type = TOKEN_TYPE_ELSE;}
+
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
     }
@@ -108,6 +109,12 @@ Token lexer_next() {
             t.type = TOKEN_TYPE_DIVIDER;
             next_char();
             return t;
+        case '%':
+            t.text[0] = '%';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_MOD;
+            next_char();
+            return t;
         case ';':
             t.text[0] = ';';
             t.text[1] = '\0';
@@ -129,17 +136,33 @@ Token lexer_next() {
                 return t;
             }
         case '=':
-            t.text[0] = '=';
-            t.text[1] = '\0';
-            t.type = TOKEN_TYPE_EQUAL;
-            next_char();
-            return t;
+            if (lookhead_char() == '=') {
+                strcpy(t.text, "==");
+                t.type = TOKEN_TYPE_EQEQ;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '=';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_EQUAL;
+                next_char();
+                return t;
+            }
         case '!':
-            t.text[0] = '!';
-            t.text[1] = '\0';
-            t.type = TOKEN_TYPE_NOT;
-            next_char();
-            return t;
+            if (lookhead_char() == '=') {
+                strcpy(t.text, "!=");
+                t.type = TOKEN_TYPE_NE;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '!';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_NOT;
+                next_char();
+                return t;
+            }
         case '&':
             t.text[0] = '&';
             t.text[1] = '\0';
@@ -152,6 +175,34 @@ Token lexer_next() {
             t.type = TOKEN_TYPE_OR;
             next_char();
             return t;
+        case '<':
+            if (lookhead_char() == '=') {
+                strcpy(t.text, "<=");
+                t.type = TOKEN_TYPE_LE;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '<';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_LT;
+                next_char();
+                return t;
+            }
+        case '>':
+            if (lookhead_char() == '=') {
+                strcpy(t.text, ">=");
+                t.type = TOKEN_TYPE_GE;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '>';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_GT;
+                next_char();
+                return t;
+            }
         case '(':
             t.text[0] = '(';
             t.text[1] = '\0';
