@@ -111,6 +111,48 @@ static int gen_expr(Node *node) {
             return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
+        case NODE_KIND_MOD: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_MOD, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_EQ: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_EQ, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_NE: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_NE, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_LT: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_LT, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_LE: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_LE, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_GT: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_GT, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_GE: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            return emit_binary(IR_GE, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
         case NODE_KIND_IDENTIFIER: {
             int dest = new_vreg();
             IRInst *inst = new_inst(IR_LOAD);

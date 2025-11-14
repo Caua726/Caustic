@@ -348,6 +348,14 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
+        case IR_MOD:
+            load_operand(inst->src1.vreg, ctx, "rax");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("cqo");
+            emit("idiv r15");
+            store_operand(inst->dest.vreg, ctx, "rdx");
+            break;
+
         case IR_NEG:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
             get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));

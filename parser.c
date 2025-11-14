@@ -16,6 +16,7 @@ static Node *parse_var_decl();
 static Node *parse_expr();
 static Node *parse_stmt();
 static Node *parse_if_stmt();
+static Node *parse_comparison();
 static Node *parse_add();
 static Node *parse_mul();
 static Node *parse_primary();
@@ -65,7 +66,7 @@ static Node *new_node_return(Node *expr) {
 }
 
 static Node *parse_expr() {
-    return parse_add();
+    return parse_comparison();
 }
 
 static Type *parse_type() {
@@ -227,13 +228,16 @@ static Node *parse_fn() {
 
 static Node *parse_mul() {
     Node *node = parse_primary();
-    while (current_token.type == TOKEN_TYPE_MULTIPLIER || current_token.type == TOKEN_TYPE_DIVIDER) {
+    while (current_token.type == TOKEN_TYPE_MULTIPLIER || current_token.type == TOKEN_TYPE_DIVIDER || current_token.type == TOKEN_TYPE_MOD) {
         if (current_token.type == TOKEN_TYPE_MULTIPLIER) {
             consume();
             node = new_binary_node(NODE_KIND_MULTIPLIER, node, parse_primary());
         } else if (current_token.type == TOKEN_TYPE_DIVIDER) {
             consume();
             node = new_binary_node(NODE_KIND_DIVIDER, node, parse_primary());
+        } else if (current_token.type == TOKEN_TYPE_MOD) {
+            consume();
+            node = new_binary_node(NODE_KIND_MOD, node, parse_primary());
         }
     }
     return node;
@@ -248,6 +252,34 @@ static Node *parse_add() {
         } else if (current_token.type == TOKEN_TYPE_MINUS) {
             consume();
             node = new_binary_node(NODE_KIND_SUBTRACTION, node, parse_mul());
+        }
+    }
+    return node;
+}
+
+static Node *parse_comparison() {
+    Node *node = parse_add();
+    while (1) {
+        if (current_token.type == TOKEN_TYPE_EQEQ) {
+            consume();
+            node = new_binary_node(NODE_KIND_EQ, node, parse_add());
+        } else if (current_token.type == TOKEN_TYPE_NE) {
+            consume();
+            node = new_binary_node(NODE_KIND_NE, node, parse_add());
+        } else if (current_token.type == TOKEN_TYPE_LT) {
+            consume();
+            node = new_binary_node(NODE_KIND_LT, node, parse_add());
+        } else if (current_token.type == TOKEN_TYPE_LE) {
+            consume();
+            node = new_binary_node(NODE_KIND_LE, node, parse_add());
+        } else if (current_token.type == TOKEN_TYPE_GT) {
+            consume();
+            node = new_binary_node(NODE_KIND_GT, node, parse_add());
+        } else if (current_token.type == TOKEN_TYPE_GE) {
+            consume();
+            node = new_binary_node(NODE_KIND_GE, node, parse_add());
+        } else {
+            break;
         }
     }
     return node;
@@ -299,7 +331,7 @@ static Node *parse_stmt() {
         return parse_block();
     }
 
-    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'if', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
+    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
     exit(1);
 }
 
@@ -393,6 +425,41 @@ static void ast_print_recursive(Node *node, int depth) {
             break;
         case NODE_KIND_DIVIDER:
             printf("BinaryOp(/)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_MOD:
+            printf("BinaryOp(%%)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_EQ:
+            printf("BinaryOp(==)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_NE:
+            printf("BinaryOp(!=)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_LT:
+            printf("BinaryOp(<)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_LE:
+            printf("BinaryOp(<=)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_GT:
+            printf("BinaryOp(>)\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
+        case NODE_KIND_GE:
+            printf("BinaryOp(>=)\n");
             ast_print_recursive(node->lhs, depth + 1);
             ast_print_recursive(node->rhs, depth + 1);
             break;
