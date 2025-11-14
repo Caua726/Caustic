@@ -57,6 +57,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "with") == 0) {t.type = TOKEN_TYPE_WITH;}
         else if (strcmp(t.text, "if") == 0) {t.type = TOKEN_TYPE_IF;}
         else if (strcmp(t.text, "else") == 0) {t.type = TOKEN_TYPE_ELSE;}
+        else if (strcmp(t.text, "asm") == 0) {t.type = TOKEN_TYPE_ASM;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
@@ -239,8 +240,32 @@ Token lexer_next() {
             t.type = TOKEN_TYPE_RBRACE;
             next_char();
             return t;
-    }
+        case '"':
+            next_char();
+            t.text[0] = '\0';
 
+            while (current_char != '"' && current_char != EOF && current_char != '\n') {
+                if (current_char == '\\' && lookhead_char() == '"') {
+                    next_char();
+                    t.text[strlen(t.text)] = '"';
+                    t.text[strlen(t.text) + 1] = '\0';
+                    next_char();
+                } else {
+                    t.text[strlen(t.text)] = current_char;
+                    t.text[strlen(t.text) + 1] = '\0';
+                    next_char();
+                }
+            }
+
+            if (current_char != '"') {
+                printf("Erro: string nao terminada na linha %d\n", line);
+                exit(1);
+            }
+
+            t.type = TOKEN_TYPE_STRING;
+            next_char();
+            return t;
+    }
     printf("caractere inesperado: %c", current_char);
     next_char();
     return lexer_next();

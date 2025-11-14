@@ -43,6 +43,8 @@ typedef enum {
 	TOKEN_TYPE_ASSIGN,
 	TOKEN_TYPE_IF,
 	TOKEN_TYPE_ELSE,
+	TOKEN_TYPE_ASM,
+	TOKEN_TYPE_STRING,
 } TokenType;
 
 static const char *TOKEN_NAMES[] = {
@@ -87,6 +89,8 @@ static const char *TOKEN_NAMES[] = {
 	"TOKEN_TYPE_ASSIGN",
 	"TOKEN_TYPE_IF",
 	"TOKEN_TYPE_ELSE",
+	"TOKEN_TYPE_ASM",
+	"TOKEN_TYPE_STRING",
 	"TOKEN_TYPE_UNKNOWN",
 };
 

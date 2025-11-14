@@ -22,6 +22,7 @@ typedef enum {
     NODE_KIND_BLOCK,
     NODE_KIND_LET,
     NODE_KIND_IF,
+    NODE_KIND_ASM,
 } NodeKind;
 
 typedef enum {

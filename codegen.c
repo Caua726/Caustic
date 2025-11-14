@@ -463,6 +463,11 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
             emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
             break;
+        case IR_ASM:
+            if (inst->asm_str) {
+                fprintf(out, "  %s\n", inst->asm_str);
+            }
+            break;
 
         default:
             break;
