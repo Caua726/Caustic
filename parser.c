@@ -1,5 +1,6 @@
 #include "parser.h"
 #include "lexer.h"
+#include "semantic.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,36 +76,36 @@ static Type *parse_type() {
         exit(1);
     }
 
-    Type *ty = calloc(1, sizeof(Type));
+    Type *ty = NULL;
 
-    if (strcmp(current_token.text, "int") == 0 || strcmp(current_token.text, "i32") == 0) {
-        ty->kind = TY_I32;
+    if (strcmp(current_token.text, "i32") == 0) {
+        ty = type_i32;
     } else if (strcmp(current_token.text, "i8") == 0) {
-        ty->kind = TY_I8;
+        ty = type_i8;
     } else if (strcmp(current_token.text, "i16") == 0) {
-        ty->kind = TY_I16;
+        ty = type_i16;
     } else if (strcmp(current_token.text, "i64") == 0) {
-        ty->kind = TY_I64;
+        ty = type_i64;
     } else if (strcmp(current_token.text, "u8") == 0) {
-        ty->kind = TY_U8;
+        ty = type_u8;
     } else if (strcmp(current_token.text, "u16") == 0) {
-        ty->kind = TY_U16;
+        ty = type_u16;
     } else if (strcmp(current_token.text, "u32") == 0) {
-        ty->kind = TY_U32;
+        ty = type_u32;
     } else if (strcmp(current_token.text, "u64") == 0) {
-        ty->kind = TY_U64;
-    } else if (strcmp(current_token.text, "float") == 0 || strcmp(current_token.text, "f32") == 0) {
-        ty->kind = TY_F32;
+        ty = type_u64;
+    } else if (strcmp(current_token.text, "f32") == 0) {
+        ty = type_f32;
     } else if (strcmp(current_token.text, "f64") == 0) {
-        ty->kind = TY_F64;
+        ty = type_f64;
     } else if (strcmp(current_token.text, "bool") == 0) {
-        ty->kind = TY_BOOL;
+        ty = type_bool;
     } else if (strcmp(current_token.text, "char") == 0) {
-        ty->kind = TY_CHAR;
+        ty = type_char;
     } else if (strcmp(current_token.text, "string") == 0) {
-        ty->kind = TY_STRING;
+        ty = type_string;
     } else if (strcmp(current_token.text, "void") == 0) {
-        ty->kind = TY_VOID;
+        ty = type_void;
     } else {
         fprintf(stderr, "Erro: tipo desconhecido '%s'\n", current_token.text);
         exit(1);
@@ -169,6 +170,41 @@ static Node *parse_primary() {
         Node *node = new_node_num(current_token.int_value);
         consume();
         return node;
+    }
+
+    if (current_token.type == TOKEN_TYPE_LPAREN) {
+        Token paren_tok = current_token;
+        consume();
+
+        if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+            Token type_tok = current_token;
+            Type *maybe_type = NULL;
+
+            if (strcmp(type_tok.text, "i8") == 0) maybe_type = type_i8;
+            else if (strcmp(type_tok.text, "i16") == 0) maybe_type = type_i16;
+            else if (strcmp(type_tok.text, "i32") == 0) maybe_type = type_i32;
+            else if (strcmp(type_tok.text, "i64") == 0) maybe_type = type_i64;
+            else if (strcmp(type_tok.text, "u8") == 0) maybe_type = type_u8;
+            else if (strcmp(type_tok.text, "u16") == 0) maybe_type = type_u16;
+            else if (strcmp(type_tok.text, "u32") == 0) maybe_type = type_u32;
+            else if (strcmp(type_tok.text, "u64") == 0) maybe_type = type_u64;
+
+            if (maybe_type) {
+                consume();
+                if (current_token.type == TOKEN_TYPE_RPAREN) {
+                    consume();
+                    Node *expr = parse_primary();
+                    Node *cast_node = new_node(NODE_KIND_CAST);
+                    cast_node->expr = expr;
+                    cast_node->ty = maybe_type;
+                    return cast_node;
+                }
+            }
+        }
+
+        Node *expr = parse_expr();
+        expect(TOKEN_TYPE_RPAREN);
+        return expr;
     }
 
     if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
@@ -545,6 +581,37 @@ static void ast_print_recursive(Node *node, int depth) {
             for (int i = 0; i < depth + 1; i++) printf("  ");
             printf("Body:\n");
             ast_print_recursive(node->while_stmt.body, depth + 2);
+            break;
+        case NODE_KIND_EXPR_STMT:
+            printf("ExprStmt\n");
+            ast_print_recursive(node->expr, depth + 1);
+            break;
+        case NODE_KIND_ASSIGN:
+            printf("AssignStmt\n");
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("LHS:\n");
+            ast_print_recursive(node->lhs, depth + 2);
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("RHS:\n");
+            ast_print_recursive(node->rhs, depth + 2);
+            break;
+        case NODE_KIND_CAST:
+            printf("CastExpr(");
+            if (node->ty) {
+                switch (node->ty->kind) {
+                    case TY_I8: printf("i8"); break;
+                    case TY_I16: printf("i16"); break;
+                    case TY_I32: printf("i32"); break;
+                    case TY_I64: printf("i64"); break;
+                    case TY_U8: printf("u8"); break;
+                    case TY_U16: printf("u16"); break;
+                    case TY_U32: printf("u32"); break;
+                    case TY_U64: printf("u64"); break;
+                    default: printf("?"); break;
+                }
+            }
+            printf(")\n");
+            ast_print_recursive(node->expr, depth + 1);
             break;
         default:
             printf("Nó Desconhecido\n");

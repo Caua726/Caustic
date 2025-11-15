@@ -24,6 +24,7 @@ typedef enum {
     NODE_KIND_IF,
     NODE_KIND_ASM,
     NODE_KIND_WHILE,
+    NODE_KIND_CAST,
 } NodeKind;
 
 typedef enum {
@@ -85,6 +86,8 @@ typedef enum {
 
 typedef struct Type {
     TypeKind kind;
+    int size;
+    int is_signed;
 } Type;
 
 void ast_print(Node *node);
