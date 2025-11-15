@@ -305,6 +305,21 @@ static Node *parse_if_stmt() {
     return if_node;
 }
 
+// Em parser.c, adicione esta função no final
+
+static Node *parse_while_stmt() {
+    expect(TOKEN_TYPE_WHILE);
+    Node *node = new_node(NODE_KIND_WHILE);
+
+    expect(TOKEN_TYPE_LPAREN);
+    node->while_stmt.cond = parse_expr();
+    expect(TOKEN_TYPE_RPAREN);
+
+    node->while_stmt.body = parse_block();
+
+    return node;
+}
+
 static Node *parse_asm_stmt() {
     consume();
     expect(TOKEN_TYPE_LPAREN);
@@ -354,6 +369,24 @@ static Node *parse_stmt() {
     if (current_token.type == TOKEN_TYPE_ASM) {
         return parse_asm_stmt();
     }
+
+    if (current_token.type == TOKEN_TYPE_WHILE) {
+        return parse_while_stmt();
+    }
+    Node *node = parse_expr();
+    if (current_token.type == TOKEN_TYPE_EQUAL) {
+        consume();
+        Node *assign_node = new_node(NODE_KIND_ASSIGN);
+        assign_node->lhs = node;
+        assign_node->rhs = parse_expr();
+        expect(TOKEN_TYPE_SEMICOLON);
+        return assign_node;
+    }
+
+    expect(TOKEN_TYPE_SEMICOLON);
+    Node *expr_stmt_node = new_node(NODE_KIND_EXPR_STMT);
+    expr_stmt_node->expr = node;
+    return expr_stmt_node;
 
     fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
     exit(1);
@@ -503,6 +536,15 @@ static void ast_print_recursive(Node *node, int depth) {
             break;
         case NODE_KIND_ASM:
             printf("AsmStmt(\"%s\")\n", node->name ? node->name : "");
+            break;
+        case NODE_KIND_WHILE:
+            printf("WhileStmt\n");
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Cond:\n");
+            ast_print_recursive(node->while_stmt.cond, depth + 2);
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Body:\n");
+            ast_print_recursive(node->while_stmt.body, depth + 2);
             break;
         default:
             printf("Nó Desconhecido\n");
