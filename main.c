@@ -30,7 +30,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Se debug_lexer estiver ativo, mostrar tokens
+    types_init();
+
     if (debug_lexer) {
         FILE *file = fopen(filename, "r");
         if (!file) {

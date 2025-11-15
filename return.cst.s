@@ -9,12 +9,24 @@ main:
   push r13
   push r14
   push r15
-  mov rbx, 0
-  mov QWORD PTR [rbp-8], rbx
-.L0:
-  mov rbx, QWORD PTR [rbp-8]
-  mov rsi, 100
+  sub rsp, 304
+  mov rbx, 1
   mov r15, rbx
+  mov WORD PTR [rbp-2], r15w
+  mov rbx, 2
+  mov r15, rbx
+  mov WORD PTR [rbp-4], r15w
+  mov rbx, 4
+  mov r15, rbx
+  mov WORD PTR [rbp-6], r15w
+  mov rbx, 6
+  mov r15, rbx
+  mov WORD PTR [rbp-8], r15w
+.L0:
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-8], r15
+  mov rsi, 100
+  mov r15, QWORD PTR [rbp-8]
   mov r14, rsi
   xor rax, rax
   cmp r15, r14
@@ -23,15 +35,197 @@ main:
   mov r15, rdi
   test r15, r15
   jz .L1
-  mov r8, QWORD PTR [rbp-8]
-  mov r9, 10
-  mov r10, r8
-  add r10, r9
-  mov QWORD PTR [rbp-8], r10
+  movsx r8, WORD PTR [rbp-2]
+  mov r9, 1
+  mov r15, r8
+  mov r14, r9
+  add r15, r14
+  mov r10, r15
+  mov r15, r10
+  mov WORD PTR [rbp-2], r15w
+  movsx r11, WORD PTR [rbp-4]
+  movsx r12, WORD PTR [rbp-6]
+  mov r15, r11
+  mov r14, r12
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov r13, rax
+  mov r15, r13
+  test r15, r15
+  jz .L2
+  movsx r14, WORD PTR [rbp-6]
+  mov r15, 57
+  mov r15, r14
+  mov r14, r15
+  add r15, r14
+  mov QWORD PTR [rbp-16], r15
+  mov r15, QWORD PTR [rbp-16]
+  mov WORD PTR [rbp-6], r15w
+  jmp .L3
+.L2:
+.L3:
+  movsx r15, WORD PTR [rbp-6]
+  mov QWORD PTR [rbp-24], r15
+  mov r15, 4
+  mov QWORD PTR [rbp-32], r15
+  mov r15, QWORD PTR [rbp-24]
+  mov r14, QWORD PTR [rbp-32]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-40], rax
+  mov r15, QWORD PTR [rbp-40]
+  test r15, r15
+  jz .L4
+  movsx r15, WORD PTR [rbp-4]
+  mov QWORD PTR [rbp-48], r15
+  mov r15, 25
+  mov QWORD PTR [rbp-56], r15
+  mov r15, QWORD PTR [rbp-48]
+  mov r14, QWORD PTR [rbp-56]
+  add r15, r14
+  mov QWORD PTR [rbp-64], r15
+  mov r15, QWORD PTR [rbp-64]
+  mov WORD PTR [rbp-4], r15w
+  jmp .L5
+.L4:
+.L5:
+  movsx r15, WORD PTR [rbp-4]
+  mov QWORD PTR [rbp-72], r15
+  movsx r15, WORD PTR [rbp-6]
+  mov QWORD PTR [rbp-80], r15
+  mov r15, QWORD PTR [rbp-72]
+  mov r14, QWORD PTR [rbp-80]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-88], rax
+  mov r15, QWORD PTR [rbp-88]
+  test r15, r15
+  jz .L6
+  movsx r15, WORD PTR [rbp-8]
+  mov QWORD PTR [rbp-96], r15
+  mov r15, 15
+  mov QWORD PTR [rbp-104], r15
+  mov r15, QWORD PTR [rbp-96]
+  mov r14, QWORD PTR [rbp-104]
+  add r15, r14
+  mov QWORD PTR [rbp-112], r15
+  mov r15, QWORD PTR [rbp-112]
+  mov WORD PTR [rbp-8], r15w
+  jmp .L7
+.L6:
+.L7:
+  movsx r15, WORD PTR [rbp-4]
+  mov QWORD PTR [rbp-120], r15
+  movsx r15, WORD PTR [rbp-6]
+  mov QWORD PTR [rbp-128], r15
+  mov r15, QWORD PTR [rbp-120]
+  mov r14, QWORD PTR [rbp-128]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-136], rax
+  mov r15, QWORD PTR [rbp-136]
+  test r15, r15
+  jz .L8
+  movsx r15, WORD PTR [rbp-8]
+  mov QWORD PTR [rbp-144], r15
+  mov r15, 15
+  mov QWORD PTR [rbp-152], r15
+  mov r15, QWORD PTR [rbp-144]
+  mov r14, QWORD PTR [rbp-152]
+  add r15, r14
+  mov QWORD PTR [rbp-160], r15
+  mov r15, QWORD PTR [rbp-160]
+  mov WORD PTR [rbp-8], r15w
+  jmp .L9
+.L8:
+.L9:
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-168], r15
+  mov r15, 5
+  mov QWORD PTR [rbp-176], r15
+  mov r15, QWORD PTR [rbp-168]
+  mov r14, QWORD PTR [rbp-176]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-184], rax
+  mov r15, QWORD PTR [rbp-184]
+  test r15, r15
+  jz .L10
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-192], r15
+  mov r15, 55
+  mov QWORD PTR [rbp-200], r15
+  mov r15, QWORD PTR [rbp-192]
+  mov r14, QWORD PTR [rbp-200]
+  add r15, r14
+  mov QWORD PTR [rbp-208], r15
+  mov r15, QWORD PTR [rbp-208]
+  mov WORD PTR [rbp-2], r15w
+  jmp .L11
+.L10:
+.L11:
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-216], r15
+  mov r15, 10
+  mov QWORD PTR [rbp-224], r15
+  mov r15, QWORD PTR [rbp-216]
+  mov r14, QWORD PTR [rbp-224]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-232], rax
+  mov r15, QWORD PTR [rbp-232]
+  test r15, r15
+  jz .L12
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-240], r15
+  mov r15, 10
+  mov QWORD PTR [rbp-248], r15
+  mov r15, QWORD PTR [rbp-240]
+  mov r14, QWORD PTR [rbp-248]
+  add r15, r14
+  mov QWORD PTR [rbp-256], r15
+  mov r15, QWORD PTR [rbp-256]
+  mov WORD PTR [rbp-2], r15w
+  jmp .L13
+.L12:
+.L13:
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-264], r15
+  mov r15, 15
+  mov QWORD PTR [rbp-272], r15
+  mov r15, QWORD PTR [rbp-264]
+  mov r14, QWORD PTR [rbp-272]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-280], rax
+  mov r15, QWORD PTR [rbp-280]
+  test r15, r15
+  jz .L14
+  movsx r15, WORD PTR [rbp-2]
+  mov QWORD PTR [rbp-288], r15
+  mov r15, 15
+  mov QWORD PTR [rbp-296], r15
+  mov r15, QWORD PTR [rbp-288]
+  mov r14, QWORD PTR [rbp-296]
+  add r15, r14
+  mov rbx, r15
+  mov r15, rbx
+  mov WORD PTR [rbp-2], r15w
+  jmp .L15
+.L14:
+.L15:
   jmp .L0
 .L1:
-  mov rbx, QWORD PTR [rbp-8]
+  movsx rbx, WORD PTR [rbp-2]
   mov rax, rbx
+  add rsp, 304
   pop r15
   pop r14
   pop r13

@@ -27,6 +27,7 @@ typedef enum {
     IR_ADDR,
     IR_PHI,
     IR_ASM,
+    IR_CAST,
 } IROp;
 
 typedef enum {
@@ -56,6 +57,7 @@ typedef struct IRInst {
     unsigned long live_in;
     unsigned long live_out;
     char *asm_str;
+    Type *cast_to_type;
 } IRInst;
 
 typedef struct IRFunction {
@@ -106,7 +108,7 @@ static const char *IR_OP_NAMES[] = {
     "JMP", "JZ", "JNZ", "LABEL",
     "CALL", "RET",
     "LOAD", "STORE", "ADDR",
-    "PHI", "ASM",
+    "PHI", "ASM", "CAST",
 };
 
 IRProgram *gen_ir(Node *ast);

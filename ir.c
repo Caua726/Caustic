@@ -69,6 +69,17 @@ static int emit_unary(IROp op, int src_reg, int line) {
     return dest;
 }
 
+static int emit_cast(int src_reg, Type *to_type, int line) {
+    int dest = new_vreg();
+    IRInst *inst = new_inst(IR_CAST);
+    inst->dest = op_vreg(dest);
+    inst->src1 = op_vreg(src_reg);
+    inst->cast_to_type = to_type;
+    inst->line = line;
+    emit(inst);
+    return dest;
+}
+
 static void emit_return(int src_reg, int line) {
     IRInst *inst = new_inst(IR_RET);
     inst->src1 = op_vreg(src_reg);
@@ -91,66 +102,132 @@ static int gen_expr(Node *node) {
         case NODE_KIND_ADD: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_ADD, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_SUBTRACTION: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_SUB, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_MULTIPLIER: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_MUL, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_DIVIDER: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_MOD: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_MOD, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_EQ: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_EQ, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_NE: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_NE, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_LT: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_LT, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_LE: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_LE, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_GT: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_GT, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_GE: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
             return emit_binary(IR_GE, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
@@ -159,9 +236,15 @@ static int gen_expr(Node *node) {
             IRInst *inst = new_inst(IR_LOAD);
             inst->dest = op_vreg(dest);
             inst->src1 = op_imm(node->offset);
+            inst->cast_to_type = node->ty;
             inst->line = node->tok ? node->tok->line : 0;
             emit(inst);
             return dest;
+        }
+
+        case NODE_KIND_CAST: {
+            int src = gen_expr(node->expr);
+            return emit_cast(src, node->ty, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_ASSIGN:
@@ -206,6 +289,7 @@ static void gen_stmt_single(Node *node) {
                 IRInst *inst = new_inst(IR_STORE);
                 inst->dest = op_imm(node->offset);
                 inst->src1 = op_vreg(val_reg);
+                inst->cast_to_type = node->ty;
                 inst->line = node->tok ? node->tok->line : 0;
                 emit(inst);
             }
@@ -281,6 +365,7 @@ static void gen_stmt_single(Node *node) {
             IRInst *inst = new_inst(IR_STORE);
             inst->dest = op_imm(node->lhs->offset);
             inst->src1 = op_vreg(val_reg);
+            inst->cast_to_type = node->lhs->ty;
             inst->line = node->tok ? node->tok->line : 0;
             emit(inst);
             break;
@@ -446,6 +531,15 @@ void ir_print(IRProgram *prog) {
                     break;
                 case IR_ASM:
                     printf("\"%s\"", inst->asm_str ? inst->asm_str : "");
+                    break;
+
+                case IR_CAST:
+                    print_operand(inst->dest);
+                    printf(" = CAST ");
+                    print_operand(inst->src1);
+                    if (inst->cast_to_type) {
+                        printf(" to [size=%d]", inst->cast_to_type->size);
+                    }
                     break;
 
                 default:

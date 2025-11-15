@@ -457,21 +457,18 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
         case IR_RET:
             load_operand(inst->src1.vreg, ctx, "rax");
 
-            // Desfaz a alocação de stack para variáveis de spill
             int stack_size = ctx->stack_slots * 8;
             if (stack_size > 0) {
                 stack_size = (stack_size + 15) & ~15;
                 emit("add rsp, %d", stack_size);
             }
 
-            // Restaura os registradores na ordem INVERSA do push
             emit("pop r15");
             emit("pop r14");
             emit("pop r13");
             emit("pop r12");
             emit("pop rbx");
 
-            // Restaura o base pointer e retorna
             emit("pop rbp");
             emit("ret");
             break;
@@ -552,16 +549,235 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 
         case IR_LOAD:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+            if (inst->cast_to_type) {
+                int size = inst->cast_to_type->size;
+
+                // Se o destino é memória, precisamos usar registrador temporário
+                int dst_is_mem = (strstr(dst, "PTR") != NULL);
+                const char *target_reg = dst_is_mem ? "r15" : dst;
+
+                if (size == 8) {
+                    emit("mov %s, QWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                } else if (size == 4) {
+                    if (inst->cast_to_type->is_signed) {
+                        emit("movsxd %s, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    } else {
+                        emit("mov %sd, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    }
+                } else if (size == 2) {
+                    if (inst->cast_to_type->is_signed) {
+                        emit("movsx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    } else {
+                        emit("movzx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    }
+                } else if (size == 1) {
+                    if (inst->cast_to_type->is_signed) {
+                        emit("movsx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    } else {
+                        emit("movzx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    }
+                }
+
+                // Se destino era memória, mover do temporário para lá
+                if (dst_is_mem) {
+                    emit("mov %s, r15", dst);
+                }
+            } else {
+                emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+            }
             break;
 
         case IR_STORE:
             get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
-            emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+            if (inst->cast_to_type) {
+                int size = inst->cast_to_type->size;
+
+                // Sempre usar registrador temporário para source se for memória
+                int src_is_mem = (strstr(src1, "PTR") != NULL);
+                const char *source_reg = src1;
+
+                if (src_is_mem) {
+                    emit("mov r15, %s", src1);
+                    source_reg = "r15";
+                }
+
+                if (size == 8) {
+                    emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + size, source_reg);
+                } else if (size == 4) {
+                    char reg32[64];
+                    if (strcmp(source_reg, "rax") == 0) strcpy(reg32, "eax");
+                    else if (strcmp(source_reg, "rbx") == 0) strcpy(reg32, "ebx");
+                    else if (strcmp(source_reg, "rcx") == 0) strcpy(reg32, "ecx");
+                    else if (strcmp(source_reg, "rdx") == 0) strcpy(reg32, "edx");
+                    else if (strcmp(source_reg, "rsi") == 0) strcpy(reg32, "esi");
+                    else if (strcmp(source_reg, "rdi") == 0) strcpy(reg32, "edi");
+                    else if (strcmp(source_reg, "r8") == 0) strcpy(reg32, "r8d");
+                    else if (strcmp(source_reg, "r9") == 0) strcpy(reg32, "r9d");
+                    else if (strcmp(source_reg, "r10") == 0) strcpy(reg32, "r10d");
+                    else if (strcmp(source_reg, "r11") == 0) strcpy(reg32, "r11d");
+                    else if (strcmp(source_reg, "r12") == 0) strcpy(reg32, "r12d");
+                    else if (strcmp(source_reg, "r13") == 0) strcpy(reg32, "r13d");
+                    else if (strcmp(source_reg, "r14") == 0) strcpy(reg32, "r14d");
+                    else if (strcmp(source_reg, "r15") == 0) strcpy(reg32, "r15d");
+                    else strncpy(reg32, source_reg, sizeof(reg32) - 1);
+                    emit("mov DWORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg32);
+                } else if (size == 2) {
+                    char reg16[64];
+                    if (strcmp(source_reg, "rax") == 0) strcpy(reg16, "ax");
+                    else if (strcmp(source_reg, "rbx") == 0) strcpy(reg16, "bx");
+                    else if (strcmp(source_reg, "rcx") == 0) strcpy(reg16, "cx");
+                    else if (strcmp(source_reg, "rdx") == 0) strcpy(reg16, "dx");
+                    else if (strcmp(source_reg, "rsi") == 0) strcpy(reg16, "si");
+                    else if (strcmp(source_reg, "rdi") == 0) strcpy(reg16, "di");
+                    else if (strcmp(source_reg, "r8") == 0) strcpy(reg16, "r8w");
+                    else if (strcmp(source_reg, "r9") == 0) strcpy(reg16, "r9w");
+                    else if (strcmp(source_reg, "r10") == 0) strcpy(reg16, "r10w");
+                    else if (strcmp(source_reg, "r11") == 0) strcpy(reg16, "r11w");
+                    else if (strcmp(source_reg, "r12") == 0) strcpy(reg16, "r12w");
+                    else if (strcmp(source_reg, "r13") == 0) strcpy(reg16, "r13w");
+                    else if (strcmp(source_reg, "r14") == 0) strcpy(reg16, "r14w");
+                    else if (strcmp(source_reg, "r15") == 0) strcpy(reg16, "r15w");
+                    else strncpy(reg16, source_reg, sizeof(reg16) - 1);
+                    emit("mov WORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg16);
+                } else if (size == 1) {
+                    char reg8[64];
+                    if (strcmp(source_reg, "rax") == 0) strcpy(reg8, "al");
+                    else if (strcmp(source_reg, "rbx") == 0) strcpy(reg8, "bl");
+                    else if (strcmp(source_reg, "rcx") == 0) strcpy(reg8, "cl");
+                    else if (strcmp(source_reg, "rdx") == 0) strcpy(reg8, "dl");
+                    else if (strcmp(source_reg, "rsi") == 0) strcpy(reg8, "sil");
+                    else if (strcmp(source_reg, "rdi") == 0) strcpy(reg8, "dil");
+                    else if (strcmp(source_reg, "r8") == 0) strcpy(reg8, "r8b");
+                    else if (strcmp(source_reg, "r9") == 0) strcpy(reg8, "r9b");
+                    else if (strcmp(source_reg, "r10") == 0) strcpy(reg8, "r10b");
+                    else if (strcmp(source_reg, "r11") == 0) strcpy(reg8, "r11b");
+                    else if (strcmp(source_reg, "r12") == 0) strcpy(reg8, "r12b");
+                    else if (strcmp(source_reg, "r13") == 0) strcpy(reg8, "r13b");
+                    else if (strcmp(source_reg, "r14") == 0) strcpy(reg8, "r14b");
+                    else if (strcmp(source_reg, "r15") == 0) strcpy(reg8, "r15b");
+                    else strncpy(reg8, source_reg, sizeof(reg8) - 1);
+                    emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm + size, reg8);
+                }
+            } else {
+                emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+            }
             break;
+
         case IR_ASM:
             if (inst->asm_str) {
                 fprintf(out, "  %s\n", inst->asm_str);
+            }
+            break;
+
+        case IR_CAST:
+            get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+
+            if (!inst->cast_to_type) {
+                if (strcmp(dst, src1) != 0) {
+                    emit("mov %s, %s", dst, src1);
+                }
+                break;
+            }
+
+            int to_size = inst->cast_to_type->size;
+
+            // Verificar se source ou dest são memória
+            int src_is_mem = (strstr(src1, "PTR") != NULL);
+            int dst_is_mem = (strstr(dst, "PTR") != NULL);
+
+            const char *work_src = src1;
+            const char *work_dst = dst;
+
+            // Se source é memória, carregar em r14 primeiro
+            if (src_is_mem) {
+                emit("mov r14, %s", src1);
+                work_src = "r14";
+            }
+
+            // Se dest é memória, usar r15 como temporário
+            if (dst_is_mem) {
+                work_dst = "r15";
+            }
+
+            if (to_size == 8) {
+                if (strcmp(work_dst, work_src) != 0) {
+                    emit("mov %s, %s", work_dst, work_src);
+                }
+            } else if (to_size == 4) {
+                char src_32[64];
+                if (strcmp(work_src, "rax") == 0) strcpy(src_32, "eax");
+                else if (strcmp(work_src, "rbx") == 0) strcpy(src_32, "ebx");
+                else if (strcmp(work_src, "rcx") == 0) strcpy(src_32, "ecx");
+                else if (strcmp(work_src, "rdx") == 0) strcpy(src_32, "edx");
+                else if (strcmp(work_src, "rsi") == 0) strcpy(src_32, "esi");
+                else if (strcmp(work_src, "rdi") == 0) strcpy(src_32, "edi");
+                else if (strcmp(work_src, "r8") == 0) strcpy(src_32, "r8d");
+                else if (strcmp(work_src, "r9") == 0) strcpy(src_32, "r9d");
+                else if (strcmp(work_src, "r10") == 0) strcpy(src_32, "r10d");
+                else if (strcmp(work_src, "r11") == 0) strcpy(src_32, "r11d");
+                else if (strcmp(work_src, "r12") == 0) strcpy(src_32, "r12d");
+                else if (strcmp(work_src, "r13") == 0) strcpy(src_32, "r13d");
+                else if (strcmp(work_src, "r14") == 0) strcpy(src_32, "r14d");
+                else if (strcmp(work_src, "r15") == 0) strcpy(src_32, "r15d");
+                else strncpy(src_32, work_src, sizeof(src_32) - 1);
+
+                if (inst->cast_to_type->is_signed) {
+                    emit("movsxd %s, %s", work_dst, src_32);
+                } else {
+                    emit("mov %s, %s", work_dst, src_32);
+                }
+            } else if (to_size == 2) {
+                char src_16[64];
+                if (strcmp(work_src, "rax") == 0) strcpy(src_16, "ax");
+                else if (strcmp(work_src, "rbx") == 0) strcpy(src_16, "bx");
+                else if (strcmp(work_src, "rcx") == 0) strcpy(src_16, "cx");
+                else if (strcmp(work_src, "rdx") == 0) strcpy(src_16, "dx");
+                else if (strcmp(work_src, "rsi") == 0) strcpy(src_16, "si");
+                else if (strcmp(work_src, "rdi") == 0) strcpy(src_16, "di");
+                else if (strcmp(work_src, "r8") == 0) strcpy(src_16, "r8w");
+                else if (strcmp(work_src, "r9") == 0) strcpy(src_16, "r9w");
+                else if (strcmp(work_src, "r10") == 0) strcpy(src_16, "r10w");
+                else if (strcmp(work_src, "r11") == 0) strcpy(src_16, "r11w");
+                else if (strcmp(work_src, "r12") == 0) strcpy(src_16, "r12w");
+                else if (strcmp(work_src, "r13") == 0) strcpy(src_16, "r13w");
+                else if (strcmp(work_src, "r14") == 0) strcpy(src_16, "r14w");
+                else if (strcmp(work_src, "r15") == 0) strcpy(src_16, "r15w");
+                else strncpy(src_16, work_src, sizeof(src_16) - 1);
+
+                if (inst->cast_to_type->is_signed) {
+                    emit("movsx %s, %s", work_dst, src_16);
+                } else {
+                    emit("movzx %s, %s", work_dst, src_16);
+                }
+            } else if (to_size == 1) {
+                char src_8[64];
+                if (strcmp(work_src, "rax") == 0) strcpy(src_8, "al");
+                else if (strcmp(work_src, "rbx") == 0) strcpy(src_8, "bl");
+                else if (strcmp(work_src, "rcx") == 0) strcpy(src_8, "cl");
+                else if (strcmp(work_src, "rdx") == 0) strcpy(src_8, "dl");
+                else if (strcmp(work_src, "rsi") == 0) strcpy(src_8, "sil");
+                else if (strcmp(work_src, "rdi") == 0) strcpy(src_8, "dil");
+                else if (strcmp(work_src, "r8") == 0) strcpy(src_8, "r8b");
+                else if (strcmp(work_src, "r9") == 0) strcpy(src_8, "r9b");
+                else if (strcmp(work_src, "r10") == 0) strcpy(src_8, "r10b");
+                else if (strcmp(work_src, "r11") == 0) strcpy(src_8, "r11b");
+                else if (strcmp(work_src, "r12") == 0) strcpy(src_8, "r12b");
+                else if (strcmp(work_src, "r13") == 0) strcpy(src_8, "r13b");
+                else if (strcmp(work_src, "r14") == 0) strcpy(src_8, "r14b");
+                else if (strcmp(work_src, "r15") == 0) strcpy(src_8, "r15b");
+                else strncpy(src_8, work_src, sizeof(src_8) - 1);
+
+                if (inst->cast_to_type->is_signed) {
+                    emit("movsx %s, %s", work_dst, src_8);
+                } else {
+                    emit("movzx %s, %s", work_dst, src_8);
+                }
+            }
+
+            // Se destino era memória, copiar do temporário
+            if (dst_is_mem) {
+                emit("mov %s, r15", dst);
             }
             break;
 
