@@ -332,59 +332,10 @@ static void store_operand(int vreg, AllocCtx *ctx, const char *source) {
 }
 
 static void gen_binary_op(IRInst *inst, AllocCtx *ctx, const char *op) {
-    char dst[64], src1[64], src2[64];
-    get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-    get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
-    get_operand_loc(inst->src2.vreg, ctx, src2, sizeof(src2));
-
-    int dst_mem = is_mem(inst->dest.vreg, ctx);
-    int src1_mem = is_mem(inst->src1.vreg, ctx);
-    int src2_mem = is_mem(inst->src2.vreg, ctx);
-
-    if (strcmp(dst, src1) == 0) {
-        if (src2_mem) {
-            emit("mov r15, %s", src2);
-            emit("%s %s, r15", op, dst);
-        } else {
-            emit("%s %s, %s", op, dst, src2);
-        }
-    } else {
-        if (dst_mem) {
-            if (src1_mem) {
-                emit("mov r15, %s", src1);
-                if (src2_mem) {
-                    emit("mov r14, %s", src2);
-                    emit("%s r15, r14", op);
-                } else {
-                    emit("%s r15, %s", op, src2);
-                }
-                emit("mov %s, r15", dst);
-            } else {
-                emit("mov r15, %s", src1);
-                if (src2_mem) {
-                    emit("mov r14, %s", src2);
-                    emit("%s r15, r14", op);
-                } else {
-                    emit("%s r15, %s", op, src2);
-                }
-                emit("mov %s, r15", dst);
-            }
-        } else {
-            if (src1_mem) {
-                emit("mov %s, %s", dst, src1);
-            } else {
-                if (strcmp(dst, src1) != 0) {
-                    emit("mov %s, %s", dst, src1);
-                }
-            }
-            if (src2_mem) {
-                emit("mov r15, %s", src2);
-                emit("%s %s, r15", op, dst);
-            } else {
-                emit("%s %s, %s", op, dst, src2);
-            }
-        }
-    }
+    load_operand(inst->src1.vreg, ctx, "r15");
+    load_operand(inst->src2.vreg, ctx, "r14");
+    emit("%s r15, r14", op);
+    store_operand(inst->dest.vreg, ctx, "r15");
 }
 
 static void gen_inst(IRInst *inst, AllocCtx *ctx) {
