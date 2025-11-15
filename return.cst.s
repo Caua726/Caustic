@@ -11,22 +11,17 @@ main:
   push r15
   sub rsp, 304
   mov rbx, 1
-  mov r15, rbx
-  mov WORD PTR [rbp-2], r15w
+  mov WORD PTR [rbp-2], bx
   mov rbx, 2
-  mov r15, rbx
-  mov WORD PTR [rbp-4], r15w
+  mov WORD PTR [rbp-4], bx
   mov rbx, 4
-  mov r15, rbx
-  mov WORD PTR [rbp-6], r15w
+  mov WORD PTR [rbp-6], bx
   mov rbx, 6
-  mov r15, rbx
-  mov WORD PTR [rbp-8], r15w
+  mov WORD PTR [rbp-8], bx
 .L0:
-  movsx r15, WORD PTR [rbp-2]
-  mov QWORD PTR [rbp-8], r15
+  movsx rax, WORD PTR [rbp-2]
   mov rsi, 100
-  mov r15, QWORD PTR [rbp-8]
+  mov r15, rax
   mov r14, rsi
   xor rax, rax
   cmp r15, r14
@@ -41,8 +36,7 @@ main:
   mov r14, r9
   add r15, r14
   mov r10, r15
-  mov r15, r10
-  mov WORD PTR [rbp-2], r15w
+  mov WORD PTR [rbp-2], r10w
   movsx r11, WORD PTR [rbp-4]
   movsx r12, WORD PTR [rbp-6]
   mov r15, r11
@@ -67,8 +61,7 @@ main:
 .L3:
   movsx r15, WORD PTR [rbp-6]
   mov QWORD PTR [rbp-24], r15
-  mov r15, 4
-  mov QWORD PTR [rbp-32], r15
+  mov QWORD PTR [rbp-32], 4
   mov r15, QWORD PTR [rbp-24]
   mov r14, QWORD PTR [rbp-32]
   xor rax, rax
@@ -80,8 +73,7 @@ main:
   jz .L4
   movsx r15, WORD PTR [rbp-4]
   mov QWORD PTR [rbp-48], r15
-  mov r15, 25
-  mov QWORD PTR [rbp-56], r15
+  mov QWORD PTR [rbp-56], 25
   mov r15, QWORD PTR [rbp-48]
   mov r14, QWORD PTR [rbp-56]
   add r15, r14
@@ -106,8 +98,7 @@ main:
   jz .L6
   movsx r15, WORD PTR [rbp-8]
   mov QWORD PTR [rbp-96], r15
-  mov r15, 15
-  mov QWORD PTR [rbp-104], r15
+  mov QWORD PTR [rbp-104], 15
   mov r15, QWORD PTR [rbp-96]
   mov r14, QWORD PTR [rbp-104]
   add r15, r14
@@ -132,8 +123,7 @@ main:
   jz .L8
   movsx r15, WORD PTR [rbp-8]
   mov QWORD PTR [rbp-144], r15
-  mov r15, 15
-  mov QWORD PTR [rbp-152], r15
+  mov QWORD PTR [rbp-152], 15
   mov r15, QWORD PTR [rbp-144]
   mov r14, QWORD PTR [rbp-152]
   add r15, r14
@@ -145,8 +135,7 @@ main:
 .L9:
   movsx r15, WORD PTR [rbp-2]
   mov QWORD PTR [rbp-168], r15
-  mov r15, 5
-  mov QWORD PTR [rbp-176], r15
+  mov QWORD PTR [rbp-176], 5
   mov r15, QWORD PTR [rbp-168]
   mov r14, QWORD PTR [rbp-176]
   xor rax, rax
@@ -158,8 +147,7 @@ main:
   jz .L10
   movsx r15, WORD PTR [rbp-2]
   mov QWORD PTR [rbp-192], r15
-  mov r15, 55
-  mov QWORD PTR [rbp-200], r15
+  mov QWORD PTR [rbp-200], 55
   mov r15, QWORD PTR [rbp-192]
   mov r14, QWORD PTR [rbp-200]
   add r15, r14
@@ -171,8 +159,7 @@ main:
 .L11:
   movsx r15, WORD PTR [rbp-2]
   mov QWORD PTR [rbp-216], r15
-  mov r15, 10
-  mov QWORD PTR [rbp-224], r15
+  mov QWORD PTR [rbp-224], 10
   mov r15, QWORD PTR [rbp-216]
   mov r14, QWORD PTR [rbp-224]
   xor rax, rax
@@ -184,8 +171,7 @@ main:
   jz .L12
   movsx r15, WORD PTR [rbp-2]
   mov QWORD PTR [rbp-240], r15
-  mov r15, 10
-  mov QWORD PTR [rbp-248], r15
+  mov QWORD PTR [rbp-248], 10
   mov r15, QWORD PTR [rbp-240]
   mov r14, QWORD PTR [rbp-248]
   add r15, r14
@@ -197,8 +183,7 @@ main:
 .L13:
   movsx r15, WORD PTR [rbp-2]
   mov QWORD PTR [rbp-264], r15
-  mov r15, 15
-  mov QWORD PTR [rbp-272], r15
+  mov QWORD PTR [rbp-272], 15
   mov r15, QWORD PTR [rbp-264]
   mov r14, QWORD PTR [rbp-272]
   xor rax, rax
@@ -210,14 +195,12 @@ main:
   jz .L14
   movsx r15, WORD PTR [rbp-2]
   mov QWORD PTR [rbp-288], r15
-  mov r15, 15
-  mov QWORD PTR [rbp-296], r15
+  mov QWORD PTR [rbp-296], 15
   mov r15, QWORD PTR [rbp-288]
   mov r14, QWORD PTR [rbp-296]
   add r15, r14
   mov rbx, r15
-  mov r15, rbx
-  mov WORD PTR [rbp-2], r15w
+  mov WORD PTR [rbp-2], bx
   jmp .L15
 .L14:
 .L15:
