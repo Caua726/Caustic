@@ -58,6 +58,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "if") == 0) {t.type = TOKEN_TYPE_IF;}
         else if (strcmp(t.text, "else") == 0) {t.type = TOKEN_TYPE_ELSE;}
         else if (strcmp(t.text, "asm") == 0) {t.type = TOKEN_TYPE_ASM;}
+        else if (strcmp(t.text, "while") == 0) {t.type = TOKEN_TYPE_WHILE;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;

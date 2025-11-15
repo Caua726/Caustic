@@ -162,6 +162,39 @@ static void walk(Node *node) {
             if (node->if_stmt.else_b) {
                 walk(node->if_stmt.else_b);
             }
+        }
+        case NODE_KIND_WHILE: {
+            walk(node->while_stmt.cond);
+            TypeKind tk = node->while_stmt.cond->ty->kind;
+            if (tk != TY_I8 && tk != TY_I16 && tk != TY_I32 && tk != TY_I64 &&
+                tk != TY_U8 && tk != TY_U16 && tk != TY_U32 && tk != TY_U64 &&
+                tk != TY_BOOL && tk != TY_INT) {
+                fprintf(stderr, "Erro: condição do while deve ser um booleano ou inteiro.\n");
+                exit(1);
+            }
+            walk(node->while_stmt.body);
+            return;
+        }
+        case NODE_KIND_ASSIGN: {
+            walk(node->lhs);
+            walk(node->rhs);
+
+            if (node->lhs->kind != NODE_KIND_IDENTIFIER) {
+                fprintf(stderr, "Erro: alvo da atribuição inválido.\n");
+                exit(1);
+            }
+
+            Variable *var = node->lhs->var;
+            if (!(var->flags & VAR_FLAG_MUT)) {
+                fprintf(stderr, "Erro: não é possível atribuir à variável imutável '%s'.\n", var->name);
+                exit(1);
+            }
+
+            if (node->lhs->ty->kind != node->rhs->ty->kind) {
+                fprintf(stderr, "Erro: tipos incompatíveis na atribuição.\n");
+                exit(1);
+            }
+            node->ty = node->lhs->ty;
             return;
         }
     }

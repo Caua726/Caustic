@@ -1,4 +1,5 @@
 #include "ir.h"
+#include "parser.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -247,6 +248,44 @@ static void gen_stmt_single(Node *node) {
             inst->line = node->tok ? node->tok->line : 0;
             emit(inst);
             break;
+        case NODE_KIND_WHILE: {
+            int start_label = new_label();
+            int end_label = new_label();
+
+            IRInst *start_lbl = new_inst(IR_LABEL);
+            start_lbl->dest = op_label(start_label);
+            emit(start_lbl);
+
+            int cond_reg = gen_expr(node->while_stmt.cond);
+
+            IRInst *jz = new_inst(IR_JZ);
+            jz->src1 = op_vreg(cond_reg);
+            jz->dest = op_label(end_label);
+            jz->line = node->tok ? node->tok->line : 0;
+            emit(jz);
+
+            gen_stmt_single(node->while_stmt.body);
+
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(start_label);
+            jmp->line = node->tok ? node->tok->line : 0;
+            emit(jmp);
+
+            IRInst *end_lbl = new_inst(IR_LABEL);
+            end_lbl->dest = op_label(end_label);
+            emit(end_lbl);
+            break;
+        }
+        case NODE_KIND_ASSIGN: {
+            int val_reg = gen_expr(node->rhs);
+            IRInst *inst = new_inst(IR_STORE);
+            inst->dest = op_imm(node->lhs->offset);
+            inst->src1 = op_vreg(val_reg);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            break;
+        }
+
         default:
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
             exit(1);

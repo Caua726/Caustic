@@ -23,6 +23,7 @@ typedef enum {
     NODE_KIND_LET,
     NODE_KIND_IF,
     NODE_KIND_ASM,
+    NODE_KIND_WHILE,
 } NodeKind;
 
 typedef enum {
@@ -56,6 +57,10 @@ typedef struct Node {
         struct Node *then_b;
         struct Node *else_b;
     } if_stmt;
+    struct {
+        struct Node *cond;
+        struct Node *body;
+    } while_stmt;
 } Node;
 
 typedef enum {
