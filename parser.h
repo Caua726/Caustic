@@ -2,6 +2,32 @@
 #include "lexer.h"
 
 typedef enum {
+    TY_INT,
+    TY_I8,
+    TY_I16,
+    TY_I32,
+    TY_I64,
+    TY_U8,
+    TY_U16,
+    TY_U32,
+    TY_U64,
+    TY_FLOAT,
+    TY_F32,
+    TY_F64,
+    TY_BOOL,
+    TY_CHAR,
+    TY_STRING,
+    TY_VOID,
+    TY_PTR,
+} TypeKind;
+
+typedef struct Type {
+    TypeKind kind;
+    int size;
+    int is_signed;
+} Type;
+
+typedef enum {
     NODE_KIND_NUM,
     NODE_KIND_IDENTIFIER,
     NODE_KIND_ADD,
@@ -19,6 +45,7 @@ typedef enum {
     NODE_KIND_EXPR_STMT,
     NODE_KIND_RETURN,
     NODE_KIND_FN,
+    NODE_KIND_FNCALL,
     NODE_KIND_BLOCK,
     NODE_KIND_LET,
     NODE_KIND_IF,
@@ -47,6 +74,7 @@ typedef struct Node {
     struct Node *init_expr;
 
     char *name;
+    Type *return_type;
     VarFlags flags;
     struct Node *body;
     struct Node *stmts;
@@ -63,32 +91,6 @@ typedef struct Node {
         struct Node *body;
     } while_stmt;
 } Node;
-
-typedef enum {
-    TY_INT,
-    TY_I8,
-    TY_I16,
-    TY_I32,
-    TY_I64,
-    TY_U8,
-    TY_U16,
-    TY_U32,
-    TY_U64,
-    TY_FLOAT,
-    TY_F32,
-    TY_F64,
-    TY_BOOL,
-    TY_CHAR,
-    TY_STRING,
-    TY_VOID,
-    TY_PTR,
-} TypeKind;
-
-typedef struct Type {
-    TypeKind kind;
-    int size;
-    int is_signed;
-} Type;
 
 void ast_print(Node *node);
 void parser_init();

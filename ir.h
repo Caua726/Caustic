@@ -57,6 +57,7 @@ typedef struct IRInst {
     unsigned long live_in;
     unsigned long live_out;
     char *asm_str;
+    char *call_target_name;
     Type *cast_to_type;
 } IRInst;
 
@@ -108,7 +109,7 @@ static const char *IR_OP_NAMES[] = {
     "JMP", "JZ", "JNZ", "LABEL",
     "CALL", "RET",
     "LOAD", "STORE", "ADDR",
-    "PHI", "ASM", "CAST",
+    "PHI", "ASM", "CAST", "CALL",
 };
 
 IRProgram *gen_ir(Node *ast);

@@ -76,9 +76,14 @@ int main(int argc, char *argv[]) {
         analyze(ast);
         if (debug_parser) {
             printf("=== DEBUG PARSER - AST ===\n");
-            ast_print(ast);
-            printf("==========================\n\n");
+            int func_num = 0;
+            for (Node *fn = ast; fn; fn = fn->next) {
+                printf("\n--- Função #%d ---\n", ++func_num);
+                ast_print(fn);
+            }
+            printf("\n==========================\n\n");
         }
+        // NÃO chamar consume() aqui
 
         IRProgram *ir = gen_ir(ast);
         if (!ir) {

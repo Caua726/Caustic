@@ -80,6 +80,16 @@ static int emit_cast(int src_reg, Type *to_type, int line) {
     return dest;
 }
 
+static int emit_call(char *func_name, int line) {
+    int dest = new_vreg();
+    IRInst *inst = new_inst(IR_CALL);
+    inst->dest = op_vreg(dest);
+    inst->call_target_name = strdup(func_name);
+    inst->line = line;
+    emit(inst);
+    return dest;
+}
+
 static void emit_return(int src_reg, int line) {
     IRInst *inst = new_inst(IR_RET);
     inst->src1 = op_vreg(src_reg);
@@ -247,6 +257,11 @@ static int gen_expr(Node *node) {
             return emit_cast(src, node->ty, node->tok ? node->tok->line : 0);
         }
 
+        case NODE_KIND_FNCALL: {
+           // int src = gen_expr(node->expr);
+            return emit_call(node->name, node->tok ? node->tok->line : 0);
+        }
+
         case NODE_KIND_ASSIGN:
             fprintf(stderr, "Erro: atribuição ainda não implementada\n");
             exit(1);
@@ -378,32 +393,50 @@ static void gen_stmt_single(Node *node) {
 }
 
 IRProgram *gen_ir(Node *ast) {
-    memset(&ctx, 0, sizeof(ctx));
-
     IRProgram *prog = calloc(1, sizeof(IRProgram));
+    IRFunction **func_ptr = &prog->functions;
 
-    if (!ast || ast->kind != NODE_KIND_FN) {
-        fprintf(stderr, "Erro: AST deve ser uma função\n");
-        exit(1);
+    for (Node *fn_node = ast; fn_node; fn_node = fn_node->next) {
+        if (fn_node->kind != NODE_KIND_FN) {
+            fprintf(stderr, "Erro: AST deve ser uma lista de funções\n");
+            exit(1);
+        }
+
+        // Processar cada função com contexto limpo
+        ctx.inst_head = NULL;
+        ctx.inst_tail = NULL;
+        ctx.vreg_count = 0;
+        ctx.label_count = 0;
+
+        IRFunction *func = calloc(1, sizeof(IRFunction));
+        strcpy(func->name, fn_node->name);
+        ctx.current_func = func;
+
+        if (fn_node->body && fn_node->body->kind == NODE_KIND_BLOCK) {
+            gen_stmt(fn_node->body->stmts);
+        } else {
+            fprintf(stderr, "Erro: função '%s' deve ter um bloco\n", fn_node->name);
+            exit(1);
+        }
+
+        func->instructions = ctx.inst_head;
+        func->vreg_count = ctx.vreg_count;
+        func->label_count = ctx.label_count;
+
+        // Adicionar à lista de funções
+        *func_ptr = func;
+        func_ptr = &func->next;
+
+        // Identificar main
+        if (strcmp(fn_node->name, "main") == 0) {
+            prog->main_func = func;
+        }
     }
 
-    IRFunction *func = calloc(1, sizeof(IRFunction));
-    strcpy(func->name, ast->name);
-    ctx.current_func = func;
-
-    if (ast->body && ast->body->kind == NODE_KIND_BLOCK) {
-        gen_stmt(ast->body->stmts);
-    } else {
-        fprintf(stderr, "Erro: função deve ter um bloco\n");
+    if (!prog->main_func) {
+        fprintf(stderr, "Erro: função main não encontrada\n");
         exit(1);
     }
-
-    func->instructions = ctx.inst_head;
-    func->vreg_count = ctx.vreg_count;
-    func->label_count = ctx.label_count;
-
-    prog->functions = func;
-    prog->main_func = func;
 
     return prog;
 }
@@ -540,6 +573,11 @@ void ir_print(IRProgram *prog) {
                     if (inst->cast_to_type) {
                         printf(" to [size=%d]", inst->cast_to_type->size);
                     }
+                    break;
+
+                case IR_CALL:
+                    print_operand(inst->dest);
+                    printf(" = CALL %s", inst->call_target_name ? inst->call_target_name : "NULL");
                     break;
 
                 default:

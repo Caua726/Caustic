@@ -28,9 +28,28 @@ void parser_init() {
     lookahead_token = lexer_next();
     consume();
 }
-
 Node *parse() {
-    return parse_fn();
+    Node head = {};
+    Node *cur = &head;
+
+    // Parsear todas as funções até encontrar EOF
+    while (current_token.type != TOKEN_TYPE_EOF) {
+        if (current_token.type != TOKEN_TYPE_FN) {
+            fprintf(stderr, "Erro na linha %d: era esperado 'fn' mas encontrou '%s'\n",
+                    current_token.line, current_token.text);
+            exit(1);
+        }
+
+        cur->next = parse_fn();
+        if (!cur->next) {
+            fprintf(stderr, "Erro crítico: parse_fn() retornou NULL\n");
+            exit(1);
+        }
+        cur = cur->next;
+    }
+
+    // NÃO chamar consume() aqui - já estamos no EOF
+    return head.next;
 }
 
 static void consume() {
@@ -208,6 +227,15 @@ static Node *parse_primary() {
     }
 
     if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+        if (lookahead_token.type == TOKEN_TYPE_LPAREN) {
+            Node *node = new_node(NODE_KIND_FNCALL);
+            node->name = strdup(current_token.text);
+            consume();
+            expect(TOKEN_TYPE_LPAREN);
+            // Later i will add here arguments parsing
+            expect(TOKEN_TYPE_RPAREN);
+            return node;
+        }
         Node *node = new_node(NODE_KIND_IDENTIFIER);
         node->name = strdup(current_token.text);
         consume();
@@ -252,13 +280,13 @@ static Node *parse_fn() {
 
     if (current_token.type == TOKEN_TYPE_ARROW) {
         consume();
-        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-            fprintf(stderr, "Erro na linha %d: esperado tipo de retorno.\n", current_token.line);
-            exit(1);
-        }
-        consume(); // Consome o tipo de retorno
+        fn_node->return_type = parse_type();
+    } else {
+        fn_node->return_type = type_i32;
     }
     fn_node->body = parse_block();
+
+    // Após parse_block(), current_token deve estar no próximo 'fn' ou EOF
     return fn_node;
 }
 
@@ -612,6 +640,9 @@ static void ast_print_recursive(Node *node, int depth) {
             }
             printf(")\n");
             ast_print_recursive(node->expr, depth + 1);
+            break;
+        case NODE_KIND_FNCALL:
+            printf("FunctionCall(%s)\n", node->name);
             break;
         default:
             printf("Nó Desconhecido\n");
