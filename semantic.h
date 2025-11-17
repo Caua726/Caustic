@@ -25,5 +25,11 @@ extern Type *type_char;
 extern Type *type_string;
 extern Type *type_void;
 
+typedef struct Function {
+    char *name;
+    Type *return_type;
+    struct Function *next;
+} Function;
+
 void types_init();
 void analyze(Node *node);

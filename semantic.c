@@ -11,6 +11,7 @@ typedef struct Scope {
 
 static Scope *current_scope = NULL;
 static int stack_offset = 0;
+static Function *function_table = NULL;
 
 Type *type_int;
 Type *type_i8;
@@ -34,6 +35,29 @@ static Type *new_type_full(TypeKind kind, int size, int is_signed) {
     ty->size = size;
     ty->is_signed = is_signed;
     return ty;
+}
+
+static void declare_function(char *name, Type *return_type) {
+    for (Function *fs = function_table; fs; fs = fs->next) {
+        if (strcmp(fs->name, name) == 0) {
+            fprintf(stderr, "Erro: redefinição da função '%s'\n", name);
+            exit(1);
+        }
+    }
+    Function *fs = calloc(1, sizeof(Function));
+    fs->name = strdup(name);
+    fs->return_type = return_type;
+    fs->next = function_table;
+    function_table = fs;
+}
+
+static Function *lookup_function(char *name) {
+    for (Function *fs = function_table; fs; fs = fs->next) {
+        if (strcmp(fs->name, name) == 0) {
+            return fs;
+        }
+    }
+    return NULL;
 }
 
 void types_init() {
@@ -125,6 +149,14 @@ static Variable *symtab_lookup(char *name) {
         }
     }
     return NULL;
+}
+
+static void register_functions(Node *program_node) {
+    for (Node *node = program_node; node; node = node->next) {
+        if (node->kind == NODE_KIND_FN) {
+            declare_function(node->name, node->return_type);
+        }
+    }
 }
 
 static void walk(Node *node) {
@@ -318,10 +350,33 @@ static void walk(Node *node) {
         case NODE_KIND_CAST:
             walk(node->expr);
             return;
+
+        case NODE_KIND_FNCALL:
+            Function *fs = lookup_function(node->name);
+            if (!fs) {
+                fprintf(stderr, "Erro: chamada para função não definida '%s'\n", node->name);
+                exit(1);
+            }
+            node->ty = fs->return_type;
+            return;
     }
 }
 
 void analyze(Node *node) {
     symtab_init();
-    walk(node);
+    function_table = NULL;
+
+    // Primeiro passo: registrar todas as funções
+    for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
+        if (fn_node->kind == NODE_KIND_FN) {
+            declare_function(fn_node->name, fn_node->return_type);
+        }
+    }
+
+    // Segundo passo: analisar cada função
+    for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
+        if (fn_node->kind == NODE_KIND_FN) {
+            walk(fn_node);
+        }
+    }
 }

@@ -732,6 +732,15 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             }
             break;
 
+            case IR_CALL: // <-- ADICIONE ESTE CASE
+                // TODO: No futuro, aqui teremos que salvar os registradores "caller-saved".
+                emit("call %s", inst->call_target_name);
+
+                // O valor de retorno da função está em 'rax', pela convenção da ABI.
+                // Armazenamos o valor de 'rax' no local designado para o vreg de destino.
+                store_operand(inst->dest.vreg, ctx, "rax");
+                break;
+
         default:
             break;
     }
