@@ -123,6 +123,12 @@ Token lexer_next() {
             t.type = TOKEN_TYPE_SEMICOLON;
             next_char();
             return t;
+        case ',':
+            t.text[0] = ',';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_COMMA;
+            next_char();
+            return t;
         case ':':
             if (lookhead_char() == '=') {
                 strcpy(t.text, ":=");
