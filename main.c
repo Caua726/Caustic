@@ -108,6 +108,8 @@ int main(int argc, char *argv[]) {
         printf("Erro ao fazer parsing do arquivo.\n");
     }
 
+    if (ast) free_ast(ast);
+    semantic_cleanup();
     fclose(file);
     return 0;
 }

@@ -10,12 +10,12 @@ add:
   push r14
   push r15
   mov rbx, 1
-  mov rsi, 5
+  mov r12, 5
   mov r15, rbx
-  mov r14, rsi
+  mov r14, r12
   add r15, r14
-  mov rdi, r15
-  mov rax, rdi
+  mov r13, r15
+  mov rax, r13
   pop r15
   pop r14
   pop r13

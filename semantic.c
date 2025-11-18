@@ -108,6 +108,7 @@ static void symtab_exit_scope() {
     Variable *var = old_scope->vars;
     while (var) {
         Variable *next = var->next;
+        free(var->name);
         free(var);
         var = next;
     }
@@ -379,4 +380,33 @@ void analyze(Node *node) {
             walk(fn_node);
         }
     }
+}
+
+void semantic_cleanup() {
+    Function *fs = function_table;
+    while (fs) {
+        Function *next = fs->next;
+        free(fs->name);
+        free(fs);
+        fs = next;
+    }
+    function_table = NULL;
+    
+    // Limpar tipos se necessário (mas eles são globais/estáticos por enquanto, então talvez não precise)
+    // Se types_init alocasse dinamicamente cada vez, precisaria limpar.
+    // Como são alocados uma vez, o SO limpa no final. Mas para ser purista:
+    free(type_i8);
+    free(type_i16);
+    free(type_i32);
+    free(type_i64);
+    free(type_u8);
+    free(type_u16);
+    free(type_u32);
+    free(type_u64);
+    free(type_f32);
+    free(type_f64);
+    free(type_bool);
+    free(type_char);
+    free(type_string);
+    free(type_void);
 }

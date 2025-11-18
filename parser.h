@@ -93,5 +93,6 @@ typedef struct Node {
 } Node;
 
 void ast_print(Node *node);
+void free_ast(Node *node);
 void parser_init();
 Node *parse();

@@ -208,8 +208,9 @@ static void build_intervals(IRFunction *func, AllocCtx *ctx) {
 }
 
 static int find_free_reg(AllocCtx *ctx, int pos) {
-    for (int i = 3; i < num_regs; i++) {
-        if (i == rax_idx || i == rcx_idx || i == rdx_idx) continue;
+    int allowed[] = {3, 10, 11}; // rbx, r12, r13
+    for (int k = 0; k < 3; k++) {
+        int i = allowed[k];
         if (ctx->regs[i].vreg == -1) return i;
         if (ctx->regs[i].last_use < pos) return i;
     }
@@ -220,8 +221,9 @@ static int spill_register(AllocCtx *ctx, int pos) {
     int max_cost = -1;
     int victim = -1;
 
-    for (int i = 3; i < num_regs; i++) {
-        if (i == rax_idx || i == rcx_idx || i == rdx_idx) continue;
+    int allowed[] = {3, 10, 11}; // rbx, r12, r13
+    for (int k = 0; k < 3; k++) {
+        int i = allowed[k];
         if (ctx->regs[i].vreg != -1) {
             LiveInterval *iv = NULL;
             for (int j = 0; j < ctx->count; j++) {
