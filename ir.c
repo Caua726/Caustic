@@ -326,14 +326,14 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_IDENTIFIER: {
-            int dest = new_vreg();
+            int reg = new_vreg();
             IRInst *inst = new_inst(IR_LOAD);
-            inst->dest = op_vreg(dest);
+            inst->dest = op_vreg(reg);
             inst->src1 = op_imm(node->offset);
             inst->cast_to_type = node->ty;
             inst->line = node->tok ? node->tok->line : 0;
             emit(inst);
-            return dest;
+            return reg;
         }
 
         case NODE_KIND_CAST: {
@@ -385,6 +385,40 @@ static int gen_expr(Node *node) {
             }
 
             return ret_reg;
+        }
+
+        case NODE_KIND_SYSCALL: {
+            int arg_count = 0;
+            for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
+
+            if (arg_count > 7) { // ID + 6 args
+                fprintf(stderr, "Erro: syscall suporta maximo 7 argumentos (ID + 6 args)\n");
+                exit(1);
+            }
+
+            int args_vregs[7]; 
+            int count = 0;
+            
+            for (Node *arg = node->args; arg; arg = arg->next) {
+                args_vregs[count++] = gen_expr(arg);
+            }
+
+            // Emit IR_SET_SYS_ARG for each argument
+            for (int i = 0; i < count; i++) {
+                IRInst *arg = new_inst(IR_SET_SYS_ARG);
+                arg->dest = op_imm(i); // 0=RAX(ID), 1=RDI, etc.
+                arg->src1 = op_vreg(args_vregs[i]);
+                arg->line = node->tok ? node->tok->line : 0;
+                emit(arg);
+            }
+
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_SYSCALL);
+            inst->dest = op_vreg(dest);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            
+            return dest;
         }
 
         case NODE_KIND_ASSIGN:

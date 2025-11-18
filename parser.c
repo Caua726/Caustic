@@ -306,6 +306,36 @@ static Node *parse_primary() {
         return node;
     }
 
+    if (current_token.type == TOKEN_TYPE_SYSCALL) {
+        consume();
+        expect(TOKEN_TYPE_LPAREN);
+        
+        Node *node = new_node(NODE_KIND_SYSCALL);
+        node->ty = type_i64; // Syscalls return i64 (rax)
+
+        if (current_token.type == TOKEN_TYPE_RPAREN) {
+             fprintf(stderr, "Erro: syscall requer pelo menos o ID.\n");
+             exit(1);
+        }
+
+        Node head = {};
+        Node *cur = &head;
+        
+        while (current_token.type != TOKEN_TYPE_RPAREN) {
+            cur->next = parse_expr();
+            cur = cur->next;
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+        node->args = head.next;
+        
+        expect(TOKEN_TYPE_RPAREN);
+        return node;
+    }
+
     fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um numero ou identificador, mas encontrou '%s'\n", current_token.line, current_token.text);
     exit(1);
 }

@@ -29,6 +29,8 @@ typedef enum {
     IR_CAST,
     IR_GET_ARG,
     IR_SET_ARG,
+    IR_SET_SYS_ARG,
+    IR_SYSCALL,
     IR_ADDR, // Get address of variable
 } IROp;
 
@@ -111,7 +113,7 @@ static const char *IR_OP_NAMES[] = {
     "JMP", "JZ", "JNZ", "LABEL",
     "CALL", "RET",
     "LOAD", "STORE", "ADDR",
-    "PHI", "ASM", "CAST", "CALL",
+    "PHI", "ASM", "CAST", "CALL", "SET_SYS_ARG", "SYSCALL",
 };
 
 IRProgram *gen_ir(Node *ast);

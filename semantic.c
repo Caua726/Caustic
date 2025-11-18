@@ -91,7 +91,7 @@ static int is_safe_implicit_conversion(Type *from, Type *to) {
 
 static void symtab_init() {
     current_scope = NULL;
-    stack_offset = 0;
+    stack_offset = 48; // Reserve 48 bytes for saved registers (rbx, r12-r15) + alignment
 }
 
 static void symtab_enter_scope() {
@@ -445,6 +445,13 @@ static void walk(Node *node) {
                     exit(1);
                 }
                 arg = arg->next;
+            }
+            return;
+
+        case NODE_KIND_SYSCALL:
+            node->ty = type_i64; // Syscalls always return i64
+            for (Node *arg = node->args; arg; arg = arg->next) {
+                walk(arg);
             }
             return;
     }
