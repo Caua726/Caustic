@@ -653,3 +653,58 @@ static void ast_print_recursive(Node *node, int depth) {
 void ast_print(Node *node) {
     ast_print_recursive(node, 0);
 }
+
+void free_ast(Node *node) {
+    if (!node) return;
+
+    // Se for uma lista (next), liberar o próximo primeiro
+    free_ast(node->next);
+
+    if (node->name) free(node->name);
+    
+    // Liberar filhos baseados no tipo
+    switch (node->kind) {
+        case NODE_KIND_FN:
+            free_ast(node->body);
+            break;
+        case NODE_KIND_BLOCK:
+            free_ast(node->stmts);
+            break;
+        case NODE_KIND_RETURN:
+        case NODE_KIND_EXPR_STMT:
+        case NODE_KIND_CAST:
+            free_ast(node->expr);
+            break;
+        case NODE_KIND_LET:
+            free_ast(node->init_expr);
+            break;
+        case NODE_KIND_IF:
+            free_ast(node->if_stmt.cond);
+            free_ast(node->if_stmt.then_b);
+            free_ast(node->if_stmt.else_b);
+            break;
+        case NODE_KIND_WHILE:
+            free_ast(node->while_stmt.cond);
+            free_ast(node->while_stmt.body);
+            break;
+        case NODE_KIND_ASSIGN:
+        case NODE_KIND_ADD:
+        case NODE_KIND_SUBTRACTION:
+        case NODE_KIND_MULTIPLIER:
+        case NODE_KIND_DIVIDER:
+        case NODE_KIND_MOD:
+        case NODE_KIND_EQ:
+        case NODE_KIND_NE:
+        case NODE_KIND_LT:
+        case NODE_KIND_LE:
+        case NODE_KIND_GT:
+        case NODE_KIND_GE:
+            free_ast(node->lhs);
+            free_ast(node->rhs);
+            break;
+        default:
+            break;
+    }
+
+    free(node);
+}

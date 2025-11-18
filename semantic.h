@@ -33,3 +33,4 @@ typedef struct Function {
 
 void types_init();
 void analyze(Node *node);
+void semantic_cleanup();

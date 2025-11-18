@@ -449,6 +449,8 @@ void ir_free(IRProgram *prog) {
         IRInst *inst = func->instructions;
         while (inst) {
             IRInst *next = inst->next;
+            if (inst->asm_str) free(inst->asm_str);
+            if (inst->call_target_name) free(inst->call_target_name);
             free(inst);
             inst = next;
         }
