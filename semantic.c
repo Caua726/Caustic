@@ -30,8 +30,7 @@ Type *type_string;
 Type *type_void;
 
 static Type *new_type_full(TypeKind kind, int size, int is_signed) {
-    Type *ty = calloc(1, sizeof(Type));
-    ty->kind = kind;
+    Type *ty = new_type(kind);
     ty->size = size;
     ty->is_signed = is_signed;
     return ty;
@@ -329,20 +328,71 @@ static void walk(Node *node) {
             walk(node->while_stmt.body);
             return;
         }
+        case NODE_KIND_ADDR:
+            walk(node->expr);
+            if (node->expr->kind != NODE_KIND_IDENTIFIER && 
+                node->expr->kind != NODE_KIND_DEREF && 
+                node->expr->kind != NODE_KIND_INDEX) {
+                fprintf(stderr, "Erro: operador '&' requer um lvalue (variável, dereferência ou índice).\n");
+                exit(1);
+            }
+            // Create pointer type
+            Type *ptr_ty = new_type(TY_PTR);
+            ptr_ty->base = node->expr->ty;
+            ptr_ty->size = 8;
+            node->ty = ptr_ty;
+            return;
+
+        case NODE_KIND_DEREF:
+            walk(node->expr);
+            if (node->expr->ty->kind != TY_PTR) {
+                fprintf(stderr, "Erro: operador '*' requer um ponteiro.\n");
+                exit(1);
+            }
+            node->ty = node->expr->ty->base;
+            return;
+
+        case NODE_KIND_INDEX:
+            walk(node->lhs);
+            walk(node->rhs);
+
+            if (node->lhs->ty->kind != TY_ARRAY && node->lhs->ty->kind != TY_PTR) {
+                fprintf(stderr, "Erro: indexação requer array ou ponteiro.\n");
+                exit(1);
+            }
+
+            // Check index type (must be integer)
+            TypeKind idx_kind = node->rhs->ty->kind;
+            if (idx_kind != TY_I32 && idx_kind != TY_I64 && idx_kind != TY_U32 && idx_kind != TY_U64 && idx_kind != TY_INT) {
+                 fprintf(stderr, "Erro: índice deve ser um inteiro.\n");
+                 exit(1);
+            }
+
+            node->ty = node->lhs->ty->base;
+            return;
+
         case NODE_KIND_ASSIGN: {
             walk(node->lhs);
             walk(node->rhs);
 
-            if (node->lhs->kind != NODE_KIND_IDENTIFIER) {
-                fprintf(stderr, "Erro: alvo da atribuição inválido.\n");
+            // Check if LHS is a valid lvalue
+            if (node->lhs->kind != NODE_KIND_IDENTIFIER && 
+                node->lhs->kind != NODE_KIND_DEREF && 
+                node->lhs->kind != NODE_KIND_INDEX) {
+                fprintf(stderr, "Erro: alvo da atribuição inválido (deve ser variável, dereferência ou índice).\n");
                 exit(1);
             }
 
-            Variable *var = node->lhs->var;
-            if (!(var->flags & VAR_FLAG_MUT)) {
-                fprintf(stderr, "Erro: não é possível atribuir à variável imutável '%s'.\n", var->name);
-                exit(1);
+            if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                Variable *var = node->lhs->var;
+                if (!(var->flags & VAR_FLAG_MUT)) {
+                    fprintf(stderr, "Erro: não é possível atribuir à variável imutável '%s'.\n", var->name);
+                    exit(1);
+                }
             }
+            // Note: For DEREF and INDEX, we assume memory is mutable for now, 
+            // or we'd need to track mutability in the type system (e.g. *mut T vs *T).
+            // For now, let's allow it.
 
             int allow_literal_narrowing = 0;
             if (node->rhs->kind == NODE_KIND_NUM) {

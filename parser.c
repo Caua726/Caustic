@@ -52,6 +52,26 @@ Node *parse() {
     return head.next;
 }
 
+// Global list of allocated types for GC
+Type *all_types = NULL;
+
+Type *new_type(TypeKind kind) {
+    Type *ty = calloc(1, sizeof(Type));
+    ty->kind = kind;
+    ty->next = all_types;
+    all_types = ty;
+    return ty;
+}
+
+void free_all_types() {
+    Type *t = all_types;
+    while (t) {
+        Type *next = t->next;
+        free(t);
+        t = next;
+    }
+}
+
 static void consume() {
     current_token = lookahead_token;
     lookahead_token = lexer_next();
@@ -90,6 +110,34 @@ static Node *parse_expr() {
 }
 
 static Type *parse_type() {
+    // Array: [N]T
+    if (current_token.type == TOKEN_TYPE_LBRACKET) {
+        consume(); // [
+        if (current_token.type != TOKEN_TYPE_INTEGER) {
+            fprintf(stderr, "Erro na linha %d: Tamanho do array deve ser um inteiro.\n", current_token.line);
+            exit(1);
+        }
+        int len = current_token.int_value;
+        consume(); // N
+        expect(TOKEN_TYPE_RBRACKET);
+        Type *base_type = parse_type();
+        Type *ty = new_type(TY_ARRAY);
+        ty->base = base_type;
+        ty->array_len = len;
+        ty->size = len * base_type->size;
+        return ty;
+    }
+
+    // Pointer: *T
+    if (current_token.type == TOKEN_TYPE_MULTIPLIER) {
+        consume();
+        Type *base_type = parse_type();
+        Type *ty = new_type(TY_PTR);
+        ty->base = base_type;
+        ty->size = 8; // 64-bit pointer
+        return ty;
+    }
+
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
         fprintf(stderr, "Erro de sintaxe na linha %d: esperado um tipo\n", current_token.line);
         exit(1);
@@ -137,6 +185,11 @@ static Type *parse_type() {
 
 static Node* parse_var_decl() {
     expect(TOKEN_TYPE_LET);
+    expect(TOKEN_TYPE_IS); // Enforce 'is'
+
+    Type *var_type = parse_type();
+
+    expect(TOKEN_TYPE_AS);
 
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
         fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um nome de variável, mas encontrou '%s'\n", current_token.line, current_token.text);
@@ -144,10 +197,6 @@ static Node* parse_var_decl() {
     }
     char *var_name = strdup(current_token.text);
     consume();
-
-    expect(TOKEN_TYPE_AS);
-
-    Type *var_type = parse_type();
 
     VarFlags var_flags = VAR_FLAG_NONE;
     if (current_token.type == TOKEN_TYPE_WITH) {
@@ -334,27 +383,56 @@ static Node *parse_fn() {
         // Actually, let's stick to previous behavior of i32 default if omitted, or maybe void. 
         // The user example `fn main() as i32` suggests explicit typing. 
         // If omitted, let's assume void to be safe, or i32 if that's what we did.
-        // Previous code: `fn_node->return_type = type_i32;`
         fn_node->return_type = type_i32; 
     }
     fn_node->body = parse_block();
-
-    // Após parse_block(), current_token deve estar no próximo 'fn' ou EOF
     return fn_node;
 }
 
-static Node *parse_mul() {
+static Node *parse_postfix() {
     Node *node = parse_primary();
+
+    while (current_token.type == TOKEN_TYPE_LBRACKET) {
+        consume(); // [
+        Node *index = parse_expr();
+        expect(TOKEN_TYPE_RBRACKET); // ]
+        
+        Node *idx_node = new_node(NODE_KIND_INDEX);
+        idx_node->lhs = node; // Array/Pointer
+        idx_node->rhs = index; // Index
+        node = idx_node;
+    }
+    return node;
+}
+
+static Node *parse_unary() {
+    if (current_token.type == TOKEN_TYPE_AND) {
+        consume();
+        Node *node = new_node(NODE_KIND_ADDR);
+        node->expr = parse_unary();
+        return node;
+    }
+    if (current_token.type == TOKEN_TYPE_MULTIPLIER) {
+        consume();
+        Node *node = new_node(NODE_KIND_DEREF);
+        node->expr = parse_unary();
+        return node;
+    }
+    return parse_postfix();
+}
+
+static Node *parse_mul() {
+    Node *node = parse_unary();
     while (current_token.type == TOKEN_TYPE_MULTIPLIER || current_token.type == TOKEN_TYPE_DIVIDER || current_token.type == TOKEN_TYPE_MOD) {
         if (current_token.type == TOKEN_TYPE_MULTIPLIER) {
             consume();
-            node = new_binary_node(NODE_KIND_MULTIPLIER, node, parse_primary());
+            node = new_binary_node(NODE_KIND_MULTIPLIER, node, parse_unary());
         } else if (current_token.type == TOKEN_TYPE_DIVIDER) {
             consume();
-            node = new_binary_node(NODE_KIND_DIVIDER, node, parse_primary());
+            node = new_binary_node(NODE_KIND_DIVIDER, node, parse_unary());
         } else if (current_token.type == TOKEN_TYPE_MOD) {
             consume();
-            node = new_binary_node(NODE_KIND_MOD, node, parse_primary());
+            node = new_binary_node(NODE_KIND_MOD, node, parse_unary());
         }
     }
     return node;
@@ -555,6 +633,12 @@ static void ast_print_recursive(Node *node, int depth) {
                 switch (node->ty->kind) {
                     case TY_I32: printf("i32"); break;
                     case TY_I64: printf("i64"); break;
+                    case TY_ARRAY: 
+                        printf("Array(len=%d, size=%d)", node->ty->array_len, node->ty->size); 
+                        break;
+                    case TY_PTR: 
+                        printf("Pointer(size=%d)", node->ty->size); 
+                        break;
                     default: printf("?"); break;
                 }
             }
@@ -697,6 +781,19 @@ static void ast_print_recursive(Node *node, int depth) {
         case NODE_KIND_FNCALL:
             printf("FunctionCall(%s)\n", node->name);
             break;
+        case NODE_KIND_ADDR:
+            printf("AddrOf(&)\n");
+            ast_print_recursive(node->expr, depth + 1);
+            break;
+        case NODE_KIND_DEREF:
+            printf("Deref(*)\n");
+            ast_print_recursive(node->expr, depth + 1);
+            break;
+        case NODE_KIND_INDEX:
+            printf("Index([])\n");
+            ast_print_recursive(node->lhs, depth + 1);
+            ast_print_recursive(node->rhs, depth + 1);
+            break;
         default:
             printf("Nó Desconhecido\n");
             break;
@@ -727,6 +824,8 @@ void free_ast(Node *node) {
         case NODE_KIND_RETURN:
         case NODE_KIND_EXPR_STMT:
         case NODE_KIND_CAST:
+        case NODE_KIND_ADDR:
+        case NODE_KIND_DEREF:
             free_ast(node->expr);
             break;
         case NODE_KIND_FNCALL:
@@ -756,6 +855,7 @@ void free_ast(Node *node) {
         case NODE_KIND_LE:
         case NODE_KIND_GT:
         case NODE_KIND_GE:
+        case NODE_KIND_INDEX:
             free_ast(node->lhs);
             free_ast(node->rhs);
             break;

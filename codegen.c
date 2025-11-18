@@ -504,119 +504,198 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
+        case IR_ADDR:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            emit("lea %s, [rbp-%ld]", dst, inst->src1.imm);
+            break;
+
         case IR_LOAD:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            if (inst->cast_to_type) {
-                int size = inst->cast_to_type->size;
+            
+            // Check if source is a VREG (pointer/address) or IMM (stack offset)
+            if (inst->src1.type == OPERAND_VREG) {
+                load_operand(inst->src1.vreg, ctx, "r15"); // Load address into r15
+                
+                if (inst->cast_to_type) {
+                    int size = inst->cast_to_type->size;
+                    const char *target_reg = dst;
+                    // If dest is mem, use temp reg
+                    if (strstr(dst, "PTR") != NULL) target_reg = "rax";
 
-                // Se o destino é memória, precisamos usar registrador temporário
-                int dst_is_mem = (strstr(dst, "PTR") != NULL);
-                const char *target_reg = dst_is_mem ? "r15" : dst;
+                    if (size == 8) emit("mov %s, QWORD PTR [r15]", target_reg);
+                    else if (size == 4) {
+                        if (inst->cast_to_type->is_signed) emit("movsxd %s, DWORD PTR [r15]", target_reg);
+                        else emit("mov %sd, DWORD PTR [r15]", target_reg);
+                    }
+                    else if (size == 2) {
+                        if (inst->cast_to_type->is_signed) emit("movsx %s, WORD PTR [r15]", target_reg);
+                        else emit("movzx %s, WORD PTR [r15]", target_reg);
+                    }
+                    else if (size == 1) {
+                        if (inst->cast_to_type->is_signed) emit("movsx %s, BYTE PTR [r15]", target_reg);
+                        else emit("movzx %s, BYTE PTR [r15]", target_reg);
+                    }
 
-                if (size == 8) {
-                    emit("mov %s, QWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                } else if (size == 4) {
-                    if (inst->cast_to_type->is_signed) {
-                        emit("movsxd %s, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                    } else {
-                        emit("mov %sd, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                    }
-                } else if (size == 2) {
-                    if (inst->cast_to_type->is_signed) {
-                        emit("movsx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                    } else {
-                        emit("movzx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                    }
-                } else if (size == 1) {
-                    if (inst->cast_to_type->is_signed) {
-                        emit("movsx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                    } else {
-                        emit("movzx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
-                    }
-                }
+                    if (strstr(dst, "PTR") != NULL) emit("mov %s, rax", dst);
 
-                // Se destino era memória, mover do temporário para lá
-                if (dst_is_mem) {
-                    emit("mov %s, r15", dst);
+                } else {
+                    emit("mov %s, QWORD PTR [r15]", dst);
                 }
             } else {
-                emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+                // Existing logic for stack offset
+                if (inst->cast_to_type) {
+                    int size = inst->cast_to_type->size;
+                    int dst_is_mem = (strstr(dst, "PTR") != NULL);
+                    const char *target_reg = dst_is_mem ? "r15" : dst;
+
+                    if (size == 8) {
+                        emit("mov %s, QWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                    } else if (size == 4) {
+                        if (inst->cast_to_type->is_signed) {
+                            emit("movsxd %s, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        } else {
+                            emit("mov %sd, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        }
+                    } else if (size == 2) {
+                        if (inst->cast_to_type->is_signed) {
+                            emit("movsx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        } else {
+                            emit("movzx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        }
+                    } else if (size == 1) {
+                        if (inst->cast_to_type->is_signed) {
+                            emit("movsx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        } else {
+                            emit("movzx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        }
+                    }
+
+                    if (dst_is_mem) {
+                        emit("mov %s, r15", dst);
+                    }
+                } else {
+                    emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+                }
             }
             break;
 
         case IR_STORE:
             get_operand_loc(inst->src1.vreg, ctx, src1, sizeof(src1));
-            if (inst->cast_to_type) {
-                int size = inst->cast_to_type->size;
-
-                // Sempre usar registrador temporário para source se for memória
-                int src_is_mem = (strstr(src1, "PTR") != NULL);
-                const char *source_reg = src1;
-
-                if (src_is_mem) {
-                    emit("mov r15, %s", src1);
-                    source_reg = "r15";
+            
+            // Check if dest is VREG (pointer/address) or IMM (stack offset)
+            if (inst->dest.type == OPERAND_VREG) {
+                load_operand(inst->dest.vreg, ctx, "r15"); // Load address into r15
+                
+                // Load value into rax if it's in memory
+                const char *val_reg = src1;
+                if (strstr(src1, "PTR") != NULL) {
+                    emit("mov rax, %s", src1);
+                    val_reg = "rax";
                 }
 
-                if (size == 8) {
-                    emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + size, source_reg);
-                } else if (size == 4) {
-                    char reg32[64];
-                    if (strcmp(source_reg, "rax") == 0) strcpy(reg32, "eax");
-                    else if (strcmp(source_reg, "rbx") == 0) strcpy(reg32, "ebx");
-                    else if (strcmp(source_reg, "rcx") == 0) strcpy(reg32, "ecx");
-                    else if (strcmp(source_reg, "rdx") == 0) strcpy(reg32, "edx");
-                    else if (strcmp(source_reg, "rsi") == 0) strcpy(reg32, "esi");
-                    else if (strcmp(source_reg, "rdi") == 0) strcpy(reg32, "edi");
-                    else if (strcmp(source_reg, "r8") == 0) strcpy(reg32, "r8d");
-                    else if (strcmp(source_reg, "r9") == 0) strcpy(reg32, "r9d");
-                    else if (strcmp(source_reg, "r10") == 0) strcpy(reg32, "r10d");
-                    else if (strcmp(source_reg, "r11") == 0) strcpy(reg32, "r11d");
-                    else if (strcmp(source_reg, "r12") == 0) strcpy(reg32, "r12d");
-                    else if (strcmp(source_reg, "r13") == 0) strcpy(reg32, "r13d");
-                    else if (strcmp(source_reg, "r14") == 0) strcpy(reg32, "r14d");
-                    else if (strcmp(source_reg, "r15") == 0) strcpy(reg32, "r15d");
-                    else strncpy(reg32, source_reg, sizeof(reg32) - 1);
-                    emit("mov DWORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg32);
-                } else if (size == 2) {
-                    char reg16[64];
-                    if (strcmp(source_reg, "rax") == 0) strcpy(reg16, "ax");
-                    else if (strcmp(source_reg, "rbx") == 0) strcpy(reg16, "bx");
-                    else if (strcmp(source_reg, "rcx") == 0) strcpy(reg16, "cx");
-                    else if (strcmp(source_reg, "rdx") == 0) strcpy(reg16, "dx");
-                    else if (strcmp(source_reg, "rsi") == 0) strcpy(reg16, "si");
-                    else if (strcmp(source_reg, "rdi") == 0) strcpy(reg16, "di");
-                    else if (strcmp(source_reg, "r8") == 0) strcpy(reg16, "r8w");
-                    else if (strcmp(source_reg, "r9") == 0) strcpy(reg16, "r9w");
-                    else if (strcmp(source_reg, "r10") == 0) strcpy(reg16, "r10w");
-                    else if (strcmp(source_reg, "r11") == 0) strcpy(reg16, "r11w");
-                    else if (strcmp(source_reg, "r12") == 0) strcpy(reg16, "r12w");
-                    else if (strcmp(source_reg, "r13") == 0) strcpy(reg16, "r13w");
-                    else if (strcmp(source_reg, "r14") == 0) strcpy(reg16, "r14w");
-                    else if (strcmp(source_reg, "r15") == 0) strcpy(reg16, "r15w");
-                    else strncpy(reg16, source_reg, sizeof(reg16) - 1);
-                    emit("mov WORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg16);
-                } else if (size == 1) {
-                    char reg8[64];
-                    if (strcmp(source_reg, "rax") == 0) strcpy(reg8, "al");
-                    else if (strcmp(source_reg, "rbx") == 0) strcpy(reg8, "bl");
-                    else if (strcmp(source_reg, "rcx") == 0) strcpy(reg8, "cl");
-                    else if (strcmp(source_reg, "rdx") == 0) strcpy(reg8, "dl");
-                    else if (strcmp(source_reg, "rsi") == 0) strcpy(reg8, "sil");
-                    else if (strcmp(source_reg, "rdi") == 0) strcpy(reg8, "dil");
-                    else if (strcmp(source_reg, "r8") == 0) strcpy(reg8, "r8b");
-                    else if (strcmp(source_reg, "r9") == 0) strcpy(reg8, "r9b");
-                    else if (strcmp(source_reg, "r10") == 0) strcpy(reg8, "r10b");
-                    else if (strcmp(source_reg, "r11") == 0) strcpy(reg8, "r11b");
-                    else if (strcmp(source_reg, "r12") == 0) strcpy(reg8, "r12b");
-                    else if (strcmp(source_reg, "r13") == 0) strcpy(reg8, "r13b");
-                    else if (strcmp(source_reg, "r14") == 0) strcpy(reg8, "r14b");
-                    else if (strcmp(source_reg, "r15") == 0) strcpy(reg8, "r15b");
-                    else strncpy(reg8, source_reg, sizeof(reg8) - 1);
-                    emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm + size, reg8);
+                if (inst->cast_to_type) {
+                    int size = inst->cast_to_type->size;
+                    if (size == 8) emit("mov QWORD PTR [r15], %s", val_reg);
+                    else if (size == 4) {
+                        // Extract 32-bit part of reg
+                        char reg32[64];
+                        if (strcmp(val_reg, "rax") == 0) strcpy(reg32, "eax");
+                        else if (strcmp(val_reg, "rbx") == 0) strcpy(reg32, "ebx");
+                        // ... simplified for brevity, assuming standard regs ...
+                        else if (val_reg[0] == 'r' && val_reg[2] == 0) { sprintf(reg32, "%sd", val_reg); } // r8 -> r8d
+                        else if (val_reg[0] == 'r') { sprintf(reg32, "%sd", val_reg); } // r12 -> r12d
+                        else { sprintf(reg32, "e%s", val_reg+1); } // rbx -> ebx (approx)
+                        
+                        // Better reg mapping needed or reuse existing helper logic?
+                        // Let's reuse the logic from existing STORE but adapted.
+                        // Actually, let's just force load to rax for simplicity if size < 8
+                        if (strcmp(val_reg, "rax") != 0) emit("mov rax, %s", val_reg);
+                        emit("mov DWORD PTR [r15], eax");
+                    }
+                    else if (size == 2) {
+                        if (strcmp(val_reg, "rax") != 0) emit("mov rax, %s", val_reg);
+                        emit("mov WORD PTR [r15], ax");
+                    }
+                    else if (size == 1) {
+                        if (strcmp(val_reg, "rax") != 0) emit("mov rax, %s", val_reg);
+                        emit("mov BYTE PTR [r15], al");
+                    }
+                } else {
+                    emit("mov QWORD PTR [r15], %s", val_reg);
                 }
+
             } else {
-                emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+                // Existing logic for stack offset
+                if (inst->cast_to_type) {
+                    int size = inst->cast_to_type->size;
+                    int src_is_mem = (strstr(src1, "PTR") != NULL);
+                    const char *source_reg = src1;
+
+                    if (src_is_mem) {
+                        emit("mov r15, %s", src1);
+                        source_reg = "r15";
+                    }
+
+                    if (size == 8) {
+                        emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + size, source_reg);
+                    } else if (size == 4) {
+                        char reg32[64];
+                        if (strcmp(source_reg, "rax") == 0) strcpy(reg32, "eax");
+                        else if (strcmp(source_reg, "rbx") == 0) strcpy(reg32, "ebx");
+                        else if (strcmp(source_reg, "rcx") == 0) strcpy(reg32, "ecx");
+                        else if (strcmp(source_reg, "rdx") == 0) strcpy(reg32, "edx");
+                        else if (strcmp(source_reg, "rsi") == 0) strcpy(reg32, "esi");
+                        else if (strcmp(source_reg, "rdi") == 0) strcpy(reg32, "edi");
+                        else if (strcmp(source_reg, "r8") == 0) strcpy(reg32, "r8d");
+                        else if (strcmp(source_reg, "r9") == 0) strcpy(reg32, "r9d");
+                        else if (strcmp(source_reg, "r10") == 0) strcpy(reg32, "r10d");
+                        else if (strcmp(source_reg, "r11") == 0) strcpy(reg32, "r11d");
+                        else if (strcmp(source_reg, "r12") == 0) strcpy(reg32, "r12d");
+                        else if (strcmp(source_reg, "r13") == 0) strcpy(reg32, "r13d");
+                        else if (strcmp(source_reg, "r14") == 0) strcpy(reg32, "r14d");
+                        else if (strcmp(source_reg, "r15") == 0) strcpy(reg32, "r15d");
+                        else strncpy(reg32, source_reg, sizeof(reg32) - 1);
+                        emit("mov DWORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg32);
+                    } else if (size == 2) {
+                        char reg16[64];
+                        if (strcmp(source_reg, "rax") == 0) strcpy(reg16, "ax");
+                        else if (strcmp(source_reg, "rbx") == 0) strcpy(reg16, "bx");
+                        else if (strcmp(source_reg, "rcx") == 0) strcpy(reg16, "cx");
+                        else if (strcmp(source_reg, "rdx") == 0) strcpy(reg16, "dx");
+                        else if (strcmp(source_reg, "rsi") == 0) strcpy(reg16, "si");
+                        else if (strcmp(source_reg, "rdi") == 0) strcpy(reg16, "di");
+                        else if (strcmp(source_reg, "r8") == 0) strcpy(reg16, "r8w");
+                        else if (strcmp(source_reg, "r9") == 0) strcpy(reg16, "r9w");
+                        else if (strcmp(source_reg, "r10") == 0) strcpy(reg16, "r10w");
+                        else if (strcmp(source_reg, "r11") == 0) strcpy(reg16, "r11w");
+                        else if (strcmp(source_reg, "r12") == 0) strcpy(reg16, "r12w");
+                        else if (strcmp(source_reg, "r13") == 0) strcpy(reg16, "r13w");
+                        else if (strcmp(source_reg, "r14") == 0) strcpy(reg16, "r14w");
+                        else if (strcmp(source_reg, "r15") == 0) strcpy(reg16, "r15w");
+                        else strncpy(reg16, source_reg, sizeof(reg16) - 1);
+                        emit("mov WORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg16);
+                    } else if (size == 1) {
+                        char reg8[64];
+                        if (strcmp(source_reg, "rax") == 0) strcpy(reg8, "al");
+                        else if (strcmp(source_reg, "rbx") == 0) strcpy(reg8, "bl");
+                        else if (strcmp(source_reg, "rcx") == 0) strcpy(reg8, "cl");
+                        else if (strcmp(source_reg, "rdx") == 0) strcpy(reg8, "dl");
+                        else if (strcmp(source_reg, "rsi") == 0) strcpy(reg8, "sil");
+                        else if (strcmp(source_reg, "rdi") == 0) strcpy(reg8, "dil");
+                        else if (strcmp(source_reg, "r8") == 0) strcpy(reg8, "r8b");
+                        else if (strcmp(source_reg, "r9") == 0) strcpy(reg8, "r9b");
+                        else if (strcmp(source_reg, "r10") == 0) strcpy(reg8, "r10b");
+                        else if (strcmp(source_reg, "r11") == 0) strcpy(reg8, "r11b");
+                        else if (strcmp(source_reg, "r12") == 0) strcpy(reg8, "r12b");
+                        else if (strcmp(source_reg, "r13") == 0) strcpy(reg8, "r13b");
+                        else if (strcmp(source_reg, "r14") == 0) strcpy(reg8, "r14b");
+                        else if (strcmp(source_reg, "r15") == 0) strcpy(reg8, "r15b");
+                        else strncpy(reg8, source_reg, sizeof(reg8) - 1);
+                        emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm + size, reg8);
+                    }
+                } else {
+                    emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+                }
             }
             break;
 
