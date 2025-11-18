@@ -46,6 +46,8 @@ static const int rdx_idx = 2;
 static const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 static const int num_arg_regs = 6;
 
+static const char *syscall_regs[] = {"rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"};
+
 static void emit(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -256,7 +258,7 @@ static int spill_register(AllocCtx *ctx, int pos) {
 static void linear_scan_alloc(IRFunction *func, AllocCtx *ctx) {
     ctx->regs = calloc(num_regs, sizeof(RegState));
     ctx->vreg_to_loc = calloc(func->vreg_count, sizeof(int));
-    ctx->next_spill = 1;
+    // ctx->next_spill is already initialized in gen_func
 
     for (int i = 0; i < num_regs; i++) {
         ctx->regs[i].vreg = -1;
@@ -299,6 +301,7 @@ static void linear_scan_alloc(IRFunction *func, AllocCtx *ctx) {
         } else {
             ctx->vreg_to_loc[iv->vreg] = -(ctx->next_spill++);
             iv->spill_loc = ctx->next_spill - 1;
+            printf("; Spilled vreg %d to loc %d (offset %d)\n", iv->vreg, ctx->vreg_to_loc[iv->vreg], (-ctx->vreg_to_loc[iv->vreg])*8);
         }
     }
 
@@ -817,6 +820,17 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             }
             break;
 
+        case IR_SET_SYS_ARG:
+            if (inst->dest.imm < 7) {
+                load_operand(inst->src1.vreg, ctx, syscall_regs[inst->dest.imm]);
+            }
+            break;
+
+        case IR_SYSCALL:
+            emit("syscall");
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
         case IR_GET_ARG:
             if (inst->src1.imm < num_arg_regs) {
                 get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
@@ -839,18 +853,18 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             }
             break;
 
-            case IR_CALL:
-                // Caller-saved registers are not explicitly saved here because:
-                // 1. Our allocator only uses callee-saved registers (rbx, r12, r13) for variables.
-                // 2. Scratch registers (r14, r15) don't need preservation across calls.
-                // 3. Argument registers (rdi, etc.) are set immediately before call.
-                // If we start using caller-saved regs for vars, we must save them here.
-                emit("call %s", inst->call_target_name);
+        case IR_CALL:
+            // Caller-saved registers are not explicitly saved here because:
+            // 1. Our allocator only uses callee-saved registers (rbx, r12, r13) for variables.
+            // 2. Scratch registers (r14, r15) don't need preservation across calls.
+            // 3. Argument registers (rdi, etc.) are set immediately before call.
+            // If we start using caller-saved regs for vars, we must save them here.
+            emit("call %s", inst->call_target_name);
 
-                // O valor de retorno da função está em 'rax', pela convenção da ABI.
-                // Armazenamos o valor de 'rax' no local designado para o vreg de destino.
-                store_operand(inst->dest.vreg, ctx, "rax");
-                break;
+            // O valor de retorno da função está em 'rax', pela convenção da ABI.
+            // Armazenamos o valor de 'rax' no local designado para o vreg de destino.
+            store_operand(inst->dest.vreg, ctx, "rax");
+            break;
 
         default:
             break;
@@ -860,7 +874,39 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 static void gen_func(IRFunction *func) {
     AllocCtx ctx = {0};
 
+    // Calculate max stack offset used by variables
+    long max_offset = 48; // Start after saved regs
+    for (IRInst *inst = func->instructions; inst; inst = inst->next) {
+        if (inst->op == IR_LOAD || inst->op == IR_ADDR) {
+             if (inst->src1.type == OPERAND_IMM) {
+                 // For LOAD/ADDR, src1 is offset.
+                 // We need to account for the size of the access if possible, but for now assume offset is the start.
+                 // Actually, codegen adds size to offset for rbp access: [rbp - (offset + size)]
+                 // So we need to find max (offset + size).
+                 // Since we don't easily know size here without type, let's approximate.
+                 // Semantic assigns offsets sequentially. The max offset seen is the start of the last var.
+                 // We need to add its size. Let's assume max size 8 for safety if unknown.
+                 long off = inst->src1.imm;
+                 if (off + 8 > max_offset) max_offset = off + 8;
+             }
+        }
+        if (inst->op == IR_STORE) {
+            if (inst->dest.type == OPERAND_IMM) {
+                long off = inst->dest.imm;
+                if (off + 8 > max_offset) max_offset = off + 8;
+            }
+        }
+    }
+
     build_intervals(func, &ctx);
+    
+    // Initialize next_spill to start after user variables
+    ctx.next_spill = (max_offset + 7) / 8;
+    if (ctx.next_spill < 6) ctx.next_spill = 6; // Minimum 6 slots (48 bytes)
+
+    // DEBUG
+    // printf("; max_offset: %ld, next_spill: %d\n", max_offset, ctx.next_spill);
+
     linear_scan_alloc(func, &ctx);
 
     fprintf(out, "%s:\n", func->name);

@@ -59,6 +59,7 @@ typedef enum {
     NODE_KIND_ADDR,
     NODE_KIND_DEREF,
     NODE_KIND_INDEX,
+    NODE_KIND_SYSCALL,
 } NodeKind;
 
 typedef enum {
