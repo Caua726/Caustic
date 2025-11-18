@@ -42,6 +42,10 @@ static const int rax_idx = 0;
 static const int rcx_idx = 1;
 static const int rdx_idx = 2;
 
+// System V AMD64 ABI argument registers: rdi, rsi, rdx, rcx, r8, r9
+static const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+static const int num_arg_regs = 6;
+
 static void emit(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -734,8 +738,34 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             }
             break;
 
-            case IR_CALL: // <-- ADICIONE ESTE CASE
-                // TODO: No futuro, aqui teremos que salvar os registradores "caller-saved".
+        case IR_GET_ARG:
+            if (inst->src1.imm < num_arg_regs) {
+                get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+                emit("mov %s, %s", dst, arg_regs[inst->src1.imm]);
+            } else {
+                get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+                // Stack args start at [rbp + 16] (skip rbp, ret addr)
+                // Arg 6 is at 16, Arg 7 at 24...
+                int offset = 16 + (inst->src1.imm - 6) * 8;
+                emit("mov %s, QWORD PTR [rbp+%d]", dst, offset);
+            }
+            break;
+
+        case IR_SET_ARG:
+            if (inst->dest.imm < num_arg_regs) {
+                load_operand(inst->src1.vreg, ctx, arg_regs[inst->dest.imm]);
+            } else {
+                load_operand(inst->src1.vreg, ctx, "rax"); // Use rax as temp
+                emit("push rax");
+            }
+            break;
+
+            case IR_CALL:
+                // Caller-saved registers are not explicitly saved here because:
+                // 1. Our allocator only uses callee-saved registers (rbx, r12, r13) for variables.
+                // 2. Scratch registers (r14, r15) don't need preservation across calls.
+                // 3. Argument registers (rdi, etc.) are set immediately before call.
+                // If we start using caller-saved regs for vars, we must save them here.
                 emit("call %s", inst->call_target_name);
 
                 // O valor de retorno da função está em 'rax', pela convenção da ABI.

@@ -37,7 +37,7 @@ static Type *new_type_full(TypeKind kind, int size, int is_signed) {
     return ty;
 }
 
-static void declare_function(char *name, Type *return_type) {
+static void declare_function(char *name, Type *return_type, Type **param_types, int param_count) {
     for (Function *fs = function_table; fs; fs = fs->next) {
         if (strcmp(fs->name, name) == 0) {
             fprintf(stderr, "Erro: redefinição da função '%s'\n", name);
@@ -47,6 +47,8 @@ static void declare_function(char *name, Type *return_type) {
     Function *fs = calloc(1, sizeof(Function));
     fs->name = strdup(name);
     fs->return_type = return_type;
+    fs->param_types = param_types;
+    fs->param_count = param_count;
     fs->next = function_table;
     function_table = fs;
 }
@@ -155,7 +157,16 @@ static Variable *symtab_lookup(char *name) {
 static void register_functions(Node *program_node) {
     for (Node *node = program_node; node; node = node->next) {
         if (node->kind == NODE_KIND_FN) {
-            declare_function(node->name, node->return_type);
+            int param_count = 0;
+            for (Node *p = node->params; p; p = p->next) param_count++;
+            
+            Type **param_types = calloc(param_count, sizeof(Type*));
+            int i = 0;
+            for (Node *p = node->params; p; p = p->next) {
+                param_types[i++] = p->ty;
+            }
+
+            declare_function(node->name, node->return_type, param_types, param_count);
         }
     }
 }
@@ -188,6 +199,12 @@ static void walk(Node *node) {
 
         case NODE_KIND_FN:
             symtab_enter_scope();
+            // Declarar parâmetros no escopo da função
+            for (Node *param = node->params; param; param = param->next) {
+                Variable *var = symtab_declare(param->name, param->ty, param->flags);
+                param->var = var;
+                param->offset = var->offset;
+            }
             walk(node->body);
             symtab_exit_scope();
             return;
@@ -359,6 +376,26 @@ static void walk(Node *node) {
                 exit(1);
             }
             node->ty = fs->return_type;
+
+            int arg_count = 0;
+            for (Node *arg = node->args; arg; arg = arg->next) {
+                walk(arg);
+                arg_count++;
+            }
+
+            if (arg_count != fs->param_count) {
+                fprintf(stderr, "Erro: função '%s' espera %d argumentos, mas recebeu %d\n", fs->name, fs->param_count, arg_count);
+                exit(1);
+            }
+
+            Node *arg = node->args;
+            for (int i = 0; i < arg_count; i++) {
+                if (!is_safe_implicit_conversion(arg->ty, fs->param_types[i])) {
+                    fprintf(stderr, "Erro: argumento %d da função '%s' tem tipo incompatível.\n", i + 1, fs->name);
+                    exit(1);
+                }
+                arg = arg->next;
+            }
             return;
     }
 }
@@ -370,7 +407,16 @@ void analyze(Node *node) {
     // Primeiro passo: registrar todas as funções
     for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
         if (fn_node->kind == NODE_KIND_FN) {
-            declare_function(fn_node->name, fn_node->return_type);
+            int param_count = 0;
+            for (Node *p = fn_node->params; p; p = p->next) param_count++;
+            
+            Type **param_types = calloc(param_count, sizeof(Type*));
+            int i = 0;
+            for (Node *p = fn_node->params; p; p = p->next) {
+                param_types[i++] = p->ty;
+            }
+
+            declare_function(fn_node->name, fn_node->return_type, param_types, param_count);
         }
     }
 
@@ -387,6 +433,7 @@ void semantic_cleanup() {
     while (fs) {
         Function *next = fs->next;
         free(fs->name);
+        if (fs->param_types) free(fs->param_types);
         free(fs);
         fs = next;
     }

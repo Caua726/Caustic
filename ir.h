@@ -28,6 +28,8 @@ typedef enum {
     IR_PHI,
     IR_ASM,
     IR_CAST,
+    IR_GET_ARG,
+    IR_SET_ARG,
 } IROp;
 
 typedef enum {

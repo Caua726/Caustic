@@ -137,11 +137,6 @@ static Type *parse_type() {
 
 static Node* parse_var_decl() {
     expect(TOKEN_TYPE_LET);
-    expect(TOKEN_TYPE_IS);
-
-    Type *var_type = parse_type();
-
-    expect(TOKEN_TYPE_AS);
 
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
         fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um nome de variável, mas encontrou '%s'\n", current_token.line, current_token.text);
@@ -149,6 +144,10 @@ static Node* parse_var_decl() {
     }
     char *var_name = strdup(current_token.text);
     consume();
+
+    expect(TOKEN_TYPE_AS);
+
+    Type *var_type = parse_type();
 
     VarFlags var_flags = VAR_FLAG_NONE;
     if (current_token.type == TOKEN_TYPE_WITH) {
@@ -232,7 +231,23 @@ static Node *parse_primary() {
             node->name = strdup(current_token.text);
             consume();
             expect(TOKEN_TYPE_LPAREN);
-            // Later i will add here arguments parsing
+            
+            // Parse arguments
+            if (current_token.type != TOKEN_TYPE_RPAREN) {
+                Node head = {};
+                Node *cur = &head;
+                while (1) {
+                    cur->next = parse_expr();
+                    cur = cur->next;
+                    if (current_token.type == TOKEN_TYPE_COMMA) {
+                        consume();
+                    } else {
+                        break;
+                    }
+                }
+                node->args = head.next;
+            }
+
             expect(TOKEN_TYPE_RPAREN);
             return node;
         }
@@ -276,13 +291,51 @@ static Node *parse_fn() {
     consume();
 
     expect(TOKEN_TYPE_LPAREN);
+
+    // Parse parameters
+    if (current_token.type != TOKEN_TYPE_RPAREN) {
+        Node head = {};
+        Node *cur = &head;
+        while (1) {
+            if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                fprintf(stderr, "Erro na linha %d: esperado nome do parâmetro.\n", current_token.line);
+                exit(1);
+            }
+            char *param_name = strdup(current_token.text);
+            consume();
+
+            expect(TOKEN_TYPE_AS);
+            Type *param_type = parse_type();
+
+            Node *param = new_node(NODE_KIND_LET); // Reusing LET node for param declaration
+            param->name = param_name;
+            param->ty = param_type;
+            param->flags = VAR_FLAG_NONE; // Parameters are immutable by default for now?
+
+            cur->next = param;
+            cur = cur->next;
+
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+        fn_node->params = head.next;
+    }
+
     expect(TOKEN_TYPE_RPAREN);
 
-    if (current_token.type == TOKEN_TYPE_ARROW) {
+    if (current_token.type == TOKEN_TYPE_AS) {
         consume();
         fn_node->return_type = parse_type();
     } else {
-        fn_node->return_type = type_i32;
+        fn_node->return_type = type_void; // Default to void if not specified? Or i32? Let's say void for now or keep i32 if that was previous behavior. Previous was i32 default.
+        // Actually, let's stick to previous behavior of i32 default if omitted, or maybe void. 
+        // The user example `fn main() as i32` suggests explicit typing. 
+        // If omitted, let's assume void to be safe, or i32 if that's what we did.
+        // Previous code: `fn_node->return_type = type_i32;`
+        fn_node->return_type = type_i32; 
     }
     fn_node->body = parse_block();
 
@@ -665,6 +718,7 @@ void free_ast(Node *node) {
     // Liberar filhos baseados no tipo
     switch (node->kind) {
         case NODE_KIND_FN:
+            free_ast(node->params);
             free_ast(node->body);
             break;
         case NODE_KIND_BLOCK:
@@ -674,6 +728,9 @@ void free_ast(Node *node) {
         case NODE_KIND_EXPR_STMT:
         case NODE_KIND_CAST:
             free_ast(node->expr);
+            break;
+        case NODE_KIND_FNCALL:
+            free_ast(node->args);
             break;
         case NODE_KIND_LET:
             free_ast(node->init_expr);

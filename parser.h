@@ -76,20 +76,24 @@ typedef struct Node {
     char *name;
     Type *return_type;
     VarFlags flags;
+    // Function
     struct Node *body;
+    struct Node *params; // Lista de parâmetros (NODE_KIND_VAR_DECL)
+
+    // Function Call
+    struct Node *args;   // Lista de argumentos (expressões)
+
     struct Node *stmts;
 
     int offset;
     struct Variable *var;
+    // If/While
     struct {
         struct Node *cond;
         struct Node *then_b;
         struct Node *else_b;
-    } if_stmt;
-    struct {
-        struct Node *cond;
         struct Node *body;
-    } while_stmt;
+    } if_stmt, while_stmt;
 } Node;
 
 void ast_print(Node *node);

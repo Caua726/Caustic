@@ -90,6 +90,24 @@ static int emit_call(char *func_name, int line) {
     return dest;
 }
 
+static void emit_set_arg(int arg_idx, int src_reg, int line) {
+    IRInst *inst = new_inst(IR_SET_ARG);
+    inst->dest = op_imm(arg_idx);
+    inst->src1 = op_vreg(src_reg);
+    inst->line = line;
+    emit(inst);
+}
+
+static int emit_get_arg(int arg_idx, int line) {
+    int dest = new_vreg();
+    IRInst *inst = new_inst(IR_GET_ARG);
+    inst->dest = op_vreg(dest);
+    inst->src1 = op_imm(arg_idx);
+    inst->line = line;
+    emit(inst);
+    return dest;
+}
+
 static void emit_return(int src_reg, int line) {
     IRInst *inst = new_inst(IR_RET);
     inst->src1 = op_vreg(src_reg);
@@ -258,8 +276,49 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_FNCALL: {
-           // int src = gen_expr(node->expr);
-            return emit_call(node->name, node->tok ? node->tok->line : 0);
+            int arg_count = 0;
+            for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
+
+            int *arg_vregs = calloc(arg_count, sizeof(int));
+            int i = 0;
+            for (Node *arg = node->args; arg; arg = arg->next) {
+                arg_vregs[i++] = gen_expr(arg);
+            }
+
+            int stack_args = (arg_count > 6) ? (arg_count - 6) : 0;
+            int padding = (stack_args % 2 != 0) ? 1 : 0;
+
+            if (padding) {
+                IRInst *align = new_inst(IR_ASM);
+                align->asm_str = strdup("sub rsp, 8");
+                align->line = node->tok ? node->tok->line : 0;
+                emit(align);
+            }
+
+            // Emit stack args in reverse order (Arg N ... Arg 7)
+            for (int j = arg_count - 1; j >= 6; j--) {
+                emit_set_arg(j, arg_vregs[j], node->tok ? node->tok->line : 0);
+            }
+
+            // Emit register args (Arg 0 ... Arg 5)
+            for (int j = 0; j < arg_count && j < 6; j++) {
+                emit_set_arg(j, arg_vregs[j], node->tok ? node->tok->line : 0);
+            }
+
+            free(arg_vregs);
+
+            int ret_reg = emit_call(node->name, node->tok ? node->tok->line : 0);
+
+            if (stack_args > 0) {
+                IRInst *cleanup = new_inst(IR_ASM);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "add rsp, %d", (stack_args + padding) * 8);
+                cleanup->asm_str = strdup(buf);
+                cleanup->line = node->tok ? node->tok->line : 0;
+                emit(cleanup);
+            }
+
+            return ret_reg;
         }
 
         case NODE_KIND_ASSIGN:
@@ -413,6 +472,17 @@ IRProgram *gen_ir(Node *ast) {
         ctx.current_func = func;
 
         if (fn_node->body && fn_node->body->kind == NODE_KIND_BLOCK) {
+            // Gerar código para recuperar argumentos e colocar nas variáveis locais
+            int arg_idx = 0;
+            for (Node *param = fn_node->params; param; param = param->next) {
+                int arg_val = emit_get_arg(arg_idx++, param->tok ? param->tok->line : 0);
+                IRInst *store = new_inst(IR_STORE);
+                store->dest = op_imm(param->offset);
+                store->src1 = op_vreg(arg_val);
+                store->cast_to_type = param->ty;
+                store->line = param->tok ? param->tok->line : 0;
+                emit(store);
+            }
             gen_stmt(fn_node->body->stmts);
         } else {
             fprintf(stderr, "Erro: função '%s' deve ter um bloco\n", fn_node->name);

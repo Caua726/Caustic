@@ -28,6 +28,8 @@ extern Type *type_void;
 typedef struct Function {
     char *name;
     Type *return_type;
+    Type **param_types;
+    int param_count;
     struct Function *next;
 } Function;
 
