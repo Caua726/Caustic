@@ -117,6 +117,45 @@ static void emit_return(int src_reg, int line) {
 
 static int gen_expr(Node *node);
 
+static int gen_addr(Node *node) {
+    switch (node->kind) {
+        case NODE_KIND_IDENTIFIER: {
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_ADDR);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_imm(node->offset);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+        case NODE_KIND_DEREF: {
+            // The address of *p is the value of p
+            return gen_expr(node->expr);
+        }
+        case NODE_KIND_INDEX: {
+            // Address of arr[i] = base_addr + i * size
+            int base = gen_addr(node->lhs);
+            int index = gen_expr(node->rhs);
+            int size = node->ty->size;
+
+            // Calculate offset = index * size
+            int offset_reg;
+            if (size == 1) {
+                offset_reg = index;
+            } else {
+                int size_reg = emit_imm(size, node->tok ? node->tok->line : 0);
+                offset_reg = emit_binary(IR_MUL, index, size_reg, node->tok ? node->tok->line : 0);
+            }
+
+            // Address = base + offset
+            return emit_binary(IR_ADD, base, offset_reg, node->tok ? node->tok->line : 0);
+        }
+        default:
+            fprintf(stderr, "Erro interno: gen_addr chamado para nó inválido\n");
+            exit(1);
+    }
+}
+
 static int gen_expr(Node *node) {
     if (!node) {
         fprintf(stderr, "Erro interno: nó de expressão nulo\n");
@@ -124,6 +163,33 @@ static int gen_expr(Node *node) {
     }
 
     switch (node->kind) {
+        case NODE_KIND_ADDR:
+            return gen_addr(node->expr);
+
+        case NODE_KIND_DEREF: {
+            int addr = gen_expr(node->expr);
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_LOAD);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_vreg(addr); // Load from address in vreg
+            inst->cast_to_type = node->ty;
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
+        case NODE_KIND_INDEX: {
+            int addr = gen_addr(node);
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_LOAD);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_vreg(addr); // Load from address in vreg
+            inst->cast_to_type = node->ty;
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
         case NODE_KIND_NUM:
             return emit_imm(node->val, node->tok ? node->tok->line : 0);
 
@@ -436,12 +502,24 @@ static void gen_stmt_single(Node *node) {
         }
         case NODE_KIND_ASSIGN: {
             int val_reg = gen_expr(node->rhs);
-            IRInst *inst = new_inst(IR_STORE);
-            inst->dest = op_imm(node->lhs->offset);
-            inst->src1 = op_vreg(val_reg);
-            inst->cast_to_type = node->lhs->ty;
-            inst->line = node->tok ? node->tok->line : 0;
-            emit(inst);
+            
+            if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                IRInst *inst = new_inst(IR_STORE);
+                inst->dest = op_imm(node->lhs->offset);
+                inst->src1 = op_vreg(val_reg);
+                inst->cast_to_type = node->lhs->ty;
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            } else {
+                // Indirect assignment (pointer/array)
+                int addr_reg = gen_addr(node->lhs);
+                IRInst *inst = new_inst(IR_STORE);
+                inst->dest = op_vreg(addr_reg); // Store to address in vreg
+                inst->src1 = op_vreg(val_reg);
+                inst->cast_to_type = node->lhs->ty;
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            }
             break;
         }
 

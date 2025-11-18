@@ -110,6 +110,7 @@ int main(int argc, char *argv[]) {
 
     if (ast) free_ast(ast);
     semantic_cleanup();
-    fclose(file);
+    free_ast(ast);
+    free_all_types();
     return 0;
 }

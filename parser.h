@@ -19,12 +19,16 @@ typedef enum {
     TY_STRING,
     TY_VOID,
     TY_PTR,
+    TY_ARRAY,
 } TypeKind;
 
 typedef struct Type {
     TypeKind kind;
     int size;
     int is_signed;
+    struct Type *base;
+    int array_len;
+    struct Type *next; // For garbage collection
 } Type;
 
 typedef enum {
@@ -52,6 +56,9 @@ typedef enum {
     NODE_KIND_ASM,
     NODE_KIND_WHILE,
     NODE_KIND_CAST,
+    NODE_KIND_ADDR,
+    NODE_KIND_DEREF,
+    NODE_KIND_INDEX,
 } NodeKind;
 
 typedef enum {
@@ -98,5 +105,7 @@ typedef struct Node {
 
 void ast_print(Node *node);
 void free_ast(Node *node);
+Type *new_type(TypeKind kind);
+void free_all_types();
 void parser_init();
 Node *parse();

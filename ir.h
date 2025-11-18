@@ -24,12 +24,12 @@ typedef enum {
     IR_RET,
     IR_LOAD,
     IR_STORE,
-    IR_ADDR,
     IR_PHI,
     IR_ASM,
     IR_CAST,
     IR_GET_ARG,
     IR_SET_ARG,
+    IR_ADDR, // Get address of variable
 } IROp;
 
 typedef enum {
