@@ -859,6 +859,7 @@ void free_ast(Node *node) {
             free_ast(node->expr);
             break;
         case NODE_KIND_FNCALL:
+        case NODE_KIND_SYSCALL:
             free_ast(node->args);
             break;
         case NODE_KIND_LET:
