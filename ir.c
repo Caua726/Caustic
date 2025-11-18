@@ -535,24 +535,38 @@ static void gen_stmt_single(Node *node) {
             break;
         }
         case NODE_KIND_ASSIGN: {
-            int val_reg = gen_expr(node->rhs);
-            
-            if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
-                IRInst *inst = new_inst(IR_STORE);
-                inst->dest = op_imm(node->lhs->offset);
-                inst->src1 = op_vreg(val_reg);
-                inst->cast_to_type = node->lhs->ty;
+            if (node->lhs->ty->kind == TY_ARRAY || node->lhs->ty->size > 8) {
+                // Array/Struct copy
+                int src_addr = gen_addr(node->rhs);
+                int dst_addr = gen_addr(node->lhs);
+                
+                IRInst *inst = new_inst(IR_COPY);
+                inst->dest = op_vreg(dst_addr);
+                inst->src1 = op_vreg(src_addr);
+                inst->src2 = op_imm(node->lhs->ty->size); // Use src2 for size
                 inst->line = node->tok ? node->tok->line : 0;
                 emit(inst);
             } else {
-                // Indirect assignment (pointer/array)
-                int addr_reg = gen_addr(node->lhs);
-                IRInst *inst = new_inst(IR_STORE);
-                inst->dest = op_vreg(addr_reg); // Store to address in vreg
-                inst->src1 = op_vreg(val_reg);
-                inst->cast_to_type = node->lhs->ty;
-                inst->line = node->tok ? node->tok->line : 0;
-                emit(inst);
+                // Scalar assignment
+                int val_reg = gen_expr(node->rhs);
+                
+                if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                    IRInst *inst = new_inst(IR_STORE);
+                    inst->dest = op_imm(node->lhs->offset);
+                    inst->src1 = op_vreg(val_reg);
+                    inst->cast_to_type = node->lhs->ty;
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                } else {
+                    // Indirect assignment (pointer/array)
+                    int addr_reg = gen_addr(node->lhs);
+                    IRInst *inst = new_inst(IR_STORE);
+                    inst->dest = op_vreg(addr_reg); // Store to address in vreg
+                    inst->src1 = op_vreg(val_reg);
+                    inst->cast_to_type = node->lhs->ty;
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                }
             }
             break;
         }
@@ -580,7 +594,7 @@ IRProgram *gen_ir(Node *ast) {
         ctx.label_count = 0;
 
         IRFunction *func = calloc(1, sizeof(IRFunction));
-        strcpy(func->name, fn_node->name);
+        func->name = strdup(fn_node->name);
         ctx.current_func = func;
 
         if (fn_node->body && fn_node->body->kind == NODE_KIND_BLOCK) {
@@ -637,6 +651,7 @@ void ir_free(IRProgram *prog) {
             inst = next;
         }
         IRFunction *next_func = func->next;
+        if (func->name) free(func->name);
         free(func);
         func = next_func;
     }

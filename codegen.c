@@ -828,7 +828,17 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 
         case IR_SYSCALL:
             emit("syscall");
+            // Result is in rax, move to dest vreg
             store_operand(inst->dest.vreg, ctx, "rax");
+            break;
+
+        case IR_COPY:
+            // dest = dst_addr, src1 = src_addr, src2 = size (imm)
+            load_operand(inst->dest.vreg, ctx, "rdi"); // Destination
+            load_operand(inst->src1.vreg, ctx, "rsi"); // Source
+            emit("mov rcx, %ld", inst->src2.imm);      // Size
+            emit("cld");
+            emit("rep movsb");
             break;
 
         case IR_GET_ARG:
@@ -910,6 +920,7 @@ static void gen_func(IRFunction *func) {
     linear_scan_alloc(func, &ctx);
 
     fprintf(out, "%s:\n", func->name);
+
     emit("push rbp");
     emit("mov rbp, rsp");
     emit("push rbx");
@@ -920,7 +931,7 @@ static void gen_func(IRFunction *func) {
 
     int stack_size = ctx.stack_slots * 8;
     if (stack_size > 0) {
-        stack_size = (stack_size + 15) & ~15;
+        stack_size = (stack_size + 15) & ~15; // Align to 16 bytes
         emit("sub rsp, %d", stack_size);
     }
 
@@ -928,9 +939,10 @@ static void gen_func(IRFunction *func) {
         gen_inst(inst, &ctx);
     }
 
-    free(ctx.intervals);
-    free(ctx.regs);
-    free(ctx.vreg_to_loc);
+    // Cleanup
+    if (ctx.intervals) free(ctx.intervals);
+    if (ctx.regs) free(ctx.regs);
+    if (ctx.vreg_to_loc) free(ctx.vreg_to_loc);
 }
 
 void codegen(IRProgram *prog, const char *filename) {

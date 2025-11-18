@@ -31,6 +31,7 @@ typedef enum {
     IR_SET_ARG,
     IR_SET_SYS_ARG,
     IR_SYSCALL,
+    IR_COPY,
     IR_ADDR, // Get address of variable
 } IROp;
 
@@ -66,7 +67,7 @@ typedef struct IRInst {
 } IRInst;
 
 typedef struct IRFunction {
-    char name[64];
+    char *name;
     IRInst *instructions;
     int vreg_count;
     int label_count;
@@ -111,7 +112,8 @@ static const char *IR_OP_NAMES[] = {
     "ADD", "SUB", "MUL", "DIV", "MOD", "NEG",
     "EQ", "NE", "LT", "LE", "GT", "GE",
     "JMP", "JZ", "JNZ", "LABEL",
-    "CALL", "RET",
+    "SYSCALL",
+    "COPY", "RET",
     "LOAD", "STORE", "ADDR",
     "PHI", "ASM", "CAST", "CALL", "SET_SYS_ARG", "SYSCALL",
 };

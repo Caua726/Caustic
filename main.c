@@ -110,5 +110,6 @@ int main(int argc, char *argv[]) {
 
     if (ast) free_ast(ast);
     semantic_cleanup();
+    free_all_types();
     return 0;
 }

@@ -499,18 +499,5 @@ void semantic_cleanup() {
     // Limpar tipos se necessário (mas eles são globais/estáticos por enquanto, então talvez não precise)
     // Se types_init alocasse dinamicamente cada vez, precisaria limpar.
     // Como são alocados uma vez, o SO limpa no final. Mas para ser purista:
-    free(type_i8);
-    free(type_i16);
-    free(type_i32);
-    free(type_i64);
-    free(type_u8);
-    free(type_u16);
-    free(type_u32);
-    free(type_u64);
-    free(type_f32);
-    free(type_f64);
-    free(type_bool);
-    free(type_char);
-    free(type_string);
-    free(type_void);
+    // Types are freed by free_all_types() in main.c
 }

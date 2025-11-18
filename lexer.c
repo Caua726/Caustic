@@ -44,7 +44,9 @@ Token lexer_next() {
         t.line = line;
         int i = 0;
         while (isalnum(current_char)) {
-            t.text[i++] = current_char;
+            if (i < 255) {
+                t.text[i++] = current_char;
+            }
             next_char();
         }
         t.text[i] = '\0';
@@ -69,7 +71,9 @@ Token lexer_next() {
         t.line = line;
         int i = 0;
         while (isdigit(current_char)) {
-            t.text[i++] = current_char;
+            if (i < 255) {
+                t.text[i++] = current_char;
+            }
             next_char();
         }
         t.text[i] = '\0';
@@ -107,6 +111,12 @@ Token lexer_next() {
             next_char();
             return t;
         case '/':
+            if (lookhead_char() == '/') {
+                while (current_char != '\n' && current_char != EOF) {
+                    next_char();
+                }
+                return lexer_next();
+            }
             t.text[0] = '/';
             t.text[1] = '\0';
             t.type = TOKEN_TYPE_DIVIDER;
@@ -255,12 +265,16 @@ Token lexer_next() {
             while (current_char != '"' && current_char != EOF && current_char != '\n') {
                 if (current_char == '\\' && lookhead_char() == '"') {
                     next_char();
-                    t.text[strlen(t.text)] = '"';
-                    t.text[strlen(t.text) + 1] = '\0';
+                    if (strlen(t.text) < 255) {
+                        t.text[strlen(t.text)] = '"';
+                        t.text[strlen(t.text) + 1] = '\0';
+                    }
                     next_char();
                 } else {
-                    t.text[strlen(t.text)] = current_char;
-                    t.text[strlen(t.text) + 1] = '\0';
+                    if (strlen(t.text) < 255) {
+                        t.text[strlen(t.text)] = current_char;
+                        t.text[strlen(t.text) + 1] = '\0';
+                    }
                     next_char();
                 }
             }
