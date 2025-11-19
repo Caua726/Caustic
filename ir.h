@@ -88,6 +88,7 @@ typedef struct {
     IRFunction *functions;
     IRFunction *main_func;
     IRGlobal *globals;
+    struct StringLiteral *strings;
 } IRProgram;
 
 static inline Operand op_none() {

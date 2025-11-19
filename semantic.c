@@ -278,6 +278,14 @@ static void walk(Node *node) {
             node->ty = type_i32;
             return;
 
+        case NODE_KIND_STRING_LITERAL: {
+            Type *ptr_ty = new_type(TY_PTR);
+            ptr_ty->base = type_u8;
+            ptr_ty->size = 8;
+            node->ty = ptr_ty;
+            return;
+        }
+
         case NODE_KIND_IDENTIFIER: {
             Variable *var = symtab_lookup(node->name);
             if (!var) {
@@ -287,14 +295,6 @@ static void walk(Node *node) {
             node->var = var;
             node->ty = var->type;
             node->offset = var->offset;
-            // We need to propagate is_global info to the node or check var->is_global in codegen
-            // But Node struct doesn't have is_global. Let's rely on node->var->is_global if var is set.
-            // Or we can use a negative offset or special flag in Node?
-            // The plan said "Update walk() to handle NODE_KIND_IDENTIFIER for globals correctly (set is_global flag)".
-            // But Node struct doesn't have is_global. Let's check if we can add it or use existing fields.
-            // Actually, in codegen we look at node->offset. If we have access to node->var, we can check that.
-            // Let's check if Node has 'var' field. Yes: struct Variable *var;
-            // So we are good.
             return;
         }
 
@@ -318,6 +318,10 @@ static void walk(Node *node) {
             }
             walk(node->body);
             symtab_exit_scope();
+            return;
+
+        case NODE_KIND_EXPR_STMT:
+            walk(node->expr);
             return;
 
         case NODE_KIND_BLOCK:

@@ -976,15 +976,27 @@ static void emit_data_section(IRProgram *prog) {
     }
 }
 
+static void emit_rodata(IRProgram *prog) {
+    if (!prog->strings) return;
+
+    fprintf(out, ".section .rodata\n");
+    for (StringLiteral *s = prog->strings; s; s = s->next) {
+        fprintf(out, ".LC%d:\n", s->id);
+        fprintf(out, "  .string \"%s\"\n", s->value);
+    }
+    fprintf(out, ".text\n");
+}
+
 void codegen(IRProgram *prog, FILE *output) {
     out = output;
 
     fprintf(out, ".intel_syntax noprefix\n");
     
+    emit_rodata(prog);
     emit_data_section(prog);
 
     fprintf(out, ".text\n");
-    fprintf(out, ".global main\n\n"); // Keep .global main here as it's a text section entry point
+    fprintf(out, ".globl main\n");
     
     for (IRFunction *func = prog->functions; func; func = func->next) {
         gen_func(func);

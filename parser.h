@@ -77,7 +77,14 @@ typedef enum {
     NODE_KIND_LOGICAL_OR,
     NODE_KIND_BREAK,
     NODE_KIND_CONTINUE,
+    NODE_KIND_STRING_LITERAL,
 } NodeKind;
+
+typedef struct StringLiteral {
+    int id;
+    char *value;
+    struct StringLiteral *next;
+} StringLiteral;
 
 typedef enum {
     VAR_FLAG_NONE,
@@ -128,3 +135,4 @@ Type *new_type(TypeKind kind);
 void free_all_types();
 void parser_init();
 Node *parse();
+StringLiteral *get_strings();

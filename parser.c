@@ -9,6 +9,22 @@
 static Token current_token;
 static Token lookahead_token;
 
+static StringLiteral *strings_head = NULL;
+static int string_id_counter = 0;
+
+static int register_string(char *val) {
+    StringLiteral *s = calloc(1, sizeof(StringLiteral));
+    s->id = string_id_counter++;
+    s->value = val;
+    s->next = strings_head;
+    strings_head = s;
+    return s->id;
+}
+
+StringLiteral *get_strings() {
+    return strings_head;
+}
+
 static void consume();
 static Node *parse_block();
 static Node *parse_fn();
@@ -262,6 +278,14 @@ static Node *new_binary_node(NodeKind kind, Node *lhs, Node *rhs) {
 static Node *parse_primary() {
     if (current_token.type == TOKEN_TYPE_INTEGER) {
         Node *node = new_node_num(current_token.int_value);
+        consume();
+        return node;
+    }
+
+    if (current_token.type == TOKEN_TYPE_STRING) {
+        int id = register_string(strdup(current_token.text));
+        Node *node = new_node(NODE_KIND_STRING_LITERAL);
+        node->val = id;
         consume();
         return node;
     }
