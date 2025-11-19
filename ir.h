@@ -72,9 +72,11 @@ typedef struct IRInst {
 
 typedef struct IRFunction {
     char *name;
+    char *asm_name;
     IRInst *instructions;
     int vreg_count;
     int label_count;
+    int is_reachable;
     struct IRFunction *next;
 } IRFunction;
 
@@ -83,6 +85,7 @@ typedef struct IRGlobal {
     int size;
     long init_value; // For simple integer initialization
     int is_initialized;
+    int is_reachable;
     struct IRGlobal *next;
 } IRGlobal;
 
@@ -121,16 +124,7 @@ static inline Operand op_label(int label) {
     return op;
 }
 
-static const char *IR_OP_NAMES[] = {
-    "IMM", "MOV",
-    "ADD", "SUB", "MUL", "DIV", "MOD", "NEG",
-    "EQ", "NE", "LT", "LE", "GT", "GE",
-    "JMP", "JZ", "JNZ", "LABEL",
-    "SYSCALL",
-    "COPY", "RET",
-    "LOAD", "STORE", "ADDR", "ADDR_GLOBAL",
-    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_SYS_ARG", "SYSCALL",
-};
+extern const char *IR_OP_NAMES[];
 
 IRProgram *gen_ir(Node *ast);
 void ir_free(IRProgram *prog);

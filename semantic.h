@@ -4,12 +4,16 @@
 
 
 
+typedef struct Module Module;
+
 typedef struct Variable {
     char *name;
     Type *type;
     VarFlags flags;
     int offset;
     int is_global;
+    int is_module;
+    Module *module_ref;
     struct Variable *next;
 } Variable;
 
@@ -34,6 +38,8 @@ typedef struct Function {
     Type *return_type;
     Type **param_types;
     int param_count;
+    char *asm_name;
+    char *module_prefix;
     struct Function *next;
 } Function;
 

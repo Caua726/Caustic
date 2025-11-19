@@ -81,6 +81,8 @@ typedef enum {
     NODE_KIND_SHL,
     NODE_KIND_SHR,
     NODE_KIND_SIZEOF,
+    NODE_KIND_USE,
+    NODE_KIND_MODULE_ACCESS,
 } NodeKind;
 
 typedef struct StringLiteral {

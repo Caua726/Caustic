@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "parser.h"
 #include "lexer.h"
 #include "semantic.h"
@@ -72,6 +73,7 @@ static Type *parse_type();
 static Node *parse_struct_decl();
 static void parse_file_body(Node **cur_ptr);
 static void parse_use(Node **cur_ptr);
+static Node *new_node(NodeKind kind);
 
 
 void parser_init() {
@@ -87,15 +89,34 @@ static void parse_use(Node **cur_ptr) {
         exit(1);
     }
 
-    // The lexer already removes quotes from strings
-    // Make a copy of the path since current_token will be consumed
     char path[256];
     strncpy(path, current_token.text, sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
     
     consume(); // Consume string token
+
+    char *alias = NULL;
+    if (current_token.type == TOKEN_TYPE_AS) {
+        consume();
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            fprintf(stderr, "Erro na linha %d: esperado identificador apos 'as'\n", current_token.line);
+            exit(1);
+        }
+        alias = strdup(current_token.text);
+        consume();
+    }
+
     expect(TOKEN_TYPE_SEMICOLON);
 
+    // Create NODE_KIND_USE
+    Node *use_node = new_node(NODE_KIND_USE);
+    use_node->name = alias; // Store alias in name
+    // We can store path in string literal or just use val/member_name? 
+    // Let's use member_name for path for now, or create a string literal node?
+    // Node struct has 'member_name'. Let's use that for path.
+    use_node->member_name = strdup(path);
+
+    // Recursive parsing
     if (!mark_file_visited(path)) {
         FILE *f = fopen(path, "r");
         if (!f) {
@@ -111,7 +132,14 @@ static void parse_use(Node **cur_ptr) {
         lexer_init(f);
         parser_init();
 
-        parse_file_body(cur_ptr);
+        // Parse into a new list for the module
+        Node module_head = {0}; // Dummy head
+        Node *module_cur = &module_head;
+        
+        parse_file_body(&module_cur);
+        
+        use_node->body = module_head.next;
+        // free dummy_head? (careful with GC/memory)
 
         lexer_set_state(&state);
         current_token = saved_curr;
@@ -119,6 +147,10 @@ static void parse_use(Node **cur_ptr) {
         
         fclose(f);
     }
+
+    // Append use_node to current AST
+    (*cur_ptr)->next = use_node;
+    *cur_ptr = use_node;
 }
 
 static void parse_file_body(Node **cur_ptr) {
@@ -391,7 +423,7 @@ static Node *parse_primary() {
     }
 
     if (current_token.type == TOKEN_TYPE_LPAREN) {
-        Token paren_tok = current_token;
+    
         consume();
 
         if (current_token.type == TOKEN_TYPE_IDENTIFIER) {

@@ -38,9 +38,7 @@ typedef struct {
 static FILE *out;
 static const char *regs[] = {"rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
 static const int num_regs = 14;
-static const int rax_idx = 0;
-static const int rcx_idx = 1;
-static const int rdx_idx = 2;
+
 
 // System V AMD64 ABI argument registers: rdi, rsi, rdx, rcx, r8, r9
 static const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
@@ -57,82 +55,9 @@ static void emit(const char *fmt, ...) {
     va_end(args);
 }
 
-static CFGNode *build_cfg(IRFunction *func, int n) {
-    CFGNode *cfg = calloc(n, sizeof(CFGNode));
-    int *label_to_pos = calloc(func->label_count + 1, sizeof(int));
 
-    int pos = 0;
-    for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
-        if (inst->op == IR_LABEL) {
-            label_to_pos[inst->dest.label] = pos;
-        }
-    }
 
-    pos = 0;
-    for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
-        cfg[pos].successors = calloc(2, sizeof(int));
-        cfg[pos].num_successors = 0;
 
-        if (inst->op == IR_JMP) {
-            cfg[pos].successors[0] = label_to_pos[inst->dest.label];
-            cfg[pos].num_successors = 1;
-        } else if (inst->op == IR_JZ || inst->op == IR_JNZ) {
-            cfg[pos].successors[0] = label_to_pos[inst->dest.label];
-            if (inst->next) {
-                cfg[pos].successors[1] = pos + 1;
-                cfg[pos].num_successors = 2;
-            } else {
-                cfg[pos].num_successors = 1;
-            }
-        } else if (inst->op == IR_RET) {
-            cfg[pos].num_successors = 0;
-        } else {
-            if (inst->next) {
-                cfg[pos].successors[0] = pos + 1;
-                cfg[pos].num_successors = 1;
-            }
-        }
-    }
-
-    free(label_to_pos);
-    return cfg;
-}
-
-static void liveness_analysis(IRFunction *func, unsigned long *live_in, unsigned long *live_out) {
-    int n = 0;
-    for (IRInst *inst = func->instructions; inst; inst = inst->next) n++;
-
-    CFGNode *cfg = build_cfg(func, n);
-
-    int changed = 1;
-    while (changed) {
-        changed = 0;
-        int pos = 0;
-        for (IRInst *inst = func->instructions; inst; inst = inst->next, pos++) {
-            unsigned long old_in = live_in[pos];
-            unsigned long old_out = live_out[pos];
-
-            unsigned long use = 0, def = 0;
-            if (inst->src1.type == OPERAND_VREG && inst->src1.vreg < 64) use |= (1UL << inst->src1.vreg);
-            if (inst->src2.type == OPERAND_VREG && inst->src2.vreg < 64) use |= (1UL << inst->src2.vreg);
-            if (inst->dest.type == OPERAND_VREG && inst->dest.vreg < 64) def |= (1UL << inst->dest.vreg);
-
-            live_out[pos] = 0;
-            for (int i = 0; i < cfg[pos].num_successors; i++) {
-                live_out[pos] |= live_in[cfg[pos].successors[i]];
-            }
-
-            live_in[pos] = use | (live_out[pos] & ~def);
-
-            if (old_in != live_in[pos] || old_out != live_out[pos]) changed = 1;
-        }
-    }
-
-    for (int i = 0; i < n; i++) {
-        free(cfg[i].successors);
-    }
-    free(cfg);
-}
 
 static int interval_cmp(const void *a, const void *b) {
     LiveInterval *ia = (LiveInterval *)a;
@@ -223,7 +148,7 @@ static int find_free_reg(AllocCtx *ctx, int pos) {
     return -1;
 }
 
-static int spill_register(AllocCtx *ctx, int pos) {
+static int spill_register(AllocCtx *ctx) {
     int max_cost = -1;
     int victim = -1;
 
@@ -290,7 +215,7 @@ static void linear_scan_alloc(IRFunction *func, AllocCtx *ctx) {
 
         int reg = find_free_reg(ctx, iv->start);
         if (reg == -1) {
-            reg = spill_register(ctx, iv->start);
+            reg = spill_register(ctx);
         }
 
         if (reg != -1) {
@@ -348,7 +273,7 @@ static void gen_binary_op(IRInst *inst, AllocCtx *ctx, const char *op) {
 }
 
 static void gen_inst(IRInst *inst, AllocCtx *ctx) {
-    char dst[64], src1[64], src2[64];
+    char dst[64], src1[64];
 
     switch (inst->op) {
         case IR_IMM:
@@ -523,12 +448,22 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 
         case IR_ADDR:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            emit("lea %s, [rbp-%ld]", dst, inst->src1.imm);
+            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                emit("lea r15, [rbp-%ld]", inst->src1.imm);
+                emit("mov %s, r15", dst);
+            } else {
+                emit("lea %s, [rbp-%ld]", dst, inst->src1.imm);
+            }
             break;
 
         case IR_ADDR_GLOBAL:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            emit("lea %s, [rip+%s]", dst, inst->global_name);
+            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                emit("lea r15, [rip+%s]", inst->global_name);
+                emit("mov %s, r15", dst);
+            } else {
+                emit("lea %s, [rip+%s]", dst, inst->global_name);
+            }
             break;
 
         case IR_LOAD:
@@ -620,13 +555,13 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                     if (size == 8) emit("mov QWORD PTR [r15], %s", val_reg);
                     else if (size == 4) {
                         // Extract 32-bit part of reg
-                        char reg32[64];
+                        char reg32[128];
                         if (strcmp(val_reg, "rax") == 0) strcpy(reg32, "eax");
                         else if (strcmp(val_reg, "rbx") == 0) strcpy(reg32, "ebx");
                         // ... simplified for brevity, assuming standard regs ...
-                        else if (val_reg[0] == 'r' && val_reg[2] == 0) { sprintf(reg32, "%sd", val_reg); } // r8 -> r8d
-                        else if (val_reg[0] == 'r') { sprintf(reg32, "%sd", val_reg); } // r12 -> r12d
-                        else { sprintf(reg32, "e%s", val_reg+1); } // rbx -> ebx (approx)
+                        else if (val_reg[0] == 'r' && val_reg[2] == 0) { snprintf(reg32, sizeof(reg32), "%sd", val_reg); } // r8 -> r8d
+                        else if (val_reg[0] == 'r') { snprintf(reg32, sizeof(reg32), "%sd", val_reg); } // r12 -> r12d
+                        else { snprintf(reg32, sizeof(reg32), "e%s", val_reg+1); } // rbx -> ebx (approx)
                         
                         // Better reg mapping needed or reuse existing helper logic?
                         // Let's reuse the logic from existing STORE but adapted.
@@ -937,11 +872,9 @@ static void gen_func(IRFunction *func) {
     // printf("; max_offset: %ld, next_spill: %d\n", max_offset, ctx.next_spill);
 
     linear_scan_alloc(func, &ctx);
-
-    fprintf(out, "%s:\n", func->name);
-
-    emit("push rbp");
-    emit("mov rbp, rsp");
+    
+    // Label and prologue are handled in codegen() loop
+    
     emit("push rbx");
     emit("push r12");
     emit("push r13");
@@ -969,6 +902,7 @@ static void emit_data_section(IRProgram *prog) {
 
     fprintf(out, ".section .data\n");
     for (IRGlobal *g = prog->globals; g; g = g->next) {
+        if (!g->is_reachable) continue;
         if (g->is_initialized) {
             fprintf(out, ".global %s\n", g->name);
             fprintf(out, "%s:\n", g->name);
@@ -982,6 +916,7 @@ static void emit_data_section(IRProgram *prog) {
 
     fprintf(out, ".section .bss\n");
     for (IRGlobal *g = prog->globals; g; g = g->next) {
+        if (!g->is_reachable) continue;
         if (!g->is_initialized) {
             fprintf(out, ".global %s\n", g->name);
             fprintf(out, "%s:\n", g->name);
@@ -1013,6 +948,16 @@ void codegen(IRProgram *prog, FILE *output) {
     fprintf(out, ".globl main\n");
     
     for (IRFunction *func = prog->functions; func; func = func->next) {
+        if (!func->is_reachable) continue;
+        if (func->asm_name) {
+            fprintf(out, "%s:\n", func->asm_name);
+        } else {
+            fprintf(out, "%s:\n", func->name);
+        }
+        
+        emit("push rbp");
+        emit("mov rbp, rsp");
+        
         gen_func(func);
         fprintf(out, "\n");
     }
