@@ -60,6 +60,8 @@ const char *TOKEN_NAMES[] = {
 	"TOKEN_TYPE_SHL",
 	"TOKEN_TYPE_SHR",
 	"TOKEN_TYPE_USE",
+    "TOKEN_TYPE_FOR",
+    "TOKEN_TYPE_DO",
 };
 
 static FILE *src;
@@ -159,6 +161,8 @@ Token lexer_next() {
         else if (strcmp(t.text, "sizeof") == 0) {t.type = TOKEN_TYPE_SIZEOF;}
         else if (strcmp(t.text, "cast") == 0) {t.type = TOKEN_TYPE_CAST;}
         else if (strcmp(t.text, "use") == 0) {t.type = TOKEN_TYPE_USE;}
+        else if (strcmp(t.text, "for") == 0) {t.type = TOKEN_TYPE_FOR;}
+        else if (strcmp(t.text, "do") == 0) {t.type = TOKEN_TYPE_DO;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;

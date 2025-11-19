@@ -24,6 +24,7 @@ typedef struct {
     struct {
         int start_label;
         int end_label;
+        int continue_label;
     } loop_stack[32];
     int loop_depth;
 } IRGenContext;
@@ -31,13 +32,14 @@ typedef struct {
 static IRGenContext ctx;
 static int global_label_count = 0;
 
-static void push_loop(int start, int end) {
+static void push_loop(int start, int end, int cont) {
     if (ctx.loop_depth >= 32) {
         fprintf(stderr, "Erro: loops aninhados demais\n");
         exit(1);
     }
     ctx.loop_stack[ctx.loop_depth].start_label = start;
     ctx.loop_stack[ctx.loop_depth].end_label = end;
+    ctx.loop_stack[ctx.loop_depth].continue_label = cont;
     ctx.loop_depth++;
 }
 
@@ -710,9 +712,60 @@ static int gen_expr(Node *node) {
             return dest;
         }
 
-        case NODE_KIND_ASSIGN:
-            fprintf(stderr, "Erro: atribuição ainda não implementada\n");
-            exit(1);
+        case NODE_KIND_ASSIGN: {
+            if (node->lhs->ty->kind == TY_ARRAY || node->lhs->ty->size > 8) {
+                // Array/Struct copy
+                int src_addr = gen_addr(node->rhs);
+                int dst_addr = gen_addr(node->lhs);
+                
+                IRInst *inst = new_inst(IR_COPY);
+                inst->dest = op_vreg(dst_addr);
+                inst->src1 = op_vreg(src_addr);
+                inst->src2 = op_imm(node->lhs->ty->size); // Use src2 for size
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+                return dst_addr;
+            } else {
+                // Scalar assignment
+                int val_reg = gen_expr(node->rhs);
+                
+                if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                    if (node->lhs->var && node->lhs->var->is_global) {
+                        // Store to global: 1. Get address, 2. Store to address
+                        int addr = new_vreg();
+                        IRInst *addr_inst = new_inst(IR_ADDR_GLOBAL);
+                        addr_inst->dest = op_vreg(addr);
+                        addr_inst->global_name = strdup(node->lhs->name);
+                        addr_inst->line = node->tok ? node->tok->line : 0;
+                        emit(addr_inst);
+
+                        IRInst *inst = new_inst(IR_STORE);
+                        inst->dest = op_vreg(addr);
+                        inst->src1 = op_vreg(val_reg);
+                        inst->cast_to_type = node->lhs->ty;
+                        inst->line = node->tok ? node->tok->line : 0;
+                        emit(inst);
+                    } else {
+                        IRInst *inst = new_inst(IR_STORE);
+                        inst->dest = op_imm(node->lhs->offset);
+                        inst->src1 = op_vreg(val_reg);
+                        inst->cast_to_type = node->lhs->ty;
+                        inst->line = node->tok ? node->tok->line : 0;
+                        emit(inst);
+                    }
+                } else {
+                    // Indirect assignment (pointer, array index, etc)
+                    int addr = gen_addr(node->lhs);
+                    IRInst *inst = new_inst(IR_STORE);
+                    inst->dest = op_vreg(addr);
+                    inst->src1 = op_vreg(val_reg);
+                    inst->cast_to_type = node->lhs->ty;
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                }
+                return val_reg;
+            }
+        }
 
         default:
             fprintf(stderr, "Erro interno: tipo de nó não suportado em expressão: %d\n", node->kind);
@@ -803,7 +856,7 @@ static void gen_stmt_single(Node *node) {
             int start_label = new_label();
             int end_label = new_label();
 
-            push_loop(start_label, end_label);
+            push_loop(start_label, end_label, start_label);
 
             IRInst *start_lbl = new_inst(IR_LABEL);
             start_lbl->dest = op_label(start_label);
@@ -832,6 +885,93 @@ static void gen_stmt_single(Node *node) {
             break;
         }
 
+        case NODE_KIND_DO_WHILE: {
+            int start_label = new_label();
+            int end_label = new_label();
+            int cond_label = new_label();
+
+            push_loop(start_label, end_label, cond_label);
+
+            IRInst *start_lbl = new_inst(IR_LABEL);
+            start_lbl->dest = op_label(start_label);
+            emit(start_lbl);
+
+            gen_stmt_single(node->do_while_stmt.body);
+
+            IRInst *cond_lbl = new_inst(IR_LABEL);
+            cond_lbl->dest = op_label(cond_label);
+            emit(cond_lbl);
+
+            int cond_reg = gen_expr(node->do_while_stmt.cond);
+
+            IRInst *jnz = new_inst(IR_JNZ);
+            jnz->src1 = op_vreg(cond_reg);
+            jnz->dest = op_label(start_label);
+            jnz->line = node->tok ? node->tok->line : 0;
+            emit(jnz);
+
+            IRInst *end_lbl = new_inst(IR_LABEL);
+            end_lbl->dest = op_label(end_label);
+            emit(end_lbl);
+
+            pop_loop();
+            break;
+        }
+
+        case NODE_KIND_FOR: {
+            int start_label = new_label();
+            int end_label = new_label();
+            int step_label = new_label();
+
+            // Init
+            if (node->for_stmt.init) {
+                if (node->for_stmt.init->kind == NODE_KIND_LET) {
+                    gen_stmt_single(node->for_stmt.init);
+                } else {
+                    gen_expr(node->for_stmt.init);
+                }
+            }
+
+            push_loop(start_label, end_label, step_label);
+
+            IRInst *start_lbl = new_inst(IR_LABEL);
+            start_lbl->dest = op_label(start_label);
+            emit(start_lbl);
+
+            // Cond
+            if (node->for_stmt.cond) {
+                int cond_reg = gen_expr(node->for_stmt.cond);
+                IRInst *jz = new_inst(IR_JZ);
+                jz->src1 = op_vreg(cond_reg);
+                jz->dest = op_label(end_label);
+                jz->line = node->tok ? node->tok->line : 0;
+                emit(jz);
+            }
+
+            gen_stmt_single(node->for_stmt.body);
+
+            IRInst *step_lbl = new_inst(IR_LABEL);
+            step_lbl->dest = op_label(step_label);
+            emit(step_lbl);
+
+            // Step
+            if (node->for_stmt.step) {
+                gen_expr(node->for_stmt.step);
+            }
+
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(start_label);
+            jmp->line = node->tok ? node->tok->line : 0;
+            emit(jmp);
+
+            IRInst *end_lbl = new_inst(IR_LABEL);
+            end_lbl->dest = op_label(end_label);
+            emit(end_lbl);
+
+            pop_loop();
+            break;
+        }
+
         case NODE_KIND_BREAK: {
             if (ctx.loop_depth == 0) {
                 fprintf(stderr, "Erro: 'break' fora de loop\n");
@@ -850,66 +990,16 @@ static void gen_stmt_single(Node *node) {
                 fprintf(stderr, "Erro: 'continue' fora de loop\n");
                 exit(1);
             }
-            int start_label = ctx.loop_stack[ctx.loop_depth - 1].start_label;
+            int continue_label = ctx.loop_stack[ctx.loop_depth - 1].continue_label;
             IRInst *jmp = new_inst(IR_JMP);
-            jmp->dest = op_label(start_label);
+            jmp->dest = op_label(continue_label);
             jmp->line = node->tok ? node->tok->line : 0;
             emit(jmp);
             break;
         }
-        case NODE_KIND_ASSIGN: {
-            if (node->lhs->ty->kind == TY_ARRAY || node->lhs->ty->size > 8) {
-                // Array/Struct copy
-                int src_addr = gen_addr(node->rhs);
-                int dst_addr = gen_addr(node->lhs);
-                
-                IRInst *inst = new_inst(IR_COPY);
-                inst->dest = op_vreg(dst_addr);
-                inst->src1 = op_vreg(src_addr);
-                inst->src2 = op_imm(node->lhs->ty->size); // Use src2 for size
-                inst->line = node->tok ? node->tok->line : 0;
-                emit(inst);
-            } else {
-                // Scalar assignment
-                int val_reg = gen_expr(node->rhs);
-                
-                if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
-                    if (node->lhs->var && node->lhs->var->is_global) {
-                        // Store to global: 1. Get address, 2. Store to address
-                        int addr = new_vreg();
-                        IRInst *addr_inst = new_inst(IR_ADDR_GLOBAL);
-                        addr_inst->dest = op_vreg(addr);
-                        addr_inst->global_name = strdup(node->lhs->name);
-                        addr_inst->line = node->tok ? node->tok->line : 0;
-                        emit(addr_inst);
-
-                        IRInst *inst = new_inst(IR_STORE);
-                        inst->dest = op_vreg(addr);
-                        inst->src1 = op_vreg(val_reg);
-                        inst->cast_to_type = node->lhs->ty;
-                        inst->line = node->tok ? node->tok->line : 0;
-                        emit(inst);
-                    } else {
-                        IRInst *inst = new_inst(IR_STORE);
-                        inst->dest = op_imm(node->lhs->offset);
-                        inst->src1 = op_vreg(val_reg);
-                        inst->cast_to_type = node->lhs->ty;
-                        inst->line = node->tok ? node->tok->line : 0;
-                        emit(inst);
-                    }
-                } else {
-                    // Indirect assignment (pointer/array/member)
-                    int addr_reg = gen_addr(node->lhs);
-                    IRInst *inst = new_inst(IR_STORE);
-                    inst->dest = op_vreg(addr_reg); // Store to address in vreg
-                    inst->src1 = op_vreg(val_reg);
-                    inst->cast_to_type = node->lhs->ty;
-                    inst->line = node->tok ? node->tok->line : 0;
-                    emit(inst);
-                }
-            }
+        case NODE_KIND_ASSIGN:
+            gen_expr(node);
             break;
-        }
 
         default:
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);
