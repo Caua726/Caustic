@@ -27,6 +27,20 @@ void lexer_init(FILE *file) {
 	next_char();
 }
 
+void lexer_get_state(LexerState *state) {
+    state->file = src;
+    state->line = line;
+    state->current_char = current_char;
+    state->ahead_char = ahead_char;
+}
+
+void lexer_set_state(LexerState *state) {
+    src = state->file;
+    line = state->line;
+    current_char = state->current_char;
+    ahead_char = state->ahead_char;
+}
+
 Token lexer_next() {
 	Token t = {0};
 
@@ -67,6 +81,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "continue") == 0) {t.type = TOKEN_TYPE_CONTINUE;}
         else if (strcmp(t.text, "sizeof") == 0) {t.type = TOKEN_TYPE_SIZEOF;}
         else if (strcmp(t.text, "cast") == 0) {t.type = TOKEN_TYPE_CAST;}
+        else if (strcmp(t.text, "use") == 0) {t.type = TOKEN_TYPE_USE;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
