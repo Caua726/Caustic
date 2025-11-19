@@ -73,6 +73,10 @@ typedef enum {
     NODE_KIND_INDEX,
     NODE_KIND_SYSCALL,
     NODE_KIND_MEMBER_ACCESS,
+    NODE_KIND_LOGICAL_AND,
+    NODE_KIND_LOGICAL_OR,
+    NODE_KIND_BREAK,
+    NODE_KIND_CONTINUE,
 } NodeKind;
 
 typedef enum {

@@ -63,6 +63,8 @@ Token lexer_next() {
         else if (strcmp(t.text, "while") == 0) {t.type = TOKEN_TYPE_WHILE;}
         else if (strcmp(t.text, "syscall") == 0) {t.type = TOKEN_TYPE_SYSCALL;}
         else if (strcmp(t.text, "struct") == 0) {t.type = TOKEN_TYPE_STRUCT;}
+        else if (strcmp(t.text, "break") == 0) {t.type = TOKEN_TYPE_BREAK;}
+        else if (strcmp(t.text, "continue") == 0) {t.type = TOKEN_TYPE_CONTINUE;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
@@ -184,17 +186,33 @@ Token lexer_next() {
                 return t;
             }
         case '&':
-            t.text[0] = '&';
-            t.text[1] = '\0';
-            t.type = TOKEN_TYPE_AND;
-            next_char();
-            return t;
+            if (lookhead_char() == '&') {
+                strcpy(t.text, "&&");
+                t.type = TOKEN_TYPE_AND_AND;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '&';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_AND;
+                next_char();
+                return t;
+            }
         case '|':
-            t.text[0] = '|';
-            t.text[1] = '\0';
-            t.type = TOKEN_TYPE_OR;
-            next_char();
-            return t;
+            if (lookhead_char() == '|') {
+                strcpy(t.text, "||");
+                t.type = TOKEN_TYPE_OR_OR;
+                next_char();
+                next_char();
+                return t;
+            } else {
+                t.text[0] = '|';
+                t.text[1] = '\0';
+                t.type = TOKEN_TYPE_OR;
+                next_char();
+                return t;
+            }
         case '<':
             if (lookhead_char() == '=') {
                 strcpy(t.text, "<=");
