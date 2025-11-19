@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 #include "parser.h"
 #include "lexer.h"
 #include "semantic.h"
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 static Token current_token;
 static Token lookahead_token;
@@ -116,20 +118,50 @@ static void parse_use(Node **cur_ptr) {
     // Node struct has 'member_name'. Let's use that for path.
     use_node->member_name = strdup(path);
 
+    // Resolve path relative to current file
+    char full_path[512];
+    if (path[0] == '/') {
+        strncpy(full_path, path, sizeof(full_path));
+    } else {
+        const char *current_file = current_token.filename;
+        if (!current_file) current_file = ".";
+        
+        char *dir = strdup(current_file);
+        char *last_slash = strrchr(dir, '/');
+        if (last_slash) {
+            *last_slash = '\0';
+        } else {
+            dir[0] = '.';
+            dir[1] = '\0';
+        }
+        
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir, path);
+        free(dir);
+    }
+
+    char canonical_path[4096];
+    if (!realpath(full_path, canonical_path)) {
+        // If realpath fails (e.g. file not found), use full_path for error reporting later
+        strncpy(canonical_path, full_path, sizeof(canonical_path));
+    }
+
     // Recursive parsing
-    if (!mark_file_visited(path)) {
-        FILE *f = fopen(path, "r");
+    if (!mark_file_visited(canonical_path)) {
+        FILE *f = fopen(canonical_path, "r");
         if (!f) {
-            fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'\n", path);
+            fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'\n", canonical_path);
             exit(1);
         }
+        
+        // We need to keep the filename string alive for tokens
+        char *persistent_path = strdup(canonical_path);
 
         LexerState state;
         lexer_get_state(&state);
         Token saved_curr = current_token;
         Token saved_look = lookahead_token;
 
-        lexer_init(f, path);
+        lexer_init(f, persistent_path);
         parser_init();
 
         // Parse into a new list for the module
