@@ -89,4 +89,4 @@ void lexer_init(FILE *file, const char *filename);
 Token lexer_next();
 void lexer_get_state(LexerState *state);
 void lexer_set_state(LexerState *state);
-void error_at_token(Token t, const char *fmt, ...);
+_Noreturn void error_at_token(Token t, const char *fmt, ...);

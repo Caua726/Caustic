@@ -279,25 +279,69 @@ static int gen_expr(Node *node) {
         case NODE_KIND_ADD: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            int line = node->tok ? node->tok->line : 0;
+
+            // Pointer Arithmetic: ptr + int
+            if (node->lhs->ty->kind == TY_PTR && (node->rhs->ty->kind == TY_I32 || node->rhs->ty->kind == TY_I64)) {
+                int size = node->lhs->ty->base->size;
+                if (size > 1) {
+                    int size_reg = emit_imm(size, line);
+                    rhs = emit_binary(IR_MUL, rhs, size_reg, line);
+                }
+                return emit_binary(IR_ADD, lhs, rhs, line);
+            }
+            // Pointer Arithmetic: int + ptr
+            if (node->rhs->ty->kind == TY_PTR && (node->lhs->ty->kind == TY_I32 || node->lhs->ty->kind == TY_I64)) {
+                int size = node->rhs->ty->base->size;
+                if (size > 1) {
+                    int size_reg = emit_imm(size, line);
+                    lhs = emit_binary(IR_MUL, lhs, size_reg, line);
+                }
+                return emit_binary(IR_ADD, lhs, rhs, line);
+            }
+
             if (node->lhs->ty != node->ty) {
-                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+                lhs = emit_cast(lhs, node->ty, line);
             }
             if (node->rhs->ty != node->ty) {
-                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+                rhs = emit_cast(rhs, node->ty, line);
             }
-            return emit_binary(IR_ADD, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary(IR_ADD, lhs, rhs, line);
         }
 
         case NODE_KIND_SUBTRACTION: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
+            int line = node->tok ? node->tok->line : 0;
+
+            // Pointer Arithmetic: ptr - int
+            if (node->lhs->ty->kind == TY_PTR && (node->rhs->ty->kind == TY_I32 || node->rhs->ty->kind == TY_I64)) {
+                int size = node->lhs->ty->base->size;
+                if (size > 1) {
+                    int size_reg = emit_imm(size, line);
+                    rhs = emit_binary(IR_MUL, rhs, size_reg, line);
+                }
+                return emit_binary(IR_SUB, lhs, rhs, line);
+            }
+            
+            // Pointer Arithmetic: ptr - ptr
+            if (node->lhs->ty->kind == TY_PTR && node->rhs->ty->kind == TY_PTR) {
+                int diff = emit_binary(IR_SUB, lhs, rhs, line);
+                int size = node->lhs->ty->base->size;
+                if (size > 1) {
+                    int size_reg = emit_imm(size, line);
+                    return emit_binary(IR_DIV, diff, size_reg, line);
+                }
+                return diff;
+            }
+
             if (node->lhs->ty != node->ty) {
-                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+                lhs = emit_cast(lhs, node->ty, line);
             }
             if (node->rhs->ty != node->ty) {
-                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+                rhs = emit_cast(rhs, node->ty, line);
             }
-            return emit_binary(IR_SUB, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary(IR_SUB, lhs, rhs, line);
         }
 
         case NODE_KIND_MULTIPLIER: {
@@ -1094,7 +1138,7 @@ IRProgram *gen_ir(Node *ast) {
         ctx.inst_head = NULL;
         ctx.inst_tail = NULL;
         ctx.vreg_count = 0;
-        // ctx.label_count = 0; // REMOVED: Labels must be unique across all functions
+        // Labels are global to ensure uniqueness across functions
 
         IRFunction *func = calloc(1, sizeof(IRFunction));
         func->name = strdup(fn_node->name);

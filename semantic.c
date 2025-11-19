@@ -384,6 +384,10 @@ static void walk(Node *node) {
 
         case NODE_KIND_LET: {
             resolve_type_ref(node->ty);
+            if (node->ty->kind == TY_VOID) {
+                fprintf(stderr, "Erro na linha %d: Variável '%s' não pode ser do tipo void.\n", node->tok ? node->tok->line : 0, node->name);
+                exit(1);
+            }
             if (node->init_expr) {
                 walk(node->init_expr);
 
@@ -432,6 +436,11 @@ static void walk(Node *node) {
             walk(node->lhs);
             walk(node->rhs);
 
+            if (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT) {
+                fprintf(stderr, "Erro na linha %d: Operacao invalida com structs.\n", node->tok ? node->tok->line : 0);
+                exit(1);
+            }
+
             if (node->lhs->kind == NODE_KIND_NUM && node->rhs->kind != NODE_KIND_NUM) {
                 long val = node->lhs->val;
                 Type *target = node->rhs->ty;
@@ -458,6 +467,31 @@ static void walk(Node *node) {
                 }
             }
 
+            // Pointer Arithmetic
+            if (node->kind == NODE_KIND_ADD || node->kind == NODE_KIND_SUBTRACTION) {
+                if (node->lhs->ty->kind == TY_PTR && (node->rhs->ty->kind == TY_I32 || node->rhs->ty->kind == TY_I64)) {
+                    node->ty = node->lhs->ty;
+                    return;
+                }
+                if (node->rhs->ty->kind == TY_PTR && (node->lhs->ty->kind == TY_I32 || node->lhs->ty->kind == TY_I64)) {
+                    if (node->kind == NODE_KIND_SUBTRACTION) {
+                        fprintf(stderr, "Erro: subtracao de ponteiro por inteiro invalida (int - ptr).\n");
+                        exit(1);
+                    }
+                    node->ty = node->rhs->ty;
+                    return;
+                }
+                if (node->lhs->ty->kind == TY_PTR && node->rhs->ty->kind == TY_PTR) {
+                    if (node->kind == NODE_KIND_SUBTRACTION) {
+                        node->ty = type_i64; // ptrdiff_t
+                        return;
+                    } else {
+                        fprintf(stderr, "Erro: soma de dois ponteiros invalida.\n");
+                        exit(1);
+                    }
+                }
+            }
+
             Type *target_type;
             if (node->lhs->ty->size > node->rhs->ty->size) {
                 target_type = node->lhs->ty;
@@ -481,6 +515,12 @@ static void walk(Node *node) {
         case NODE_KIND_LOGICAL_OR:
             walk(node->lhs);
             walk(node->rhs);
+            
+            if (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT) {
+                fprintf(stderr, "Erro na linha %d: Operacao invalida com structs.\n", node->tok ? node->tok->line : 0);
+                exit(1);
+            }
+
             // Check if operands are boolean-like (integers or bool)
             // For now, we allow integers as booleans (C-style)
             node->ty = type_bool;
@@ -946,7 +986,13 @@ static void register_funcs(Node *node) {
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_FN) {
              // Resolve param types and return type
-            for (Node *p = n->params; p; p = p->next) resolve_type_ref(p->ty);
+            for (Node *p = n->params; p; p = p->next) {
+                resolve_type_ref(p->ty);
+                if (p->ty->kind == TY_VOID) {
+                    fprintf(stderr, "Erro na linha %d: Parâmetro '%s' não pode ser do tipo void.\n", p->tok ? p->tok->line : 0, p->name);
+                    exit(1);
+                }
+            }
             resolve_type_ref(n->return_type);
 
             int param_count = 0;
