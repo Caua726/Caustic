@@ -512,6 +512,11 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             emit("lea %s, [rbp-%ld]", dst, inst->src1.imm);
             break;
 
+        case IR_ADDR_GLOBAL:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            emit("lea %s, [rip+%s]", dst, inst->global_name);
+            break;
+
         case IR_LOAD:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
             
@@ -552,24 +557,24 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                     const char *target_reg = dst_is_mem ? "r15" : dst;
 
                     if (size == 8) {
-                        emit("mov %s, QWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                        emit("mov %s, QWORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
                     } else if (size == 4) {
                         if (inst->cast_to_type->is_signed) {
-                            emit("movsxd %s, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                            emit("movsxd %s, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         } else {
-                            emit("mov %sd, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                            emit("mov %sd, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         }
                     } else if (size == 2) {
                         if (inst->cast_to_type->is_signed) {
-                            emit("movsx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                            emit("movsx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         } else {
-                            emit("movzx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                            emit("movzx %s, WORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         }
                     } else if (size == 1) {
                         if (inst->cast_to_type->is_signed) {
-                            emit("movsx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                            emit("movsx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         } else {
-                            emit("movzx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm + size);
+                            emit("movzx %s, BYTE PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         }
                     }
 
@@ -577,7 +582,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                         emit("mov %s, r15", dst);
                     }
                 } else {
-                    emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm + 8);
+                    emit("mov %s, QWORD PTR [rbp-%ld]", dst, inst->src1.imm);
                 }
             }
             break;
@@ -640,7 +645,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                     }
 
                     if (size == 8) {
-                        emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + size, source_reg);
+                        emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm, source_reg);
                     } else if (size == 4) {
                         char reg32[64];
                         if (strcmp(source_reg, "rax") == 0) strcpy(reg32, "eax");
@@ -658,7 +663,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                         else if (strcmp(source_reg, "r14") == 0) strcpy(reg32, "r14d");
                         else if (strcmp(source_reg, "r15") == 0) strcpy(reg32, "r15d");
                         else strncpy(reg32, source_reg, sizeof(reg32) - 1);
-                        emit("mov DWORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg32);
+                        emit("mov DWORD PTR [rbp-%ld], %s", inst->dest.imm, reg32);
                     } else if (size == 2) {
                         char reg16[64];
                         if (strcmp(source_reg, "rax") == 0) strcpy(reg16, "ax");
@@ -945,20 +950,44 @@ static void gen_func(IRFunction *func) {
     if (ctx.vreg_to_loc) free(ctx.vreg_to_loc);
 }
 
-void codegen(IRProgram *prog, const char *filename) {
-    out = fopen(filename, "w");
-    if (!out) {
-        fprintf(stderr, "Erro ao abrir arquivo de saida: %s\n", filename);
-        return;
+static void emit_data_section(IRProgram *prog) {
+    if (!prog->globals) return;
+
+    fprintf(out, ".section .data\n");
+    for (IRGlobal *g = prog->globals; g; g = g->next) {
+        if (g->is_initialized) {
+            fprintf(out, ".global %s\n", g->name);
+            fprintf(out, "%s:\n", g->name);
+            if (g->size == 1) fprintf(out, "  .byte %ld\n", g->init_value);
+            else if (g->size == 2) fprintf(out, "  .value %ld\n", g->init_value);
+            else if (g->size == 4) fprintf(out, "  .long %ld\n", g->init_value);
+            else if (g->size == 8) fprintf(out, "  .quad %ld\n", g->init_value);
+            else fprintf(out, "  .zero %d\n", g->size);
+        }
     }
 
-    fprintf(out, ".intel_syntax noprefix\n");
-    fprintf(out, ".global main\n\n");
+    fprintf(out, ".section .bss\n");
+    for (IRGlobal *g = prog->globals; g; g = g->next) {
+        if (!g->is_initialized) {
+            fprintf(out, ".global %s\n", g->name);
+            fprintf(out, "%s:\n", g->name);
+            fprintf(out, "  .zero %d\n", g->size);
+        }
+    }
+}
 
+void codegen(IRProgram *prog, FILE *output) {
+    out = output;
+
+    fprintf(out, ".intel_syntax noprefix\n");
+    
+    emit_data_section(prog);
+
+    fprintf(out, ".text\n");
+    fprintf(out, ".global main\n\n"); // Keep .global main here as it's a text section entry point
+    
     for (IRFunction *func = prog->functions; func; func = func->next) {
         gen_func(func);
         fprintf(out, "\n");
     }
-
-    fclose(out);
 }

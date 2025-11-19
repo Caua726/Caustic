@@ -9,6 +9,7 @@ typedef struct Variable {
     Type *type;
     VarFlags flags;
     int offset;
+    int is_global;
     struct Variable *next;
 } Variable;
 

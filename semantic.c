@@ -10,6 +10,7 @@ typedef struct Scope {
 } Scope;
 
 static Scope *current_scope = NULL;
+static Scope *global_scope = NULL;
 static int stack_offset = 0;
 static Function *function_table = NULL;
 
@@ -181,12 +182,15 @@ static int is_safe_implicit_conversion(Type *from, Type *to) {
 
 static void symtab_init() {
     current_scope = NULL;
+    global_scope = calloc(1, sizeof(Scope));
+    current_scope = global_scope;
     stack_offset = 48; // Reserve 48 bytes for saved registers (rbx, r12-r15) + alignment
 }
 
 static void symtab_enter_scope() {
     Scope *new_scope = calloc(1, sizeof(Scope));
     new_scope->parent = current_scope;
+    current_scope = new_scope;
     current_scope = new_scope;
 }
 
@@ -195,14 +199,10 @@ static void symtab_exit_scope() {
 
     Scope *old_scope = current_scope;
     current_scope = current_scope->parent;
-
-    Variable *var = old_scope->vars;
-    while (var) {
-        Variable *next = var->next;
-        free(var->name);
-        free(var);
-        var = next;
-    }
+    
+    // Do NOT free variables here, they are referenced by AST nodes.
+    // We could add them to a global list for cleanup later if needed.
+    
     free(old_scope);
 }
 
@@ -223,8 +223,15 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     var->name = strdup(name);
     var->type = type;
     var->flags = flags;
-    var->offset = stack_offset;
-    stack_offset += type->size;
+
+    if (current_scope == global_scope) {
+        var->is_global = 1;
+        var->offset = 0; // Globals don't have stack offset
+    } else {
+        var->is_global = 0;
+        var->offset = stack_offset;
+        stack_offset += type->size;
+    }
 
     var->next = current_scope->vars;
     current_scope->vars = var;
@@ -279,6 +286,14 @@ static void walk(Node *node) {
             node->var = var;
             node->ty = var->type;
             node->offset = var->offset;
+            // We need to propagate is_global info to the node or check var->is_global in codegen
+            // But Node struct doesn't have is_global. Let's rely on node->var->is_global if var is set.
+            // Or we can use a negative offset or special flag in Node?
+            // The plan said "Update walk() to handle NODE_KIND_IDENTIFIER for globals correctly (set is_global flag)".
+            // But Node struct doesn't have is_global. Let's check if we can add it or use existing fields.
+            // Actually, in codegen we look at node->offset. If we have access to node->var, we can check that.
+            // Let's check if Node has 'var' field. Yes: struct Variable *var;
+            // So we are good.
             return;
         }
 
@@ -287,7 +302,13 @@ static void walk(Node *node) {
             return;
 
         case NODE_KIND_FN:
+            // Function scope is a child of global scope (or current scope if nested functions were supported)
+            // But we need to reset stack_offset for each function.
+            // And we need to ensure we are entering a new scope from global scope.
+            // Since we are iterating top-level nodes in analyze(), we might be in global scope.
+            // Let's ensure we push a new scope.
             symtab_enter_scope();
+            stack_offset = 48; // Reset stack offset for new function
             // Declarar parâmetros no escopo da função
             for (Node *param = node->params; param; param = param->next) {
                 Variable *var = symtab_declare(param->name, param->ty, param->flags);
@@ -328,9 +349,8 @@ static void walk(Node *node) {
                 }
             }
             Variable *var = symtab_declare(node->name, node->ty, node->flags);
-            resolve_type_ref(node->ty); // Resolve type if it's a struct
-            var->type = node->ty; // Update var type after resolution
-            var->offset = stack_offset; // Re-read stack offset? No, symtab_declare uses current stack_offset.
+            node->var = var;
+            node->offset = var->offset;
             // Wait, symtab_declare uses type->size. If type was not resolved, size might be 0.
             // We must resolve BEFORE declaring.
             // Let's fix this.
@@ -600,6 +620,34 @@ void analyze(Node *node) {
         }
     }
 
+    // Pass 0.2: Register Globals (Variables)
+    // We need to walk the top-level nodes to find LETs and register them in global scope.
+    // But walk() handles LET by declaring.
+    // So we can just walk the top-level nodes?
+    // But walk() also descends into functions.
+    // We should separate global registration or just let walk() handle it if we are in global scope.
+    // The issue is that functions are also top-level.
+    // If we walk() a FN node, it enters scope and walks body.
+    // If we walk() a LET node, it declares in current (global) scope.
+    // So we can just walk all nodes?
+    // But we need to register functions first so they can be called before definition?
+    // Current logic:
+    // 1. Register structs
+    // 2. Register functions (declare_function)
+    // 3. Walk functions (analyze body)
+    
+    // We need to insert Global Variable analysis.
+    // Globals can be used in functions, so they must be declared before function analysis.
+    // Globals might depend on other globals? "let x = 10; let y = x;"
+    // So order matters.
+    // We should walk top-level LET nodes first.
+    
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_LET) {
+            walk(n);
+        }
+    }
+
     // Pass 0.5: Resolve types in struct fields (handle recursive structs or pointers to structs)
     // For now, we just assume pointers are 8 bytes and don't need deep resolution for size calculation
     // unless we have embedded structs.
@@ -641,6 +689,10 @@ void analyze(Node *node) {
     // Segundo passo: analisar cada função
     for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
         if (fn_node->kind == NODE_KIND_FN) {
+            // Ensure we are back in global scope before entering function
+            // Actually walk(FN) calls symtab_enter_scope().
+            // We need to make sure current_scope is global_scope.
+            // It should be if we balanced calls.
             walk(fn_node);
         }
     }

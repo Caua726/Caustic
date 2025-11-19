@@ -49,8 +49,14 @@ Node *parse() {
              continue;
         }
 
+        if (current_token.type == TOKEN_TYPE_LET) {
+            cur->next = parse_var_decl();
+            cur = cur->next;
+            continue;
+        }
+
         if (current_token.type != TOKEN_TYPE_FN) {
-            fprintf(stderr, "Erro na linha %d: era esperado 'fn' mas encontrou '%s'\n",
+            fprintf(stderr, "Erro na linha %d: era esperado 'fn' ou 'let' mas encontrou '%s'\n",
                     current_token.line, current_token.text);
             exit(1);
         }

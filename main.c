@@ -99,7 +99,16 @@ int main(int argc, char *argv[]) {
         char output[256];
         snprintf(output, sizeof(output), "%s.s", filename);
 
-        codegen(ir, output);
+        FILE *out_file = fopen(output, "w");
+        if (!out_file) {
+            printf("Erro ao abrir arquivo de saida: %s\n", output);
+            ir_free(ir);
+            fclose(file);
+            return 1;
+        }
+
+        codegen(ir, out_file);
+        fclose(out_file);
 
         printf("Compilado com sucesso: %s\n", output);
 

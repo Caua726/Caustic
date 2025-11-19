@@ -1,5 +1,6 @@
 #include "ir.h"
 #include "parser.h"
+#include "semantic.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -121,11 +122,19 @@ static int gen_addr(Node *node) {
     switch (node->kind) {
         case NODE_KIND_IDENTIFIER: {
             int dest = new_vreg();
-            IRInst *inst = new_inst(IR_ADDR);
-            inst->dest = op_vreg(dest);
-            inst->src1 = op_imm(node->offset);
-            inst->line = node->tok ? node->tok->line : 0;
-            emit(inst);
+            if (node->var && node->var->is_global) {
+                IRInst *inst = new_inst(IR_ADDR_GLOBAL);
+                inst->dest = op_vreg(dest);
+                inst->global_name = strdup(node->name);
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            } else {
+                IRInst *inst = new_inst(IR_ADDR);
+                inst->dest = op_vreg(dest);
+                inst->src1 = op_imm(node->offset);
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            }
             return dest;
         }
         case NODE_KIND_DEREF: {
@@ -348,12 +357,29 @@ static int gen_expr(Node *node) {
 
         case NODE_KIND_IDENTIFIER: {
             int reg = new_vreg();
-            IRInst *inst = new_inst(IR_LOAD);
-            inst->dest = op_vreg(reg);
-            inst->src1 = op_imm(node->offset);
-            inst->cast_to_type = node->ty;
-            inst->line = node->tok ? node->tok->line : 0;
-            emit(inst);
+            if (node->var && node->var->is_global) {
+                // Load from global: 1. Get address, 2. Load from address
+                int addr = new_vreg();
+                IRInst *addr_inst = new_inst(IR_ADDR_GLOBAL);
+                addr_inst->dest = op_vreg(addr);
+                addr_inst->global_name = strdup(node->name);
+                addr_inst->line = node->tok ? node->tok->line : 0;
+                emit(addr_inst);
+
+                IRInst *inst = new_inst(IR_LOAD);
+                inst->dest = op_vreg(reg);
+                inst->src1 = op_vreg(addr);
+                inst->cast_to_type = node->ty;
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            } else {
+                IRInst *inst = new_inst(IR_LOAD);
+                inst->dest = op_vreg(reg);
+                inst->src1 = op_imm(node->offset);
+                inst->cast_to_type = node->ty;
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+            }
             return reg;
         }
 
@@ -417,9 +443,9 @@ static int gen_expr(Node *node) {
                 exit(1);
             }
 
-            int args_vregs[7]; 
+            int args_vregs[7];
             int count = 0;
-            
+
             for (Node *arg = node->args; arg; arg = arg->next) {
                 args_vregs[count++] = gen_expr(arg);
             }
@@ -438,7 +464,7 @@ static int gen_expr(Node *node) {
             inst->dest = op_vreg(dest);
             inst->line = node->tok ? node->tok->line : 0;
             emit(inst);
-            
+
             return dest;
         }
 
@@ -572,12 +598,29 @@ static void gen_stmt_single(Node *node) {
                 int val_reg = gen_expr(node->rhs);
                 
                 if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
-                    IRInst *inst = new_inst(IR_STORE);
-                    inst->dest = op_imm(node->lhs->offset);
-                    inst->src1 = op_vreg(val_reg);
-                    inst->cast_to_type = node->lhs->ty;
-                    inst->line = node->tok ? node->tok->line : 0;
-                    emit(inst);
+                    if (node->lhs->var && node->lhs->var->is_global) {
+                        // Store to global: 1. Get address, 2. Store to address
+                        int addr = new_vreg();
+                        IRInst *addr_inst = new_inst(IR_ADDR_GLOBAL);
+                        addr_inst->dest = op_vreg(addr);
+                        addr_inst->global_name = strdup(node->lhs->name);
+                        addr_inst->line = node->tok ? node->tok->line : 0;
+                        emit(addr_inst);
+
+                        IRInst *inst = new_inst(IR_STORE);
+                        inst->dest = op_vreg(addr);
+                        inst->src1 = op_vreg(val_reg);
+                        inst->cast_to_type = node->lhs->ty;
+                        inst->line = node->tok ? node->tok->line : 0;
+                        emit(inst);
+                    } else {
+                        IRInst *inst = new_inst(IR_STORE);
+                        inst->dest = op_imm(node->lhs->offset);
+                        inst->src1 = op_vreg(val_reg);
+                        inst->cast_to_type = node->lhs->ty;
+                        inst->line = node->tok ? node->tok->line : 0;
+                        emit(inst);
+                    }
                 } else {
                     // Indirect assignment (pointer/array/member)
                     int addr_reg = gen_addr(node->lhs);
@@ -601,11 +644,36 @@ static void gen_stmt_single(Node *node) {
 IRProgram *gen_ir(Node *ast) {
     IRProgram *prog = calloc(1, sizeof(IRProgram));
     IRFunction **func_ptr = &prog->functions;
+    IRGlobal **global_ptr = &prog->globals;
 
-    for (Node *fn_node = ast; fn_node; fn_node = fn_node->next) {
-        if (fn_node->kind != NODE_KIND_FN) {
+    for (Node *node = ast; node; node = node->next) {
+        if (node->kind == NODE_KIND_LET) {
+            // Global variable
+            IRGlobal *glob = calloc(1, sizeof(IRGlobal));
+            glob->name = strdup(node->name);
+            glob->size = node->ty->size;
+            
+            // Handle initialization
+            if (node->init_expr && node->init_expr->kind == NODE_KIND_NUM) {
+                glob->init_value = node->init_expr->val;
+                glob->is_initialized = 1;
+            } else if (node->init_expr) {
+                fprintf(stderr, "Erro: inicialização de global suporta apenas literais inteiros por enquanto.\n");
+                exit(1);
+            } else {
+                glob->is_initialized = 0;
+            }
+
+            *global_ptr = glob;
+            global_ptr = &glob->next;
             continue;
         }
+
+        if (node->kind != NODE_KIND_FN) {
+            continue;
+        }
+        
+        Node *fn_node = node;
 
         // Processar cada função com contexto limpo
         ctx.inst_head = NULL;
@@ -667,6 +735,7 @@ void ir_free(IRProgram *prog) {
             IRInst *next = inst->next;
             if (inst->asm_str) free(inst->asm_str);
             if (inst->call_target_name) free(inst->call_target_name);
+            if (inst->global_name) free(inst->global_name);
             free(inst);
             inst = next;
         }
@@ -674,6 +743,14 @@ void ir_free(IRProgram *prog) {
         if (func->name) free(func->name);
         free(func);
         func = next_func;
+    }
+    
+    IRGlobal *glob = prog->globals;
+    while (glob) {
+        IRGlobal *next = glob->next;
+        free(glob->name);
+        free(glob);
+        glob = next;
     }
     free(prog);
 }
@@ -701,6 +778,11 @@ void ir_print(IRProgram *prog) {
     }
 
     printf("=== IR GERADO ===\n\n");
+
+    for (IRGlobal *g = prog->globals; g; g = g->next) {
+        printf("global %s: size=%d, init=%d, val=%ld\n", g->name, g->size, g->is_initialized, g->init_value);
+    }
+    printf("\n");
 
     for (IRFunction *func = prog->functions; func; func = func->next) {
         printf("function %s():\n", func->name);
@@ -797,6 +879,11 @@ void ir_print(IRProgram *prog) {
                 case IR_CALL:
                     print_operand(inst->dest);
                     printf(" = CALL %s", inst->call_target_name ? inst->call_target_name : "NULL");
+                    break;
+
+                case IR_ADDR_GLOBAL:
+                    print_operand(inst->dest);
+                    printf(" = ADDR_GLOBAL %s", inst->global_name ? inst->global_name : "NULL");
                     break;
 
                 default:

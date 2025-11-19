@@ -32,7 +32,8 @@ typedef enum {
     IR_SET_SYS_ARG,
     IR_SYSCALL,
     IR_COPY,
-    IR_ADDR, // Get address of variable
+    IR_ADDR, // Get address of variable (stack)
+    IR_ADDR_GLOBAL, // Get address of global variable
 } IROp;
 
 typedef enum {
@@ -63,6 +64,7 @@ typedef struct IRInst {
     unsigned long live_out;
     char *asm_str;
     char *call_target_name;
+    char *global_name; // For IR_ADDR_GLOBAL
     Type *cast_to_type;
 } IRInst;
 
@@ -74,9 +76,18 @@ typedef struct IRFunction {
     struct IRFunction *next;
 } IRFunction;
 
+typedef struct IRGlobal {
+    char *name;
+    int size;
+    long init_value; // For simple integer initialization
+    int is_initialized;
+    struct IRGlobal *next;
+} IRGlobal;
+
 typedef struct {
     IRFunction *functions;
     IRFunction *main_func;
+    IRGlobal *globals;
 } IRProgram;
 
 static inline Operand op_none() {
@@ -114,7 +125,7 @@ static const char *IR_OP_NAMES[] = {
     "JMP", "JZ", "JNZ", "LABEL",
     "SYSCALL",
     "COPY", "RET",
-    "LOAD", "STORE", "ADDR",
+    "LOAD", "STORE", "ADDR", "ADDR_GLOBAL",
     "PHI", "ASM", "CAST", "CALL", "SET_SYS_ARG", "SYSCALL",
 };
 
