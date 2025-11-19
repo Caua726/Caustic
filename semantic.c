@@ -13,6 +13,7 @@ static Scope *current_scope = NULL;
 static Scope *global_scope = NULL;
 static int stack_offset = 0;
 static Function *function_table = NULL;
+static int loop_depth = 0;
 
 Type *type_int;
 Type *type_i8;
@@ -420,6 +421,29 @@ static void walk(Node *node) {
             node->ty = target_type;
             return;
 
+        case NODE_KIND_LOGICAL_AND:
+        case NODE_KIND_LOGICAL_OR:
+            walk(node->lhs);
+            walk(node->rhs);
+            // Check if operands are boolean-like (integers or bool)
+            // For now, we allow integers as booleans (C-style)
+            node->ty = type_bool;
+            return;
+
+        case NODE_KIND_BREAK:
+            if (loop_depth == 0) {
+                fprintf(stderr, "Erro: 'break' fora de loop.\n");
+                exit(1);
+            }
+            return;
+
+        case NODE_KIND_CONTINUE:
+            if (loop_depth == 0) {
+                fprintf(stderr, "Erro: 'continue' fora de loop.\n");
+                exit(1);
+            }
+            return;
+
         case NODE_KIND_IF: {
             walk(node->if_stmt.cond);
             TypeKind tk = node->if_stmt.cond->ty->kind;
@@ -444,7 +468,9 @@ static void walk(Node *node) {
                 fprintf(stderr, "Erro: condição do while deve ser um booleano ou inteiro.\n");
                 exit(1);
             }
+            loop_depth++;
             walk(node->while_stmt.body);
+            loop_depth--;
             return;
         }
         case NODE_KIND_ADDR:

@@ -17,6 +17,9 @@ static Node *parse_var_decl();
 static Node *parse_expr();
 static Node *parse_stmt();
 static Node *parse_if_stmt();
+static Node *parse_if_stmt();
+static Node *parse_logical_or();
+static Node *parse_logical_and();
 static Node *parse_comparison();
 static Node *parse_add();
 static Node *parse_mul();
@@ -127,7 +130,7 @@ static Node *new_node_return(Node *expr) {
 }
 
 static Node *parse_expr() {
-    return parse_comparison();
+    return parse_logical_or();
 }
 
 static Type *parse_type() {
@@ -521,6 +524,24 @@ static Node *parse_add() {
     return node;
 }
 
+static Node *parse_logical_and() {
+    Node *node = parse_comparison();
+    while (current_token.type == TOKEN_TYPE_AND_AND) {
+        consume();
+        node = new_binary_node(NODE_KIND_LOGICAL_AND, node, parse_comparison());
+    }
+    return node;
+}
+
+static Node *parse_logical_or() {
+    Node *node = parse_logical_and();
+    while (current_token.type == TOKEN_TYPE_OR_OR) {
+        consume();
+        node = new_binary_node(NODE_KIND_LOGICAL_OR, node, parse_logical_and());
+    }
+    return node;
+}
+
 static Node *parse_comparison() {
     Node *node = parse_add();
     while (1) {
@@ -710,6 +731,18 @@ static Node *parse_stmt() {
 
     if (current_token.type == TOKEN_TYPE_WHILE) {
         return parse_while_stmt();
+    }
+
+    if (current_token.type == TOKEN_TYPE_BREAK) {
+        consume();
+        expect(TOKEN_TYPE_SEMICOLON);
+        return new_node(NODE_KIND_BREAK);
+    }
+
+    if (current_token.type == TOKEN_TYPE_CONTINUE) {
+        consume();
+        expect(TOKEN_TYPE_SEMICOLON);
+        return new_node(NODE_KIND_CONTINUE);
     }
     Node *node = parse_expr();
     if (current_token.type == TOKEN_TYPE_EQUAL) {

@@ -11,9 +11,31 @@ typedef struct {
     IRInst *inst_tail;
     int vreg_count;
     int label_count;
+    
+    struct {
+        int start_label;
+        int end_label;
+    } loop_stack[32];
+    int loop_depth;
 } IRGenContext;
 
 static IRGenContext ctx;
+
+static void push_loop(int start, int end) {
+    if (ctx.loop_depth >= 32) {
+        fprintf(stderr, "Erro: loops aninhados demais\n");
+        exit(1);
+    }
+    ctx.loop_stack[ctx.loop_depth].start_label = start;
+    ctx.loop_stack[ctx.loop_depth].end_label = end;
+    ctx.loop_depth++;
+}
+
+static void pop_loop() {
+    if (ctx.loop_depth > 0) {
+        ctx.loop_depth--;
+    }
+}
 
 static IRInst *new_inst(IROp op) {
     IRInst *inst = calloc(1, sizeof(IRInst));
@@ -355,6 +377,102 @@ static int gen_expr(Node *node) {
             return emit_binary(IR_GE, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
+        case NODE_KIND_LOGICAL_AND: {
+            int false_label = new_label();
+            int end_label = new_label();
+            int dest = new_vreg();
+
+            int lhs = gen_expr(node->lhs);
+            IRInst *jz1 = new_inst(IR_JZ);
+            jz1->src1 = op_vreg(lhs);
+            jz1->dest = op_label(false_label);
+            jz1->line = node->tok ? node->tok->line : 0;
+            emit(jz1);
+
+            int rhs = gen_expr(node->rhs);
+            IRInst *jz2 = new_inst(IR_JZ);
+            jz2->src1 = op_vreg(rhs);
+            jz2->dest = op_label(false_label);
+            jz2->line = node->tok ? node->tok->line : 0;
+            emit(jz2);
+
+            // True case
+            IRInst *mov_true = new_inst(IR_IMM);
+            mov_true->dest = op_vreg(dest);
+            mov_true->src1 = op_imm(1);
+            emit(mov_true);
+            
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(end_label);
+            emit(jmp);
+
+            // False label
+            IRInst *lbl_false = new_inst(IR_LABEL);
+            lbl_false->dest = op_label(false_label);
+            emit(lbl_false);
+
+            // False case
+            IRInst *mov_false = new_inst(IR_IMM);
+            mov_false->dest = op_vreg(dest);
+            mov_false->src1 = op_imm(0);
+            emit(mov_false);
+
+            // End label
+            IRInst *lbl_end = new_inst(IR_LABEL);
+            lbl_end->dest = op_label(end_label);
+            emit(lbl_end);
+
+            return dest;
+        }
+
+        case NODE_KIND_LOGICAL_OR: {
+            int true_label = new_label();
+            int end_label = new_label();
+            int dest = new_vreg();
+
+            int lhs = gen_expr(node->lhs);
+            IRInst *jnz1 = new_inst(IR_JNZ);
+            jnz1->src1 = op_vreg(lhs);
+            jnz1->dest = op_label(true_label);
+            jnz1->line = node->tok ? node->tok->line : 0;
+            emit(jnz1);
+
+            int rhs = gen_expr(node->rhs);
+            IRInst *jnz2 = new_inst(IR_JNZ);
+            jnz2->src1 = op_vreg(rhs);
+            jnz2->dest = op_label(true_label);
+            jnz2->line = node->tok ? node->tok->line : 0;
+            emit(jnz2);
+
+            // False case
+            IRInst *mov_false = new_inst(IR_IMM);
+            mov_false->dest = op_vreg(dest);
+            mov_false->src1 = op_imm(0);
+            emit(mov_false);
+
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(end_label);
+            emit(jmp);
+
+            // True label
+            IRInst *lbl_true = new_inst(IR_LABEL);
+            lbl_true->dest = op_label(true_label);
+            emit(lbl_true);
+
+            // True case
+            IRInst *mov_true = new_inst(IR_IMM);
+            mov_true->dest = op_vreg(dest);
+            mov_true->src1 = op_imm(1);
+            emit(mov_true);
+
+            // End label
+            IRInst *lbl_end = new_inst(IR_LABEL);
+            lbl_end->dest = op_label(end_label);
+            emit(lbl_end);
+
+            return dest;
+        }
+
         case NODE_KIND_IDENTIFIER: {
             int reg = new_vreg();
             if (node->var && node->var->is_global) {
@@ -557,6 +675,8 @@ static void gen_stmt_single(Node *node) {
             int start_label = new_label();
             int end_label = new_label();
 
+            push_loop(start_label, end_label);
+
             IRInst *start_lbl = new_inst(IR_LABEL);
             start_lbl->dest = op_label(start_label);
             emit(start_lbl);
@@ -579,6 +699,34 @@ static void gen_stmt_single(Node *node) {
             IRInst *end_lbl = new_inst(IR_LABEL);
             end_lbl->dest = op_label(end_label);
             emit(end_lbl);
+            
+            pop_loop();
+            break;
+        }
+
+        case NODE_KIND_BREAK: {
+            if (ctx.loop_depth == 0) {
+                fprintf(stderr, "Erro: 'break' fora de loop\n");
+                exit(1);
+            }
+            int end_label = ctx.loop_stack[ctx.loop_depth - 1].end_label;
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(end_label);
+            jmp->line = node->tok ? node->tok->line : 0;
+            emit(jmp);
+            break;
+        }
+
+        case NODE_KIND_CONTINUE: {
+            if (ctx.loop_depth == 0) {
+                fprintf(stderr, "Erro: 'continue' fora de loop\n");
+                exit(1);
+            }
+            int start_label = ctx.loop_stack[ctx.loop_depth - 1].start_label;
+            IRInst *jmp = new_inst(IR_JMP);
+            jmp->dest = op_label(start_label);
+            jmp->line = node->tok ? node->tok->line : 0;
+            emit(jmp);
             break;
         }
         case NODE_KIND_ASSIGN: {
