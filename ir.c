@@ -245,6 +245,18 @@ static int gen_expr(Node *node) {
         case NODE_KIND_NUM:
             return emit_imm(node->val, node->tok ? node->tok->line : 0);
 
+        case NODE_KIND_STRING_LITERAL: {
+            int dest = new_vreg();
+            char name[32];
+            sprintf(name, ".LC%ld", node->val);
+            IRInst *inst = new_inst(IR_ADDR_GLOBAL);
+            inst->dest = op_vreg(dest);
+            inst->global_name = strdup(name);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
         case NODE_KIND_ADD: {
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
@@ -869,6 +881,8 @@ IRProgram *gen_ir(Node *ast) {
         fprintf(stderr, "Erro: função main não encontrada\n");
         exit(1);
     }
+
+    prog->strings = get_strings();
 
     return prog;
 }
