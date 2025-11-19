@@ -78,6 +78,9 @@ typedef enum {
     NODE_KIND_BREAK,
     NODE_KIND_CONTINUE,
     NODE_KIND_STRING_LITERAL,
+    NODE_KIND_SHL,
+    NODE_KIND_SHR,
+    NODE_KIND_SIZEOF,
 } NodeKind;
 
 typedef struct StringLiteral {

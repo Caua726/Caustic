@@ -65,6 +65,8 @@ Token lexer_next() {
         else if (strcmp(t.text, "struct") == 0) {t.type = TOKEN_TYPE_STRUCT;}
         else if (strcmp(t.text, "break") == 0) {t.type = TOKEN_TYPE_BREAK;}
         else if (strcmp(t.text, "continue") == 0) {t.type = TOKEN_TYPE_CONTINUE;}
+        else if (strcmp(t.text, "sizeof") == 0) {t.type = TOKEN_TYPE_SIZEOF;}
+        else if (strcmp(t.text, "cast") == 0) {t.type = TOKEN_TYPE_CAST;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
@@ -220,6 +222,12 @@ Token lexer_next() {
                 next_char();
                 next_char();
                 return t;
+            } else if (lookhead_char() == '<') {
+                strcpy(t.text, "<<");
+                t.type = TOKEN_TYPE_SHL;
+                next_char();
+                next_char();
+                return t;
             } else {
                 t.text[0] = '<';
                 t.text[1] = '\0';
@@ -231,6 +239,12 @@ Token lexer_next() {
             if (lookhead_char() == '=') {
                 strcpy(t.text, ">=");
                 t.type = TOKEN_TYPE_GE;
+                next_char();
+                next_char();
+                return t;
+            } else if (lookhead_char() == '>') {
+                strcpy(t.text, ">>");
+                t.type = TOKEN_TYPE_SHR;
                 next_char();
                 next_char();
                 return t;

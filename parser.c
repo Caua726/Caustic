@@ -276,6 +276,31 @@ static Node *new_binary_node(NodeKind kind, Node *lhs, Node *rhs) {
 }
 
 static Node *parse_primary() {
+    if (current_token.type == TOKEN_TYPE_SIZEOF) {
+        consume();
+        expect(TOKEN_TYPE_LPAREN);
+        Type *ty = parse_type();
+        expect(TOKEN_TYPE_RPAREN);
+        
+        Node *node = new_node(NODE_KIND_SIZEOF);
+        node->ty = ty; // Store the type to measure
+        return node;
+    }
+
+    if (current_token.type == TOKEN_TYPE_CAST) {
+        consume();
+        expect(TOKEN_TYPE_LPAREN);
+        Type *ty = parse_type();
+        expect(TOKEN_TYPE_COMMA);
+        Node *expr = parse_expr();
+        expect(TOKEN_TYPE_RPAREN);
+        
+        Node *node = new_node(NODE_KIND_CAST);
+        node->ty = ty;
+        node->expr = expr;
+        return node;
+    }
+
     if (current_token.type == TOKEN_TYPE_INTEGER) {
         Node *node = new_node_num(current_token.int_value);
         consume();
@@ -566,27 +591,41 @@ static Node *parse_logical_or() {
     return node;
 }
 
-static Node *parse_comparison() {
+static Node *parse_shift() {
     Node *node = parse_add();
+    while (current_token.type == TOKEN_TYPE_SHL || current_token.type == TOKEN_TYPE_SHR) {
+        if (current_token.type == TOKEN_TYPE_SHL) {
+            consume();
+            node = new_binary_node(NODE_KIND_SHL, node, parse_add());
+        } else if (current_token.type == TOKEN_TYPE_SHR) {
+            consume();
+            node = new_binary_node(NODE_KIND_SHR, node, parse_add());
+        }
+    }
+    return node;
+}
+
+static Node *parse_comparison() {
+    Node *node = parse_shift();
     while (1) {
         if (current_token.type == TOKEN_TYPE_EQEQ) {
             consume();
-            node = new_binary_node(NODE_KIND_EQ, node, parse_add());
+            node = new_binary_node(NODE_KIND_EQ, node, parse_shift());
         } else if (current_token.type == TOKEN_TYPE_NE) {
             consume();
-            node = new_binary_node(NODE_KIND_NE, node, parse_add());
+            node = new_binary_node(NODE_KIND_NE, node, parse_shift());
         } else if (current_token.type == TOKEN_TYPE_LT) {
             consume();
-            node = new_binary_node(NODE_KIND_LT, node, parse_add());
+            node = new_binary_node(NODE_KIND_LT, node, parse_shift());
         } else if (current_token.type == TOKEN_TYPE_LE) {
             consume();
-            node = new_binary_node(NODE_KIND_LE, node, parse_add());
+            node = new_binary_node(NODE_KIND_LE, node, parse_shift());
         } else if (current_token.type == TOKEN_TYPE_GT) {
             consume();
-            node = new_binary_node(NODE_KIND_GT, node, parse_add());
+            node = new_binary_node(NODE_KIND_GT, node, parse_shift());
         } else if (current_token.type == TOKEN_TYPE_GE) {
             consume();
-            node = new_binary_node(NODE_KIND_GE, node, parse_add());
+            node = new_binary_node(NODE_KIND_GE, node, parse_shift());
         } else {
             break;
         }
