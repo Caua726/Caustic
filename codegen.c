@@ -507,6 +507,20 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
+        case IR_SHL:
+            load_operand(inst->src2.vreg, ctx, "rcx");
+            load_operand(inst->src1.vreg, ctx, "r15");
+            emit("shl r15, cl");
+            store_operand(inst->dest.vreg, ctx, "r15");
+            break;
+
+        case IR_SHR:
+            load_operand(inst->src2.vreg, ctx, "rcx");
+            load_operand(inst->src1.vreg, ctx, "r15");
+            emit("shr r15, cl");
+            store_operand(inst->dest.vreg, ctx, "r15");
+            break;
+
         case IR_ADDR:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
             emit("lea %s, [rbp-%ld]", dst, inst->src1.imm);

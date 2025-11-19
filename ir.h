@@ -27,6 +27,8 @@ typedef enum {
     IR_PHI,
     IR_ASM,
     IR_CAST,
+    IR_SHL,
+    IR_SHR,
     IR_GET_ARG,
     IR_SET_ARG,
     IR_SET_SYS_ARG,
@@ -127,7 +129,7 @@ static const char *IR_OP_NAMES[] = {
     "SYSCALL",
     "COPY", "RET",
     "LOAD", "STORE", "ADDR", "ADDR_GLOBAL",
-    "PHI", "ASM", "CAST", "CALL", "SET_SYS_ARG", "SYSCALL",
+    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_SYS_ARG", "SYSCALL",
 };
 
 IRProgram *gen_ir(Node *ast);

@@ -230,8 +230,8 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
         var->offset = 0; // Globals don't have stack offset
     } else {
         var->is_global = 0;
-        var->offset = stack_offset;
         stack_offset += type->size;
+        var->offset = stack_offset;
     }
 
     var->next = current_scope->vars;
@@ -377,6 +377,8 @@ static void walk(Node *node) {
         case NODE_KIND_LE:
         case NODE_KIND_GT:
         case NODE_KIND_GE:
+        case NODE_KIND_SHL:
+        case NODE_KIND_SHR:
             walk(node->lhs);
             walk(node->rhs);
 
@@ -567,6 +569,13 @@ static void walk(Node *node) {
 
         case NODE_KIND_CAST:
             walk(node->expr);
+            return;
+
+        case NODE_KIND_SIZEOF:
+            resolve_type_ref(node->ty);
+            node->kind = NODE_KIND_NUM;
+            node->val = node->ty->size;
+            node->ty = type_i32; // sizeof returns i32 (or size_t which we map to i32/i64)
             return;
 
         case NODE_KIND_FNCALL:

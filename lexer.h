@@ -52,6 +52,10 @@ typedef enum {
 	TOKEN_TYPE_OR_OR,
 	TOKEN_TYPE_BREAK,
 	TOKEN_TYPE_CONTINUE,
+	TOKEN_TYPE_SIZEOF,
+	TOKEN_TYPE_CAST,
+	TOKEN_TYPE_SHL,
+	TOKEN_TYPE_SHR,
 } TokenType;
 
 static const char *TOKEN_NAMES[] = {
@@ -105,6 +109,10 @@ static const char *TOKEN_NAMES[] = {
 	"TOKEN_TYPE_OR_OR",
 	"TOKEN_TYPE_BREAK",
 	"TOKEN_TYPE_CONTINUE",
+	"TOKEN_TYPE_SIZEOF",
+	"TOKEN_TYPE_CAST",
+	"TOKEN_TYPE_SHL",
+	"TOKEN_TYPE_SHR",
 };
 
 typedef struct {
