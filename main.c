@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
         }
 
         printf("=== DEBUG LEXER ===\n");
-        lexer_init(file);
+        lexer_init(file, filename);
 
         while (1) {
             Token t = lexer_next();
@@ -68,7 +68,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    lexer_init(file);
+    lexer_init(file, filename);
     parser_init();
     Node *ast = parse();
 

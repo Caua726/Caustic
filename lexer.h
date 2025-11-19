@@ -66,6 +66,8 @@ typedef struct {
 	const char *start;
 	int length;
 	int line;
+    int col;
+    const char *filename;
 
 	long long int_value;
 
@@ -75,11 +77,14 @@ typedef struct {
 typedef struct {
     FILE *file;
     int line;
+    int col;
+    const char *filename;
     int current_char;
     int ahead_char; // Added ahead_char to state
 } LexerState;
 
-void lexer_init(FILE *file);
+void lexer_init(FILE *file, const char *filename);
 Token lexer_next();
 void lexer_get_state(LexerState *state);
 void lexer_set_state(LexerState *state);
+void error_at_token(Token t, const char *fmt, ...);

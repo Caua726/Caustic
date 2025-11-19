@@ -129,7 +129,7 @@ static void parse_use(Node **cur_ptr) {
         Token saved_curr = current_token;
         Token saved_look = lookahead_token;
 
-        lexer_init(f);
+        lexer_init(f, path);
         parser_init();
 
         // Parse into a new list for the module
