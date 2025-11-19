@@ -116,8 +116,11 @@ Token lexer_next() {
         t.line = line;
         int i = 0;
         while (isalnum(current_char) || current_char == '_') {
-            if (i < 255) {
+            if (i < 254) {
                 t.text[i++] = current_char;
+            } else {
+                printf("Erro: identificador muito longo na linha %d\n", line);
+                exit(1);
             }
             next_char();
         }
@@ -148,14 +151,40 @@ Token lexer_next() {
     if (isdigit(current_char)) {
         t.line = line;
         int i = 0;
+        
+        // Hexadecimal support
+        if (current_char == '0' && lookhead_char() == 'x') {
+            next_char(); // consume '0'
+            next_char(); // consume 'x'
+            while (isxdigit(current_char)) {
+                if (i < 254) {
+                    t.text[i++] = current_char;
+                } else {
+                    printf("Erro: literal hexadecimal muito longo na linha %d\n", line);
+                    exit(1);
+                }
+                next_char();
+            }
+            t.text[i] = '\0';
+            t.type = TOKEN_TYPE_INTEGER;
+            // Safe conversion check could be added here, but strtoll handles overflow by clamping (though we might want to error)
+            t.int_value = strtoll(t.text, NULL, 16);
+            return t;
+        }
+
         while (isdigit(current_char)) {
-            if (i < 255) {
+            if (i < 254) {
                 t.text[i++] = current_char;
+            } else {
+                printf("Erro: literal inteiro muito longo na linha %d\n", line);
+                exit(1);
             }
             next_char();
         }
         t.text[i] = '\0';
         t.type = TOKEN_TYPE_INTEGER;
+        // Check for overflow? For now, atoll is standard but unsafe for huge numbers.
+        // Let's stick to standard behavior or simple check.
         t.int_value = atoll(t.text);
         return t;
     }
@@ -375,17 +404,27 @@ Token lexer_next() {
             t.text[0] = '\0';
 
             while (current_char != '"' && current_char != EOF && current_char != '\n') {
-                if (current_char == '\\' && lookhead_char() == '"') {
+                if (current_char == '\\') {
                     next_char();
+                    char escaped = current_char;
+                    if (current_char == 'n') escaped = '\n';
+                    else if (current_char == 't') escaped = '\t';
+                    else if (current_char == 'r') escaped = '\r';
+                    else if (current_char == '0') escaped = '\0';
+                    else if (current_char == '\\') escaped = '\\';
+                    else if (current_char == '"') escaped = '"';
+                    
                     if (strlen(t.text) < 255) {
-                        t.text[strlen(t.text)] = '"';
-                        t.text[strlen(t.text) + 1] = '\0';
+                        int len = strlen(t.text);
+                        t.text[len] = escaped;
+                        t.text[len + 1] = '\0';
                     }
                     next_char();
                 } else {
                     if (strlen(t.text) < 255) {
-                        t.text[strlen(t.text)] = current_char;
-                        t.text[strlen(t.text) + 1] = '\0';
+                        int len = strlen(t.text);
+                        t.text[len] = current_char;
+                        t.text[len + 1] = '\0';
                     }
                     next_char();
                 }
@@ -399,8 +438,28 @@ Token lexer_next() {
             t.type = TOKEN_TYPE_STRING;
             next_char();
             return t;
+        case '\'':
+            next_char();
+            char c = current_char;
+            if (current_char == '\\') {
+                next_char();
+                if (current_char == 'n') c = '\n';
+                else if (current_char == 't') c = '\t';
+                else if (current_char == 'r') c = '\r';
+                else if (current_char == '0') c = '\0';
+                else if (current_char == '\\') c = '\\';
+                else if (current_char == '\'') c = '\'';
+            }
+            next_char();
+            if (current_char != '\'') {
+                printf("Erro: char literal nao terminado na linha %d\n", line);
+                exit(1);
+            }
+            next_char();
+            t.type = TOKEN_TYPE_INTEGER;
+            t.int_value = (long long)c;
+            return t;
     }
-    printf("caractere inesperado: %c", current_char);
-    next_char();
-    return lexer_next();
+    printf("Erro: caractere inesperado '%c' na linha %d\n", current_char, line);
+    exit(1);
 }
