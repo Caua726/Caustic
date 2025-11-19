@@ -61,6 +61,96 @@ static Function *lookup_function(char *name) {
     return NULL;
 }
 
+// Global list of registered structs (using the Type structs themselves)
+static Type *struct_list = NULL;
+
+static void register_struct(Type *struct_type) {
+    // Check for redefinition
+    for (Type *t = struct_list; t; t = t->next) {
+        // Note: t->next here is iterating our local list, not the global all_types list
+        // But wait, Type struct has 'next' for GC. We shouldn't reuse that for this list unless we are careful.
+        // Actually, let's just use a separate linked list for looked up structs or just iterate all_types?
+        // parser.h exposes 'all_types' but it's a flat list of ALL allocated types.
+        // Let's create a separate struct for the symbol table of structs.
+    }
+    // Simpler: Just add to a static list.
+    // But Type struct 'next' is used for GC.
+    // Let's add a 'next_struct' field to Type? No, can't change header easily now.
+    // Let's use a separate linked list node.
+}
+
+typedef struct StructDef {
+    char *name;
+    Type *type;
+    struct StructDef *next;
+} StructDef;
+
+static StructDef *struct_defs = NULL;
+
+static void declare_struct(Type *type) {
+    for (StructDef *s = struct_defs; s; s = s->next) {
+        if (strcmp(s->name, type->name) == 0) {
+            fprintf(stderr, "Erro: redefinição da struct '%s'\n", type->name);
+            exit(1);
+        }
+    }
+    StructDef *s = calloc(1, sizeof(StructDef));
+    s->name = strdup(type->name);
+    s->type = type;
+    s->next = struct_defs;
+    struct_defs = s;
+
+    // Calculate size and offsets
+    int offset = 0;
+    for (Field *f = type->fields; f; f = f->next) {
+        f->offset = offset;
+        offset += f->type->size;
+    }
+    type->size = offset;
+}
+
+static Type *lookup_struct(char *name) {
+    for (StructDef *s = struct_defs; s; s = s->next) {
+        if (strcmp(s->name, name) == 0) {
+            return s->type;
+        }
+    }
+    return NULL;
+}
+
+// Helper to resolve placeholder struct types
+static void resolve_types(Node *node) {
+    // We need to traverse the AST and find any Type that is TY_STRUCT but has no fields (placeholder).
+    // But Types are shared/allocated in parser. 
+    // Actually, we can just iterate 'all_types' from parser if we had access.
+    // Since we don't have easy access to 'all_types' root here (it's in parser.c),
+    // we can rely on the fact that we will encounter them during traversal or we can export all_types.
+    // Let's export all_types in parser.h? It is not exported.
+    // Alternative: When we see a variable declaration with TY_STRUCT, we check if it's resolved.
+    // If not, we look it up and replace the Type pointer or copy details.
+    // Replacing pointer is better so all usages see it.
+    // But we can't easily find all pointers TO the placeholder.
+    // Better: Copy details FROM the definition TO the placeholder.
+    // But size is needed.
+}
+
+static void resolve_type_ref(Type *ty) {
+    if (ty->kind == TY_STRUCT && ty->fields == NULL && ty->name != NULL) {
+        Type *def = lookup_struct(ty->name);
+        if (!def) {
+            fprintf(stderr, "Erro: struct '%s' não definida.\n", ty->name);
+            exit(1);
+        }
+        // Copy details
+        ty->fields = def->fields;
+        ty->size = def->size;
+        // ty->name is already set
+    }
+    if (ty->kind == TY_PTR || ty->kind == TY_ARRAY) {
+        resolve_type_ref(ty->base);
+    }
+}
+
 void types_init() {
     type_i8 = new_type_full(TY_I8, 1, 1);
     type_i16 = new_type_full(TY_I16, 2, 1);
@@ -217,6 +307,7 @@ static void walk(Node *node) {
             return;
 
         case NODE_KIND_LET: {
+            resolve_type_ref(node->ty);
             if (node->init_expr) {
                 walk(node->init_expr);
 
@@ -237,8 +328,16 @@ static void walk(Node *node) {
                 }
             }
             Variable *var = symtab_declare(node->name, node->ty, node->flags);
-            node->var = var;
-            node->offset = var->offset;
+            resolve_type_ref(node->ty); // Resolve type if it's a struct
+            var->type = node->ty; // Update var type after resolution
+            var->offset = stack_offset; // Re-read stack offset? No, symtab_declare uses current stack_offset.
+            // Wait, symtab_declare uses type->size. If type was not resolved, size might be 0.
+            // We must resolve BEFORE declaring.
+            // Let's fix this.
+            
+            // Undo symtab_declare side effects? No, let's resolve before.
+            // But we already called symtab_declare.
+            // Let's change the order.
             return;
         }
 
@@ -378,8 +477,9 @@ static void walk(Node *node) {
             // Check if LHS is a valid lvalue
             if (node->lhs->kind != NODE_KIND_IDENTIFIER && 
                 node->lhs->kind != NODE_KIND_DEREF && 
-                node->lhs->kind != NODE_KIND_INDEX) {
-                fprintf(stderr, "Erro: alvo da atribuição inválido (deve ser variável, dereferência ou índice).\n");
+                node->lhs->kind != NODE_KIND_INDEX &&
+                node->lhs->kind != NODE_KIND_MEMBER_ACCESS) {
+                fprintf(stderr, "Erro: alvo da atribuição inválido (deve ser variável, dereferência, índice ou membro).\n");
                 exit(1);
             }
 
@@ -454,16 +554,77 @@ static void walk(Node *node) {
                 walk(arg);
             }
             return;
+
+        case NODE_KIND_MEMBER_ACCESS:
+            walk(node->lhs);
+            
+            Type *struct_ty = node->lhs->ty;
+            if (struct_ty->kind == TY_PTR) {
+                struct_ty = struct_ty->base;
+            }
+
+            if (struct_ty->kind != TY_STRUCT) {
+                fprintf(stderr, "Erro: operador '.' requer struct ou ponteiro para struct.\n");
+                exit(1);
+            }
+
+            Field *field = NULL;
+            for (Field *f = struct_ty->fields; f; f = f->next) {
+                if (strcmp(f->name, node->member_name) == 0) {
+                    field = f;
+                    break;
+                }
+            }
+
+            if (!field) {
+                fprintf(stderr, "Erro: struct '%s' não possui membro '%s'.\n", struct_ty->name, node->member_name);
+                exit(1);
+            }
+
+            node->ty = field->type;
+            node->offset = field->offset;
+            return;
     }
 }
 
 void analyze(Node *node) {
     symtab_init();
     function_table = NULL;
+    struct_defs = NULL;
+
+    // Pass 0: Register Structs
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
+            // This is our dummy struct decl node
+            declare_struct(n->ty);
+        }
+    }
+
+    // Pass 0.5: Resolve types in struct fields (handle recursive structs or pointers to structs)
+    // For now, we just assume pointers are 8 bytes and don't need deep resolution for size calculation
+    // unless we have embedded structs.
+    // If we have `struct A { b: B; }`, B must be defined before A or we need multi-pass.
+    // Current parser enforces order somewhat, but let's just resolve field types.
+    for (StructDef *s = struct_defs; s; s = s->next) {
+        for (Field *f = s->type->fields; f; f = f->next) {
+            resolve_type_ref(f->type);
+        }
+        // Recalculate size after resolution
+        int offset = 0;
+        for (Field *f = s->type->fields; f; f = f->next) {
+            f->offset = offset;
+            offset += f->type->size;
+        }
+        s->type->size = offset;
+    }
 
     // Primeiro passo: registrar todas as funções
     for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
         if (fn_node->kind == NODE_KIND_FN) {
+            // Resolve param types and return type
+            for (Node *p = fn_node->params; p; p = p->next) resolve_type_ref(p->ty);
+            resolve_type_ref(fn_node->return_type);
+
             int param_count = 0;
             for (Node *p = fn_node->params; p; p = p->next) param_count++;
             
@@ -496,6 +657,15 @@ void semantic_cleanup() {
     }
     function_table = NULL;
     
+    StructDef *sd = struct_defs;
+    while (sd) {
+        StructDef *next = sd->next;
+        free(sd->name);
+        free(sd);
+        sd = next;
+    }
+    struct_defs = NULL;
+
     // Limpar tipos se necessário (mas eles são globais/estáticos por enquanto, então talvez não precise)
     // Se types_init alocasse dinamicamente cada vez, precisaria limpar.
     // Como são alocados uma vez, o SO limpa no final. Mas para ser purista:

@@ -150,8 +150,17 @@ static int gen_addr(Node *node) {
             // Address = base + offset
             return emit_binary(IR_ADD, base, offset_reg, node->tok ? node->tok->line : 0);
         }
+        case NODE_KIND_MEMBER_ACCESS: {
+            // Address of struct.member = base_addr + offset
+            int base = gen_addr(node->lhs);
+            if (node->offset == 0) {
+                return base;
+            }
+            int offset_reg = emit_imm(node->offset, node->tok ? node->tok->line : 0);
+            return emit_binary(IR_ADD, base, offset_reg, node->tok ? node->tok->line : 0);
+        }
         default:
-            fprintf(stderr, "Erro interno: gen_addr chamado para nó inválido\n");
+            fprintf(stderr, "Erro interno: gen_addr chamado para nó inválido: %d\n", node->kind);
             exit(1);
     }
 }
@@ -179,6 +188,18 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_INDEX: {
+            int addr = gen_addr(node);
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_LOAD);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_vreg(addr); // Load from address in vreg
+            inst->cast_to_type = node->ty;
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
+        case NODE_KIND_MEMBER_ACCESS: {
             int addr = gen_addr(node);
             int dest = new_vreg();
             IRInst *inst = new_inst(IR_LOAD);
@@ -558,7 +579,7 @@ static void gen_stmt_single(Node *node) {
                     inst->line = node->tok ? node->tok->line : 0;
                     emit(inst);
                 } else {
-                    // Indirect assignment (pointer/array)
+                    // Indirect assignment (pointer/array/member)
                     int addr_reg = gen_addr(node->lhs);
                     IRInst *inst = new_inst(IR_STORE);
                     inst->dest = op_vreg(addr_reg); // Store to address in vreg
@@ -583,8 +604,7 @@ IRProgram *gen_ir(Node *ast) {
 
     for (Node *fn_node = ast; fn_node; fn_node = fn_node->next) {
         if (fn_node->kind != NODE_KIND_FN) {
-            fprintf(stderr, "Erro: AST deve ser uma lista de funções\n");
-            exit(1);
+            continue;
         }
 
         // Processar cada função com contexto limpo

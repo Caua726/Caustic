@@ -62,6 +62,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "asm") == 0) {t.type = TOKEN_TYPE_ASM;}
         else if (strcmp(t.text, "while") == 0) {t.type = TOKEN_TYPE_WHILE;}
         else if (strcmp(t.text, "syscall") == 0) {t.type = TOKEN_TYPE_SYSCALL;}
+        else if (strcmp(t.text, "struct") == 0) {t.type = TOKEN_TYPE_STRUCT;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
@@ -244,6 +245,12 @@ Token lexer_next() {
             t.text[0] = ']';
             t.text[1] = '\0';
             t.type = TOKEN_TYPE_RBRACKET;
+            next_char();
+            return t;
+        case '.':
+            t.text[0] = '.';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_DOT;
             next_char();
             return t;
         case '{':

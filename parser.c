@@ -21,7 +21,12 @@ static Node *parse_comparison();
 static Node *parse_add();
 static Node *parse_mul();
 static Node *parse_primary();
+static Node *parse_comparison();
+static Node *parse_add();
+static Node *parse_mul();
+static Node *parse_primary();
 static Type *parse_type();
+static Node *parse_struct_decl();
 
 
 void parser_init() {
@@ -34,6 +39,16 @@ Node *parse() {
 
     // Parsear todas as funções até encontrar EOF
     while (current_token.type != TOKEN_TYPE_EOF) {
+        if (current_token.type == TOKEN_TYPE_STRUCT) {
+             // Struct declarations are top-level, but we need to store them somewhere.
+             // For now, let's attach them to the AST or handle them separately.
+             // Ideally, we should have a list of top-level declarations.
+             // Let's make parse_struct_decl return a Node and link it.
+             cur->next = parse_struct_decl();
+             cur = cur->next;
+             continue;
+        }
+
         if (current_token.type != TOKEN_TYPE_FN) {
             fprintf(stderr, "Erro na linha %d: era esperado 'fn' mas encontrou '%s'\n",
                     current_token.line, current_token.text);
@@ -174,8 +189,11 @@ static Type *parse_type() {
     } else if (strcmp(current_token.text, "void") == 0) {
         ty = type_void;
     } else {
-        fprintf(stderr, "Erro: tipo desconhecido '%s'\n", current_token.text);
-        exit(1);
+        // Check if it's a struct type
+        // For now, we just assume any unknown identifier used as a type is a struct name
+        // The semantic analyzer will verify if it exists.
+        ty = new_type(TY_STRUCT);
+        ty->name = strdup(current_token.text);
     }
 
     consume();
@@ -422,15 +440,30 @@ static Node *parse_fn() {
 static Node *parse_postfix() {
     Node *node = parse_primary();
 
-    while (current_token.type == TOKEN_TYPE_LBRACKET) {
-        consume(); // [
-        Node *index = parse_expr();
-        expect(TOKEN_TYPE_RBRACKET); // ]
-        
-        Node *idx_node = new_node(NODE_KIND_INDEX);
-        idx_node->lhs = node; // Array/Pointer
-        idx_node->rhs = index; // Index
-        node = idx_node;
+    while (1) {
+        if (current_token.type == TOKEN_TYPE_LBRACKET) {
+            consume(); // [
+            Node *index = parse_expr();
+            expect(TOKEN_TYPE_RBRACKET); // ]
+            
+            Node *idx_node = new_node(NODE_KIND_INDEX);
+            idx_node->lhs = node; // Array/Pointer
+            idx_node->rhs = index; // Index
+            node = idx_node;
+        } else if (current_token.type == TOKEN_TYPE_DOT) {
+            consume(); // .
+            if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                fprintf(stderr, "Erro na linha %d: esperado nome do membro após '.'\n", current_token.line);
+                exit(1);
+            }
+            Node *member_node = new_node(NODE_KIND_MEMBER_ACCESS);
+            member_node->lhs = node;
+            member_node->member_name = strdup(current_token.text);
+            consume();
+            node = member_node;
+        } else {
+            break;
+        }
     }
     return node;
 }
@@ -542,6 +575,80 @@ static Node *parse_while_stmt() {
 
     node->while_stmt.body = parse_block();
 
+    return node;
+}
+
+static Node *parse_struct_decl() {
+    expect(TOKEN_TYPE_STRUCT);
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        fprintf(stderr, "Erro na linha %d: esperado nome da struct.\n", current_token.line);
+        exit(1);
+    }
+    char *struct_name = strdup(current_token.text);
+    consume();
+
+    Type *struct_type = new_type(TY_STRUCT);
+    struct_type->name = struct_name;
+    
+    expect(TOKEN_TYPE_LBRACE);
+
+    Field head = {};
+    Field *cur = &head;
+
+    while (current_token.type != TOKEN_TYPE_RBRACE) {
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+             fprintf(stderr, "Erro na linha %d: esperado nome do campo.\n", current_token.line);
+             exit(1);
+        }
+        char *field_name = strdup(current_token.text);
+        consume();
+
+        expect(TOKEN_TYPE_AS);
+        Type *field_type = parse_type();
+        expect(TOKEN_TYPE_SEMICOLON);
+
+        Field *f = calloc(1, sizeof(Field));
+        f->name = field_name;
+        f->type = field_type;
+        cur->next = f;
+        cur = f;
+    }
+    expect(TOKEN_TYPE_RBRACE);
+    struct_type->fields = head.next;
+
+    // We return a dummy node to keep the parser loop happy, 
+    // but the important part is that the type is created and (conceptually) registered.
+    // Actually, we need to register this type so it can be looked up later.
+    // Since we don't have a global type table yet (other than all_types list),
+    // we rely on the fact that we created it.
+    // BUT, when parsing types later, we create NEW TY_STRUCT types with just the name.
+    // We will need to resolve them in semantic analysis.
+    
+    // Let's return a NO-OP node or a special STRUCT_DECL node if we had one.
+    // For now, let's reuse EXPR_STMT with a null expr or something, or add NODE_KIND_STRUCT_DECL.
+    // Or better, since we are in top-level, we can just return NULL and handle it in the loop?
+    // No, the loop expects a node.
+    // Let's add NODE_KIND_STRUCT_DECL to parser.h? No, let's avoid changing header again if possible.
+    // Let's use a dummy node.
+    Node *node = new_node(NODE_KIND_EXPR_STMT); // Dummy
+    node->ty = struct_type; // Store the type here so we can register it in semantic analysis
+    // Actually, let's use a new node kind to be clean, or just use a hack.
+    // Hack: Use NODE_KIND_NUM with a special flag? No.
+    // Let's just add NODE_KIND_STRUCT_DECL. It's safer.
+    // Wait, I can't edit parser.h in this tool call.
+    // I will use NODE_KIND_BLOCK with no statements as a placeholder, but attach the type.
+    // Actually, I can just return a node that carries the type info.
+    // Let's use NODE_KIND_LET but with a special flag?
+    // Let's just use NODE_KIND_EXPR_STMT with NULL expr, but set the 'ty' field to the struct type.
+    // Semantic analysis will see this and register the struct.
+    node->kind = NODE_KIND_EXPR_STMT;
+    node->expr = NULL; // Signal that this is a struct decl
+    // Wait, EXPR_STMT expects expr.
+    // Let's use NODE_KIND_BLOCK with empty stmts.
+    node->kind = NODE_KIND_BLOCK;
+    node->stmts = NULL;
+    node->ty = struct_type; // Pass the type info
+    
     return node;
 }
 
@@ -841,6 +948,7 @@ void free_ast(Node *node) {
     free_ast(node->next);
 
     if (node->name) free(node->name);
+    if (node->member_name) free(node->member_name);
     
     // Liberar filhos baseados no tipo
     switch (node->kind) {

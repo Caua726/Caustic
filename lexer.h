@@ -47,6 +47,7 @@ typedef enum {
 	TOKEN_TYPE_STRING,
 	TOKEN_TYPE_WHILE,
 	TOKEN_TYPE_SYSCALL,
+	TOKEN_TYPE_STRUCT,
 } TokenType;
 
 static const char *TOKEN_NAMES[] = {
