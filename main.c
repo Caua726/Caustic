@@ -9,25 +9,49 @@
 #include <string.h>
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("É necessario colocar um arquivo, exemplo: ./caustic main.cst\n");
-        return 1;
-    }
-
-    const char *filename = argv[1];
-
+    const char *filename = NULL;
+    const char *output_filename = NULL;
     int debug_lexer = 0;
     int debug_parser = 0;
     int debug_ir = 0;
 
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-debuglexer") == 0) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            printf("Uso: ./caustic <arquivo> [opcoes]\n");
+            printf("Opcoes:\n");
+            printf("  -o <arquivo>    Define o arquivo de saida (assembly)\n");
+            printf("  -debuglexer     Mostra tokens do lexer\n");
+            printf("  -debugparser    Mostra AST do parser\n");
+            printf("  -debugir        Mostra IR gerado\n");
+            printf("  --help          Mostra esta mensagem\n");
+            return 0;
+        } else if (strcmp(argv[i], "-debuglexer") == 0) {
             debug_lexer = 1;
         } else if (strcmp(argv[i], "-debugparser") == 0) {
             debug_parser = 1;
         } else if (strcmp(argv[i], "-debugir") == 0) {
             debug_ir = 1;
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 < argc) {
+                output_filename = argv[++i];
+            } else {
+                fprintf(stderr, "Erro: esperado nome do arquivo apos '-o'\n");
+                return 1;
+            }
+        } else {
+            if (filename == NULL) {
+                filename = argv[i];
+            } else {
+                fprintf(stderr, "Erro: multiplos arquivos de entrada fornecidos: '%s' e '%s'\n", filename, argv[i]);
+                return 1;
+            }
         }
+    }
+
+    if (filename == NULL) {
+        printf("É necessario colocar um arquivo, exemplo: ./caustic main.cst\n");
+        printf("Use --help para ver as opcoes.\n");
+        return 1;
     }
 
     types_init();
@@ -97,7 +121,12 @@ int main(int argc, char *argv[]) {
         }
 
         char output[256];
-        snprintf(output, sizeof(output), "%s.s", filename);
+        if (output_filename) {
+            strncpy(output, output_filename, sizeof(output) - 1);
+            output[sizeof(output) - 1] = '\0';
+        } else {
+            snprintf(output, sizeof(output), "%s.s", filename);
+        }
 
         FILE *out_file = fopen(output, "w");
         if (!out_file) {
