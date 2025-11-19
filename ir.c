@@ -135,7 +135,11 @@ static int emit_get_arg(int arg_idx, int line) {
 
 static void emit_return(int src_reg, int line) {
     IRInst *inst = new_inst(IR_RET);
-    inst->src1 = op_vreg(src_reg);
+    if (src_reg != -1) {
+        inst->src1 = op_vreg(src_reg);
+    } else {
+        inst->src1.type = OPERAND_NONE;
+    }
     inst->line = line;
     emit(inst);
 }
@@ -732,8 +736,12 @@ static void gen_stmt_single(Node *node) {
 
     switch (node->kind) {
         case NODE_KIND_RETURN: {
-            int result_reg = gen_expr(node->expr);
-            emit_return(result_reg, node->tok ? node->tok->line : 0);
+            if (node->expr) {
+                int result_reg = gen_expr(node->expr);
+                emit_return(result_reg, node->tok ? node->tok->line : 0);
+            } else {
+                emit_return(-1, node->tok ? node->tok->line : 0);
+            }
             break;
         }
 
