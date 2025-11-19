@@ -529,6 +529,46 @@ static void walk(Node *node) {
             loop_depth--;
             return;
         }
+
+        case NODE_KIND_DO_WHILE: {
+            loop_depth++;
+            walk(node->do_while_stmt.body);
+            loop_depth--;
+            walk(node->do_while_stmt.cond);
+            TypeKind tk = node->do_while_stmt.cond->ty->kind;
+            if (tk != TY_I8 && tk != TY_I16 && tk != TY_I32 && tk != TY_I64 &&
+                tk != TY_U8 && tk != TY_U16 && tk != TY_U32 && tk != TY_U64 &&
+                tk != TY_BOOL && tk != TY_INT) {
+                fprintf(stderr, "Erro: condição do do-while deve ser um booleano ou inteiro.\n");
+                exit(1);
+            }
+            return;
+        }
+
+        case NODE_KIND_FOR: {
+            symtab_enter_scope();
+            if (node->for_stmt.init) walk(node->for_stmt.init);
+            
+            if (node->for_stmt.cond) {
+                walk(node->for_stmt.cond);
+                TypeKind tk = node->for_stmt.cond->ty->kind;
+                if (tk != TY_I8 && tk != TY_I16 && tk != TY_I32 && tk != TY_I64 &&
+                    tk != TY_U8 && tk != TY_U16 && tk != TY_U32 && tk != TY_U64 &&
+                    tk != TY_BOOL && tk != TY_INT) {
+                    fprintf(stderr, "Erro: condição do for deve ser um booleano ou inteiro.\n");
+                    exit(1);
+                }
+            }
+            
+            if (node->for_stmt.step) walk(node->for_stmt.step);
+            
+            loop_depth++;
+            walk(node->for_stmt.body);
+            loop_depth--;
+            
+            symtab_exit_scope();
+            return;
+        }
         case NODE_KIND_ADDR:
             walk(node->expr);
             if (node->expr->kind != NODE_KIND_IDENTIFIER && 

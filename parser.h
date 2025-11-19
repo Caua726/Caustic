@@ -83,6 +83,8 @@ typedef enum {
     NODE_KIND_SIZEOF,
     NODE_KIND_USE,
     NODE_KIND_MODULE_ACCESS,
+    NODE_KIND_FOR,
+    NODE_KIND_DO_WHILE,
 } NodeKind;
 
 typedef struct StringLiteral {
@@ -132,6 +134,16 @@ typedef struct Node {
         struct Node *else_b;
         struct Node *body;
     } if_stmt, while_stmt;
+    struct {
+        struct Node *init;
+        struct Node *cond;
+        struct Node *step;
+        struct Node *body;
+    } for_stmt;
+    struct {
+        struct Node *body;
+        struct Node *cond;
+    } do_while_stmt;
 } Node;
 
 void ast_print(Node *node);

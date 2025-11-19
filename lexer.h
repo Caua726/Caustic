@@ -57,6 +57,8 @@ typedef enum {
 	TOKEN_TYPE_SHL,
 	TOKEN_TYPE_SHR,
 	TOKEN_TYPE_USE,
+	TOKEN_TYPE_FOR,
+	TOKEN_TYPE_DO,
 } TokenType;
 
 extern const char *TOKEN_NAMES[];

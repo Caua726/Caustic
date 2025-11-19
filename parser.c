@@ -253,7 +253,15 @@ static Node *new_node_return(Node *expr) {
 }
 
 static Node *parse_expr() {
-    return parse_logical_or();
+    Node *node = parse_logical_or();
+    if (current_token.type == TOKEN_TYPE_EQUAL) {
+        consume();
+        Node *assign_node = new_node(NODE_KIND_ASSIGN);
+        assign_node->lhs = node;
+        assign_node->rhs = parse_expr(); // Right-associative
+        return assign_node;
+    }
+    return node;
 }
 
 static Type *parse_type() {
@@ -879,6 +887,69 @@ static Node *parse_asm_stmt() {
     return asm_node;
 }
 
+static Node *parse_for_stmt() {
+    expect(TOKEN_TYPE_FOR);
+    expect(TOKEN_TYPE_LPAREN);
+
+    Node *node = new_node(NODE_KIND_FOR);
+    
+    // Init (can be let or expr or empty)
+    if (current_token.type != TOKEN_TYPE_SEMICOLON) {
+        if (current_token.type == TOKEN_TYPE_LET) {
+            node->for_stmt.init = parse_var_decl();
+        } else {
+            node->for_stmt.init = parse_expr();
+            // If it's an expression, we might need to consume a semicolon if it's not part of the expression?
+            // parse_expr parses until it can't.
+            // But wait, parse_var_decl consumes the semicolon?
+            // parse_var_decl calls consume() at the end?
+            // Let's check parse_var_decl.
+            // It ends with consume() after init expr.
+        }
+    }
+    // parse_var_decl consumes the semicolon?
+    // parse_var_decl: ... consume(); return node;
+    // It consumes the semicolon at the end of let statement?
+    // Let's check parse_var_decl again.
+    // It expects semicolon at the end.
+    
+    // If init was expression, we need to consume semicolon.
+    if (node->for_stmt.init && node->for_stmt.init->kind != NODE_KIND_LET) {
+        expect(TOKEN_TYPE_SEMICOLON);
+    } else if (!node->for_stmt.init) {
+        expect(TOKEN_TYPE_SEMICOLON);
+    }
+    // If it was LET, parse_var_decl consumed semicolon.
+
+    // Cond
+    if (current_token.type != TOKEN_TYPE_SEMICOLON) {
+        node->for_stmt.cond = parse_expr();
+    }
+    expect(TOKEN_TYPE_SEMICOLON);
+
+    // Step
+    if (current_token.type != TOKEN_TYPE_RPAREN) {
+        node->for_stmt.step = parse_expr();
+    }
+    expect(TOKEN_TYPE_RPAREN);
+
+    node->for_stmt.body = parse_block();
+
+    return node;
+}
+
+static Node *parse_do_while_stmt() {
+    expect(TOKEN_TYPE_DO);
+    Node *node = new_node(NODE_KIND_DO_WHILE);
+    node->do_while_stmt.body = parse_block();
+    expect(TOKEN_TYPE_WHILE);
+    expect(TOKEN_TYPE_LPAREN);
+    node->do_while_stmt.cond = parse_expr();
+    expect(TOKEN_TYPE_RPAREN);
+    expect(TOKEN_TYPE_SEMICOLON);
+    return node;
+}
+
 static Node *parse_stmt() {
     if (current_token.type == TOKEN_TYPE_SEMICOLON) {
         consume();
@@ -893,6 +964,14 @@ static Node *parse_stmt() {
 
     if (current_token.type == TOKEN_TYPE_LET) {
         return parse_var_decl();
+    }
+
+    if (current_token.type == TOKEN_TYPE_FOR) {
+        return parse_for_stmt();
+    }
+
+    if (current_token.type == TOKEN_TYPE_DO) {
+        return parse_do_while_stmt();
     }
 
     if (current_token.type == TOKEN_TYPE_IF) {
@@ -939,14 +1018,7 @@ static Node *parse_stmt() {
         return new_node(NODE_KIND_CONTINUE);
     }
     Node *node = parse_expr();
-    if (current_token.type == TOKEN_TYPE_EQUAL) {
-        consume();
-        Node *assign_node = new_node(NODE_KIND_ASSIGN);
-        assign_node->lhs = node;
-        assign_node->rhs = parse_expr();
-        expect(TOKEN_TYPE_SEMICOLON);
-        return assign_node;
-    }
+    // Assignment is now handled in parse_expr
 
     expect(TOKEN_TYPE_SEMICOLON);
     Node *expr_stmt_node = new_node(NODE_KIND_EXPR_STMT);
