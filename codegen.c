@@ -36,8 +36,8 @@ typedef struct {
 } AllocCtx;
 
 static FILE *out;
-static const char *regs[] = {"rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
-static const int num_regs = 14;
+static const char *regs[] = {"rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13"};
+static const int num_regs = 12;
 
 
 // System V AMD64 ABI argument registers: rdi, rsi, rdx, rcx, r8, r9
@@ -278,7 +278,12 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
     switch (inst->op) {
         case IR_IMM:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            emit("mov %s, %ld", dst, inst->src1.imm);
+            if (is_mem(inst->dest.vreg, ctx) && (inst->src1.imm > INT_MAX || inst->src1.imm < INT_MIN)) {
+                emit("mov r15, %ld", inst->src1.imm);
+                emit("mov %s, r15", dst);
+            } else {
+                emit("mov %s, %ld", dst, inst->src1.imm);
+            }
             break;
 
         case IR_MOV:
@@ -309,17 +314,23 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
         case IR_DIV:
             load_operand(inst->src1.vreg, ctx, "rax");
             load_operand(inst->src2.vreg, ctx, "r15");
+            emit("push rdx");
             emit("cqo");
             emit("idiv r15");
-            store_operand(inst->dest.vreg, ctx, "rax");
+            emit("mov r15, rax");
+            emit("pop rdx");
+            store_operand(inst->dest.vreg, ctx, "r15");
             break;
 
         case IR_MOD:
             load_operand(inst->src1.vreg, ctx, "rax");
             load_operand(inst->src2.vreg, ctx, "r15");
+            emit("push rdx");
             emit("cqo");
             emit("idiv r15");
-            store_operand(inst->dest.vreg, ctx, "rdx");
+            emit("mov r15, rdx");
+            emit("pop rdx");
+            store_operand(inst->dest.vreg, ctx, "r15");
             break;
 
         case IR_NEG:
@@ -781,18 +792,28 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             break;
 
         case IR_SYSCALL:
+            emit("push rcx");
+            emit("push r11");
             emit("syscall");
+            emit("pop r11");
+            emit("pop rcx");
             // Result is in rax, move to dest vreg
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
         case IR_COPY:
             // dest = dst_addr, src1 = src_addr, src2 = size (imm)
+            emit("push rcx");
+            emit("push rsi");
+            emit("push rdi");
             load_operand(inst->dest.vreg, ctx, "rdi"); // Destination
             load_operand(inst->src1.vreg, ctx, "rsi"); // Source
             emit("mov rcx, %ld", inst->src2.imm);      // Size
             emit("cld");
             emit("rep movsb");
+            emit("pop rdi");
+            emit("pop rsi");
+            emit("pop rcx");
             break;
 
         case IR_GET_ARG:
@@ -889,6 +910,26 @@ static void gen_func(IRFunction *func) {
 
     for (IRInst *inst = func->instructions; inst; inst = inst->next) {
         gen_inst(inst, &ctx);
+    }
+
+    // Implicit return for void functions (or fallthrough safety)
+    IRInst *last = func->instructions;
+    while (last && last->next) last = last->next;
+    
+    if (!last || last->op != IR_RET) {
+        // Emit epilogue
+        int stack_size = ctx.stack_slots * 8;
+        if (stack_size > 0) {
+            stack_size = (stack_size + 15) & ~15;
+            emit("add rsp, %d", stack_size);
+        }
+        emit("pop r15");
+        emit("pop r14");
+        emit("pop r13");
+        emit("pop r12");
+        emit("pop rbx");
+        emit("pop rbp");
+        emit("ret");
     }
 
     // Cleanup
