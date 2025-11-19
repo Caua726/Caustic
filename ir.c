@@ -1031,6 +1031,31 @@ static void mark_reachable(IRProgram *prog, IRFunction *func) {
     }
 }
 
+static long eval_const_expr(Node *node) {
+    if (node->kind == NODE_KIND_NUM) {
+        return node->val;
+    }
+    if (node->kind == NODE_KIND_ADD) {
+        return eval_const_expr(node->lhs) + eval_const_expr(node->rhs);
+    }
+    if (node->kind == NODE_KIND_SUBTRACTION) {
+        return eval_const_expr(node->lhs) - eval_const_expr(node->rhs);
+    }
+    if (node->kind == NODE_KIND_MULTIPLIER) {
+        return eval_const_expr(node->lhs) * eval_const_expr(node->rhs);
+    }
+    if (node->kind == NODE_KIND_DIVIDER) {
+        long rhs = eval_const_expr(node->rhs);
+        if (rhs == 0) {
+            fprintf(stderr, "Erro: divisão por zero em expressão constante.\n");
+            exit(1);
+        }
+        return eval_const_expr(node->lhs) / rhs;
+    }
+    fprintf(stderr, "Erro: expressão não constante na inicialização global.\n");
+    exit(1);
+}
+
 IRProgram *gen_ir(Node *ast) {
     static int depth = 0;
     depth++;
@@ -1047,12 +1072,9 @@ IRProgram *gen_ir(Node *ast) {
             glob->size = node->ty->size;
             
             // Handle initialization
-            if (node->init_expr && node->init_expr->kind == NODE_KIND_NUM) {
-                glob->init_value = node->init_expr->val;
+            if (node->init_expr) {
+                glob->init_value = eval_const_expr(node->init_expr);
                 glob->is_initialized = 1;
-            } else if (node->init_expr) {
-                fprintf(stderr, "Erro: inicialização de global suporta apenas literais inteiros por enquanto.\n");
-                exit(1);
             } else {
                 glob->is_initialized = 0;
             }
