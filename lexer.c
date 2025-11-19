@@ -63,14 +63,18 @@ const char *TOKEN_NAMES[] = {
 };
 
 static FILE *src;
+static const char *src_filename;
 static int current_char;
 static int ahead_char;
 static int line = 1;
+static int col = 0;
 
 static void next_char(void) {
 	current_char = fgetc(src);
+    col++;
 	if (current_char == '\n') {
 		line++;
+        col = 0;
 	}
 }
 
@@ -80,14 +84,19 @@ static int lookhead_char() {
     return c;
 }
 
-void lexer_init(FILE *file) {
+void lexer_init(FILE *file, const char *filename) {
 	src = file;
+    src_filename = filename;
+    line = 1;
+    col = 0;
 	next_char();
 }
 
 void lexer_get_state(LexerState *state) {
     state->file = src;
     state->line = line;
+    state->col = col;
+    state->filename = src_filename;
     state->current_char = current_char;
     state->ahead_char = ahead_char;
 }
@@ -95,12 +104,15 @@ void lexer_get_state(LexerState *state) {
 void lexer_set_state(LexerState *state) {
     src = state->file;
     line = state->line;
+    col = state->col;
+    src_filename = state->filename;
     current_char = state->current_char;
     ahead_char = state->ahead_char;
 }
 
 Token lexer_next() {
 	Token t = {0};
+    t.text[0] = '\0';
 
 	while (isspace(current_char)) {
 		next_char();
@@ -108,12 +120,16 @@ Token lexer_next() {
 
 	if (current_char == EOF) {
 		t.line = line;
+        t.col = col;
+        t.filename = src_filename;
 		t.type = TOKEN_TYPE_EOF;
 		return t;
 	}
 
     if (isalpha(current_char) || current_char == '_') {
         t.line = line;
+        t.col = col;
+        t.filename = src_filename;
         int i = 0;
         while (isalnum(current_char) || current_char == '_') {
             if (i < 254) {
@@ -150,6 +166,8 @@ Token lexer_next() {
 
     if (isdigit(current_char)) {
         t.line = line;
+        t.col = col;
+        t.filename = src_filename;
         int i = 0;
         
         // Hexadecimal support
@@ -190,6 +208,8 @@ Token lexer_next() {
     }
 
     t.line = line;
+    t.col = col;
+    t.filename = src_filename;
     switch (current_char) {
         case '+':
             t.text[0] = '+';
@@ -461,5 +481,23 @@ Token lexer_next() {
             return t;
     }
     printf("Erro: caractere inesperado '%c' na linha %d\n", current_char, line);
+    exit(1);
+}
+
+#include <stdarg.h>
+
+void error_at_token(Token t, const char *fmt, ...) {
+    fprintf(stderr, "Erro em %s:%d:%d: ", t.filename ? t.filename : "<unknown>", t.line, t.col);
+    
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    
+    fprintf(stderr, "\n");
+    
+    // Optional: Print source snippet if we had access to the line content easily.
+    // For now, just the location is a huge improvement.
+    
     exit(1);
 }
