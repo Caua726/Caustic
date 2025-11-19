@@ -40,10 +40,10 @@ Token lexer_next() {
 		return t;
 	}
 
-    if (isalpha(current_char)) {
+    if (isalpha(current_char) || current_char == '_') {
         t.line = line;
         int i = 0;
-        while (isalnum(current_char)) {
+        while (isalnum(current_char) || current_char == '_') {
             if (i < 255) {
                 t.text[i++] = current_char;
             }

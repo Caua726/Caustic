@@ -1,4 +1,13 @@
 .intel_syntax noprefix
+.section .data
+.global global_var
+global_var:
+  .long 10
+.global global_const
+global_const:
+  .long 20
+.section .bss
+.text
 .global main
 
 main:
@@ -9,39 +18,21 @@ main:
   push r13
   push r14
   push r15
-  sub rsp, 80
-  mov rbx, 10
-  lea r12, [rbp-56]
-  mov r15, r12
-  mov rax, rbx
-  mov DWORD PTR [r15], eax
-  mov rbx, 20
-  lea r12, [rbp-56]
-  mov QWORD PTR [rbp-64], 4
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-64]
-  add r15, r14
-  mov r13, r15
-  mov r15, r13
-  mov rax, rbx
-  mov DWORD PTR [r15], eax
-  lea rbx, [rbp-56]
+  sub rsp, 48
+  lea rbx, [rip+global_var]
   mov r15, rbx
   movsxd r12, DWORD PTR [r15]
-  lea rbx, [rbp-56]
-  mov QWORD PTR [rbp-72], 4
+  lea rbx, [rip+global_const]
   mov r15, rbx
-  mov r14, QWORD PTR [rbp-72]
-  add r15, r14
-  mov r13, r15
-  mov r15, r13
-  movsxd rbx, DWORD PTR [r15]
+  movsxd r13, DWORD PTR [r15]
   mov r15, r12
-  mov r14, rbx
+  mov r14, r13
   add r15, r14
-  mov r13, r15
-  mov rax, r13
-  add rsp, 80
+  mov rbx, r15
+  mov DWORD PTR [rbp-48], ebx
+  movsxd rbx, DWORD PTR [rbp-48]
+  mov rax, rbx
+  add rsp, 48
   pop r15
   pop r14
   pop r13

@@ -1,4 +1,5 @@
 #pragma once
 #include "ir.h"
 
-void codegen(IRProgram *prog, const char *output_file);
+#include <stdio.h>
+void codegen(IRProgram *prog, FILE *output_file);
