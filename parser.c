@@ -712,16 +712,10 @@ static Node *parse_shift() {
     return node;
 }
 
-static Node *parse_comparison() {
+static Node *parse_relational() {
     Node *node = parse_shift();
     while (1) {
-        if (current_token.type == TOKEN_TYPE_EQEQ) {
-            consume();
-            node = new_binary_node(NODE_KIND_EQ, node, parse_shift());
-        } else if (current_token.type == TOKEN_TYPE_NE) {
-            consume();
-            node = new_binary_node(NODE_KIND_NE, node, parse_shift());
-        } else if (current_token.type == TOKEN_TYPE_LT) {
+        if (current_token.type == TOKEN_TYPE_LT) {
             consume();
             node = new_binary_node(NODE_KIND_LT, node, parse_shift());
         } else if (current_token.type == TOKEN_TYPE_LE) {
@@ -733,6 +727,22 @@ static Node *parse_comparison() {
         } else if (current_token.type == TOKEN_TYPE_GE) {
             consume();
             node = new_binary_node(NODE_KIND_GE, node, parse_shift());
+        } else {
+            break;
+        }
+    }
+    return node;
+}
+
+static Node *parse_comparison() {
+    Node *node = parse_relational();
+    while (1) {
+        if (current_token.type == TOKEN_TYPE_EQEQ) {
+            consume();
+            node = new_binary_node(NODE_KIND_EQ, node, parse_relational());
+        } else if (current_token.type == TOKEN_TYPE_NE) {
+            consume();
+            node = new_binary_node(NODE_KIND_NE, node, parse_relational());
         } else {
             break;
         }
@@ -870,6 +880,17 @@ static Node *parse_asm_stmt() {
 }
 
 static Node *parse_stmt() {
+    if (current_token.type == TOKEN_TYPE_SEMICOLON) {
+        consume();
+        // Return a no-op node or just continue?
+        // Since parse_stmt returns a Node*, we should return a Block with no stmts or similar.
+        // Or just NULL? But callers might expect a node.
+        // Let's return an empty block.
+        Node *node = new_node(NODE_KIND_BLOCK);
+        node->stmts = NULL;
+        return node;
+    }
+
     if (current_token.type == TOKEN_TYPE_LET) {
         return parse_var_decl();
     }
@@ -880,7 +901,10 @@ static Node *parse_stmt() {
 
     if (current_token.type == TOKEN_TYPE_RETURN) {
         consume();
-        Node *expr_node = parse_expr();
+        Node *expr_node = NULL;
+        if (current_token.type != TOKEN_TYPE_SEMICOLON) {
+            expr_node = parse_expr();
+        }
 
         if (current_token.type != TOKEN_TYPE_SEMICOLON) {
             fprintf(stderr, "Erro de sintaxe na linha %d: era esperado ';' depois da expressao.\n", current_token.line);

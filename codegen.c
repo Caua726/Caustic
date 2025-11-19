@@ -351,7 +351,9 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             break;
 
         case IR_RET:
-            load_operand(inst->src1.vreg, ctx, "rax");
+            if (inst->src1.type != OPERAND_NONE) {
+                load_operand(inst->src1.vreg, ctx, "rax");
+            }
 
             int stack_size = ctx->stack_slots * 8;
             if (stack_size > 0) {
