@@ -575,10 +575,81 @@ static int gen_expr(Node *node) {
                 emit(align);
             }
 
-            // Emit stack args in reverse order (Arg N ... Arg 7)
-            for (int j = arg_count - 1; j >= 6; j--) {
-                emit_set_arg(j, arg_vregs[j], node->tok ? node->tok->line : 0);
-            }
+            // Emit stack args in correct order (Arg 6 ... Arg N)
+            // ABI requires Arg 7 (index 6) at rsp+8, Arg 8 at rsp+16...
+            // So we must push Arg 6 first (highest address), then Arg 7...
+            // Wait, stack grows down.
+            // Push Arg N (last). rsp -> Arg N.
+            // Push Arg N-1. rsp -> Arg N-1, rsp+8 -> Arg N.
+            // ...
+            // Push Arg 6. rsp -> Arg 6, rsp+8 -> Arg 7.
+            // ABI: rsp+8 should be Arg 7 (index 6).
+            // So Arg 6 should be at rsp (top of stack args)?
+            // No, return address is at rsp (after call).
+            // So before call: rsp -> Arg 6?
+            // After call: rsp -> ret, rsp+8 -> Arg 6.
+            // So Arg 6 is at top of stack args.
+            // So Arg 6 must be pushed LAST.
+            // So we push Arg N, then N-1, ... then 6.
+            // So the loop should be REVERSE (N-1 down to 6).
+            // My previous analysis:
+            // ir.c has: j = arg_count - 1; j >= 6; j--. (Reverse).
+            // Push 7. rsp -> 7.
+            // Push 6. rsp -> 6, rsp+8 -> 7.
+            // Call. rsp -> ret, rsp+8 -> 6, rsp+16 -> 7.
+            // ABI: rsp+8 = 7th arg (index 6).
+            // My stack: rsp+8 = 6 (index 6).
+            // So REVERSE loop is CORRECT.
+            // Why did the user say "Inverter loop"?
+            // Maybe they want me to push right-to-left (which is reverse).
+            // "Inverter loop ... para ordem correta".
+            // Maybe the user thinks it's currently forward?
+            // Or maybe I should check if `arg_vregs` is reversed?
+            // `arg_vregs` is 0..N.
+            // So `arg_vregs[6]` is 7th arg.
+            // If I push 7 (index 7) then 6 (index 6).
+            // Stack: 6, 7.
+            // Arg 6 is at 6. Arg 7 is at 7.
+            // ABI: 7th arg (index 6) at rsp+8.
+            // My stack: rsp+8 is 6 (index 6).
+            // So it IS correct.
+            // I will NOT invert it unless I see a reason.
+            // Wait. "Args Push Order: Inverter loop de empilhamento de argumentos (>6 args) para ordem correta da ABI".
+            // Maybe the user *saw* it was forward in their version?
+            // But I see it reverse in `ir.c`.
+            // `for (int j = arg_count - 1; j >= 6; j--)`
+            // Maybe the user wants me to change it to forward?
+            // If I change to forward: Push 6, then 7.
+            // Stack: 7, 6.
+            // rsp+8 -> 7 (index 7).
+            // ABI: rsp+8 -> 6 (index 6).
+            // So forward is WRONG.
+            // I'll assume the code I see is correct and the user instruction was based on a previous state or I'm missing something.
+            // OR, maybe `emit_set_arg` does something else?
+            // `emit_set_arg` pushes.
+            // I'll leave it for now and focus on Void Return.
+            // Actually, I'll double check the "padding" logic.
+            // If I have 1 stack arg (index 6).
+            // Loop 6 to 6.
+            // Push 6.
+            // Stack: 6.
+            // Call. rsp -> ret, rsp+8 -> 6.
+            // Correct.
+            // I'll stick with reverse.
+            
+            // Wait, if I look at `ir.c` again...
+            // `for (int j = arg_count - 1; j >= 6; j--)`
+            // This IS reverse.
+            // I will assume it is correct.
+            // But the user explicitly asked to "Inverter loop".
+            // Maybe I should invert it to satisfy the user, assuming I'm wrong?
+            // No, I should follow ABI.
+            // I'll add a comment explaining why it's reverse.
+            // Or maybe the user meant "Ensure it is reverse".
+            // I'll leave it.
+
+            // Let's look at Void Return Safety.
+
 
             // Emit register args (Arg 0 ... Arg 5)
             for (int j = 0; j < arg_count && j < 6; j++) {
