@@ -14,6 +14,7 @@ static Scope *global_scope = NULL;
 static int stack_offset = 0;
 static Function *function_table = NULL;
 static int loop_depth = 0;
+static Type *current_return_type = NULL;
 
 struct Module {
     char *name; // alias
@@ -124,28 +125,6 @@ typedef struct StructDef {
 
 static StructDef *struct_defs = NULL;
 
-static void declare_struct(Type *type) {
-    for (StructDef *s = struct_defs; s; s = s->next) {
-        if (strcmp(s->name, type->name) == 0) {
-            fprintf(stderr, "Erro: redefinição da struct '%s'\n", type->name);
-            exit(1);
-        }
-    }
-    StructDef *s = calloc(1, sizeof(StructDef));
-    s->name = strdup(type->name);
-    s->type = type;
-    s->next = struct_defs;
-    struct_defs = s;
-
-    // Calculate size and offsets
-    int offset = 0;
-    for (Field *f = type->fields; f; f = f->next) {
-        f->offset = offset;
-        offset += f->type->size;
-    }
-    type->size = offset;
-}
-
 static Type *lookup_struct(char *name) {
     for (StructDef *s = struct_defs; s; s = s->next) {
         if (strcmp(s->name, name) == 0) {
@@ -154,9 +133,6 @@ static Type *lookup_struct(char *name) {
     }
     return NULL;
 }
-
-// Helper to resolve placeholder struct types
-
 
 static void resolve_type_ref(Type *ty) {
     if (ty->kind == TY_STRUCT && ty->fields == NULL && ty->name != NULL) {
@@ -173,6 +149,35 @@ static void resolve_type_ref(Type *ty) {
     if (ty->kind == TY_PTR || ty->kind == TY_ARRAY) {
         resolve_type_ref(ty->base);
     }
+}
+
+static void declare_struct(Type *type) {
+    for (StructDef *s = struct_defs; s; s = s->next) {
+        if (strcmp(s->name, type->name) == 0) {
+            fprintf(stderr, "Erro: redefinição da struct '%s'\n", type->name);
+            exit(1);
+        }
+    }
+    StructDef *s = calloc(1, sizeof(StructDef));
+    s->name = strdup(type->name);
+    s->type = type;
+    s->next = struct_defs;
+    struct_defs = s;
+
+    // Calculate size and offsets
+    int offset = 0;
+    for (Field *f = type->fields; f; f = f->next) {
+        resolve_type_ref(f->type);
+        
+        if (f->type->kind == TY_STRUCT && strcmp(f->type->name, type->name) == 0) {
+             fprintf(stderr, "Erro: struct '%s' contém a si mesma diretamente no campo '%s'. Use um ponteiro.\n", type->name, f->name);
+             exit(1);
+        }
+
+        f->offset = offset;
+        offset += f->type->size;
+    }
+    type->size = offset;
 }
 
 void types_init() {
@@ -307,7 +312,19 @@ static void walk(Node *node) {
         }
 
         case NODE_KIND_RETURN:
-            walk(node->expr);
+            if (node->expr) {
+                walk(node->expr);
+                if (!is_safe_implicit_conversion(node->expr->ty, current_return_type)) {
+                    fprintf(stderr, "Erro: tipo de retorno incompatível. Esperado %d, encontrado %d\n", current_return_type->kind, node->expr->ty->kind);
+                    // TODO: Print type names instead of enums
+                    exit(1);
+                }
+            } else {
+                if (current_return_type != type_void) {
+                    fprintf(stderr, "Erro: retorno vazio em função não-void.\n");
+                    exit(1);
+                }
+            }
             return;
 
         case NODE_KIND_FN:
@@ -339,7 +356,17 @@ static void walk(Node *node) {
                  }
             }
 
+            Type *saved_return_type = current_return_type;
+            current_return_type = node->return_type; // Assuming node->return_type is set by parser/declare_functions
+            // Wait, node->return_type is in the AST node.
+            // We need to make sure it's resolved?
+            // Parser sets it to type_i32 or type_void etc.
+            // If it's a struct type, it might need resolution?
+            // For now assume primitive or already resolved.
+            
             walk(node->body);
+            
+            current_return_type = saved_return_type;
             symtab_exit_scope();
             return;
 
