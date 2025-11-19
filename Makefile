@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g -std=c11
+CFLAGS = -Wall -Wextra -g -std=c23
 SOURCES = main.c lexer.c parser.c semantic.c ir.c codegen.c
 OBJECTS = $(SOURCES:.c=.o)
 TARGET = caustic

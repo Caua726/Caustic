@@ -5,13 +5,22 @@
 #include <stdio.h>
 #include <string.h>
 
+const char *IR_OP_NAMES[] = {
+    "IMM", "MOV",
+    "ADD", "SUB", "MUL", "DIV", "MOD", "NEG",
+    "EQ", "NE", "LT", "LE", "GT", "GE",
+    "JMP", "JZ", "JNZ", "LABEL",
+    "SYSCALL",
+    "COPY", "RET",
+    "LOAD", "STORE", "ADDR", "ADDR_GLOBAL",
+    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_SYS_ARG", "SYSCALL",
+};
+
 typedef struct {
     IRFunction *current_func;
     IRInst *inst_head;
     IRInst *inst_tail;
     int vreg_count;
-    int label_count;
-    
     struct {
         int start_label;
         int end_label;
@@ -20,6 +29,7 @@ typedef struct {
 } IRGenContext;
 
 static IRGenContext ctx;
+static int global_label_count = 0;
 
 static void push_loop(int start, int end) {
     if (ctx.loop_depth >= 32) {
@@ -58,7 +68,7 @@ static int new_vreg() {
 }
 
 static int new_label() {
-    return ctx.label_count++;
+    return global_label_count++;
 }
 
 static int emit_imm(long value, int line) {
@@ -82,15 +92,7 @@ static int emit_binary(IROp op, int lhs_reg, int rhs_reg, int line) {
     return dest;
 }
 
-static int emit_unary(IROp op, int src_reg, int line) {
-    int dest = new_vreg();
-    IRInst *inst = new_inst(op);
-    inst->dest = op_vreg(dest);
-    inst->src1 = op_vreg(src_reg);
-    inst->line = line;
-    emit(inst);
-    return dest;
-}
+
 
 static int emit_cast(int src_reg, Type *to_type, int line) {
     int dest = new_vreg();
@@ -165,7 +167,12 @@ static int gen_addr(Node *node) {
         }
         case NODE_KIND_INDEX: {
             // Address of arr[i] = base_addr + i * size
-            int base = gen_addr(node->lhs);
+            int base;
+            if (node->lhs->ty->kind == TY_PTR) {
+                base = gen_expr(node->lhs);
+            } else {
+                base = gen_addr(node->lhs);
+            }
             int index = gen_expr(node->rhs);
             int size = node->ty->size;
 
@@ -183,7 +190,13 @@ static int gen_addr(Node *node) {
         }
         case NODE_KIND_MEMBER_ACCESS: {
             // Address of struct.member = base_addr + offset
-            int base = gen_addr(node->lhs);
+            int base;
+            if (node->lhs->ty->kind == TY_PTR) {
+                base = gen_expr(node->lhs); // Load the pointer value
+            } else {
+                base = gen_addr(node->lhs); // Get the address of the struct
+            }
+
             if (node->offset == 0) {
                 return base;
             }
@@ -825,7 +838,34 @@ static void gen_stmt_single(Node *node) {
     }
 }
 
+static void mark_reachable(IRProgram *prog, IRFunction *func) {
+    if (!func || func->is_reachable) return;
+    func->is_reachable = 1;
+    
+    for (IRInst *inst = func->instructions; inst; inst = inst->next) {
+        if (inst->op == IR_CALL && inst->call_target_name) {
+            for (IRFunction *f = prog->functions; f; f = f->next) {
+                char *fname = f->asm_name ? f->asm_name : f->name;
+                if (strcmp(fname, inst->call_target_name) == 0) {
+                    mark_reachable(prog, f);
+                    break;
+                }
+            }
+        } else if (inst->op == IR_ADDR_GLOBAL && inst->global_name) {
+             for (IRGlobal *g = prog->globals; g; g = g->next) {
+                if (strcmp(g->name, inst->global_name) == 0) {
+                    g->is_reachable = 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 IRProgram *gen_ir(Node *ast) {
+    static int depth = 0;
+    depth++;
+    
     IRProgram *prog = calloc(1, sizeof(IRProgram));
     IRFunction **func_ptr = &prog->functions;
     IRGlobal **global_ptr = &prog->globals;
@@ -863,10 +903,12 @@ IRProgram *gen_ir(Node *ast) {
         ctx.inst_head = NULL;
         ctx.inst_tail = NULL;
         ctx.vreg_count = 0;
-        ctx.label_count = 0;
+        // ctx.label_count = 0; // REMOVED: Labels must be unique across all functions
 
         IRFunction *func = calloc(1, sizeof(IRFunction));
         func->name = strdup(fn_node->name);
+        func->asm_name = strdup(fn_node->name);
+        func->instructions = NULL;
         ctx.current_func = func;
 
         if (fn_node->body && fn_node->body->kind == NODE_KIND_BLOCK) {
@@ -882,6 +924,11 @@ IRProgram *gen_ir(Node *ast) {
                 emit(store);
             }
             gen_stmt(fn_node->body->stmts);
+            
+            // Sempre emitir um retorno implícito (0) no final da função.
+            // Isso garante que funções void tenham epílogo gerado no codegen.
+            int zero = emit_imm(0, 0);
+            emit_return(zero, 0);
         } else {
             fprintf(stderr, "Erro: função '%s' deve ter um bloco\n", fn_node->name);
             exit(1);
@@ -889,7 +936,7 @@ IRProgram *gen_ir(Node *ast) {
 
         func->instructions = ctx.inst_head;
         func->vreg_count = ctx.vreg_count;
-        func->label_count = ctx.label_count;
+        func->label_count = global_label_count;
 
         // Adicionar à lista de funções
         *func_ptr = func;
@@ -901,13 +948,62 @@ IRProgram *gen_ir(Node *ast) {
         }
     }
 
-    if (!prog->main_func) {
+    // Handle NODE_KIND_USE at top level
+    for (Node *node = ast; node; node = node->next) {
+        if (node->kind == NODE_KIND_USE) {
+            IRProgram *mod_prog = gen_ir(node->body);
+            
+            // Merge functions
+            if (mod_prog->functions) {
+                
+                if (prog->functions) {
+                    IRFunction *last = prog->functions;
+                    while (last->next) last = last->next;
+                    last->next = mod_prog->functions;
+                } else {
+                    prog->functions = mod_prog->functions;
+                }
+            }
+
+            // Merge globals
+            if (mod_prog->globals) {
+                if (prog->globals) {
+                    IRGlobal *last = prog->globals;
+                    while (last->next) last = last->next;
+                    last->next = mod_prog->globals;
+                } else {
+                    prog->globals = mod_prog->globals;
+                }
+            }
+            
+            // Strings are global (handled by get_strings())
+            
+            free(mod_prog); // Free container
+        }
+    }
+
+    // Scan for main function after all merges (only at top level)
+    if (depth == 1 && !prog->main_func) {
+        for (IRFunction *f = prog->functions; f; f = f->next) {
+            if (strcmp(f->name, "main") == 0) {
+                prog->main_func = f;
+                break;
+            }
+        }
+    }
+
+    if (depth == 1 && !prog->main_func) {
         fprintf(stderr, "Erro: função main não encontrada\n");
         exit(1);
     }
 
     prog->strings = get_strings();
 
+    if (prog->main_func) {
+        mark_reachable(prog, prog->main_func);
+    }
+
+    depth--;
     return prog;
 }
 

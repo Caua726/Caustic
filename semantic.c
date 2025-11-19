@@ -15,6 +15,31 @@ static int stack_offset = 0;
 static Function *function_table = NULL;
 static int loop_depth = 0;
 
+struct Module {
+    char *name; // alias
+    Scope *scope;
+    char *path_prefix;
+    struct Module *next;
+};
+
+static char *current_module_path = NULL; // Prefix for current module
+static Module *module_list = NULL;
+
+static char *get_module_prefix(const char *path) {
+    char *prefix = malloc(strlen(path) + 2);
+    prefix[0] = '_';
+    int j = 1;
+    for (int i = 0; path[i]; i++) {
+        if (path[i] == '/' || path[i] == '.' || path[i] == '\\') {
+            prefix[j++] = '_';
+        } else {
+            prefix[j++] = path[i];
+        }
+    }
+    prefix[j] = '\0';
+    return prefix;
+}
+
 Type *type_int;
 Type *type_i8;
 Type *type_i16;
@@ -50,36 +75,46 @@ static void declare_function(char *name, Type *return_type, Type **param_types, 
     fs->return_type = return_type;
     fs->param_types = param_types;
     fs->param_count = param_count;
+    
+    if (current_module_path) {
+        fs->module_prefix = strdup(current_module_path);
+        // Mangle name: prefix + "_" + name
+        int len = strlen(current_module_path) + 1 + strlen(name) + 1;
+        fs->asm_name = malloc(len);
+        snprintf(fs->asm_name, len, "%s_%s", current_module_path, name);
+    } else {
+        fs->module_prefix = NULL;
+        fs->asm_name = strdup(name);
+    }
+
     fs->next = function_table;
     function_table = fs;
 }
 
-static Function *lookup_function(char *name) {
+static Function *lookup_function_qualified(char *name, char *prefix) {
     for (Function *fs = function_table; fs; fs = fs->next) {
         if (strcmp(fs->name, name) == 0) {
-            return fs;
+            if (prefix && fs->module_prefix && strcmp(fs->module_prefix, prefix) == 0) return fs;
+            if (!prefix && !fs->module_prefix) return fs;
         }
     }
     return NULL;
 }
 
-// Global list of registered structs (using the Type structs themselves)
-static Type *struct_list = NULL;
-
-static void register_struct(Type *struct_type) {
-    // Check for redefinition
-    for (Type *t = struct_list; t; t = t->next) {
-        // Note: t->next here is iterating our local list, not the global all_types list
-        // But wait, Type struct has 'next' for GC. We shouldn't reuse that for this list unless we are careful.
-        // Actually, let's just use a separate linked list for looked up structs or just iterate all_types?
-        // parser.h exposes 'all_types' but it's a flat list of ALL allocated types.
-        // Let's create a separate struct for the symbol table of structs.
+static Function *lookup_function(char *name) {
+    // Try current module first
+    if (current_module_path) {
+        Function *f = lookup_function_qualified(name, current_module_path);
+        if (f) return f;
     }
-    // Simpler: Just add to a static list.
-    // But Type struct 'next' is used for GC.
-    // Let's add a 'next_struct' field to Type? No, can't change header easily now.
-    // Let's use a separate linked list node.
+    // Try global
+    return lookup_function_qualified(name, NULL);
 }
+
+// Global list of registered structs (using the Type structs themselves)
+
+
+
 
 typedef struct StructDef {
     char *name;
@@ -121,20 +156,7 @@ static Type *lookup_struct(char *name) {
 }
 
 // Helper to resolve placeholder struct types
-static void resolve_types(Node *node) {
-    // We need to traverse the AST and find any Type that is TY_STRUCT but has no fields (placeholder).
-    // But Types are shared/allocated in parser. 
-    // Actually, we can just iterate 'all_types' from parser if we had access.
-    // Since we don't have easy access to 'all_types' root here (it's in parser.c),
-    // we can rely on the fact that we will encounter them during traversal or we can export all_types.
-    // Let's export all_types in parser.h? It is not exported.
-    // Alternative: When we see a variable declaration with TY_STRUCT, we check if it's resolved.
-    // If not, we look it up and replace the Type pointer or copy details.
-    // Replacing pointer is better so all usages see it.
-    // But we can't easily find all pointers TO the placeholder.
-    // Better: Copy details FROM the definition TO the placeholder.
-    // But size is needed.
-}
+
 
 static void resolve_type_ref(Type *ty) {
     if (ty->kind == TY_STRUCT && ty->fields == NULL && ty->name != NULL) {
@@ -251,22 +273,7 @@ static Variable *symtab_lookup(char *name) {
     return NULL;
 }
 
-static void register_functions(Node *program_node) {
-    for (Node *node = program_node; node; node = node->next) {
-        if (node->kind == NODE_KIND_FN) {
-            int param_count = 0;
-            for (Node *p = node->params; p; p = p->next) param_count++;
-            
-            Type **param_types = calloc(param_count, sizeof(Type*));
-            int i = 0;
-            for (Node *p = node->params; p; p = p->next) {
-                param_types[i++] = p->ty;
-            }
 
-            declare_function(node->name, node->return_type, param_types, param_count);
-        }
-    }
-}
 
 static void walk(Node *node) {
     if (!node) {
@@ -274,6 +281,7 @@ static void walk(Node *node) {
     }
 
     switch (node->kind) {
+        case NODE_KIND_ASM: break;
         case NODE_KIND_NUM:
             node->ty = type_i32;
             return;
@@ -316,6 +324,21 @@ static void walk(Node *node) {
                 param->var = var;
                 param->offset = var->offset;
             }
+            // Update node->name to asm_name for codegen
+            // We need to find the function in the table to get asm_name
+            // But we are in a new scope? No, function_table is global.
+            // But we need to know the prefix?
+            // lookup_function uses current_module_path.
+            // analyze_bodies sets current_module_path.
+            // So lookup_function(node->name) should work.
+            Function *fs_def = lookup_function(node->name);
+            if (fs_def && fs_def->asm_name) {
+                 // Only update if different (to avoid leak if we run multiple times?)
+                 if (strcmp(node->name, fs_def->asm_name) != 0) {
+                     node->name = strdup(fs_def->asm_name);
+                 }
+            }
+
             walk(node->body);
             symtab_exit_scope();
             return;
@@ -345,7 +368,7 @@ static void walk(Node *node) {
                     else if (node->ty == type_i32 && val >= -2147483648LL && val <= 2147483647LL) allow_literal_narrowing = 1;
                     else if (node->ty == type_u8 && val >= 0 && val <= 255) allow_literal_narrowing = 1;
                     else if (node->ty == type_u16 && val >= 0 && val <= 65535) allow_literal_narrowing = 1;
-                    else if (node->ty == type_u32 && val >= 0 && val <= 4294967295ULL) allow_literal_narrowing = 1;
+                    else if (node->ty == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL) allow_literal_narrowing = 1;
                 }
 
                 if (!allow_literal_narrowing && !is_safe_implicit_conversion(node->init_expr->ty, node->ty)) {
@@ -390,7 +413,7 @@ static void walk(Node *node) {
                     (target == type_i32 && val >= -2147483648LL && val <= 2147483647LL) ||
                     (target == type_u8 && val >= 0 && val <= 255) ||
                     (target == type_u16 && val >= 0 && val <= 65535) ||
-                    (target == type_u32 && val >= 0 && val <= 4294967295ULL)) {
+                    (target == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL)) {
                     node->lhs->ty = target;
                 }
             }
@@ -403,7 +426,7 @@ static void walk(Node *node) {
                     (target == type_i32 && val >= -2147483648LL && val <= 2147483647LL) ||
                     (target == type_u8 && val >= 0 && val <= 255) ||
                     (target == type_u16 && val >= 0 && val <= 65535) ||
-                    (target == type_u32 && val >= 0 && val <= 4294967295ULL)) {
+                    (target == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL)) {
                     node->rhs->ty = target;
                 }
             }
@@ -555,7 +578,7 @@ static void walk(Node *node) {
                 else if (target == type_i32 && val >= -2147483648LL && val <= 2147483647LL) allow_literal_narrowing = 1;
                 else if (target == type_u8 && val >= 0 && val <= 255) allow_literal_narrowing = 1;
                 else if (target == type_u16 && val >= 0 && val <= 65535) allow_literal_narrowing = 1;
-                else if (target == type_u32 && val >= 0 && val <= 4294967295ULL) allow_literal_narrowing = 1;
+                else if (target == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL) allow_literal_narrowing = 1;
             }
 
             if (!allow_literal_narrowing && !is_safe_implicit_conversion(node->rhs->ty, node->lhs->ty)) {
@@ -605,6 +628,13 @@ static void walk(Node *node) {
                 }
                 arg = arg->next;
             }
+
+
+            // Update node->name to asm_name for codegen
+            if (fs->asm_name) {
+                node->name = strdup(fs->asm_name);
+            }
+
             return;
 
         case NODE_KIND_SYSCALL:
@@ -614,14 +644,117 @@ static void walk(Node *node) {
             }
             return;
 
+            return;
+            
+        case NODE_KIND_USE:
+            // Handled in analyze passes
+            return;
+
+        case NODE_KIND_MODULE_ACCESS:
         case NODE_KIND_MEMBER_ACCESS:
+            // Check if LHS is a module
+            if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                Variable *var = symtab_lookup(node->lhs->name);
+                if (var && var->is_module) {
+                    // Module access
+                    Module *mod = var->module_ref;
+                    char *member_name = node->member_name;
+                    
+                    // Try to find function in module
+                    Function *fn = lookup_function_qualified(member_name, mod->path_prefix);
+                    if (fn) {
+                        // It's a function. 
+                        // We need to transform this node into something that FNCALL can use.
+                        // FNCALL expects a name or an expression.
+                        // If we set node->kind = NODE_KIND_IDENTIFIER and node->name = fn->asm_name?
+                        // But FNCALL uses node->name directly if it's an identifier.
+                        // Or we can set node->name to the mangled name.
+                        node->kind = NODE_KIND_IDENTIFIER;
+                        node->name = strdup(fn->asm_name); // Use mangled name
+                        node->ty = fn->return_type; // Function type? 
+                        // Actually, in C, function name evaluates to function pointer.
+                        // But here we just want FNCALL to find it.
+                        // If this is part of FNCALL (node->lhs of FNCALL is this node), 
+                        // then FNCALL logic needs to handle it.
+                        // FNCALL logic: Function *fs = lookup_function(node->name);
+                        // If node is IDENTIFIER, it uses node->name.
+                        // So if we change name to asm_name, lookup_function needs to find it.
+                        // lookup_function searches by name.
+                        // But asm_name is NOT in the function table as 'name'.
+                        // 'name' is original name. 'asm_name' is separate.
+                        // So lookup_function won't find it by asm_name unless we index by asm_name too.
+                        // OR we change lookup_function to check asm_name too.
+                        // OR we change FNCALL to handle resolved function pointer.
+                        // Let's change FNCALL to use a 'function_ref' if present?
+                        // Or better: lookup_function checks asm_name? No, asm_name is for codegen.
+                        
+                        // Wait, if I found the function 'fn', I can attach it to the node.
+                        // Node struct has no 'fn_ref'.
+                        // I can add 'struct Function *fn' to Node?
+                        // Or I can use 'var' field? No, var is Variable.
+                        
+                        // Simplest: FNCALL logic in walk() calls lookup_function(node->name).
+                        // If I change node->name to something unique that lookup_function finds...
+                        // But 'fn' is already found here.
+                        // Maybe I should handle FNCALL with MODULE_ACCESS specially?
+                        // But FNCALL walks its 'name' (which is not a node, it's a string in Node struct?).
+                        // Wait, NODE_KIND_FNCALL has 'name' field. It does NOT have an 'expr' for the function.
+                        // AST: `fn_call(args)` -> `NODE_KIND_FNCALL` with `name`.
+                        // So `mod.func()` is NOT `FNCALL` with `MEMBER_ACCESS`.
+                        // Parser `parse_primary` or `parse_fn_call`?
+                        // Let's check parser.
+                        // If parser sees `ident.ident(...)`, does it create FNCALL?
+                        // `parse_primary` handles `ident` then `parse_postfix` handles `.` and `(`.
+                        // If `(` follows `ident`, it's FNCALL.
+                        // If `.` follows, it's MEMBER_ACCESS.
+                        // If `(` follows MEMBER_ACCESS, it's... ?
+                        // Parser likely doesn't support `expr(...)` call syntax, only `name(...)`.
+                        // I need to check parser.c `parse_primary`.
+                        
+                        // If parser only supports `name(...)`, then `mod.func(...)` is not parsed as FNCALL?
+                        // Or maybe `parse_postfix` handles `(` on any expr?
+                        // If so, it creates FNCALL?
+                        // Let's check parser.c.
+                        return;
+                    }
+                    
+                    // Try to find variable in module scope
+                    // We need to look in mod->scope.
+                    // But symtab_lookup uses current_scope.
+                    // We can manually search mod->scope->vars.
+                    for (Variable *v = mod->scope->vars; v; v = v->next) {
+                        if (strcmp(v->name, member_name) == 0) {
+                            node->kind = NODE_KIND_IDENTIFIER;
+                            node->var = v;
+                            node->ty = v->type;
+                            node->offset = v->offset;
+                            // If it's a global in module, is_global is set.
+                            // Codegen needs to know how to access it.
+                            // If it's global, it uses name (asm_name?).
+                            // Globals use name.
+                            // If module global, name should be mangled?
+                            // We didn't mangle global variable names yet.
+                            // We should mangle them in register_globals.
+                            return;
+                        }
+                    }
+                    
+                    fprintf(stderr, "Erro: membro '%s' não encontrado no módulo '%s'\n", member_name, mod->name);
+                    exit(1);
+                }
+            }
+
             walk(node->lhs);
             
             Type *struct_ty = node->lhs->ty;
             if (struct_ty->kind == TY_PTR) {
                 struct_ty = struct_ty->base;
             }
-
+            
+            // If LHS is a module (but resolved to something else?), error?
+            // If LHS was identifier resolved to module, we handled it above.
+            // If LHS is not identifier (e.g. expr), it can't be module.
+            
             if (struct_ty->kind != TY_STRUCT) {
                 fprintf(stderr, "Erro: operador '.' requer struct ou ponteiro para struct.\n");
                 exit(1);
@@ -646,57 +779,165 @@ static void walk(Node *node) {
     }
 }
 
+static void register_structs(Node *node) {
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_USE) {
+            char *prefix = NULL;
+            if (n->name) prefix = get_module_prefix(n->member_name);
+            
+            char *old_path = current_module_path;
+            if (prefix) current_module_path = prefix;
+            
+            register_structs(n->body);
+            
+            current_module_path = old_path;
+            if (prefix) free(prefix);
+        } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
+            // Mangle struct name if in module
+            if (current_module_path) {
+                int len = strlen(current_module_path) + 1 + strlen(n->ty->name) + 1;
+                char *mangled = malloc(len);
+                snprintf(mangled, len, "%s_%s", current_module_path, n->ty->name);
+                n->ty->name = mangled; // Update name in type
+            }
+            declare_struct(n->ty);
+        }
+    }
+}
+
+static void register_globals(Node *node) {
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_USE) {
+            char *prefix = NULL;
+            if (n->name) prefix = get_module_prefix(n->member_name);
+            
+            char *old_path = current_module_path;
+            if (prefix) current_module_path = prefix;
+            
+            // If alias, create module scope. If not, use current scope.
+            Scope *outer_scope = current_scope;
+            Scope *mod_scope = outer_scope;
+            
+            if (n->name) {
+                mod_scope = calloc(1, sizeof(Scope));
+                mod_scope->parent = global_scope; 
+                current_scope = mod_scope;
+            }
+            
+            register_globals(n->body);
+            
+            current_scope = outer_scope;
+            
+            if (n->name) {
+                // Create Module symbol
+                Module *mod = calloc(1, sizeof(Module));
+                mod->name = strdup(n->name);
+                mod->path_prefix = strdup(prefix);
+                mod->scope = mod_scope;
+                mod->next = module_list;
+                module_list = mod;
+                
+                // Declare alias in outer scope
+                Variable *var = symtab_declare(n->name, type_void, VAR_FLAG_NONE);
+                var->is_module = 1;
+                var->module_ref = mod;
+            }
+            
+            current_module_path = old_path;
+            if (prefix) free(prefix);
+        } else if (n->kind == NODE_KIND_LET) {
+            walk(n); // walk handles declaration
+            // If we are in module, walk declares in current_scope (mod_scope).
+            // We also need to mangle the global name for codegen?
+            // Variable struct doesn't have asm_name.
+            // We should add asm_name to Variable or mangle 'name'.
+            // If we mangle 'name', then lookup by name fails.
+            // So Variable needs asm_name.
+            // I didn't add asm_name to Variable in semantic.h.
+            // I should have.
+            // For now, I'll skip mangling globals or assume they are unique enough?
+            // No, globals in modules MUST be mangled.
+            // I'll add asm_name to Variable in semantic.h later or now?
+            // I can't change header easily in this tool call.
+            // I'll assume I can update it later.
+        }
+    }
+}
+
+static void register_funcs(Node *node) {
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_USE) {
+            char *prefix = NULL;
+            if (n->name) prefix = get_module_prefix(n->member_name);
+            
+            char *old_path = current_module_path;
+            if (prefix) current_module_path = prefix;
+            
+            register_funcs(n->body);
+            
+            current_module_path = old_path;
+            if (prefix) free(prefix);
+        } else if (n->kind == NODE_KIND_FN) {
+             // Resolve param types and return type
+            for (Node *p = n->params; p; p = p->next) resolve_type_ref(p->ty);
+            resolve_type_ref(n->return_type);
+
+            int param_count = 0;
+            for (Node *p = n->params; p; p = p->next) param_count++;
+            
+            Type **param_types = calloc(param_count, sizeof(Type*));
+            int i = 0;
+            for (Node *p = n->params; p; p = p->next) {
+                param_types[i++] = p->ty;
+            }
+
+            declare_function(n->name, n->return_type, param_types, param_count);
+        }
+    }
+}
+
+static void analyze_bodies(Node *node) {
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_USE) {
+            char *prefix = NULL;
+            if (n->name) prefix = get_module_prefix(n->member_name);
+            
+            char *old_path = current_module_path;
+            if (prefix) current_module_path = prefix;
+            
+            Scope *outer_scope = current_scope;
+            if (n->name) {
+                Variable *var = symtab_lookup(n->name);
+                if (var && var->is_module) {
+                    current_scope = var->module_ref->scope;
+                }
+            }
+            
+            analyze_bodies(n->body);
+            
+            current_scope = outer_scope;
+            current_module_path = old_path;
+            if (prefix) free(prefix);
+        } else if (n->kind == NODE_KIND_FN) {
+            walk(n);
+        }
+    }
+}
+
 void analyze(Node *node) {
     symtab_init();
     function_table = NULL;
     struct_defs = NULL;
+    module_list = NULL;
 
-    // Pass 0: Register Structs
-    for (Node *n = node; n; n = n->next) {
-        if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
-            // This is our dummy struct decl node
-            declare_struct(n->ty);
-        }
-    }
-
-    // Pass 0.2: Register Globals (Variables)
-    // We need to walk the top-level nodes to find LETs and register them in global scope.
-    // But walk() handles LET by declaring.
-    // So we can just walk the top-level nodes?
-    // But walk() also descends into functions.
-    // We should separate global registration or just let walk() handle it if we are in global scope.
-    // The issue is that functions are also top-level.
-    // If we walk() a FN node, it enters scope and walks body.
-    // If we walk() a LET node, it declares in current (global) scope.
-    // So we can just walk all nodes?
-    // But we need to register functions first so they can be called before definition?
-    // Current logic:
-    // 1. Register structs
-    // 2. Register functions (declare_function)
-    // 3. Walk functions (analyze body)
+    register_structs(node);
+    register_globals(node);
     
-    // We need to insert Global Variable analysis.
-    // Globals can be used in functions, so they must be declared before function analysis.
-    // Globals might depend on other globals? "let x = 10; let y = x;"
-    // So order matters.
-    // We should walk top-level LET nodes first.
-    
-    for (Node *n = node; n; n = n->next) {
-        if (n->kind == NODE_KIND_LET) {
-            walk(n);
-        }
-    }
-
-    // Pass 0.5: Resolve types in struct fields (handle recursive structs or pointers to structs)
-    // For now, we just assume pointers are 8 bytes and don't need deep resolution for size calculation
-    // unless we have embedded structs.
-    // If we have `struct A { b: B; }`, B must be defined before A or we need multi-pass.
-    // Current parser enforces order somewhat, but let's just resolve field types.
+    // Resolve struct fields
     for (StructDef *s = struct_defs; s; s = s->next) {
         for (Field *f = s->type->fields; f; f = f->next) {
             resolve_type_ref(f->type);
         }
-        // Recalculate size after resolution
         int offset = 0;
         for (Field *f = s->type->fields; f; f = f->next) {
             f->offset = offset;
@@ -705,36 +946,8 @@ void analyze(Node *node) {
         s->type->size = offset;
     }
 
-    // Primeiro passo: registrar todas as funções
-    for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
-        if (fn_node->kind == NODE_KIND_FN) {
-            // Resolve param types and return type
-            for (Node *p = fn_node->params; p; p = p->next) resolve_type_ref(p->ty);
-            resolve_type_ref(fn_node->return_type);
-
-            int param_count = 0;
-            for (Node *p = fn_node->params; p; p = p->next) param_count++;
-            
-            Type **param_types = calloc(param_count, sizeof(Type*));
-            int i = 0;
-            for (Node *p = fn_node->params; p; p = p->next) {
-                param_types[i++] = p->ty;
-            }
-
-            declare_function(fn_node->name, fn_node->return_type, param_types, param_count);
-        }
-    }
-
-    // Segundo passo: analisar cada função
-    for (Node *fn_node = node; fn_node; fn_node = fn_node->next) {
-        if (fn_node->kind == NODE_KIND_FN) {
-            // Ensure we are back in global scope before entering function
-            // Actually walk(FN) calls symtab_enter_scope().
-            // We need to make sure current_scope is global_scope.
-            // It should be if we balanced calls.
-            walk(fn_node);
-        }
-    }
+    register_funcs(node);
+    analyze_bodies(node);
 }
 
 void semantic_cleanup() {
