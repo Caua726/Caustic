@@ -20,7 +20,15 @@ typedef enum {
     TY_VOID,
     TY_PTR,
     TY_ARRAY,
+    TY_STRUCT,
 } TypeKind;
+
+typedef struct Field {
+    char *name;
+    struct Type *type;
+    int offset;
+    struct Field *next;
+} Field;
 
 typedef struct Type {
     TypeKind kind;
@@ -29,6 +37,10 @@ typedef struct Type {
     struct Type *base;
     int array_len;
     struct Type *next; // For garbage collection
+    
+    // Struct fields
+    char *name; // Struct name
+    Field *fields;
 } Type;
 
 typedef enum {
@@ -60,6 +72,7 @@ typedef enum {
     NODE_KIND_DEREF,
     NODE_KIND_INDEX,
     NODE_KIND_SYSCALL,
+    NODE_KIND_MEMBER_ACCESS,
 } NodeKind;
 
 typedef enum {
@@ -82,6 +95,7 @@ typedef struct Node {
     struct Node *init_expr;
 
     char *name;
+    char *member_name; // For member access
     Type *return_type;
     VarFlags flags;
     // Function

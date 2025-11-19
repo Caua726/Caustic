@@ -104,6 +104,7 @@ int main(int argc, char *argv[]) {
         printf("Compilado com sucesso: %s\n", output);
 
         ir_free(ir);
+        fclose(file);
     } else {
         printf("Erro ao fazer parsing do arquivo.\n");
     }
