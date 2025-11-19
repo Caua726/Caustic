@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
 
 const char *TOKEN_NAMES[] = {
     "TOKEN_TYPE_EOF",
@@ -189,8 +191,12 @@ Token lexer_next() {
             }
             t.text[i] = '\0';
             t.type = TOKEN_TYPE_INTEGER;
-            // Safe conversion check could be added here, but strtoll handles overflow by clamping (though we might want to error)
+            
+            errno = 0;
             t.int_value = strtoll(t.text, NULL, 16);
+            if (errno == ERANGE) {
+                error_at_token(t, "literal hexadecimal muito grande (overflow)");
+            }
             return t;
         }
 
@@ -205,9 +211,12 @@ Token lexer_next() {
         }
         t.text[i] = '\0';
         t.type = TOKEN_TYPE_INTEGER;
-        // Check for overflow? For now, atoll is standard but unsafe for huge numbers.
-        // Let's stick to standard behavior or simple check.
-        t.int_value = atoll(t.text);
+        
+        errno = 0;
+        t.int_value = strtoll(t.text, NULL, 10);
+        if (errno == ERANGE) {
+            error_at_token(t, "literal inteiro muito grande (overflow)");
+        }
         return t;
     }
 
@@ -490,7 +499,7 @@ Token lexer_next() {
 
 #include <stdarg.h>
 
-void error_at_token(Token t, const char *fmt, ...) {
+_Noreturn void error_at_token(Token t, const char *fmt, ...) {
     fprintf(stderr, "Erro em %s:%d:%d: ", t.filename ? t.filename : "<unknown>", t.line, t.col);
     
     va_list args;

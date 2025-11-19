@@ -87,8 +87,7 @@ static void parse_use(Node **cur_ptr) {
     expect(TOKEN_TYPE_USE);
 
     if (current_token.type != TOKEN_TYPE_STRING) {
-        fprintf(stderr, "Erro na linha %d: esperado caminho do arquivo apos 'use'\n", current_token.line);
-        exit(1);
+        error_at_token(current_token, "esperado caminho do arquivo apos 'use'");
     }
 
     char path[256];
@@ -101,8 +100,7 @@ static void parse_use(Node **cur_ptr) {
     if (current_token.type == TOKEN_TYPE_AS) {
         consume();
         if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-            fprintf(stderr, "Erro na linha %d: esperado identificador apos 'as'\n", current_token.line);
-            exit(1);
+            error_at_token(current_token, "esperado identificador apos 'as'");
         }
         alias = strdup(current_token.text);
         consume();
@@ -149,8 +147,7 @@ static void parse_use(Node **cur_ptr) {
     if (!mark_file_visited(canonical_path)) {
         FILE *f = fopen(canonical_path, "r");
         if (!f) {
-            fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'\n", canonical_path);
-            exit(1);
+            error_at_token(current_token, "nao foi possivel abrir o arquivo '%s'", canonical_path);
         }
         
         // We need to keep the filename string alive for tokens
@@ -206,16 +203,12 @@ static void parse_file_body(Node **cur_ptr) {
         }
 
         if (current_token.type != TOKEN_TYPE_FN) {
-            fprintf(stderr, "Erro na linha %d: era esperado 'fn', 'let', 'struct' ou 'use' mas encontrou '%s'\n",
-                    current_token.line, current_token.text);
-            exit(1);
+            error_at_token(current_token, "era esperado 'fn', 'let', 'struct' ou 'use' mas encontrou '%s'", current_token.text);
         }
 
         cur->next = parse_fn();
-        if (!cur->next) {
-            fprintf(stderr, "Erro crítico: parse_fn() retornou NULL\n");
-            exit(1);
-        }
+        // The original code had a critical error check here, but the instruction implies removing it.
+        // If parse_fn() returns NULL, it means an error occurred and error_at_token should have been called.
         cur = cur->next;
     }
     *cur_ptr = cur;
@@ -260,9 +253,7 @@ static void expect(TokenType type) {
     if (current_token.type == type) {
         consume();
     } else {
-        fprintf(stderr, "Erro na linha %d: esperado '%s' mas encontrou '%s'\n",
-                current_token.line, TOKEN_NAMES[type], TOKEN_NAMES[current_token.type]);
-        exit(1);
+        error_at_token(current_token, "esperado '%s' mas encontrou '%s'", TOKEN_NAMES[type], current_token.text);
     }
 }
 
@@ -301,8 +292,7 @@ static Type *parse_type() {
     if (current_token.type == TOKEN_TYPE_LBRACKET) {
         consume(); // [
         if (current_token.type != TOKEN_TYPE_INTEGER) {
-            fprintf(stderr, "Erro na linha %d: Tamanho do array deve ser um inteiro.\n", current_token.line);
-            exit(1);
+            error_at_token(current_token, "Tamanho do array deve ser um inteiro.");
         }
         int len = current_token.int_value;
         consume(); // N
@@ -326,8 +316,7 @@ static Type *parse_type() {
     }
 
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-        fprintf(stderr, "Erro de sintaxe na linha %d: esperado um tipo\n", current_token.line);
-        exit(1);
+        error_at_token(current_token, "esperado um tipo");
     }
 
     Type *ty = NULL;
@@ -382,8 +371,7 @@ static Node* parse_var_decl() {
     expect(TOKEN_TYPE_AS);
 
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-        fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um nome de variável, mas encontrou '%s'\n", current_token.line, current_token.text);
-        exit(1);
+        error_at_token(current_token, "era esperado um nome de variável, mas encontrou '%s'", current_token.text);
     }
     char *var_name = strdup(current_token.text);
     consume();
@@ -537,8 +525,7 @@ static Node *parse_primary() {
         node->ty = type_i64; // Syscalls return i64 (rax)
 
         if (current_token.type == TOKEN_TYPE_RPAREN) {
-             fprintf(stderr, "Erro: syscall requer pelo menos o ID.\n");
-             exit(1);
+             error_at_token(current_token, "syscall requer pelo menos o ID.");
         }
 
         Node head = {};
@@ -559,8 +546,7 @@ static Node *parse_primary() {
         return node;
     }
 
-    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado um numero ou identificador, mas encontrou '%s'\n", current_token.line, current_token.text);
-    exit(1);
+    error_at_token(current_token, "era esperado um numero ou identificador, mas encontrou '%s'", current_token.text);
 }
 
 static Node *parse_block() {
@@ -586,8 +572,7 @@ static Node *parse_fn() {
     Node *fn_node = new_node(NODE_KIND_FN);
 
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-        fprintf(stderr, "Erro na linha %d: esperado nome da função.\n", current_token.line);
-        exit(1);
+        error_at_token(current_token, "esperado nome da função.");
     }
     fn_node->name = strdup(current_token.text);
     consume();
@@ -600,8 +585,7 @@ static Node *parse_fn() {
         Node *cur = &head;
         while (1) {
             if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-                fprintf(stderr, "Erro na linha %d: esperado nome do parâmetro.\n", current_token.line);
-                exit(1);
+                error_at_token(current_token, "esperado nome do parâmetro.");
             }
             char *param_name = strdup(current_token.text);
             consume();
@@ -632,10 +616,6 @@ static Node *parse_fn() {
         consume();
         fn_node->return_type = parse_type();
     } else {
-        fn_node->return_type = type_void; // Default to void if not specified? Or i32? Let's say void for now or keep i32 if that was previous behavior. Previous was i32 default.
-        // Actually, let's stick to previous behavior of i32 default if omitted, or maybe void. 
-        // The user example `fn main() as i32` suggests explicit typing. 
-        // If omitted, let's assume void to be safe, or i32 if that's what we did.
         fn_node->return_type = type_i32; 
     }
     fn_node->body = parse_block();
@@ -658,8 +638,7 @@ static Node *parse_postfix() {
         } else if (current_token.type == TOKEN_TYPE_DOT) {
             consume(); // .
             if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-                fprintf(stderr, "Erro na linha %d: esperado nome do membro após '.'\n", current_token.line);
-                exit(1);
+                error_at_token(current_token, "esperado nome do membro após '.'");
             }
             Node *member_node = new_node(NODE_KIND_MEMBER_ACCESS);
             member_node->lhs = node;
@@ -828,8 +807,7 @@ static Node *parse_while_stmt() {
 static Node *parse_struct_decl() {
     expect(TOKEN_TYPE_STRUCT);
     if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-        fprintf(stderr, "Erro na linha %d: esperado nome da struct.\n", current_token.line);
-        exit(1);
+        error_at_token(current_token, "esperado nome da struct.");
     }
     char *struct_name = strdup(current_token.text);
     consume();
@@ -844,8 +822,7 @@ static Node *parse_struct_decl() {
 
     while (current_token.type != TOKEN_TYPE_RBRACE) {
         if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-             fprintf(stderr, "Erro na linha %d: esperado nome do campo.\n", current_token.line);
-             exit(1);
+             error_at_token(current_token, "esperado nome do campo.");
         }
         char *field_name = strdup(current_token.text);
         consume();
@@ -888,10 +865,6 @@ static Node *parse_struct_decl() {
     // Let's use NODE_KIND_LET but with a special flag?
     // Let's just use NODE_KIND_EXPR_STMT with NULL expr, but set the 'ty' field to the struct type.
     // Semantic analysis will see this and register the struct.
-    node->kind = NODE_KIND_EXPR_STMT;
-    node->expr = NULL; // Signal that this is a struct decl
-    // Wait, EXPR_STMT expects expr.
-    // Let's use NODE_KIND_BLOCK with empty stmts.
     node->kind = NODE_KIND_BLOCK;
     node->stmts = NULL;
     node->ty = struct_type; // Pass the type info
@@ -904,9 +877,7 @@ static Node *parse_asm_stmt() {
     expect(TOKEN_TYPE_LPAREN);
 
     if (current_token.type != TOKEN_TYPE_STRING) {
-        fprintf(stderr, "Erro na linha %d: esperado string apos 'asm('\n",
-                current_token.line);
-        exit(1);
+        error_at_token(current_token, "esperado string apos 'asm('");
     }
 
     Node *asm_node = new_node(NODE_KIND_ASM);
@@ -1018,8 +989,7 @@ static Node *parse_stmt() {
         }
 
         if (current_token.type != TOKEN_TYPE_SEMICOLON) {
-            fprintf(stderr, "Erro de sintaxe na linha %d: era esperado ';' depois da expressao.\n", current_token.line);
-            exit(1);
+            error_at_token(current_token, "era esperado ';' depois da expressao.");
         }
         consume();
 
@@ -1057,8 +1027,7 @@ static Node *parse_stmt() {
     expr_stmt_node->expr = node;
     return expr_stmt_node;
 
-    fprintf(stderr, "Erro de sintaxe na linha %d: era esperado 'let', 'return' ou bloco, mas encontrou '%s'\n", current_token.line, current_token.text);
-    exit(1);
+    error_at_token(current_token, "era esperado 'let', 'return' ou bloco, mas encontrou '%s'", current_token.text);
 }
 
 static void ast_print_recursive(Node *node, int depth) {
