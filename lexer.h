@@ -56,6 +56,7 @@ typedef enum {
 	TOKEN_TYPE_CAST,
 	TOKEN_TYPE_SHL,
 	TOKEN_TYPE_SHR,
+	TOKEN_TYPE_USE,
 } TokenType;
 
 static const char *TOKEN_NAMES[] = {
@@ -113,6 +114,7 @@ static const char *TOKEN_NAMES[] = {
 	"TOKEN_TYPE_CAST",
 	"TOKEN_TYPE_SHL",
 	"TOKEN_TYPE_SHR",
+	"TOKEN_TYPE_USE",
 };
 
 typedef struct {
@@ -126,5 +128,14 @@ typedef struct {
 	char text[256];
 } Token;
 
+typedef struct {
+    FILE *file;
+    int line;
+    int current_char;
+    int ahead_char; // Added ahead_char to state
+} LexerState;
+
 void lexer_init(FILE *file);
 Token lexer_next();
+void lexer_get_state(LexerState *state);
+void lexer_set_state(LexerState *state);

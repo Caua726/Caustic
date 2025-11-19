@@ -21,6 +21,30 @@ static int register_string(char *val) {
     return s->id;
 }
 
+typedef struct IncludedFile {
+    char *path;
+    struct IncludedFile *next;
+} IncludedFile;
+
+static IncludedFile *visited_files = NULL;
+
+// Retorna 1 se já visitou, 0 se não. Adiciona na lista se 0.
+int mark_file_visited(const char *path) {
+    IncludedFile *cur = visited_files;
+    while (cur) {
+        if (strcmp(cur->path, path) == 0) {
+            return 1;
+        }
+        cur = cur->next;
+    }
+
+    IncludedFile *new_file = calloc(1, sizeof(IncludedFile));
+    new_file->path = strdup(path);
+    new_file->next = visited_files;
+    visited_files = new_file;
+    return 0;
+}
+
 StringLiteral *get_strings() {
     return strings_head;
 }
@@ -46,23 +70,66 @@ static Node *parse_mul();
 static Node *parse_primary();
 static Type *parse_type();
 static Node *parse_struct_decl();
+static void parse_file_body(Node **cur_ptr);
+static void parse_use(Node **cur_ptr);
 
 
 void parser_init() {
     lookahead_token = lexer_next();
     consume();
 }
-Node *parse() {
-    Node head = {};
-    Node *cur = &head;
 
-    // Parsear todas as funções até encontrar EOF
+static void parse_use(Node **cur_ptr) {
+    expect(TOKEN_TYPE_USE);
+
+    if (current_token.type != TOKEN_TYPE_STRING) {
+        fprintf(stderr, "Erro na linha %d: esperado caminho do arquivo apos 'use'\n", current_token.line);
+        exit(1);
+    }
+
+    // The lexer already removes quotes from strings
+    // Make a copy of the path since current_token will be consumed
+    char path[256];
+    strncpy(path, current_token.text, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    
+    consume(); // Consume string token
+    expect(TOKEN_TYPE_SEMICOLON);
+
+    if (!mark_file_visited(path)) {
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'\n", path);
+            exit(1);
+        }
+
+        LexerState state;
+        lexer_get_state(&state);
+        Token saved_curr = current_token;
+        Token saved_look = lookahead_token;
+
+        lexer_init(f);
+        parser_init();
+
+        parse_file_body(cur_ptr);
+
+        lexer_set_state(&state);
+        current_token = saved_curr;
+        lookahead_token = saved_look;
+        
+        fclose(f);
+    }
+}
+
+static void parse_file_body(Node **cur_ptr) {
+    Node *cur = *cur_ptr;
     while (current_token.type != TOKEN_TYPE_EOF) {
+        if (current_token.type == TOKEN_TYPE_USE) {
+            parse_use(&cur);
+            continue;
+        }
+
         if (current_token.type == TOKEN_TYPE_STRUCT) {
-             // Struct declarations are top-level, but we need to store them somewhere.
-             // For now, let's attach them to the AST or handle them separately.
-             // Ideally, we should have a list of top-level declarations.
-             // Let's make parse_struct_decl return a Node and link it.
              cur->next = parse_struct_decl();
              cur = cur->next;
              continue;
@@ -75,7 +142,7 @@ Node *parse() {
         }
 
         if (current_token.type != TOKEN_TYPE_FN) {
-            fprintf(stderr, "Erro na linha %d: era esperado 'fn' ou 'let' mas encontrou '%s'\n",
+            fprintf(stderr, "Erro na linha %d: era esperado 'fn', 'let', 'struct' ou 'use' mas encontrou '%s'\n",
                     current_token.line, current_token.text);
             exit(1);
         }
@@ -87,6 +154,14 @@ Node *parse() {
         }
         cur = cur->next;
     }
+    *cur_ptr = cur;
+}
+
+Node *parse() {
+    Node head = {};
+    Node *cur = &head;
+
+    parse_file_body(&cur);
 
     // NÃO chamar consume() aqui - já estamos no EOF
     return head.next;
