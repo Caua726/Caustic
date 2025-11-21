@@ -247,6 +247,16 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
         }
     }
 
+    // Check for shadowing
+    for (Scope *s = current_scope->parent; s; s = s->parent) {
+        for (Variable *v = s->vars; v; v = v->next) {
+            if (strcmp(v->name, name) == 0) {
+                fprintf(stderr, "Aviso: variavel '%s' sombreia uma declaracao anterior\n", name);
+                break;
+            }
+        }
+    }
+
     Variable *var = calloc(1, sizeof(Variable));
     var->name = strdup(name);
     var->type = type;

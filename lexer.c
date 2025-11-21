@@ -509,8 +509,28 @@ _Noreturn void error_at_token(Token t, const char *fmt, ...) {
     
     fprintf(stderr, "\n");
     
-    // Optional: Print source snippet if we had access to the line content easily.
-    // For now, just the location is a huge improvement.
+    if (t.filename) {
+        FILE *f = fopen(t.filename, "r");
+        if (f) {
+            int current_line = 1;
+            char buffer[1024];
+            while (fgets(buffer, sizeof(buffer), f)) {
+                if (current_line == t.line) {
+                    // Remove newline if present
+                    size_t len = strlen(buffer);
+                    if (len > 0 && buffer[len-1] == '\n') buffer[len-1] = '\0';
+                    
+                    fprintf(stderr, "  %s\n", buffer);
+                    fprintf(stderr, "  ");
+                    for (int i = 1; i < t.col; i++) fprintf(stderr, " ");
+                    fprintf(stderr, "^\n");
+                    break;
+                }
+                current_line++;
+            }
+            fclose(f);
+        }
+    }
     
     exit(1);
 }

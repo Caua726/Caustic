@@ -13,7 +13,7 @@ const char *IR_OP_NAMES[] = {
     "SYSCALL",
     "COPY", "RET",
     "LOAD", "STORE", "ADDR", "ADDR_GLOBAL",
-    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_SYS_ARG", "SYSCALL",
+    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_SYS_ARG", "SYSCALL", "COPY", "ADDR", "ADDR_GLOBAL", "GET_ALLOC_ADDR",
 };
 
 typedef struct {
@@ -26,7 +26,11 @@ typedef struct {
         int end_label;
         int continue_label;
     } loop_stack[32];
+
     int loop_depth;
+    int has_sret;
+    int sret_vreg;
+    int has_returned;
 } IRGenContext;
 
 static IRGenContext ctx;
@@ -227,6 +231,7 @@ static int gen_expr(Node *node) {
 
         case NODE_KIND_DEREF: {
             int addr = gen_expr(node->expr);
+            if (node->ty->size > 8) return addr;
             int dest = new_vreg();
             IRInst *inst = new_inst(IR_LOAD);
             inst->dest = op_vreg(dest);
@@ -239,6 +244,7 @@ static int gen_expr(Node *node) {
 
         case NODE_KIND_INDEX: {
             int addr = gen_addr(node);
+            if (node->ty->size > 8) return addr;
             int dest = new_vreg();
             IRInst *inst = new_inst(IR_LOAD);
             inst->dest = op_vreg(dest);
@@ -249,8 +255,32 @@ static int gen_expr(Node *node) {
             return dest;
         }
 
+        case NODE_KIND_ASSIGN: {
+            int lhs_addr = gen_addr(node->lhs);
+            int rhs_val = gen_expr(node->rhs);
+
+            if (node->ty->size > 8) {
+                IRInst *inst = new_inst(IR_COPY);
+                inst->dest = op_vreg(lhs_addr);
+                inst->src1 = op_vreg(rhs_val);
+                inst->src2 = op_imm(node->ty->size);
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+                return lhs_addr; // Return address as result of assignment
+            }
+
+            IRInst *inst = new_inst(IR_STORE);
+            inst->dest = op_vreg(lhs_addr);
+            inst->src1 = op_vreg(rhs_val);
+            inst->cast_to_type = node->ty;
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return rhs_val;
+        }
+
         case NODE_KIND_MEMBER_ACCESS: {
             int addr = gen_addr(node);
+            if (node->ty->size > 8) return addr;
             int dest = new_vreg();
             IRInst *inst = new_inst(IR_LOAD);
             inst->dest = op_vreg(dest);
@@ -277,6 +307,9 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_ADD: {
+            if (node->lhs->kind == NODE_KIND_NUM && node->rhs->kind == NODE_KIND_NUM) {
+                return emit_imm(node->lhs->val + node->rhs->val, node->tok ? node->tok->line : 0);
+            }
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             int line = node->tok ? node->tok->line : 0;
@@ -310,6 +343,9 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_SUBTRACTION: {
+            if (node->lhs->kind == NODE_KIND_NUM && node->rhs->kind == NODE_KIND_NUM) {
+                return emit_imm(node->lhs->val - node->rhs->val, node->tok ? node->tok->line : 0);
+            }
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             int line = node->tok ? node->tok->line : 0;
@@ -345,6 +381,9 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_MULTIPLIER: {
+            if (node->lhs->kind == NODE_KIND_NUM && node->rhs->kind == NODE_KIND_NUM) {
+                return emit_imm(node->lhs->val * node->rhs->val, node->tok ? node->tok->line : 0);
+            }
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             if (node->lhs->ty != node->ty) {
@@ -357,6 +396,13 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_DIVIDER: {
+            if (node->lhs->kind == NODE_KIND_NUM && node->rhs->kind == NODE_KIND_NUM) {
+                if (node->rhs->val == 0) {
+                    fprintf(stderr, "Erro: divisão por zero na linha %d\n", node->tok ? node->tok->line : 0);
+                    exit(1);
+                }
+                return emit_imm(node->lhs->val / node->rhs->val, node->tok ? node->tok->line : 0);
+            }
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             if (node->lhs->ty != node->ty) {
@@ -369,6 +415,13 @@ static int gen_expr(Node *node) {
         }
 
         case NODE_KIND_MOD: {
+            if (node->lhs->kind == NODE_KIND_NUM && node->rhs->kind == NODE_KIND_NUM) {
+                if (node->rhs->val == 0) {
+                    fprintf(stderr, "Erro: módulo por zero na linha %d\n", node->tok ? node->tok->line : 0);
+                    exit(1);
+                }
+                return emit_imm(node->lhs->val % node->rhs->val, node->tok ? node->tok->line : 0);
+            }
             int lhs = gen_expr(node->lhs);
             int rhs = gen_expr(node->rhs);
             if (node->lhs->ty != node->ty) {
@@ -583,6 +636,8 @@ static int gen_expr(Node *node) {
                 addr_inst->line = node->tok ? node->tok->line : 0;
                 emit(addr_inst);
 
+                if (node->ty->size > 8) return addr;
+
                 IRInst *inst = new_inst(IR_LOAD);
                 inst->dest = op_vreg(reg);
                 inst->src1 = op_vreg(addr);
@@ -590,6 +645,14 @@ static int gen_expr(Node *node) {
                 inst->line = node->tok ? node->tok->line : 0;
                 emit(inst);
             } else {
+                if (node->ty->size > 8) {
+                    IRInst *inst = new_inst(IR_ADDR);
+                    inst->dest = op_vreg(reg);
+                    inst->src1 = op_imm(node->offset);
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                    return reg;
+                }
                 IRInst *inst = new_inst(IR_LOAD);
                 inst->dest = op_vreg(reg);
                 inst->src1 = op_imm(node->offset);
@@ -609,8 +672,31 @@ static int gen_expr(Node *node) {
             int arg_count = 0;
             for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
 
+            int sret_addr_reg = -1;
+            if (node->ty->size > 8) {
+                // Allocate stack space for return value
+                int offset = ctx.current_func->alloc_stack_size;
+                ctx.current_func->alloc_stack_size += node->ty->size;
+                // Align to 16 bytes
+                if (ctx.current_func->alloc_stack_size % 16 != 0) {
+                    ctx.current_func->alloc_stack_size += 16 - (ctx.current_func->alloc_stack_size % 16);
+                }
+
+                sret_addr_reg = new_vreg();
+                IRInst *inst = new_inst(IR_GET_ALLOC_ADDR);
+                inst->dest = op_vreg(sret_addr_reg);
+                inst->src1 = op_imm(offset);
+                inst->line = node->tok ? node->tok->line : 0;
+                emit(inst);
+
+                arg_count++; // Add hidden argument
+            }
+
             int *arg_vregs = calloc(arg_count, sizeof(int));
             int i = 0;
+            if (sret_addr_reg != -1) {
+                arg_vregs[i++] = sret_addr_reg;
+            }
             for (Node *arg = node->args; arg; arg = arg->next) {
                 arg_vregs[i++] = gen_expr(arg);
             }
@@ -719,6 +805,9 @@ static int gen_expr(Node *node) {
                 emit(cleanup);
             }
 
+            if (sret_addr_reg != -1) {
+                return sret_addr_reg;
+            }
             return ret_reg;
         }
 
@@ -756,60 +845,7 @@ static int gen_expr(Node *node) {
             return dest;
         }
 
-        case NODE_KIND_ASSIGN: {
-            if (node->lhs->ty->kind == TY_ARRAY || node->lhs->ty->size > 8) {
-                // Array/Struct copy
-                int src_addr = gen_addr(node->rhs);
-                int dst_addr = gen_addr(node->lhs);
-                
-                IRInst *inst = new_inst(IR_COPY);
-                inst->dest = op_vreg(dst_addr);
-                inst->src1 = op_vreg(src_addr);
-                inst->src2 = op_imm(node->lhs->ty->size); // Use src2 for size
-                inst->line = node->tok ? node->tok->line : 0;
-                emit(inst);
-                return dst_addr;
-            } else {
-                // Scalar assignment
-                int val_reg = gen_expr(node->rhs);
-                
-                if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
-                    if (node->lhs->var && node->lhs->var->is_global) {
-                        // Store to global: 1. Get address, 2. Store to address
-                        int addr = new_vreg();
-                        IRInst *addr_inst = new_inst(IR_ADDR_GLOBAL);
-                        addr_inst->dest = op_vreg(addr);
-                        addr_inst->global_name = strdup(node->lhs->name);
-                        addr_inst->line = node->tok ? node->tok->line : 0;
-                        emit(addr_inst);
 
-                        IRInst *inst = new_inst(IR_STORE);
-                        inst->dest = op_vreg(addr);
-                        inst->src1 = op_vreg(val_reg);
-                        inst->cast_to_type = node->lhs->ty;
-                        inst->line = node->tok ? node->tok->line : 0;
-                        emit(inst);
-                    } else {
-                        IRInst *inst = new_inst(IR_STORE);
-                        inst->dest = op_imm(node->lhs->offset);
-                        inst->src1 = op_vreg(val_reg);
-                        inst->cast_to_type = node->lhs->ty;
-                        inst->line = node->tok ? node->tok->line : 0;
-                        emit(inst);
-                    }
-                } else {
-                    // Indirect assignment (pointer, array index, etc)
-                    int addr = gen_addr(node->lhs);
-                    IRInst *inst = new_inst(IR_STORE);
-                    inst->dest = op_vreg(addr);
-                    inst->src1 = op_vreg(val_reg);
-                    inst->cast_to_type = node->lhs->ty;
-                    inst->line = node->tok ? node->tok->line : 0;
-                    emit(inst);
-                }
-                return val_reg;
-            }
-        }
 
         default:
             fprintf(stderr, "Erro interno: tipo de nó não suportado em expressão: %d\n", node->kind);
@@ -821,7 +857,9 @@ static void gen_stmt_single(Node *node);
 
 static void gen_stmt(Node *node) {
     while (node) {
-        gen_stmt_single(node);
+        if (!ctx.has_returned) {
+            gen_stmt_single(node);
+        }
         node = node->next;
     }
 }
@@ -835,10 +873,21 @@ static void gen_stmt_single(Node *node) {
         case NODE_KIND_RETURN: {
             if (node->expr) {
                 int result_reg = gen_expr(node->expr);
-                emit_return(result_reg, node->tok ? node->tok->line : 0);
+                if (ctx.has_sret) {
+                    IRInst *inst = new_inst(IR_COPY);
+                    inst->dest = op_vreg(ctx.sret_vreg);
+                    inst->src1 = op_vreg(result_reg);
+                    inst->src2 = op_imm(node->expr->ty->size);
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                    emit_return(ctx.sret_vreg, node->tok ? node->tok->line : 0);
+                } else {
+                    emit_return(result_reg, node->tok ? node->tok->line : 0);
+                }
             } else {
                 emit_return(-1, node->tok ? node->tok->line : 0);
             }
+            ctx.has_returned = 1;
             break;
         }
 
@@ -850,12 +899,29 @@ static void gen_stmt_single(Node *node) {
         case NODE_KIND_LET: {
             if (node->init_expr) {
                 int val_reg = gen_expr(node->init_expr);
-                IRInst *inst = new_inst(IR_STORE);
-                inst->dest = op_imm(node->offset);
-                inst->src1 = op_vreg(val_reg);
-                inst->cast_to_type = node->ty;
-                inst->line = node->tok ? node->tok->line : 0;
-                emit(inst);
+                
+                if (node->ty->size > 8) {
+                    int dest_addr = new_vreg();
+                    IRInst *addr_inst = new_inst(IR_ADDR);
+                    addr_inst->dest = op_vreg(dest_addr);
+                    addr_inst->src1 = op_imm(node->offset);
+                    addr_inst->line = node->tok ? node->tok->line : 0;
+                    emit(addr_inst);
+
+                    IRInst *inst = new_inst(IR_COPY);
+                    inst->dest = op_vreg(dest_addr);
+                    inst->src1 = op_vreg(val_reg);
+                    inst->src2 = op_imm(node->ty->size);
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                } else {
+                    IRInst *inst = new_inst(IR_STORE);
+                    inst->dest = op_imm(node->offset);
+                    inst->src1 = op_vreg(val_reg);
+                    inst->cast_to_type = node->ty;
+                    inst->line = node->tok ? node->tok->line : 0;
+                    emit(inst);
+                }
             }
             break;
         }
@@ -866,6 +932,8 @@ static void gen_stmt_single(Node *node) {
         }
 
         case NODE_KIND_IF: {
+            int saved_ret = ctx.has_returned;
+            
             int else_label = new_label();
             int end_label = new_label();
             int cond_reg = gen_expr(node->if_stmt.cond);
@@ -874,20 +942,35 @@ static void gen_stmt_single(Node *node) {
             jz->dest = op_label(else_label);
             jz->line = node->tok ? node->tok->line : 0;
             emit(jz);
+            
             gen_stmt(node->if_stmt.then_b);
+            int then_ret = ctx.has_returned;
+            ctx.has_returned = saved_ret; // Reset for else block
+            
             IRInst *jmp = new_inst(IR_JMP);
             jmp->dest = op_label(end_label);
             jmp->line = node->tok ? node->tok->line : 0;
             emit(jmp);
+            
             IRInst *else_lbl = new_inst(IR_LABEL);
             else_lbl->dest = op_label(else_label);
             emit(else_lbl);
+            
+            int else_ret = 0;
             if (node->if_stmt.else_b) {
                 gen_stmt(node->if_stmt.else_b);
+                else_ret = ctx.has_returned;
             }
+            
             IRInst *end_lbl = new_inst(IR_LABEL);
             end_lbl->dest = op_label(end_label);
             emit(end_lbl);
+            
+            if (then_ret && else_ret) {
+                ctx.has_returned = 1;
+            } else {
+                ctx.has_returned = saved_ret;
+            }
             break;
         }
         case NODE_KIND_ASM:
@@ -895,8 +978,10 @@ static void gen_stmt_single(Node *node) {
             inst->asm_str = strdup(node->name);
             inst->line = node->tok ? node->tok->line : 0;
             emit(inst);
+            ctx.has_returned = 1;
             break;
         case NODE_KIND_WHILE: {
+            int saved_ret = ctx.has_returned;
             int start_label = new_label();
             int end_label = new_label();
 
@@ -926,10 +1011,12 @@ static void gen_stmt_single(Node *node) {
             emit(end_lbl);
             
             pop_loop();
+            ctx.has_returned = saved_ret; // Loops might not execute
             break;
         }
 
         case NODE_KIND_DO_WHILE: {
+            int saved_ret = ctx.has_returned;
             int start_label = new_label();
             int end_label = new_label();
             int cond_label = new_label();
@@ -959,6 +1046,7 @@ static void gen_stmt_single(Node *node) {
             emit(end_lbl);
 
             pop_loop();
+            ctx.has_returned = saved_ret;
             break;
         }
 
@@ -1138,17 +1226,35 @@ IRProgram *gen_ir(Node *ast) {
         ctx.inst_head = NULL;
         ctx.inst_tail = NULL;
         ctx.vreg_count = 0;
+        ctx.loop_depth = 0;
+        ctx.has_sret = 0;
+        ctx.has_returned = 0;
         // Labels are global to ensure uniqueness across functions
 
         IRFunction *func = calloc(1, sizeof(IRFunction));
         func->name = strdup(fn_node->name);
         func->asm_name = strdup(fn_node->name);
         func->instructions = NULL;
+        
+        int param_count = 0;
+        for (Node *param = fn_node->params; param; param = param->next) {
+            param_count++;
+        }
+        func->num_args = param_count;
+        
         ctx.current_func = func;
 
         if (fn_node->body && fn_node->body->kind == NODE_KIND_BLOCK) {
-            // Gerar código para recuperar argumentos e colocar nas variáveis locais
+            // Check for SRET (Struct Return)
             int arg_idx = 0;
+            if (fn_node->return_type && fn_node->return_type->size > 8) {
+                ctx.has_sret = 1;
+                ctx.sret_vreg = emit_get_arg(arg_idx++, fn_node->tok ? fn_node->tok->line : 0);
+            } else {
+                ctx.has_sret = 0;
+            }
+
+            // Gerar código para recuperar argumentos e colocar nas variáveis locais
             for (Node *param = fn_node->params; param; param = param->next) {
                 int arg_val = emit_get_arg(arg_idx++, param->tok ? param->tok->line : 0);
                 IRInst *store = new_inst(IR_STORE);

@@ -33,6 +33,7 @@ typedef struct {
     int *vreg_to_loc;
     int stack_slots;
     int next_spill;
+    int is_leaf;
 } AllocCtx;
 
 static FILE *out;
@@ -272,7 +273,7 @@ static void gen_binary_op(IRInst *inst, AllocCtx *ctx, const char *op) {
     store_operand(inst->dest.vreg, ctx, "r15");
 }
 
-static void gen_inst(IRInst *inst, AllocCtx *ctx) {
+static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
     char dst[64], src1[64];
 
     switch (inst->op) {
@@ -355,7 +356,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                 load_operand(inst->src1.vreg, ctx, "rax");
             }
 
-            int stack_size = ctx->stack_slots * 8;
+            int stack_size = ctx->stack_slots * 8 + alloc_stack_size;
             if (stack_size > 0) {
                 stack_size = (stack_size + 15) & ~15;
                 emit("add rsp, %d", stack_size);
@@ -367,7 +368,9 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             emit("pop r12");
             emit("pop rbx");
 
-            emit("pop rbp");
+            if (!ctx->is_leaf) {
+                emit("pop rbp");
+            }
             emit("ret");
             break;
 
@@ -471,12 +474,15 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 
         case IR_ADDR_GLOBAL:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
-                emit("lea r15, [rip+%s]", inst->global_name);
-                emit("mov %s, r15", dst);
-            } else {
-                emit("lea %s, [rip+%s]", dst, inst->global_name);
-            }
+            emit("lea %s, [rip+%s]", dst, inst->global_name);
+            break;
+
+        case IR_GET_ALLOC_ADDR:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            // Base of alloc area is [rbp - (ctx->stack_slots * 8)]
+            // Offset is inst->src1.imm
+            // Addr = rbp - (ctx->stack_slots * 8 + inst->src1.imm)
+            emit("lea %s, [rbp-%ld]", dst, (long)(ctx->stack_slots * 8 + inst->src1.imm));
             break;
 
         case IR_LOAD:
@@ -889,7 +895,8 @@ static void gen_func(IRFunction *func) {
     
     // Initialize next_spill to start after user variables
     ctx.next_spill = (max_offset + 7) / 8;
-    if (ctx.next_spill < 6) ctx.next_spill = 6; // Minimum 6 slots (48 bytes)
+    ctx.next_spill = (max_offset + 7) / 8;
+    // if (ctx.next_spill < 6) ctx.next_spill = 6; // Minimum 6 slots (48 bytes) - Removed for leaf opt
 
     // DEBUG
     // printf("; max_offset: %ld, next_spill: %d\n", max_offset, ctx.next_spill);
@@ -898,20 +905,37 @@ static void gen_func(IRFunction *func) {
     
     // Label and prologue are handled in codegen() loop
     
+    // Check for leaf function optimization
+    int has_call = 0;
+    for (IRInst *inst = func->instructions; inst; inst = inst->next) {
+        if (inst->op == IR_CALL) {
+            has_call = 1;
+            break;
+        }
+    }
+    // Only optimize if no calls, no locals, no allocs, and arguments fit in registers
+    // Also check if stack_slots is small (just saved regs)
+    ctx.is_leaf = !has_call && ctx.stack_slots <= 6 && func->alloc_stack_size == 0 && func->num_args <= 6;
+
+    if (!ctx.is_leaf) {
+        emit("push rbp");
+        emit("mov rbp, rsp");
+    }
+
     emit("push rbx");
     emit("push r12");
     emit("push r13");
     emit("push r14");
     emit("push r15");
 
-    int stack_size = ctx.stack_slots * 8;
+    int stack_size = ctx.stack_slots * 8 + func->alloc_stack_size;
     if (stack_size > 0) {
         stack_size = (stack_size + 15) & ~15; // Align to 16 bytes
         emit("sub rsp, %d", stack_size);
     }
 
     for (IRInst *inst = func->instructions; inst; inst = inst->next) {
-        gen_inst(inst, &ctx);
+        gen_inst(inst, &ctx, func->alloc_stack_size);
     }
 
     // Implicit return for void functions (or fallthrough safety)
@@ -920,7 +944,7 @@ static void gen_func(IRFunction *func) {
     
     if (!last || last->op != IR_RET) {
         // Emit epilogue
-        int stack_size = ctx.stack_slots * 8;
+        int stack_size = ctx.stack_slots * 8 + func->alloc_stack_size;
         if (stack_size > 0) {
             stack_size = (stack_size + 15) & ~15;
             emit("add rsp, %d", stack_size);
@@ -930,7 +954,9 @@ static void gen_func(IRFunction *func) {
         emit("pop r13");
         emit("pop r12");
         emit("pop rbx");
-        emit("pop rbp");
+        if (!ctx.is_leaf) {
+            emit("pop rbp");
+        }
         emit("ret");
     }
 
@@ -998,8 +1024,7 @@ void codegen(IRProgram *prog, FILE *output) {
             fprintf(out, "%s:\n", func->name);
         }
         
-        emit("push rbp");
-        emit("mov rbp, rsp");
+
         
         gen_func(func);
         fprintf(out, "\n");

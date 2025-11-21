@@ -36,6 +36,7 @@ typedef enum {
     IR_COPY,
     IR_ADDR, // Get address of variable (stack)
     IR_ADDR_GLOBAL, // Get address of global variable
+    IR_GET_ALLOC_ADDR, // Get address of allocated stack space
 } IROp;
 
 typedef enum {
@@ -77,6 +78,8 @@ typedef struct IRFunction {
     int vreg_count;
     int label_count;
     int is_reachable;
+    int alloc_stack_size; // Extra stack space allocated by IR (e.g. for struct returns)
+    int num_args;
     struct IRFunction *next;
 } IRFunction;
 
