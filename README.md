@@ -31,7 +31,7 @@ $ ./main
 - [x] **Functions**
 - [-] **Standard Library**
   - [x] **Memory Management**
-  - [ ] **Dynamic Strings**
+  - [X] **Dynamic Strings**
   - [ ] **IO Library**
 - [ ] **Language Extensions**
   - [ ] **FFI / C Interop**
