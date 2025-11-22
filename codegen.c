@@ -485,6 +485,14 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             emit("lea %s, [rbp-%ld]", dst, (long)(ctx->stack_slots * 8 + inst->src1.imm));
             break;
 
+        case IR_SET_CTX:
+            if (inst->src1.type == OPERAND_IMM) {
+                emit("xor r10, r10");
+            } else {
+                load_operand(inst->src1.vreg, ctx, "r10");
+            }
+            break;
+
         case IR_LOAD:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
             
