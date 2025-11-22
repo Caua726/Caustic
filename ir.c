@@ -13,7 +13,7 @@ const char *IR_OP_NAMES[] = {
     "SYSCALL",
     "COPY", "RET",
     "LOAD", "STORE", "ADDR", "ADDR_GLOBAL",
-    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_SYS_ARG", "SYSCALL", "COPY", "ADDR", "ADDR_GLOBAL", "GET_ALLOC_ADDR",
+    "PHI", "ASM", "CAST", "SHL", "SHR", "CALL", "SET_ARG", "GET_ARG", "SET_SYS_ARG", "SYSCALL", "COPY", "ADDR", "ADDR_GLOBAL", "GET_ALLOC_ADDR", "SET_CTX",
 };
 
 typedef struct {
@@ -257,6 +257,14 @@ static int gen_expr(Node *node) {
 
         case NODE_KIND_ASSIGN: {
             int lhs_addr = gen_addr(node->lhs);
+
+            if (node->rhs->kind == NODE_KIND_FNCALL || node->rhs->kind == NODE_KIND_SYSCALL) {
+                IRInst *ctx = new_inst(IR_SET_CTX);
+                ctx->src1 = op_vreg(lhs_addr);
+                ctx->line = node->tok ? node->tok->line : 0;
+                emit(ctx);
+            }
+
             int rhs_val = gen_expr(node->rhs);
 
             if (node->ty->size > 8) {
@@ -897,6 +905,13 @@ static void gen_stmt_single(Node *node) {
         }
 
         case NODE_KIND_LET: {
+            if (node->init_expr && (node->init_expr->kind == NODE_KIND_FNCALL || node->init_expr->kind == NODE_KIND_SYSCALL)) {
+                IRInst *ctx = new_inst(IR_SET_CTX);
+                ctx->src1 = op_imm(0);
+                ctx->line = node->tok ? node->tok->line : 0;
+                emit(ctx);
+            }
+
             if (node->init_expr) {
                 int val_reg = gen_expr(node->init_expr);
                 

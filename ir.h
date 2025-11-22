@@ -37,6 +37,7 @@ typedef enum {
     IR_ADDR, // Get address of variable (stack)
     IR_ADDR_GLOBAL, // Get address of global variable
     IR_GET_ALLOC_ADDR, // Get address of allocated stack space
+    IR_SET_CTX, // Set context (target address) for next call
 } IROp;
 
 typedef enum {
