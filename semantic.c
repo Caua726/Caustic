@@ -699,7 +699,11 @@ static void walk(Node *node) {
             }
 
             if (!allow_literal_narrowing && !is_safe_implicit_conversion(node->rhs->ty, node->lhs->ty)) {
-                fprintf(stderr, "Erro: conversão implícita não segura na atribuição. Use cast explícito.\n");
+                fprintf(stderr, "Erro em %s:%d: conversão implícita não segura na atribuição (de tipo %d para tipo %d). Use cast explícito.\n",
+                    node->tok ? node->tok->filename : "?",
+                    node->tok ? node->tok->line : 0,
+                    node->rhs->ty->kind,
+                    node->lhs->ty->kind);
                 exit(1);
             }
 
