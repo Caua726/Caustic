@@ -1,27 +1,42 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g -std=c23
-SOURCES = main.c lexer.c parser.c semantic.c ir.c codegen.c
-OBJECTS = $(SOURCES:.c=.o)
+# -Isrc diz pro compilador procurar headers (.h) dentro da pasta src
+CFLAGS = -Wall -Wextra -g -std=c23 -Isrc
+
+# Pastas
+SRC_DIR = src
+BUILD_DIR = build
+
+# Lista de fontes
+SOURCES = $(SRC_DIR)/main.c $(SRC_DIR)/lexer.c $(SRC_DIR)/parser.c \
+          $(SRC_DIR)/semantic.c $(SRC_DIR)/ir.c $(SRC_DIR)/codegen.c
+
+# Gera a lista de objetos baseada nos fontes, mas trocando o diretório para build/
+OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
+
 TARGET = caustic
 
 # Compila tudo
 all: $(TARGET)
 
-# Linka os objetos
-$(TARGET): $(OBJECTS)
+# Cria o diretório build se não existir
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+# Linka os objetos para criar o binário final na raiz
+$(TARGET): $(BUILD_DIR) $(OBJECTS)
 	$(CC) $(OBJECTS) -o $(TARGET)
 
-# Compila cada .c para .o
-%.o: %.c
+# Compila cada .c da src para .o na build
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Limpa binários e arquivos temporários (.s, .o)
+# Limpeza profunda
 clean:
-	rm -f $(OBJECTS) $(TARGET) *.s *.o
+	rm -rf $(BUILD_DIR) $(TARGET) *.s output main
 
-# Um atalho para compilar e rodar um teste rápido
-# Uso: make run FILE=main.cst
+# Atalho de execução
 run: $(TARGET)
-	./$(TARGET) $(FILE)
-	gcc -no-pie $(FILE).s -o output
-	./output
+	./$(TARGET) main.cst
+	# Adicione -nostartfiles entry.s aqui se for usar o runtime assembly
+	gcc -no-pie main.cst.s -o main
+	./main

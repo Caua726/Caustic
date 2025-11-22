@@ -32,7 +32,7 @@ $ ./main
 - [-] **Standard Library**
   - [x] **Memory Management**
   - [X] **Dynamic Strings**
-  - [ ] **IO Library**
+  - [-] **IO Library**
 - [ ] **Language Extensions**
   - [ ] **FFI / C Interop**
   - [ ] **Generics**
