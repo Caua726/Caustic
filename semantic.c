@@ -67,8 +67,15 @@ static Type *new_type_full(TypeKind kind, int size, int is_signed) {
 static void declare_function(char *name, Type *return_type, Type **param_types, int param_count) {
     for (Function *fs = function_table; fs; fs = fs->next) {
         if (strcmp(fs->name, name) == 0) {
-            fprintf(stderr, "Erro: redefinição da função '%s'\n", name);
-            exit(1);
+            // Check if in same module
+            int same_module = 0;
+            if (current_module_path && fs->module_prefix && strcmp(current_module_path, fs->module_prefix) == 0) same_module = 1;
+            if (!current_module_path && !fs->module_prefix) same_module = 1;
+
+            if (same_module) {
+                fprintf(stderr, "Erro: redefinição da função '%s'\n", name);
+                exit(1);
+            }
         }
     }
     Function *fs = calloc(1, sizeof(Function));
@@ -728,41 +735,83 @@ static void walk(Node *node) {
             node->ty = type_i32; // sizeof returns i32 (or size_t which we map to i32/i64)
             return;
 
-        case NODE_KIND_FNCALL:
-            Function *fs = lookup_function(node->name);
-            if (!fs) {
-                fprintf(stderr, "Erro: chamada para função não definida '%s'\n", node->name);
+        case NODE_KIND_FNCALL: {
+            Function *func = NULL;
+            
+            // Case 1: Direct Identifier Call (func())
+            if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                func = lookup_function(node->lhs->name);
+                if (!func) {
+                    fprintf(stderr, "Erro: função '%s' não declarada.\n", node->lhs->name);
+                    exit(1);
+                }
+            } 
+            // Case 2: Member Access Call (mod.func() or struct.method())
+            else if (node->lhs->kind == NODE_KIND_MEMBER_ACCESS) {
+                Node *lhs_expr = node->lhs->lhs;
+                char *member_name = node->lhs->member_name;
+                
+                // Check if lhs is a Module (Namespace)
+                if (lhs_expr->kind == NODE_KIND_IDENTIFIER) {
+                    Variable *var = symtab_lookup(lhs_expr->name);
+                    if (var && var->is_module) {
+                        // It is a module call! (e.g. str.free)
+                        // Resolve module prefix
+                        if (!var->module_ref) {
+                             fprintf(stderr, "Erro interno: variavel de modulo sem referencia de modulo.\n");
+                             exit(1);
+                        }
+                        
+                        func = lookup_function_qualified(member_name, var->module_ref->path_prefix);
+                        if (!func) {
+                            fprintf(stderr, "Erro: função '%s' não encontrada no módulo '%s'.\n", member_name, lhs_expr->name);
+                            exit(1);
+                        }
+                    } else {
+                        // Not a module, assume struct member access (method or function pointer)
+                        // For now, we don't support methods or function pointers in structs fully yet in this pass?
+                        // Or maybe we do? The user said "Futuro/Erro por enquanto".
+                        // Let's emit error for now to be safe, or fall through if we want to support function pointers later.
+                        fprintf(stderr, "Erro: métodos ou ponteiros de função em structs ainda não suportados para '%s.%s'.\n", lhs_expr->name, member_name);
+                        exit(1);
+                    }
+                } else {
+                    // Complex expression on LHS (e.g. get_struct().method())
+                    fprintf(stderr, "Erro: chamadas em expressões complexas ainda não suportadas.\n");
+                    exit(1);
+                }
+            } else {
+                fprintf(stderr, "Erro: tipo de chamada de função inválido.\n");
                 exit(1);
             }
-            node->ty = fs->return_type;
 
+            node->ty = func->return_type;
+            // Store asm_name in the node for codegen
+            node->name = func->asm_name; // We might need a new field or reuse name. 
+            // Codegen uses node->name for FNCALL.
+            
+            // Verify arguments
             int arg_count = 0;
-            for (Node *arg = node->args; arg; arg = arg->next) {
-                walk(arg);
-                arg_count++;
-            }
+            for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
 
-            if (arg_count != fs->param_count) {
-                fprintf(stderr, "Erro: função '%s' espera %d argumentos, mas recebeu %d\n", fs->name, fs->param_count, arg_count);
+            if (arg_count != func->param_count) {
+                fprintf(stderr, "Erro: função '%s' espera %d argumentos, mas recebeu %d.\n", func->name, func->param_count, arg_count);
                 exit(1);
             }
 
             Node *arg = node->args;
             for (int i = 0; i < arg_count; i++) {
-                if (!is_safe_implicit_conversion(arg->ty, fs->param_types[i])) {
-                    fprintf(stderr, "Erro: argumento %d da função '%s' tem tipo incompatível.\n", i + 1, fs->name);
-                    exit(1);
+                walk(arg);
+                // Implicit Cast
+                if (!is_safe_implicit_conversion(arg->ty, func->param_types[i])) {
+                     fprintf(stderr, "Erro: tipo incompatível no argumento %d da função '%s'.\n", i+1, func->name);
+                     // print_type(arg->ty); fprintf(stderr, " vs "); print_type(func->param_types[i]); fprintf(stderr, "\n");
+                     exit(1);
                 }
                 arg = arg->next;
             }
-
-
-            // Update node->name to asm_name for codegen
-            if (fs->asm_name) {
-                node->name = strdup(fs->asm_name);
-            }
-
             return;
+        }
 
         case NODE_KIND_SYSCALL:
             node->ty = type_i64; // Syscalls always return i64
