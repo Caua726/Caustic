@@ -474,7 +474,12 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
 
         case IR_ADDR_GLOBAL:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            emit("lea %s, [rip+%s]", dst, inst->global_name);
+            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                emit("lea r15, [rip+%s]", inst->global_name);
+                emit("mov %s, r15", dst);
+            } else {
+                emit("lea %s, [rip+%s]", dst, inst->global_name);
+            }
             break;
 
         case IR_GET_ALLOC_ADDR:
@@ -482,7 +487,12 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             // Base of alloc area is [rbp - (ctx->stack_slots * 8)]
             // Offset is inst->src1.imm
             // Addr = rbp - (ctx->stack_slots * 8 + inst->src1.imm)
-            emit("lea %s, [rbp-%ld]", dst, (long)(ctx->stack_slots * 8 + inst->src1.imm));
+            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                emit("lea r15, [rbp-%ld]", (long)(ctx->stack_slots * 8 + inst->src1.imm));
+                emit("mov %s, r15", dst);
+            } else {
+                emit("lea %s, [rbp-%ld]", dst, (long)(ctx->stack_slots * 8 + inst->src1.imm));
+            }
             break;
 
         case IR_SET_CTX:
@@ -676,6 +686,16 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                         else if (strcmp(source_reg, "r15") == 0) strcpy(reg8, "r15b");
                         else strncpy(reg8, source_reg, sizeof(reg8) - 1);
                         emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm + size, reg8);
+                    } else {
+                        // Struct > 8 bytes (passed by reference/pointer in register)
+                        // Copy from [src_reg] to [rbp-dest]
+                        // src1 holds the ADDRESS of the source struct
+                        
+                        emit("lea rdi, [rbp-%ld]", inst->dest.imm); // Dest address (local var)
+                        emit("mov rsi, %s", source_reg);            // Source address (param)
+                        emit("mov rcx, %d", size);
+                        emit("cld");
+                        emit("rep movsb");
                     }
                 } else {
                     emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
