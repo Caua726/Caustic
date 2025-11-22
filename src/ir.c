@@ -159,7 +159,11 @@ static int gen_addr(Node *node) {
             if (node->var && node->var->is_global) {
                 IRInst *inst = new_inst(IR_ADDR_GLOBAL);
                 inst->dest = op_vreg(dest);
-                inst->global_name = strdup(node->name);
+                if (node->var->asm_name) {
+                    inst->global_name = strdup(node->var->asm_name);
+                } else {
+                    inst->global_name = strdup(node->name);
+                }
                 inst->line = node->tok ? node->tok->line : 0;
                 emit(inst);
             } else {
@@ -640,7 +644,11 @@ static int gen_expr(Node *node) {
                 int addr = new_vreg();
                 IRInst *addr_inst = new_inst(IR_ADDR_GLOBAL);
                 addr_inst->dest = op_vreg(addr);
-                addr_inst->global_name = strdup(node->name);
+                if (node->var->asm_name) {
+                    addr_inst->global_name = strdup(node->var->asm_name);
+                } else {
+                    addr_inst->global_name = strdup(node->name);
+                }
                 addr_inst->line = node->tok ? node->tok->line : 0;
                 emit(addr_inst);
 
@@ -1214,8 +1222,13 @@ IRProgram *gen_ir(Node *ast) {
     for (Node *node = ast; node; node = node->next) {
         if (node->kind == NODE_KIND_LET) {
             // Global variable
+            // Global variable
             IRGlobal *glob = calloc(1, sizeof(IRGlobal));
-            glob->name = strdup(node->name);
+            if (node->var && node->var->asm_name) {
+                glob->name = strdup(node->var->asm_name);
+            } else {
+                glob->name = strdup(node->name);
+            }
             glob->size = node->ty->size;
             
             // Handle initialization

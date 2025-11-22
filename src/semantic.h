@@ -14,6 +14,7 @@ typedef struct Variable {
     int is_global;
     int is_module;
     Module *module_ref;
+    char *asm_name;
     struct Variable *next;
 } Variable;
 

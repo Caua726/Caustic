@@ -26,26 +26,30 @@ static int register_string(char *val) {
 
 typedef struct IncludedFile {
     char *path;
+    Node *body;
     struct IncludedFile *next;
 } IncludedFile;
 
 static IncludedFile *visited_files = NULL;
 
-// Retorna 1 se já visitou, 0 se não. Adiciona na lista se 0.
-int mark_file_visited(const char *path) {
+// Retorna o corpo se já visitou, NULL se não.
+Node *get_cached_module(const char *path) {
     IncludedFile *cur = visited_files;
     while (cur) {
         if (strcmp(cur->path, path) == 0) {
-            return 1;
+            return cur->body;
         }
         cur = cur->next;
     }
+    return NULL;
+}
 
+void cache_module(const char *path, Node *body) {
     IncludedFile *new_file = calloc(1, sizeof(IncludedFile));
     new_file->path = strdup(path);
+    new_file->body = body;
     new_file->next = visited_files;
     visited_files = new_file;
-    return 0;
 }
 
 StringLiteral *get_strings() {
@@ -114,7 +118,6 @@ static void parse_use(Node **cur_ptr) {
     // We can store path in string literal or just use val/member_name? 
     // Let's use member_name for path for now, or create a string literal node?
     // Node struct has 'member_name'. Let's use that for path.
-    use_node->member_name = strdup(path);
 
     // Resolve path relative to current file
     char full_path[512];
@@ -143,8 +146,24 @@ static void parse_use(Node **cur_ptr) {
         strncpy(canonical_path, full_path, sizeof(canonical_path));
     }
 
-    // Recursive parsing
-    if (!mark_file_visited(canonical_path)) {
+    use_node->member_name = strdup(canonical_path);
+
+    // Check cache
+    Node *cached_body = get_cached_module(canonical_path);
+    if (cached_body) {
+        // Reuse body!
+        // But wait, if we reuse the SAME node list, modifying it (e.g. setting next) might be dangerous if it's used elsewhere?
+        // The body list is a chain of nodes.
+        // We are not modifying the nodes themselves in semantic analysis (mostly).
+        // Except for 'next' pointers?
+        // 'next' pointers link statements in the file.
+        // 'use_node->body' points to the head of that list.
+        // It should be fine to share the read-only AST structure.
+        // But if we modify AST (e.g. type resolution), it affects all users.
+        // That's actually GOOD for types (resolve once).
+        // But for 'use', we iterate it.
+        use_node->body = cached_body;
+    } else {
         FILE *f = fopen(canonical_path, "r");
         if (!f) {
             error_at_token(current_token, "nao foi possivel abrir o arquivo '%s'", canonical_path);
@@ -168,6 +187,7 @@ static void parse_use(Node **cur_ptr) {
         parse_file_body(&module_cur);
         
         use_node->body = module_head.next;
+        cache_module(canonical_path, use_node->body);
         // free dummy_head? (careful with GC/memory)
 
         lexer_set_state(&state);
@@ -320,6 +340,33 @@ static Type *parse_type() {
     }
 
     Type *ty = NULL;
+
+    // Check for namespaced type (e.g. string.String)
+    if (current_token.type == TOKEN_TYPE_IDENTIFIER && lookahead_token.type == TOKEN_TYPE_DOT) {
+        char *module_name = strdup(current_token.text);
+        consume(); // consume module name
+        consume(); // consume dot
+        
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            error_at_token(current_token, "esperado nome do tipo após '.'");
+        }
+        
+        char *type_name = strdup(current_token.text);
+        
+        // Construct full name "module.Type"
+        int len = strlen(module_name) + 1 + strlen(type_name) + 1;
+        char *full_name = calloc(1, len);
+        snprintf(full_name, len, "%s.%s", module_name, type_name);
+        
+        ty = new_type(TY_STRUCT);
+        ty->name = full_name;
+        
+        free(module_name);
+        free(type_name);
+        
+        consume(); // consume type name
+        return ty;
+    }
 
     if (strcmp(current_token.text, "i32") == 0) {
         ty = type_i32;
