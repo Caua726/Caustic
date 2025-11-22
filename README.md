@@ -41,6 +41,14 @@ $ ./main
   - [ ] **Optimization**
   - [ ] **Self Hosting**
 
+### Not important, but just to note
+
+- [ ] **Defer**
+  - ```cst
+    defer free(ptr);
+    ```
+    this will generate a stack of function calls to be executed when the function returns
+
 ### Syntax Dump
 
 #### Entry Point
