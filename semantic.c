@@ -446,6 +446,12 @@ static void walk(Node *node) {
             walk(node->lhs);
             walk(node->rhs);
 
+            if ((node->kind == NODE_KIND_EQ || node->kind == NODE_KIND_NE) && 
+                (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT)) {
+                fprintf(stderr, "Erro na linha %d: Comparação direta de structs ('==', '!=') não suportada. Use uma função de comparação.\n", node->tok ? node->tok->line : 0);
+                exit(1);
+            }
+
             if (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT) {
                 fprintf(stderr, "Erro na linha %d: Operacao invalida com structs.\n", node->tok ? node->tok->line : 0);
                 exit(1);
