@@ -1028,7 +1028,15 @@ static void emit_rodata(IRProgram *prog) {
     fprintf(out, ".section .rodata\n");
     for (StringLiteral *s = prog->strings; s; s = s->next) {
         fprintf(out, ".LC%d:\n", s->id);
-        fprintf(out, "  .string \"%s\"\n", s->value);
+        fprintf(out, "  .string \"");
+        for (char *p = s->value; *p; p++) {
+            if (*p == '\n') fprintf(out, "\\n");
+            else if (*p == '\t') fprintf(out, "\\t");
+            else if (*p == '\"') fprintf(out, "\\\"");
+            else if (*p == '\\') fprintf(out, "\\\\");
+            else fprintf(out, "%c", *p);
+        }
+        fprintf(out, "\"\n");
     }
     fprintf(out, ".text\n");
 }

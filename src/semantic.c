@@ -7,6 +7,7 @@
 typedef struct Scope {
     Variable *vars;
     struct Scope *parent;
+    int is_global_scope;
 } Scope;
 
 static Scope *current_scope = NULL;
@@ -31,7 +32,7 @@ static char *get_module_prefix(const char *path) {
     prefix[0] = '_';
     int j = 1;
     for (int i = 0; path[i]; i++) {
-        if (path[i] == '/' || path[i] == '.' || path[i] == '\\') {
+        if (path[i] == '/' || path[i] == '.' || path[i] == '\\' || path[i] == '-') {
             prefix[j++] = '_';
         } else {
             prefix[j++] = path[i];
@@ -57,6 +58,8 @@ Type *type_char;
 Type *type_string;
 Type *type_void;
 
+static Variable *symtab_lookup(char *name);
+
 static Type *new_type_full(TypeKind kind, int size, int is_signed) {
     Type *ty = new_type(kind);
     ty->size = size;
@@ -73,37 +76,40 @@ static void declare_function(char *name, Type *return_type, Type **param_types, 
             if (!current_module_path && !fs->module_prefix) same_module = 1;
 
             if (same_module) {
-                fprintf(stderr, "Erro: redefinição da função '%s'\n", name);
-                exit(1);
+                // fprintf(stderr, "Aviso: redefinição da função '%s' ignorada (mesmo módulo)\n", name);
+                return;
             }
         }
     }
-    Function *fs = calloc(1, sizeof(Function));
-    fs->name = strdup(name);
-    fs->return_type = return_type;
-    fs->param_types = param_types;
-    fs->param_count = param_count;
-    
-    if (current_module_path) {
-        fs->module_prefix = strdup(current_module_path);
-        // Mangle name: prefix + "_" + name
-        int len = strlen(current_module_path) + 1 + strlen(name) + 1;
-        fs->asm_name = malloc(len);
-        snprintf(fs->asm_name, len, "%s_%s", current_module_path, name);
-    } else {
-        fs->module_prefix = NULL;
-        fs->asm_name = strdup(name);
-    }
 
-    fs->next = function_table;
-    function_table = fs;
+    Function *f = calloc(1, sizeof(Function));
+    f->name = strdup(name);
+    f->return_type = return_type;
+    f->param_types = param_types;
+    f->param_count = param_count;
+    f->module_prefix = current_module_path ? strdup(current_module_path) : NULL;
+
+    if (current_module_path) {
+        int len = strlen(current_module_path) + 1 + strlen(name) + 1;
+        f->asm_name = malloc(len);
+        snprintf(f->asm_name, len, "%s_%s", current_module_path, name);
+    } else {
+        f->asm_name = strdup(name);
+    }
+    
+    // fprintf(stderr, "Debug: Registrando funcao '%s' (asm: '%s') prefix: '%s'\n", name, f->asm_name, f->module_prefix);
+
+    f->next = function_table;
+    function_table = f;
 }
 
 static Function *lookup_function_qualified(char *name, char *prefix) {
-    for (Function *fs = function_table; fs; fs = fs->next) {
-        if (strcmp(fs->name, name) == 0) {
-            if (prefix && fs->module_prefix && strcmp(fs->module_prefix, prefix) == 0) return fs;
-            if (!prefix && !fs->module_prefix) return fs;
+    // fprintf(stderr, "Debug: lookup_function_qualified '%s' prefix '%s'\n", name, prefix ? prefix : "NULL");
+    for (Function *f = function_table; f; f = f->next) {
+        // fprintf(stderr, "Debug: Checking func '%s' prefix '%s'\n", f->name, f->module_prefix ? f->module_prefix : "NULL");
+        if (strcmp(f->name, name) == 0) {
+            if (prefix == NULL && f->module_prefix == NULL) return f;
+            if (prefix != NULL && f->module_prefix != NULL && strcmp(prefix, f->module_prefix) == 0) return f;
         }
     }
     return NULL;
@@ -144,8 +150,57 @@ static Type *lookup_struct(char *name) {
 static void resolve_type_ref(Type *ty) {
     if (ty->kind == TY_STRUCT && ty->fields == NULL && ty->name != NULL) {
         Type *def = lookup_struct(ty->name);
+        
+        // 1. Try mangled name (Internal reference)
+        if (!def && current_module_path) {
+             int len = strlen(current_module_path) + 1 + strlen(ty->name) + 1;
+             char *mangled = malloc(len);
+             snprintf(mangled, len, "%s_%s", current_module_path, ty->name);
+             def = lookup_struct(mangled);
+             if (!def) {
+                 // fprintf(stderr, "Debug: Lookup interno falhou para '%s'. Tentou: '%s'. CurrentPath: '%s'\n", ty->name, mangled, current_module_path);
+             }
+             free(mangled);
+        }
+        
+        // 2. Try resolving alias (External reference: alias.Type)
+        if (!def && strchr(ty->name, '.')) {
+            char *dot = strchr(ty->name, '.');
+            int alias_len = dot - ty->name;
+            char *alias = malloc(alias_len + 1);
+            strncpy(alias, ty->name, alias_len);
+            alias[alias_len] = '\0';
+            
+            char *type_name = dot + 1;
+            
+            Variable *var = symtab_lookup(alias);
+            if (var) {
+                if (var->is_module && var->module_ref) {
+                    char *prefix = var->module_ref->path_prefix;
+                    int len = strlen(prefix) + 1 + strlen(type_name) + 1;
+                    char *mangled = malloc(len);
+                    snprintf(mangled, len, "%s_%s", prefix, type_name);
+                    def = lookup_struct(mangled);
+                    if (!def) {
+                        fprintf(stderr, "Debug: Struct '%s' (mangled: '%s') nao encontrada no modulo '%s' (prefix: '%s').\n", type_name, mangled, alias, prefix);
+                    }
+                    free(mangled);
+                } else {
+                    fprintf(stderr, "Debug: '%s' encontrado mas nao e modulo ou sem ref.\n", alias);
+                }
+            } else {
+                fprintf(stderr, "Debug: Alias '%s' nao encontrado no escopo atual.\n", alias);
+            }
+            free(alias);
+        }
+
         if (!def) {
             fprintf(stderr, "Erro: struct '%s' não definida.\n", ty->name);
+            // Print all registered structs for debugging
+            fprintf(stderr, "Structs registradas:\n");
+            for (StructDef *s = struct_defs; s; s = s->next) {
+                fprintf(stderr, "  - %s\n", s->name);
+            }
             exit(1);
         }
         // Copy details
@@ -158,15 +213,16 @@ static void resolve_type_ref(Type *ty) {
     }
 }
 
-static void declare_struct(Type *type) {
+static void declare_struct(char *name, Type *type) {
     for (StructDef *s = struct_defs; s; s = s->next) {
-        if (strcmp(s->name, type->name) == 0) {
-            fprintf(stderr, "Erro: redefinição da struct '%s'\n", type->name);
-            exit(1);
+        if (strcmp(s->name, name) == 0) {
+            // Idempotent: if already registered, just return.
+            // fprintf(stderr, "Aviso: redefinição da struct '%s' ignorada\n", name);
+            return;
         }
     }
     StructDef *s = calloc(1, sizeof(StructDef));
-    s->name = strdup(type->name);
+    s->name = strdup(name);
     s->type = type;
     s->next = struct_defs;
     struct_defs = s;
@@ -218,6 +274,7 @@ static int is_safe_implicit_conversion(Type *from, Type *to) {
 static void symtab_init() {
     current_scope = NULL;
     global_scope = calloc(1, sizeof(Scope));
+    global_scope->is_global_scope = 1;
     current_scope = global_scope;
     stack_offset = 48; // Reserve 48 bytes for saved registers (rbx, r12-r15) + alignment
 }
@@ -249,8 +306,8 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
 
     for (Variable *v = current_scope->vars; v; v = v->next) {
         if (strcmp(v->name, name) == 0) {
-            fprintf(stderr, "Erro: variavel '%s' ja declarada neste escopo\n", name);
-            exit(1);
+            // fprintf(stderr, "Aviso: variavel '%s' ja declarada neste escopo (idempotente)\n", name);
+            return v;
         }
     }
 
@@ -258,7 +315,7 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     for (Scope *s = current_scope->parent; s; s = s->parent) {
         for (Variable *v = s->vars; v; v = v->next) {
             if (strcmp(v->name, name) == 0) {
-                fprintf(stderr, "Aviso: variavel '%s' sombreia uma declaracao anterior\n", name);
+                // fprintf(stderr, "Aviso: variavel '%s' sombreia uma declaracao anterior\n", name);
                 break;
             }
         }
@@ -269,17 +326,29 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     var->type = type;
     var->flags = flags;
 
-    if (current_scope == global_scope) {
+    if (current_scope->is_global_scope) {
         var->is_global = 1;
         var->offset = 0; // Globals don't have stack offset
+        
+        if (current_module_path) {
+            int len = strlen(current_module_path) + 1 + strlen(name) + 1;
+            char *mangled = malloc(len);
+            snprintf(mangled, len, "%s_%s", current_module_path, name);
+            var->asm_name = mangled;
+        } else {
+            var->asm_name = strdup(name);
+        }
     } else {
         var->is_global = 0;
         stack_offset += type->size;
         var->offset = stack_offset;
+        var->asm_name = NULL;
     }
 
     var->next = current_scope->vars;
     current_scope->vars = var;
+    
+    // fprintf(stderr, "Debug: Declarada variavel '%s' no escopo %p\n", name, (void*)current_scope);
 
     return var;
 }
@@ -292,16 +361,15 @@ static Variable *symtab_lookup(char *name) {
             }
         }
     }
+    fprintf(stderr, "Debug: Lookup '%s' falhou. Escopo atual: %p\n", name, (void*)current_scope);
     return NULL;
 }
 
 
 
-static void walk(Node *node) {
-    if (!node) {
-        return;
-    }
-
+void walk(Node *node) {
+    if (!node) return;
+    // fprintf(stderr, "Debug: walk node %p kind %d\n", (void*)node, node->kind);
     switch (node->kind) {
         case NODE_KIND_ASM: break;
         case NODE_KIND_NUM:
@@ -317,6 +385,11 @@ static void walk(Node *node) {
         }
 
         case NODE_KIND_IDENTIFIER: {
+            if (node->var) {
+                 node->ty = node->var->type;
+                 node->offset = node->var->offset;
+                 return;
+            }
             Variable *var = symtab_lookup(node->name);
             if (!var) {
                 fprintf(stderr, "Erro: variavel '%s' nao declarada\n", node->name);
@@ -737,6 +810,7 @@ static void walk(Node *node) {
 
         case NODE_KIND_FNCALL: {
             Function *func = NULL;
+            // fprintf(stderr, "Debug: Visiting FNCALL. LHS kind: %d\n", node->lhs->kind);
             
             // Case 1: Direct Identifier Call (func())
             if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
@@ -751,10 +825,14 @@ static void walk(Node *node) {
                 Node *lhs_expr = node->lhs->lhs;
                 char *member_name = node->lhs->member_name;
                 
+                // fprintf(stderr, "Debug: FNCALL Member Access. Member: %s\n", member_name);
+                
                 // Check if lhs is a Module (Namespace)
                 if (lhs_expr->kind == NODE_KIND_IDENTIFIER) {
+                    // fprintf(stderr, "Debug: LHS is Identifier: %s\n", lhs_expr->name);
                     Variable *var = symtab_lookup(lhs_expr->name);
                     if (var && var->is_module) {
+                        // fprintf(stderr, "Debug: Module found. Var: %p, ModuleRef: %p\n", (void*)var, (void*)var->module_ref);
                         // It is a module call! (e.g. str.free)
                         // Resolve module prefix
                         if (!var->module_ref) {
@@ -762,11 +840,13 @@ static void walk(Node *node) {
                              exit(1);
                         }
                         
+                        // fprintf(stderr, "Debug: Looking up function '%s' in prefix '%s'\n", member_name, var->module_ref->path_prefix);
                         func = lookup_function_qualified(member_name, var->module_ref->path_prefix);
                         if (!func) {
                             fprintf(stderr, "Erro: função '%s' não encontrada no módulo '%s'.\n", member_name, lhs_expr->name);
                             exit(1);
                         }
+                        // fprintf(stderr, "Debug: Function found: %p. Name: %s. AsmName: %s\n", (void*)func, func->name, func->asm_name);
                     } else {
                         // Not a module, assume struct member access (method or function pointer)
                         // For now, we don't support methods or function pointers in structs fully yet in this pass?
@@ -787,12 +867,16 @@ static void walk(Node *node) {
 
             node->ty = func->return_type;
             // Store asm_name in the node for codegen
-            node->name = func->asm_name; // We might need a new field or reuse name. 
-            // Codegen uses node->name for FNCALL.
+            node->name = func->asm_name; 
+            
+            // fprintf(stderr, "Debug: Processing args for function '%s'\n", func->name);
             
             // Verify arguments
             int arg_count = 0;
-            for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
+            for (Node *arg = node->args; arg; arg = arg->next) {
+                // fprintf(stderr, "Debug: Counting arg %p\n", (void*)arg);
+                arg_count++;
+            }
 
             if (arg_count != func->param_count) {
                 fprintf(stderr, "Erro: função '%s' espera %d argumentos, mas recebeu %d.\n", func->name, func->param_count, arg_count);
@@ -801,6 +885,7 @@ static void walk(Node *node) {
 
             Node *arg = node->args;
             for (int i = 0; i < arg_count; i++) {
+                // fprintf(stderr, "Debug: Walking arg %d\n", i);
                 walk(arg);
                 // Implicit Cast
                 if (!is_safe_implicit_conversion(arg->ty, func->param_types[i])) {
@@ -828,6 +913,7 @@ static void walk(Node *node) {
 
         case NODE_KIND_MODULE_ACCESS:
         case NODE_KIND_MEMBER_ACCESS:
+            // fprintf(stderr, "Debug: Visiting MEMBER_ACCESS. Node: %p\n", (void*)node);
             // Check if LHS is a module
             if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
                 Variable *var = symtab_lookup(node->lhs->name);
@@ -836,81 +922,36 @@ static void walk(Node *node) {
                     Module *mod = var->module_ref;
                     char *member_name = node->member_name;
                     
+                    // fprintf(stderr, "Debug: Accessing module '%s'. Member: '%s'\n", mod->name, member_name);
+
                     // Try to find function in module
                     Function *fn = lookup_function_qualified(member_name, mod->path_prefix);
                     if (fn) {
-                        // It's a function. 
-                        // We need to transform this node into something that FNCALL can use.
-                        // FNCALL expects a name or an expression.
-                        // If we set node->kind = NODE_KIND_IDENTIFIER and node->name = fn->asm_name?
-                        // But FNCALL uses node->name directly if it's an identifier.
-                        // Or we can set node->name to the mangled name.
+                        // ... (omitted for brevity) ...
                         node->kind = NODE_KIND_IDENTIFIER;
-                        node->name = strdup(fn->asm_name); // Use mangled name
-                        node->ty = fn->return_type; // Function type? 
-                        // Actually, in C, function name evaluates to function pointer.
-                        // But here we just want FNCALL to find it.
-                        // If this is part of FNCALL (node->lhs of FNCALL is this node), 
-                        // then FNCALL logic needs to handle it.
-                        // FNCALL logic: Function *fs = lookup_function(node->name);
-                        // If node is IDENTIFIER, it uses node->name.
-                        // So if we change name to asm_name, lookup_function needs to find it.
-                        // lookup_function searches by name.
-                        // But asm_name is NOT in the function table as 'name'.
-                        // 'name' is original name. 'asm_name' is separate.
-                        // So lookup_function won't find it by asm_name unless we index by asm_name too.
-                        // OR we change lookup_function to check asm_name too.
-                        // OR we change FNCALL to handle resolved function pointer.
-                        // Let's change FNCALL to use a 'function_ref' if present?
-                        // Or better: lookup_function checks asm_name? No, asm_name is for codegen.
-                        
-                        // Wait, if I found the function 'fn', I can attach it to the node.
-                        // Node struct has no 'fn_ref'.
-                        // I can add 'struct Function *fn' to Node?
-                        // Or I can use 'var' field? No, var is Variable.
-                        
-                        // Simplest: FNCALL logic in walk() calls lookup_function(node->name).
-                        // If I change node->name to something unique that lookup_function finds...
-                        // But 'fn' is already found here.
-                        // Maybe I should handle FNCALL with MODULE_ACCESS specially?
-                        // But FNCALL walks its 'name' (which is not a node, it's a string in Node struct?).
-                        // Wait, NODE_KIND_FNCALL has 'name' field. It does NOT have an 'expr' for the function.
-                        // AST: `fn_call(args)` -> `NODE_KIND_FNCALL` with `name`.
-                        // So `mod.func()` is NOT `FNCALL` with `MEMBER_ACCESS`.
-                        // Parser `parse_primary` or `parse_fn_call`?
-                        // Let's check parser.
-                        // If parser sees `ident.ident(...)`, does it create FNCALL?
-                        // `parse_primary` handles `ident` then `parse_postfix` handles `.` and `(`.
-                        // If `(` follows `ident`, it's FNCALL.
-                        // If `.` follows, it's MEMBER_ACCESS.
-                        // If `(` follows MEMBER_ACCESS, it's... ?
-                        // Parser likely doesn't support `expr(...)` call syntax, only `name(...)`.
-                        // I need to check parser.c `parse_primary`.
-                        
-                        // If parser only supports `name(...)`, then `mod.func(...)` is not parsed as FNCALL?
-                        // Or maybe `parse_postfix` handles `(` on any expr?
-                        // If so, it creates FNCALL?
-                        // Let's check parser.c.
+                        node->name = strdup(fn->asm_name); 
+                        node->ty = fn->return_type; 
                         return;
                     }
                     
                     // Try to find variable in module scope
-                    // We need to look in mod->scope.
-                    // But symtab_lookup uses current_scope.
-                    // We can manually search mod->scope->vars.
+                    // fprintf(stderr, "Debug: Searching variable '%s' in module scope %p\n", member_name, (void*)mod->scope);
+                    if (!mod->scope) {
+                        fprintf(stderr, "Erro interno: modulo '%s' sem escopo.\n", mod->name);
+                        exit(1);
+                    }
+
                     for (Variable *v = mod->scope->vars; v; v = v->next) {
                         if (strcmp(v->name, member_name) == 0) {
                             node->kind = NODE_KIND_IDENTIFIER;
+                            if (v->asm_name) {
+                                node->name = strdup(v->asm_name);
+                            } else {
+                                node->name = strdup(v->name);
+                            }
                             node->var = v;
                             node->ty = v->type;
                             node->offset = v->offset;
-                            // If it's a global in module, is_global is set.
-                            // Codegen needs to know how to access it.
-                            // If it's global, it uses name (asm_name?).
-                            // Globals use name.
-                            // If module global, name should be mangled?
-                            // We didn't mangle global variable names yet.
-                            // We should mangle them in register_globals.
                             return;
                         }
                     }
@@ -970,18 +1011,30 @@ static void register_structs(Node *node) {
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
             // Mangle struct name if in module
+            char *name = n->ty->name;
+            char *mangled = NULL;
             if (current_module_path) {
-                int len = strlen(current_module_path) + 1 + strlen(n->ty->name) + 1;
-                char *mangled = malloc(len);
-                snprintf(mangled, len, "%s_%s", current_module_path, n->ty->name);
-                n->ty->name = mangled; // Update name in type
+                int len = strlen(current_module_path) + 1 + strlen(name) + 1;
+                mangled = malloc(len);
+                snprintf(mangled, len, "%s_%s", current_module_path, name);
+                name = mangled;
             }
-            declare_struct(n->ty);
+            declare_struct(name, n->ty);
+            if (mangled) free(mangled);
         }
     }
 }
 
-static void register_globals(Node *node) {
+static Module *find_module_by_prefix(char *prefix) {
+    for (Module *m = module_list; m; m = m->next) {
+        if (strcmp(m->path_prefix, prefix) == 0) {
+            return m;
+        }
+    }
+    return NULL;
+}
+
+static void register_aliases(Node *node) {
     for (Node *n = node; n; n = n->next) {
         if (n->kind == NODE_KIND_USE) {
             char *prefix = NULL;
@@ -994,48 +1047,113 @@ static void register_globals(Node *node) {
             Scope *outer_scope = current_scope;
             Scope *mod_scope = outer_scope;
             
+            Module *existing = NULL;
             if (n->name) {
-                mod_scope = calloc(1, sizeof(Scope));
-                mod_scope->parent = global_scope; 
+                existing = find_module_by_prefix(prefix);
+                if (existing) {
+                    mod_scope = existing->scope;
+                } else {
+                    mod_scope = calloc(1, sizeof(Scope));
+                    mod_scope->parent = global_scope; 
+                    mod_scope->is_global_scope = 1;
+                }
                 current_scope = mod_scope;
             }
             
-            register_globals(n->body);
+            register_aliases(n->body);
             
             current_scope = outer_scope;
             
             if (n->name) {
-                // Create Module symbol
-                Module *mod = calloc(1, sizeof(Module));
-                mod->name = strdup(n->name);
-                mod->path_prefix = strdup(prefix);
-                mod->scope = mod_scope;
-                mod->next = module_list;
-                module_list = mod;
+                if (!existing) {
+                    // Create Module symbol
+                    Module *mod = calloc(1, sizeof(Module));
+                    mod->name = strdup(n->name);
+                    mod->path_prefix = strdup(prefix);
+                    mod->scope = mod_scope;
+                    mod->next = module_list;
+                    module_list = mod;
+                    existing = mod;
+                }
                 
                 // Declare alias in outer scope
                 Variable *var = symtab_declare(n->name, type_void, VAR_FLAG_NONE);
                 var->is_module = 1;
-                var->module_ref = mod;
+                var->module_ref = existing;
             }
             
             current_module_path = old_path;
             if (prefix) free(prefix);
+        }
+    }
+}
+
+static void resolve_fields(Node *node) {
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_USE) {
+            char *prefix = NULL;
+            if (n->name) prefix = get_module_prefix(n->member_name);
+            
+            char *old_path = current_module_path;
+            if (prefix) current_module_path = prefix;
+            
+            Scope *outer_scope = current_scope;
+            if (n->name) {
+                Variable *var = symtab_lookup(n->name);
+                if (var && var->is_module) {
+                    current_scope = var->module_ref->scope;
+                }
+            }
+            
+            resolve_fields(n->body);
+            
+            current_scope = outer_scope;
+            current_module_path = old_path;
+            if (prefix) free(prefix);
+        } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
+            // Resolve fields for this struct
+            Type *type = n->ty;
+            int offset = 0;
+            for (Field *f = type->fields; f; f = f->next) {
+                resolve_type_ref(f->type);
+                
+                if (f->type->kind == TY_STRUCT && strcmp(f->type->name, type->name) == 0) {
+                     fprintf(stderr, "Erro: struct '%s' contém a si mesma diretamente no campo '%s'. Use um ponteiro.\n", type->name, f->name);
+                     exit(1);
+                }
+
+                f->offset = offset;
+                offset += f->type->size;
+            }
+            type->size = offset;
+        }
+    }
+}
+
+static void register_vars(Node *node) {
+    for (Node *n = node; n; n = n->next) {
+        if (n->kind == NODE_KIND_USE) {
+            char *prefix = NULL;
+            if (n->name) prefix = get_module_prefix(n->member_name);
+            
+            char *old_path = current_module_path;
+            if (prefix) current_module_path = prefix;
+            
+            Scope *outer_scope = current_scope;
+            if (n->name) {
+                Variable *var = symtab_lookup(n->name);
+                if (var && var->is_module) {
+                    current_scope = var->module_ref->scope;
+                }
+            }
+            
+            register_vars(n->body);
+            
+            current_scope = outer_scope;
+            current_module_path = old_path;
+            if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_LET) {
-            walk(n); // walk handles declaration
-            // If we are in module, walk declares in current_scope (mod_scope).
-            // We also need to mangle the global name for codegen?
-            // Variable struct doesn't have asm_name.
-            // We should add asm_name to Variable or mangle 'name'.
-            // If we mangle 'name', then lookup by name fails.
-            // So Variable needs asm_name.
-            // I didn't add asm_name to Variable in semantic.h.
-            // I should have.
-            // For now, I'll skip mangling globals or assume they are unique enough?
-            // No, globals in modules MUST be mangled.
-            // I'll add asm_name to Variable in semantic.h later or now?
-            // I can't change header easily in this tool call.
-            // I'll assume I can update it later.
+            walk(n); 
         }
     }
 }
@@ -1049,8 +1167,17 @@ static void register_funcs(Node *node) {
             char *old_path = current_module_path;
             if (prefix) current_module_path = prefix;
             
+            Scope *outer_scope = current_scope;
+            if (n->name) {
+                Variable *var = symtab_lookup(n->name);
+                if (var && var->is_module) {
+                    current_scope = var->module_ref->scope;
+                }
+            }
+            
             register_funcs(n->body);
             
+            current_scope = outer_scope;
             current_module_path = old_path;
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_FN) {
@@ -1113,21 +1240,10 @@ void analyze(Node *node) {
     module_list = NULL;
 
     register_structs(node);
-    register_globals(node);
+    register_aliases(node);
+    resolve_fields(node);
+    register_vars(node);
     
-    // Resolve struct fields
-    for (StructDef *s = struct_defs; s; s = s->next) {
-        for (Field *f = s->type->fields; f; f = f->next) {
-            resolve_type_ref(f->type);
-        }
-        int offset = 0;
-        for (Field *f = s->type->fields; f; f = f->next) {
-            f->offset = offset;
-            offset += f->type->size;
-        }
-        s->type->size = offset;
-    }
-
     register_funcs(node);
     analyze_bodies(node);
 }
