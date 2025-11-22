@@ -487,8 +487,13 @@ static Node *parse_primary() {
 
     if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
         if (lookahead_token.type == TOKEN_TYPE_LPAREN) {
+            Node *id_node = new_node(NODE_KIND_IDENTIFIER);
+            id_node->name = strdup(current_token.text);
+
             Node *node = new_node(NODE_KIND_FNCALL);
-            node->name = strdup(current_token.text);
+            node->lhs = id_node;
+            // node->name = strdup(current_token.text); // No longer needed, walk uses lhs->name
+            
             consume();
             expect(TOKEN_TYPE_LPAREN);
             
@@ -645,6 +650,30 @@ static Node *parse_postfix() {
             member_node->member_name = strdup(current_token.text);
             consume();
             node = member_node;
+        } else if (current_token.type == TOKEN_TYPE_LPAREN) {
+            // Generic Function Call (expr(...))
+            consume(); // (
+            
+            Node *call_node = new_node(NODE_KIND_FNCALL);
+            call_node->lhs = node; // The function being called (identifier, member access, etc)
+            
+            // Parse arguments
+            if (current_token.type != TOKEN_TYPE_RPAREN) {
+                Node head = {};
+                Node *cur = &head;
+                while (1) {
+                    cur->next = parse_expr();
+                    cur = cur->next;
+                    if (current_token.type == TOKEN_TYPE_COMMA) {
+                        consume();
+                    } else {
+                        break;
+                    }
+                }
+                call_node->args = head.next;
+            }
+            expect(TOKEN_TYPE_RPAREN);
+            node = call_node;
         } else {
             break;
         }
