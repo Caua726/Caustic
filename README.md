@@ -34,7 +34,6 @@ $ ./main
   - [X] **Dynamic Strings**
   - [-] **IO Library**
 - [ ] **Language Extensions**
-  - [ ] **FFI / C Interop**
   - [ ] **Generics**
   - [ ] **Enums & Pattern Matching** 
 - [ ] **Compiler Evolution**
@@ -48,6 +47,12 @@ $ ./main
     defer free(ptr);
     ```
     this will generate a stack of function calls to be executed when the function returns
+- [ ] **Assembler**
+  - i need to develop a way to transform the generated assembly code into machine code without nasm or gcc
+- [ ] **Linker**
+  - i need to develop a way to link the generated machine code into a runnable executable
+- [ ] **FFI / C Interop**
+  - i need to develop a way to call C functions from Caustic
 
 ### Syntax Dump
 

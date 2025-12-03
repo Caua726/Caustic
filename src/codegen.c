@@ -34,6 +34,7 @@ typedef struct {
     int stack_slots;
     int next_spill;
     int is_leaf;
+    int arg_spill_base;
 } AllocCtx;
 
 static FILE *out;
@@ -855,7 +856,13 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
         case IR_GET_ARG:
             if (inst->src1.imm < num_arg_regs) {
                 get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-                emit("mov %s, %s", dst, arg_regs[inst->src1.imm]);
+                int slot = ctx->arg_spill_base + inst->src1.imm;
+                if (strstr(dst, "PTR") != NULL || strstr(dst, "[") != NULL) {
+                    emit("mov rax, QWORD PTR [rbp-%d]", slot * 8);
+                    emit("mov %s, rax", dst);
+                } else {
+                    emit("mov %s, QWORD PTR [rbp-%d]", dst, slot * 8);
+                }
             } else {
                 get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
                 // Stack args start at [rbp + 16] (skip rbp, ret addr)
@@ -923,7 +930,11 @@ static void gen_func(IRFunction *func) {
     
     // Initialize next_spill to start after user variables
     ctx.next_spill = (max_offset + 7) / 8;
-    ctx.next_spill = (max_offset + 7) / 8;
+    
+    // Reserve space for register arguments
+    ctx.arg_spill_base = ctx.next_spill;
+    ctx.next_spill += 6;
+
     // if (ctx.next_spill < 6) ctx.next_spill = 6; // Minimum 6 slots (48 bytes) - Removed for leaf opt
 
     // DEBUG
@@ -960,6 +971,12 @@ static void gen_func(IRFunction *func) {
     if (stack_size > 0) {
         stack_size = (stack_size + 15) & ~15; // Align to 16 bytes
         emit("sub rsp, %d", stack_size);
+    }
+
+    // Save register arguments to stack
+    for (int i = 0; i < 6; i++) {
+        int slot = ctx.arg_spill_base + i;
+        emit("mov QWORD PTR [rbp-%d], %s", slot * 8, arg_regs[i]);
     }
 
     for (IRInst *inst = func->instructions; inst; inst = inst->next) {
