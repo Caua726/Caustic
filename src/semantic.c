@@ -8,8 +8,10 @@ typedef struct Scope {
     Variable *vars;
     struct Scope *parent;
     int is_global_scope;
+    struct Scope *next_allocated; // For cleanup
 } Scope;
 
+static Scope *all_scopes = NULL; // Global list of all allocated scopes
 static Scope *current_scope = NULL;
 static Scope *global_scope = NULL;
 static int stack_offset = 0;
@@ -67,7 +69,7 @@ static Type *new_type_full(TypeKind kind, int size, int is_signed) {
     return ty;
 }
 
-static void declare_function(char *name, Type *return_type, Type **param_types, int param_count) {
+static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic) {
     for (Function *fs = function_table; fs; fs = fs->next) {
         if (strcmp(fs->name, name) == 0) {
             // Check if in same module
@@ -76,7 +78,7 @@ static void declare_function(char *name, Type *return_type, Type **param_types, 
             if (!current_module_path && !fs->module_prefix) same_module = 1;
 
             if (same_module) {
-                // fprintf(stderr, "Aviso: redefinição da função '%s' ignorada (mesmo módulo)\n", name);
+                if (param_types) free(param_types); // Free unused param_types
                 return;
             }
         }
@@ -87,6 +89,7 @@ static void declare_function(char *name, Type *return_type, Type **param_types, 
     f->return_type = return_type;
     f->param_types = param_types;
     f->param_count = param_count;
+    f->is_variadic = is_variadic;
     f->module_prefix = current_module_path ? strdup(current_module_path) : NULL;
 
     if (current_module_path) {
@@ -96,17 +99,14 @@ static void declare_function(char *name, Type *return_type, Type **param_types, 
     } else {
         f->asm_name = strdup(name);
     }
+    // printf("Declared Function: %s -> ASM: %s (Module: %s)\n", name, f->asm_name, current_module_path ? current_module_path : "NONE");
     
-    // fprintf(stderr, "Debug: Registrando funcao '%s' (asm: '%s') prefix: '%s'\n", name, f->asm_name, f->module_prefix);
-
     f->next = function_table;
     function_table = f;
 }
 
 static Function *lookup_function_qualified(char *name, char *prefix) {
-    // fprintf(stderr, "Debug: lookup_function_qualified '%s' prefix '%s'\n", name, prefix ? prefix : "NULL");
     for (Function *f = function_table; f; f = f->next) {
-        // fprintf(stderr, "Debug: Checking func '%s' prefix '%s'\n", f->name, f->module_prefix ? f->module_prefix : "NULL");
         if (strcmp(f->name, name) == 0) {
             if (prefix == NULL && f->module_prefix == NULL) return f;
             if (prefix != NULL && f->module_prefix != NULL && strcmp(prefix, f->module_prefix) == 0) return f;
@@ -158,7 +158,6 @@ static void resolve_type_ref(Type *ty) {
              snprintf(mangled, len, "%s_%s", current_module_path, ty->name);
              def = lookup_struct(mangled);
              if (!def) {
-                 // fprintf(stderr, "Debug: Lookup interno falhou para '%s'. Tentou: '%s'. CurrentPath: '%s'\n", ty->name, mangled, current_module_path);
              }
              free(mangled);
         }
@@ -181,15 +180,8 @@ static void resolve_type_ref(Type *ty) {
                     char *mangled = malloc(len);
                     snprintf(mangled, len, "%s_%s", prefix, type_name);
                     def = lookup_struct(mangled);
-                    if (!def) {
-                        fprintf(stderr, "Debug: Struct '%s' (mangled: '%s') nao encontrada no modulo '%s' (prefix: '%s').\n", type_name, mangled, alias, prefix);
-                    }
                     free(mangled);
-                } else {
-                    fprintf(stderr, "Debug: '%s' encontrado mas nao e modulo ou sem ref.\n", alias);
                 }
-            } else {
-                fprintf(stderr, "Debug: Alias '%s' nao encontrado no escopo atual.\n", alias);
             }
             free(alias);
         }
@@ -205,6 +197,7 @@ static void resolve_type_ref(Type *ty) {
         }
         // Copy details
         ty->fields = def->fields;
+        ty->owns_fields = 0; // We are borrowing fields from def, do not free them
         ty->size = def->size;
         // ty->name is already set
     }
@@ -216,8 +209,6 @@ static void resolve_type_ref(Type *ty) {
 static void declare_struct(char *name, Type *type) {
     for (StructDef *s = struct_defs; s; s = s->next) {
         if (strcmp(s->name, name) == 0) {
-            // Idempotent: if already registered, just return.
-            // fprintf(stderr, "Aviso: redefinição da struct '%s' ignorada\n", name);
             return;
         }
     }
@@ -244,20 +235,20 @@ static void declare_struct(char *name, Type *type) {
 }
 
 void types_init() {
-    type_i8 = new_type_full(TY_I8, 1, 1);
-    type_i16 = new_type_full(TY_I16, 2, 1);
-    type_i32 = new_type_full(TY_I32, 4, 1);
-    type_i64 = new_type_full(TY_I64, 8, 1);
-    type_u8 = new_type_full(TY_U8, 1, 0);
-    type_u16 = new_type_full(TY_U16, 2, 0);
-    type_u32 = new_type_full(TY_U32, 4, 0);
-    type_u64 = new_type_full(TY_U64, 8, 0);
-    type_f32 = new_type_full(TY_F32, 4, 1);
-    type_f64 = new_type_full(TY_F64, 8, 1);
-    type_bool = new_type_full(TY_BOOL, 1, 0);
-    type_char = new_type_full(TY_CHAR, 1, 1);
-    type_string = new_type_full(TY_STRING, 8, 0);
-    type_void = new_type_full(TY_VOID, 0, 0);
+    type_i8 = new_type_full(TY_I8, 1, 1); type_i8->is_static = 1;
+    type_i16 = new_type_full(TY_I16, 2, 1); type_i16->is_static = 1;
+    type_i32 = new_type_full(TY_I32, 4, 1); type_i32->is_static = 1;
+    type_i64 = new_type_full(TY_I64, 8, 1); type_i64->is_static = 1;
+    type_u8 = new_type_full(TY_U8, 1, 0); type_u8->is_static = 1;
+    type_u16 = new_type_full(TY_U16, 2, 0); type_u16->is_static = 1;
+    type_u32 = new_type_full(TY_U32, 4, 0); type_u32->is_static = 1;
+    type_u64 = new_type_full(TY_U64, 8, 0); type_u64->is_static = 1;
+    type_f32 = new_type_full(TY_F32, 4, 1); type_f32->is_static = 1;
+    type_f64 = new_type_full(TY_F64, 8, 1); type_f64->is_static = 1;
+    type_bool = new_type_full(TY_BOOL, 1, 0); type_bool->is_static = 1;
+    type_char = new_type_full(TY_CHAR, 1, 1); type_char->is_static = 1;
+    type_string = new_type_full(TY_STRING, 8, 0); type_string->is_static = 1;
+    type_void = new_type_full(TY_VOID, 0, 0); type_void->is_static = 1;
     type_int = type_i32;
 }
 
@@ -274,6 +265,7 @@ static int is_safe_implicit_conversion(Type *from, Type *to) {
 static void symtab_init() {
     current_scope = NULL;
     global_scope = calloc(1, sizeof(Scope));
+    global_scope->next_allocated = all_scopes; all_scopes = global_scope;
     global_scope->is_global_scope = 1;
     current_scope = global_scope;
     stack_offset = 48; // Reserve 48 bytes for saved registers (rbx, r12-r15) + alignment
@@ -281,6 +273,7 @@ static void symtab_init() {
 
 static void symtab_enter_scope() {
     Scope *new_scope = calloc(1, sizeof(Scope));
+    new_scope->next_allocated = all_scopes; all_scopes = new_scope;
     new_scope->parent = current_scope;
     current_scope = new_scope;
     current_scope = new_scope;
@@ -289,13 +282,8 @@ static void symtab_enter_scope() {
 static void symtab_exit_scope() {
     if (!current_scope) return;
 
-    Scope *old_scope = current_scope;
+
     current_scope = current_scope->parent;
-    
-    // Do NOT free variables here, they are referenced by AST nodes.
-    // We could add them to a global list for cleanup later if needed.
-    
-    free(old_scope);
 }
 
 static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
@@ -306,8 +294,9 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
 
     for (Variable *v = current_scope->vars; v; v = v->next) {
         if (strcmp(v->name, name) == 0) {
-            // fprintf(stderr, "Aviso: variavel '%s' ja declarada neste escopo (idempotente)\n", name);
+        if (strcmp(v->name, name) == 0) {
             return v;
+        }
         }
     }
 
@@ -315,7 +304,6 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     for (Scope *s = current_scope->parent; s; s = s->parent) {
         for (Variable *v = s->vars; v; v = v->next) {
             if (strcmp(v->name, name) == 0) {
-                // fprintf(stderr, "Aviso: variavel '%s' sombreia uma declaracao anterior\n", name);
                 break;
             }
         }
@@ -348,8 +336,8 @@ static Variable *symtab_declare(char *name, Type *type, VarFlags flags) {
     var->next = current_scope->vars;
     current_scope->vars = var;
     
-    // fprintf(stderr, "Debug: Declarada variavel '%s' no escopo %p\n", name, (void*)current_scope);
-
+    current_scope->vars = var;
+    
     return var;
 }
 
@@ -361,7 +349,6 @@ static Variable *symtab_lookup(char *name) {
             }
         }
     }
-    fprintf(stderr, "Debug: Lookup '%s' falhou. Escopo atual: %p\n", name, (void*)current_scope);
     return NULL;
 }
 
@@ -369,11 +356,10 @@ static Variable *symtab_lookup(char *name) {
 
 void walk(Node *node) {
     if (!node) return;
-    // fprintf(stderr, "Debug: walk node %p kind %d\n", (void*)node, node->kind);
     switch (node->kind) {
         case NODE_KIND_ASM: break;
         case NODE_KIND_NUM:
-            node->ty = type_i32;
+            if (!node->ty) node->ty = type_i64;
             return;
 
         case NODE_KIND_STRING_LITERAL: {
@@ -405,7 +391,10 @@ void walk(Node *node) {
             if (node->expr) {
                 walk(node->expr);
                 if (!is_safe_implicit_conversion(node->expr->ty, current_return_type)) {
-                    fprintf(stderr, "Erro: tipo de retorno incompatível. Esperado %d, encontrado %d\n", current_return_type->kind, node->expr->ty->kind);
+                    fprintf(stderr, "Erro em %s:%d: tipo de retorno incompatível. Esperado %d, encontrado %d\n", 
+                            node->tok ? node->tok->filename : "?",
+                            node->tok ? node->tok->line : 0,
+                            current_return_type->kind, node->expr->ty->kind);
                     // TODO: Print type names instead of enums
                     exit(1);
                 }
@@ -866,8 +855,9 @@ void walk(Node *node) {
             }
 
             node->ty = func->return_type;
-            // Store asm_name in the node for codegen
-            node->name = func->asm_name; 
+            // Store asm_name in the node for codegen - must strdup to avoid shared ownership
+            if (node->name) free(node->name);  // Free original parsed name
+            node->name = strdup(func->asm_name); 
             
             // fprintf(stderr, "Debug: Processing args for function '%s'\n", func->name);
             
@@ -877,22 +867,39 @@ void walk(Node *node) {
                 // fprintf(stderr, "Debug: Counting arg %p\n", (void*)arg);
                 arg_count++;
             }
-
-            if (arg_count != func->param_count) {
-                fprintf(stderr, "Erro: função '%s' espera %d argumentos, mas recebeu %d.\n", func->name, func->param_count, arg_count);
-                exit(1);
+            // 3. Verificar número de argumentos
+            int param_count = func->param_count;
+            if (func->is_variadic) {
+                if (arg_count < param_count) {
+                    fprintf(stderr, "Erro: função '%s' espera pelo menos %d argumentos, mas recebeu %d.\n", func->name, param_count, arg_count);
+                    exit(1);
+                }
+            } else {
+                if (arg_count != param_count) {
+                    fprintf(stderr, "Erro: função '%s' espera %d argumentos, mas recebeu %d.\n", func->name, param_count, arg_count);
+                    exit(1);
+                }
             }
 
+            // 4. Verificar tipos dos argumentos
             Node *arg = node->args;
-            for (int i = 0; i < arg_count; i++) {
-                // fprintf(stderr, "Debug: Walking arg %d\n", i);
+            int i = 0;
+            while (i < param_count) { // Iterate only for fixed parameters
                 walk(arg);
+                
                 // Implicit Cast
                 if (!is_safe_implicit_conversion(arg->ty, func->param_types[i])) {
                      fprintf(stderr, "Erro: tipo incompatível no argumento %d da função '%s'.\n", i+1, func->name);
                      // print_type(arg->ty); fprintf(stderr, " vs "); print_type(func->param_types[i]); fprintf(stderr, "\n");
                      exit(1);
                 }
+                arg = arg->next;
+                i++;
+            }
+            
+            // Check remaining args for variadic (optional: check if they are valid types)
+            while (arg) {
+                walk(arg); // Just walk them, no type checking against parameters for variadic args
                 arg = arg->next;
             }
             return;
@@ -1054,6 +1061,7 @@ static void register_aliases(Node *node) {
                     mod_scope = existing->scope;
                 } else {
                     mod_scope = calloc(1, sizeof(Scope));
+                    mod_scope->next_allocated = all_scopes; all_scopes = mod_scope;
                     mod_scope->parent = global_scope; 
                     mod_scope->is_global_scope = 1;
                 }
@@ -1200,7 +1208,7 @@ static void register_funcs(Node *node) {
                 param_types[i++] = p->ty;
             }
 
-            declare_function(n->name, n->return_type, param_types, param_count);
+            declare_function(n->name, n->return_type, param_types, param_count, n->is_variadic);
         }
     }
 }
@@ -1239,6 +1247,15 @@ void analyze(Node *node) {
     struct_defs = NULL;
     module_list = NULL;
 
+    // Register intrinsics
+    // __builtin_va_start(va_list_ptr) -> void
+    Type *ptr_type = new_type(TY_PTR);
+    ptr_type->base = type_u8;
+    ptr_type->size = 8;
+    Type **va_params = calloc(1, sizeof(Type*));
+    va_params[0] = ptr_type;
+    declare_function("__builtin_va_start", type_void, va_params, 1, 0);
+
     register_structs(node);
     register_aliases(node);
     resolve_fields(node);
@@ -1249,27 +1266,61 @@ void analyze(Node *node) {
 }
 
 void semantic_cleanup() {
+    // Free function table
     Function *fs = function_table;
     while (fs) {
         Function *next = fs->next;
-        free(fs->name);
+        if (fs->name) free(fs->name);
+        if (fs->asm_name) free(fs->asm_name);
+        if (fs->module_prefix) free(fs->module_prefix);
         if (fs->param_types) free(fs->param_types);
         free(fs);
         fs = next;
     }
     function_table = NULL;
     
+    // Free struct definitions
     StructDef *sd = struct_defs;
     while (sd) {
         StructDef *next = sd->next;
-        free(sd->name);
+        if (sd->name) free(sd->name);
         free(sd);
         sd = next;
     }
     struct_defs = NULL;
 
-    // Limpar tipos se necessário (mas eles são globais/estáticos por enquanto, então talvez não precise)
-    // Se types_init alocasse dinamicamente cada vez, precisaria limpar.
-    // Como são alocados uma vez, o SO limpa no final. Mas para ser purista:
+    // Free module list (only the module structs, scopes are in all_scopes)
+    Module *mod = module_list;
+    while (mod) {
+        Module *next = mod->next;
+        if (mod->name) free(mod->name);
+        if (mod->path_prefix) free(mod->path_prefix);
+        // mod->scope is freed via all_scopes list
+        free(mod);
+        mod = next;
+    }
+    module_list = NULL;
+
+    // Free ALL scopes (global, module, and block scopes)
+    Scope *s = all_scopes;
+    while (s) {
+        Scope *next = s->next_allocated;
+        
+        Variable *v = s->vars;
+        while (v) {
+            Variable *vnext = v->next;
+            if (v->name) free(v->name);
+            if (v->asm_name) free(v->asm_name);
+            free(v);
+            v = vnext;
+        }
+        
+        free(s);
+        s = next;
+    }
+    all_scopes = NULL;
+    global_scope = NULL;
+    current_scope = NULL;
+
     // Types are freed by free_all_types() in main.c
 }

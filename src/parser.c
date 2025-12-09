@@ -30,9 +30,33 @@ typedef struct IncludedFile {
     struct IncludedFile *next;
 } IncludedFile;
 
+typedef struct SourcePath {
+    char *path;
+    struct SourcePath *next;
+} SourcePath;
+
+static SourcePath *source_paths = NULL;
+
+void register_source_path(char *path) {
+    SourcePath *sp = malloc(sizeof(SourcePath));
+    sp->path = path;
+    sp->next = source_paths;
+    source_paths = sp;
+}
+
+void free_source_paths() {
+    SourcePath *cur = source_paths;
+    while (cur) {
+        SourcePath *next = cur->next;
+        free(cur->path);
+        free(cur);
+        cur = next;
+    }
+}
+
 static IncludedFile *visited_files = NULL;
 
-// Retorna o corpo se já visitou, NULL se não.
+
 Node *get_cached_module(const char *path) {
     IncludedFile *cur = visited_files;
     while (cur) {
@@ -52,8 +76,32 @@ void cache_module(const char *path, Node *body) {
     visited_files = new_file;
 }
 
+void free_module_cache() {
+    IncludedFile *cur = visited_files;
+    while (cur) {
+        IncludedFile *next = cur->next;
+        free(cur->path);
+        free_ast(cur->body);  // Now safe to free since we skip USE bodies
+        free(cur);
+        cur = next;
+    }
+    visited_files = NULL;
+}
+
 StringLiteral *get_strings() {
     return strings_head;
+}
+
+void free_strings() {
+    StringLiteral *s = strings_head;
+    while (s) {
+        StringLiteral *next = s->next;
+        if (s->value) free(s->value);
+        free(s);
+        s = next;
+    }
+    strings_head = NULL;
+    string_id_counter = 0;
 }
 
 static void consume();
@@ -112,12 +160,8 @@ static void parse_use(Node **cur_ptr) {
 
     expect(TOKEN_TYPE_SEMICOLON);
 
-    // Create NODE_KIND_USE
     Node *use_node = new_node(NODE_KIND_USE);
     use_node->name = alias; // Store alias in name
-    // We can store path in string literal or just use val/member_name? 
-    // Let's use member_name for path for now, or create a string literal node?
-    // Node struct has 'member_name'. Let's use that for path.
 
     // Resolve path relative to current file
     char full_path[512];
@@ -151,17 +195,6 @@ static void parse_use(Node **cur_ptr) {
     // Check cache
     Node *cached_body = get_cached_module(canonical_path);
     if (cached_body) {
-        // Reuse body!
-        // But wait, if we reuse the SAME node list, modifying it (e.g. setting next) might be dangerous if it's used elsewhere?
-        // The body list is a chain of nodes.
-        // We are not modifying the nodes themselves in semantic analysis (mostly).
-        // Except for 'next' pointers?
-        // 'next' pointers link statements in the file.
-        // 'use_node->body' points to the head of that list.
-        // It should be fine to share the read-only AST structure.
-        // But if we modify AST (e.g. type resolution), it affects all users.
-        // That's actually GOOD for types (resolve once).
-        // But for 'use', we iterate it.
         use_node->body = cached_body;
     } else {
         FILE *f = fopen(canonical_path, "r");
@@ -171,6 +204,7 @@ static void parse_use(Node **cur_ptr) {
         
         // We need to keep the filename string alive for tokens
         char *persistent_path = strdup(canonical_path);
+        register_source_path(persistent_path);
 
         LexerState state;
         lexer_get_state(&state);
@@ -227,8 +261,6 @@ static void parse_file_body(Node **cur_ptr) {
         }
 
         cur->next = parse_fn();
-        // The original code had a critical error check here, but the instruction implies removing it.
-        // If parse_fn() returns NULL, it means an error occurred and error_at_token should have been called.
         cur = cur->next;
     }
     *cur_ptr = cur;
@@ -240,7 +272,7 @@ Node *parse() {
 
     parse_file_body(&cur);
 
-    // NÃO chamar consume() aqui - já estamos no EOF
+
     return head.next;
 }
 
@@ -251,6 +283,7 @@ Type *new_type(TypeKind kind) {
     Type *ty = calloc(1, sizeof(Type));
     ty->kind = kind;
     ty->next = all_types;
+    ty->owns_fields = 1; // Default to owning fields
     all_types = ty;
     return ty;
 }
@@ -259,9 +292,32 @@ void free_all_types() {
     Type *t = all_types;
     while (t) {
         Type *next = t->next;
-        free(t);
+        
+        if (!t->is_static) {
+            // Free type name if allocated
+            if (t->name) free(t->name);
+            
+            // Free field list for struct types ONLY if we own them
+            if (t->owns_fields) {
+                Field *f = t->fields;
+                while (f) {
+                    Field *fnext = f->next;
+                    if (f->name) free(f->name);
+                    free(f);
+                    f = fnext;
+                }
+            }
+        }
+        
+        // Always free the Type struct itself (assuming it was malloc'd in new_type)
+        if (!t->is_static) {
+             free(t);
+        } else {
+             free(t); 
+        }
         t = next;
     }
+    all_types = NULL;
 }
 
 static void consume() {
@@ -397,9 +453,6 @@ static Type *parse_type() {
     } else if (strcmp(current_token.text, "void") == 0) {
         ty = type_void;
     } else {
-        // Check if it's a struct type
-        // For now, we just assume any unknown identifier used as a type is a struct name
-        // The semantic analyzer will verify if it exists.
         ty = new_type(TY_STRUCT);
         ty->name = strdup(current_token.text);
     }
@@ -485,8 +538,17 @@ static Node *parse_primary() {
 
     if (current_token.type == TOKEN_TYPE_INTEGER) {
         Node *node = new_node_num(current_token.int_value);
+        node->ty = type_i64; // Default integer type
         consume();
         return node;
+    }
+    
+    if (current_token.type == TOKEN_TYPE_FLOAT) {
+        Node *node = new_node(NODE_KIND_NUM);
+        node->fval = current_token.float_value;
+        node->ty = type_f64; // Default float type
+        consume();
+        return node; // We rely on codegen/semantic to check ty->kind
     }
 
     if (current_token.type == TOKEN_TYPE_STRING) {
@@ -563,6 +625,19 @@ static Node *parse_primary() {
             expect(TOKEN_TYPE_RPAREN);
             return node;
         }
+        if (strcmp(current_token.text, "true") == 0) {
+            Node *node = new_node_num(1);
+            node->ty = type_bool;
+            consume();
+            return node;
+        }
+        if (strcmp(current_token.text, "false") == 0) {
+            Node *node = new_node_num(0);
+            node->ty = type_bool;
+            consume();
+            return node;
+        }
+
         Node *node = new_node(NODE_KIND_IDENTIFIER);
         node->name = strdup(current_token.text);
         consume();
@@ -636,6 +711,15 @@ static Node *parse_fn() {
         Node head = {};
         Node *cur = &head;
         while (1) {
+            if (current_token.type == TOKEN_TYPE_ELLIPSIS) {
+                fn_node->is_variadic = 1;
+                consume();
+                if (current_token.type != TOKEN_TYPE_RPAREN) {
+                    error_at_token(current_token, "variadic '...' deve ser o ultimo parametro.");
+                }
+                break;
+            }
+
             if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
                 error_at_token(current_token, "esperado nome do parâmetro.");
             }
@@ -1323,46 +1407,82 @@ void ast_print(Node *node) {
     ast_print_recursive(node, 0);
 }
 
-void free_ast(Node *node) {
-    if (!node) return;
+// Simple visited set for free_ast (uses linear probing)
+#define FREE_AST_SET_SIZE 65536
+static Node *freed_nodes[FREE_AST_SET_SIZE];
+static int freed_count = 0;
 
-    // Se for uma lista (next), liberar o próximo primeiro
-    free_ast(node->next);
+static int free_ast_visited(Node *node) {
+    if (!node) return 1;
+    unsigned long hash = ((unsigned long)node) % FREE_AST_SET_SIZE;
+    for (int i = 0; i < FREE_AST_SET_SIZE; i++) {
+        int idx = (hash + i) % FREE_AST_SET_SIZE;
+        if (freed_nodes[idx] == node) return 1;  // Already freed
+        if (freed_nodes[idx] == NULL) {
+            freed_nodes[idx] = node;
+            freed_count++;
+            return 0;  // Not freed yet
+        }
+    }
+    return 0;  // Set full, assume not freed (rare edge case)
+}
+
+static void free_ast_impl(Node *node) {
+    if (!node) return;
+    if (free_ast_visited(node)) return;  // Already freed
+
+    // Free next pointer first (list traversal)
+    free_ast_impl(node->next);
 
     if (node->name) free(node->name);
     if (node->member_name) free(node->member_name);
     
-    // Liberar filhos baseados no tipo
+    // Free children based on node type
     switch (node->kind) {
         case NODE_KIND_FN:
-            free_ast(node->params);
-            free_ast(node->body);
+            free_ast_impl(node->params);
+            free_ast_impl(node->body);
             break;
         case NODE_KIND_BLOCK:
-            free_ast(node->stmts);
+            free_ast_impl(node->stmts);
             break;
         case NODE_KIND_RETURN:
         case NODE_KIND_EXPR_STMT:
         case NODE_KIND_CAST:
         case NODE_KIND_ADDR:
         case NODE_KIND_DEREF:
-            free_ast(node->expr);
+            free_ast_impl(node->expr);
             break;
         case NODE_KIND_FNCALL:
         case NODE_KIND_SYSCALL:
-            free_ast(node->args);
+            free_ast_impl(node->lhs); // Free the function expression (identifier, member access, etc)
+            free_ast_impl(node->args);
             break;
         case NODE_KIND_LET:
-            free_ast(node->init_expr);
+            free_ast_impl(node->init_expr);
             break;
         case NODE_KIND_IF:
-            free_ast(node->if_stmt.cond);
-            free_ast(node->if_stmt.then_b);
-            free_ast(node->if_stmt.else_b);
+            free_ast_impl(node->if_stmt.cond);
+            free_ast_impl(node->if_stmt.then_b);
+            free_ast_impl(node->if_stmt.else_b);
             break;
         case NODE_KIND_WHILE:
-            free_ast(node->while_stmt.cond);
-            free_ast(node->while_stmt.body);
+            free_ast_impl(node->while_stmt.cond);
+            free_ast_impl(node->while_stmt.body);
+            break;
+        case NODE_KIND_USE:
+            // USE body is shared with module cache - still free it but visited set prevents double-free
+            free_ast_impl(node->body);
+            break;
+        case NODE_KIND_FOR:
+            free_ast_impl(node->for_stmt.init);
+            free_ast_impl(node->for_stmt.cond);
+            free_ast_impl(node->for_stmt.step);
+            free_ast_impl(node->for_stmt.body);
+            break;
+        case NODE_KIND_DO_WHILE:
+            free_ast_impl(node->do_while_stmt.cond);
+            free_ast_impl(node->do_while_stmt.body);
             break;
         case NODE_KIND_ASSIGN:
         case NODE_KIND_ADD:
@@ -1377,12 +1497,29 @@ void free_ast(Node *node) {
         case NODE_KIND_GT:
         case NODE_KIND_GE:
         case NODE_KIND_INDEX:
-            free_ast(node->lhs);
-            free_ast(node->rhs);
+        case NODE_KIND_LOGICAL_AND:
+        case NODE_KIND_LOGICAL_OR:
+        case NODE_KIND_SHL:
+        case NODE_KIND_SHR:
+        case NODE_KIND_MODULE_ACCESS:
+        case NODE_KIND_MEMBER_ACCESS:
+            free_ast_impl(node->lhs);
+            free_ast_impl(node->rhs);
             break;
         default:
             break;
     }
 
     free(node);
+}
+
+void free_ast_reset() {
+    memset(freed_nodes, 0, sizeof(freed_nodes));
+    freed_count = 0;
+}
+
+void free_ast(Node *node) {
+    // Do NOT reset visited set here - it must persist across calls (e.g. module cache)
+    // Call free_ast_reset() manually at start of cleanup phase if needed
+    free_ast_impl(node);
 }

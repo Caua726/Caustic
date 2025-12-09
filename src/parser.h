@@ -37,6 +37,8 @@ typedef struct Type {
     struct Type *base;
     int array_len;
     struct Type *next; // For garbage collection
+    int is_static;     // If true, do not free name/fields (global primitive types)
+    int owns_fields;   // If true, this type owns the field list memory
     
     // Struct fields
     char *name; // Struct name
@@ -108,6 +110,7 @@ typedef struct Node {
     struct Node *lhs;
     struct Node *rhs;
     long val;
+    double fval;
 
     struct Node *expr;
     struct Node *init_expr;
@@ -119,6 +122,7 @@ typedef struct Node {
     // Function
     struct Node *body;
     struct Node *params; // Lista de parâmetros (NODE_KIND_VAR_DECL)
+    int is_variadic;
 
     // Function Call
     struct Node *args;   // Lista de argumentos (expressões)
@@ -147,7 +151,14 @@ typedef struct Node {
 } Node;
 
 void ast_print(Node *node);
+// Memory Management
 void free_ast(Node *node);
+void free_ast_reset();
+void cache_module(const char *path, Node *body);
+Node *get_cached_module(const char *path);
+void free_module_cache();
+void free_source_paths();
+void free_strings();
 Type *new_type(TypeKind kind);
 void free_all_types();
 void parser_init();

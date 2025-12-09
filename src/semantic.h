@@ -41,6 +41,7 @@ typedef struct Function {
     int param_count;
     char *asm_name;
     char *module_prefix;
+    int is_variadic;
     struct Function *next;
 } Function;
 

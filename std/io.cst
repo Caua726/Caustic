@@ -2,28 +2,297 @@ use "linux.cst" as linux;
 use "string.cst" as string;
 use "mem.cst" as mem;
 
+// --- Buffered Reader ---
+
+struct Reader {
+    fd as i64;
+    buf as *u8;
+    cap as i64;
+    len as i64;
+    pos as i64;
+}
+
+fn Reader(fd as i64, buf as *u8, cap as i64) as Reader {
+    let is Reader as r;
+    r.fd = fd;
+    r.buf = buf;
+    r.cap = cap;
+    r.len = 0;
+    r.pos = 0;
+    return r;
+}
+
+// Refills buffer if empty. Returns byte (0-255) or -1 (EOF/Error)
+fn read(r as *Reader) as i32 {
+    // Cache buf pointer locally
+    let is *u8 as buf = r.buf;
+    let is i64 as cap = r.cap;
+    let is i64 as fd = r.fd;
+    
+    if (r.pos >= r.len) {
+        r.pos = 0;
+        let is i64 as n = linux.read(fd, buf, cap);
+        r.len = n;
+        
+        if (n <= 0) {
+            return cast(i32, 0 - 1); // EOF or Error
+        }
+    }
+
+    let is i64 as p = r.pos;
+    let is u8 as b = buf[p];
+    r.pos = p + 1;
+    
+    return cast(i32, b);
+}
+
+// Reads a line efficiently using the internal buffer
+fn readline(r as *Reader) as string.String {
+    // Initial guess for line length
+    let is i64 as cap with mut = 64;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = mem.galloc(cap);
+
+    while (1 == 1) {
+        let is i32 as b = read(r);
+
+        if (b == (0 - 1)) {
+            break;
+        }
+
+        if (b == 10) { // \n
+            break;
+        }
+
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = mem.galloc(new_cap);
+            mem.memcpy(new_ptr, ptr, len);
+            mem.gfree(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        ptr[len] = cast(u8, b);
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0); // Null terminator
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+
+    return s;
+}
+
+// --- Buffered Writer ---
+
+struct Writer {
+    fd as i64;
+    buf as *u8;
+    cap as i64;
+    len as i64;
+}
+
+fn Writer(fd as i64, buf as *u8, cap as i64) as Writer {
+    let is Writer as w;
+    w.fd = fd;
+    w.buf = buf;
+    w.cap = cap;
+    w.len = 0;
+    return w;
+}
+
+fn flush(w as *Writer) as void {
+    if (w.len > 0) {
+        linux.write(w.fd, w.buf, w.len);
+        w.len = 0;
+    }
+}
+
+fn put(w as *Writer, b as u8) as void {
+    if (w.len >= w.cap) {
+        flush(w);
+    }
+    let is i64 as l = w.len;
+    w.buf[l] = b;
+    w.len = l + 1;
+}
+
+fn write(w as *Writer, s as string.String) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as slen = cast(i64, s.len);
+    
+    // Optimization: if string is larger than buffer, flush and write directly
+    if (slen > w.cap) {
+        flush(w);
+        linux.write(w.fd, s.ptr, slen);
+        return;
+    }
+
+    while (i < slen) {
+        put(w, s.ptr[i]);
+        i = i + 1;
+    }
+}
+
+// --- Generic IO ---
+
+fn write_bytes(fd as i64, ptr as *u8, len as i64) as i64 {
+    return linux.write(fd, ptr, len);
+}
+
+fn write_str(fd as i64, s as string.String) as i64 {
+    return linux.write(fd, s.ptr, cast(i64, s.len));
+}
+
+fn read_exact(fd as i64, buf as *u8, count as i64) as i64 {
+    let is i64 as total with mut = 0;
+    while (total < count) {
+        let is i64 as addr = cast(i64, buf) + total;
+        let is i64 as n = linux.read(fd, cast(*u8, addr), count - total);
+        if (n <= 0) {
+            break;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+// --- Formatted Output Helpers ---
+
+fn print_hex(n as i64) as void {
+    let is *u8 as hex = "0123456789ABCDEF";
+    let is *u8 as buf = mem.galloc(19); // 0x + 16 digits + null
+    
+    buf[0] = 48; // '0'
+    buf[1] = 120; // 'x'
+    
+    let is i64 as i with mut = 0;
+    let is i64 as val with mut = n;
+    
+    while (i < 16) {
+        let is i64 as digit = val % 16; // val & 15
+        // 17 - i because we fill backwards from end
+        // buf[2..17]
+        buf[17 - i] = hex[digit];
+        val = val / 16; // val >> 4
+        i = i + 1;
+    }
+    
+    linux.write(linux.STDOUT, buf, 18);
+    mem.gfree(buf);
+}
+
+fn print_bool(b as i32) as void {
+    if (b != 0) {
+        linux.write(linux.STDOUT, "true", 4);
+    } else {
+        linux.write(linux.STDOUT, "false", 5);
+    }
+}
+
+fn print_ptr(ptr as *u8) as void {
+    print_hex(cast(i64, ptr));
+}
+
+// --- Formatted Output (printf) ---
+
+// --- Formatted Output (printf) ---
+
+struct VaList {
+    gp_offset as i32;
+    fp_offset as i32;
+    overflow_arg_area as *u8;
+    reg_save_area as *u8;
+}
+
+fn printf(fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    
+    let is i64 as i with mut = 0;
+
+    while (fmt[i] != 0) {
+        if (fmt[i] == 37) { // '%'
+            i = i + 1;
+            if (fmt[i] == 0) { break; }
+
+            if (fmt[i] == 37) { // '%%'
+                let is u8 as c = 37;
+                linux.write(linux.STDOUT, &c, 1);
+            } else {
+                // Fetch argument only if not %%
+            let is *i64 as arg_ptr with mut = cast(*i64, 0);
+            if (va.gp_offset < 48) {
+                    arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
+                    va.gp_offset = va.gp_offset + 8;
+                } else {
+                    arg_ptr = cast(*i64, va.overflow_arg_area);
+                    va.overflow_arg_area = va.overflow_arg_area + 8;
+                }
+
+                if (fmt[i] == 100) { // 'd' (decimal i64)
+                    let is i64 as val = *arg_ptr;
+                    print_int(val);
+                } else if (fmt[i] == 115) { // 's' (string - *u8)
+                    let is *u8 as val = cast(*u8, *arg_ptr);
+                    
+                    // Print C-string
+                    let is i64 as len with mut = 0;
+                    while (val[len] != 0) { len = len + 1; }
+                    linux.write(linux.STDOUT, val, len);
+                } else if (fmt[i] == 83) { // 'S' (Caustic String)
+                    let is *string.String as s_ptr = cast(*string.String, *arg_ptr); 
+                    linux.write(linux.STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
+                } else if (fmt[i] == 120) { // 'x' (hex i64)
+                    let is i64 as val = *arg_ptr;
+                    print_hex(val);
+                } else if (fmt[i] == 99) { // 'c' (char)
+                    let is i64 as val = *arg_ptr; 
+                    let is u8 as c = cast(u8, val);
+                    linux.write(linux.STDOUT, &c, 1);
+                } else {
+                    // Unknown format
+                    let is u8 as c = 37;
+                    linux.write(linux.STDOUT, &c, 1);
+                    linux.write(linux.STDOUT, &fmt[i], 1);
+                }
+            }
+        } else {
+            linux.write(linux.STDOUT, &fmt[i], 1);
+        }
+        i = i + 1;
+    }
+}
+
 struct File {
     fd as i64;
 }
 
-fn print(s as string.String) {
+fn print(s as string.String) as void {
     if (s.len > 0) {
         linux.write(linux.STDOUT, s.ptr, cast(i64, s.len));
     }
 }
 
-fn println(s as string.String) {
+fn println(s as string.String) as void {
     print(s);
     linux.write(linux.STDOUT, "\n", 1);
 }
 
-fn print_int(n as i64) {
+fn print_int(n as i64) as void {
     let is string.String as s = string.int_to_string(n);
     print(s);
     string.string_free(s);
 }
 
+// Legacy read_line (slow, unbuffered) - kept for compatibility
+// or could be rewritten to use a stack buffer
 fn read_line() as string.String {
+    // Implementation using small stack buffer for basic buffering
     let is i64 as cap with mut = 128;
     let is i64 as len with mut = 0;
     let is *u8 as ptr with mut = mem.galloc(cap);
@@ -52,7 +321,7 @@ fn read_line() as string.String {
         len = len + 1;
     }
 
-    ptr[len] = 0; // Null terminator
+    ptr[len] = cast(u8, 0);
 
     let is string.String as s;
     s.ptr = ptr;
@@ -62,97 +331,63 @@ fn read_line() as string.String {
     return s;
 }
 
-// Lê um arquivo inteiro para uma String (Slurp)
 fn read_file(path as string.String) as string.String {
-    // 1. Abre
     let is i64 as fd = linux.open(path.ptr, linux.O_RDONLY, 0);
     if (fd < 0) { 
-        return string.String(""); // Retorna vazia em erro
+        return string.String(""); 
     }
 
-    // 2. Tamanho
     let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
-    linux.lseek(fd, 0, linux.SEEK_SET); // Rewind
+    linux.lseek(fd, 0, linux.SEEK_SET);
 
-    // 3. Aloca
     let is string.String as s;
     s.len = cast(i32, size);
     s.cap = cast(i32, size);
     
     if (size > 0) {
         s.ptr = cast(*u8, mem.galloc(size + 1));
-        // 4. Lê
         linux.read(fd, s.ptr, size);
-        s.ptr[size] = 0;
+        s.ptr[size] = cast(u8, 0);
     } else {
         s.ptr = cast(*u8, 0);
     }
 
-    // 5. Fecha
     linux.close(fd);
-
     return s;
 }
 
-
-// Escreve string em arquivo (Sobrescreve/Cria)
-// Flags: O_WRONLY(1) | O_CREAT(64) | O_TRUNC(512) = 577
-// Mode: 0644 = 420 (decimal)
 fn write_file(path as string.String, content as string.String) as i64 {
     let is i64 as fd = linux.open(path.ptr, 577, 420);
-    
-    if (fd < 0) {
-        return fd; // Erro
-    }
-
+    if (fd < 0) { return fd; }
     let is i64 as res = linux.write(fd, content.ptr, cast(i64, content.len));
     linux.close(fd);
-    
     return res;
 }
 
-// Adiciona ao final do arquivo
-// Flags: O_WRONLY(1) | O_CREAT(64) | O_APPEND(1024) = 1089
 fn append_file(path as string.String, content as string.String) as i64 {
     let is i64 as fd = linux.open(path.ptr, 1089, 420);
-    
-    if (fd < 0) {
-        return fd;
-    }
-
+    if (fd < 0) { return fd; }
     let is i64 as res = linux.write(fd, content.ptr, cast(i64, content.len));
     linux.close(fd);
-    
     return res;
 }
 
-// Verifica se arquivo existe tentando abrir
 fn file_exists(path as string.String) as i32 {
-    // O_RDONLY = 0
     let is i64 as fd = linux.open(path.ptr, 0, 0);
     if (fd >= 0) {
         linux.close(fd);
-        return 1; // True
+        return cast(i32, 1);
     }
-    return 0; // False
+    return cast(i32, 0);
 }
 
-// Move o cursor do arquivo
-// whence: 0 (SEEK_SET), 1 (SEEK_CUR), 2 (SEEK_END)
-fn file_seek(f as File, offset as i64, whence as i64) as i64 {
-    return linux.lseek(f.fd, offset, whence);
-}
-
-// Abre arquivo para streaming
 fn open_file(path as string.String) as File {
     let is i64 as fd = linux.open(path.ptr, linux.O_RDONLY, 0);
-    
     let is File as f;
     f.fd = fd;
-    
     return f;
 }
 
-fn close_file(file as File) {
+fn close_file(file as File) as void {
     linux.close(file.fd);
 }

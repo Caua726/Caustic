@@ -82,7 +82,6 @@ int main(int argc, char *argv[]) {
         }
         printf("===================\n\n");
         fclose(file);
-        // IMPORTANTE: Não retornar aqui, continuar com o parsing normal
     }
 
     // Reabrir o arquivo para o parsing real
@@ -107,7 +106,7 @@ int main(int argc, char *argv[]) {
             }
             printf("\n==========================\n\n");
         }
-        // NÃO chamar consume() aqui
+
 
         IRProgram *ir = gen_ir(ast);
         if (!ir) {
@@ -141,14 +140,23 @@ int main(int argc, char *argv[]) {
 
         printf("Compilado com sucesso: %s\n", output);
 
-        ir_free(ir);
-        fclose(file);
+    free_ast_reset();
+
+    if (ast) {
+        free_ast(ast);
+        ast = NULL;
+    }
+    
+    ir_free(ir);
+    fclose(file);
     } else {
         printf("Erro ao fazer parsing do arquivo.\n");
     }
 
-    if (ast) free_ast(ast);
+    free_module_cache();  
+    free_source_paths();
     semantic_cleanup();
+    free_strings();
     free_all_types();
     return 0;
 }

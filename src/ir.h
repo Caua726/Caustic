@@ -81,6 +81,7 @@ typedef struct IRFunction {
     int is_reachable;
     int alloc_stack_size; // Extra stack space allocated by IR (e.g. for struct returns)
     int num_args;
+    int is_variadic; // Added flag
     struct IRFunction *next;
 } IRFunction;
 

@@ -2,6 +2,7 @@
 #include <stdio.h>
 
 typedef enum {
+	TOKEN_TYPE_FLOAT,
 	TOKEN_TYPE_EOF,
 	TOKEN_TYPE_IDENTIFIER,
 	TOKEN_TYPE_INTEGER,
@@ -59,6 +60,7 @@ typedef enum {
 	TOKEN_TYPE_USE,
 	TOKEN_TYPE_FOR,
 	TOKEN_TYPE_DO,
+	TOKEN_TYPE_ELLIPSIS,
 } TokenType;
 
 extern const char *TOKEN_NAMES[];
@@ -72,6 +74,7 @@ typedef struct {
     const char *filename;
 
 	long long int_value;
+    double float_value;
 
 	char text[256];
 } Token;

@@ -10,6 +10,7 @@ const char *TOKEN_NAMES[] = {
     "TOKEN_TYPE_EOF",
 	"TOKEN_TYPE_IDENTIFIER",
 	"TOKEN_TYPE_INTEGER",
+    "TOKEN_TYPE_FLOAT",
 
 	"TOKEN_TYPE_RETURN",
 
@@ -63,7 +64,9 @@ const char *TOKEN_NAMES[] = {
 	"TOKEN_TYPE_SHR",
 	"TOKEN_TYPE_USE",
     "TOKEN_TYPE_FOR",
+    "TOKEN_TYPE_FOR",
     "TOKEN_TYPE_DO",
+    "TOKEN_TYPE_ELLIPSIS",
 };
 
 static FILE *src;
@@ -209,6 +212,34 @@ Token lexer_next() {
             }
             next_char();
         }
+
+        // Float support
+        if (current_char == '.') {
+            if (isdigit(lookhead_char())) {
+                if (i < 254) {
+                    t.text[i++] = '.';
+                }
+                next_char(); // consume '.'
+                
+                while (isdigit(current_char)) {
+                    if (i < 254) {
+                        t.text[i++] = current_char;
+                    }
+                    next_char();
+                }
+                t.text[i] = '\0';
+                t.type = TOKEN_TYPE_INTEGER; // For now we reuse INTEGER token but it will contain a float string.
+                                             // Ideally we should have TOKEN_TYPE_FLOAT, but let's see if parser handles it.
+                                             // Actually, parser uses t.int_value. We need to handle this.
+                                             // If we treat it as INTEGER token, parser will take int_value.
+                                             // We need a TOKEN_TYPE_FLOAT or handle it in parser.
+                                             // Let's add TOKEN_TYPE_FLOAT.
+                t.type = TOKEN_TYPE_FLOAT; 
+                t.float_value = strtod(t.text, NULL);
+                return t;
+            }
+        }
+
         t.text[i] = '\0';
         t.type = TOKEN_TYPE_INTEGER;
         
@@ -415,10 +446,44 @@ Token lexer_next() {
             next_char();
             return t;
         case '.':
+            if (lookhead_char() == '.') {
+                next_char();
+                if (lookhead_char() == '.') {
+                     next_char();
+                     strcpy(t.text, "...");
+                     t.type = TOKEN_TYPE_ELLIPSIS;
+                     next_char();
+                     return t;
+                }
+                // Handle .. if we supported it
+            }
             t.text[0] = '.';
             t.text[1] = '\0';
             t.type = TOKEN_TYPE_DOT;
             next_char();
+            return t;
+
+        case '\'':
+            next_char(); // Consume opening '
+            char c = current_char;
+            if (c == '\\') {
+                next_char();
+                if (current_char == 'n') c = '\n';
+                else if (current_char == 't') c = '\t';
+                else if (current_char == 'r') c = '\r';
+                else if (current_char == '0') c = '\0';
+                else if (current_char == '\'') c = '\'';
+                else if (current_char == '\\') c = '\\';
+            }
+            t.int_value = (long long)c;
+            t.type = TOKEN_TYPE_INTEGER;
+            sprintf(t.text, "'%c'", c); // Approximation for debug
+            next_char(); // Consume char
+            if (current_char != '\'') {
+                printf("Erro: esperado ' fechando literal de caractere na linha %d\n", line);
+                exit(1);
+            }
+            next_char(); // Consume closing '
             return t;
         case '{':
             t.text[0] = '{';
@@ -471,27 +536,7 @@ Token lexer_next() {
             t.type = TOKEN_TYPE_STRING;
             next_char();
             return t;
-        case '\'':
-            next_char();
-            char c = current_char;
-            if (current_char == '\\') {
-                next_char();
-                if (current_char == 'n') c = '\n';
-                else if (current_char == 't') c = '\t';
-                else if (current_char == 'r') c = '\r';
-                else if (current_char == '0') c = '\0';
-                else if (current_char == '\\') c = '\\';
-                else if (current_char == '\'') c = '\'';
-            }
-            next_char();
-            if (current_char != '\'') {
-                printf("Erro: char literal nao terminado na linha %d\n", line);
-                exit(1);
-            }
-            next_char();
-            t.type = TOKEN_TYPE_INTEGER;
-            t.int_value = (long long)c;
-            return t;
+
     }
     printf("Erro: caractere inesperado '%c' na linha %d\n", current_char, line);
     exit(1);

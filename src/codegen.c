@@ -35,6 +35,7 @@ typedef struct {
     int next_spill;
     int is_leaf;
     int arg_spill_base;
+    IRFunction *current_func; // Added to access func info in gen_inst
 } AllocCtx;
 
 static FILE *out;
@@ -668,7 +669,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                         else if (strcmp(source_reg, "r14") == 0) strcpy(reg16, "r14w");
                         else if (strcmp(source_reg, "r15") == 0) strcpy(reg16, "r15w");
                         else strncpy(reg16, source_reg, sizeof(reg16) - 1);
-                        emit("mov WORD PTR [rbp-%ld], %s", inst->dest.imm + size, reg16);
+                        emit("mov WORD PTR [rbp-%ld], %s", inst->dest.imm, reg16);
                     } else if (size == 1) {
                         char reg8[64];
                         if (strcmp(source_reg, "rax") == 0) strcpy(reg8, "al");
@@ -686,7 +687,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                         else if (strcmp(source_reg, "r14") == 0) strcpy(reg8, "r14b");
                         else if (strcmp(source_reg, "r15") == 0) strcpy(reg8, "r15b");
                         else strncpy(reg8, source_reg, sizeof(reg8) - 1);
-                        emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm + size, reg8);
+                        emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm, reg8);
                     } else {
                         // Struct > 8 bytes (passed by reference/pointer in register)
                         // Copy from [src_reg] to [rbp-dest]
@@ -699,7 +700,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                         emit("rep movsb");
                     }
                 } else {
-                    emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm + 8, src1);
+                    emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm, src1);
                 }
             }
             break;
@@ -723,20 +724,17 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
 
             int to_size = inst->cast_to_type->size;
 
-            // Verificar se source ou dest são memória
             int src_is_mem = (strstr(src1, "PTR") != NULL);
             int dst_is_mem = (strstr(dst, "PTR") != NULL);
 
             const char *work_src = src1;
             const char *work_dst = dst;
 
-            // Se source é memória, carregar em r14 primeiro
             if (src_is_mem) {
                 emit("mov r14, %s", src1);
                 work_src = "r14";
             }
 
-            // Se dest é memória, usar r15 como temporário
             if (dst_is_mem) {
                 work_dst = "r15";
             }
@@ -816,7 +814,6 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                 }
             }
 
-            // Se destino era memória, copiar do temporário
             if (dst_is_mem) {
                 emit("mov %s, r15", dst);
             }
@@ -855,13 +852,19 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
 
         case IR_GET_ARG:
             if (inst->src1.imm < num_arg_regs) {
-                get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-                int slot = ctx->arg_spill_base + inst->src1.imm;
-                if (strstr(dst, "PTR") != NULL || strstr(dst, "[") != NULL) {
-                    emit("mov rax, QWORD PTR [rbp-%d]", slot * 8);
-                    emit("mov %s, rax", dst);
+                if (ctx->current_func->is_variadic) {
+                    // Variadic: Args are spilled to stack in reverse order
+                    get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+                    int slot = ctx->arg_spill_base + (5 - inst->src1.imm);
+                    if (strstr(dst, "PTR") != NULL || strstr(dst, "[") != NULL) {
+                        emit("mov rax, QWORD PTR [rbp-%d]", slot * 8);
+                        emit("mov %s, rax", dst);
+                    } else {
+                        emit("mov %s, QWORD PTR [rbp-%d]", dst, slot * 8);
+                    }
                 } else {
-                    emit("mov %s, QWORD PTR [rbp-%d]", dst, slot * 8);
+                    // Normal: Args are in registers
+                    store_operand(inst->dest.vreg, ctx, arg_regs[inst->src1.imm]);
                 }
             } else {
                 get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
@@ -882,6 +885,53 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             break;
 
         case IR_CALL:
+            // Handle builtins
+            if (strcmp(inst->call_target_name, "__builtin_va_start") == 0) {
+                // __builtin_va_start(va_list_ptr)
+                // va_list struct:
+                // 0: gp_offset (i32)
+                // 4: fp_offset (i32)
+                // 8: overflow_arg_area (*u8)
+                // 16: reg_save_area (*u8)
+                
+                // The pointer to va_list is in rdi (Arg 0 of the intrinsic call).
+                // But wait, rdi is used for arguments of the CURRENT function?
+                // No, rdi is the argument passed TO __builtin_va_start.
+                // So we need to ensure rdi contains the address of 'va' local variable.
+                // The IR should have SET_ARG(0, &va) before CALL.
+                // So 'rdi' register holds the address.
+                
+                // We emit code to populate [rdi].
+                
+                int num_fixed = ctx->current_func->num_args;
+                
+                // 1. gp_offset = num_fixed * 8
+                int gp_offset = num_fixed * 8;
+                if (gp_offset > 48) gp_offset = 48; // Cap at 48 if > 6 args
+                emit("mov DWORD PTR [rdi], %d", gp_offset);
+                
+                // 2. fp_offset = 48 (skip floats)
+                emit("mov DWORD PTR [rdi+4], 48");
+                
+                // 3. overflow_arg_area = rbp + 16 + (num_fixed > 6 ? (num_fixed - 6) * 8 : 0)
+                // If num_fixed > 6, the first variadic arg is further up the stack.
+                int stack_offset = 16;
+                if (num_fixed > 6) {
+                    stack_offset += (num_fixed - 6) * 8;
+                }
+                emit("lea rax, [rbp+%d]", stack_offset);
+                emit("mov QWORD PTR [rdi+8], rax");
+                
+                // 4. reg_save_area = rbp - (base + 5) * 8
+                // This points to the start of the spill area (where rdi is stored).
+                // rdi is at base + 5.
+                int slot = ctx->arg_spill_base + 5;
+                emit("lea rax, [rbp-%d]", slot * 8);
+                emit("mov QWORD PTR [rdi+16], rax");
+                
+                break;
+            }
+
             // Caller-saved registers are not explicitly saved here because:
             // 1. Our allocator only uses callee-saved registers (rbx, r12, r13) for variables.
             // 2. Scratch registers (r14, r15) don't need preservation across calls.
@@ -889,8 +939,6 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             // If we start using caller-saved regs for vars, we must save them here.
             emit("call %s", inst->call_target_name);
 
-            // O valor de retorno da função está em 'rax', pela convenção da ABI.
-            // Armazenamos o valor de 'rax' no local designado para o vreg de destino.
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
@@ -901,6 +949,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
 
 static void gen_func(IRFunction *func) {
     AllocCtx ctx = {0};
+    ctx.current_func = func;
 
     // Calculate max stack offset used by variables
     long max_offset = 48; // Start after saved regs
@@ -909,11 +958,6 @@ static void gen_func(IRFunction *func) {
              if (inst->src1.type == OPERAND_IMM) {
                  // For LOAD/ADDR, src1 is offset.
                  // We need to account for the size of the access if possible, but for now assume offset is the start.
-                 // Actually, codegen adds size to offset for rbp access: [rbp - (offset + size)]
-                 // So we need to find max (offset + size).
-                 // Since we don't easily know size here without type, let's approximate.
-                 // Semantic assigns offsets sequentially. The max offset seen is the start of the last var.
-                 // We need to add its size. Let's assume max size 8 for safety if unknown.
                  long off = inst->src1.imm;
                  if (off + 8 > max_offset) max_offset = off + 8;
              }
@@ -973,11 +1017,178 @@ static void gen_func(IRFunction *func) {
         emit("sub rsp, %d", stack_size);
     }
 
-    // Save register arguments to stack
-    for (int i = 0; i < 6; i++) {
-        int slot = ctx.arg_spill_base + i;
-        emit("mov QWORD PTR [rbp-%d], %s", slot * 8, arg_regs[i]);
+    if (func->is_variadic) {
+        // Spill ALL 6 register args
+            for (int i = 0; i < 6; i++) {
+                 // Spill in reverse order so Arg 0 is at lowest address (highest offset)
+                 // Arg 0 at base + 5
+                 // Arg 5 at base + 0
+                 int slot = ctx.arg_spill_base + (5 - i);
+                 emit("mov QWORD PTR [rbp-%d], %s", slot * 8, arg_regs[i]);
+            }
+    } else {
+        // Normal function: we don't need to spill all args, only those that the allocator decided to spill?
+        // Wait, the allocator handles spilling of LIVE ranges.
+        // But the initial values come from registers.
+        // If a param is spilled, we need to store it?
+        // No, the IR usually has "mov vreg, arg_reg".
+        // If vreg is spilled, the "mov" becomes "mov [stack], arg_reg".
+        // So we don't need to do anything here for normal functions.
+        // The loop I saw before:
+        // for (int i = 0; i < 6; i++) { ... }
+        // was probably my previous attempt or existing code?
+        // Ah, the existing code had:
+        /*
+        for (int i = 0; i < 6; i++) {
+            int slot = ctx.arg_spill_base + i;
+            emit("mov QWORD PTR [rbp-%d], %s", slot * 8, arg_regs[i]);
+        }
+        */
+        // This was spilling ALL args ALWAYS. This is inefficient for normal functions but safe.
+        // If I keep it, it works for varargs too.
+        // But for optimization, we should only do it for varargs OR if we want to be lazy.
+        // Let's keep it for now as it was already there (or I misread).
+        // Wait, looking at the file content I requested (lines 800-1086), lines 977-980 ARE:
+        /*
+        for (int i = 0; i < 6; i++) {
+            int slot = ctx.arg_spill_base + i;
+            emit("mov QWORD PTR [rbp-%d], %s", slot * 8, arg_regs[i]);
+        }
+        */
+        // So it WAS already spilling everything.
+        // So `is_variadic` support is implicitly "half-done" by this inefficiency?
+        // Yes, if we spill everything, then `va_start` just needs to point to `ctx.arg_spill_base`.
+        // So I just need to ensure `ctx.arg_spill_base` is correct and maybe optimize this later.
+        // But wait, if I want to implement `va_start` builtin, I need to know WHERE they are.
+        // They are at `[rbp - (ctx.arg_spill_base * 8)]` (first arg, rdi)
+        // down to `[rbp - ((ctx.arg_spill_base + 5) * 8)]` (6th arg, r9).
+        // Since stack grows down, `rbp - small` is higher address than `rbp - large`.
+        // `ctx.arg_spill_base` is the start index.
+        // `slot * 8` is the offset.
+        // `rbp - slot*8`.
+        // If `arg_spill_base` is e.g. 1.
+        // rdi at `rbp - 8`.
+        // rsi at `rbp - 16`.
+        // ...
+        // This is REVERSE order in memory compared to C array?
+        // C array: `args[0]` is lower address?
+        // If I want `va_arg` to just increment a pointer...
+        // I need them in memory as: `arg1, arg2, arg3...` (increasing address).
+        // `rbp - 8` (high addr)
+        // `rbp - 16` (lower)
+        // So `rdi` is at HIGHER address than `rsi`.
+        // So if I have `ptr` pointing to `rdi` (rbp-8), and I do `ptr++` (add 8), I get `rbp`. WRONG.
+        // I need `ptr` to go DOWN? Or I need to store them in REVERSE order?
+        // If I store `rdi` at `rbp - 48`, `rsi` at `rbp - 40`...
+        // Then `rdi` is at lower address.
+        // `ptr` at `rdi`. `ptr + 8` is `rsi`.
+        // This allows standard `va_arg` logic (pointer increment).
+        
+        // So I should change the storage order for Variadic Functions (or all).
+        // Let's change it for ALL for simplicity, or just Variadic.
+        // Existing code: `slot = base + i`. `offset = slot * 8`. `[rbp - offset]`.
+        // i=0 (rdi) -> offset small -> High Addr.
+        // i=5 (r9) -> offset large -> Low Addr.
+        // Memory: [r9] [r8] ... [rsi] [rdi] ... [rbp]
+        //           Low <----------- High
+        // This is "Stack Growth" order.
+        // But for `va_arg` (array-like access), we usually want:
+        // [rdi] [rsi] ... [r9]
+        // Low -----------> High
+        
+        // So I should store `rdi` at the LOWEST address (largest offset)?
+        // No, `rdi` is the first argument.
+        // If I have `fn(a, b, ...)`. `a` is `rdi`. `b` is `rsi`. `...` starts at `rdx`.
+        // `va_start` should point to `rdx`.
+        // If `rdx` is at `[rbp - 24]` and `rcx` is at `[rbp - 32]`.
+        // `ptr = &rdx`. `ptr + 8` = `rbp - 16` (rsi). WRONG.
+        // `ptr + 8` should be `rcx`.
+        
+        // So I need to store them such that `Arg N` is at `Address X`, and `Arg N+1` is at `Address X+8`.
+        // So `rdi` (Arg 0) at `Base`.
+        // `rsi` (Arg 1) at `Base + 8`.
+        // ...
+        // `r9` (Arg 5) at `Base + 40`.
+        
+        // Current: `rdi` at `rbp - 8` (if base=1).
+        // `rsi` at `rbp - 16`.
+        // `rsi` is at `Address(rdi) - 8`.
+        // So addresses are DECREASING.
+        
+        // FIX: Store them in REVERSE order of `i`.
+        // Store `rdi` at `rbp - 48`.
+        // Store `rsi` at `rbp - 40`.
+        // ...
+        // Store `r9` at `rbp - 8`.
+        
+        // Then `rdi` (Arg 0) is at Low Addr.
+        // `rsi` (Arg 1) is at `rdi + 8`.
+        // This matches `va_arg` expectation.
+        
+        // So I will modify the loop.
+        // And I should probably only do this for `is_variadic` to avoid breaking existing stuff?
+        // Existing stuff doesn't rely on this layout (it uses `arg_regs` directly or `mov` instructions).
+        // EXCEPT `IR_GET_ARG` implementation in `gen_inst`.
+        // `IR_GET_ARG` uses `ctx.arg_spill_base + inst->src1.imm`.
+        // `slot * 8`. `[rbp - slot*8]`.
+        // If I change the layout, I must update `IR_GET_ARG` too.
+        
+        // Let's stick to modifying ONLY `gen_func` and `IR_GET_ARG` logic if needed.
+        // Actually, `IR_GET_ARG` is used for retrieving arguments.
+        // If I change storage to:
+        // `rdi` at `rbp - (base + 5)*8`
+        // `r9` at `rbp - (base + 0)*8`
+        // Then `IR_GET_ARG(0)` (rdi) should look at `base + 5`.
+        
+        // Let's just implement `is_variadic` specific spilling logic and leave the default one for non-variadic?
+        // But `IR_GET_ARG` is generic.
+        // Does `IR_GET_ARG` rely on the spill area?
+        // Yes: `int slot = ctx.arg_spill_base + inst->src1.imm; emit("mov %s, QWORD PTR [rbp-%d]", dst, slot * 8);`
+        // So currently `IR_GET_ARG` expects `rdi` at `base + 0`.
+        
+        // If I want to support `va_start`, I should probably just make `va_start` smart enough to handle the decreasing addresses?
+        // `va_arg` usually does `val = *ptr; ptr += 8;`.
+        // If I make `va_start` return the address of the first variadic arg.
+        // And `va_arg` does `ptr -= 8`?
+        // That would be non-standard `va_arg` logic (if `va_arg` is a macro/builtin).
+        // If `va_arg` is generated by compiler (IR_VA_ARG), I can do whatever I want.
+        // But the plan says `__builtin_va_arg`.
+        // Usually `va_arg(ap, type)` expands to `*(type*)((ap += 8) - 8)`.
+        
+        // So standard `va_arg` expects increasing addresses.
+        // So I SHOULD fix the layout to be increasing.
+        
+        // Plan:
+        // 1. Change spilling loop to spill in increasing address order (r9 at top/high, rdi at bottom/low).
+        //    `r9` at `rbp - (base)*8`.
+        //    `r8` at `rbp - (base+1)*8`.
+        //    ...
+        //    `rdi` at `rbp - (base+5)*8`.
+        //    Wait, `rbp - small` is HIGH. `rbp - large` is LOW.
+        //    So `r9` (Arg 5) at `rbp - (base)*8` (High).
+        //    `rdi` (Arg 0) at `rbp - (base+5)*8` (Low).
+        //    This gives: `&rdi < &rsi < ... < &r9`.
+        //    This is what we want!
+        
+        // 2. Update `IR_GET_ARG` to match this new layout.
+        //    `IR_GET_ARG(0)` (rdi) -> `slot = base + 5`.
+        //    `IR_GET_ARG(i)` -> `slot = base + (5 - i)`.
+        
+        // 3. Update `gen_func` loop.
+        
+        // Let's do this.
+        
+        for (int i = 0; i < 6; i++) {
+             // We want Arg 0 (rdi) at Low Addr (High Offset).
+             // We want Arg 5 (r9) at High Addr (Low Offset).
+             // Slot 0 (base) -> High Addr.
+             // Slot 5 (base+5) -> Low Addr.
+             // So Arg i should be at Slot (5 - i).
+             int slot = ctx.arg_spill_base + (5 - i);
+             emit("mov QWORD PTR [rbp-%d], %s", slot * 8, arg_regs[i]);
+        }
     }
+
 
     for (IRInst *inst = func->instructions; inst; inst = inst->next) {
         gen_inst(inst, &ctx, func->alloc_stack_size);
