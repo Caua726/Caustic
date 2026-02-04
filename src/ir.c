@@ -100,15 +100,20 @@ static int emit_binary(IROp op, int lhs_reg, int rhs_reg, int line) {
 
 
 
-static int emit_cast(int src_reg, Type *to_type, int line) {
+static int emit_cast_from(int src_reg, Type *from_type, Type *to_type, int line) {
     int dest = new_vreg();
     IRInst *inst = new_inst(IR_CAST);
     inst->dest = op_vreg(dest);
     inst->src1 = op_vreg(src_reg);
     inst->cast_to_type = to_type;
+    inst->cast_from_type = from_type;
     inst->line = line;
     emit(inst);
     return dest;
+}
+
+static int emit_cast(int src_reg, Type *to_type, int line) {
+    return emit_cast_from(src_reg, NULL, to_type, line);
 }
 
 static int emit_call(char *func_name, int line) {
@@ -357,6 +362,10 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, line);
             }
+            // Float addition
+            if (node->ty->kind == TY_F32 || node->ty->kind == TY_F64) {
+                return emit_binary(IR_FADD, lhs, rhs, line);
+            }
             return emit_binary(IR_ADD, lhs, rhs, line);
         }
 
@@ -395,6 +404,10 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, line);
             }
+            // Float subtraction
+            if (node->ty->kind == TY_F32 || node->ty->kind == TY_F64) {
+                return emit_binary(IR_FSUB, lhs, rhs, line);
+            }
             return emit_binary(IR_SUB, lhs, rhs, line);
         }
 
@@ -409,6 +422,10 @@ static int gen_expr(Node *node) {
             }
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            // Float multiplication
+            if (node->ty->kind == TY_F32 || node->ty->kind == TY_F64) {
+                return emit_binary(IR_FMUL, lhs, rhs, node->tok ? node->tok->line : 0);
             }
             return emit_binary(IR_MUL, lhs, rhs, node->tok ? node->tok->line : 0);
         }
@@ -428,6 +445,10 @@ static int gen_expr(Node *node) {
             }
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            // Float division
+            if (node->ty->kind == TY_F32 || node->ty->kind == TY_F64) {
+                return emit_binary(IR_FDIV, lhs, rhs, node->tok ? node->tok->line : 0);
             }
             return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
         }
@@ -571,6 +592,51 @@ static int gen_expr(Node *node) {
             return emit_binary(IR_OR, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
+        case NODE_KIND_BITWISE_XOR: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            return emit_binary(IR_XOR, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_BITWISE_NOT: {
+            int src = gen_expr(node->expr);
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_NOT);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_vreg(src);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
+        case NODE_KIND_LOGICAL_NOT: {
+            int src = gen_expr(node->expr);
+            int zero = emit_imm(0, node->tok ? node->tok->line : 0);
+            return emit_binary(IR_EQ, src, zero, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_NEG: {
+            int src = gen_expr(node->expr);
+            int dest = new_vreg();
+            // Float negation
+            IROp neg_op = IR_NEG;
+            if (node->expr->ty->kind == TY_F32 || node->expr->ty->kind == TY_F64) {
+                neg_op = IR_FNEG;
+            }
+            IRInst *inst = new_inst(neg_op);
+            inst->dest = op_vreg(dest);
+            inst->src1 = op_vreg(src);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
         case NODE_KIND_LOGICAL_AND: {
             int false_label = new_label();
             int end_label = new_label();
@@ -711,7 +777,7 @@ static int gen_expr(Node *node) {
 
         case NODE_KIND_CAST: {
             int src = gen_expr(node->expr);
-            return emit_cast(src, node->ty, node->tok ? node->tok->line : 0);
+            return emit_cast_from(src, node->expr->ty, node->ty, node->tok ? node->tok->line : 0);
         }
 
         case NODE_KIND_FNCALL: {

@@ -552,6 +552,7 @@ void walk(Node *node) {
         case NODE_KIND_SHR:
         case NODE_KIND_BITWISE_AND:
         case NODE_KIND_BITWISE_OR:
+        case NODE_KIND_BITWISE_XOR:
             walk(node->lhs);
             walk(node->rhs);
 
@@ -757,6 +758,49 @@ void walk(Node *node) {
             }
             node->ty = node->expr->ty->base;
             return;
+
+        case NODE_KIND_NEG: {
+            walk(node->expr);
+            // Unary minus works on integers and floats
+            TypeKind neg_tk = node->expr->ty->kind;
+            if (neg_tk != TY_I8 && neg_tk != TY_I16 && neg_tk != TY_I32 && neg_tk != TY_I64 &&
+                neg_tk != TY_U8 && neg_tk != TY_U16 && neg_tk != TY_U32 && neg_tk != TY_U64 &&
+                neg_tk != TY_F32 && neg_tk != TY_F64 && neg_tk != TY_INT) {
+                fprintf(stderr, "Erro: operador '-' unário requer um tipo numérico.\n");
+                exit(1);
+            }
+            node->ty = node->expr->ty;
+            return;
+        }
+
+        case NODE_KIND_BITWISE_NOT: {
+            walk(node->expr);
+            // Bitwise NOT works only on integers
+            TypeKind bnot_tk = node->expr->ty->kind;
+            if (bnot_tk != TY_I8 && bnot_tk != TY_I16 && bnot_tk != TY_I32 && bnot_tk != TY_I64 &&
+                bnot_tk != TY_U8 && bnot_tk != TY_U16 && bnot_tk != TY_U32 && bnot_tk != TY_U64 &&
+                bnot_tk != TY_INT) {
+                fprintf(stderr, "Erro: operador '~' requer um tipo inteiro.\n");
+                exit(1);
+            }
+            node->ty = node->expr->ty;
+            return;
+        }
+
+        case NODE_KIND_LOGICAL_NOT: {
+            walk(node->expr);
+            // Logical NOT works on integers and booleans, returns bool
+            TypeKind lnot_tk = node->expr->ty->kind;
+            if (lnot_tk != TY_I8 && lnot_tk != TY_I16 && lnot_tk != TY_I32 && lnot_tk != TY_I64 &&
+                lnot_tk != TY_U8 && lnot_tk != TY_U16 && lnot_tk != TY_U32 && lnot_tk != TY_U64 &&
+                lnot_tk != TY_BOOL && lnot_tk != TY_INT) {
+                fprintf(stderr, "Erro: operador '!' requer um tipo inteiro ou booleano.\n");
+                exit(1);
+            }
+            node->ty = new_type(TY_BOOL);
+            node->ty->size = 1;
+            return;
+        }
 
         case NODE_KIND_INDEX:
             walk(node->lhs);

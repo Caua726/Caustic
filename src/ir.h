@@ -31,6 +31,8 @@ typedef enum {
     IR_SHR,
     IR_AND,
     IR_OR,
+    IR_XOR,
+    IR_NOT,
     IR_GET_ARG,
     IR_SET_ARG,
     IR_SET_SYS_ARG,
@@ -40,6 +42,12 @@ typedef enum {
     IR_ADDR_GLOBAL, // Get address of global variable
     IR_GET_ALLOC_ADDR, // Get address of allocated stack space
     IR_SET_CTX, // Set context (target address) for next call
+    // Floating point operations
+    IR_FADD,
+    IR_FSUB,
+    IR_FMUL,
+    IR_FDIV,
+    IR_FNEG,
 } IROp;
 
 typedef enum {
@@ -72,6 +80,7 @@ typedef struct IRInst {
     char *call_target_name;
     char *global_name; // For IR_ADDR_GLOBAL
     Type *cast_to_type;
+    Type *cast_from_type; // For float<->int conversions
 } IRInst;
 
 typedef struct IRFunction {

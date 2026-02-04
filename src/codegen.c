@@ -353,6 +353,58 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             }
             break;
 
+        // Float operations using SSE
+        case IR_FADD:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("movq xmm0, r14");
+            emit("movq xmm1, r15");
+            emit("addsd xmm0, xmm1");
+            emit("movq r14, xmm0");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_FSUB:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("movq xmm0, r14");
+            emit("movq xmm1, r15");
+            emit("subsd xmm0, xmm1");
+            emit("movq r14, xmm0");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_FMUL:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("movq xmm0, r14");
+            emit("movq xmm1, r15");
+            emit("mulsd xmm0, xmm1");
+            emit("movq r14, xmm0");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_FDIV:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("movq xmm0, r14");
+            emit("movq xmm1, r15");
+            emit("divsd xmm0, xmm1");
+            emit("movq r14, xmm0");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_FNEG:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            emit("movq xmm0, r14");
+            // XOR with sign bit to negate: -0.0 has the sign bit set
+            emit("mov r15, 0x8000000000000000");
+            emit("movq xmm1, r15");
+            emit("xorpd xmm0, xmm1");
+            emit("movq r14, xmm0");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
         case IR_RET:
             if (inst->src1.type != OPERAND_NONE) {
                 load_operand(inst->src1.vreg, ctx, "rax");
@@ -475,6 +527,19 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             load_operand(inst->src1.vreg, ctx, "r14");
             load_operand(inst->src2.vreg, ctx, "r15");
             emit("or r14, r15");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_XOR:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("xor r14, r15");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_NOT:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            emit("not r14");
             store_operand(inst->dest.vreg, ctx, "r14");
             break;
 
@@ -734,6 +799,32 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                     emit("mov %s, %s", dst, src1);
                 }
                 break;
+            }
+
+            // Handle float <-> int conversions
+            if (inst->cast_from_type) {
+                TypeKind from_kind = inst->cast_from_type->kind;
+                TypeKind to_kind = inst->cast_to_type->kind;
+
+                // Float to integer conversion
+                if ((from_kind == TY_F64 || from_kind == TY_F32) &&
+                    (to_kind != TY_F64 && to_kind != TY_F32)) {
+                    load_operand(inst->src1.vreg, ctx, "r14");
+                    emit("movq xmm0, r14");
+                    emit("cvttsd2si r14, xmm0");
+                    store_operand(inst->dest.vreg, ctx, "r14");
+                    break;
+                }
+
+                // Integer to float conversion
+                if ((from_kind != TY_F64 && from_kind != TY_F32) &&
+                    (to_kind == TY_F64 || to_kind == TY_F32)) {
+                    load_operand(inst->src1.vreg, ctx, "r14");
+                    emit("cvtsi2sd xmm0, r14");
+                    emit("movq r14, xmm0");
+                    store_operand(inst->dest.vreg, ctx, "r14");
+                    break;
+                }
             }
 
             int to_size = inst->cast_to_type->size;

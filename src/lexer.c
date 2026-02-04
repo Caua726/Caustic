@@ -476,7 +476,7 @@ Token lexer_next() {
                 else if (current_char == '\\') c = '\\';
             }
             t.int_value = (long long)c;
-            t.type = TOKEN_TYPE_INTEGER;
+            t.type = TOKEN_TYPE_CHAR;
             sprintf(t.text, "'%c'", c); // Approximation for debug
             next_char(); // Consume char
             if (current_char != '\'') {
@@ -537,6 +537,18 @@ Token lexer_next() {
             next_char();
             return t;
 
+        case '^':
+            t.text[0] = '^';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_XOR;
+            next_char();
+            return t;
+        case '~':
+            t.text[0] = '~';
+            t.text[1] = '\0';
+            t.type = TOKEN_TYPE_BITNOT;
+            next_char();
+            return t;
     }
     printf("Erro: caractere inesperado '%c' na linha %d\n", current_char, line);
     exit(1);

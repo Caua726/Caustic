@@ -61,6 +61,9 @@ typedef enum {
 	TOKEN_TYPE_FOR,
 	TOKEN_TYPE_DO,
 	TOKEN_TYPE_ELLIPSIS,
+	TOKEN_TYPE_XOR,
+	TOKEN_TYPE_BITNOT,
+	TOKEN_TYPE_CHAR,
 } TokenType;
 
 extern const char *TOKEN_NAMES[];

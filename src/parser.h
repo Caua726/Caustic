@@ -89,6 +89,10 @@ typedef enum {
     NODE_KIND_MODULE_ACCESS,
     NODE_KIND_FOR,
     NODE_KIND_DO_WHILE,
+    NODE_KIND_BITWISE_XOR,
+    NODE_KIND_BITWISE_NOT,
+    NODE_KIND_LOGICAL_NOT,
+    NODE_KIND_NEG,
 } NodeKind;
 
 typedef struct StringLiteral {

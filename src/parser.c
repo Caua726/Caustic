@@ -551,6 +551,13 @@ static Node *parse_primary() {
         return node; // We rely on codegen/semantic to check ty->kind
     }
 
+    if (current_token.type == TOKEN_TYPE_CHAR) {
+        Node *node = new_node_num(current_token.int_value);
+        node->ty = type_char; // Char type
+        consume();
+        return node;
+    }
+
     if (current_token.type == TOKEN_TYPE_STRING) {
         int id = register_string(strdup(current_token.text));
         Node *node = new_node(NODE_KIND_STRING_LITERAL);
@@ -825,6 +832,24 @@ static Node *parse_unary() {
         node->expr = parse_unary();
         return node;
     }
+    if (current_token.type == TOKEN_TYPE_MINUS) {
+        consume();
+        Node *node = new_node(NODE_KIND_NEG);
+        node->expr = parse_unary();
+        return node;
+    }
+    if (current_token.type == TOKEN_TYPE_NOT) {
+        consume();
+        Node *node = new_node(NODE_KIND_LOGICAL_NOT);
+        node->expr = parse_unary();
+        return node;
+    }
+    if (current_token.type == TOKEN_TYPE_BITNOT) {
+        consume();
+        Node *node = new_node(NODE_KIND_BITWISE_NOT);
+        node->expr = parse_unary();
+        return node;
+    }
     return parse_postfix();
 }
 
@@ -868,11 +893,20 @@ static Node *parse_bitwise_and() {
     return node;
 }
 
-static Node *parse_bitwise_or() {
+static Node *parse_bitwise_xor() {
     Node *node = parse_bitwise_and();
+    while (current_token.type == TOKEN_TYPE_XOR) {
+        consume();
+        node = new_binary_node(NODE_KIND_BITWISE_XOR, node, parse_bitwise_and());
+    }
+    return node;
+}
+
+static Node *parse_bitwise_or() {
+    Node *node = parse_bitwise_xor();
     while (current_token.type == TOKEN_TYPE_OR) {
         consume();
-        node = new_binary_node(NODE_KIND_BITWISE_OR, node, parse_bitwise_and());
+        node = new_binary_node(NODE_KIND_BITWISE_OR, node, parse_bitwise_xor());
     }
     return node;
 }
