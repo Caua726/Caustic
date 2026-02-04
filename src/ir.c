@@ -547,6 +547,30 @@ static int gen_expr(Node *node) {
             return emit_binary(IR_SHR, lhs, rhs, node->tok ? node->tok->line : 0);
         }
 
+        case NODE_KIND_BITWISE_AND: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            return emit_binary(IR_AND, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
+        case NODE_KIND_BITWISE_OR: {
+            int lhs = gen_expr(node->lhs);
+            int rhs = gen_expr(node->rhs);
+            if (node->lhs->ty != node->ty) {
+                lhs = emit_cast(lhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            if (node->rhs->ty != node->ty) {
+                rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
+            }
+            return emit_binary(IR_OR, lhs, rhs, node->tok ? node->tok->line : 0);
+        }
+
         case NODE_KIND_LOGICAL_AND: {
             int false_label = new_label();
             int end_label = new_label();

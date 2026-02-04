@@ -60,6 +60,31 @@ Type *type_char;
 Type *type_string;
 Type *type_void;
 
+static const char *type_name(Type *ty) {
+    if (!ty) return "unknown";
+    switch (ty->kind) {
+        case TY_INT: return "int";
+        case TY_I8: return "i8";
+        case TY_I16: return "i16";
+        case TY_I32: return "i32";
+        case TY_I64: return "i64";
+        case TY_U8: return "u8";
+        case TY_U16: return "u16";
+        case TY_U32: return "u32";
+        case TY_U64: return "u64";
+        case TY_F32: return "f32";
+        case TY_F64: return "f64";
+        case TY_BOOL: return "bool";
+        case TY_CHAR: return "char";
+        case TY_STRING: return "string";
+        case TY_VOID: return "void";
+        case TY_PTR: return "*ptr";
+        case TY_ARRAY: return "array";
+        case TY_STRUCT: return ty->name ? ty->name : "struct";
+        default: return "unknown";
+    }
+}
+
 static Variable *symtab_lookup(char *name);
 
 static Type *new_type_full(TypeKind kind, int size, int is_signed) {
@@ -390,12 +415,25 @@ void walk(Node *node) {
         case NODE_KIND_RETURN:
             if (node->expr) {
                 walk(node->expr);
-                if (!is_safe_implicit_conversion(node->expr->ty, current_return_type)) {
-                    fprintf(stderr, "Erro em %s:%d: tipo de retorno incompatível. Esperado %d, encontrado %d\n", 
+                // Allow implicit conversion for integer literals that fit in target type
+                int allow_literal_narrowing = 0;
+                if (node->expr->kind == NODE_KIND_NUM) {
+                    long val = node->expr->val;
+                    if (current_return_type == type_i8 && val >= -128 && val <= 127) allow_literal_narrowing = 1;
+                    else if (current_return_type == type_i16 && val >= -32768 && val <= 32767) allow_literal_narrowing = 1;
+                    else if (current_return_type == type_i32 && val >= -2147483648LL && val <= 2147483647LL) allow_literal_narrowing = 1;
+                    else if (current_return_type == type_u8 && val >= 0 && val <= 255) allow_literal_narrowing = 1;
+                    else if (current_return_type == type_u16 && val >= 0 && val <= 65535) allow_literal_narrowing = 1;
+                    else if (current_return_type == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL) allow_literal_narrowing = 1;
+                    if (allow_literal_narrowing) {
+                        node->expr->ty = current_return_type;
+                    }
+                }
+                if (!allow_literal_narrowing && !is_safe_implicit_conversion(node->expr->ty, current_return_type)) {
+                    fprintf(stderr, "Erro em %s:%d: tipo de retorno incompatível. Esperado '%s', encontrado '%s'\n",
                             node->tok ? node->tok->filename : "?",
                             node->tok ? node->tok->line : 0,
-                            current_return_type->kind, node->expr->ty->kind);
-                    // TODO: Print type names instead of enums
+                            type_name(current_return_type), type_name(node->expr->ty));
                     exit(1);
                 }
             } else {
@@ -512,6 +550,8 @@ void walk(Node *node) {
         case NODE_KIND_GE:
         case NODE_KIND_SHL:
         case NODE_KIND_SHR:
+        case NODE_KIND_BITWISE_AND:
+        case NODE_KIND_BITWISE_OR:
             walk(node->lhs);
             walk(node->rhs);
 
@@ -752,7 +792,8 @@ void walk(Node *node) {
 
             if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
                 Variable *var = node->lhs->var;
-                if (!(var->flags & VAR_FLAG_MUT)) {
+                // Variables are mutable by default. Only immutable if explicitly marked with 'imut'.
+                if (var->flags & VAR_FLAG_IMUT) {
                     fprintf(stderr, "Erro: não é possível atribuir à variável imutável '%s'.\n", var->name);
                     exit(1);
                 }
@@ -774,11 +815,11 @@ void walk(Node *node) {
             }
 
             if (!allow_literal_narrowing && !is_safe_implicit_conversion(node->rhs->ty, node->lhs->ty)) {
-                fprintf(stderr, "Erro em %s:%d: conversão implícita não segura na atribuição (de tipo %d para tipo %d). Use cast explícito.\n",
+                fprintf(stderr, "Erro em %s:%d: conversão implícita não segura na atribuição (de '%s' para '%s'). Use cast explícito.\n",
                     node->tok ? node->tok->filename : "?",
                     node->tok ? node->tok->line : 0,
-                    node->rhs->ty->kind,
-                    node->lhs->ty->kind);
+                    type_name(node->rhs->ty),
+                    type_name(node->lhs->ty));
                 exit(1);
             }
 
@@ -886,11 +927,29 @@ void walk(Node *node) {
             int i = 0;
             while (i < param_count) { // Iterate only for fixed parameters
                 walk(arg);
-                
-                // Implicit Cast
-                if (!is_safe_implicit_conversion(arg->ty, func->param_types[i])) {
-                     fprintf(stderr, "Erro: tipo incompatível no argumento %d da função '%s'.\n", i+1, func->name);
-                     // print_type(arg->ty); fprintf(stderr, " vs "); print_type(func->param_types[i]); fprintf(stderr, "\n");
+
+                // Allow implicit conversion for integer literals that fit in param type
+                int allow_literal_narrowing = 0;
+                if (arg->kind == NODE_KIND_NUM) {
+                    long val = arg->val;
+                    Type *target = func->param_types[i];
+                    if (target == type_i8 && val >= -128 && val <= 127) allow_literal_narrowing = 1;
+                    else if (target == type_i16 && val >= -32768 && val <= 32767) allow_literal_narrowing = 1;
+                    else if (target == type_i32 && val >= -2147483648LL && val <= 2147483647LL) allow_literal_narrowing = 1;
+                    else if (target == type_u8 && val >= 0 && val <= 255) allow_literal_narrowing = 1;
+                    else if (target == type_u16 && val >= 0 && val <= 65535) allow_literal_narrowing = 1;
+                    else if (target == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL) allow_literal_narrowing = 1;
+                    else if (target == type_i64) allow_literal_narrowing = 1;
+                    else if (target == type_u64 && val >= 0) allow_literal_narrowing = 1;
+                    if (allow_literal_narrowing) {
+                        arg->ty = target;
+                    }
+                }
+
+                // Check type compatibility
+                if (!allow_literal_narrowing && !is_safe_implicit_conversion(arg->ty, func->param_types[i])) {
+                     fprintf(stderr, "Erro: tipo incompatível no argumento %d da função '%s' (esperado '%s', encontrado '%s').\n",
+                             i+1, func->name, type_name(func->param_types[i]), type_name(arg->ty));
                      exit(1);
                 }
                 arg = arg->next;

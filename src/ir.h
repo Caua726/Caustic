@@ -29,6 +29,8 @@ typedef enum {
     IR_CAST,
     IR_SHL,
     IR_SHR,
+    IR_AND,
+    IR_OR,
     IR_GET_ARG,
     IR_SET_ARG,
     IR_SET_SYS_ARG,

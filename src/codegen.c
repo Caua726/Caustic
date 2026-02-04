@@ -464,6 +464,20 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             store_operand(inst->dest.vreg, ctx, "r15");
             break;
 
+        case IR_AND:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("and r14, r15");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
+        case IR_OR:
+            load_operand(inst->src1.vreg, ctx, "r14");
+            load_operand(inst->src2.vreg, ctx, "r15");
+            emit("or r14, r15");
+            store_operand(inst->dest.vreg, ctx, "r14");
+            break;
+
         case IR_ADDR:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
             if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {

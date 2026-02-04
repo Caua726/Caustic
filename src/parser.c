@@ -859,11 +859,29 @@ static Node *parse_add() {
     return node;
 }
 
-static Node *parse_logical_and() {
+static Node *parse_bitwise_and() {
     Node *node = parse_comparison();
+    while (current_token.type == TOKEN_TYPE_AND) {
+        consume();
+        node = new_binary_node(NODE_KIND_BITWISE_AND, node, parse_comparison());
+    }
+    return node;
+}
+
+static Node *parse_bitwise_or() {
+    Node *node = parse_bitwise_and();
+    while (current_token.type == TOKEN_TYPE_OR) {
+        consume();
+        node = new_binary_node(NODE_KIND_BITWISE_OR, node, parse_bitwise_and());
+    }
+    return node;
+}
+
+static Node *parse_logical_and() {
+    Node *node = parse_bitwise_or();
     while (current_token.type == TOKEN_TYPE_AND_AND) {
         consume();
-        node = new_binary_node(NODE_KIND_LOGICAL_AND, node, parse_comparison());
+        node = new_binary_node(NODE_KIND_LOGICAL_AND, node, parse_bitwise_or());
     }
     return node;
 }
@@ -1501,6 +1519,8 @@ static void free_ast_impl(Node *node) {
         case NODE_KIND_LOGICAL_OR:
         case NODE_KIND_SHL:
         case NODE_KIND_SHR:
+        case NODE_KIND_BITWISE_AND:
+        case NODE_KIND_BITWISE_OR:
         case NODE_KIND_MODULE_ACCESS:
         case NODE_KIND_MEMBER_ACCESS:
             free_ast_impl(node->lhs);
