@@ -33,9 +33,9 @@ $ ./main
   - [x] **Memory Management**
   - [X] **Dynamic Strings**
   - [-] **IO Library**
-- [ ] **Language Extensions**
-  - [ ] **Generics**
-  - [ ] **Enums & Pattern Matching** 
+- [-] **Language Extensions**
+  - [x] **Generics**
+  - [ ] **Enums & Pattern Matching**
 - [ ] **Compiler Evolution**
   - [ ] **Optimization**
   - [ ] **Self Hosting**
