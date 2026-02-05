@@ -35,7 +35,7 @@ $ ./main
   - [-] **IO Library**
 - [-] **Language Extensions**
   - [x] **Generics**
-  - [ ] **Enums & Pattern Matching**
+  - [x] **Enums & Pattern Matching**
 - [ ] **Compiler Evolution**
   - [ ] **Optimization**
   - [ ] **Self Hosting**
@@ -85,6 +85,37 @@ struct Vec3 {
 let is Vec3 as v;
 v.x = 10;
 let is i32 as size = sizeof(Vec3); // 12
+```
+
+#### Enums & Pattern Matching
+```cst
+// Simple enum
+enum Color { Red; Green; Blue; }
+
+// Tagged union (with data)
+enum Shape { Circle as i32; Rect as i32, i32; None; }
+
+// Generic enum
+enum Option gen T { Some as T; None; }
+
+// Construction
+let is Color as c = Color.Blue;
+let is Shape as s = Shape.Rect(10, 20);
+let is Option gen i32 as x = Option gen i32 .Some(42);
+
+// Pattern matching
+match Color (c) {
+    case Red { return 1; }
+    case Green { return 2; }
+    case Blue { return 3; }
+}
+
+// Destructuring
+match Shape (s) {
+    case Rect(w, h) { return w + h; }
+    case Circle(r) { return r; }
+    else { return 0; }
+}
 ```
 
 #### Flow Control
