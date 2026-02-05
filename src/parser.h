@@ -21,6 +21,7 @@ typedef enum {
     TY_PTR,
     TY_ARRAY,
     TY_STRUCT,
+    TY_ENUM,
 } TypeKind;
 
 typedef struct Field {
@@ -43,6 +44,11 @@ typedef struct Type {
     // Struct fields
     char *name; // Struct name
     Field *fields;
+
+    // Enum info
+    int variant_count;
+    int payload_offset;
+    int max_payload_size;
 
     // Generic info
     char **generic_params;      // Template params (for uninstantiated): ["T", "U"]
@@ -100,6 +106,8 @@ typedef enum {
     NODE_KIND_BITWISE_NOT,
     NODE_KIND_LOGICAL_NOT,
     NODE_KIND_NEG,
+    NODE_KIND_ENUM_LITERAL,
+    NODE_KIND_MATCH,
 } NodeKind;
 
 typedef struct StringLiteral {
@@ -169,6 +177,16 @@ typedef struct Node {
         struct Node *body;
         struct Node *cond;
     } do_while_stmt;
+    struct {
+        struct Node *expr;
+        struct Type *match_type;
+        struct Node *cases;
+        struct Node *else_b;
+    } match_stmt;
+    struct {
+        int discriminant;
+        struct Node *payload_args;
+    } enum_literal;
 } Node;
 
 void ast_print(Node *node);

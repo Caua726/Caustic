@@ -71,6 +71,9 @@ const char *TOKEN_NAMES[] = {
     "TOKEN_TYPE_BITNOT",
     "TOKEN_TYPE_CHAR",
     "TOKEN_TYPE_GEN",
+    "TOKEN_TYPE_ENUM",
+    "TOKEN_TYPE_MATCH",
+    "TOKEN_TYPE_CASE",
 };
 
 static FILE *src;
@@ -173,6 +176,9 @@ Token lexer_next() {
         else if (strcmp(t.text, "for") == 0) {t.type = TOKEN_TYPE_FOR;}
         else if (strcmp(t.text, "do") == 0) {t.type = TOKEN_TYPE_DO;}
         else if (strcmp(t.text, "gen") == 0) {t.type = TOKEN_TYPE_GEN;}
+        else if (strcmp(t.text, "enum") == 0) {t.type = TOKEN_TYPE_ENUM;}
+        else if (strcmp(t.text, "match") == 0) {t.type = TOKEN_TYPE_MATCH;}
+        else if (strcmp(t.text, "case") == 0) {t.type = TOKEN_TYPE_CASE;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;

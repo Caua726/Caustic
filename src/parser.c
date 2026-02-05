@@ -126,6 +126,8 @@ static Node *parse_mul();
 static Node *parse_primary();
 static Type *parse_type();
 static Node *parse_struct_decl();
+static Node *parse_enum_decl();
+static Node *parse_match_stmt();
 static void parse_file_body(Node **cur_ptr);
 static void parse_use(Node **cur_ptr);
 static Node *new_node(NodeKind kind);
@@ -251,6 +253,12 @@ static void parse_file_body(Node **cur_ptr) {
              continue;
         }
 
+        if (current_token.type == TOKEN_TYPE_ENUM) {
+             cur->next = parse_enum_decl();
+             cur = cur->next;
+             continue;
+        }
+
         if (current_token.type == TOKEN_TYPE_LET) {
             cur->next = parse_var_decl();
             cur = cur->next;
@@ -258,7 +266,7 @@ static void parse_file_body(Node **cur_ptr) {
         }
 
         if (current_token.type != TOKEN_TYPE_FN) {
-            error_at_token(current_token, "era esperado 'fn', 'let', 'struct' ou 'use' mas encontrou '%s'", current_token.text);
+            error_at_token(current_token, "era esperado 'fn', 'let', 'struct', 'enum' ou 'use' mas encontrou '%s'", current_token.text);
         }
 
         cur->next = parse_fn();
@@ -399,30 +407,44 @@ static Type *parse_type() {
     Type *ty = NULL;
 
     // Check for namespaced type (e.g. string.String)
+    // But only if it's NOT a known primitive type
     if (current_token.type == TOKEN_TYPE_IDENTIFIER && lookahead_token.type == TOKEN_TYPE_DOT) {
-        char *module_name = strdup(current_token.text);
-        consume(); // consume module name
-        consume(); // consume dot
-        
-        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
-            error_at_token(current_token, "esperado nome do tipo após '.'");
+        // Check if the identifier is a known primitive — if so, skip the namespace path
+        int is_primitive = 0;
+        if (strcmp(current_token.text, "i8") == 0 || strcmp(current_token.text, "i16") == 0 ||
+            strcmp(current_token.text, "i32") == 0 || strcmp(current_token.text, "i64") == 0 ||
+            strcmp(current_token.text, "u8") == 0 || strcmp(current_token.text, "u16") == 0 ||
+            strcmp(current_token.text, "u32") == 0 || strcmp(current_token.text, "u64") == 0 ||
+            strcmp(current_token.text, "f32") == 0 || strcmp(current_token.text, "f64") == 0 ||
+            strcmp(current_token.text, "bool") == 0 || strcmp(current_token.text, "char") == 0 ||
+            strcmp(current_token.text, "string") == 0 || strcmp(current_token.text, "void") == 0) {
+            is_primitive = 1;
         }
-        
-        char *type_name = strdup(current_token.text);
-        
-        // Construct full name "module.Type"
-        int len = strlen(module_name) + 1 + strlen(type_name) + 1;
-        char *full_name = calloc(1, len);
-        snprintf(full_name, len, "%s.%s", module_name, type_name);
-        
-        ty = new_type(TY_STRUCT);
-        ty->name = full_name;
-        
-        free(module_name);
-        free(type_name);
-        
-        consume(); // consume type name
-        return ty;
+        if (!is_primitive) {
+            char *module_name = strdup(current_token.text);
+            consume(); // consume module name
+            consume(); // consume dot
+
+            if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                error_at_token(current_token, "esperado nome do tipo após '.'");
+            }
+
+            char *type_name_str = strdup(current_token.text);
+
+            // Construct full name "module.Type"
+            int len = strlen(module_name) + 1 + strlen(type_name_str) + 1;
+            char *full_name = calloc(1, len);
+            snprintf(full_name, len, "%s.%s", module_name, type_name_str);
+
+            ty = new_type(TY_STRUCT);
+            ty->name = full_name;
+
+            free(module_name);
+            free(type_name_str);
+
+            consume(); // consume type name
+            return ty;
+        }
     }
 
     if (strcmp(current_token.text, "i32") == 0) {
@@ -733,36 +755,44 @@ static Node *parse_primary() {
                 }
             }
 
-            // Now expect LPAREN for function call
+            // If LPAREN follows, this is a generic function call
+            // Otherwise, return just the identifier (e.g., for enum constructors like Option gen i32 .Some(42))
             Node *id_node = new_node(NODE_KIND_IDENTIFIER);
             id_node->name = strdup(mangled);
+            id_node->generic_args = gen_args;
+            id_node->generic_arg_count = gen_count;
+            id_node->member_name = fn_name;
 
-            Node *node = new_node(NODE_KIND_FNCALL);
-            node->lhs = id_node;
-            node->generic_args = gen_args;
-            node->generic_arg_count = gen_count;
-            // Store original name for template lookup
-            node->member_name = fn_name;
+            if (current_token.type == TOKEN_TYPE_LPAREN) {
+                Node *node = new_node(NODE_KIND_FNCALL);
+                node->lhs = id_node;
+                node->generic_args = gen_args;
+                node->generic_arg_count = gen_count;
+                node->member_name = fn_name;
 
-            expect(TOKEN_TYPE_LPAREN);
+                expect(TOKEN_TYPE_LPAREN);
 
-            if (current_token.type != TOKEN_TYPE_RPAREN) {
-                Node head = {};
-                Node *cur = &head;
-                while (1) {
-                    cur->next = parse_expr();
-                    cur = cur->next;
-                    if (current_token.type == TOKEN_TYPE_COMMA) {
-                        consume();
-                    } else {
-                        break;
+                if (current_token.type != TOKEN_TYPE_RPAREN) {
+                    Node head = {};
+                    Node *cur = &head;
+                    while (1) {
+                        cur->next = parse_expr();
+                        cur = cur->next;
+                        if (current_token.type == TOKEN_TYPE_COMMA) {
+                            consume();
+                        } else {
+                            break;
+                        }
                     }
+                    node->args = head.next;
                 }
-                node->args = head.next;
+
+                expect(TOKEN_TYPE_RPAREN);
+                return node;
             }
 
-            expect(TOKEN_TYPE_RPAREN);
-            return node;
+            // Not a function call - return identifier, let parse_postfix handle the rest
+            return id_node;
         }
         if (lookahead_token.type == TOKEN_TYPE_LPAREN) {
             Node *id_node = new_node(NODE_KIND_IDENTIFIER);
@@ -1289,6 +1319,198 @@ static Node *parse_struct_decl() {
     return node;
 }
 
+static Node *parse_enum_decl() {
+    expect(TOKEN_TYPE_ENUM);
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        error_at_token(current_token, "esperado nome do enum.");
+    }
+    char *enum_name = strdup(current_token.text);
+    consume();
+
+    Type *enum_type = new_type(TY_ENUM);
+    enum_type->name = enum_name;
+
+    // Parse generic params: enum Option gen T { ... }
+    if (current_token.type == TOKEN_TYPE_GEN) {
+        consume();
+        int cap = 4;
+        enum_type->generic_params = calloc(cap, sizeof(char*));
+        enum_type->generic_param_count = 0;
+        while (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+            if (enum_type->generic_param_count >= cap) {
+                cap *= 2;
+                enum_type->generic_params = realloc(enum_type->generic_params, cap * sizeof(char*));
+            }
+            enum_type->generic_params[enum_type->generic_param_count++] = strdup(current_token.text);
+            consume();
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+    }
+
+    expect(TOKEN_TYPE_LBRACE);
+
+    Field head = {};
+    Field *cur = &head;
+    int discriminant = 0;
+
+    while (current_token.type != TOKEN_TYPE_RBRACE) {
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            error_at_token(current_token, "esperado nome da variante do enum.");
+        }
+        char *variant_name = strdup(current_token.text);
+        consume();
+
+        Field *f = calloc(1, sizeof(Field));
+        f->name = variant_name;
+        f->offset = discriminant++;
+
+        // Check for payload types: Variant as Type or Variant as Type, Type
+        if (current_token.type == TOKEN_TYPE_AS) {
+            consume();
+            // Parse first type
+            Type *first_type = parse_type();
+
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                // Multi-field payload: create anonymous struct
+                int field_cap = 4;
+                Type **payload_types = calloc(field_cap, sizeof(Type*));
+                payload_types[0] = first_type;
+                int payload_count = 1;
+
+                while (current_token.type == TOKEN_TYPE_COMMA) {
+                    consume();
+                    if (payload_count >= field_cap) {
+                        field_cap *= 2;
+                        payload_types = realloc(payload_types, field_cap * sizeof(Type*));
+                    }
+                    payload_types[payload_count++] = parse_type();
+                }
+
+                // Create anonymous struct for multi-field payload
+                Type *payload_struct = new_type(TY_STRUCT);
+                char anon_name[256];
+                snprintf(anon_name, sizeof(anon_name), "__enum_%s_%s_payload", enum_name, variant_name);
+                payload_struct->name = strdup(anon_name);
+                payload_struct->owns_fields = 1;
+
+                Field *phead = NULL, *ptail = NULL;
+                int poffset = 0;
+                for (int i = 0; i < payload_count; i++) {
+                    Field *pf = calloc(1, sizeof(Field));
+                    char fname[16];
+                    snprintf(fname, sizeof(fname), "_%d", i);
+                    pf->name = strdup(fname);
+                    pf->type = payload_types[i];
+                    pf->offset = poffset;
+                    poffset += payload_types[i]->size;
+                    if (!phead) { phead = pf; ptail = pf; }
+                    else { ptail->next = pf; ptail = pf; }
+                }
+                payload_struct->fields = phead;
+                payload_struct->size = poffset;
+                f->type = payload_struct;
+                free(payload_types);
+            } else {
+                // Single type payload
+                f->type = first_type;
+            }
+        } else {
+            f->type = NULL; // No payload
+        }
+
+        expect(TOKEN_TYPE_SEMICOLON);
+        cur->next = f;
+        cur = f;
+    }
+    expect(TOKEN_TYPE_RBRACE);
+
+    enum_type->fields = head.next;
+    enum_type->variant_count = discriminant;
+
+    Node *node = new_node(NODE_KIND_BLOCK);
+    node->stmts = NULL;
+    node->ty = enum_type;
+    return node;
+}
+
+static Node *parse_match_stmt() {
+    Token match_tok = current_token;
+    expect(TOKEN_TYPE_MATCH);
+
+    // Parse the type name: match TypeName (expr) { ... }
+    Type *match_type = parse_type();
+
+    expect(TOKEN_TYPE_LPAREN);
+    Node *match_expr = parse_expr();
+    expect(TOKEN_TYPE_RPAREN);
+
+    expect(TOKEN_TYPE_LBRACE);
+
+    Node *match_node = new_node(NODE_KIND_MATCH);
+    match_node->tok = calloc(1, sizeof(Token));
+    *match_node->tok = match_tok;
+    match_node->match_stmt.expr = match_expr;
+    match_node->match_stmt.match_type = match_type;
+
+    // Parse cases
+    Node case_head = {};
+    Node *case_cur = &case_head;
+
+    while (current_token.type != TOKEN_TYPE_RBRACE) {
+        if (current_token.type == TOKEN_TYPE_ELSE) {
+            consume();
+            match_node->match_stmt.else_b = parse_block();
+            break;
+        }
+
+        expect(TOKEN_TYPE_CASE);
+
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            error_at_token(current_token, "esperado nome da variante apos 'case'.");
+        }
+
+        Node *case_node = new_node(NODE_KIND_BLOCK);
+        case_node->name = strdup(current_token.text);
+        consume();
+
+        // Parse destructuring bindings: case Variant(x, y) { ... }
+        if (current_token.type == TOKEN_TYPE_LPAREN) {
+            consume();
+            Node param_head = {};
+            Node *param_cur = &param_head;
+            while (current_token.type != TOKEN_TYPE_RPAREN) {
+                if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                    error_at_token(current_token, "esperado nome de binding no case.");
+                }
+                Node *binding = new_node(NODE_KIND_LET);
+                binding->name = strdup(current_token.text);
+                consume();
+                param_cur->next = binding;
+                param_cur = binding;
+                if (current_token.type == TOKEN_TYPE_COMMA) {
+                    consume();
+                } else {
+                    break;
+                }
+            }
+            expect(TOKEN_TYPE_RPAREN);
+            case_node->params = param_head.next;
+        }
+
+        case_node->body = parse_block();
+        case_cur->next = case_node;
+        case_cur = case_node;
+    }
+
+    expect(TOKEN_TYPE_RBRACE);
+    match_node->match_stmt.cases = case_head.next;
+    return match_node;
+}
+
 static Node *parse_asm_stmt() {
     consume();
     expect(TOKEN_TYPE_LPAREN);
@@ -1423,6 +1645,10 @@ static Node *parse_stmt() {
 
     if (current_token.type == TOKEN_TYPE_WHILE) {
         return parse_while_stmt();
+    }
+
+    if (current_token.type == TOKEN_TYPE_MATCH) {
+        return parse_match_stmt();
     }
 
     if (current_token.type == TOKEN_TYPE_BREAK) {
@@ -1654,6 +1880,25 @@ static void ast_print_recursive(Node *node, int depth) {
             ast_print_recursive(node->lhs, depth + 1);
             ast_print_recursive(node->rhs, depth + 1);
             break;
+        case NODE_KIND_ENUM_LITERAL:
+            printf("EnumLiteral(disc=%d)\n", node->enum_literal.discriminant);
+            break;
+        case NODE_KIND_MATCH:
+            printf("MatchStmt\n");
+            for (int i = 0; i < depth + 1; i++) printf("  ");
+            printf("Expr:\n");
+            ast_print_recursive(node->match_stmt.expr, depth + 2);
+            for (Node *c = node->match_stmt.cases; c; c = c->next) {
+                for (int i = 0; i < depth + 1; i++) printf("  ");
+                printf("Case(%s, disc=%ld):\n", c->name ? c->name : "?", c->val);
+                ast_print_recursive(c->body, depth + 2);
+            }
+            if (node->match_stmt.else_b) {
+                for (int i = 0; i < depth + 1; i++) printf("  ");
+                printf("Else:\n");
+                ast_print_recursive(node->match_stmt.else_b, depth + 2);
+            }
+            break;
         default:
             printf("Nó Desconhecido\n");
             break;
@@ -1771,6 +2016,14 @@ static void free_ast_impl(Node *node) {
         case NODE_KIND_MEMBER_ACCESS:
             free_ast_impl(node->lhs);
             free_ast_impl(node->rhs);
+            break;
+        case NODE_KIND_ENUM_LITERAL:
+            free_ast_impl(node->enum_literal.payload_args);
+            break;
+        case NODE_KIND_MATCH:
+            free_ast_impl(node->match_stmt.expr);
+            free_ast_impl(node->match_stmt.cases);
+            free_ast_impl(node->match_stmt.else_b);
             break;
         default:
             break;

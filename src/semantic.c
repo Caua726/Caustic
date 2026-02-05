@@ -34,6 +34,7 @@ static const char *type_name(Type *ty);
 static Variable *symtab_lookup(char *name);
 static void resolve_type_ref(Type *ty);
 static void declare_struct(char *name, Type *type);
+static void declare_enum(char *name, Type *type);
 static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic);
 void walk(Node *node);
 
@@ -260,6 +261,15 @@ static Node *clone_node(Node *node) {
         case NODE_KIND_USE:
             c->body = node->body; // Share module body
             break;
+        case NODE_KIND_ENUM_LITERAL:
+            c->enum_literal.payload_args = clone_node_list(node->enum_literal.payload_args);
+            break;
+        case NODE_KIND_MATCH:
+            c->match_stmt.expr = clone_node(node->match_stmt.expr);
+            c->match_stmt.match_type = clone_type(node->match_stmt.match_type);
+            c->match_stmt.cases = clone_node_list(node->match_stmt.cases);
+            c->match_stmt.else_b = clone_node(node->match_stmt.else_b);
+            break;
         default:
             // NUM, IDENTIFIER, STRING_LITERAL, ASM, BREAK, CONTINUE, SIZEOF — no deep children
             break;
@@ -433,6 +443,25 @@ static void substitute_types_in_node(Node *node, char **param_names, Type **conc
             substitute_types_in_node(node->lhs, param_names, concrete, count);
             substitute_types_in_node(node->rhs, param_names, concrete, count);
             break;
+        case NODE_KIND_ENUM_LITERAL:
+            for (Node *a = node->enum_literal.payload_args; a; a = a->next)
+                substitute_types_in_node(a, param_names, concrete, count);
+            break;
+        case NODE_KIND_MATCH:
+            substitute_types_in_node(node->match_stmt.expr, param_names, concrete, count);
+            if (node->match_stmt.match_type) {
+                Type *sub = find_generic_substitution(node->match_stmt.match_type, param_names, concrete, count);
+                if (sub) node->match_stmt.match_type = sub;
+                else if (!node->match_stmt.match_type->is_static)
+                    substitute_type(node->match_stmt.match_type, param_names, concrete, count);
+            }
+            for (Node *c = node->match_stmt.cases; c; c = c->next) {
+                for (Node *p = c->params; p; p = p->next)
+                    substitute_types_in_node(p, param_names, concrete, count);
+                substitute_types_in_node(c->body, param_names, concrete, count);
+            }
+            substitute_types_in_node(node->match_stmt.else_b, param_names, concrete, count);
+            break;
         default:
             break;
     }
@@ -493,6 +522,7 @@ static const char *type_name(Type *ty) {
         case TY_PTR: return "*ptr";
         case TY_ARRAY: return "array";
         case TY_STRUCT: return ty->name ? ty->name : "struct";
+        case TY_ENUM: return ty->name ? ty->name : "enum";
         default: return "unknown";
     }
 }
@@ -582,6 +612,65 @@ static Type *lookup_struct(char *name) {
     return NULL;
 }
 
+typedef struct EnumDef {
+    char *name;
+    Type *type;
+    struct EnumDef *next;
+} EnumDef;
+
+static EnumDef *enum_defs = NULL;
+
+static Type *lookup_enum(char *name) {
+    for (EnumDef *e = enum_defs; e; e = e->next) {
+        if (strcmp(e->name, name) == 0) {
+            return e->type;
+        }
+    }
+    return NULL;
+}
+
+static void declare_enum(char *name, Type *type) {
+    for (EnumDef *e = enum_defs; e; e = e->next) {
+        if (strcmp(e->name, name) == 0) {
+            return;
+        }
+    }
+    EnumDef *e = calloc(1, sizeof(EnumDef));
+    e->name = strdup(name);
+    e->type = type;
+    e->next = enum_defs;
+    enum_defs = e;
+
+    // Calculate layout
+    int has_payload = 0;
+    int max_payload = 0;
+    for (Field *f = type->fields; f; f = f->next) {
+        if (f->type) {
+            has_payload = 1;
+            if (f->type->kind == TY_STRUCT && f->type->fields) {
+                // Anonymous struct payload — resolve field types
+                for (Field *pf = f->type->fields; pf; pf = pf->next) {
+                    resolve_type_ref(pf->type);
+                }
+            } else {
+                resolve_type_ref(f->type);
+            }
+            int payload_size = f->type->size;
+            if (payload_size > max_payload) max_payload = payload_size;
+        }
+    }
+
+    if (has_payload) {
+        type->payload_offset = 8; // tag(4) + pad(4), aligned to 8
+        type->max_payload_size = max_payload;
+        type->size = 8 + max_payload;
+    } else {
+        type->payload_offset = 0;
+        type->max_payload_size = 0;
+        type->size = 4; // Just discriminant
+    }
+}
+
 static void resolve_type_ref(Type *ty) {
     if (ty->kind == TY_STRUCT && ty->fields == NULL && ty->name != NULL) {
         Type *def = lookup_struct(ty->name);
@@ -631,18 +720,49 @@ static void resolve_type_ref(Type *ty) {
         }
 
         if (!def) {
-            fprintf(stderr, "Erro: struct '%s' não definida.\n", ty->name);
-            // Print all registered structs for debugging
-            fprintf(stderr, "Structs registradas:\n");
-            for (StructDef *s = struct_defs; s; s = s->next) {
-                fprintf(stderr, "  - %s\n", s->name);
+            // Try enum lookup before failing
+            Type *enum_def = lookup_enum(ty->name);
+            if (!enum_def && current_module_path) {
+                int len = strlen(current_module_path) + 1 + strlen(ty->name) + 1;
+                char *mangled = malloc(len);
+                snprintf(mangled, len, "%s_%s", current_module_path, ty->name);
+                enum_def = lookup_enum(mangled);
+                free(mangled);
             }
-            exit(1);
+            // Try generic enum instantiation
+            if (!enum_def && ty->generic_arg_count > 0 && ty->base_name) {
+                GenericTemplate *tmpl = lookup_generic_template(ty->base_name);
+                if (tmpl && !tmpl->is_function) {
+                    instantiate_generic_struct(tmpl, ty->generic_args, ty->generic_arg_count, ty->name);
+                    enum_def = lookup_enum(ty->name);
+                }
+            }
+            if (enum_def) {
+                ty->kind = TY_ENUM;
+                ty->fields = enum_def->fields;
+                ty->owns_fields = 0;
+                ty->size = enum_def->size;
+                ty->variant_count = enum_def->variant_count;
+                ty->payload_offset = enum_def->payload_offset;
+                ty->max_payload_size = enum_def->max_payload_size;
+            } else {
+                fprintf(stderr, "Erro: tipo '%s' não definido.\n", ty->name);
+                fprintf(stderr, "Structs registradas:\n");
+                for (StructDef *s = struct_defs; s; s = s->next) {
+                    fprintf(stderr, "  - %s\n", s->name);
+                }
+                fprintf(stderr, "Enums registrados:\n");
+                for (EnumDef *e = enum_defs; e; e = e->next) {
+                    fprintf(stderr, "  - %s\n", e->name);
+                }
+                exit(1);
+            }
+        } else {
+            // Copy details from struct def
+            ty->fields = def->fields;
+            ty->owns_fields = 0;
+            ty->size = def->size;
         }
-        // Copy details
-        ty->fields = def->fields;
-        ty->owns_fields = 0; // We are borrowing fields from def, do not free them
-        ty->size = def->size;
         // ty->name is already set
     }
     if (ty->kind == TY_PTR || ty->kind == TY_ARRAY) {
@@ -861,6 +981,7 @@ static void instantiate_generic_struct(GenericTemplate *tmpl, Type **concrete, i
 
     // Substitute type params in fields — use direct pointer replacement
     for (Field *f = new_struct->fields; f; f = f->next) {
+        if (!f->type) continue; // Enum variants without payload
         Type *sub = find_generic_substitution(f->type, tmpl->params, concrete, count);
         if (sub) {
             f->type = sub;
@@ -871,6 +992,7 @@ static void instantiate_generic_struct(GenericTemplate *tmpl, Type **concrete, i
 
     // Handle nested generic struct fields (e.g. Inner gen T inside Outer gen T)
     for (Field *f = new_struct->fields; f; f = f->next) {
+        if (!f->type) continue; // Enum variants without payload
         if (f->type->generic_arg_count > 0 && f->type->base_name) {
             // Substitute each generic_arg (e.g. T -> i32)
             for (int gi = 0; gi < f->type->generic_arg_count; gi++) {
@@ -905,7 +1027,11 @@ static void instantiate_generic_struct(GenericTemplate *tmpl, Type **concrete, i
     }
 
     // Register and calculate sizes
-    declare_struct(mangled_name, new_struct);
+    if (new_struct->kind == TY_ENUM) {
+        declare_enum(mangled_name, new_struct);
+    } else {
+        declare_struct(mangled_name, new_struct);
+    }
 }
 
 void walk(Node *node) {
@@ -1085,14 +1211,16 @@ void walk(Node *node) {
             walk(node->lhs);
             walk(node->rhs);
 
-            if ((node->kind == NODE_KIND_EQ || node->kind == NODE_KIND_NE) && 
-                (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT)) {
-                fprintf(stderr, "Erro na linha %d: Comparação direta de structs ('==', '!=') não suportada. Use uma função de comparação.\n", node->tok ? node->tok->line : 0);
+            if ((node->kind == NODE_KIND_EQ || node->kind == NODE_KIND_NE) &&
+                (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT ||
+                 node->lhs->ty->kind == TY_ENUM || node->rhs->ty->kind == TY_ENUM)) {
+                fprintf(stderr, "Erro na linha %d: Comparação direta de structs/enums ('==', '!=') não suportada.\n", node->tok ? node->tok->line : 0);
                 exit(1);
             }
 
-            if (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT) {
-                fprintf(stderr, "Erro na linha %d: Operacao invalida com structs.\n", node->tok ? node->tok->line : 0);
+            if (node->lhs->ty->kind == TY_STRUCT || node->rhs->ty->kind == TY_STRUCT ||
+                node->lhs->ty->kind == TY_ENUM || node->rhs->ty->kind == TY_ENUM) {
+                fprintf(stderr, "Erro na linha %d: Operacao invalida com structs/enums.\n", node->tok ? node->tok->line : 0);
                 exit(1);
             }
 
@@ -1413,8 +1541,106 @@ void walk(Node *node) {
 
         case NODE_KIND_FNCALL: {
             Function *func = NULL;
-            // fprintf(stderr, "Debug: Visiting FNCALL. LHS kind: %d\n", node->lhs->kind);
-            
+
+            // Case 0: Enum constructor call (EnumName.Variant(args) or EnumName gen T .Variant(args))
+            if (node->lhs->kind == NODE_KIND_MEMBER_ACCESS && node->lhs->lhs->kind == NODE_KIND_IDENTIFIER) {
+                char *enum_name = node->lhs->lhs->name;
+                char *variant_name = node->lhs->member_name;
+
+                // Check if it's an enum (not a variable)
+                Variable *var_check = symtab_lookup(enum_name);
+                Type *enum_ty = NULL;
+                if (!var_check) {
+                    enum_ty = lookup_enum(enum_name);
+                } else if (var_check->is_module) {
+                    // Let module handling below deal with this
+                    enum_ty = NULL;
+                }
+
+                if (enum_ty) {
+                    Field *variant = NULL;
+                    for (Field *f = enum_ty->fields; f; f = f->next) {
+                        if (strcmp(f->name, variant_name) == 0) {
+                            variant = f;
+                            break;
+                        }
+                    }
+                    if (!variant) {
+                        fprintf(stderr, "Erro: variante '%s' não existe no enum '%s'.\n", variant_name, enum_ty->name);
+                        exit(1);
+                    }
+                    if (!variant->type) {
+                        fprintf(stderr, "Erro: variante '%s.%s' não aceita argumentos.\n", enum_ty->name, variant_name);
+                        exit(1);
+                    }
+
+                    // Type check args against payload
+                    Node *arg = node->args;
+                    if (variant->type->kind == TY_STRUCT && variant->type->fields) {
+                        // Multi-field payload
+                        Field *pf = variant->type->fields;
+                        while (arg && pf) {
+                            walk(arg);
+                            resolve_type_ref(pf->type);
+                            // Allow literal narrowing for enums too
+                            int allow = 0;
+                            if (arg->kind == NODE_KIND_NUM) {
+                                long val = arg->val;
+                                Type *target = pf->type;
+                                if (target == type_i8 && val >= -128 && val <= 127) allow = 1;
+                                else if (target == type_i16 && val >= -32768 && val <= 32767) allow = 1;
+                                else if (target == type_i32 && val >= -2147483648LL && val <= 2147483647LL) allow = 1;
+                                else if (target == type_u8 && val >= 0 && val <= 255) allow = 1;
+                                else if (target == type_u16 && val >= 0 && val <= 65535) allow = 1;
+                                else if (target == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL) allow = 1;
+                                if (allow) arg->ty = target;
+                            }
+                            if (!allow && !is_safe_implicit_conversion(arg->ty, pf->type)) {
+                                fprintf(stderr, "Erro: tipo incompatível no argumento de '%s.%s'.\n", enum_ty->name, variant_name);
+                                exit(1);
+                            }
+                            arg = arg->next;
+                            pf = pf->next;
+                        }
+                        if (arg || pf) {
+                            fprintf(stderr, "Erro: número de argumentos incorreto para '%s.%s'.\n", enum_ty->name, variant_name);
+                            exit(1);
+                        }
+                    } else {
+                        // Single field payload
+                        walk(arg);
+                        resolve_type_ref(variant->type);
+                        int allow = 0;
+                        if (arg->kind == NODE_KIND_NUM) {
+                            long val = arg->val;
+                            Type *target = variant->type;
+                            if (target == type_i8 && val >= -128 && val <= 127) allow = 1;
+                            else if (target == type_i16 && val >= -32768 && val <= 32767) allow = 1;
+                            else if (target == type_i32 && val >= -2147483648LL && val <= 2147483647LL) allow = 1;
+                            else if (target == type_u8 && val >= 0 && val <= 255) allow = 1;
+                            else if (target == type_u16 && val >= 0 && val <= 65535) allow = 1;
+                            else if (target == type_u32 && val >= 0 && (unsigned long)val <= 4294967295ULL) allow = 1;
+                            if (allow) arg->ty = target;
+                        }
+                        if (!allow && !is_safe_implicit_conversion(arg->ty, variant->type)) {
+                            fprintf(stderr, "Erro: tipo incompatível no argumento de '%s.%s'.\n", enum_ty->name, variant_name);
+                            exit(1);
+                        }
+                        if (arg->next) {
+                            fprintf(stderr, "Erro: argumentos demais para '%s.%s'.\n", enum_ty->name, variant_name);
+                            exit(1);
+                        }
+                    }
+
+                    // Transform into ENUM_LITERAL
+                    node->kind = NODE_KIND_ENUM_LITERAL;
+                    node->ty = enum_ty;
+                    node->enum_literal.discriminant = variant->offset;
+                    node->enum_literal.payload_args = node->args;
+                    return;
+                }
+            }
+
             // Case 1: Direct Identifier Call (func())
             if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
                 func = lookup_function(node->lhs->name);
@@ -1563,9 +1789,141 @@ void walk(Node *node) {
             // Handled in analyze passes
             return;
 
+        case NODE_KIND_ENUM_LITERAL:
+            // Already resolved, nothing to do
+            return;
+
+        case NODE_KIND_MATCH: {
+            resolve_type_ref(node->match_stmt.match_type);
+            walk(node->match_stmt.expr);
+
+            Type *mt = node->match_stmt.match_type;
+            if (mt->kind != TY_ENUM) {
+                fprintf(stderr, "Erro: 'match' requer tipo enum, mas encontrou '%s'.\n", type_name(mt));
+                exit(1);
+            }
+
+            // Track exhaustiveness
+            int *covered = calloc(mt->variant_count, sizeof(int));
+            int has_else = (node->match_stmt.else_b != NULL);
+
+            for (Node *c = node->match_stmt.cases; c; c = c->next) {
+                // Find variant by name
+                Field *variant = NULL;
+                for (Field *f = mt->fields; f; f = f->next) {
+                    if (strcmp(f->name, c->name) == 0) {
+                        variant = f;
+                        break;
+                    }
+                }
+                if (!variant) {
+                    fprintf(stderr, "Erro: variante '%s' não existe no enum '%s'.\n", c->name, mt->name);
+                    exit(1);
+                }
+                c->val = variant->offset; // Store discriminant
+                covered[variant->offset] = 1;
+
+                // Handle destructuring bindings
+                symtab_enter_scope();
+                if (c->params) {
+                    if (!variant->type) {
+                        fprintf(stderr, "Erro: variante '%s' não tem dados para destructuring.\n", c->name);
+                        exit(1);
+                    }
+                    if (variant->type->kind == TY_STRUCT && variant->type->fields) {
+                        // Multi-field payload — bind each to corresponding field
+                        Node *binding = c->params;
+                        Field *pf = variant->type->fields;
+                        while (binding && pf) {
+                            resolve_type_ref(pf->type);
+                            binding->ty = pf->type;
+                            Variable *bvar = symtab_declare(binding->name, pf->type, VAR_FLAG_NONE);
+                            binding->var = bvar;
+                            binding->offset = bvar->offset;
+                            binding = binding->next;
+                            pf = pf->next;
+                        }
+                        if (binding) {
+                            fprintf(stderr, "Erro: bindings demais no case '%s'.\n", c->name);
+                            exit(1);
+                        }
+                    } else {
+                        // Single field payload
+                        Node *binding = c->params;
+                        if (binding->next) {
+                            fprintf(stderr, "Erro: variante '%s' tem apenas um campo, mas múltiplos bindings.\n", c->name);
+                            exit(1);
+                        }
+                        resolve_type_ref(variant->type);
+                        binding->ty = variant->type;
+                        Variable *bvar = symtab_declare(binding->name, variant->type, VAR_FLAG_NONE);
+                        binding->var = bvar;
+                        binding->offset = bvar->offset;
+                    }
+                }
+                walk(c->body);
+                symtab_exit_scope();
+            }
+
+            if (has_else) {
+                symtab_enter_scope();
+                walk(node->match_stmt.else_b);
+                symtab_exit_scope();
+            }
+
+            // Check exhaustiveness
+            if (!has_else) {
+                for (int i = 0; i < mt->variant_count; i++) {
+                    if (!covered[i]) {
+                        // Find variant name for warning
+                        for (Field *f = mt->fields; f; f = f->next) {
+                            if (f->offset == i) {
+                                fprintf(stderr, "Warning: variante '%s' não coberta no match de '%s'.\n", f->name, mt->name);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            free(covered);
+            return;
+        }
+
         case NODE_KIND_MODULE_ACCESS:
         case NODE_KIND_MEMBER_ACCESS:
-            // fprintf(stderr, "Debug: Visiting MEMBER_ACCESS. Node: %p\n", (void*)node);
+            // Check if LHS is an enum type name (e.g. Color.Red)
+            if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
+                // First check if it's a variable
+                Variable *var_check = symtab_lookup(node->lhs->name);
+                if (!var_check || (!var_check->is_module && var_check->type->kind != TY_ENUM)) {
+                    // Not a variable, try enum lookup
+                    Type *enum_ty = lookup_enum(node->lhs->name);
+                    if (enum_ty) {
+                        // Found enum — resolve variant
+                        Field *variant = NULL;
+                        for (Field *f = enum_ty->fields; f; f = f->next) {
+                            if (strcmp(f->name, node->member_name) == 0) {
+                                variant = f;
+                                break;
+                            }
+                        }
+                        if (!variant) {
+                            fprintf(stderr, "Erro: variante '%s' não existe no enum '%s'.\n", node->member_name, enum_ty->name);
+                            exit(1);
+                        }
+                        if (variant->type) {
+                            fprintf(stderr, "Erro: variante '%s.%s' requer argumentos.\n", enum_ty->name, variant->name);
+                            exit(1);
+                        }
+                        node->kind = NODE_KIND_ENUM_LITERAL;
+                        node->ty = enum_ty;
+                        node->enum_literal.discriminant = variant->offset;
+                        node->enum_literal.payload_args = NULL;
+                        return;
+                    }
+                }
+            }
+
             // Check if LHS is a module
             if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
                 Variable *var = symtab_lookup(node->lhs->name);
@@ -1678,6 +2036,22 @@ static void register_structs(Node *node) {
             }
             declare_struct(name, n->ty);
             if (mangled) free(mangled);
+        } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_ENUM) {
+            // If generic template, store and skip
+            if (n->ty->generic_param_count > 0) {
+                store_generic_template(n->ty->name, n->ty->generic_params, n->ty->generic_param_count, NULL, n->ty, 0);
+                continue;
+            }
+            char *name = n->ty->name;
+            char *mangled = NULL;
+            if (current_module_path) {
+                int len = strlen(current_module_path) + 1 + strlen(name) + 1;
+                mangled = malloc(len);
+                snprintf(mangled, len, "%s_%s", current_module_path, name);
+                name = mangled;
+            }
+            declare_enum(name, n->ty);
+            if (mangled) free(mangled);
         }
     }
 }
@@ -1787,6 +2161,24 @@ static void resolve_fields(Node *node) {
                 offset += f->type->size;
             }
             type->size = offset;
+        } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_ENUM) {
+            // Skip generic templates
+            if (n->ty->generic_param_count > 0) continue;
+
+            // Resolve payload types for enum variants
+            Type *type = n->ty;
+            for (Field *f = type->fields; f; f = f->next) {
+                if (f->type) {
+                    if (f->type->kind == TY_STRUCT && f->type->fields) {
+                        // Anonymous struct payload
+                        for (Field *pf = f->type->fields; pf; pf = pf->next) {
+                            resolve_type_ref(pf->type);
+                        }
+                    } else {
+                        resolve_type_ref(f->type);
+                    }
+                }
+            }
         }
     }
 }
@@ -1906,6 +2298,7 @@ void analyze(Node *node) {
     symtab_init();
     function_table = NULL;
     struct_defs = NULL;
+    enum_defs = NULL;
     module_list = NULL;
     generic_templates = NULL;
     generic_instances = NULL;
@@ -1957,6 +2350,16 @@ void semantic_cleanup() {
         sd = next;
     }
     struct_defs = NULL;
+
+    // Free enum definitions
+    EnumDef *ed = enum_defs;
+    while (ed) {
+        EnumDef *next = ed->next;
+        if (ed->name) free(ed->name);
+        free(ed);
+        ed = next;
+    }
+    enum_defs = NULL;
 
     // Free module list (only the module structs, scopes are in all_scopes)
     Module *mod = module_list;

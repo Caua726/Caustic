@@ -852,6 +852,139 @@ static int gen_expr(Node *node) {
             return ret_reg;
         }
 
+        case NODE_KIND_ENUM_LITERAL: {
+            int line = node->tok ? node->tok->line : 0;
+            int disc = node->enum_literal.discriminant;
+
+            if (!node->enum_literal.payload_args && node->ty->size <= 4) {
+                // Simple enum (no payload variants at all): just return the discriminant as an i32
+                return emit_imm(disc, line);
+            }
+
+            if (!node->enum_literal.payload_args && node->ty->size > 4) {
+                // Tagged union variant with no payload (e.g., None in Option gen T):
+                // Must still allocate the full tagged union and store the discriminant
+                int total_size = node->ty->size;
+                int offset = ctx.current_func->alloc_stack_size;
+                ctx.current_func->alloc_stack_size += total_size;
+                if (ctx.current_func->alloc_stack_size % 16 != 0) {
+                    ctx.current_func->alloc_stack_size += 16 - (ctx.current_func->alloc_stack_size % 16);
+                }
+
+                int base_addr = new_vreg();
+                IRInst *addr_inst = new_inst(IR_GET_ALLOC_ADDR);
+                addr_inst->dest = op_vreg(base_addr);
+                addr_inst->src1 = op_imm(offset);
+                addr_inst->line = line;
+                emit(addr_inst);
+
+                int disc_reg = emit_imm(disc, line);
+                IRInst *store_tag = new_inst(IR_STORE);
+                store_tag->dest = op_vreg(base_addr);
+                store_tag->src1 = op_vreg(disc_reg);
+                store_tag->cast_to_type = type_i32;
+                store_tag->line = line;
+                emit(store_tag);
+
+                return base_addr;
+            }
+
+            // Tagged union: allocate stack space, store tag + payload
+            int total_size = node->ty->size;
+            int offset = ctx.current_func->alloc_stack_size;
+            ctx.current_func->alloc_stack_size += total_size;
+            // Align to 16
+            if (ctx.current_func->alloc_stack_size % 16 != 0) {
+                ctx.current_func->alloc_stack_size += 16 - (ctx.current_func->alloc_stack_size % 16);
+            }
+
+            int base_addr = new_vreg();
+            IRInst *addr_inst = new_inst(IR_GET_ALLOC_ADDR);
+            addr_inst->dest = op_vreg(base_addr);
+            addr_inst->src1 = op_imm(offset);
+            addr_inst->line = line;
+            emit(addr_inst);
+
+            // Store discriminant (i32) at offset 0
+            int disc_reg = emit_imm(disc, line);
+            IRInst *store_tag = new_inst(IR_STORE);
+            store_tag->dest = op_vreg(base_addr);
+            store_tag->src1 = op_vreg(disc_reg);
+            store_tag->cast_to_type = type_i32;
+            store_tag->line = line;
+            emit(store_tag);
+
+            // Store payload at payload_offset
+            int payload_off = node->ty->payload_offset;
+            int payload_addr_reg = base_addr;
+            if (payload_off > 0) {
+                int off_reg = emit_imm(payload_off, line);
+                payload_addr_reg = emit_binary(IR_ADD, base_addr, off_reg, line);
+            }
+
+            // Check if multi-field or single-field payload
+            Node *arg = node->enum_literal.payload_args;
+
+            // Find the variant to check payload type
+            Field *variant = NULL;
+            for (Field *f = node->ty->fields; f; f = f->next) {
+                if (f->offset == disc) {
+                    variant = f;
+                    break;
+                }
+            }
+
+            if (variant && variant->type && variant->type->kind == TY_STRUCT && variant->type->fields) {
+                // Multi-field: store each field at its sub-offset
+                Field *pf = variant->type->fields;
+                while (arg && pf) {
+                    int val = gen_expr(arg);
+                    int field_addr = payload_addr_reg;
+                    if (pf->offset > 0) {
+                        int foff_reg = emit_imm(pf->offset, line);
+                        field_addr = emit_binary(IR_ADD, payload_addr_reg, foff_reg, line);
+                    }
+                    if (pf->type->size > 8) {
+                        IRInst *copy = new_inst(IR_COPY);
+                        copy->dest = op_vreg(field_addr);
+                        copy->src1 = op_vreg(val);
+                        copy->src2 = op_imm(pf->type->size);
+                        copy->line = line;
+                        emit(copy);
+                    } else {
+                        IRInst *store = new_inst(IR_STORE);
+                        store->dest = op_vreg(field_addr);
+                        store->src1 = op_vreg(val);
+                        store->cast_to_type = pf->type;
+                        store->line = line;
+                        emit(store);
+                    }
+                    arg = arg->next;
+                    pf = pf->next;
+                }
+            } else {
+                // Single field
+                int val = gen_expr(arg);
+                if (variant->type->size > 8) {
+                    IRInst *copy = new_inst(IR_COPY);
+                    copy->dest = op_vreg(payload_addr_reg);
+                    copy->src1 = op_vreg(val);
+                    copy->src2 = op_imm(variant->type->size);
+                    copy->line = line;
+                    emit(copy);
+                } else {
+                    IRInst *store = new_inst(IR_STORE);
+                    store->dest = op_vreg(payload_addr_reg);
+                    store->src1 = op_vreg(val);
+                    store->cast_to_type = variant->type;
+                    store->line = line;
+                    emit(store);
+                }
+            }
+
+            return base_addr;
+        }
+
         case NODE_KIND_SYSCALL: {
             int arg_count = 0;
             for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
@@ -1180,6 +1313,186 @@ static void gen_stmt_single(Node *node) {
         case NODE_KIND_ASSIGN:
             gen_expr(node);
             break;
+
+        case NODE_KIND_MATCH: {
+            int saved_ret = ctx.has_returned;
+            int end_label = new_label();
+            int line = node->tok ? node->tok->line : 0;
+
+            // Get address of the match expression
+            int expr_reg = gen_expr(node->match_stmt.expr);
+            Type *mt = node->match_stmt.match_type;
+            int is_tagged = (mt->payload_offset > 0);
+
+            // Load discriminant
+            int disc_reg;
+            if (is_tagged) {
+                // expr_reg is address; load i32 tag from offset 0
+                disc_reg = new_vreg();
+                IRInst *load = new_inst(IR_LOAD);
+                load->dest = op_vreg(disc_reg);
+                load->src1 = op_vreg(expr_reg);
+                load->cast_to_type = type_i32;
+                load->line = line;
+                emit(load);
+            } else {
+                // Simple enum: expr_reg IS the discriminant value
+                disc_reg = expr_reg;
+            }
+
+            int all_returned = 1;
+
+            for (Node *c = node->match_stmt.cases; c; c = c->next) {
+                int next_label = new_label();
+                int case_disc = c->val;
+
+                // Compare disc_reg == case_disc
+                int imm = emit_imm(case_disc, line);
+                int cmp = emit_binary(IR_EQ, disc_reg, imm, line);
+
+                IRInst *jz = new_inst(IR_JZ);
+                jz->src1 = op_vreg(cmp);
+                jz->dest = op_label(next_label);
+                jz->line = line;
+                emit(jz);
+
+                // Extract payload bindings if any
+                if (c->params && is_tagged) {
+                    int payload_off = mt->payload_offset;
+                    int payload_addr = expr_reg;
+                    if (payload_off > 0) {
+                        int off_reg = emit_imm(payload_off, line);
+                        payload_addr = emit_binary(IR_ADD, expr_reg, off_reg, line);
+                    }
+
+                    // Find variant for payload type info
+                    Field *variant = NULL;
+                    for (Field *f = mt->fields; f; f = f->next) {
+                        if (f->offset == case_disc) {
+                            variant = f;
+                            break;
+                        }
+                    }
+
+                    if (variant && variant->type) {
+                        if (variant->type->kind == TY_STRUCT && variant->type->fields) {
+                            // Multi-field: load each field
+                            Node *binding = c->params;
+                            Field *pf = variant->type->fields;
+                            while (binding && pf) {
+                                int field_addr = payload_addr;
+                                if (pf->offset > 0) {
+                                    int foff = emit_imm(pf->offset, line);
+                                    field_addr = emit_binary(IR_ADD, payload_addr, foff, line);
+                                }
+                                int val;
+                                if (pf->type->size > 8) {
+                                    val = field_addr;
+                                } else {
+                                    val = new_vreg();
+                                    IRInst *load = new_inst(IR_LOAD);
+                                    load->dest = op_vreg(val);
+                                    load->src1 = op_vreg(field_addr);
+                                    load->cast_to_type = pf->type;
+                                    load->line = line;
+                                    emit(load);
+                                }
+                                // Store into binding's stack slot
+                                if (pf->type->size > 8) {
+                                    int dest_addr = new_vreg();
+                                    IRInst *addr = new_inst(IR_ADDR);
+                                    addr->dest = op_vreg(dest_addr);
+                                    addr->src1 = op_imm(binding->offset);
+                                    addr->line = line;
+                                    emit(addr);
+                                    IRInst *copy = new_inst(IR_COPY);
+                                    copy->dest = op_vreg(dest_addr);
+                                    copy->src1 = op_vreg(val);
+                                    copy->src2 = op_imm(pf->type->size);
+                                    copy->line = line;
+                                    emit(copy);
+                                } else {
+                                    IRInst *store = new_inst(IR_STORE);
+                                    store->dest = op_imm(binding->offset);
+                                    store->src1 = op_vreg(val);
+                                    store->cast_to_type = pf->type;
+                                    store->line = line;
+                                    emit(store);
+                                }
+                                binding = binding->next;
+                                pf = pf->next;
+                            }
+                        } else {
+                            // Single field
+                            Node *binding = c->params;
+                            int val;
+                            if (variant->type->size > 8) {
+                                val = payload_addr;
+                            } else {
+                                val = new_vreg();
+                                IRInst *load = new_inst(IR_LOAD);
+                                load->dest = op_vreg(val);
+                                load->src1 = op_vreg(payload_addr);
+                                load->cast_to_type = variant->type;
+                                load->line = line;
+                                emit(load);
+                            }
+                            if (variant->type->size > 8) {
+                                int dest_addr = new_vreg();
+                                IRInst *addr = new_inst(IR_ADDR);
+                                addr->dest = op_vreg(dest_addr);
+                                addr->src1 = op_imm(binding->offset);
+                                addr->line = line;
+                                emit(addr);
+                                IRInst *copy = new_inst(IR_COPY);
+                                copy->dest = op_vreg(dest_addr);
+                                copy->src1 = op_vreg(val);
+                                copy->src2 = op_imm(variant->type->size);
+                                copy->line = line;
+                                emit(copy);
+                            } else {
+                                IRInst *store = new_inst(IR_STORE);
+                                store->dest = op_imm(binding->offset);
+                                store->src1 = op_vreg(val);
+                                store->cast_to_type = variant->type;
+                                store->line = line;
+                                emit(store);
+                            }
+                        }
+                    }
+                }
+
+                // Generate case body
+                ctx.has_returned = saved_ret;
+                gen_stmt(c->body);
+                if (!ctx.has_returned) all_returned = 0;
+
+                IRInst *jmp = new_inst(IR_JMP);
+                jmp->dest = op_label(end_label);
+                jmp->line = line;
+                emit(jmp);
+
+                IRInst *next_lbl = new_inst(IR_LABEL);
+                next_lbl->dest = op_label(next_label);
+                emit(next_lbl);
+            }
+
+            // Else block
+            if (node->match_stmt.else_b) {
+                ctx.has_returned = saved_ret;
+                gen_stmt(node->match_stmt.else_b);
+                if (!ctx.has_returned) all_returned = 0;
+            } else {
+                all_returned = 0;
+            }
+
+            IRInst *end_lbl = new_inst(IR_LABEL);
+            end_lbl->dest = op_label(end_label);
+            emit(end_lbl);
+
+            ctx.has_returned = all_returned ? 1 : saved_ret;
+            break;
+        }
 
         default:
             fprintf(stderr, "Erro interno: tipo de statement não suportado: %d\n", node->kind);

@@ -65,6 +65,9 @@ typedef enum {
 	TOKEN_TYPE_BITNOT,
 	TOKEN_TYPE_CHAR,
 	TOKEN_TYPE_GEN,
+	TOKEN_TYPE_ENUM,
+	TOKEN_TYPE_MATCH,
+	TOKEN_TYPE_CASE,
 } TokenType;
 
 extern const char *TOKEN_NAMES[];
