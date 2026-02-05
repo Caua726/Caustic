@@ -11,6 +11,7 @@
 
 static Token current_token;
 static Token lookahead_token;
+static int in_fn_params = 0; // Set when parsing fn params to disambiguate generic commas
 
 static StringLiteral *strings_head = NULL;
 static int string_id_counter = 0;
@@ -458,6 +459,83 @@ static Type *parse_type() {
     }
 
     consume();
+
+    // Parse generic type args: Vec gen i32, f64
+    if (ty->kind == TY_STRUCT && current_token.type == TOKEN_TYPE_GEN) {
+        consume();
+        ty->base_name = strdup(ty->name);
+        int cap = 4;
+        ty->generic_args = calloc(cap, sizeof(Type*));
+        ty->generic_arg_count = 0;
+
+        // Build mangled name: Vec__i32_f64
+        char mangled[512];
+        snprintf(mangled, sizeof(mangled), "%s", ty->base_name);
+
+        while (1) {
+            Type *arg_type = parse_type();
+            if (ty->generic_arg_count >= cap) {
+                cap *= 2;
+                ty->generic_args = realloc(ty->generic_args, cap * sizeof(Type*));
+            }
+            ty->generic_args[ty->generic_arg_count++] = arg_type;
+
+            // Append type name to mangled
+            const char *tname = "unknown";
+            switch (arg_type->kind) {
+                case TY_I8: tname = "i8"; break;
+                case TY_I16: tname = "i16"; break;
+                case TY_I32: tname = "i32"; break;
+                case TY_I64: tname = "i64"; break;
+                case TY_U8: tname = "u8"; break;
+                case TY_U16: tname = "u16"; break;
+                case TY_U32: tname = "u32"; break;
+                case TY_U64: tname = "u64"; break;
+                case TY_F32: tname = "f32"; break;
+                case TY_F64: tname = "f64"; break;
+                case TY_BOOL: tname = "bool"; break;
+                case TY_CHAR: tname = "char"; break;
+                case TY_STRING: tname = "string"; break;
+                case TY_VOID: tname = "void"; break;
+                case TY_PTR: tname = "ptr"; break;
+                case TY_STRUCT: tname = arg_type->name ? arg_type->name : "struct"; break;
+                default: break;
+            }
+            size_t cur_len = strlen(mangled);
+            snprintf(mangled + cur_len, sizeof(mangled) - cur_len, "_%s", tname);
+
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                // In fn params, check if comma is a param separator (COMMA IDENTIFIER AS)
+                if (in_fn_params && lookahead_token.type == TOKEN_TYPE_IDENTIFIER) {
+                    // 2-token lookahead: save full state, peek, restore
+                    LexerState lex_save;
+                    lexer_get_state(&lex_save);
+                    long file_pos = ftell(lex_save.file);
+                    Token save_cur = current_token;
+                    Token save_la = lookahead_token;
+
+                    consume(); // cur = IDENTIFIER, la = lexer_next()
+                    int is_param_boundary = (current_token.type == TOKEN_TYPE_IDENTIFIER &&
+                                              lookahead_token.type == TOKEN_TYPE_AS);
+
+                    // Restore everything
+                    fseek(lex_save.file, file_pos, SEEK_SET);
+                    lexer_set_state(&lex_save);
+                    current_token = save_cur;
+                    lookahead_token = save_la;
+
+                    if (is_param_boundary) break;
+                }
+                consume(); // consume the comma — it's a generic arg separator
+            } else {
+                break;
+            }
+        }
+
+        free(ty->name);
+        ty->name = strdup(mangled);
+    }
+
     return ty;
 }
 
@@ -602,17 +680,100 @@ static Node *parse_primary() {
     }
 
     if (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+        // Generic function call: name gen type1, type2 (args...)
+        if (lookahead_token.type == TOKEN_TYPE_GEN) {
+            char *fn_name = strdup(current_token.text);
+            consume(); // consume identifier
+            consume(); // consume 'gen'
+
+            // Parse generic type arguments
+            int cap = 4;
+            Type **gen_args = calloc(cap, sizeof(Type*));
+            int gen_count = 0;
+
+            // Build mangled name
+            char mangled[512];
+            snprintf(mangled, sizeof(mangled), "%s", fn_name);
+
+            while (1) {
+                Type *arg_type = parse_type();
+                if (gen_count >= cap) {
+                    cap *= 2;
+                    gen_args = realloc(gen_args, cap * sizeof(Type*));
+                }
+                gen_args[gen_count++] = arg_type;
+
+                const char *tname = "unknown";
+                switch (arg_type->kind) {
+                    case TY_I8: tname = "i8"; break;
+                    case TY_I16: tname = "i16"; break;
+                    case TY_I32: tname = "i32"; break;
+                    case TY_I64: tname = "i64"; break;
+                    case TY_U8: tname = "u8"; break;
+                    case TY_U16: tname = "u16"; break;
+                    case TY_U32: tname = "u32"; break;
+                    case TY_U64: tname = "u64"; break;
+                    case TY_F32: tname = "f32"; break;
+                    case TY_F64: tname = "f64"; break;
+                    case TY_BOOL: tname = "bool"; break;
+                    case TY_CHAR: tname = "char"; break;
+                    case TY_STRING: tname = "string"; break;
+                    case TY_VOID: tname = "void"; break;
+                    case TY_PTR: tname = "ptr"; break;
+                    case TY_STRUCT: tname = arg_type->name ? arg_type->name : "struct"; break;
+                    default: break;
+                }
+                size_t cur_len = strlen(mangled);
+                snprintf(mangled + cur_len, sizeof(mangled) - cur_len, "_%s", tname);
+
+                if (current_token.type == TOKEN_TYPE_COMMA) {
+                    consume();
+                } else {
+                    break;
+                }
+            }
+
+            // Now expect LPAREN for function call
+            Node *id_node = new_node(NODE_KIND_IDENTIFIER);
+            id_node->name = strdup(mangled);
+
+            Node *node = new_node(NODE_KIND_FNCALL);
+            node->lhs = id_node;
+            node->generic_args = gen_args;
+            node->generic_arg_count = gen_count;
+            // Store original name for template lookup
+            node->member_name = fn_name;
+
+            expect(TOKEN_TYPE_LPAREN);
+
+            if (current_token.type != TOKEN_TYPE_RPAREN) {
+                Node head = {};
+                Node *cur = &head;
+                while (1) {
+                    cur->next = parse_expr();
+                    cur = cur->next;
+                    if (current_token.type == TOKEN_TYPE_COMMA) {
+                        consume();
+                    } else {
+                        break;
+                    }
+                }
+                node->args = head.next;
+            }
+
+            expect(TOKEN_TYPE_RPAREN);
+            return node;
+        }
         if (lookahead_token.type == TOKEN_TYPE_LPAREN) {
             Node *id_node = new_node(NODE_KIND_IDENTIFIER);
             id_node->name = strdup(current_token.text);
 
             Node *node = new_node(NODE_KIND_FNCALL);
             node->lhs = id_node;
-            // node->name = strdup(current_token.text); // No longer needed, walk uses lhs->name
-            
+
             consume();
             expect(TOKEN_TYPE_LPAREN);
-            
+
             // Parse arguments
             if (current_token.type != TOKEN_TYPE_RPAREN) {
                 Node head = {};
@@ -711,10 +872,32 @@ static Node *parse_fn() {
     fn_node->name = strdup(current_token.text);
     consume();
 
+    // Parse generic params: fn max gen T, U (...)
+    if (current_token.type == TOKEN_TYPE_GEN) {
+        consume();
+        int cap = 4;
+        fn_node->generic_params = calloc(cap, sizeof(char*));
+        fn_node->generic_param_count = 0;
+        while (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+            if (fn_node->generic_param_count >= cap) {
+                cap *= 2;
+                fn_node->generic_params = realloc(fn_node->generic_params, cap * sizeof(char*));
+            }
+            fn_node->generic_params[fn_node->generic_param_count++] = strdup(current_token.text);
+            consume();
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+    }
+
     expect(TOKEN_TYPE_LPAREN);
 
     // Parse parameters
     if (current_token.type != TOKEN_TYPE_RPAREN) {
+        in_fn_params = 1;
         Node head = {};
         Node *cur = &head;
         while (1) {
@@ -751,6 +934,7 @@ static Node *parse_fn() {
             }
         }
         fn_node->params = head.next;
+        in_fn_params = 0;
     }
 
     expect(TOKEN_TYPE_RPAREN);
@@ -1026,7 +1210,28 @@ static Node *parse_struct_decl() {
 
     Type *struct_type = new_type(TY_STRUCT);
     struct_type->name = struct_name;
-    
+
+    // Parse generic params: struct Vec gen T, U { ... }
+    if (current_token.type == TOKEN_TYPE_GEN) {
+        consume();
+        int cap = 4;
+        struct_type->generic_params = calloc(cap, sizeof(char*));
+        struct_type->generic_param_count = 0;
+        while (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+            if (struct_type->generic_param_count >= cap) {
+                cap *= 2;
+                struct_type->generic_params = realloc(struct_type->generic_params, cap * sizeof(char*));
+            }
+            struct_type->generic_params[struct_type->generic_param_count++] = strdup(current_token.text);
+            consume();
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+    }
+
     expect(TOKEN_TYPE_LBRACE);
 
     Field head = {};
@@ -1488,7 +1693,14 @@ static void free_ast_impl(Node *node) {
 
     if (node->name) free(node->name);
     if (node->member_name) free(node->member_name);
-    
+    if (node->generic_params) {
+        for (int i = 0; i < node->generic_param_count; i++) {
+            if (node->generic_params[i]) free(node->generic_params[i]);
+        }
+        free(node->generic_params);
+    }
+    if (node->generic_args) free(node->generic_args);
+
     // Free children based on node type
     switch (node->kind) {
         case NODE_KIND_FN:

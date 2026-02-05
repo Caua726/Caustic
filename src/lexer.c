@@ -67,6 +67,10 @@ const char *TOKEN_NAMES[] = {
     "TOKEN_TYPE_FOR",
     "TOKEN_TYPE_DO",
     "TOKEN_TYPE_ELLIPSIS",
+    "TOKEN_TYPE_XOR",
+    "TOKEN_TYPE_BITNOT",
+    "TOKEN_TYPE_CHAR",
+    "TOKEN_TYPE_GEN",
 };
 
 static FILE *src;
@@ -168,6 +172,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "use") == 0) {t.type = TOKEN_TYPE_USE;}
         else if (strcmp(t.text, "for") == 0) {t.type = TOKEN_TYPE_FOR;}
         else if (strcmp(t.text, "do") == 0) {t.type = TOKEN_TYPE_DO;}
+        else if (strcmp(t.text, "gen") == 0) {t.type = TOKEN_TYPE_GEN;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;

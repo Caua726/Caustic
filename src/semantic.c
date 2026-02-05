@@ -29,6 +29,418 @@ struct Module {
 static char *current_module_path = NULL; // Prefix for current module
 static Module *module_list = NULL;
 
+// Forward declarations for generics support
+static const char *type_name(Type *ty);
+static Variable *symtab_lookup(char *name);
+static void resolve_type_ref(Type *ty);
+static void declare_struct(char *name, Type *type);
+static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic);
+void walk(Node *node);
+
+// --- Generics support ---
+static GenericTemplate *generic_templates = NULL;
+static GenericInstance *generic_instances = NULL;
+static Node *ast_tail = NULL; // Tail of top-level AST for appending instantiated functions
+
+static void store_generic_template(char *name, char **params, int count, Node *ast, Type *struct_type, int is_function) {
+    GenericTemplate *t = calloc(1, sizeof(GenericTemplate));
+    t->name = strdup(name);
+    t->params = calloc(count, sizeof(char*));
+    for (int i = 0; i < count; i++) t->params[i] = strdup(params[i]);
+    t->param_count = count;
+    t->ast = ast;
+    t->struct_type = struct_type;
+    t->is_function = is_function;
+    t->module_prefix = current_module_path ? strdup(current_module_path) : NULL;
+    t->next = generic_templates;
+    generic_templates = t;
+}
+
+static GenericTemplate *lookup_generic_template(char *name) {
+    for (GenericTemplate *t = generic_templates; t; t = t->next) {
+        if (strcmp(t->name, name) == 0) return t;
+    }
+    return NULL;
+}
+
+static int is_already_instantiated(char *mangled) {
+    for (GenericInstance *i = generic_instances; i; i = i->next) {
+        if (strcmp(i->mangled_name, mangled) == 0) return 1;
+    }
+    return 0;
+}
+
+static void mark_instantiated(char *mangled) {
+    GenericInstance *i = calloc(1, sizeof(GenericInstance));
+    i->mangled_name = strdup(mangled);
+    i->next = generic_instances;
+    generic_instances = i;
+}
+
+static char *mangle_generic_name(const char *base, Type **concrete, int count) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", base);
+    for (int i = 0; i < count; i++) {
+        size_t len = strlen(buf);
+        snprintf(buf + len, sizeof(buf) - len, "_%s", type_name(concrete[i]));
+    }
+    return strdup(buf);
+}
+
+// Deep clone a Type
+static Type *clone_type(Type *ty) {
+    if (!ty) return NULL;
+    // Don't clone primitive singletons — preserve pointer equality
+    if (ty->is_static) return ty;
+    Type *clone = new_type(ty->kind);
+    clone->size = ty->size;
+    clone->is_signed = ty->is_signed;
+    clone->array_len = ty->array_len;
+    clone->is_static = 0;
+    clone->owns_fields = 0; // Cloned types borrow fields initially
+
+    if (ty->name) clone->name = strdup(ty->name);
+    if (ty->base_name) clone->base_name = strdup(ty->base_name);
+    clone->base = clone_type(ty->base);
+
+    // Clone fields for structs
+    if (ty->fields) {
+        clone->owns_fields = 1;
+        Field *head = NULL, *tail = NULL;
+        for (Field *f = ty->fields; f; f = f->next) {
+            Field *cf = calloc(1, sizeof(Field));
+            cf->name = strdup(f->name);
+            cf->type = clone_type(f->type);
+            cf->offset = f->offset;
+            if (!head) { head = cf; tail = cf; }
+            else { tail->next = cf; tail = cf; }
+        }
+        clone->fields = head;
+    }
+
+    // Clone generic info
+    if (ty->generic_params) {
+        clone->generic_param_count = ty->generic_param_count;
+        clone->generic_params = calloc(ty->generic_param_count, sizeof(char*));
+        for (int i = 0; i < ty->generic_param_count; i++)
+            clone->generic_params[i] = strdup(ty->generic_params[i]);
+    }
+    if (ty->generic_args) {
+        clone->generic_arg_count = ty->generic_arg_count;
+        clone->generic_args = calloc(ty->generic_arg_count, sizeof(Type*));
+        for (int i = 0; i < ty->generic_arg_count; i++)
+            clone->generic_args[i] = ty->generic_args[i]; // Share concrete types
+    }
+
+    return clone;
+}
+
+// Forward declaration
+static Node *clone_node(Node *node);
+
+static Node *clone_node_list(Node *node) {
+    if (!node) return NULL;
+    Node *head = clone_node(node);
+    Node *cur = head;
+    for (Node *n = node->next; n; n = n->next) {
+        cur->next = clone_node(n);
+        cur = cur->next;
+    }
+    return head;
+}
+
+static Node *clone_node(Node *node) {
+    if (!node) return NULL;
+    Node *c = calloc(1, sizeof(Node));
+    *c = *node; // Shallow copy
+    c->next = NULL;
+
+    // Deep copy allocated strings
+    if (node->name) c->name = strdup(node->name);
+    if (node->member_name) c->member_name = strdup(node->member_name);
+
+    // Deep copy type
+    if (node->ty && !node->ty->is_static) {
+        c->ty = clone_type(node->ty);
+    }
+    if (node->return_type && !node->return_type->is_static) {
+        c->return_type = clone_type(node->return_type);
+    }
+
+    // Clear semantic-phase pointers (will be re-resolved)
+    c->var = NULL;
+    c->offset = 0;
+    c->tok = node->tok; // Keep token for error reporting
+
+    // Deep copy generic params
+    if (node->generic_params) {
+        c->generic_params = calloc(node->generic_param_count, sizeof(char*));
+        c->generic_param_count = node->generic_param_count;
+        for (int i = 0; i < node->generic_param_count; i++)
+            c->generic_params[i] = strdup(node->generic_params[i]);
+    }
+    if (node->generic_args) {
+        c->generic_args = calloc(node->generic_arg_count, sizeof(Type*));
+        c->generic_arg_count = node->generic_arg_count;
+        for (int i = 0; i < node->generic_arg_count; i++)
+            c->generic_args[i] = node->generic_args[i];
+    }
+
+    // Deep copy children based on node kind
+    switch (node->kind) {
+        case NODE_KIND_FN:
+            c->params = clone_node_list(node->params);
+            c->body = clone_node(node->body);
+            break;
+        case NODE_KIND_BLOCK:
+            c->stmts = clone_node_list(node->stmts);
+            break;
+        case NODE_KIND_RETURN:
+        case NODE_KIND_EXPR_STMT:
+        case NODE_KIND_CAST:
+        case NODE_KIND_ADDR:
+        case NODE_KIND_DEREF:
+        case NODE_KIND_NEG:
+        case NODE_KIND_BITWISE_NOT:
+        case NODE_KIND_LOGICAL_NOT:
+            c->expr = clone_node(node->expr);
+            break;
+        case NODE_KIND_LET:
+            c->init_expr = clone_node(node->init_expr);
+            break;
+        case NODE_KIND_FNCALL:
+        case NODE_KIND_SYSCALL:
+            c->lhs = clone_node(node->lhs);
+            c->args = clone_node_list(node->args);
+            break;
+        case NODE_KIND_IF:
+            c->if_stmt.cond = clone_node(node->if_stmt.cond);
+            c->if_stmt.then_b = clone_node(node->if_stmt.then_b);
+            c->if_stmt.else_b = clone_node(node->if_stmt.else_b);
+            break;
+        case NODE_KIND_WHILE:
+            c->while_stmt.cond = clone_node(node->while_stmt.cond);
+            c->while_stmt.body = clone_node(node->while_stmt.body);
+            break;
+        case NODE_KIND_DO_WHILE:
+            c->do_while_stmt.cond = clone_node(node->do_while_stmt.cond);
+            c->do_while_stmt.body = clone_node(node->do_while_stmt.body);
+            break;
+        case NODE_KIND_FOR:
+            c->for_stmt.init = clone_node(node->for_stmt.init);
+            c->for_stmt.cond = clone_node(node->for_stmt.cond);
+            c->for_stmt.step = clone_node(node->for_stmt.step);
+            c->for_stmt.body = clone_node(node->for_stmt.body);
+            break;
+        case NODE_KIND_ASSIGN:
+        case NODE_KIND_ADD:
+        case NODE_KIND_SUBTRACTION:
+        case NODE_KIND_MULTIPLIER:
+        case NODE_KIND_DIVIDER:
+        case NODE_KIND_MOD:
+        case NODE_KIND_EQ:
+        case NODE_KIND_NE:
+        case NODE_KIND_LT:
+        case NODE_KIND_LE:
+        case NODE_KIND_GT:
+        case NODE_KIND_GE:
+        case NODE_KIND_INDEX:
+        case NODE_KIND_LOGICAL_AND:
+        case NODE_KIND_LOGICAL_OR:
+        case NODE_KIND_SHL:
+        case NODE_KIND_SHR:
+        case NODE_KIND_BITWISE_AND:
+        case NODE_KIND_BITWISE_OR:
+        case NODE_KIND_BITWISE_XOR:
+        case NODE_KIND_MEMBER_ACCESS:
+        case NODE_KIND_MODULE_ACCESS:
+            c->lhs = clone_node(node->lhs);
+            c->rhs = clone_node(node->rhs);
+            break;
+        case NODE_KIND_USE:
+            c->body = node->body; // Share module body
+            break;
+        default:
+            // NUM, IDENTIFIER, STRING_LITERAL, ASM, BREAK, CONTINUE, SIZEOF — no deep children
+            break;
+    }
+
+    return c;
+}
+
+// Check if a type matches a generic param; if so, return the concrete type pointer.
+// Returns NULL if no match.
+static Type *find_generic_substitution(Type *ty, char **param_names, Type **concrete, int count) {
+    if (ty->kind == TY_STRUCT && ty->name && !ty->fields) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(ty->name, param_names[i]) == 0) {
+                return concrete[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// Substitute generic type params with concrete types in a Type.
+// For pointer/array base types that are generic params, we replace the base pointer.
+static void substitute_type(Type *ty, char **param_names, Type **concrete, int count) {
+    if (!ty) return;
+
+    // Check if this type IS a generic param (TY_STRUCT with name matching a param)
+    if (ty->kind == TY_STRUCT && ty->name && !ty->fields) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(ty->name, param_names[i]) == 0) {
+                // Replace with concrete type
+                free(ty->name);
+                ty->kind = concrete[i]->kind;
+                ty->size = concrete[i]->size;
+                ty->is_signed = concrete[i]->is_signed;
+                ty->is_static = concrete[i]->is_static;
+                ty->name = concrete[i]->name ? strdup(concrete[i]->name) : NULL;
+                ty->base = concrete[i]->base;
+                ty->fields = concrete[i]->fields;
+                ty->owns_fields = 0;
+                ty->array_len = concrete[i]->array_len;
+                return;
+            }
+        }
+    }
+
+    // Recurse into pointer base
+    if (ty->base) substitute_type(ty->base, param_names, concrete, count);
+
+    // Recurse into struct fields — replace field type pointers directly
+    if (ty->owns_fields) {
+        for (Field *f = ty->fields; f; f = f->next) {
+            Type *sub = find_generic_substitution(f->type, param_names, concrete, count);
+            if (sub) {
+                f->type = sub; // Direct pointer replacement
+            } else {
+                substitute_type(f->type, param_names, concrete, count);
+            }
+        }
+    }
+}
+
+// Substitute types in the entire AST tree
+static void substitute_types_in_node(Node *node, char **param_names, Type **concrete, int count) {
+    if (!node) return;
+
+    // Substitute in this node's type
+    if (node->ty) {
+        Type *sub = find_generic_substitution(node->ty, param_names, concrete, count);
+        if (sub) {
+            node->ty = sub; // Point directly to concrete type (e.g. type_i32 global)
+        } else if (!node->ty->is_static) {
+            substitute_type(node->ty, param_names, concrete, count);
+        }
+    }
+    if (node->return_type) {
+        Type *sub = find_generic_substitution(node->return_type, param_names, concrete, count);
+        if (sub) {
+            node->return_type = sub;
+        } else if (!node->return_type->is_static) {
+            substitute_type(node->return_type, param_names, concrete, count);
+        }
+    }
+
+    // Recurse into children
+    switch (node->kind) {
+        case NODE_KIND_FN:
+            for (Node *p = node->params; p; p = p->next)
+                substitute_types_in_node(p, param_names, concrete, count);
+            substitute_types_in_node(node->body, param_names, concrete, count);
+            break;
+        case NODE_KIND_BLOCK:
+            for (Node *s = node->stmts; s; s = s->next)
+                substitute_types_in_node(s, param_names, concrete, count);
+            break;
+        case NODE_KIND_RETURN:
+        case NODE_KIND_EXPR_STMT:
+        case NODE_KIND_CAST:
+        case NODE_KIND_ADDR:
+        case NODE_KIND_DEREF:
+        case NODE_KIND_NEG:
+        case NODE_KIND_BITWISE_NOT:
+        case NODE_KIND_LOGICAL_NOT:
+            substitute_types_in_node(node->expr, param_names, concrete, count);
+            break;
+        case NODE_KIND_LET:
+            substitute_types_in_node(node->init_expr, param_names, concrete, count);
+            break;
+        case NODE_KIND_FNCALL:
+        case NODE_KIND_SYSCALL:
+            // Substitute generic type args on the call itself (for nested generic calls)
+            if (node->generic_arg_count > 0 && node->member_name) {
+                for (int gi = 0; gi < node->generic_arg_count; gi++) {
+                    Type *sub = find_generic_substitution(node->generic_args[gi], param_names, concrete, count);
+                    if (sub) node->generic_args[gi] = sub;
+                }
+                // Rebuild mangled name from original name + substituted generic args
+                char *new_mangled = mangle_generic_name(node->member_name, node->generic_args, node->generic_arg_count);
+                if (node->lhs && node->lhs->name) {
+                    free(node->lhs->name);
+                    node->lhs->name = new_mangled;
+                } else {
+                    free(new_mangled);
+                }
+            }
+            substitute_types_in_node(node->lhs, param_names, concrete, count);
+            for (Node *a = node->args; a; a = a->next)
+                substitute_types_in_node(a, param_names, concrete, count);
+            break;
+        case NODE_KIND_IF:
+            substitute_types_in_node(node->if_stmt.cond, param_names, concrete, count);
+            substitute_types_in_node(node->if_stmt.then_b, param_names, concrete, count);
+            substitute_types_in_node(node->if_stmt.else_b, param_names, concrete, count);
+            break;
+        case NODE_KIND_WHILE:
+            substitute_types_in_node(node->while_stmt.cond, param_names, concrete, count);
+            substitute_types_in_node(node->while_stmt.body, param_names, concrete, count);
+            break;
+        case NODE_KIND_DO_WHILE:
+            substitute_types_in_node(node->do_while_stmt.cond, param_names, concrete, count);
+            substitute_types_in_node(node->do_while_stmt.body, param_names, concrete, count);
+            break;
+        case NODE_KIND_FOR:
+            substitute_types_in_node(node->for_stmt.init, param_names, concrete, count);
+            substitute_types_in_node(node->for_stmt.cond, param_names, concrete, count);
+            substitute_types_in_node(node->for_stmt.step, param_names, concrete, count);
+            substitute_types_in_node(node->for_stmt.body, param_names, concrete, count);
+            break;
+        case NODE_KIND_ASSIGN:
+        case NODE_KIND_ADD:
+        case NODE_KIND_SUBTRACTION:
+        case NODE_KIND_MULTIPLIER:
+        case NODE_KIND_DIVIDER:
+        case NODE_KIND_MOD:
+        case NODE_KIND_EQ:
+        case NODE_KIND_NE:
+        case NODE_KIND_LT:
+        case NODE_KIND_LE:
+        case NODE_KIND_GT:
+        case NODE_KIND_GE:
+        case NODE_KIND_INDEX:
+        case NODE_KIND_LOGICAL_AND:
+        case NODE_KIND_LOGICAL_OR:
+        case NODE_KIND_SHL:
+        case NODE_KIND_SHR:
+        case NODE_KIND_BITWISE_AND:
+        case NODE_KIND_BITWISE_OR:
+        case NODE_KIND_BITWISE_XOR:
+        case NODE_KIND_MEMBER_ACCESS:
+        case NODE_KIND_MODULE_ACCESS:
+            substitute_types_in_node(node->lhs, param_names, concrete, count);
+            substitute_types_in_node(node->rhs, param_names, concrete, count);
+            break;
+        default:
+            break;
+    }
+}
+
+static void instantiate_generic_func(GenericTemplate *tmpl, Type **concrete, int count, char *mangled_name);
+static void instantiate_generic_struct(GenericTemplate *tmpl, Type **concrete, int count, char *mangled_name);
+
 static char *get_module_prefix(const char *path) {
     char *prefix = malloc(strlen(path) + 2);
     prefix[0] = '_';
@@ -84,8 +496,6 @@ static const char *type_name(Type *ty) {
         default: return "unknown";
     }
 }
-
-static Variable *symtab_lookup(char *name);
 
 static Type *new_type_full(TypeKind kind, int size, int is_signed) {
     Type *ty = new_type(kind);
@@ -209,6 +619,15 @@ static void resolve_type_ref(Type *ty) {
                 }
             }
             free(alias);
+        }
+
+        // 3. Try generic instantiation (e.g. Vec_i32 from template Vec gen T)
+        if (!def && ty->generic_arg_count > 0 && ty->base_name) {
+            GenericTemplate *tmpl = lookup_generic_template(ty->base_name);
+            if (tmpl && !tmpl->is_function) {
+                instantiate_generic_struct(tmpl, ty->generic_args, ty->generic_arg_count, ty->name);
+                def = lookup_struct(ty->name);
+            }
         }
 
         if (!def) {
@@ -378,6 +797,116 @@ static Variable *symtab_lookup(char *name) {
 }
 
 
+
+static void instantiate_generic_func(GenericTemplate *tmpl, Type **concrete, int count, char *mangled_name) {
+    if (is_already_instantiated(mangled_name)) return;
+    mark_instantiated(mangled_name);
+
+    // Clone the template AST
+    Node *fn_clone = clone_node(tmpl->ast);
+
+    // Substitute type params
+    substitute_types_in_node(fn_clone, tmpl->params, concrete, count);
+
+    // Rename function
+    free(fn_clone->name);
+    fn_clone->name = strdup(mangled_name);
+
+    // Clear generic params so it's treated as a normal function
+    if (fn_clone->generic_params) {
+        for (int i = 0; i < fn_clone->generic_param_count; i++)
+            free(fn_clone->generic_params[i]);
+        free(fn_clone->generic_params);
+        fn_clone->generic_params = NULL;
+        fn_clone->generic_param_count = 0;
+    }
+
+    // Register function in the function table
+    int param_count = 0;
+    for (Node *p = fn_clone->params; p; p = p->next) {
+        resolve_type_ref(p->ty);
+        param_count++;
+    }
+    resolve_type_ref(fn_clone->return_type);
+
+    Type **param_types = calloc(param_count, sizeof(Type*));
+    int i = 0;
+    for (Node *p = fn_clone->params; p; p = p->next) {
+        param_types[i++] = p->ty;
+    }
+    declare_function(mangled_name, fn_clone->return_type, param_types, param_count, fn_clone->is_variadic);
+
+    // Append to AST for IR generation
+    if (ast_tail) {
+        ast_tail->next = fn_clone;
+        ast_tail = fn_clone;
+    }
+
+    // Walk the function body for type checking
+    // Save and restore state since walk(NODE_KIND_FN) modifies global stack_offset and scope
+    int saved_stack_offset = stack_offset;
+    Scope *saved_scope = current_scope;
+    walk(fn_clone);
+    stack_offset = saved_stack_offset;
+    current_scope = saved_scope;
+}
+
+static void instantiate_generic_struct(GenericTemplate *tmpl, Type **concrete, int count, char *mangled_name) {
+    if (is_already_instantiated(mangled_name)) return;
+    mark_instantiated(mangled_name);
+
+    // Clone the struct type
+    Type *new_struct = clone_type(tmpl->struct_type);
+    new_struct->owns_fields = 1;
+
+    // Substitute type params in fields — use direct pointer replacement
+    for (Field *f = new_struct->fields; f; f = f->next) {
+        Type *sub = find_generic_substitution(f->type, tmpl->params, concrete, count);
+        if (sub) {
+            f->type = sub;
+        } else {
+            substitute_type(f->type, tmpl->params, concrete, count);
+        }
+    }
+
+    // Handle nested generic struct fields (e.g. Inner gen T inside Outer gen T)
+    for (Field *f = new_struct->fields; f; f = f->next) {
+        if (f->type->generic_arg_count > 0 && f->type->base_name) {
+            // Substitute each generic_arg (e.g. T -> i32)
+            for (int gi = 0; gi < f->type->generic_arg_count; gi++) {
+                Type *sub = find_generic_substitution(f->type->generic_args[gi], tmpl->params, concrete, count);
+                if (sub) f->type->generic_args[gi] = sub;
+            }
+            // Rebuild mangled name (e.g. Inner_i32)
+            char *new_name = mangle_generic_name(f->type->base_name, f->type->generic_args, f->type->generic_arg_count);
+            free(f->type->name);
+            f->type->name = strdup(new_name);
+
+            // Instantiate the inner generic struct if not already done
+            GenericTemplate *inner_tmpl = lookup_generic_template(f->type->base_name);
+            if (inner_tmpl && !inner_tmpl->is_function) {
+                instantiate_generic_struct(inner_tmpl, f->type->generic_args, f->type->generic_arg_count, new_name);
+            }
+            free(new_name);
+        }
+    }
+
+    // Rename
+    if (new_struct->name) free(new_struct->name);
+    new_struct->name = strdup(mangled_name);
+
+    // Clear generic params
+    if (new_struct->generic_params) {
+        for (int i = 0; i < new_struct->generic_param_count; i++)
+            free(new_struct->generic_params[i]);
+        free(new_struct->generic_params);
+        new_struct->generic_params = NULL;
+        new_struct->generic_param_count = 0;
+    }
+
+    // Register and calculate sizes
+    declare_struct(mangled_name, new_struct);
+}
 
 void walk(Node *node) {
     if (!node) return;
@@ -889,6 +1418,19 @@ void walk(Node *node) {
             // Case 1: Direct Identifier Call (func())
             if (node->lhs->kind == NODE_KIND_IDENTIFIER) {
                 func = lookup_function(node->lhs->name);
+                if (!func && node->generic_arg_count > 0 && node->member_name) {
+                    // Generic function call: try to instantiate from template
+                    GenericTemplate *tmpl = lookup_generic_template(node->member_name);
+                    if (tmpl && tmpl->is_function) {
+                        char *mangled = mangle_generic_name(tmpl->name, node->generic_args, node->generic_arg_count);
+                        // Update the LHS name to match the mangled name
+                        free(node->lhs->name);
+                        node->lhs->name = strdup(mangled);
+                        instantiate_generic_func(tmpl, node->generic_args, node->generic_arg_count, mangled);
+                        func = lookup_function(mangled);
+                        free(mangled);
+                    }
+                }
                 if (!func) {
                     fprintf(stderr, "Erro: função '%s' não declarada.\n", node->lhs->name);
                     exit(1);
@@ -1120,6 +1662,11 @@ static void register_structs(Node *node) {
             current_module_path = old_path;
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
+            // If generic template, store and skip
+            if (n->ty->generic_param_count > 0) {
+                store_generic_template(n->ty->name, n->ty->generic_params, n->ty->generic_param_count, NULL, n->ty, 0);
+                continue;
+            }
             // Mangle struct name if in module
             char *name = n->ty->name;
             char *mangled = NULL;
@@ -1222,12 +1769,15 @@ static void resolve_fields(Node *node) {
             current_module_path = old_path;
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_BLOCK && n->ty && n->ty->kind == TY_STRUCT) {
+            // Skip generic templates
+            if (n->ty->generic_param_count > 0) continue;
+
             // Resolve fields for this struct
             Type *type = n->ty;
             int offset = 0;
             for (Field *f = type->fields; f; f = f->next) {
                 resolve_type_ref(f->type);
-                
+
                 if (f->type->kind == TY_STRUCT && strcmp(f->type->name, type->name) == 0) {
                      fprintf(stderr, "Erro: struct '%s' contém a si mesma diretamente no campo '%s'. Use um ponteiro.\n", type->name, f->name);
                      exit(1);
@@ -1292,6 +1842,12 @@ static void register_funcs(Node *node) {
             current_module_path = old_path;
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_FN) {
+            // If generic template, store and skip
+            if (n->generic_param_count > 0) {
+                store_generic_template(n->name, n->generic_params, n->generic_param_count, n, NULL, 1);
+                continue;
+            }
+
              // Resolve param types and return type
             for (Node *p = n->params; p; p = p->next) {
                 resolve_type_ref(p->ty);
@@ -1304,7 +1860,7 @@ static void register_funcs(Node *node) {
 
             int param_count = 0;
             for (Node *p = n->params; p; p = p->next) param_count++;
-            
+
             Type **param_types = calloc(param_count, sizeof(Type*));
             int i = 0;
             for (Node *p = n->params; p; p = p->next) {
@@ -1339,6 +1895,8 @@ static void analyze_bodies(Node *node) {
             current_module_path = old_path;
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_FN) {
+            // Skip generic templates — they are instantiated on demand
+            if (n->generic_param_count > 0) continue;
             walk(n);
         }
     }
@@ -1349,6 +1907,14 @@ void analyze(Node *node) {
     function_table = NULL;
     struct_defs = NULL;
     module_list = NULL;
+    generic_templates = NULL;
+    generic_instances = NULL;
+
+    // Set ast_tail to the last node in the AST (for appending generic instantiations)
+    ast_tail = node;
+    if (ast_tail) {
+        while (ast_tail->next) ast_tail = ast_tail->next;
+    }
 
     // Register intrinsics
     // __builtin_va_start(va_list_ptr) -> void
@@ -1363,7 +1929,7 @@ void analyze(Node *node) {
     register_aliases(node);
     resolve_fields(node);
     register_vars(node);
-    
+
     register_funcs(node);
     analyze_bodies(node);
 }
@@ -1424,6 +1990,34 @@ void semantic_cleanup() {
     all_scopes = NULL;
     global_scope = NULL;
     current_scope = NULL;
+
+    // Free generic templates
+    GenericTemplate *gt = generic_templates;
+    while (gt) {
+        GenericTemplate *next = gt->next;
+        if (gt->name) free(gt->name);
+        if (gt->module_prefix) free(gt->module_prefix);
+        if (gt->params) {
+            for (int i = 0; i < gt->param_count; i++) {
+                if (gt->params[i]) free(gt->params[i]);
+            }
+            free(gt->params);
+        }
+        free(gt);
+        gt = next;
+    }
+    generic_templates = NULL;
+
+    // Free generic instances
+    GenericInstance *gi = generic_instances;
+    while (gi) {
+        GenericInstance *next = gi->next;
+        if (gi->mangled_name) free(gi->mangled_name);
+        free(gi);
+        gi = next;
+    }
+    generic_instances = NULL;
+    ast_tail = NULL;
 
     // Types are freed by free_all_types() in main.c
 }

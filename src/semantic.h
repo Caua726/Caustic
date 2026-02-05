@@ -45,6 +45,22 @@ typedef struct Function {
     struct Function *next;
 } Function;
 
+typedef struct GenericTemplate {
+    char *name;              // "max", "Vec"
+    char **params;           // ["T", "U"]
+    int param_count;
+    Node *ast;               // AST original (for functions)
+    Type *struct_type;       // For generic structs (Type with template fields)
+    int is_function;         // 1=func, 0=struct
+    char *module_prefix;     // Module context
+    struct GenericTemplate *next;
+} GenericTemplate;
+
+typedef struct GenericInstance {
+    char *mangled_name;
+    struct GenericInstance *next;
+} GenericInstance;
+
 void types_init();
 void analyze(Node *node);
 void semantic_cleanup();

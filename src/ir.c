@@ -1272,7 +1272,12 @@ IRProgram *gen_ir(Node *ast) {
         if (node->kind != NODE_KIND_FN) {
             continue;
         }
-        
+
+        // Skip generic templates (uninstantiated)
+        if (node->generic_param_count > 0) {
+            continue;
+        }
+
         Node *fn_node = node;
 
         // Processar cada função com contexto limpo

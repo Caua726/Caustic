@@ -43,6 +43,13 @@ typedef struct Type {
     // Struct fields
     char *name; // Struct name
     Field *fields;
+
+    // Generic info
+    char **generic_params;      // Template params (for uninstantiated): ["T", "U"]
+    int generic_param_count;
+    struct Type **generic_args;  // Concrete args (for instantiated): [type_i32, type_f64]
+    int generic_arg_count;
+    char *base_name;            // Original name before mangling (e.g. "Vec")
 } Type;
 
 typedef enum {
@@ -132,6 +139,14 @@ typedef struct Node {
 
     // Function Call
     struct Node *args;   // Lista de argumentos (expressões)
+
+    // Generic parameters (declaration: gen T, U)
+    char **generic_params;       // ["T", "U"]
+    int generic_param_count;
+
+    // Generic arguments (usage: gen i32, f64)
+    Type **generic_args;         // [type_i32, type_f64]
+    int generic_arg_count;
 
     struct Node *stmts;
 

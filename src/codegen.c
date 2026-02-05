@@ -62,6 +62,24 @@ static void emit(const char *fmt, ...) {
 
 
 
+static const char *reg64_to_reg32(const char *reg64) {
+    if (strcmp(reg64, "rax") == 0) return "eax";
+    if (strcmp(reg64, "rbx") == 0) return "ebx";
+    if (strcmp(reg64, "rcx") == 0) return "ecx";
+    if (strcmp(reg64, "rdx") == 0) return "edx";
+    if (strcmp(reg64, "rsi") == 0) return "esi";
+    if (strcmp(reg64, "rdi") == 0) return "edi";
+    if (strcmp(reg64, "r8") == 0) return "r8d";
+    if (strcmp(reg64, "r9") == 0) return "r9d";
+    if (strcmp(reg64, "r10") == 0) return "r10d";
+    if (strcmp(reg64, "r11") == 0) return "r11d";
+    if (strcmp(reg64, "r12") == 0) return "r12d";
+    if (strcmp(reg64, "r13") == 0) return "r13d";
+    if (strcmp(reg64, "r14") == 0) return "r14d";
+    if (strcmp(reg64, "r15") == 0) return "r15d";
+    return reg64;
+}
+
 static int interval_cmp(const void *a, const void *b) {
     LiveInterval *ia = (LiveInterval *)a;
     LiveInterval *ib = (LiveInterval *)b;
@@ -600,7 +618,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                     if (size == 8) emit("mov %s, QWORD PTR [r15]", target_reg);
                     else if (size == 4) {
                         if (inst->cast_to_type->is_signed) emit("movsxd %s, DWORD PTR [r15]", target_reg);
-                        else emit("mov %sd, DWORD PTR [r15]", target_reg);
+                        else emit("mov %s, DWORD PTR [r15]", reg64_to_reg32(target_reg));
                     }
                     else if (size == 2) {
                         if (inst->cast_to_type->is_signed) emit("movsx %s, WORD PTR [r15]", target_reg);
@@ -629,7 +647,7 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                         if (inst->cast_to_type->is_signed) {
                             emit("movsxd %s, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
                         } else {
-                            emit("mov %sd, DWORD PTR [rbp-%ld]", target_reg, inst->src1.imm);
+                            emit("mov %s, DWORD PTR [rbp-%ld]", reg64_to_reg32(target_reg), inst->src1.imm);
                         }
                     } else if (size == 2) {
                         if (inst->cast_to_type->is_signed) {
