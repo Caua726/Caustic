@@ -42,7 +42,7 @@ $ ./main
 
 ### Not important, but just to note
 
-- [ ] **Defer**
+- [x] **Defer**
   - ```cst
     defer free(ptr);
     ```
