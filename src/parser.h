@@ -108,6 +108,7 @@ typedef enum {
     NODE_KIND_NEG,
     NODE_KIND_ENUM_LITERAL,
     NODE_KIND_MATCH,
+    NODE_KIND_DEFER,
 } NodeKind;
 
 typedef struct StringLiteral {

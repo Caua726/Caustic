@@ -31,6 +31,10 @@ typedef struct {
     int has_sret;
     int sret_vreg;
     int has_returned;
+
+    Node **defer_stack;
+    int defer_count;
+    int defer_cap;
 } IRGenContext;
 
 static IRGenContext ctx;
@@ -1029,6 +1033,12 @@ static int gen_expr(Node *node) {
 
 static void gen_stmt_single(Node *node);
 
+static void emit_deferred_calls() {
+    for (int i = ctx.defer_count - 1; i >= 0; i--) {
+        gen_expr(ctx.defer_stack[i]);
+    }
+}
+
 static void gen_stmt(Node *node) {
     while (node) {
         if (!ctx.has_returned) {
@@ -1047,6 +1057,7 @@ static void gen_stmt_single(Node *node) {
         case NODE_KIND_RETURN: {
             if (node->expr) {
                 int result_reg = gen_expr(node->expr);
+                emit_deferred_calls();
                 if (ctx.has_sret) {
                     IRInst *inst = new_inst(IR_COPY);
                     inst->dest = op_vreg(ctx.sret_vreg);
@@ -1059,6 +1070,7 @@ static void gen_stmt_single(Node *node) {
                     emit_return(result_reg, node->tok ? node->tok->line : 0);
                 }
             } else {
+                emit_deferred_calls();
                 emit_return(-1, node->tok ? node->tok->line : 0);
             }
             ctx.has_returned = 1;
@@ -1114,7 +1126,8 @@ static void gen_stmt_single(Node *node) {
 
         case NODE_KIND_IF: {
             int saved_ret = ctx.has_returned;
-            
+            int saved_defer = ctx.defer_count;
+
             int else_label = new_label();
             int end_label = new_label();
             int cond_reg = gen_expr(node->if_stmt.cond);
@@ -1123,35 +1136,37 @@ static void gen_stmt_single(Node *node) {
             jz->dest = op_label(else_label);
             jz->line = node->tok ? node->tok->line : 0;
             emit(jz);
-            
+
             gen_stmt(node->if_stmt.then_b);
             int then_ret = ctx.has_returned;
             ctx.has_returned = saved_ret; // Reset for else block
-            
+            ctx.defer_count = saved_defer; // Restore defers from then block
+
             IRInst *jmp = new_inst(IR_JMP);
             jmp->dest = op_label(end_label);
             jmp->line = node->tok ? node->tok->line : 0;
             emit(jmp);
-            
+
             IRInst *else_lbl = new_inst(IR_LABEL);
             else_lbl->dest = op_label(else_label);
             emit(else_lbl);
-            
+
             int else_ret = 0;
             if (node->if_stmt.else_b) {
                 gen_stmt(node->if_stmt.else_b);
                 else_ret = ctx.has_returned;
             }
-            
+
             IRInst *end_lbl = new_inst(IR_LABEL);
             end_lbl->dest = op_label(end_label);
             emit(end_lbl);
-            
+
             if (then_ret && else_ret) {
                 ctx.has_returned = 1;
             } else {
                 ctx.has_returned = saved_ret;
             }
+            ctx.defer_count = saved_defer; // Restore defers from else block
             break;
         }
         case NODE_KIND_ASM:
@@ -1163,6 +1178,7 @@ static void gen_stmt_single(Node *node) {
             break;
         case NODE_KIND_WHILE: {
             int saved_ret = ctx.has_returned;
+            int saved_defer = ctx.defer_count;
             int start_label = new_label();
             int end_label = new_label();
 
@@ -1190,14 +1206,16 @@ static void gen_stmt_single(Node *node) {
             IRInst *end_lbl = new_inst(IR_LABEL);
             end_lbl->dest = op_label(end_label);
             emit(end_lbl);
-            
+
             pop_loop();
-            ctx.has_returned = saved_ret; // Loops might not execute
+            ctx.has_returned = saved_ret;
+            ctx.defer_count = saved_defer;
             break;
         }
 
         case NODE_KIND_DO_WHILE: {
             int saved_ret = ctx.has_returned;
+            int saved_defer = ctx.defer_count;
             int start_label = new_label();
             int end_label = new_label();
             int cond_label = new_label();
@@ -1228,10 +1246,12 @@ static void gen_stmt_single(Node *node) {
 
             pop_loop();
             ctx.has_returned = saved_ret;
+            ctx.defer_count = saved_defer;
             break;
         }
 
         case NODE_KIND_FOR: {
+            int saved_defer = ctx.defer_count;
             int start_label = new_label();
             int end_label = new_label();
             int step_label = new_label();
@@ -1282,6 +1302,7 @@ static void gen_stmt_single(Node *node) {
             emit(end_lbl);
 
             pop_loop();
+            ctx.defer_count = saved_defer;
             break;
         }
 
@@ -1314,8 +1335,17 @@ static void gen_stmt_single(Node *node) {
             gen_expr(node);
             break;
 
+        case NODE_KIND_DEFER:
+            if (ctx.defer_count >= ctx.defer_cap) {
+                ctx.defer_cap *= 2;
+                ctx.defer_stack = realloc(ctx.defer_stack, ctx.defer_cap * sizeof(Node *));
+            }
+            ctx.defer_stack[ctx.defer_count++] = node->expr;
+            break;
+
         case NODE_KIND_MATCH: {
             int saved_ret = ctx.has_returned;
+            int saved_defer = ctx.defer_count;
             int end_label = new_label();
             int line = node->tok ? node->tok->line : 0;
 
@@ -1464,6 +1494,7 @@ static void gen_stmt_single(Node *node) {
 
                 // Generate case body
                 ctx.has_returned = saved_ret;
+                ctx.defer_count = saved_defer;
                 gen_stmt(c->body);
                 if (!ctx.has_returned) all_returned = 0;
 
@@ -1491,6 +1522,7 @@ static void gen_stmt_single(Node *node) {
             emit(end_lbl);
 
             ctx.has_returned = all_returned ? 1 : saved_ret;
+            ctx.defer_count = saved_defer;
             break;
         }
 
@@ -1600,6 +1632,9 @@ IRProgram *gen_ir(Node *ast) {
         ctx.loop_depth = 0;
         ctx.has_sret = 0;
         ctx.has_returned = 0;
+        ctx.defer_count = 0;
+        ctx.defer_cap = 8;
+        ctx.defer_stack = calloc(ctx.defer_cap, sizeof(Node *));
         // Labels are global to ensure uniqueness across functions
 
         IRFunction *func = calloc(1, sizeof(IRFunction));
@@ -1636,7 +1671,10 @@ IRProgram *gen_ir(Node *ast) {
                 emit(store);
             }
             gen_stmt(fn_node->body->stmts);
-            
+
+            // Emit deferred calls before implicit return
+            emit_deferred_calls();
+
             // Sempre emitir um retorno implícito (0) no final da função.
             // Isso garante que funções void tenham epílogo gerado no codegen.
             int zero = emit_imm(0, 0);
@@ -1649,6 +1687,7 @@ IRProgram *gen_ir(Node *ast) {
         func->instructions = ctx.inst_head;
         func->vreg_count = ctx.vreg_count;
         func->label_count = global_label_count;
+        free(ctx.defer_stack);
 
         // Adicionar à lista de funções
         *func_ptr = func;

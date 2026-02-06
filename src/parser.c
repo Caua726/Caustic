@@ -1662,6 +1662,17 @@ static Node *parse_stmt() {
         expect(TOKEN_TYPE_SEMICOLON);
         return new_node(NODE_KIND_CONTINUE);
     }
+
+    if (current_token.type == TOKEN_TYPE_DEFER) {
+        Token defer_tok = current_token;
+        consume();
+        Node *node = new_node(NODE_KIND_DEFER);
+        node->tok = calloc(1, sizeof(Token));
+        *node->tok = defer_tok;
+        node->expr = parse_expr();
+        expect(TOKEN_TYPE_SEMICOLON);
+        return node;
+    }
     Node *node = parse_expr();
     // Assignment is now handled in parse_expr
 
@@ -1899,6 +1910,10 @@ static void ast_print_recursive(Node *node, int depth) {
                 ast_print_recursive(node->match_stmt.else_b, depth + 2);
             }
             break;
+        case NODE_KIND_DEFER:
+            printf("Defer\n");
+            ast_print_recursive(node->expr, depth + 1);
+            break;
         default:
             printf("Nó Desconhecido\n");
             break;
@@ -1960,6 +1975,7 @@ static void free_ast_impl(Node *node) {
         case NODE_KIND_CAST:
         case NODE_KIND_ADDR:
         case NODE_KIND_DEREF:
+        case NODE_KIND_DEFER:
             free_ast_impl(node->expr);
             break;
         case NODE_KIND_FNCALL:

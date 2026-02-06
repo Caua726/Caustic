@@ -204,6 +204,7 @@ static Node *clone_node(Node *node) {
         case NODE_KIND_NEG:
         case NODE_KIND_BITWISE_NOT:
         case NODE_KIND_LOGICAL_NOT:
+        case NODE_KIND_DEFER:
             c->expr = clone_node(node->expr);
             break;
         case NODE_KIND_LET:
@@ -373,6 +374,7 @@ static void substitute_types_in_node(Node *node, char **param_names, Type **conc
         case NODE_KIND_NEG:
         case NODE_KIND_BITWISE_NOT:
         case NODE_KIND_LOGICAL_NOT:
+        case NODE_KIND_DEFER:
             substitute_types_in_node(node->expr, param_names, concrete, count);
             break;
         case NODE_KIND_LET:
@@ -1308,6 +1310,36 @@ void walk(Node *node) {
             // For now, we allow integers as booleans (C-style)
             node->ty = type_bool;
             return;
+
+        case NODE_KIND_DEFER: {
+            if (node->expr->kind != NODE_KIND_FNCALL) {
+                const char *kind_str = "expressao";
+                switch (node->expr->kind) {
+                    case NODE_KIND_NUM: kind_str = "literal numerico"; break;
+                    case NODE_KIND_IDENTIFIER: kind_str = "variavel"; break;
+                    case NODE_KIND_STRING_LITERAL: kind_str = "string literal"; break;
+                    case NODE_KIND_ADD: case NODE_KIND_SUBTRACTION:
+                    case NODE_KIND_MULTIPLIER: case NODE_KIND_DIVIDER:
+                    case NODE_KIND_MOD:
+                        kind_str = "operacao aritmetica"; break;
+                    case NODE_KIND_ASSIGN: kind_str = "atribuicao"; break;
+                    case NODE_KIND_CAST: kind_str = "cast"; break;
+                    case NODE_KIND_SYSCALL: kind_str = "syscall"; break;
+                    case NODE_KIND_DEREF: kind_str = "dereference"; break;
+                    case NODE_KIND_ADDR: kind_str = "endereco (&)"; break;
+                    case NODE_KIND_SIZEOF: kind_str = "sizeof"; break;
+                    default: break;
+                }
+                if (node->tok) {
+                    error_at_token(*node->tok, "'defer' so aceita chamadas de funcao, mas encontrou %s.", kind_str);
+                } else {
+                    fprintf(stderr, "Erro: 'defer' so aceita chamadas de funcao, mas encontrou %s.\n", kind_str);
+                    exit(1);
+                }
+            }
+            walk(node->expr);
+            return;
+        }
 
         case NODE_KIND_BREAK:
             if (loop_depth == 0) {
