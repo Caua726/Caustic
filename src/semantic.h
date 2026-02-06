@@ -42,6 +42,7 @@ typedef struct Function {
     char *asm_name;
     char *module_prefix;
     int is_variadic;
+    int is_extern;
     struct Function *next;
 } Function;
 

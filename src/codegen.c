@@ -35,6 +35,7 @@ typedef struct {
     int next_spill;
     int is_leaf;
     int arg_spill_base;
+    int aligned_stack_size;
     IRFunction *current_func; // Added to access func info in gen_inst
 } AllocCtx;
 
@@ -293,7 +294,7 @@ static void gen_binary_op(IRInst *inst, AllocCtx *ctx, const char *op) {
     store_operand(inst->dest.vreg, ctx, "r15");
 }
 
-static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
+static void gen_inst(IRInst *inst, AllocCtx *ctx) {
     char dst[64], src1[64];
 
     switch (inst->op) {
@@ -428,10 +429,8 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
                 load_operand(inst->src1.vreg, ctx, "rax");
             }
 
-            int stack_size = ctx->stack_slots * 8 + alloc_stack_size;
-            if (stack_size > 0) {
-                stack_size = (stack_size + 15) & ~15;
-                emit("add rsp, %d", stack_size);
+            if (ctx->aligned_stack_size > 0) {
+                emit("add rsp, %d", ctx->aligned_stack_size);
             }
 
             emit("pop r15");
@@ -1060,6 +1059,9 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx, int alloc_stack_size) {
             // 2. Scratch registers (r14, r15) don't need preservation across calls.
             // 3. Argument registers (rdi, etc.) are set immediately before call.
             // If we start using caller-saved regs for vars, we must save them here.
+            if (inst->is_variadic_call) {
+                emit("xor eax, eax");
+            }
             emit("call %s", inst->call_target_name);
 
             store_operand(inst->dest.vreg, ctx, "rax");
@@ -1135,8 +1137,14 @@ static void gen_func(IRFunction *func) {
     emit("push r15");
 
     int stack_size = ctx.stack_slots * 8 + func->alloc_stack_size;
+    stack_size = (stack_size + 15) & ~15; // Round up to multiple of 16
+    // After 6 pushes (rbp + 5 callee-saved = 48 bytes), rsp % 16 == 8.
+    // Need sub_rsp % 16 == 8 so rsp is 16-byte aligned before calls (ABI).
+    if (!ctx.is_leaf && stack_size % 16 == 0) {
+        stack_size += 8;
+    }
+    ctx.aligned_stack_size = stack_size;
     if (stack_size > 0) {
-        stack_size = (stack_size + 15) & ~15; // Align to 16 bytes
         emit("sub rsp, %d", stack_size);
     }
 
@@ -1314,7 +1322,7 @@ static void gen_func(IRFunction *func) {
 
 
     for (IRInst *inst = func->instructions; inst; inst = inst->next) {
-        gen_inst(inst, &ctx, func->alloc_stack_size);
+        gen_inst(inst, &ctx);
     }
 
     // Implicit return for void functions (or fallthrough safety)
@@ -1323,10 +1331,8 @@ static void gen_func(IRFunction *func) {
     
     if (!last || last->op != IR_RET) {
         // Emit epilogue
-        int stack_size = ctx.stack_slots * 8 + func->alloc_stack_size;
-        if (stack_size > 0) {
-            stack_size = (stack_size + 15) & ~15;
-            emit("add rsp, %d", stack_size);
+        if (ctx.aligned_stack_size > 0) {
+            emit("add rsp, %d", ctx.aligned_stack_size);
         }
         emit("pop r15");
         emit("pop r14");

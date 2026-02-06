@@ -130,6 +130,7 @@ static Node *parse_enum_decl();
 static Node *parse_match_stmt();
 static void parse_file_body(Node **cur_ptr);
 static void parse_use(Node **cur_ptr);
+static Node *parse_extern_fn();
 static Node *new_node(NodeKind kind);
 
 
@@ -265,8 +266,14 @@ static void parse_file_body(Node **cur_ptr) {
             continue;
         }
 
+        if (current_token.type == TOKEN_TYPE_EXTERN) {
+            cur->next = parse_extern_fn();
+            cur = cur->next;
+            continue;
+        }
+
         if (current_token.type != TOKEN_TYPE_FN) {
-            error_at_token(current_token, "era esperado 'fn', 'let', 'struct', 'enum' ou 'use' mas encontrou '%s'", current_token.text);
+            error_at_token(current_token, "era esperado 'fn', 'extern', 'let', 'struct', 'enum' ou 'use' mas encontrou '%s'", current_token.text);
         }
 
         cur->next = parse_fn();
@@ -889,6 +896,80 @@ static Node *parse_block() {
 
     node->stmts = head.next;
     return node;
+}
+
+static Node *parse_extern_fn() {
+    consume(); // extern
+    expect(TOKEN_TYPE_FN);
+
+    Node *fn_node = new_node(NODE_KIND_FN);
+    fn_node->is_extern = 1;
+
+    if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+        error_at_token(current_token, "esperado nome da funcao apos 'extern fn'.");
+    }
+    fn_node->name = strdup(current_token.text);
+    consume();
+
+    if (current_token.type == TOKEN_TYPE_GEN) {
+        error_at_token(current_token, "funcoes extern nao podem ser genericas.");
+    }
+
+    expect(TOKEN_TYPE_LPAREN);
+
+    if (current_token.type != TOKEN_TYPE_RPAREN) {
+        in_fn_params = 1;
+        Node head = {};
+        Node *cur = &head;
+        while (1) {
+            if (current_token.type == TOKEN_TYPE_ELLIPSIS) {
+                fn_node->is_variadic = 1;
+                consume();
+                if (current_token.type != TOKEN_TYPE_RPAREN) {
+                    error_at_token(current_token, "variadic '...' deve ser o ultimo parametro.");
+                }
+                break;
+            }
+
+            if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                error_at_token(current_token, "esperado nome do parametro.");
+            }
+            char *param_name = strdup(current_token.text);
+            consume();
+
+            expect(TOKEN_TYPE_AS);
+            Type *param_type = parse_type();
+
+            Node *param = new_node(NODE_KIND_LET);
+            param->name = param_name;
+            param->ty = param_type;
+            param->flags = VAR_FLAG_NONE;
+
+            cur->next = param;
+            cur = cur->next;
+
+            if (current_token.type == TOKEN_TYPE_COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+        fn_node->params = head.next;
+        in_fn_params = 0;
+    }
+
+    expect(TOKEN_TYPE_RPAREN);
+
+    if (current_token.type == TOKEN_TYPE_AS) {
+        consume();
+        fn_node->return_type = parse_type();
+    } else {
+        fn_node->return_type = type_i32;
+    }
+
+    fn_node->body = NULL;
+    expect(TOKEN_TYPE_SEMICOLON);
+    return fn_node;
 }
 
 static Node *parse_fn() {
@@ -1695,8 +1776,8 @@ static void ast_print_recursive(Node *node, int depth) {
 
     switch (node->kind) {
         case NODE_KIND_FN:
-            printf("Function(%s)\n", node->name);
-            ast_print_recursive(node->body, depth + 1);
+            printf("Function(%s%s)\n", node->name, node->is_extern ? " [extern]" : "");
+            if (node->body) ast_print_recursive(node->body, depth + 1);
             break;
         case NODE_KIND_BLOCK:
             printf("Block\n");

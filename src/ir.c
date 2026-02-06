@@ -120,11 +120,12 @@ static int emit_cast(int src_reg, Type *to_type, int line) {
     return emit_cast_from(src_reg, NULL, to_type, line);
 }
 
-static int emit_call(char *func_name, int line) {
+static int emit_call(char *func_name, int is_variadic, int line) {
     int dest = new_vreg();
     IRInst *inst = new_inst(IR_CALL);
     inst->dest = op_vreg(dest);
     inst->call_target_name = strdup(func_name);
+    inst->is_variadic_call = is_variadic;
     inst->line = line;
     emit(inst);
     return dest;
@@ -839,7 +840,7 @@ static int gen_expr(Node *node) {
 
             free(arg_vregs);
 
-            int ret_reg = emit_call(node->name, node->tok ? node->tok->line : 0);
+            int ret_reg = emit_call(node->name, node->is_variadic, node->tok ? node->tok->line : 0);
 
             if (stack_args > 0) {
                 IRInst *cleanup = new_inst(IR_ASM);
@@ -1620,6 +1621,11 @@ IRProgram *gen_ir(Node *ast) {
 
         // Skip generic templates (uninstantiated)
         if (node->generic_param_count > 0) {
+            continue;
+        }
+
+        // Skip extern functions (no body to generate)
+        if (!node->body) {
             continue;
         }
 

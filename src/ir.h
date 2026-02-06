@@ -78,6 +78,7 @@ typedef struct IRInst {
     unsigned long live_out;
     char *asm_str;
     char *call_target_name;
+    int is_variadic_call;
     char *global_name; // For IR_ADDR_GLOBAL
     Type *cast_to_type;
     Type *cast_from_type; // For float<->int conversions

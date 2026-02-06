@@ -35,7 +35,7 @@ static Variable *symtab_lookup(char *name);
 static void resolve_type_ref(Type *ty);
 static void declare_struct(char *name, Type *type);
 static void declare_enum(char *name, Type *type);
-static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic);
+static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic, int is_extern);
 void walk(Node *node);
 
 // --- Generics support ---
@@ -536,9 +536,15 @@ static Type *new_type_full(TypeKind kind, int size, int is_signed) {
     return ty;
 }
 
-static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic) {
+static void declare_function(char *name, Type *return_type, Type **param_types, int param_count, int is_variadic, int is_extern) {
     for (Function *fs = function_table; fs; fs = fs->next) {
         if (strcmp(fs->name, name) == 0) {
+            // Check extern/local collision
+            if (fs->is_extern != is_extern) {
+                fprintf(stderr, "Erro: conflito de nome '%s' entre funcao extern e funcao local.\n", name);
+                exit(1);
+            }
+
             // Check if in same module
             int same_module = 0;
             if (current_module_path && fs->module_prefix && strcmp(current_module_path, fs->module_prefix) == 0) same_module = 1;
@@ -557,17 +563,18 @@ static void declare_function(char *name, Type *return_type, Type **param_types, 
     f->param_types = param_types;
     f->param_count = param_count;
     f->is_variadic = is_variadic;
+    f->is_extern = is_extern;
     f->module_prefix = current_module_path ? strdup(current_module_path) : NULL;
 
-    if (current_module_path) {
+    if (is_extern) {
+        f->asm_name = strdup(name);
+    } else if (current_module_path) {
         int len = strlen(current_module_path) + 1 + strlen(name) + 1;
         f->asm_name = malloc(len);
         snprintf(f->asm_name, len, "%s_%s", current_module_path, name);
     } else {
         f->asm_name = strdup(name);
     }
-    // printf("Declared Function: %s -> ASM: %s (Module: %s)\n", name, f->asm_name, current_module_path ? current_module_path : "NONE");
-    
     f->next = function_table;
     function_table = f;
 }
@@ -956,7 +963,7 @@ static void instantiate_generic_func(GenericTemplate *tmpl, Type **concrete, int
     for (Node *p = fn_clone->params; p; p = p->next) {
         param_types[i++] = p->ty;
     }
-    declare_function(mangled_name, fn_clone->return_type, param_types, param_count, fn_clone->is_variadic);
+    declare_function(mangled_name, fn_clone->return_type, param_types, param_count, fn_clone->is_variadic, 0);
 
     // Append to AST for IR generation
     if (ast_tail) {
@@ -1742,8 +1749,9 @@ void walk(Node *node) {
             node->ty = func->return_type;
             // Store asm_name in the node for codegen - must strdup to avoid shared ownership
             if (node->name) free(node->name);  // Free original parsed name
-            node->name = strdup(func->asm_name); 
-            
+            node->name = strdup(func->asm_name);
+            node->is_variadic = func->is_variadic;
+
             // fprintf(stderr, "Debug: Processing args for function '%s'\n", func->name);
             
             // Verify arguments
@@ -2291,7 +2299,7 @@ static void register_funcs(Node *node) {
                 param_types[i++] = p->ty;
             }
 
-            declare_function(n->name, n->return_type, param_types, param_count, n->is_variadic);
+            declare_function(n->name, n->return_type, param_types, param_count, n->is_variadic, n->is_extern);
         }
     }
 }
@@ -2319,8 +2327,8 @@ static void analyze_bodies(Node *node) {
             current_module_path = old_path;
             if (prefix) free(prefix);
         } else if (n->kind == NODE_KIND_FN) {
-            // Skip generic templates — they are instantiated on demand
             if (n->generic_param_count > 0) continue;
+            if (n->is_extern) continue;
             walk(n);
         }
     }
@@ -2348,7 +2356,7 @@ void analyze(Node *node) {
     ptr_type->size = 8;
     Type **va_params = calloc(1, sizeof(Type*));
     va_params[0] = ptr_type;
-    declare_function("__builtin_va_start", type_void, va_params, 1, 0);
+    declare_function("__builtin_va_start", type_void, va_params, 1, 0, 0);
 
     register_structs(node);
     register_aliases(node);

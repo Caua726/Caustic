@@ -145,6 +145,7 @@ typedef struct Node {
     struct Node *body;
     struct Node *params; // Lista de parâmetros (NODE_KIND_VAR_DECL)
     int is_variadic;
+    int is_extern;
 
     // Function Call
     struct Node *args;   // Lista de argumentos (expressões)
