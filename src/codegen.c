@@ -786,14 +786,28 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                         emit("mov BYTE PTR [rbp-%ld], %s", inst->dest.imm, reg8);
                     } else {
                         // Struct > 8 bytes (passed by reference/pointer in register)
-                        // Copy from [src_reg] to [rbp-dest]
-                        // src1 holds the ADDRESS of the source struct
-                        
-                        emit("lea rdi, [rbp-%ld]", inst->dest.imm); // Dest address (local var)
-                        emit("mov rsi, %s", source_reg);            // Source address (param)
-                        emit("mov rcx, %d", size);
-                        emit("cld");
-                        emit("rep movsb");
+                        // Copy from [src_reg] to [rbp-dest] using rax as scratch
+                        // (rep movsb would clobber rdi/rsi/rcx and corrupt other params)
+                        int off = 0;
+                        while (off + 8 <= size) {
+                            emit("mov rax, QWORD PTR [%s+%d]", source_reg, off);
+                            emit("mov QWORD PTR [rbp-%ld], rax", (long)inst->dest.imm - off);
+                            off += 8;
+                        }
+                        if (off + 4 <= size) {
+                            emit("mov eax, DWORD PTR [%s+%d]", source_reg, off);
+                            emit("mov DWORD PTR [rbp-%ld], eax", (long)inst->dest.imm - off);
+                            off += 4;
+                        }
+                        if (off + 2 <= size) {
+                            emit("movzx eax, WORD PTR [%s+%d]", source_reg, off);
+                            emit("mov WORD PTR [rbp-%ld], ax", (long)inst->dest.imm - off);
+                            off += 2;
+                        }
+                        if (off < size) {
+                            emit("movzx eax, BYTE PTR [%s+%d]", source_reg, off);
+                            emit("mov BYTE PTR [rbp-%ld], al", (long)inst->dest.imm - off);
+                        }
                     }
                 } else {
                     emit("mov QWORD PTR [rbp-%ld], %s", inst->dest.imm, src1);

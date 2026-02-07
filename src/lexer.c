@@ -183,6 +183,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "case") == 0) {t.type = TOKEN_TYPE_CASE;}
         else if (strcmp(t.text, "defer") == 0) {t.type = TOKEN_TYPE_DEFER;}
         else if (strcmp(t.text, "extern") == 0) {t.type = TOKEN_TYPE_EXTERN;}
+        else if (strcmp(t.text, "impl") == 0) {t.type = TOKEN_TYPE_IMPL;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;

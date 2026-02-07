@@ -272,8 +272,70 @@ static void parse_file_body(Node **cur_ptr) {
             continue;
         }
 
+        if (current_token.type == TOKEN_TYPE_IMPL) {
+            consume(); // impl
+            if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                error_at_token(current_token, "esperado nome do tipo após 'impl'.");
+            }
+            char *type_name = strdup(current_token.text);
+            consume();
+
+            // Parse optional generic params: impl Vec gen T, U { ... }
+            char **impl_generic_params = NULL;
+            int impl_generic_count = 0;
+            if (current_token.type == TOKEN_TYPE_GEN) {
+                consume();
+                int cap = 4;
+                impl_generic_params = calloc(cap, sizeof(char*));
+                while (current_token.type == TOKEN_TYPE_IDENTIFIER) {
+                    if (impl_generic_count >= cap) {
+                        cap *= 2;
+                        impl_generic_params = realloc(impl_generic_params, cap * sizeof(char*));
+                    }
+                    impl_generic_params[impl_generic_count++] = strdup(current_token.text);
+                    consume();
+                    if (current_token.type == TOKEN_TYPE_COMMA) {
+                        consume();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            expect(TOKEN_TYPE_LBRACE);
+            while (current_token.type != TOKEN_TYPE_RBRACE) {
+                if (current_token.type != TOKEN_TYPE_FN) {
+                    error_at_token(current_token, "esperado 'fn' dentro de bloco impl.");
+                }
+                Node *fn = parse_fn();
+                // Mangle name: Type_method
+                char mangled[512];
+                snprintf(mangled, sizeof(mangled), "%s_%s", type_name, fn->name);
+                free(fn->name);
+                fn->name = strdup(mangled);
+                fn->impl_type_name = strdup(type_name);
+
+                // Copy generic params from impl to fn if fn doesn't have its own
+                if (impl_generic_count > 0 && fn->generic_param_count == 0) {
+                    fn->generic_params = calloc(impl_generic_count, sizeof(char*));
+                    fn->generic_param_count = impl_generic_count;
+                    for (int i = 0; i < impl_generic_count; i++) {
+                        fn->generic_params[i] = strdup(impl_generic_params[i]);
+                    }
+                }
+
+                cur->next = fn;
+                cur = cur->next;
+            }
+            expect(TOKEN_TYPE_RBRACE);
+            for (int i = 0; i < impl_generic_count; i++) free(impl_generic_params[i]);
+            free(impl_generic_params);
+            free(type_name);
+            continue;
+        }
+
         if (current_token.type != TOKEN_TYPE_FN) {
-            error_at_token(current_token, "era esperado 'fn', 'extern', 'let', 'struct', 'enum' ou 'use' mas encontrou '%s'", current_token.text);
+            error_at_token(current_token, "era esperado 'fn', 'extern', 'impl', 'let', 'struct', 'enum' ou 'use' mas encontrou '%s'", current_token.text);
         }
 
         cur->next = parse_fn();
@@ -450,44 +512,46 @@ static Type *parse_type() {
             free(type_name_str);
 
             consume(); // consume type name
-            return ty;
+            // Fall through to check for generic args (e.g. t.Result gen i32, i32)
         }
     }
 
-    if (strcmp(current_token.text, "i32") == 0) {
-        ty = type_i32;
-    } else if (strcmp(current_token.text, "i8") == 0) {
-        ty = type_i8;
-    } else if (strcmp(current_token.text, "i16") == 0) {
-        ty = type_i16;
-    } else if (strcmp(current_token.text, "i64") == 0) {
-        ty = type_i64;
-    } else if (strcmp(current_token.text, "u8") == 0) {
-        ty = type_u8;
-    } else if (strcmp(current_token.text, "u16") == 0) {
-        ty = type_u16;
-    } else if (strcmp(current_token.text, "u32") == 0) {
-        ty = type_u32;
-    } else if (strcmp(current_token.text, "u64") == 0) {
-        ty = type_u64;
-    } else if (strcmp(current_token.text, "f32") == 0) {
-        ty = type_f32;
-    } else if (strcmp(current_token.text, "f64") == 0) {
-        ty = type_f64;
-    } else if (strcmp(current_token.text, "bool") == 0) {
-        ty = type_bool;
-    } else if (strcmp(current_token.text, "char") == 0) {
-        ty = type_char;
-    } else if (strcmp(current_token.text, "string") == 0) {
-        ty = type_string;
-    } else if (strcmp(current_token.text, "void") == 0) {
-        ty = type_void;
-    } else {
-        ty = new_type(TY_STRUCT);
-        ty->name = strdup(current_token.text);
-    }
+    if (ty == NULL) {
+        if (strcmp(current_token.text, "i32") == 0) {
+            ty = type_i32;
+        } else if (strcmp(current_token.text, "i8") == 0) {
+            ty = type_i8;
+        } else if (strcmp(current_token.text, "i16") == 0) {
+            ty = type_i16;
+        } else if (strcmp(current_token.text, "i64") == 0) {
+            ty = type_i64;
+        } else if (strcmp(current_token.text, "u8") == 0) {
+            ty = type_u8;
+        } else if (strcmp(current_token.text, "u16") == 0) {
+            ty = type_u16;
+        } else if (strcmp(current_token.text, "u32") == 0) {
+            ty = type_u32;
+        } else if (strcmp(current_token.text, "u64") == 0) {
+            ty = type_u64;
+        } else if (strcmp(current_token.text, "f32") == 0) {
+            ty = type_f32;
+        } else if (strcmp(current_token.text, "f64") == 0) {
+            ty = type_f64;
+        } else if (strcmp(current_token.text, "bool") == 0) {
+            ty = type_bool;
+        } else if (strcmp(current_token.text, "char") == 0) {
+            ty = type_char;
+        } else if (strcmp(current_token.text, "string") == 0) {
+            ty = type_string;
+        } else if (strcmp(current_token.text, "void") == 0) {
+            ty = type_void;
+        } else {
+            ty = new_type(TY_STRUCT);
+            ty->name = strdup(current_token.text);
+        }
 
-    consume();
+        consume();
+    }
 
     // Parse generic type args: Vec gen i32, f64
     if (ty->kind == TY_STRUCT && current_token.type == TOKEN_TYPE_GEN) {
@@ -1078,11 +1142,70 @@ static Node *parse_postfix() {
             if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
                 error_at_token(current_token, "esperado nome do membro após '.'");
             }
-            Node *member_node = new_node(NODE_KIND_MEMBER_ACCESS);
-            member_node->lhs = node;
-            member_node->member_name = strdup(current_token.text);
-            consume();
-            node = member_node;
+            // Check for module-qualified generic: t.Result gen i32, i32
+            if (node->kind == NODE_KIND_IDENTIFIER && lookahead_token.type == TOKEN_TYPE_GEN) {
+                char combined[512];
+                snprintf(combined, sizeof(combined), "%s.%s", node->name, current_token.text);
+                char *original_name = strdup(combined);
+                consume(); // consume type/fn name
+                consume(); // consume 'gen'
+
+                int cap = 4;
+                Type **gen_args = calloc(cap, sizeof(Type*));
+                int gen_count = 0;
+                char mangled[512];
+                snprintf(mangled, sizeof(mangled), "%s", combined);
+
+                while (1) {
+                    Type *arg_type = parse_type();
+                    if (gen_count >= cap) {
+                        cap *= 2;
+                        gen_args = realloc(gen_args, cap * sizeof(Type*));
+                    }
+                    gen_args[gen_count++] = arg_type;
+
+                    const char *tname = "unknown";
+                    switch (arg_type->kind) {
+                        case TY_I8: tname = "i8"; break;
+                        case TY_I16: tname = "i16"; break;
+                        case TY_I32: tname = "i32"; break;
+                        case TY_I64: tname = "i64"; break;
+                        case TY_U8: tname = "u8"; break;
+                        case TY_U16: tname = "u16"; break;
+                        case TY_U32: tname = "u32"; break;
+                        case TY_U64: tname = "u64"; break;
+                        case TY_F32: tname = "f32"; break;
+                        case TY_F64: tname = "f64"; break;
+                        case TY_BOOL: tname = "bool"; break;
+                        case TY_CHAR: tname = "char"; break;
+                        case TY_STRING: tname = "string"; break;
+                        case TY_VOID: tname = "void"; break;
+                        case TY_PTR: tname = "ptr"; break;
+                        case TY_STRUCT: tname = arg_type->name ? arg_type->name : "struct"; break;
+                        default: break;
+                    }
+                    size_t cur_len = strlen(mangled);
+                    snprintf(mangled + cur_len, sizeof(mangled) - cur_len, "_%s", tname);
+
+                    if (current_token.type == TOKEN_TYPE_COMMA) {
+                        consume();
+                    } else {
+                        break;
+                    }
+                }
+
+                free(node->name);
+                node->name = strdup(mangled);
+                node->generic_args = gen_args;
+                node->generic_arg_count = gen_count;
+                node->member_name = original_name;
+            } else {
+                Node *member_node = new_node(NODE_KIND_MEMBER_ACCESS);
+                member_node->lhs = node;
+                member_node->member_name = strdup(current_token.text);
+                consume();
+                node = member_node;
+            }
         } else if (current_token.type == TOKEN_TYPE_LPAREN) {
             // Generic Function Call (expr(...))
             consume(); // (

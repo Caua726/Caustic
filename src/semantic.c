@@ -320,6 +320,22 @@ static void substitute_type(Type *ty, char **param_names, Type **concrete, int c
     // Recurse into pointer base
     if (ty->base) substitute_type(ty->base, param_names, concrete, count);
 
+    // Substitute generic args and re-mangle name (e.g. Wrapper gen T → Wrapper gen i32 → Wrapper_i32)
+    if (ty->generic_arg_count > 0 && ty->base_name) {
+        for (int i = 0; i < ty->generic_arg_count; i++) {
+            Type *sub = find_generic_substitution(ty->generic_args[i], param_names, concrete, count);
+            if (sub) {
+                ty->generic_args[i] = sub;
+            } else {
+                substitute_type(ty->generic_args[i], param_names, concrete, count);
+            }
+        }
+        // Re-mangle the name with the substituted args
+        char *new_name = mangle_generic_name(ty->base_name, ty->generic_args, ty->generic_arg_count);
+        free(ty->name);
+        ty->name = new_name;
+    }
+
     // Recurse into struct fields — replace field type pointers directly
     if (ty->owns_fields) {
         for (Field *f = ty->fields; f; f = f->next) {
@@ -722,6 +738,31 @@ static void resolve_type_ref(Type *ty) {
         // 3. Try generic instantiation (e.g. Vec_i32 from template Vec gen T)
         if (!def && ty->generic_arg_count > 0 && ty->base_name) {
             GenericTemplate *tmpl = lookup_generic_template(ty->base_name);
+            // If base_name is module-qualified (e.g. "t.Result"), resolve the alias
+            if (!tmpl && strchr(ty->base_name, '.')) {
+                char *dot = strchr(ty->base_name, '.');
+                int alias_len = dot - ty->base_name;
+                char *alias = malloc(alias_len + 1);
+                strncpy(alias, ty->base_name, alias_len);
+                alias[alias_len] = '\0';
+                char *type_name = dot + 1;
+                Variable *var = symtab_lookup(alias);
+                if (var && var->is_module && var->module_ref) {
+                    tmpl = lookup_generic_template(type_name);
+                    // Rebuild mangled name with module prefix
+                    if (tmpl) {
+                        char *mangled = mangle_generic_name(type_name, ty->generic_args, ty->generic_arg_count);
+                        char *prefix = var->module_ref->path_prefix;
+                        int len = strlen(prefix) + 1 + strlen(mangled) + 1;
+                        char *full_mangled = malloc(len);
+                        snprintf(full_mangled, len, "%s_%s", prefix, mangled);
+                        free(ty->name);
+                        ty->name = full_mangled;
+                        free(mangled);
+                    }
+                }
+                free(alias);
+            }
             if (tmpl && !tmpl->is_function) {
                 instantiate_generic_struct(tmpl, ty->generic_args, ty->generic_arg_count, ty->name);
                 def = lookup_struct(ty->name);
@@ -741,6 +782,30 @@ static void resolve_type_ref(Type *ty) {
             // Try generic enum instantiation
             if (!enum_def && ty->generic_arg_count > 0 && ty->base_name) {
                 GenericTemplate *tmpl = lookup_generic_template(ty->base_name);
+                // If base_name is module-qualified (e.g. "t.Result"), resolve the alias
+                if (!tmpl && strchr(ty->base_name, '.')) {
+                    char *dot = strchr(ty->base_name, '.');
+                    int alias_len = dot - ty->base_name;
+                    char *alias = malloc(alias_len + 1);
+                    strncpy(alias, ty->base_name, alias_len);
+                    alias[alias_len] = '\0';
+                    char *type_name = dot + 1;
+                    Variable *var = symtab_lookup(alias);
+                    if (var && var->is_module && var->module_ref) {
+                        tmpl = lookup_generic_template(type_name);
+                        if (tmpl) {
+                            char *mangled = mangle_generic_name(type_name, ty->generic_args, ty->generic_arg_count);
+                            char *prefix = var->module_ref->path_prefix;
+                            int len = strlen(prefix) + 1 + strlen(mangled) + 1;
+                            char *full_mangled = malloc(len);
+                            snprintf(full_mangled, len, "%s_%s", prefix, mangled);
+                            free(ty->name);
+                            ty->name = full_mangled;
+                            free(mangled);
+                        }
+                    }
+                    free(alias);
+                }
                 if (tmpl && !tmpl->is_function) {
                     instantiate_generic_struct(tmpl, ty->generic_args, ty->generic_arg_count, ty->name);
                     enum_def = lookup_enum(ty->name);
@@ -1596,6 +1661,38 @@ void walk(Node *node) {
                     enum_ty = NULL;
                 }
 
+                // Try module-qualified generic enum (e.g. t.Result gen i32, i32 .Ok(val))
+                if (!enum_ty && !var_check && node->lhs->lhs->generic_arg_count > 0 && node->lhs->lhs->member_name) {
+                    char *full_member = node->lhs->lhs->member_name; // "t.Result"
+                    char *dot = strchr(full_member, '.');
+                    if (dot) {
+                        int alias_len = dot - full_member;
+                        char alias[256];
+                        strncpy(alias, full_member, alias_len);
+                        alias[alias_len] = '\0';
+                        char *type_name = dot + 1; // "Result"
+
+                        Variable *mod_var = symtab_lookup(alias);
+                        if (mod_var && mod_var->is_module && mod_var->module_ref) {
+                            char *mangled = mangle_generic_name(type_name, node->lhs->lhs->generic_args, node->lhs->lhs->generic_arg_count);
+                            char *prefix = mod_var->module_ref->path_prefix;
+                            int len = strlen(prefix) + 1 + strlen(mangled) + 1;
+                            char *full_mangled = malloc(len);
+                            snprintf(full_mangled, len, "%s_%s", prefix, mangled);
+
+                            GenericTemplate *tmpl = lookup_generic_template(type_name);
+                            if (tmpl && !tmpl->is_function) {
+                                instantiate_generic_struct(tmpl, node->lhs->lhs->generic_args, node->lhs->lhs->generic_arg_count, full_mangled);
+                            }
+
+                            enum_ty = lookup_enum(full_mangled);
+                            free(node->lhs->lhs->name);
+                            node->lhs->lhs->name = full_mangled;
+                            free(mangled);
+                        }
+                    }
+                }
+
                 if (enum_ty) {
                     Field *variant = NULL;
                     for (Field *f = enum_ty->fields; f; f = f->next) {
@@ -1728,13 +1825,82 @@ void walk(Node *node) {
                             exit(1);
                         }
                         // fprintf(stderr, "Debug: Function found: %p. Name: %s. AsmName: %s\n", (void*)func, func->name, func->asm_name);
+                    } else if (!var) {
+                        // Associated function: Point.new(3, 4) → Point_new(3, 4)
+                        // Check if the name is a struct or enum type
+                        Type *struct_ty = lookup_struct(lhs_expr->name);
+                        Type *enum_ty2 = struct_ty ? NULL : lookup_enum(lhs_expr->name);
+                        char *type_name = struct_ty ? struct_ty->name : (enum_ty2 ? enum_ty2->name : NULL);
+                        if (type_name) {
+                            char assoc_fn[512];
+                            snprintf(assoc_fn, sizeof(assoc_fn), "%s_%s", type_name, member_name);
+                            func = lookup_function(assoc_fn);
+                            if (!func) {
+                                fprintf(stderr, "Erro: função associada '%s' não encontrada para tipo '%s'.\n", member_name, type_name);
+                                exit(1);
+                            }
+                            // No self argument prepended - this is a static call
+                        } else {
+                            fprintf(stderr, "Erro: '%s' não é um módulo, variável ou tipo.\n", lhs_expr->name);
+                            exit(1);
+                        }
                     } else {
-                        // Not a module, assume struct member access (method or function pointer)
-                        // For now, we don't support methods or function pointers in structs fully yet in this pass?
-                        // Or maybe we do? The user said "Futuro/Erro por enquanto".
-                        // Let's emit error for now to be safe, or fall through if we want to support function pointers later.
-                        fprintf(stderr, "Erro: métodos ou ponteiros de função em structs ainda não suportados para '%s.%s'.\n", lhs_expr->name, member_name);
-                        exit(1);
+                        // Method call: x.method(args) → Type_method(&x, args)
+                        walk(lhs_expr); // Resolve the variable
+                        Type *obj_type = lhs_expr->ty;
+                        // If it's a pointer, dereference to get the base type
+                        Type *base_type = obj_type;
+                        if (base_type && base_type->kind == TY_PTR) base_type = base_type->base;
+
+                        if (base_type && (base_type->kind == TY_STRUCT || base_type->kind == TY_ENUM) && base_type->name) {
+                            // Try Type_method (e.g. Wrapper_i32_get or Point_sum)
+                            char method_name[512];
+                            snprintf(method_name, sizeof(method_name), "%s_%s", base_type->name, member_name);
+                            func = lookup_function(method_name);
+
+                            // If not found, try generic method instantiation
+                            // e.g. for Wrapper_i32, look for template Wrapper_get gen T, instantiate as Wrapper_get_i32
+                            if (!func && base_type->generic_arg_count > 0 && base_type->base_name) {
+                                char tmpl_method[512];
+                                snprintf(tmpl_method, sizeof(tmpl_method), "%s_%s", base_type->base_name, member_name);
+                                GenericTemplate *tmpl = lookup_generic_template(tmpl_method);
+                                if (tmpl && tmpl->is_function) {
+                                    char *mangled = mangle_generic_name(tmpl_method, base_type->generic_args, base_type->generic_arg_count);
+                                    instantiate_generic_func(tmpl, base_type->generic_args, base_type->generic_arg_count, mangled);
+                                    func = lookup_function(mangled);
+                                    // Update method_name for asm_name resolution
+                                    strncpy(method_name, mangled, sizeof(method_name));
+                                    free(mangled);
+                                }
+                            }
+
+                            if (func) {
+                                // Prepend &x (or x if already pointer) as first arg
+                                Node *self_arg;
+                                if (obj_type->kind == TY_PTR) {
+                                    // Already a pointer, pass directly
+                                    self_arg = lhs_expr;
+                                } else {
+                                    self_arg = calloc(1, sizeof(Node));
+                                    self_arg->kind = NODE_KIND_ADDR;
+                                    self_arg->expr = lhs_expr;
+                                    // Set type to *T
+                                    Type *ptr_ty = calloc(1, sizeof(Type));
+                                    ptr_ty->kind = TY_PTR;
+                                    ptr_ty->base = obj_type;
+                                    ptr_ty->size = 8;
+                                    self_arg->ty = ptr_ty;
+                                }
+                                self_arg->next = node->args;
+                                node->args = self_arg;
+                            } else {
+                                fprintf(stderr, "Erro: método '%s' não encontrado para tipo '%s'.\n", member_name, base_type->name);
+                                exit(1);
+                            }
+                        } else {
+                            fprintf(stderr, "Erro: chamada de método em tipo não suportado para '%s.%s'.\n", lhs_expr->name, member_name);
+                            exit(1);
+                        }
                     }
                 } else {
                     // Complex expression on LHS (e.g. get_struct().method())
@@ -1938,6 +2104,34 @@ void walk(Node *node) {
                 if (!var_check || (!var_check->is_module && var_check->type->kind != TY_ENUM)) {
                     // Not a variable, try enum lookup
                     Type *enum_ty = lookup_enum(node->lhs->name);
+                    // Try module-qualified generic enum (e.g. t.Option_i32.None)
+                    if (!enum_ty && node->lhs->generic_arg_count > 0 && node->lhs->member_name) {
+                        char *full_member = node->lhs->member_name; // "t.Option"
+                        char *dot = strchr(full_member, '.');
+                        if (dot) {
+                            int alias_len = dot - full_member;
+                            char alias[256];
+                            strncpy(alias, full_member, alias_len);
+                            alias[alias_len] = '\0';
+                            char *type_name = dot + 1;
+                            Variable *mod_var = symtab_lookup(alias);
+                            if (mod_var && mod_var->is_module && mod_var->module_ref) {
+                                char *mangled = mangle_generic_name(type_name, node->lhs->generic_args, node->lhs->generic_arg_count);
+                                char *prefix = mod_var->module_ref->path_prefix;
+                                int len = strlen(prefix) + 1 + strlen(mangled) + 1;
+                                char *full_mangled = malloc(len);
+                                snprintf(full_mangled, len, "%s_%s", prefix, mangled);
+                                GenericTemplate *tmpl = lookup_generic_template(type_name);
+                                if (tmpl && !tmpl->is_function) {
+                                    instantiate_generic_struct(tmpl, node->lhs->generic_args, node->lhs->generic_arg_count, full_mangled);
+                                }
+                                enum_ty = lookup_enum(full_mangled);
+                                free(node->lhs->name);
+                                node->lhs->name = full_mangled;
+                                free(mangled);
+                            }
+                        }
+                    }
                     if (enum_ty) {
                         // Found enum — resolve variant
                         Field *variant = NULL;

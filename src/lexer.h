@@ -70,6 +70,7 @@ typedef enum {
 	TOKEN_TYPE_CASE,
 	TOKEN_TYPE_DEFER,
 	TOKEN_TYPE_EXTERN,
+	TOKEN_TYPE_IMPL,
 } TokenType;
 
 extern const char *TOKEN_NAMES[];

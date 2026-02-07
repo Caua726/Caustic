@@ -36,23 +36,13 @@ $ ./main
 - [-] **Language Extensions**
   - [x] **Generics**
   - [x] **Enums & Pattern Matching**
+  - [x] **Defer**
+  - [x] **FFI / C Interop**
 - [ ] **Compiler Evolution**
+  - [ ] **Assembler** (eliminate NASM/GCC dependency)
+  - [ ] **Linker** (produce ELF binaries directly)
   - [ ] **Optimization**
   - [ ] **Self Hosting**
-
-### Not important, but just to note
-
-- [x] **Defer**
-  - ```cst
-    defer free(ptr);
-    ```
-    this will generate a stack of function calls to be executed when the function returns
-- [ ] **Assembler**
-  - i need to develop a way to transform the generated assembly code into machine code without nasm or gcc
-- [ ] **Linker**
-  - i need to develop a way to link the generated machine code into a runnable executable
-- [ ] **FFI / C Interop**
-  - i need to develop a way to call C functions from Caustic
 
 ### Syntax Dump
 
@@ -131,6 +121,30 @@ while (1) {
 
 // Short-circuit logic
 if (ptr != 0 && *ptr == 10) { ... }
+```
+
+#### FFI / C Interop
+```cst
+extern fn printf(fmt as *u8, ...) as i32;
+extern fn malloc(size as u64) as *u8;
+extern fn free(ptr as *u8) as void;
+
+fn main() as i32 {
+    let is *u8 as buf = malloc(256);
+    printf("Hello %s, %d\n", "world", 42);
+    free(buf);
+    return 0;
+}
+```
+
+#### Defer
+```cst
+fn work() as void {
+    let is *u8 as ptr = alloc(1024);
+    defer free(ptr);
+    // ... use ptr ...
+    // free(ptr) is called automatically on return
+}
 ```
 
 #### Low Level / Unsafe
