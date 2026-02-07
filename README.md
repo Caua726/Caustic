@@ -31,13 +31,16 @@ $ ./main
 - [x] **Functions**
 - [-] **Standard Library**
   - [x] **Memory Management**
-  - [X] **Dynamic Strings**
+  - [x] **Dynamic Strings**
+  - [x] **String Operations** (eq, starts_with, ends_with, contains, char_at, parse_int)
+  - [x] **Option & Result Types**
   - [-] **IO Library**
 - [-] **Language Extensions**
   - [x] **Generics**
   - [x] **Enums & Pattern Matching**
   - [x] **Defer**
   - [x] **FFI / C Interop**
+  - [x] **Impl Blocks** (methods & associated functions)
 - [ ] **Compiler Evolution**
   - [ ] **Assembler** (eliminate NASM/GCC dependency)
   - [ ] **Linker** (produce ELF binaries directly)
@@ -145,6 +148,28 @@ fn work() as void {
     // ... use ptr ...
     // free(ptr) is called automatically on return
 }
+```
+
+#### Impl Blocks
+```cst
+struct Point { x as i32; y as i32; }
+
+impl Point {
+    // Associated function (no self)
+    fn new(x as i32, y as i32) as Point {
+        let is Point as p;
+        p.x = x; p.y = y;
+        return p;
+    }
+
+    // Method (takes self pointer)
+    fn sum(self as *Point) as i32 {
+        return self.x + self.y;
+    }
+}
+
+let is Point as p = Point.new(3, 4); // associated function
+let is i32 as s = p.sum();           // method call
 ```
 
 #### Low Level / Unsafe
