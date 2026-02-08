@@ -40,3 +40,8 @@ run: $(TARGET)
 	# Adicione -nostartfiles entry.s aqui se for usar o runtime assembly
 	gcc -no-pie main.cst.s -o main
 	./main
+
+# Assembler
+assembler: $(TARGET)
+	./$(TARGET) caustic-assembler/main.cst
+	gcc -no-pie caustic-assembler/main.cst.s -o caustic-as
