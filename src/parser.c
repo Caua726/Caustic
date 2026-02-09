@@ -486,7 +486,7 @@ static Type *parse_type() {
             strcmp(current_token.text, "u32") == 0 || strcmp(current_token.text, "u64") == 0 ||
             strcmp(current_token.text, "f32") == 0 || strcmp(current_token.text, "f64") == 0 ||
             strcmp(current_token.text, "bool") == 0 || strcmp(current_token.text, "char") == 0 ||
-            strcmp(current_token.text, "string") == 0 || strcmp(current_token.text, "void") == 0) {
+            strcmp(current_token.text, "void") == 0) {
             is_primitive = 1;
         }
         if (!is_primitive) {
