@@ -80,6 +80,7 @@ typedef struct IRInst {
     char *call_target_name;
     int is_variadic_call;
     char *global_name; // For IR_ADDR_GLOBAL
+    int is_extern_global; // For IR_ADDR_GLOBAL: load from GOT instead of lea
     Type *cast_to_type;
     Type *cast_from_type; // For float<->int conversions
 } IRInst;
@@ -142,6 +143,7 @@ static inline Operand op_label(int label) {
 }
 
 extern const char *IR_OP_NAMES[];
+extern int ir_no_main_required;
 
 IRProgram *gen_ir(Node *ast);
 void ir_free(IRProgram *prog);

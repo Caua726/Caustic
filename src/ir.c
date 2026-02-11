@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+int ir_no_main_required = 0;
+
 const char *IR_OP_NAMES[] = {
     "IMM", "MOV",
     "ADD", "SUB", "MUL", "DIV", "MOD", "NEG",
@@ -174,6 +176,7 @@ static int gen_addr(Node *node) {
                 } else {
                     inst->global_name = strdup(node->name);
                 }
+                inst->is_extern_global = node->var->is_extern;
                 inst->line = node->tok ? node->tok->line : 0;
                 emit(inst);
             } else {
@@ -1592,7 +1595,8 @@ IRProgram *gen_ir(Node *ast) {
 
     for (Node *node = ast; node; node = node->next) {
         if (node->kind == NODE_KIND_LET) {
-            // Global variable
+            // Skip extern globals — no data emitted, resolved via GOT at link time
+            if (node->is_extern) continue;
             // Global variable
             IRGlobal *glob = calloc(1, sizeof(IRGlobal));
             if (node->var && node->var->asm_name) {
@@ -1749,7 +1753,7 @@ IRProgram *gen_ir(Node *ast) {
         }
     }
 
-    if (depth == 1 && !prog->main_func) {
+    if (depth == 1 && !prog->main_func && !ir_no_main_required) {
         fprintf(stderr, "Erro: função main não encontrada\n");
         exit(1);
     }
@@ -1758,6 +1762,14 @@ IRProgram *gen_ir(Node *ast) {
 
     if (prog->main_func) {
         mark_reachable(prog, prog->main_func);
+    } else if (ir_no_main_required) {
+        // In compile-only mode, mark all functions and globals as reachable
+        for (IRFunction *f = prog->functions; f; f = f->next) {
+            f->is_reachable = 1;
+        }
+        for (IRGlobal *g = prog->globals; g; g = g->next) {
+            g->is_reachable = 1;
+        }
     }
 
     depth--;

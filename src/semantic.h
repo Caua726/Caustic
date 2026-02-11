@@ -12,6 +12,7 @@ typedef struct Variable {
     VarFlags flags;
     int offset;
     int is_global;
+    int is_extern;
     int is_module;
     Module *module_ref;
     char *asm_name;

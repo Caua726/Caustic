@@ -572,11 +572,21 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
 
         case IR_ADDR_GLOBAL:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
-            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
-                emit("lea r15, [rip+%s]", inst->global_name);
-                emit("mov %s, r15", dst);
+            if (inst->is_extern_global) {
+                // Extern global: load address from GOT via mov reg, [rip+sym]
+                if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                    emit("mov r15, QWORD PTR [rip+%s]", inst->global_name);
+                    emit("mov %s, r15", dst);
+                } else {
+                    emit("mov %s, QWORD PTR [rip+%s]", dst, inst->global_name);
+                }
             } else {
-                emit("lea %s, [rip+%s]", dst, inst->global_name);
+                if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                    emit("lea r15, [rip+%s]", inst->global_name);
+                    emit("mov %s, r15", dst);
+                } else {
+                    emit("lea %s, [rip+%s]", dst, inst->global_name);
+                }
             }
             break;
 
@@ -1421,8 +1431,12 @@ void codegen(IRProgram *prog, FILE *output) {
     emit_data_section(prog);
 
     fprintf(out, ".text\n");
-    fprintf(out, ".globl main\n");
-    
+    for (IRFunction *func = prog->functions; func; func = func->next) {
+        if (!func->is_reachable) continue;
+        const char *fname = func->asm_name ? func->asm_name : func->name;
+        fprintf(out, ".globl %s\n", fname);
+    }
+
     for (IRFunction *func = prog->functions; func; func = func->next) {
         if (!func->is_reachable) continue;
         if (func->asm_name) {

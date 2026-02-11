@@ -14,12 +14,14 @@ int main(int argc, char *argv[]) {
     int debug_lexer = 0;
     int debug_parser = 0;
     int debug_ir = 0;
+    int compile_only = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             printf("Uso: ./caustic <arquivo> [opcoes]\n");
             printf("Opcoes:\n");
             printf("  -o <arquivo>    Define o arquivo de saida (assembly)\n");
+            printf("  -c              Compile only (no main required)\n");
             printf("  -debuglexer     Mostra tokens do lexer\n");
             printf("  -debugparser    Mostra AST do parser\n");
             printf("  -debugir        Mostra IR gerado\n");
@@ -31,6 +33,8 @@ int main(int argc, char *argv[]) {
             debug_parser = 1;
         } else if (strcmp(argv[i], "-debugir") == 0) {
             debug_ir = 1;
+        } else if (strcmp(argv[i], "-c") == 0) {
+            compile_only = 1;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 output_filename = argv[++i];
@@ -108,6 +112,7 @@ int main(int argc, char *argv[]) {
         }
 
 
+        ir_no_main_required = compile_only;
         IRProgram *ir = gen_ir(ast);
         if (!ir) {
             printf("Erro ao gerar IR.\n");

@@ -1234,6 +1234,14 @@ void walk(Node *node) {
                 fprintf(stderr, "Erro na linha %d: Variável '%s' não pode ser do tipo void.\n", node->tok ? node->tok->line : 0, node->name);
                 exit(1);
             }
+            if (node->is_extern) {
+                // Extern globals: no init, no data — resolved at link time via GOT
+                Variable *var = symtab_declare(node->name, node->ty, node->flags);
+                var->is_extern = 1;
+                node->var = var;
+                node->offset = var->offset;
+                return;
+            }
             if (node->init_expr) {
                 walk(node->init_expr);
 

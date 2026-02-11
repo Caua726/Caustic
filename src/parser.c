@@ -267,8 +267,38 @@ static void parse_file_body(Node **cur_ptr) {
         }
 
         if (current_token.type == TOKEN_TYPE_EXTERN) {
-            cur->next = parse_extern_fn();
-            cur = cur->next;
+            // Peek ahead: extern fn ... or extern let ...
+            Token save = current_token;
+            Token save_la = lookahead_token;
+            consume(); // consume 'extern'
+            if (current_token.type == TOKEN_TYPE_LET) {
+                // extern let is TYPE as NAME;
+                expect(TOKEN_TYPE_LET);
+                expect(TOKEN_TYPE_IS);
+                Type *var_type = parse_type();
+                expect(TOKEN_TYPE_AS);
+                if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                    error_at_token(current_token, "esperado nome da variavel apos 'extern let is TYPE as'.");
+                }
+                char *var_name = strdup(current_token.text);
+                consume();
+                expect(TOKEN_TYPE_SEMICOLON);
+
+                Node *node = new_node(NODE_KIND_LET);
+                node->name = var_name;
+                node->ty = var_type;
+                node->flags = VAR_FLAG_NONE;
+                node->is_extern = 1;
+                node->init_expr = NULL;
+                cur->next = node;
+                cur = cur->next;
+            } else {
+                // Restore and let parse_extern_fn handle it
+                current_token = save;
+                lookahead_token = save_la;
+                cur->next = parse_extern_fn();
+                cur = cur->next;
+            }
             continue;
         }
 

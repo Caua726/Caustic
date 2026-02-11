@@ -6,6 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 make              # Build the compiler (creates ./caustic binary)
+make assembler    # Build the assembler (creates ./caustic-as binary)
+make linker       # Build the linker (creates ./caustic-ld binary)
+make test-linker  # Run full linker test suite (36 tests)
 make run          # Build, compile main.cst, assemble with GCC, and run
 make clean        # Remove build artifacts
 ```
@@ -13,15 +16,24 @@ make clean        # Remove build artifacts
 **Compiler usage:**
 ```bash
 ./caustic <source.cst>           # Generates <source.cst>.s assembly
+./caustic -c <source.cst>        # Compile only (no main required, for libraries)
 ./caustic -debuglexer <file>     # Debug tokenization
 ./caustic -debugparser <file>    # Debug AST
 ./caustic -debugir <file>        # Debug IR generation
 
-# Full compilation pipeline:
+# Full self-hosted pipeline (no gcc needed):
+./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program && ./program
+
+# Legacy pipeline with gcc:
 ./caustic program.cst && gcc program.cst.s -o program && ./program
 
+# Multi-object linking:
+./caustic -c lib.cst && ./caustic main.cst
+./caustic-as lib.cst.s && ./caustic-as main.cst.s
+./caustic-ld lib.cst.s.o main.cst.s.o -o program
+
 # Quick one-liner test (prints exit code):
-./caustic test.cst && gcc test.cst.s -o /tmp/t && /tmp/t; echo "Exit: $?"
+./caustic test.cst && ./caustic-as test.cst.s && ./caustic-ld test.cst.s.o -o /tmp/t && /tmp/t; echo "Exit: $?"
 ```
 
 ## Architecture

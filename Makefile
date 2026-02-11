@@ -45,3 +45,14 @@ run: $(TARGET)
 assembler: $(TARGET)
 	./$(TARGET) caustic-assembler/main.cst
 	gcc -no-pie caustic-assembler/main.cst.s -o caustic-as
+
+# Linker
+linker: $(TARGET)
+	./$(TARGET) caustic-linker/main.cst
+	gcc -no-pie caustic-linker/main.cst.s -o caustic-ld
+
+# Test linker
+test-linker: $(TARGET) linker assembler
+	bash tests_asm/test_linker.sh
+
+.PHONY: all clean run assembler linker test-linker
