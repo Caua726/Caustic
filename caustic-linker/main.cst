@@ -1,0 +1,388 @@
+use "../std/mem.cst" as mem;
+use "../std/linux.cst" as linux;
+use "elf_reader.cst" as reader;
+use "linker.cst" as linker;
+use "elf_writer.cst" as writer;
+
+// ============================================================
+// main.cst — CLI parsing and orchestration for caustic-ld
+// ============================================================
+
+// ============================================================
+// CLI helpers
+// ============================================================
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn streq_lit(a as *u8, lit as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (lit[i] != 0) {
+        if (a[i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != 0) { return 0; }
+    return 1;
+}
+
+fn starts_with(a as *u8, prefix as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (prefix[i] != 0) {
+        if (a[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn print_str(s as *u8) as void {
+    linux.write(linux.STDERR, s, strlen(s));
+}
+
+fn print_out(s as *u8) as void {
+    linux.write(linux.STDOUT, s, strlen(s));
+}
+
+fn print_int(n as i64) as void {
+    if (n == 0) { linux.write(linux.STDERR, "0", 1); return; }
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i64 as start = cast(i64, pos) + 1;
+    linux.write(linux.STDERR, cast(*u8, cast(i64, &buf) + start), 24 - start);
+}
+
+// Parse hex string (after "0x" prefix) to i64
+fn parse_hex(s as *u8) as i64 {
+    let is i64 as result with mut = 0;
+    let is i64 as i with mut = 0;
+    // Skip "0x" or "0X" prefix
+    if (s[0] == 48 && (s[1] == 120 || s[1] == 88)) {
+        i = 2;
+    }
+    while (s[i] != 0) {
+        let is i64 as c = cast(i64, s[i]);
+        let is i64 as digit with mut = 0;
+        if (c >= 48 && c <= 57) { digit = c - 48; }           // '0'-'9'
+        else if (c >= 97 && c <= 102) { digit = c - 87; }     // 'a'-'f'
+        else if (c >= 65 && c <= 70) { digit = c - 55; }      // 'A'-'F'
+        else { break; }
+        result = result * 16 + digit;
+        i = i + 1;
+    }
+    return result;
+}
+
+fn print_usage() as void {
+    print_out("caustic-ld: linker for Caustic\n\n");
+    print_out("Usage: caustic-ld [options] <input.o ...>\n\n");
+    print_out("Options:\n");
+    print_out("  -o <file>          Output file (default: a.out)\n");
+    print_out("  -l<lib>            Link with shared library (e.g. -lc, -lm)\n");
+    print_out("  --entry=<symbol>   Entry point symbol (default: main)\n");
+    print_out("  --base=<addr>      Base address in hex (default: 0x400000)\n");
+    print_out("  --strip            Remove symbol table from output\n");
+    print_out("  --map              Generate map file (<output>.map)\n");
+    print_out("  --keep-empty       Include empty sections in output\n");
+    print_out("  -v                 Verbose output\n");
+}
+
+// Convert -l<name> to library soname (e.g. "c" -> "libc.so.6")
+fn lib_to_soname(name as *u8) as *u8 {
+    let is i64 as name_len = strlen(name);
+    // "lib" + name + ".so.6" + null = 3 + name_len + 5 + 1
+    let is *u8 as soname = mem.galloc(name_len + 9);
+    soname[0] = 108; // 'l'
+    soname[1] = 105; // 'i'
+    soname[2] = 98;  // 'b'
+    let is i64 as i with mut = 0;
+    while (i < name_len) {
+        soname[3 + i] = name[i];
+        i = i + 1;
+    }
+    soname[3 + name_len] = 46;  // '.'
+    soname[4 + name_len] = 115; // 's'
+    soname[5 + name_len] = 111; // 'o'
+    soname[6 + name_len] = 46;  // '.'
+    soname[7 + name_len] = 54;  // '6'
+    soname[8 + name_len] = 0;
+    return soname;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+fn main(argc as i64, argv as i64) as i32 {
+    let is *i64 as argv_arr = cast(*i64, argv);
+
+    if (argc < 2) {
+        print_usage();
+        return 1;
+    }
+
+    // Parse CLI args
+    let is *u8 as output_path with mut = "a.out";
+    let is *u8 as entry_name with mut = "main";
+    let is i64 as base_addr with mut = 4194304; // 0x400000
+    let is i32 as verbose with mut = 0;
+    let is i32 as do_strip with mut = 0;
+    let is i32 as do_map with mut = 0;
+    let is i32 as keep_empty with mut = 0;
+
+    // Collect input file paths (max 256)
+    let is [256]i64 as input_files;
+    let is i32 as num_inputs with mut = 0;
+
+    // Collect -l libraries (max 32)
+    let is [32]i64 as needed_libs;
+    let is i32 as needed_count with mut = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as arg = cast(*u8, argv_arr[ai]);
+
+        if (streq_lit(arg, "-o") == 1) {
+            ai = ai + 1;
+            if (ai < argc) {
+                output_path = cast(*u8, argv_arr[ai]);
+            }
+        }
+        else if (starts_with(arg, "--entry=") == 1) {
+            entry_name = cast(*u8, cast(i64, arg) + 8);
+        }
+        else if (starts_with(arg, "--base=") == 1) {
+            let is *u8 as hex_str = cast(*u8, cast(i64, arg) + 7);
+            base_addr = parse_hex(hex_str);
+        }
+        else if (streq_lit(arg, "--strip") == 1) {
+            do_strip = 1;
+        }
+        else if (streq_lit(arg, "--map") == 1) {
+            do_map = 1;
+        }
+        else if (streq_lit(arg, "--keep-empty") == 1) {
+            keep_empty = 1;
+        }
+        else if (streq_lit(arg, "-v") == 1) {
+            verbose = 1;
+        }
+        else if (streq_lit(arg, "--help") == 1 || streq_lit(arg, "-h") == 1) {
+            print_usage();
+            return 0;
+        }
+        else if (arg[0] == 45 && arg[1] == 108 && arg[2] != 0) {  // '-l<lib>'
+            let is *u8 as lib_name = cast(*u8, cast(i64, arg) + 2);
+            needed_libs[needed_count] = cast(i64, lib_name);
+            needed_count = needed_count + 1;
+        }
+        else if (arg[0] == 45) {  // '-' — unknown flag
+            print_str("error: unknown option: ");
+            print_str(arg);
+            print_str("\n");
+            return 1;
+        }
+        else {
+            // Input file
+            input_files[num_inputs] = cast(i64, arg);
+            num_inputs = num_inputs + 1;
+        }
+
+        ai = ai + 1;
+    }
+
+    if (num_inputs == 0) {
+        print_str("error: no input files\n");
+        return 1;
+    }
+
+    // Calculate total file sizes for heap
+    let is i64 as total_file_size with mut = 0;
+    let is i32 as fi with mut = 0;
+    while (fi < num_inputs) {
+        let is *u8 as path = cast(*u8, input_files[fi]);
+        let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+        if (fd >= 0) {
+            let is i64 as sz = linux.lseek(fd, 0, linux.SEEK_END);
+            total_file_size = total_file_size + sz;
+            linux.close(fd);
+        }
+        fi = fi + 1;
+    }
+
+    // Initialize heap: file_sizes * 4 + 256KB (extra for dynamic linking)
+    let is i64 as heap_size = total_file_size * 4 + 262144;
+    if (needed_count > 0) { heap_size = heap_size + 524288; } // extra 512KB for dynamic sections
+    if (heap_size < 524288) { heap_size = 524288; } // minimum 512KB
+    mem.gheapinit(heap_size);
+
+    if (verbose == 1) {
+        print_str("caustic-ld: linking ");
+        print_int(cast(i64, num_inputs));
+        print_str(" object file(s)\n");
+        print_str("  heap: ");
+        print_int(heap_size);
+        print_str(" bytes\n");
+    }
+
+    // Initialize linker state
+    let is linker.LinkerState as ls = linker.linker_init(base_addr);
+    ls.entry_name = entry_name;
+    ls.verbose = verbose;
+    ls.do_strip = do_strip;
+    ls.do_map = do_map;
+    ls.keep_empty = keep_empty;
+
+    // Store needed libs (convert raw names to sonames)
+    if (needed_count > 0) {
+        ls.needed_libs = mem.galloc(cast(i64, needed_count) * 8);
+        let is *i64 as lib_arr = cast(*i64, ls.needed_libs);
+        let is i32 as lci with mut = 0;
+        while (lci < needed_count) {
+            let is *u8 as raw_name = cast(*u8, needed_libs[lci]);
+            lib_arr[lci] = cast(i64, lib_to_soname(raw_name));
+            lci = lci + 1;
+        }
+        ls.needed_count = needed_count;
+    }
+
+    // Read all object files
+    ls.objs = mem.galloc(cast(i64, num_inputs) * 8);
+    ls.obj_count = num_inputs;
+
+    fi = 0;
+    while (fi < num_inputs) {
+        let is *u8 as path = cast(*u8, input_files[fi]);
+        let is *reader.ObjFile as obj = cast(*reader.ObjFile, mem.galloc(sizeof(reader.ObjFile)));
+
+        let is i32 as err = reader.read_obj(path, obj);
+        if (err != 0) {
+            print_str("error: failed to read ");
+            print_str(path);
+            print_str("\n");
+            return 1;
+        }
+
+        // Store pointer in array
+        let is *i64 as arr = cast(*i64, ls.objs);
+        arr[fi] = cast(i64, obj);
+
+        if (verbose == 1) {
+            print_str("  ");
+            print_str(path);
+            print_str(": text=");
+            print_int(obj.text.size);
+            print_str(" data=");
+            print_int(obj.data_sec.size);
+            print_str(" rodata=");
+            print_int(obj.rodata.size);
+            print_str(" bss=");
+            print_int(obj.bss_size);
+            print_str(" syms=");
+            print_int(cast(i64, obj.sym_count));
+            print_str(" relocs=");
+            print_int(cast(i64, obj.reloc_count));
+            print_str("\n");
+        }
+
+        fi = fi + 1;
+    }
+
+    // Phase 1: Merge sections
+    linker.merge_sections(&ls);
+
+    if (verbose == 1) {
+        print_str("  merged: text=");
+        print_int(ls.text_size);
+        print_str(" rodata=");
+        print_int(ls.rodata_size);
+        print_str(" data=");
+        print_int(ls.data_size);
+        print_str(" bss=");
+        print_int(ls.bss_total);
+        print_str("\n");
+    }
+
+    // Phase 2: Assign virtual addresses
+    linker.assign_addresses(&ls);
+
+    if (verbose == 1) {
+        print_str("  text_vaddr=");
+        reader.print_hex(ls.text_vaddr);
+        print_str(" data_vaddr=");
+        reader.print_hex(ls.data_vaddr);
+        print_str("\n");
+    }
+
+    // Phase 3: Build symbol table + patch _start
+    let is i32 as sym_err = linker.build_symtab(&ls);
+    if (sym_err != 0) {
+        return 1;
+    }
+
+    if (verbose == 1) {
+        print_str("  global symbols: ");
+        let is *linker.GlobalSymTab as gsyms_dbg = linker.get_gsyms(&ls);
+        print_int(cast(i64, gsyms_dbg.count));
+        print_str("\n");
+    }
+
+    let is i32 as write_err with mut = 0;
+
+    if (ls.needed_count > 0) {
+        // Dynamic linking path
+        if (verbose == 1) {
+            print_str("  dynamic linking mode (");
+            print_int(cast(i64, ls.needed_count));
+            print_str(" libs)\n");
+        }
+
+        // Collect undefined symbols as dynamic
+        linker.collect_dynamic_syms(&ls);
+
+        // Allocate dynamic section buffers
+        linker.alloc_dynamic_bufs(&ls);
+
+        // The dynamic writer handles address reassignment, PLT/GOT building,
+        // symtab rebuild, relocation application, and metadata generation
+        write_err = writer.write_dynamic_executable(&ls, output_path);
+    } else {
+        // Static linking path (unchanged)
+        // Phase 4: Apply relocations
+        linker.apply_relocations(&ls);
+
+        // Phase 5: Write ELF executable
+        write_err = writer.write_executable(&ls, output_path);
+    }
+
+    if (write_err != 0) {
+        return 1;
+    }
+
+    // Phase 6: Map file
+    if (do_map == 1) {
+        linker.write_map(&ls, output_path);
+    }
+
+    if (verbose == 1) {
+        print_str("  output: ");
+        print_str(output_path);
+        print_str("\n");
+    }
+
+    print_str("caustic-ld: ");
+    print_str(output_path);
+    print_str("\n");
+
+    return 0;
+}

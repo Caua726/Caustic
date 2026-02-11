@@ -1,0 +1,573 @@
+use "../std/mem.cst" as mem;
+use "../std/linux.cst" as linux;
+use "elf_reader.cst" as reader;
+use "linker.cst" as linker;
+
+// ============================================================
+// elf_writer.cst — Write ELF64 executable
+// ============================================================
+
+let is i32 as ET_EXEC with imut = 2;
+let is i32 as ET_DYN with imut = 3;
+let is i32 as PT_LOAD with imut = 1;
+let is i32 as PT_DYNAMIC with imut = 2;
+let is i32 as PT_INTERP with imut = 3;
+let is i32 as PF_X with imut = 1;
+let is i32 as PF_W with imut = 2;
+let is i32 as PF_R with imut = 4;
+let is i64 as ELF_HDR_SIZE with imut = 64;
+let is i64 as PHDR_SIZE with imut = 56;
+let is i64 as PAGE_SIZE with imut = 4096;
+
+fn write_executable(ls as *linker.LinkerState, output_path as *u8) as i32 {
+    let is reader.ByteBuffer as out = reader.buf_init(131072);
+
+    let is *reader.ByteBuffer as text_buf = linker.get_text(ls);
+    let is *reader.ByteBuffer as rodata_buf = linker.get_rodata(ls);
+    let is *reader.ByteBuffer as data_buf = linker.get_data(ls);
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+
+    // --- Determine segments ---
+    let is i32 as num_phdrs with mut = 2;
+    let is i32 as has_data with mut = 0;
+    if (ls.data_size > 0 || ls.bss_total > 0) {
+        has_data = 1;
+    } else {
+        num_phdrs = 1;
+    }
+
+    let is i64 as phdr_off = ELF_HDR_SIZE;
+    let is i64 as text_file_off = PAGE_SIZE;
+    let is i64 as rodata_file_off = text_file_off + ls.text_size;
+    let is i64 as rx_file_size = ls.text_size + ls.rodata_size;
+
+    let is i64 as data_file_off with mut = text_file_off + rx_file_size;
+    if (has_data == 1 && data_file_off % PAGE_SIZE != 0) {
+        data_file_off = data_file_off + PAGE_SIZE - (data_file_off % PAGE_SIZE);
+    }
+
+    // --- Section header layout (if not stripped) ---
+    let is i64 as shdr_file_off with mut = 0;
+    let is i32 as num_shdrs with mut = 0;
+    let is i32 as shstrndx with mut = 0;
+
+    let is reader.ByteBuffer as shstrtab = reader.buf_init(256);
+    let is reader.ByteBuffer as out_symtab = reader.buf_init(4096);
+    let is reader.ByteBuffer as out_strtab = reader.buf_init(4096);
+
+    let is i32 as shn_text with mut = 0;
+    let is i32 as shn_rodata with mut = 0;
+    let is i32 as shn_data with mut = 0;
+    let is i32 as shn_bss with mut = 0;
+    let is i32 as shn_symtab with mut = 0;
+    let is i32 as shn_strtab with mut = 0;
+    let is i32 as shn_shstrtab with mut = 0;
+
+    let is i64 as symtab_file_off with mut = 0;
+    let is i64 as strtab_file_off with mut = 0;
+    let is i64 as shstrtab_file_off with mut = 0;
+    let is i32 as num_local_syms with mut = 2;
+
+    if (ls.do_strip == 0) {
+        reader.buf_emit8(&shstrtab, 0);
+        shn_text = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".text", 6);
+        shn_rodata = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".rodata", 8);
+        shn_data = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".data", 6);
+        shn_bss = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".bss", 5);
+        shn_symtab = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".symtab", 8);
+        shn_strtab = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".strtab", 8);
+        shn_shstrtab = cast(i32, shstrtab.len);
+        reader.buf_append(&shstrtab, ".shstrtab", 10);
+
+        num_shdrs = 8;
+        shstrndx = 7;
+
+        // Build symtab + strtab
+        reader.buf_emit8(&out_strtab, 0);
+        let is i32 as zi with mut = 0;
+        while (zi < 24) { reader.buf_emit8(&out_symtab, 0); zi = zi + 1; }
+
+        // _start symbol
+        let is i32 as start_str_off = cast(i32, out_strtab.len);
+        reader.buf_append(&out_strtab, "_start", 7);
+        reader.buf_emit32_le(&out_symtab, cast(i64, start_str_off));
+        reader.buf_emit8(&out_symtab, 18);
+        reader.buf_emit8(&out_symtab, 0);
+        reader.buf_emit16_le(&out_symtab, 1);
+        reader.buf_emit64_le(&out_symtab, ls.text_vaddr);
+        reader.buf_emit64_le(&out_symtab, cast(i64, linker.START_STUB_SIZE));
+
+        // Global symbols
+        let is i32 as gi with mut = 0;
+        while (gi < gsyms.count) {
+            let is *linker.GlobalSym as g = linker.gsym_get(gsyms, gi);
+            if (g.defined == 1) {
+                let is i32 as str_off = cast(i32, out_strtab.len);
+                reader.buf_append(&out_strtab, g.name, cast(i64, g.name_len));
+                reader.buf_emit8(&out_strtab, 0);
+
+                reader.buf_emit32_le(&out_symtab, cast(i64, str_off));
+                let is i32 as sym_type with mut = 2;
+                if (g.section == reader.SECIDX_DATA || g.section == reader.SECIDX_BSS) {
+                    sym_type = 1;
+                }
+                reader.buf_emit8(&out_symtab, sym_type + 16);
+                reader.buf_emit8(&out_symtab, 0);
+                let is i32 as out_shndx with mut = 0;
+                if (g.section == reader.SECIDX_TEXT) { out_shndx = 1; }
+                if (g.section == reader.SECIDX_RODATA) { out_shndx = 2; }
+                if (g.section == reader.SECIDX_DATA) { out_shndx = 3; }
+                if (g.section == reader.SECIDX_BSS) { out_shndx = 4; }
+                reader.buf_emit16_le(&out_symtab, out_shndx);
+                reader.buf_emit64_le(&out_symtab, g.vaddr);
+                reader.buf_emit64_le(&out_symtab, 0);
+            }
+            gi = gi + 1;
+        }
+
+        // Calculate metadata file positions
+        let is i64 as meta_off with mut = data_file_off + ls.data_size;
+        if (has_data == 0) { meta_off = text_file_off + rx_file_size; }
+        if (meta_off % 8 != 0) { meta_off = meta_off + 8 - (meta_off % 8); }
+
+        symtab_file_off = meta_off;
+        strtab_file_off = symtab_file_off + out_symtab.len;
+        shstrtab_file_off = strtab_file_off + out_strtab.len;
+
+        let is i64 as shdr_start = shstrtab_file_off + shstrtab.len;
+        if (shdr_start % 8 != 0) { shdr_start = shdr_start + 8 - (shdr_start % 8); }
+        shdr_file_off = shdr_start;
+    }
+
+    // === ELF header ===
+    reader.buf_emit8(&out, 127);
+    reader.buf_emit8(&out, 69);
+    reader.buf_emit8(&out, 76);
+    reader.buf_emit8(&out, 70);
+    reader.buf_emit8(&out, 2);
+    reader.buf_emit8(&out, 1);
+    reader.buf_emit8(&out, 1);
+    reader.buf_emit8(&out, 0);
+    reader.buf_emit64_le(&out, 0);
+    reader.buf_emit16_le(&out, ET_EXEC);
+    reader.buf_emit16_le(&out, reader.EM_X86_64);
+    reader.buf_emit32_le(&out, 1);
+    reader.buf_emit64_le(&out, ls.entry_vaddr);
+    reader.buf_emit64_le(&out, phdr_off);
+    reader.buf_emit64_le(&out, shdr_file_off);
+    reader.buf_emit32_le(&out, 0);
+    reader.buf_emit16_le(&out, 64);
+    reader.buf_emit16_le(&out, 56);
+    reader.buf_emit16_le(&out, num_phdrs);
+    reader.buf_emit16_le(&out, 64);
+    reader.buf_emit16_le(&out, num_shdrs);
+    reader.buf_emit16_le(&out, shstrndx);
+
+    // === Program headers ===
+    // PT_LOAD R+X
+    reader.buf_emit32_le(&out, cast(i64, PT_LOAD));
+    reader.buf_emit32_le(&out, cast(i64, PF_R + PF_X));
+    reader.buf_emit64_le(&out, 0);
+    reader.buf_emit64_le(&out, ls.base_addr);
+    reader.buf_emit64_le(&out, ls.base_addr);
+    reader.buf_emit64_le(&out, text_file_off + rx_file_size);
+    reader.buf_emit64_le(&out, text_file_off + rx_file_size);
+    reader.buf_emit64_le(&out, PAGE_SIZE);
+
+    if (has_data == 1) {
+        reader.buf_emit32_le(&out, cast(i64, PT_LOAD));
+        reader.buf_emit32_le(&out, cast(i64, PF_R + PF_W));
+        reader.buf_emit64_le(&out, data_file_off);
+        reader.buf_emit64_le(&out, ls.data_vaddr);
+        reader.buf_emit64_le(&out, ls.data_vaddr);
+        reader.buf_emit64_le(&out, ls.data_size);
+        reader.buf_emit64_le(&out, ls.data_size + ls.bss_total);
+        reader.buf_emit64_le(&out, PAGE_SIZE);
+    }
+
+    // === Pad + sections ===
+    reader.buf_pad_to(&out, text_file_off);
+    reader.buf_append(&out, text_buf.data, ls.text_size);
+
+    if (ls.rodata_size > 0) {
+        reader.buf_append(&out, rodata_buf.data, ls.rodata_size);
+    }
+
+    if (has_data == 1) {
+        reader.buf_pad_to(&out, data_file_off);
+        if (ls.data_size > 0) {
+            reader.buf_append(&out, data_buf.data, ls.data_size);
+        }
+    }
+
+    // === Metadata + section headers ===
+    if (ls.do_strip == 0) {
+        reader.buf_pad_to(&out, symtab_file_off);
+        reader.buf_append(&out, out_symtab.data, out_symtab.len);
+        reader.buf_append(&out, out_strtab.data, out_strtab.len);
+        reader.buf_append(&out, shstrtab.data, shstrtab.len);
+        reader.buf_pad_to(&out, shdr_file_off);
+
+        // NULL section header
+        let is i32 as nzi with mut = 0;
+        while (nzi < 64) { reader.buf_emit8(&out, 0); nzi = nzi + 1; }
+
+        // .text
+        write_shdr(&out, cast(i64, shn_text), 1, 6,
+                   ls.text_vaddr, text_file_off, ls.text_size, 0, 0, 16, 0);
+        // .rodata
+        write_shdr(&out, cast(i64, shn_rodata), 1, 2,
+                   ls.rodata_vaddr, rodata_file_off, ls.rodata_size, 0, 0, 1, 0);
+        // .data
+        let is i64 as data_off_val with mut = 0;
+        if (has_data == 1) { data_off_val = data_file_off; }
+        write_shdr(&out, cast(i64, shn_data), 1, 3,
+                   ls.data_vaddr, data_off_val, ls.data_size, 0, 0, 8, 0);
+        // .bss
+        let is i64 as bss_off_val with mut = 0;
+        if (has_data == 1) { bss_off_val = data_file_off + ls.data_size; }
+        write_shdr(&out, cast(i64, shn_bss), 8, 3,
+                   ls.bss_vaddr, bss_off_val, ls.bss_total, 0, 0, 8, 0);
+        // .symtab
+        write_shdr(&out, cast(i64, shn_symtab), 2, 0,
+                   0, symtab_file_off, out_symtab.len, 6, cast(i64, num_local_syms), 8, 24);
+        // .strtab
+        write_shdr(&out, cast(i64, shn_strtab), 3, 0,
+                   0, strtab_file_off, out_strtab.len, 0, 0, 1, 0);
+        // .shstrtab
+        write_shdr(&out, cast(i64, shn_shstrtab), 3, 0,
+                   0, shstrtab_file_off, shstrtab.len, 0, 0, 1, 0);
+    }
+
+    // === Write to file ===
+    let is i64 as fd = linux.open(output_path, 577, 493);
+    if (fd < 0) {
+        reader.print_str("error: cannot create output: ");
+        reader.print_str(output_path);
+        reader.print_str("\n");
+        return 1;
+    }
+
+    linux.write(fd, out.data, out.len);
+    linux.close(fd);
+    return 0;
+}
+
+fn write_shdr(out as *reader.ByteBuffer, sh_name as i64, sh_type as i64, sh_flags as i64,
+              sh_addr as i64, sh_offset as i64, sh_size as i64,
+              sh_link as i64, sh_info as i64, sh_addralign as i64, sh_entsize as i64) as void {
+    reader.buf_emit32_le(out, sh_name);
+    reader.buf_emit32_le(out, sh_type);
+    reader.buf_emit64_le(out, sh_flags);
+    reader.buf_emit64_le(out, sh_addr);
+    reader.buf_emit64_le(out, sh_offset);
+    reader.buf_emit64_le(out, sh_size);
+    reader.buf_emit32_le(out, sh_link);
+    reader.buf_emit32_le(out, sh_info);
+    reader.buf_emit64_le(out, sh_addralign);
+    reader.buf_emit64_le(out, sh_entsize);
+}
+
+// ============================================================
+// Dynamic executable writer
+// ============================================================
+
+fn align_up(val as i64, align as i64) as i64 {
+    if (val % align != 0) {
+        return val + align - (val % align);
+    }
+    return val;
+}
+
+fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i32 {
+    let is *reader.ByteBuffer as text_buf = linker.get_text(ls);
+    let is *reader.ByteBuffer as rodata_buf = linker.get_rodata(ls);
+    let is *reader.ByteBuffer as data_buf = linker.get_data(ls);
+    let is *linker.DynSymTab as dst = linker.get_dynsyms(ls);
+    let is i32 as ndynsyms = dst.count;
+
+    // Pre-calculate section sizes (before buffers are filled)
+    let is i64 as interp_size = 28;  // "/lib64/ld-linux-x86-64.so.2\0"
+    let is i64 as dynsym_size = cast(i64, ndynsyms + 1) * 24; // null + entries
+    let is i64 as relaplt_size = cast(i64, ndynsyms) * 24;
+    let is i64 as plt_size = 16 + cast(i64, ndynsyms) * 16;  // PLT0 + entries
+    let is i64 as got_size = 24 + cast(i64, ndynsyms) * 8;   // 3 reserved + entries
+
+    // Pre-calculate .hash size: 8 + nbucket*4 + nchain*4
+    let is i32 as nbucket with mut = ndynsyms;
+    if (nbucket < 1) { nbucket = 1; }
+    let is i32 as nchain = ndynsyms + 1;
+    let is i64 as hash_size = 8 + cast(i64, nbucket) * 4 + cast(i64, nchain) * 4;
+
+    // Pre-calculate .dynstr size: null + lib names + symbol names
+    let is i64 as dynstr_size with mut = 1;  // null byte
+    let is *i64 as lib_arr = cast(*i64, ls.needed_libs);
+    let is i32 as li with mut = 0;
+    while (li < ls.needed_count) {
+        let is *u8 as lib_name = cast(*u8, lib_arr[li]);
+        dynstr_size = dynstr_size + reader.strlen(lib_name) + 1;
+        li = li + 1;
+    }
+    let is i32 as di with mut = 0;
+    while (di < ndynsyms) {
+        let is *linker.DynSym as d = linker.dynsym_get(dst, di);
+        dynstr_size = dynstr_size + cast(i64, d.name_len) + 1;
+        di = di + 1;
+    }
+
+    // Pre-calculate .dynamic size: DT entries * 16 bytes each
+    // DT_NEEDED * nlibs + DT_HASH + DT_STRTAB + DT_SYMTAB + DT_STRSZ + DT_SYMENT
+    // + DT_PLTGOT + DT_PLTRELSZ + DT_PLTREL + DT_JMPREL + DT_FLAGS + DT_NULL = nlibs + 11
+    let is i64 as dynamic_size = (cast(i64, ls.needed_count) + 11) * 16;
+
+    // Layout: 4 program headers
+    let is i32 as num_phdrs = 4;
+
+    // R+X segment starts at 0x1000
+    // Order: .interp, .hash, .dynsym, .dynstr, .rela.plt, .plt, _start+.text, .rodata
+    let is i64 as rx_file_start = PAGE_SIZE;
+    let is i64 as rx_vaddr_start = ls.base_addr + PAGE_SIZE;
+
+    let is i64 as interp_foff = rx_file_start;
+    let is i64 as interp_vaddr = rx_vaddr_start;
+
+    let is i64 as hash_foff = align_up(interp_foff + interp_size, 4);
+    let is i64 as hash_vaddr = rx_vaddr_start + (hash_foff - rx_file_start);
+
+    let is i64 as dynsym_foff = align_up(hash_foff + hash_size, 8);
+    let is i64 as dynsym_vaddr = rx_vaddr_start + (dynsym_foff - rx_file_start);
+
+    let is i64 as dynstr_foff = dynsym_foff + dynsym_size;
+    let is i64 as dynstr_vaddr = rx_vaddr_start + (dynstr_foff - rx_file_start);
+
+    let is i64 as relaplt_foff = align_up(dynstr_foff + dynstr_size, 8);
+    let is i64 as relaplt_vaddr = rx_vaddr_start + (relaplt_foff - rx_file_start);
+
+    let is i64 as plt_foff = align_up(relaplt_foff + relaplt_size, 16);
+    let is i64 as plt_vaddr = rx_vaddr_start + (plt_foff - rx_file_start);
+
+    let is i64 as text_foff = plt_foff + plt_size;
+    let is i64 as text_vaddr = rx_vaddr_start + (text_foff - rx_file_start);
+
+    let is i64 as rodata_foff = text_foff + ls.text_size;
+    let is i64 as rodata_vaddr = rx_vaddr_start + (rodata_foff - rx_file_start);
+
+    let is i64 as rx_file_end = rodata_foff + ls.rodata_size;
+
+    // R+W segment — aligned to next page
+    let is i64 as rw_file_start = align_up(rx_file_end, PAGE_SIZE);
+    let is i64 as rw_vaddr_start = align_up(rx_vaddr_start + (rx_file_end - rx_file_start), PAGE_SIZE);
+
+    // R+W order: .got.plt, .dynamic, .data, .bss
+    let is i64 as got_foff = rw_file_start;
+    let is i64 as got_vaddr = rw_vaddr_start;
+
+    let is i64 as dynamic_foff = align_up(got_foff + got_size, 8);
+    let is i64 as dynamic_vaddr = rw_vaddr_start + (dynamic_foff - rw_file_start);
+
+    let is i64 as data_foff = dynamic_foff + dynamic_size;
+    let is i64 as data_vaddr = rw_vaddr_start + (data_foff - rw_file_start);
+
+    let is i64 as bss_vaddr = data_vaddr + ls.data_size;
+
+    let is i64 as rw_file_size = (data_foff + ls.data_size) - rw_file_start;
+    let is i64 as rw_mem_size = rw_file_size + ls.bss_total;
+
+    // Update LinkerState addresses for the new layout
+    ls.text_vaddr = text_vaddr;
+    ls.rodata_vaddr = rodata_vaddr;
+    ls.data_vaddr = data_vaddr;
+    ls.bss_vaddr = bss_vaddr;
+
+    // Reset and rebuild global symbol table with new addresses
+    let is *linker.GlobalSymTab as gsyms = linker.get_gsyms(ls);
+    gsyms.count = 0;
+    let is i32 as sym_err = linker.build_symtab(ls);
+    if (sym_err != 0) { return 1; }
+
+    // Build PLT/GOT with real addresses
+    linker.build_plt_got(ls, plt_vaddr, got_vaddr);
+
+    // Apply relocations (dynamic syms redirect to PLT)
+    linker.apply_relocations(ls);
+
+    // Build all dynamic metadata sections
+    linker.build_dynamic_metadata(ls, plt_vaddr, got_vaddr,
+                                  interp_vaddr, dynsym_vaddr, dynstr_vaddr,
+                                  hash_vaddr, relaplt_vaddr, dynamic_vaddr);
+
+    // Get the filled buffers
+    let is *reader.ByteBuffer as interp_b = cast(*reader.ByteBuffer, ls.interp_buf);
+    let is *reader.ByteBuffer as hash_b = cast(*reader.ByteBuffer, ls.hash_buf);
+    let is *reader.ByteBuffer as dynsym_b = cast(*reader.ByteBuffer, ls.dynsym_buf);
+    let is *reader.ByteBuffer as dynstr_b = cast(*reader.ByteBuffer, ls.dynstr_buf);
+    let is *reader.ByteBuffer as relaplt_b = cast(*reader.ByteBuffer, ls.relaplt_buf);
+    let is *reader.ByteBuffer as plt_b = cast(*reader.ByteBuffer, ls.plt_buf);
+    let is *reader.ByteBuffer as got_b = cast(*reader.ByteBuffer, ls.got_buf);
+    let is *reader.ByteBuffer as dynamic_b = cast(*reader.ByteBuffer, ls.dynamic_buf);
+
+    // Patch GOT[0] = .dynamic vaddr
+    let is *u8 as got_data = got_b.data;
+    got_data[0] = cast(u8, dynamic_vaddr & 255);
+    got_data[1] = cast(u8, (dynamic_vaddr >> 8) & 255);
+    got_data[2] = cast(u8, (dynamic_vaddr >> 16) & 255);
+    got_data[3] = cast(u8, (dynamic_vaddr >> 24) & 255);
+    got_data[4] = cast(u8, (dynamic_vaddr >> 32) & 255);
+    got_data[5] = cast(u8, (dynamic_vaddr >> 40) & 255);
+    got_data[6] = cast(u8, (dynamic_vaddr >> 48) & 255);
+    got_data[7] = cast(u8, (dynamic_vaddr >> 56) & 255);
+
+    // === Write the ELF ===
+    let is reader.ByteBuffer as out = reader.buf_init(262144);
+
+    // ELF header (64 bytes)
+    reader.buf_emit8(&out, 127);  // magic
+    reader.buf_emit8(&out, 69);
+    reader.buf_emit8(&out, 76);
+    reader.buf_emit8(&out, 70);
+    reader.buf_emit8(&out, 2);    // class: 64-bit
+    reader.buf_emit8(&out, 1);    // data: little-endian
+    reader.buf_emit8(&out, 1);    // version
+    reader.buf_emit8(&out, 0);    // OS/ABI
+    reader.buf_emit64_le(&out, 0); // padding
+    reader.buf_emit16_le(&out, ET_EXEC);
+    reader.buf_emit16_le(&out, reader.EM_X86_64);
+    reader.buf_emit32_le(&out, 1);  // version
+    reader.buf_emit64_le(&out, ls.entry_vaddr);  // e_entry = _start
+    reader.buf_emit64_le(&out, ELF_HDR_SIZE);    // e_phoff
+    reader.buf_emit64_le(&out, 0);  // e_shoff (no section headers)
+    reader.buf_emit32_le(&out, 0);  // e_flags
+    reader.buf_emit16_le(&out, 64); // e_ehsize
+    reader.buf_emit16_le(&out, 56); // e_phentsize
+    reader.buf_emit16_le(&out, num_phdrs);
+    reader.buf_emit16_le(&out, 64); // e_shentsize
+    reader.buf_emit16_le(&out, 0);  // e_shnum
+    reader.buf_emit16_le(&out, 0);  // e_shstrndx
+
+    // Program headers
+
+    // PH[0]: PT_LOAD R+X
+    reader.buf_emit32_le(&out, cast(i64, PT_LOAD));
+    reader.buf_emit32_le(&out, cast(i64, PF_R + PF_X));
+    reader.buf_emit64_le(&out, 0);           // p_offset
+    reader.buf_emit64_le(&out, ls.base_addr); // p_vaddr
+    reader.buf_emit64_le(&out, ls.base_addr); // p_paddr
+    reader.buf_emit64_le(&out, rx_file_end);  // p_filesz
+    reader.buf_emit64_le(&out, rx_file_end);  // p_memsz
+    reader.buf_emit64_le(&out, PAGE_SIZE);
+
+    // PH[1]: PT_LOAD R+W
+    reader.buf_emit32_le(&out, cast(i64, PT_LOAD));
+    reader.buf_emit32_le(&out, cast(i64, PF_R + PF_W));
+    reader.buf_emit64_le(&out, rw_file_start);
+    reader.buf_emit64_le(&out, rw_vaddr_start);
+    reader.buf_emit64_le(&out, rw_vaddr_start);
+    reader.buf_emit64_le(&out, rw_file_size);
+    reader.buf_emit64_le(&out, rw_mem_size);
+    reader.buf_emit64_le(&out, PAGE_SIZE);
+
+    // PH[2]: PT_INTERP
+    reader.buf_emit32_le(&out, cast(i64, PT_INTERP));
+    reader.buf_emit32_le(&out, cast(i64, PF_R));
+    reader.buf_emit64_le(&out, interp_foff);
+    reader.buf_emit64_le(&out, interp_vaddr);
+    reader.buf_emit64_le(&out, interp_vaddr);
+    reader.buf_emit64_le(&out, interp_size);
+    reader.buf_emit64_le(&out, interp_size);
+    reader.buf_emit64_le(&out, 1);
+
+    // PH[3]: PT_DYNAMIC
+    reader.buf_emit32_le(&out, cast(i64, PT_DYNAMIC));
+    reader.buf_emit32_le(&out, cast(i64, PF_R + PF_W));
+    reader.buf_emit64_le(&out, dynamic_foff);
+    reader.buf_emit64_le(&out, dynamic_vaddr);
+    reader.buf_emit64_le(&out, dynamic_vaddr);
+    reader.buf_emit64_le(&out, dynamic_size);
+    reader.buf_emit64_le(&out, dynamic_size);
+    reader.buf_emit64_le(&out, 8);
+
+    // === Write sections ===
+
+    // Pad to R+X segment
+    reader.buf_pad_to(&out, interp_foff);
+    reader.buf_append(&out, interp_b.data, interp_b.len);
+
+    reader.buf_pad_to(&out, hash_foff);
+    reader.buf_append(&out, hash_b.data, hash_b.len);
+
+    reader.buf_pad_to(&out, dynsym_foff);
+    reader.buf_append(&out, dynsym_b.data, dynsym_b.len);
+
+    reader.buf_pad_to(&out, dynstr_foff);
+    reader.buf_append(&out, dynstr_b.data, dynstr_b.len);
+
+    reader.buf_pad_to(&out, relaplt_foff);
+    reader.buf_append(&out, relaplt_b.data, relaplt_b.len);
+
+    reader.buf_pad_to(&out, plt_foff);
+    reader.buf_append(&out, plt_b.data, plt_b.len);
+
+    reader.buf_pad_to(&out, text_foff);
+    reader.buf_append(&out, text_buf.data, ls.text_size);
+
+    if (ls.rodata_size > 0) {
+        reader.buf_append(&out, rodata_buf.data, ls.rodata_size);
+    }
+
+    // Pad to R+W segment
+    reader.buf_pad_to(&out, rw_file_start);
+    reader.buf_append(&out, got_b.data, got_b.len);
+
+    reader.buf_pad_to(&out, dynamic_foff);
+    reader.buf_append(&out, dynamic_b.data, dynamic_b.len);
+
+    if (ls.data_size > 0) {
+        reader.buf_pad_to(&out, data_foff);
+        reader.buf_append(&out, data_buf.data, ls.data_size);
+    }
+
+    // === Write to file ===
+    let is i64 as fd = linux.open(output_path, 577, 493);
+    if (fd < 0) {
+        reader.print_str("error: cannot create output: ");
+        reader.print_str(output_path);
+        reader.print_str("\n");
+        return 1;
+    }
+
+    linux.write(fd, out.data, out.len);
+    linux.close(fd);
+
+    if (ls.verbose == 1) {
+        reader.print_str("  dynamic ELF layout:\n");
+        reader.print_str("    .interp @ ");
+        reader.print_hex(interp_vaddr);
+        reader.print_str("\n    .hash @ ");
+        reader.print_hex(hash_vaddr);
+        reader.print_str("\n    .dynsym @ ");
+        reader.print_hex(dynsym_vaddr);
+        reader.print_str("\n    .dynstr @ ");
+        reader.print_hex(dynstr_vaddr);
+        reader.print_str("\n    .rela.plt @ ");
+        reader.print_hex(relaplt_vaddr);
+        reader.print_str("\n    .plt @ ");
+        reader.print_hex(plt_vaddr);
+        reader.print_str("\n    .text @ ");
+        reader.print_hex(text_vaddr);
+        reader.print_str("\n    .got.plt @ ");
+        reader.print_hex(got_vaddr);
+        reader.print_str("\n    .dynamic @ ");
+        reader.print_hex(dynamic_vaddr);
+        reader.print_str("\n    .data @ ");
+        reader.print_hex(data_vaddr);
+        reader.print_str("\n");
+    }
+
+    return 0;
+}
