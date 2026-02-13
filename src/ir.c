@@ -122,6 +122,71 @@ static int emit_cast(int src_reg, Type *to_type, int line) {
     return emit_cast_from(src_reg, NULL, to_type, line);
 }
 
+// System V ABI struct classification
+typedef enum { CLASS_INTEGER, CLASS_SSE, CLASS_MEMORY } SysVClass;
+
+typedef struct {
+    SysVClass classes[2]; // Up to 2 eightbytes
+    int num_eightbytes;   // 0 = MEMORY (pass by ref), 1 or 2
+} SysVClassification;
+
+static int is_float_type(Type *ty) {
+    return ty && (ty->kind == TY_F32 || ty->kind == TY_F64);
+}
+
+static SysVClassification classify_struct_sysv(Type *ty) {
+    SysVClassification result = { .num_eightbytes = 0 };
+
+    if (!ty || ty->kind != TY_STRUCT) {
+        // Not a struct — scalar, handled separately
+        result.num_eightbytes = -1; // sentinel: not a struct
+        return result;
+    }
+
+    if (ty->size > 16) {
+        return result; // MEMORY: too large for registers
+    }
+
+    // Check for fields crossing the 8-byte boundary (packed struct issue)
+    for (Field *f = ty->fields; f; f = f->next) {
+        int fend = f->offset + f->type->size;
+        if (f->offset < 8 && fend > 8 && ty->size > 8) {
+            return result; // MEMORY: field crosses eightbyte boundary
+        }
+    }
+
+    int num_eb = (ty->size <= 8) ? 1 : 2;
+    result.num_eightbytes = num_eb;
+
+    // Classify each eightbyte
+    for (int eb = 0; eb < num_eb; eb++) {
+        int eb_start = eb * 8;
+        int eb_end = eb_start + 8;
+        int has_int = 0, has_float = 0;
+
+        for (Field *f = ty->fields; f; f = f->next) {
+            int fend = f->offset + f->type->size;
+            // Does this field overlap with this eightbyte?
+            if (f->offset < eb_end && fend > eb_start) {
+                if (is_float_type(f->type)) {
+                    has_float = 1;
+                } else {
+                    has_int = 1;
+                }
+            }
+        }
+
+        // INTEGER wins over SSE in merge rules
+        if (has_int || (!has_int && !has_float)) {
+            result.classes[eb] = CLASS_INTEGER;
+        } else {
+            result.classes[eb] = CLASS_SSE;
+        }
+    }
+
+    return result;
+}
+
 static int emit_call(char *func_name, int is_variadic, Type *return_type, int xmm_arg_count, int line) {
     int dest = new_vreg();
     IRInst *inst = new_inst(IR_CALL);
@@ -795,9 +860,31 @@ static int gen_expr(Node *node) {
         case NODE_KIND_FNCALL: {
             int arg_count = 0;
             for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
+            int line = node->tok ? node->tok->line : 0;
+
+            // Determine if we need SRET (struct return by hidden pointer)
+            // For extern fn: structs ≤16 bytes can return in registers (rax+rdx)
+            // For internal fn or >16 bytes: use SRET as before
+            int use_sret = 0;
+            int extern_small_struct_ret = 0; // 2-eightbyte return from extern
+            SysVClassification ret_cls = {0};
+
+            if (node->is_extern && node->ty->kind == TY_STRUCT && node->ty->size > 0 && node->ty->size <= 16) {
+                ret_cls = classify_struct_sysv(node->ty);
+                if (ret_cls.num_eightbytes > 0) {
+                    if (node->ty->size > 8) {
+                        extern_small_struct_ret = 1; // 2-eightbyte: return in rax+rdx
+                    }
+                    // 1-eightbyte: handled below after emit_call (SSE vs GPR)
+                } else {
+                    use_sret = 1; // MEMORY class → use SRET
+                }
+            } else if (node->ty->size > 8) {
+                use_sret = 1; // >16 bytes or internal → use SRET
+            }
 
             int sret_addr_reg = -1;
-            if (node->ty->size > 8) {
+            if (use_sret) {
                 // Allocate stack space for return value
                 int offset = ctx.current_func->alloc_stack_size;
                 ctx.current_func->alloc_stack_size += node->ty->size;
@@ -810,14 +897,32 @@ static int gen_expr(Node *node) {
                 IRInst *inst = new_inst(IR_GET_ALLOC_ADDR);
                 inst->dest = op_vreg(sret_addr_reg);
                 inst->src1 = op_imm(offset);
-                inst->line = node->tok ? node->tok->line : 0;
+                inst->line = line;
                 emit(inst);
 
                 arg_count++; // Add hidden argument
             }
 
-            int *arg_vregs = calloc(arg_count, sizeof(int));
-            Type **arg_types = calloc(arg_count, sizeof(Type *));
+            // Allocate stack buffer for 2-eightbyte return (rax+rdx → memory)
+            int ret_buf_reg = -1;
+            if (extern_small_struct_ret) {
+                int offset = ctx.current_func->alloc_stack_size;
+                ctx.current_func->alloc_stack_size += 16;
+                if (ctx.current_func->alloc_stack_size % 16 != 0) {
+                    ctx.current_func->alloc_stack_size += 16 - (ctx.current_func->alloc_stack_size % 16);
+                }
+
+                ret_buf_reg = new_vreg();
+                IRInst *inst = new_inst(IR_GET_ALLOC_ADDR);
+                inst->dest = op_vreg(ret_buf_reg);
+                inst->src1 = op_imm(offset);
+                inst->line = line;
+                emit(inst);
+            }
+
+            // Generate arg expressions
+            int *arg_vregs = calloc((arg_count + 8) * 2, sizeof(int)); // extra space for expansion
+            Type **arg_types = calloc((arg_count + 8) * 2, sizeof(Type *));
             int i = 0;
             if (sret_addr_reg != -1) {
                 arg_vregs[i] = sret_addr_reg;
@@ -836,17 +941,128 @@ static int gen_expr(Node *node) {
             int stack_arg_count = 0;
 
             if (node->is_extern) {
+                // Pre-process struct args for System V ABI
+                // May expand 2-eightbyte structs into 2 args
+                int max_new = arg_count * 2 + 8;
+                int *new_vregs = calloc(max_new, sizeof(int));
+                Type **new_types = calloc(max_new, sizeof(Type *));
+                int ni = 0;
+
+                for (int j = 0; j < arg_count; j++) {
+                    if (arg_types[j] && arg_types[j]->kind == TY_STRUCT && arg_types[j]->size > 0) {
+                        SysVClassification cls = classify_struct_sysv(arg_types[j]);
+
+                        if (cls.num_eightbytes == 0) {
+                            // MEMORY class (>16 bytes or field crosses boundary)
+                            // Pass on stack as a block — allocate stack buffer, copy, push bytes
+                            // For now: convert to invisible pointer (works for most C functions)
+                            int struct_size = arg_types[j]->size;
+                            int buf_offset = ctx.current_func->alloc_stack_size;
+                            ctx.current_func->alloc_stack_size += struct_size;
+                            if (ctx.current_func->alloc_stack_size % 16 != 0) {
+                                ctx.current_func->alloc_stack_size += 16 - (ctx.current_func->alloc_stack_size % 16);
+                            }
+
+                            int buf_reg = new_vreg();
+                            IRInst *ga = new_inst(IR_GET_ALLOC_ADDR);
+                            ga->dest = op_vreg(buf_reg);
+                            ga->src1 = op_imm(buf_offset);
+                            ga->line = line;
+                            emit(ga);
+
+                            // Copy struct to buffer
+                            IRInst *cpy = new_inst(IR_COPY);
+                            cpy->dest = op_vreg(buf_reg);
+                            cpy->src1 = op_vreg(arg_vregs[j]);
+                            cpy->src2 = op_imm(struct_size);
+                            cpy->line = line;
+                            emit(cpy);
+
+                            // Pass pointer as INTEGER arg
+                            new_vregs[ni] = buf_reg;
+                            new_types[ni] = type_i64;
+                            ni++;
+                        } else if (cls.num_eightbytes == 1) {
+                            // 1 eightbyte: gen_expr already loaded value (size ≤ 8)
+                            // Reclassify type for proper register routing
+                            if (cls.classes[0] == CLASS_SSE) {
+                                new_types[ni] = type_f64; // Route to XMM
+                            } else {
+                                new_types[ni] = type_i64; // Route to GPR
+                            }
+                            new_vregs[ni] = arg_vregs[j];
+                            ni++;
+                        } else {
+                            // 2 eightbytes: gen_expr returned address (size > 8)
+                            int addr = arg_vregs[j];
+
+                            // Load first eightbyte
+                            int lo = new_vreg();
+                            IRInst *load1 = new_inst(IR_LOAD);
+                            load1->dest = op_vreg(lo);
+                            load1->src1 = op_vreg(addr);
+                            load1->cast_to_type = type_i64;
+                            load1->line = line;
+                            emit(load1);
+
+                            new_vregs[ni] = lo;
+                            new_types[ni] = (cls.classes[0] == CLASS_SSE) ? type_f64 : type_i64;
+                            ni++;
+
+                            // Compute addr + 8
+                            int eight_vreg = emit_imm(8, line);
+                            int addr8 = new_vreg();
+                            IRInst *add_inst = new_inst(IR_ADD);
+                            add_inst->dest = op_vreg(addr8);
+                            add_inst->src1 = op_vreg(addr);
+                            add_inst->src2 = op_vreg(eight_vreg);
+                            add_inst->line = line;
+                            emit(add_inst);
+
+                            // Load second eightbyte (only size-8 bytes are valid)
+                            int hi = new_vreg();
+                            int second_eb_size = arg_types[j]->size - 8;
+                            Type *load2_type = type_i64;
+                            if (second_eb_size <= 1) load2_type = type_i8;
+                            else if (second_eb_size <= 2) load2_type = type_i16;
+                            else if (second_eb_size <= 4) load2_type = type_i32;
+
+                            IRInst *load2 = new_inst(IR_LOAD);
+                            load2->dest = op_vreg(hi);
+                            load2->src1 = op_vreg(addr8);
+                            load2->cast_to_type = load2_type;
+                            load2->line = line;
+                            emit(load2);
+
+                            new_vregs[ni] = hi;
+                            new_types[ni] = (cls.classes[1] == CLASS_SSE) ? type_f64 : type_i64;
+                            ni++;
+                        }
+                    } else {
+                        // Non-struct arg: keep as-is
+                        new_vregs[ni] = arg_vregs[j];
+                        new_types[ni] = arg_types[j];
+                        ni++;
+                    }
+                }
+
+                free(arg_vregs);
+                free(arg_types);
+                arg_vregs = new_vregs;
+                arg_types = new_types;
+                arg_count = ni;
+
                 // System V ABI: separate GPR and XMM register assignment
                 int gpr_idx = 0, xmm_idx = 0;
                 int *arg_reg_idx = calloc(arg_count, sizeof(int));
                 int *arg_on_stack = calloc(arg_count, sizeof(int));
 
                 for (int j = 0; j < arg_count; j++) {
-                    int is_float = arg_types[j] &&
+                    int is_float_arg = arg_types[j] &&
                         (arg_types[j]->kind == TY_F32 || arg_types[j]->kind == TY_F64);
-                    if (is_float && xmm_idx < 8) {
+                    if (is_float_arg && xmm_idx < 8) {
                         arg_reg_idx[j] = xmm_idx++;
-                    } else if (!is_float && gpr_idx < 6) {
+                    } else if (!is_float_arg && gpr_idx < 6) {
                         arg_reg_idx[j] = gpr_idx++;
                     } else {
                         arg_reg_idx[j] = 99; // Forces push in codegen
@@ -863,30 +1079,26 @@ static int gen_expr(Node *node) {
                 if (padding) {
                     IRInst *align = new_inst(IR_ASM);
                     align->asm_str = strdup("sub rsp, 8");
-                    align->line = node->tok ? node->tok->line : 0;
+                    align->line = line;
                     emit(align);
                 }
 
                 // Emit stack args in reverse order
                 for (int j = arg_count - 1; j >= 0; j--) {
                     if (arg_on_stack[j]) {
-                        emit_set_arg(arg_reg_idx[j], arg_vregs[j], arg_types[j], node->tok ? node->tok->line : 0);
+                        emit_set_arg(arg_reg_idx[j], arg_vregs[j], arg_types[j], line);
                     }
                 }
 
                 // Emit register args
                 for (int j = 0; j < arg_count; j++) {
                     if (!arg_on_stack[j]) {
-                        emit_set_arg(arg_reg_idx[j], arg_vregs[j], arg_types[j], node->tok ? node->tok->line : 0);
+                        emit_set_arg(arg_reg_idx[j], arg_vregs[j], arg_types[j], line);
                     }
                 }
 
                 free(arg_reg_idx);
                 free(arg_on_stack);
-
-                if (stack_arg_count > 0) {
-                    // Will clean up stack after call
-                }
             } else {
                 // Caustic internal ABI: all args in GPRs (rdi, rsi, rdx, rcx, r8, r9)
                 stack_arg_count = (arg_count > 6) ? (arg_count - 6) : 0;
@@ -895,25 +1107,25 @@ static int gen_expr(Node *node) {
                 if (padding) {
                     IRInst *align = new_inst(IR_ASM);
                     align->asm_str = strdup("sub rsp, 8");
-                    align->line = node->tok ? node->tok->line : 0;
+                    align->line = line;
                     emit(align);
                 }
 
                 // Emit stack args in reverse order
                 for (int j = arg_count - 1; j >= 6; j--) {
-                    emit_set_arg(j, arg_vregs[j], NULL, node->tok ? node->tok->line : 0);
+                    emit_set_arg(j, arg_vregs[j], NULL, line);
                 }
 
                 // Emit register args
                 for (int j = 0; j < arg_count && j < 6; j++) {
-                    emit_set_arg(j, arg_vregs[j], NULL, node->tok ? node->tok->line : 0);
+                    emit_set_arg(j, arg_vregs[j], NULL, line);
                 }
             }
 
             free(arg_vregs);
             free(arg_types);
 
-            int ret_reg = emit_call(node->name, node->is_variadic, node->ty, xmm_count, node->tok ? node->tok->line : 0);
+            int ret_reg = emit_call(node->name, node->is_variadic, node->ty, xmm_count, line);
 
             if (stack_arg_count > 0) {
                 int pad = (stack_arg_count % 2 != 0) ? 1 : 0;
@@ -921,8 +1133,29 @@ static int gen_expr(Node *node) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "add rsp, %d", (stack_arg_count + pad) * 8);
                 cleanup->asm_str = strdup(buf);
-                cleanup->line = node->tok ? node->tok->line : 0;
+                cleanup->line = line;
                 emit(cleanup);
+            }
+
+            // Handle 1-eightbyte SSE struct return from extern fn
+            // e.g. struct { f64 x; } returns in xmm0, not rax
+            if (node->is_extern && node->ty->kind == TY_STRUCT &&
+                node->ty->size <= 8 && ret_cls.num_eightbytes == 1 &&
+                ret_cls.classes[0] == CLASS_SSE) {
+                // Patch the IR_CALL to treat return as float so codegen reads xmm0
+                ctx.inst_tail->cast_to_type = (node->ty->size <= 4) ? type_f32 : type_f64;
+            }
+
+            // Handle 2-eightbyte struct return from extern fn
+            // Strategy: modify the IR_CALL dest to the buffer vreg,
+            // and set cast_from_type to signal codegen to store rax+rdx
+            if (extern_small_struct_ret && ret_buf_reg != -1) {
+                // The IR_CALL is the last emitted instruction (ctx.inst_tail)
+                // Change its dest to the buffer address vreg
+                // Codegen will detect cast_from_type == TY_STRUCT and handle rax+rdx
+                ctx.inst_tail->dest = op_vreg(ret_buf_reg);
+                ctx.inst_tail->cast_from_type = node->ty; // Signal: 2-eightbyte struct return
+                return ret_buf_reg;
             }
 
             if (sret_addr_reg != -1) {

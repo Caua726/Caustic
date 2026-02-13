@@ -1104,6 +1104,17 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             }
             emit("call %s", inst->call_target_name);
 
+            // 2-eightbyte struct return: dest holds buffer address, store rax+rdx there
+            if (inst->cast_from_type && inst->cast_from_type->kind == TY_STRUCT &&
+                inst->cast_from_type->size > 8 && inst->cast_from_type->size <= 16) {
+                // Load buffer address into r15, store rax and rdx
+                load_operand(inst->dest.vreg, ctx, "r15");
+                emit("mov QWORD PTR [r15], rax");
+                emit("mov QWORD PTR [r15+8], rdx");
+                // dest vreg keeps buffer address (no store_operand needed)
+                break;
+            }
+
             // Float-returning functions return in xmm0, not rax
             if (inst->cast_to_type &&
                 (inst->cast_to_type->kind == TY_F32 || inst->cast_to_type->kind == TY_F64)) {
