@@ -1,0 +1,599 @@
+// =======================================================
+// std/compatcffi.cst
+// C FFI Compatibility Layer
+// Handles C struct alignment, unions, C strings, typed pointers
+// =======================================================
+
+use "mem.cst" as mem;
+use "string.cst" as string;
+
+// --- Section 1: C Type Size Constants (x86_64 Linux) ---
+
+let is i64 as C_CHAR_SIZE with imut = 1;
+let is i64 as C_SHORT_SIZE with imut = 2;
+let is i64 as C_INT_SIZE with imut = 4;
+let is i64 as C_LONG_SIZE with imut = 8;
+let is i64 as C_PTR_SIZE with imut = 8;
+let is i64 as C_FLOAT_SIZE with imut = 4;
+let is i64 as C_DOUBLE_SIZE with imut = 8;
+let is i64 as C_SIZE_T_SIZE with imut = 8;
+
+let is i64 as C_CHAR_ALIGN with imut = 1;
+let is i64 as C_SHORT_ALIGN with imut = 2;
+let is i64 as C_INT_ALIGN with imut = 4;
+let is i64 as C_LONG_ALIGN with imut = 8;
+let is i64 as C_PTR_ALIGN with imut = 8;
+let is i64 as C_FLOAT_ALIGN with imut = 4;
+let is i64 as C_DOUBLE_ALIGN with imut = 8;
+
+// --- Section 2: Data Structures ---
+
+struct CField {
+    offset as i64;
+    size as i64;
+    align as i64;
+    count as i64;
+}
+
+struct CStruct {
+    fields as *u8;
+    field_count as i32;
+    field_cap as i32;
+    total_size as i64;
+    max_align as i64;
+}
+
+struct CUnion {
+    sizes as *u8;
+    aligns as *u8;
+    variant_count as i32;
+    variant_cap as i32;
+    total_size as i64;
+    max_align as i64;
+}
+
+// --- Section 3: Internal Helpers ---
+
+fn align_up(val as i64, align as i64) as i64 {
+    let is i64 as rem = val % align;
+    if (rem != 0) {
+        return val + align - rem;
+    }
+    return val;
+}
+
+fn field_get(cs as *CStruct, idx as i64) as *CField {
+    return cast(*CField, cast(i64, cs.fields) + idx * sizeof(CField));
+}
+
+// --- Section 4: CStruct — Layout Definition ---
+
+fn new_struct() as CStruct {
+    let is CStruct as cs;
+    cs.field_cap = 8;
+    cs.field_count = 0;
+    cs.total_size = 0;
+    cs.max_align = 1;
+    cs.fields = mem.galloc(cast(i64, 8) * sizeof(CField));
+    return cs;
+}
+
+fn add_field(cs as *CStruct, fsize as i64, falign as i64, fcount as i64) as void {
+    // Grow if needed
+    if (cs.field_count >= cs.field_cap) {
+        let is i32 as new_cap = cs.field_cap * 2;
+        let is *u8 as new_data = mem.galloc(cast(i64, new_cap) * sizeof(CField));
+        mem.memcpy(new_data, cs.fields, cast(i64, cs.field_count) * sizeof(CField));
+        mem.gfree(cs.fields);
+        cs.fields = new_data;
+        cs.field_cap = new_cap;
+    }
+
+    // Calculate aligned offset
+    let is i64 as current_offset with mut = 0;
+    if (cs.field_count > 0) {
+        let is *CField as prev = field_get(cs, cast(i64, cs.field_count) - 1);
+        current_offset = prev.offset + prev.size * prev.count;
+    }
+    current_offset = align_up(current_offset, falign);
+
+    // Store field
+    let is *CField as f = field_get(cs, cast(i64, cs.field_count));
+    f.offset = current_offset;
+    f.size = fsize;
+    f.align = falign;
+    f.count = fcount;
+
+    cs.field_count = cs.field_count + 1;
+
+    // Track max alignment
+    if (falign > cs.max_align) {
+        cs.max_align = falign;
+    }
+}
+
+// Convenience: add scalar fields
+fn add_i8(cs as *CStruct) as void { add_field(cs, 1, 1, 1); }
+fn add_i16(cs as *CStruct) as void { add_field(cs, 2, 2, 1); }
+fn add_i32(cs as *CStruct) as void { add_field(cs, 4, 4, 1); }
+fn add_i64(cs as *CStruct) as void { add_field(cs, 8, 8, 1); }
+fn add_f32(cs as *CStruct) as void { add_field(cs, 4, 4, 1); }
+fn add_f64(cs as *CStruct) as void { add_field(cs, 8, 8, 1); }
+fn add_ptr(cs as *CStruct) as void { add_field(cs, 8, 8, 1); }
+
+// Convenience: add array fields
+fn add_array_i8(cs as *CStruct, count as i64) as void { add_field(cs, 1, 1, count); }
+fn add_array_i16(cs as *CStruct, count as i64) as void { add_field(cs, 2, 2, count); }
+fn add_array_i32(cs as *CStruct, count as i64) as void { add_field(cs, 4, 4, count); }
+fn add_array_i64(cs as *CStruct, count as i64) as void { add_field(cs, 8, 8, count); }
+fn add_array_f32(cs as *CStruct, count as i64) as void { add_field(cs, 4, 4, count); }
+fn add_array_f64(cs as *CStruct, count as i64) as void { add_field(cs, 8, 8, count); }
+fn add_array_ptr(cs as *CStruct, count as i64) as void { add_field(cs, 8, 8, count); }
+
+// Nested struct
+fn add_struct(cs as *CStruct, inner as *CStruct) as void {
+    add_field(cs, inner.total_size, inner.max_align, 1);
+}
+
+// Custom field (escape hatch)
+fn add_bytes(cs as *CStruct, fsize as i64, falign as i64) as void {
+    add_field(cs, fsize, falign, 1);
+}
+
+// Finalize: apply tail padding
+fn finish(cs as *CStruct) as void {
+    if (cs.field_count == 0) {
+        cs.total_size = 0;
+        return;
+    }
+    let is *CField as last = field_get(cs, cast(i64, cs.field_count) - 1);
+    let is i64 as raw_end = last.offset + last.size * last.count;
+    cs.total_size = align_up(raw_end, cs.max_align);
+}
+
+// --- Section 5: CStruct — Instances ---
+
+fn alloc(cs as *CStruct) as *u8 {
+    let is *u8 as buf = mem.galloc(cs.total_size);
+    mem.memset(buf, cast(i32, 0), cs.total_size);
+    return buf;
+}
+
+fn free_struct(cs as *CStruct) as void {
+    if (cast(i64, cs.fields) != 0) {
+        mem.gfree(cs.fields);
+        cs.fields = cast(*u8, 0);
+    }
+}
+
+fn offset(cs as *CStruct, idx as i64) as i64 {
+    let is *CField as f = field_get(cs, idx);
+    return f.offset;
+}
+
+fn size(cs as *CStruct) as i64 {
+    return cs.total_size;
+}
+
+// --- Section 6: CStruct — Scalar Getters/Setters ---
+
+fn set_i8(buf as *u8, cs as *CStruct, idx as i64, val as i32) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *u8 as p = cast(*u8, cast(i64, buf) + f.offset);
+    p[0] = cast(u8, val);
+}
+
+fn get_i8(buf as *u8, cs as *CStruct, idx as i64) as i32 {
+    let is *CField as f = field_get(cs, idx);
+    let is *u8 as p = cast(*u8, cast(i64, buf) + f.offset);
+    return cast(i32, p[0]);
+}
+
+fn set_i16(buf as *u8, cs as *CStruct, idx as i64, val as i32) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *i16 as p = cast(*i16, cast(i64, buf) + f.offset);
+    *p = cast(i16, val);
+}
+
+fn get_i16(buf as *u8, cs as *CStruct, idx as i64) as i32 {
+    let is *CField as f = field_get(cs, idx);
+    let is *i16 as p = cast(*i16, cast(i64, buf) + f.offset);
+    return cast(i32, *p);
+}
+
+fn set_i32(buf as *u8, cs as *CStruct, idx as i64, val as i32) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *i32 as p = cast(*i32, cast(i64, buf) + f.offset);
+    *p = val;
+}
+
+fn get_i32(buf as *u8, cs as *CStruct, idx as i64) as i32 {
+    let is *CField as f = field_get(cs, idx);
+    let is *i32 as p = cast(*i32, cast(i64, buf) + f.offset);
+    return *p;
+}
+
+fn set_i64(buf as *u8, cs as *CStruct, idx as i64, val as i64) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset);
+    *p = val;
+}
+
+fn get_i64(buf as *u8, cs as *CStruct, idx as i64) as i64 {
+    let is *CField as f = field_get(cs, idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset);
+    return *p;
+}
+
+fn set_f32(buf as *u8, cs as *CStruct, idx as i64, val as f32) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *f32 as p = cast(*f32, cast(i64, buf) + f.offset);
+    *p = val;
+}
+
+fn get_f32(buf as *u8, cs as *CStruct, idx as i64) as f32 {
+    let is *CField as f = field_get(cs, idx);
+    let is *f32 as p = cast(*f32, cast(i64, buf) + f.offset);
+    return *p;
+}
+
+fn set_f64(buf as *u8, cs as *CStruct, idx as i64, val as f64) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *f64 as p = cast(*f64, cast(i64, buf) + f.offset);
+    *p = val;
+}
+
+fn get_f64(buf as *u8, cs as *CStruct, idx as i64) as f64 {
+    let is *CField as f = field_get(cs, idx);
+    let is *f64 as p = cast(*f64, cast(i64, buf) + f.offset);
+    return *p;
+}
+
+fn set_ptr(buf as *u8, cs as *CStruct, idx as i64, val as *u8) as void {
+    let is *CField as f = field_get(cs, idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset);
+    *p = cast(i64, val);
+}
+
+fn get_ptr(buf as *u8, cs as *CStruct, idx as i64) as *u8 {
+    let is *CField as f = field_get(cs, idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset);
+    return cast(*u8, *p);
+}
+
+// --- Section 7: CStruct — Array Getters/Setters ---
+
+fn set_array_i8(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as i32) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *u8 as p = cast(*u8, cast(i64, buf) + f.offset + arr_idx);
+    p[0] = cast(u8, val);
+}
+
+fn get_array_i8(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as i32 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *u8 as p = cast(*u8, cast(i64, buf) + f.offset + arr_idx);
+    return cast(i32, p[0]);
+}
+
+fn set_array_i16(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as i32) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i16 as p = cast(*i16, cast(i64, buf) + f.offset + arr_idx * 2);
+    *p = cast(i16, val);
+}
+
+fn get_array_i16(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as i32 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i16 as p = cast(*i16, cast(i64, buf) + f.offset + arr_idx * 2);
+    return cast(i32, *p);
+}
+
+fn set_array_i32(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as i32) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i32 as p = cast(*i32, cast(i64, buf) + f.offset + arr_idx * 4);
+    *p = val;
+}
+
+fn get_array_i32(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as i32 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i32 as p = cast(*i32, cast(i64, buf) + f.offset + arr_idx * 4);
+    return *p;
+}
+
+fn set_array_i64(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as i64) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset + arr_idx * 8);
+    *p = val;
+}
+
+fn get_array_i64(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as i64 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset + arr_idx * 8);
+    return *p;
+}
+
+fn set_array_f32(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as f32) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *f32 as p = cast(*f32, cast(i64, buf) + f.offset + arr_idx * 4);
+    *p = val;
+}
+
+fn get_array_f32(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as f32 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *f32 as p = cast(*f32, cast(i64, buf) + f.offset + arr_idx * 4);
+    return *p;
+}
+
+fn set_array_f64(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as f64) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *f64 as p = cast(*f64, cast(i64, buf) + f.offset + arr_idx * 8);
+    *p = val;
+}
+
+fn get_array_f64(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as f64 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *f64 as p = cast(*f64, cast(i64, buf) + f.offset + arr_idx * 8);
+    return *p;
+}
+
+fn set_array_ptr(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64, val as *u8) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset + arr_idx * 8);
+    *p = cast(i64, val);
+}
+
+fn get_array_ptr(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) as *u8 {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset + arr_idx * 8);
+    return cast(*u8, *p);
+}
+
+// --- Section 8: CUnion ---
+
+fn new_union() as CUnion {
+    let is CUnion as u;
+    u.variant_cap = 8;
+    u.variant_count = 0;
+    u.total_size = 0;
+    u.max_align = 1;
+    u.sizes = mem.galloc(cast(i64, 8) * 8);
+    u.aligns = mem.galloc(cast(i64, 8) * 8);
+    return u;
+}
+
+fn union_add_variant(u as *CUnion, vsize as i64, valign as i64) as void {
+    // Grow if needed
+    if (u.variant_count >= u.variant_cap) {
+        let is i32 as new_cap = u.variant_cap * 2;
+        let is *u8 as new_sizes = mem.galloc(cast(i64, new_cap) * 8);
+        let is *u8 as new_aligns = mem.galloc(cast(i64, new_cap) * 8);
+        mem.memcpy(new_sizes, u.sizes, cast(i64, u.variant_count) * 8);
+        mem.memcpy(new_aligns, u.aligns, cast(i64, u.variant_count) * 8);
+        mem.gfree(u.sizes);
+        mem.gfree(u.aligns);
+        u.sizes = new_sizes;
+        u.aligns = new_aligns;
+        u.variant_cap = new_cap;
+    }
+
+    // Store variant metadata
+    let is *i64 as sp = cast(*i64, cast(i64, u.sizes) + cast(i64, u.variant_count) * 8);
+    *sp = vsize;
+    let is *i64 as ap = cast(*i64, cast(i64, u.aligns) + cast(i64, u.variant_count) * 8);
+    *ap = valign;
+
+    u.variant_count = u.variant_count + 1;
+
+    if (vsize > u.total_size) { u.total_size = vsize; }
+    if (valign > u.max_align) { u.max_align = valign; }
+}
+
+// Convenience: add variant by type
+fn union_add_i8(u as *CUnion) as void { union_add_variant(u, 1, 1); }
+fn union_add_i16(u as *CUnion) as void { union_add_variant(u, 2, 2); }
+fn union_add_i32(u as *CUnion) as void { union_add_variant(u, 4, 4); }
+fn union_add_i64(u as *CUnion) as void { union_add_variant(u, 8, 8); }
+fn union_add_f32(u as *CUnion) as void { union_add_variant(u, 4, 4); }
+fn union_add_f64(u as *CUnion) as void { union_add_variant(u, 8, 8); }
+fn union_add_ptr(u as *CUnion) as void { union_add_variant(u, 8, 8); }
+
+fn union_finish(u as *CUnion) as void {
+    u.total_size = align_up(u.total_size, u.max_align);
+}
+
+fn union_alloc(u as *CUnion) as *u8 {
+    let is *u8 as buf = mem.galloc(u.total_size);
+    mem.memset(buf, cast(i32, 0), u.total_size);
+    return buf;
+}
+
+fn union_free(u as *CUnion) as void {
+    if (cast(i64, u.sizes) != 0) {
+        mem.gfree(u.sizes);
+        u.sizes = cast(*u8, 0);
+    }
+    if (cast(i64, u.aligns) != 0) {
+        mem.gfree(u.aligns);
+        u.aligns = cast(*u8, 0);
+    }
+}
+
+fn union_size(u as *CUnion) as i64 {
+    return u.total_size;
+}
+
+// Union getters/setters (all write at offset 0)
+fn union_set_i8(buf as *u8, u as *CUnion, variant as i64, val as i32) as void {
+    buf[0] = cast(u8, val);
+}
+
+fn union_get_i8(buf as *u8, u as *CUnion, variant as i64) as i32 {
+    return cast(i32, buf[0]);
+}
+
+fn union_set_i16(buf as *u8, u as *CUnion, variant as i64, val as i32) as void {
+    let is *i16 as p = cast(*i16, buf);
+    *p = cast(i16, val);
+}
+
+fn union_get_i16(buf as *u8, u as *CUnion, variant as i64) as i32 {
+    let is *i16 as p = cast(*i16, buf);
+    return cast(i32, *p);
+}
+
+fn union_set_i32(buf as *u8, u as *CUnion, variant as i64, val as i32) as void {
+    let is *i32 as p = cast(*i32, buf);
+    *p = val;
+}
+
+fn union_get_i32(buf as *u8, u as *CUnion, variant as i64) as i32 {
+    let is *i32 as p = cast(*i32, buf);
+    return *p;
+}
+
+fn union_set_i64(buf as *u8, u as *CUnion, variant as i64, val as i64) as void {
+    let is *i64 as p = cast(*i64, buf);
+    *p = val;
+}
+
+fn union_get_i64(buf as *u8, u as *CUnion, variant as i64) as i64 {
+    let is *i64 as p = cast(*i64, buf);
+    return *p;
+}
+
+fn union_set_f32(buf as *u8, u as *CUnion, variant as i64, val as f32) as void {
+    let is *f32 as p = cast(*f32, buf);
+    *p = val;
+}
+
+fn union_get_f32(buf as *u8, u as *CUnion, variant as i64) as f32 {
+    let is *f32 as p = cast(*f32, buf);
+    return *p;
+}
+
+fn union_set_f64(buf as *u8, u as *CUnion, variant as i64, val as f64) as void {
+    let is *f64 as p = cast(*f64, buf);
+    *p = val;
+}
+
+fn union_get_f64(buf as *u8, u as *CUnion, variant as i64) as f64 {
+    let is *f64 as p = cast(*f64, buf);
+    return *p;
+}
+
+fn union_set_ptr(buf as *u8, u as *CUnion, variant as i64, val as *u8) as void {
+    let is *i64 as p = cast(*i64, buf);
+    *p = cast(i64, val);
+}
+
+fn union_get_ptr(buf as *u8, u as *CUnion, variant as i64) as *u8 {
+    let is *i64 as p = cast(*i64, buf);
+    return cast(*u8, *p);
+}
+
+// --- Section 9: C Strings ---
+
+fn to_cstr(s as string.String) as *u8 {
+    return s.ptr;
+}
+
+fn from_cstr(cstr as *u8) as string.String {
+    let is i64 as len = string.strlen(cstr);
+    let is string.String as s;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, len);
+    if (len > 0) {
+        s.ptr = mem.galloc(len + 1);
+        mem.memcpy(s.ptr, cstr, len + 1);
+    } else {
+        s.ptr = cast(*u8, 0);
+    }
+    return s;
+}
+
+fn from_cstr_len(cstr as *u8, len as i64) as string.String {
+    let is string.String as s;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, len);
+    if (len > 0) {
+        s.ptr = mem.galloc(len + 1);
+        mem.memcpy(s.ptr, cstr, len);
+        s.ptr[len] = cast(u8, 0);
+    } else {
+        s.ptr = cast(*u8, 0);
+    }
+    return s;
+}
+
+// --- Section 10: Typed Pointer Arithmetic ---
+
+fn ptr_add(ptr as *u8, index as i64, elem_size as i64) as *u8 {
+    return cast(*u8, cast(i64, ptr) + index * elem_size);
+}
+
+fn ptr_get_i8(ptr as *u8, index as i64) as i32 {
+    return cast(i32, ptr[index]);
+}
+
+fn ptr_set_i8(ptr as *u8, index as i64, val as i32) as void {
+    ptr[index] = cast(u8, val);
+}
+
+fn ptr_get_i16(ptr as *u8, index as i64) as i32 {
+    let is *i16 as p = cast(*i16, cast(i64, ptr) + index * 2);
+    return cast(i32, *p);
+}
+
+fn ptr_set_i16(ptr as *u8, index as i64, val as i32) as void {
+    let is *i16 as p = cast(*i16, cast(i64, ptr) + index * 2);
+    *p = cast(i16, val);
+}
+
+fn ptr_get_i32(ptr as *u8, index as i64) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, ptr) + index * 4);
+    return *p;
+}
+
+fn ptr_set_i32(ptr as *u8, index as i64, val as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, ptr) + index * 4);
+    *p = val;
+}
+
+fn ptr_get_i64(ptr as *u8, index as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, ptr) + index * 8);
+    return *p;
+}
+
+fn ptr_set_i64(ptr as *u8, index as i64, val as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, ptr) + index * 8);
+    *p = val;
+}
+
+fn ptr_get_f32(ptr as *u8, index as i64) as f32 {
+    let is *f32 as p = cast(*f32, cast(i64, ptr) + index * 4);
+    return *p;
+}
+
+fn ptr_set_f32(ptr as *u8, index as i64, val as f32) as void {
+    let is *f32 as p = cast(*f32, cast(i64, ptr) + index * 4);
+    *p = val;
+}
+
+fn ptr_get_f64(ptr as *u8, index as i64) as f64 {
+    let is *f64 as p = cast(*f64, cast(i64, ptr) + index * 8);
+    return *p;
+}
+
+fn ptr_set_f64(ptr as *u8, index as i64, val as f64) as void {
+    let is *f64 as p = cast(*f64, cast(i64, ptr) + index * 8);
+    *p = val;
+}
+
+fn ptr_get_ptr(ptr as *u8, index as i64) as *u8 {
+    let is *i64 as p = cast(*i64, cast(i64, ptr) + index * 8);
+    return cast(*u8, *p);
+}
+
+fn ptr_set_ptr(ptr as *u8, index as i64, val as *u8) as void {
+    let is *i64 as p = cast(*i64, cast(i64, ptr) + index * 8);
+    *p = cast(i64, val);
+}
