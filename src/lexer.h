@@ -71,6 +71,7 @@ typedef enum {
 	TOKEN_TYPE_DEFER,
 	TOKEN_TYPE_EXTERN,
 	TOKEN_TYPE_IMPL,
+	TOKEN_TYPE_FN_PTR,
 } TokenType;
 
 extern const char *TOKEN_NAMES[];

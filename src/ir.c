@@ -857,6 +857,16 @@ static int gen_expr(Node *node) {
             return emit_cast_from(src, node->expr->ty, node->ty, node->tok ? node->tok->line : 0);
         }
 
+        case NODE_KIND_FN_PTR: {
+            int dest = new_vreg();
+            IRInst *inst = new_inst(IR_FN_ADDR);
+            inst->dest = op_vreg(dest);
+            inst->global_name = strdup(node->name);
+            inst->line = node->tok ? node->tok->line : 0;
+            emit(inst);
+            return dest;
+        }
+
         case NODE_KIND_FNCALL: {
             int arg_count = 0;
             for (Node *arg = node->args; arg; arg = arg->next) arg_count++;
@@ -1849,6 +1859,14 @@ static void mark_reachable(IRProgram *prog, IRFunction *func) {
             for (IRFunction *f = prog->functions; f; f = f->next) {
                 char *fname = f->asm_name ? f->asm_name : f->name;
                 if (strcmp(fname, inst->call_target_name) == 0) {
+                    mark_reachable(prog, f);
+                    break;
+                }
+            }
+        } else if (inst->op == IR_FN_ADDR && inst->global_name) {
+            for (IRFunction *f = prog->functions; f; f = f->next) {
+                char *fname = f->asm_name ? f->asm_name : f->name;
+                if (strcmp(fname, inst->global_name) == 0) {
                     mark_reachable(prog, f);
                     break;
                 }

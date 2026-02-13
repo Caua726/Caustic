@@ -1651,6 +1651,43 @@ void walk(Node *node) {
             node->ty = type_i32; // sizeof returns i32 (or size_t which we map to i32/i64)
             return;
 
+        case NODE_KIND_FN_PTR: {
+            char *fn_name = node->name;
+            char *module_name = node->member_name;
+            Function *func = NULL;
+
+            if (module_name) {
+                // Module-qualified: fn_ptr(mod.func)
+                Variable *var = symtab_lookup(fn_name);
+                if (!var || !var->is_module || !var->module_ref) {
+                    error_at_token(*node->tok, "modulo '%s' nao encontrado", fn_name);
+                }
+                func = lookup_function_qualified(module_name, var->module_ref->path_prefix);
+                if (!func) {
+                    error_at_token(*node->tok, "funcao '%s.%s' nao encontrada", fn_name, module_name);
+                }
+                free(node->name);
+                node->name = strdup(func->asm_name ? func->asm_name : func->name);
+                free(node->member_name);
+                node->member_name = NULL;
+            } else {
+                func = lookup_function(fn_name);
+                if (!func) {
+                    error_at_token(*node->tok, "funcao '%s' nao encontrada", fn_name);
+                }
+                if (func->asm_name) {
+                    free(node->name);
+                    node->name = strdup(func->asm_name);
+                }
+            }
+
+            Type *ptr_ty = new_type(TY_PTR);
+            ptr_ty->base = type_u8;
+            ptr_ty->size = 8;
+            node->ty = ptr_ty;
+            return;
+        }
+
         case NODE_KIND_FNCALL: {
             Function *func = NULL;
 

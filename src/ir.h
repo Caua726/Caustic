@@ -48,6 +48,7 @@ typedef enum {
     IR_FMUL,
     IR_FDIV,
     IR_FNEG,
+    IR_FN_ADDR,
 } IROp;
 
 typedef enum {

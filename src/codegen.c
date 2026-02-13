@@ -590,6 +590,16 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             }
             break;
 
+        case IR_FN_ADDR:
+            get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
+            if (strstr(dst, "PTR") != NULL || strstr(dst, "[rbp-") != NULL) {
+                emit("lea r15, [rip+%s]", inst->global_name);
+                emit("mov %s, r15", dst);
+            } else {
+                emit("lea %s, [rip+%s]", dst, inst->global_name);
+            }
+            break;
+
         case IR_GET_ALLOC_ADDR:
             get_operand_loc(inst->dest.vreg, ctx, dst, sizeof(dst));
             // Base of alloc area is [rbp - (ctx->stack_slots * 8)]

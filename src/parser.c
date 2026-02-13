@@ -731,6 +731,45 @@ static Node *parse_primary() {
         return node;
     }
 
+    if (current_token.type == TOKEN_TYPE_FN_PTR) {
+        Token fn_ptr_tok = current_token;
+        consume();
+        expect(TOKEN_TYPE_LPAREN);
+
+        if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+            error_at_token(current_token, "fn_ptr espera um nome de funcao");
+        }
+
+        char *fn_name = strdup(current_token.text);
+        consume();
+
+        // Support module-qualified: fn_ptr(mod.func)
+        if (current_token.type == TOKEN_TYPE_DOT) {
+            consume();
+            if (current_token.type != TOKEN_TYPE_IDENTIFIER) {
+                error_at_token(current_token, "esperado nome de funcao apos '.'");
+            }
+            char *member = strdup(current_token.text);
+            consume();
+
+            Node *node = new_node(NODE_KIND_FN_PTR);
+            node->tok = calloc(1, sizeof(Token));
+            *node->tok = fn_ptr_tok;
+            node->name = fn_name;
+            node->member_name = member;
+            expect(TOKEN_TYPE_RPAREN);
+            return node;
+        }
+
+        Node *node = new_node(NODE_KIND_FN_PTR);
+        node->tok = calloc(1, sizeof(Token));
+        *node->tok = fn_ptr_tok;
+        node->name = fn_name;
+        node->member_name = NULL;
+        expect(TOKEN_TYPE_RPAREN);
+        return node;
+    }
+
     if (current_token.type == TOKEN_TYPE_INTEGER) {
         Node *node = new_node_num(current_token.int_value);
         node->ty = type_i64; // Default integer type

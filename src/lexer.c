@@ -76,6 +76,8 @@ const char *TOKEN_NAMES[] = {
     "TOKEN_TYPE_CASE",
     "TOKEN_TYPE_DEFER",
     "TOKEN_TYPE_EXTERN",
+    "TOKEN_TYPE_IMPL",
+    "TOKEN_TYPE_FN_PTR",
 };
 
 static FILE *src;
@@ -184,6 +186,7 @@ Token lexer_next() {
         else if (strcmp(t.text, "defer") == 0) {t.type = TOKEN_TYPE_DEFER;}
         else if (strcmp(t.text, "extern") == 0) {t.type = TOKEN_TYPE_EXTERN;}
         else if (strcmp(t.text, "impl") == 0) {t.type = TOKEN_TYPE_IMPL;}
+        else if (strcmp(t.text, "fn_ptr") == 0) {t.type = TOKEN_TYPE_FN_PTR;}
 
         else {t.type = TOKEN_TYPE_IDENTIFIER;}
         return t;
