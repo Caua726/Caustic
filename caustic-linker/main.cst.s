@@ -309,6 +309,12 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
 .global __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_PLT32
 __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_PLT32:
   .quad 4
+.global __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GOTPCREL
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GOTPCREL:
+  .quad 9
+.global __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GLOB_DAT
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GLOB_DAT:
+  .quad 6
 .global __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_SECIDX_TEXT
 __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_SECIDX_TEXT:
   .long 1
@@ -441,6 +447,11 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_mem_cst__std
 .globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_dynamic_bufs
 .globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_is_dynamic_sym
 .globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_plt_vaddr
+.globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_data_got_vaddr
+.globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_data_dynsyms
+.globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_func_dynsyms
+.globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_data_got
+.globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_rela_dyn
 .globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_write_executable
 .globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_write_shdr
 .globl __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
@@ -1748,13 +1759,13 @@ main:
   push r13
   push r14
   push r15
-  sub rsp, 5544
-  mov QWORD PTR [rbp-2848], rdi
-  mov QWORD PTR [rbp-2840], rsi
-  mov QWORD PTR [rbp-2832], rdx
-  mov QWORD PTR [rbp-2824], rcx
-  mov QWORD PTR [rbp-2816], r8
-  mov QWORD PTR [rbp-2808], r9
+  sub rsp, 5576
+  mov QWORD PTR [rbp-2864], rdi
+  mov QWORD PTR [rbp-2856], rsi
+  mov QWORD PTR [rbp-2848], rdx
+  mov QWORD PTR [rbp-2840], rcx
+  mov QWORD PTR [rbp-2832], r8
+  mov QWORD PTR [rbp-2824], r9
   mov rbx, rdi
   mov QWORD PTR [rbp-56], rbx
   mov rbx, rsi
@@ -1777,7 +1788,7 @@ main:
   mov rbx, rax
   mov rbx, 1
   mov rax, rbx
-  add rsp, 5544
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -1810,105 +1821,105 @@ main:
   mov QWORD PTR [rbp-2432], rbx
 .L44:
   mov r15, QWORD PTR [rbp-2432]
-  mov QWORD PTR [rbp-2856], r15
+  mov QWORD PTR [rbp-2872], r15
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-2960], r15
-  mov r15, QWORD PTR [rbp-2856]
-  mov r14, QWORD PTR [rbp-2960]
+  mov QWORD PTR [rbp-2976], r15
+  mov r15, QWORD PTR [rbp-2872]
+  mov r14, QWORD PTR [rbp-2976]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-3016], rax
-  mov r15, QWORD PTR [rbp-3016]
+  mov QWORD PTR [rbp-3032], rax
+  mov r15, QWORD PTR [rbp-3032]
   test r15, r15
   jz .L45
   mov r15, QWORD PTR [rbp-72]
-  mov QWORD PTR [rbp-2864], r15
+  mov QWORD PTR [rbp-2880], r15
   mov r15, QWORD PTR [rbp-2432]
-  mov QWORD PTR [rbp-2872], r15
-  mov QWORD PTR [rbp-2880], 8
-  mov r15, QWORD PTR [rbp-2872]
-  mov r14, QWORD PTR [rbp-2880]
-  imul r15, r14
   mov QWORD PTR [rbp-2888], r15
-  mov r15, QWORD PTR [rbp-2864]
-  mov r14, QWORD PTR [rbp-2888]
-  add r15, r14
-  mov QWORD PTR [rbp-2896], r15
-  mov r15, QWORD PTR [rbp-2896]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-2904], rax
+  mov QWORD PTR [rbp-2896], 8
+  mov r15, QWORD PTR [rbp-2888]
+  mov r14, QWORD PTR [rbp-2896]
+  imul r15, r14
+  mov QWORD PTR [rbp-2904], r15
+  mov r15, QWORD PTR [rbp-2880]
   mov r14, QWORD PTR [rbp-2904]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-2912], r15
   mov r15, QWORD PTR [rbp-2912]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-2920], rax
+  mov r14, QWORD PTR [rbp-2920]
+  mov r15, r14
+  mov QWORD PTR [rbp-2928], r15
+  mov r15, QWORD PTR [rbp-2928]
   mov QWORD PTR [rbp-2440], r15
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-2920], r15
+  mov QWORD PTR [rbp-2936], r15
   lea r15, [rip+.LC86]
-  mov QWORD PTR [rbp-2928], r15
-  mov rdi, QWORD PTR [rbp-2920]
-  mov rsi, QWORD PTR [rbp-2928]
+  mov QWORD PTR [rbp-2944], r15
+  mov rdi, QWORD PTR [rbp-2936]
+  mov rsi, QWORD PTR [rbp-2944]
   call streq_lit
-  mov QWORD PTR [rbp-2936], rax
-  mov QWORD PTR [rbp-2944], 1
-  mov r15, QWORD PTR [rbp-2936]
-  mov r14, QWORD PTR [rbp-2944]
+  mov QWORD PTR [rbp-2952], rax
+  mov QWORD PTR [rbp-2960], 1
+  mov r15, QWORD PTR [rbp-2952]
+  mov r14, QWORD PTR [rbp-2960]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-2952], rax
-  mov r15, QWORD PTR [rbp-2952]
+  mov QWORD PTR [rbp-2968], rax
+  mov r15, QWORD PTR [rbp-2968]
   test r15, r15
   jz .L46
   lea r15, [rbp-2432]
-  mov QWORD PTR [rbp-3120], r15
+  mov QWORD PTR [rbp-3136], r15
   mov r15, QWORD PTR [rbp-2432]
-  mov QWORD PTR [rbp-2968], r15
-  mov QWORD PTR [rbp-2976], 1
-  mov r15, QWORD PTR [rbp-2968]
-  mov r14, QWORD PTR [rbp-2976]
-  add r15, r14
   mov QWORD PTR [rbp-2984], r15
-  mov r15, QWORD PTR [rbp-3120]
-  mov rax, QWORD PTR [rbp-2984]
+  mov QWORD PTR [rbp-2992], 1
+  mov r15, QWORD PTR [rbp-2984]
+  mov r14, QWORD PTR [rbp-2992]
+  add r15, r14
+  mov QWORD PTR [rbp-3000], r15
+  mov r15, QWORD PTR [rbp-3136]
+  mov rax, QWORD PTR [rbp-3000]
   mov QWORD PTR [r15], rax
   mov r15, QWORD PTR [rbp-2432]
-  mov QWORD PTR [rbp-2992], r15
+  mov QWORD PTR [rbp-3008], r15
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-3000], r15
-  mov r15, QWORD PTR [rbp-2992]
-  mov r14, QWORD PTR [rbp-3000]
+  mov QWORD PTR [rbp-3016], r15
+  mov r15, QWORD PTR [rbp-3008]
+  mov r14, QWORD PTR [rbp-3016]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-3008], rax
-  mov r15, QWORD PTR [rbp-3008]
+  mov QWORD PTR [rbp-3024], rax
+  mov r15, QWORD PTR [rbp-3024]
   test r15, r15
   jz .L48
   lea r15, [rbp-80]
-  mov QWORD PTR [rbp-3584], r15
+  mov QWORD PTR [rbp-3600], r15
   mov r15, QWORD PTR [rbp-72]
-  mov QWORD PTR [rbp-3024], r15
+  mov QWORD PTR [rbp-3040], r15
   mov r15, QWORD PTR [rbp-2432]
-  mov QWORD PTR [rbp-3032], r15
-  mov QWORD PTR [rbp-3040], 8
-  mov r15, QWORD PTR [rbp-3032]
-  mov r14, QWORD PTR [rbp-3040]
-  imul r15, r14
   mov QWORD PTR [rbp-3048], r15
-  mov r15, QWORD PTR [rbp-3024]
-  mov r14, QWORD PTR [rbp-3048]
-  add r15, r14
-  mov QWORD PTR [rbp-3056], r15
-  mov r15, QWORD PTR [rbp-3056]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-3064], rax
+  mov QWORD PTR [rbp-3056], 8
+  mov r15, QWORD PTR [rbp-3048]
+  mov r14, QWORD PTR [rbp-3056]
+  imul r15, r14
+  mov QWORD PTR [rbp-3064], r15
+  mov r15, QWORD PTR [rbp-3040]
   mov r14, QWORD PTR [rbp-3064]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-3072], r15
-  mov r15, QWORD PTR [rbp-3584]
-  mov rax, QWORD PTR [rbp-3072]
+  mov r15, QWORD PTR [rbp-3072]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-3080], rax
+  mov r14, QWORD PTR [rbp-3080]
+  mov r15, r14
+  mov QWORD PTR [rbp-3088], r15
+  mov r15, QWORD PTR [rbp-3600]
+  mov rax, QWORD PTR [rbp-3088]
   mov QWORD PTR [r15], rax
   jmp .L49
 .L48:
@@ -1916,242 +1927,242 @@ main:
   jmp .L47
 .L46:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3080], r15
+  mov QWORD PTR [rbp-3096], r15
   lea r15, [rip+.LC87]
-  mov QWORD PTR [rbp-3088], r15
-  mov rdi, QWORD PTR [rbp-3080]
-  mov rsi, QWORD PTR [rbp-3088]
+  mov QWORD PTR [rbp-3104], r15
+  mov rdi, QWORD PTR [rbp-3096]
+  mov rsi, QWORD PTR [rbp-3104]
   call starts_with
-  mov QWORD PTR [rbp-3096], rax
-  mov QWORD PTR [rbp-3104], 1
-  mov r15, QWORD PTR [rbp-3096]
-  mov r14, QWORD PTR [rbp-3104]
+  mov QWORD PTR [rbp-3112], rax
+  mov QWORD PTR [rbp-3120], 1
+  mov r15, QWORD PTR [rbp-3112]
+  mov r14, QWORD PTR [rbp-3120]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3112], rax
-  mov r15, QWORD PTR [rbp-3112]
+  mov QWORD PTR [rbp-3128], rax
+  mov r15, QWORD PTR [rbp-3128]
   test r15, r15
   jz .L50
   lea r15, [rbp-88]
-  mov QWORD PTR [rbp-3944], r15
+  mov QWORD PTR [rbp-3960], r15
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3128], r15
-  mov r14, QWORD PTR [rbp-3128]
-  mov r15, r14
-  mov QWORD PTR [rbp-3136], r15
-  mov QWORD PTR [rbp-3144], 8
-  mov r15, QWORD PTR [rbp-3136]
+  mov QWORD PTR [rbp-3144], r15
   mov r14, QWORD PTR [rbp-3144]
-  add r15, r14
-  mov QWORD PTR [rbp-3152], r15
-  mov r14, QWORD PTR [rbp-3152]
   mov r15, r14
-  mov QWORD PTR [rbp-3160], r15
-  mov r15, QWORD PTR [rbp-3944]
-  mov rax, QWORD PTR [rbp-3160]
+  mov QWORD PTR [rbp-3152], r15
+  mov QWORD PTR [rbp-3160], 8
+  mov r15, QWORD PTR [rbp-3152]
+  mov r14, QWORD PTR [rbp-3160]
+  add r15, r14
+  mov QWORD PTR [rbp-3168], r15
+  mov r14, QWORD PTR [rbp-3168]
+  mov r15, r14
+  mov QWORD PTR [rbp-3176], r15
+  mov r15, QWORD PTR [rbp-3960]
+  mov rax, QWORD PTR [rbp-3176]
   mov QWORD PTR [r15], rax
   jmp .L51
 .L50:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3168], r15
+  mov QWORD PTR [rbp-3184], r15
   lea r15, [rip+.LC88]
-  mov QWORD PTR [rbp-3176], r15
-  mov rdi, QWORD PTR [rbp-3168]
-  mov rsi, QWORD PTR [rbp-3176]
+  mov QWORD PTR [rbp-3192], r15
+  mov rdi, QWORD PTR [rbp-3184]
+  mov rsi, QWORD PTR [rbp-3192]
   call starts_with
-  mov QWORD PTR [rbp-3184], rax
-  mov QWORD PTR [rbp-3192], 1
-  mov r15, QWORD PTR [rbp-3184]
-  mov r14, QWORD PTR [rbp-3192]
+  mov QWORD PTR [rbp-3200], rax
+  mov QWORD PTR [rbp-3208], 1
+  mov r15, QWORD PTR [rbp-3200]
+  mov r14, QWORD PTR [rbp-3208]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3200], rax
-  mov r15, QWORD PTR [rbp-3200]
+  mov QWORD PTR [rbp-3216], rax
+  mov r15, QWORD PTR [rbp-3216]
   test r15, r15
   jz .L52
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3208], r15
-  mov r14, QWORD PTR [rbp-3208]
-  mov r15, r14
-  mov QWORD PTR [rbp-3216], r15
-  mov QWORD PTR [rbp-3224], 7
-  mov r15, QWORD PTR [rbp-3216]
+  mov QWORD PTR [rbp-3224], r15
   mov r14, QWORD PTR [rbp-3224]
-  add r15, r14
-  mov QWORD PTR [rbp-3232], r15
-  mov r14, QWORD PTR [rbp-3232]
   mov r15, r14
-  mov QWORD PTR [rbp-3240], r15
-  mov r15, QWORD PTR [rbp-3240]
+  mov QWORD PTR [rbp-3232], r15
+  mov QWORD PTR [rbp-3240], 7
+  mov r15, QWORD PTR [rbp-3232]
+  mov r14, QWORD PTR [rbp-3240]
+  add r15, r14
+  mov QWORD PTR [rbp-3248], r15
+  mov r14, QWORD PTR [rbp-3248]
+  mov r15, r14
+  mov QWORD PTR [rbp-3256], r15
+  mov r15, QWORD PTR [rbp-3256]
   mov QWORD PTR [rbp-2448], r15
   lea r15, [rbp-96]
-  mov QWORD PTR [rbp-3248], r15
-  mov r10, QWORD PTR [rbp-3248]
+  mov QWORD PTR [rbp-3264], r15
+  mov r10, QWORD PTR [rbp-3264]
   mov r15, QWORD PTR [rbp-2448]
-  mov QWORD PTR [rbp-3256], r15
-  mov rdi, QWORD PTR [rbp-3256]
+  mov QWORD PTR [rbp-3272], r15
+  mov rdi, QWORD PTR [rbp-3272]
   call parse_hex
-  mov QWORD PTR [rbp-3264], rax
-  mov r15, QWORD PTR [rbp-3248]
-  mov rax, QWORD PTR [rbp-3264]
+  mov QWORD PTR [rbp-3280], rax
+  mov r15, QWORD PTR [rbp-3264]
+  mov rax, QWORD PTR [rbp-3280]
   mov QWORD PTR [r15], rax
   jmp .L53
 .L52:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3272], r15
+  mov QWORD PTR [rbp-3288], r15
   lea r15, [rip+.LC89]
-  mov QWORD PTR [rbp-3280], r15
-  mov rdi, QWORD PTR [rbp-3272]
-  mov rsi, QWORD PTR [rbp-3280]
+  mov QWORD PTR [rbp-3296], r15
+  mov rdi, QWORD PTR [rbp-3288]
+  mov rsi, QWORD PTR [rbp-3296]
   call streq_lit
-  mov QWORD PTR [rbp-3288], rax
-  mov QWORD PTR [rbp-3296], 1
-  mov r15, QWORD PTR [rbp-3288]
-  mov r14, QWORD PTR [rbp-3296]
+  mov QWORD PTR [rbp-3304], rax
+  mov QWORD PTR [rbp-3312], 1
+  mov r15, QWORD PTR [rbp-3304]
+  mov r14, QWORD PTR [rbp-3312]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3304], rax
-  mov r15, QWORD PTR [rbp-3304]
+  mov QWORD PTR [rbp-3320], rax
+  mov r15, QWORD PTR [rbp-3320]
   test r15, r15
   jz .L54
   lea r15, [rbp-104]
-  mov QWORD PTR [rbp-3312], r15
-  mov QWORD PTR [rbp-3320], 1
-  mov r15, QWORD PTR [rbp-3312]
-  mov rax, QWORD PTR [rbp-3320]
+  mov QWORD PTR [rbp-3328], r15
+  mov QWORD PTR [rbp-3336], 1
+  mov r15, QWORD PTR [rbp-3328]
+  mov rax, QWORD PTR [rbp-3336]
   mov DWORD PTR [r15], eax
   jmp .L55
 .L54:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3328], r15
+  mov QWORD PTR [rbp-3344], r15
   lea r15, [rip+.LC90]
-  mov QWORD PTR [rbp-3336], r15
-  mov rdi, QWORD PTR [rbp-3328]
-  mov rsi, QWORD PTR [rbp-3336]
+  mov QWORD PTR [rbp-3352], r15
+  mov rdi, QWORD PTR [rbp-3344]
+  mov rsi, QWORD PTR [rbp-3352]
   call streq_lit
-  mov QWORD PTR [rbp-3344], rax
-  mov QWORD PTR [rbp-3352], 1
-  mov r15, QWORD PTR [rbp-3344]
-  mov r14, QWORD PTR [rbp-3352]
+  mov QWORD PTR [rbp-3360], rax
+  mov QWORD PTR [rbp-3368], 1
+  mov r15, QWORD PTR [rbp-3360]
+  mov r14, QWORD PTR [rbp-3368]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3360], rax
-  mov r15, QWORD PTR [rbp-3360]
+  mov QWORD PTR [rbp-3376], rax
+  mov r15, QWORD PTR [rbp-3376]
   test r15, r15
   jz .L56
   lea r15, [rbp-108]
-  mov QWORD PTR [rbp-3368], r15
-  mov QWORD PTR [rbp-3376], 1
-  mov r15, QWORD PTR [rbp-3368]
-  mov rax, QWORD PTR [rbp-3376]
+  mov QWORD PTR [rbp-3384], r15
+  mov QWORD PTR [rbp-3392], 1
+  mov r15, QWORD PTR [rbp-3384]
+  mov rax, QWORD PTR [rbp-3392]
   mov DWORD PTR [r15], eax
   jmp .L57
 .L56:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3384], r15
+  mov QWORD PTR [rbp-3400], r15
   lea r15, [rip+.LC91]
-  mov QWORD PTR [rbp-3392], r15
-  mov rdi, QWORD PTR [rbp-3384]
-  mov rsi, QWORD PTR [rbp-3392]
+  mov QWORD PTR [rbp-3408], r15
+  mov rdi, QWORD PTR [rbp-3400]
+  mov rsi, QWORD PTR [rbp-3408]
   call streq_lit
-  mov QWORD PTR [rbp-3400], rax
-  mov QWORD PTR [rbp-3408], 1
-  mov r15, QWORD PTR [rbp-3400]
-  mov r14, QWORD PTR [rbp-3408]
+  mov QWORD PTR [rbp-3416], rax
+  mov QWORD PTR [rbp-3424], 1
+  mov r15, QWORD PTR [rbp-3416]
+  mov r14, QWORD PTR [rbp-3424]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3416], rax
-  mov r15, QWORD PTR [rbp-3416]
+  mov QWORD PTR [rbp-3432], rax
+  mov r15, QWORD PTR [rbp-3432]
   test r15, r15
   jz .L58
   lea r15, [rbp-112]
-  mov QWORD PTR [rbp-3424], r15
-  mov QWORD PTR [rbp-3432], 1
-  mov r15, QWORD PTR [rbp-3424]
-  mov rax, QWORD PTR [rbp-3432]
+  mov QWORD PTR [rbp-3440], r15
+  mov QWORD PTR [rbp-3448], 1
+  mov r15, QWORD PTR [rbp-3440]
+  mov rax, QWORD PTR [rbp-3448]
   mov DWORD PTR [r15], eax
   jmp .L59
 .L58:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3440], r15
+  mov QWORD PTR [rbp-3456], r15
   lea r15, [rip+.LC92]
-  mov QWORD PTR [rbp-3448], r15
-  mov rdi, QWORD PTR [rbp-3440]
-  mov rsi, QWORD PTR [rbp-3448]
+  mov QWORD PTR [rbp-3464], r15
+  mov rdi, QWORD PTR [rbp-3456]
+  mov rsi, QWORD PTR [rbp-3464]
   call streq_lit
-  mov QWORD PTR [rbp-3456], rax
-  mov QWORD PTR [rbp-3464], 1
-  mov r15, QWORD PTR [rbp-3456]
-  mov r14, QWORD PTR [rbp-3464]
+  mov QWORD PTR [rbp-3472], rax
+  mov QWORD PTR [rbp-3480], 1
+  mov r15, QWORD PTR [rbp-3472]
+  mov r14, QWORD PTR [rbp-3480]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3472], rax
-  mov r15, QWORD PTR [rbp-3472]
+  mov QWORD PTR [rbp-3488], rax
+  mov r15, QWORD PTR [rbp-3488]
   test r15, r15
   jz .L60
   lea r15, [rbp-100]
-  mov QWORD PTR [rbp-3480], r15
-  mov QWORD PTR [rbp-3488], 1
-  mov r15, QWORD PTR [rbp-3480]
-  mov rax, QWORD PTR [rbp-3488]
+  mov QWORD PTR [rbp-3496], r15
+  mov QWORD PTR [rbp-3504], 1
+  mov r15, QWORD PTR [rbp-3496]
+  mov rax, QWORD PTR [rbp-3504]
   mov DWORD PTR [r15], eax
   jmp .L61
 .L60:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3504], r15
+  mov QWORD PTR [rbp-3520], r15
   lea r15, [rip+.LC93]
-  mov QWORD PTR [rbp-3512], r15
-  mov rdi, QWORD PTR [rbp-3504]
-  mov rsi, QWORD PTR [rbp-3512]
+  mov QWORD PTR [rbp-3528], r15
+  mov rdi, QWORD PTR [rbp-3520]
+  mov rsi, QWORD PTR [rbp-3528]
   call streq_lit
-  mov QWORD PTR [rbp-3520], rax
-  mov QWORD PTR [rbp-3528], 1
-  mov r15, QWORD PTR [rbp-3520]
-  mov r14, QWORD PTR [rbp-3528]
+  mov QWORD PTR [rbp-3536], rax
+  mov QWORD PTR [rbp-3544], 1
+  mov r15, QWORD PTR [rbp-3536]
+  mov r14, QWORD PTR [rbp-3544]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3536], rax
-  mov r15, QWORD PTR [rbp-3536]
+  mov QWORD PTR [rbp-3552], rax
+  mov r15, QWORD PTR [rbp-3552]
   test r15, r15
   jnz .L64
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3544], r15
+  mov QWORD PTR [rbp-3560], r15
   lea r15, [rip+.LC94]
-  mov QWORD PTR [rbp-3552], r15
-  mov rdi, QWORD PTR [rbp-3544]
-  mov rsi, QWORD PTR [rbp-3552]
+  mov QWORD PTR [rbp-3568], r15
+  mov rdi, QWORD PTR [rbp-3560]
+  mov rsi, QWORD PTR [rbp-3568]
   call streq_lit
-  mov QWORD PTR [rbp-3560], rax
-  mov QWORD PTR [rbp-3568], 1
-  mov r15, QWORD PTR [rbp-3560]
-  mov r14, QWORD PTR [rbp-3568]
+  mov QWORD PTR [rbp-3576], rax
+  mov QWORD PTR [rbp-3584], 1
+  mov r15, QWORD PTR [rbp-3576]
+  mov r14, QWORD PTR [rbp-3584]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3576], rax
-  mov r15, QWORD PTR [rbp-3576]
+  mov QWORD PTR [rbp-3592], rax
+  mov r15, QWORD PTR [rbp-3592]
   test r15, r15
   jnz .L64
-  mov QWORD PTR [rbp-3496], 0
+  mov QWORD PTR [rbp-3512], 0
   jmp .L65
 .L64:
-  mov QWORD PTR [rbp-3496], 1
+  mov QWORD PTR [rbp-3512], 1
 .L65:
-  mov r15, QWORD PTR [rbp-3496]
+  mov r15, QWORD PTR [rbp-3512]
   test r15, r15
   jz .L62
   call print_usage
-  mov QWORD PTR [rbp-3960], rax
-  mov QWORD PTR [rbp-3592], 0
-  mov rax, QWORD PTR [rbp-3592]
-  add rsp, 5544
+  mov QWORD PTR [rbp-3976], rax
+  mov QWORD PTR [rbp-3608], 0
+  mov rax, QWORD PTR [rbp-3608]
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -2162,169 +2173,169 @@ main:
   jmp .L63
 .L62:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3616], r15
-  mov QWORD PTR [rbp-3624], 0
-  mov r15, QWORD PTR [rbp-3616]
-  mov r14, QWORD PTR [rbp-3624]
-  add r15, r14
   mov QWORD PTR [rbp-3632], r15
+  mov QWORD PTR [rbp-3640], 0
   mov r15, QWORD PTR [rbp-3632]
+  mov r14, QWORD PTR [rbp-3640]
+  add r15, r14
+  mov QWORD PTR [rbp-3648], r15
+  mov r15, QWORD PTR [rbp-3648]
   movzx rax, BYTE PTR [r15]
-  mov QWORD PTR [rbp-3640], rax
-  mov QWORD PTR [rbp-3648], 45
-  mov r15, QWORD PTR [rbp-3640]
-  mov r14, QWORD PTR [rbp-3648]
+  mov QWORD PTR [rbp-3656], rax
+  mov QWORD PTR [rbp-3664], 45
+  mov r15, QWORD PTR [rbp-3656]
+  mov r14, QWORD PTR [rbp-3664]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3656], rax
-  mov r15, QWORD PTR [rbp-3656]
+  mov QWORD PTR [rbp-3672], rax
+  mov r15, QWORD PTR [rbp-3672]
   test r15, r15
   jz .L70
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3664], r15
-  mov QWORD PTR [rbp-3672], 1
-  mov r15, QWORD PTR [rbp-3664]
-  mov r14, QWORD PTR [rbp-3672]
-  add r15, r14
   mov QWORD PTR [rbp-3680], r15
+  mov QWORD PTR [rbp-3688], 1
   mov r15, QWORD PTR [rbp-3680]
+  mov r14, QWORD PTR [rbp-3688]
+  add r15, r14
+  mov QWORD PTR [rbp-3696], r15
+  mov r15, QWORD PTR [rbp-3696]
   movzx rax, BYTE PTR [r15]
-  mov QWORD PTR [rbp-3688], rax
-  mov QWORD PTR [rbp-3696], 108
-  mov r15, QWORD PTR [rbp-3688]
-  mov r14, QWORD PTR [rbp-3696]
+  mov QWORD PTR [rbp-3704], rax
+  mov QWORD PTR [rbp-3712], 108
+  mov r15, QWORD PTR [rbp-3704]
+  mov r14, QWORD PTR [rbp-3712]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3704], rax
-  mov r15, QWORD PTR [rbp-3704]
+  mov QWORD PTR [rbp-3720], rax
+  mov r15, QWORD PTR [rbp-3720]
   test r15, r15
   jz .L70
-  mov QWORD PTR [rbp-3608], 1
+  mov QWORD PTR [rbp-3624], 1
   jmp .L71
 .L70:
-  mov QWORD PTR [rbp-3608], 0
+  mov QWORD PTR [rbp-3624], 0
 .L71:
-  mov r15, QWORD PTR [rbp-3608]
+  mov r15, QWORD PTR [rbp-3624]
   test r15, r15
   jz .L68
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3712], r15
-  mov QWORD PTR [rbp-3720], 2
-  mov r15, QWORD PTR [rbp-3712]
-  mov r14, QWORD PTR [rbp-3720]
-  add r15, r14
   mov QWORD PTR [rbp-3728], r15
+  mov QWORD PTR [rbp-3736], 2
   mov r15, QWORD PTR [rbp-3728]
+  mov r14, QWORD PTR [rbp-3736]
+  add r15, r14
+  mov QWORD PTR [rbp-3744], r15
+  mov r15, QWORD PTR [rbp-3744]
   movzx rax, BYTE PTR [r15]
-  mov QWORD PTR [rbp-3736], rax
-  mov QWORD PTR [rbp-3744], 0
-  mov r15, QWORD PTR [rbp-3736]
-  mov r14, QWORD PTR [rbp-3744]
+  mov QWORD PTR [rbp-3752], rax
+  mov QWORD PTR [rbp-3760], 0
+  mov r15, QWORD PTR [rbp-3752]
+  mov r14, QWORD PTR [rbp-3760]
   xor rax, rax
   cmp r15, r14
   setne al
-  mov QWORD PTR [rbp-3752], rax
-  mov r15, QWORD PTR [rbp-3752]
+  mov QWORD PTR [rbp-3768], rax
+  mov r15, QWORD PTR [rbp-3768]
   test r15, r15
   jz .L68
-  mov QWORD PTR [rbp-3600], 1
+  mov QWORD PTR [rbp-3616], 1
   jmp .L69
 .L68:
-  mov QWORD PTR [rbp-3600], 0
+  mov QWORD PTR [rbp-3616], 0
 .L69:
-  mov r15, QWORD PTR [rbp-3600]
+  mov r15, QWORD PTR [rbp-3616]
   test r15, r15
   jz .L66
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3760], r15
-  mov r14, QWORD PTR [rbp-3760]
-  mov r15, r14
-  mov QWORD PTR [rbp-3768], r15
-  mov QWORD PTR [rbp-3776], 2
-  mov r15, QWORD PTR [rbp-3768]
+  mov QWORD PTR [rbp-3776], r15
   mov r14, QWORD PTR [rbp-3776]
-  add r15, r14
-  mov QWORD PTR [rbp-3784], r15
-  mov r14, QWORD PTR [rbp-3784]
   mov r15, r14
-  mov QWORD PTR [rbp-3792], r15
-  mov r15, QWORD PTR [rbp-3792]
+  mov QWORD PTR [rbp-3784], r15
+  mov QWORD PTR [rbp-3792], 2
+  mov r15, QWORD PTR [rbp-3784]
+  mov r14, QWORD PTR [rbp-3792]
+  add r15, r14
+  mov QWORD PTR [rbp-3800], r15
+  mov r14, QWORD PTR [rbp-3800]
+  mov r15, r14
+  mov QWORD PTR [rbp-3808], r15
+  mov r15, QWORD PTR [rbp-3808]
   mov QWORD PTR [rbp-2456], r15
   lea r15, [rbp-2420]
-  mov QWORD PTR [rbp-3800], r15
+  mov QWORD PTR [rbp-3816], r15
   movsxd r15, DWORD PTR [rbp-2424]
-  mov QWORD PTR [rbp-3808], r15
-  mov QWORD PTR [rbp-3816], 8
-  mov r15, QWORD PTR [rbp-3808]
-  mov r14, QWORD PTR [rbp-3816]
-  imul r15, r14
   mov QWORD PTR [rbp-3824], r15
-  mov r15, QWORD PTR [rbp-3800]
-  mov r14, QWORD PTR [rbp-3824]
-  add r15, r14
-  mov QWORD PTR [rbp-3832], r15
-  mov r15, QWORD PTR [rbp-2456]
+  mov QWORD PTR [rbp-3832], 8
+  mov r15, QWORD PTR [rbp-3824]
+  mov r14, QWORD PTR [rbp-3832]
+  imul r15, r14
   mov QWORD PTR [rbp-3840], r15
+  mov r15, QWORD PTR [rbp-3816]
   mov r14, QWORD PTR [rbp-3840]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-3848], r15
-  mov r15, QWORD PTR [rbp-3832]
-  mov rax, QWORD PTR [rbp-3848]
+  mov r15, QWORD PTR [rbp-2456]
+  mov QWORD PTR [rbp-3856], r15
+  mov r14, QWORD PTR [rbp-3856]
+  mov r15, r14
+  mov QWORD PTR [rbp-3864], r15
+  mov r15, QWORD PTR [rbp-3848]
+  mov rax, QWORD PTR [rbp-3864]
   mov QWORD PTR [r15], rax
   lea r15, [rbp-2424]
-  mov QWORD PTR [rbp-3856], r15
+  mov QWORD PTR [rbp-3872], r15
   movsxd r15, DWORD PTR [rbp-2424]
-  mov QWORD PTR [rbp-3864], r15
-  mov QWORD PTR [rbp-3872], 1
-  mov r15, QWORD PTR [rbp-3864]
-  mov r14, QWORD PTR [rbp-3872]
-  add r15, r14
   mov QWORD PTR [rbp-3880], r15
-  mov r15, QWORD PTR [rbp-3856]
-  mov rax, QWORD PTR [rbp-3880]
+  mov QWORD PTR [rbp-3888], 1
+  mov r15, QWORD PTR [rbp-3880]
+  mov r14, QWORD PTR [rbp-3888]
+  add r15, r14
+  mov QWORD PTR [rbp-3896], r15
+  mov r15, QWORD PTR [rbp-3872]
+  mov rax, QWORD PTR [rbp-3896]
   mov DWORD PTR [r15], eax
   jmp .L67
 .L66:
   mov r15, QWORD PTR [rbp-2440]
-  mov QWORD PTR [rbp-3888], r15
-  mov QWORD PTR [rbp-3896], 0
-  mov r15, QWORD PTR [rbp-3888]
-  mov r14, QWORD PTR [rbp-3896]
-  add r15, r14
   mov QWORD PTR [rbp-3904], r15
+  mov QWORD PTR [rbp-3912], 0
   mov r15, QWORD PTR [rbp-3904]
+  mov r14, QWORD PTR [rbp-3912]
+  add r15, r14
+  mov QWORD PTR [rbp-3920], r15
+  mov r15, QWORD PTR [rbp-3920]
   movzx rax, BYTE PTR [r15]
-  mov QWORD PTR [rbp-3912], rax
-  mov QWORD PTR [rbp-3920], 45
-  mov r15, QWORD PTR [rbp-3912]
-  mov r14, QWORD PTR [rbp-3920]
+  mov QWORD PTR [rbp-3928], rax
+  mov QWORD PTR [rbp-3936], 45
+  mov r15, QWORD PTR [rbp-3928]
+  mov r14, QWORD PTR [rbp-3936]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-3928], rax
-  mov r15, QWORD PTR [rbp-3928]
+  mov QWORD PTR [rbp-3944], rax
+  mov r15, QWORD PTR [rbp-3944]
   test r15, r15
   jz .L72
   lea r15, [rip+.LC95]
-  mov QWORD PTR [rbp-3936], r15
-  mov rdi, QWORD PTR [rbp-3936]
-  call print_str
-  mov r12, rax
-  mov r15, QWORD PTR [rbp-2440]
   mov QWORD PTR [rbp-3952], r15
   mov rdi, QWORD PTR [rbp-3952]
   call print_str
-  mov r13, rax
-  lea r15, [rip+.LC96]
+  mov r12, rax
+  mov r15, QWORD PTR [rbp-2440]
   mov QWORD PTR [rbp-3968], r15
   mov rdi, QWORD PTR [rbp-3968]
   call print_str
-  mov QWORD PTR [rbp-3976], rax
-  mov QWORD PTR [rbp-3984], 1
-  mov rax, QWORD PTR [rbp-3984]
-  add rsp, 5544
+  mov r13, rax
+  lea r15, [rip+.LC96]
+  mov QWORD PTR [rbp-3984], r15
+  mov rdi, QWORD PTR [rbp-3984]
+  call print_str
+  mov QWORD PTR [rbp-3992], rax
+  mov QWORD PTR [rbp-4000], 1
+  mov rax, QWORD PTR [rbp-4000]
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -2335,37 +2346,37 @@ main:
   jmp .L73
 .L72:
   lea r15, [rbp-2160]
-  mov QWORD PTR [rbp-3992], r15
+  mov QWORD PTR [rbp-4008], r15
   movsxd r15, DWORD PTR [rbp-2164]
-  mov QWORD PTR [rbp-4000], r15
-  mov QWORD PTR [rbp-4008], 8
-  mov r15, QWORD PTR [rbp-4000]
-  mov r14, QWORD PTR [rbp-4008]
-  imul r15, r14
   mov QWORD PTR [rbp-4016], r15
-  mov r15, QWORD PTR [rbp-3992]
-  mov r14, QWORD PTR [rbp-4016]
-  add r15, r14
-  mov QWORD PTR [rbp-4024], r15
-  mov r15, QWORD PTR [rbp-2440]
+  mov QWORD PTR [rbp-4024], 8
+  mov r15, QWORD PTR [rbp-4016]
+  mov r14, QWORD PTR [rbp-4024]
+  imul r15, r14
   mov QWORD PTR [rbp-4032], r15
+  mov r15, QWORD PTR [rbp-4008]
   mov r14, QWORD PTR [rbp-4032]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-4040], r15
-  mov r15, QWORD PTR [rbp-4024]
-  mov rax, QWORD PTR [rbp-4040]
+  mov r15, QWORD PTR [rbp-2440]
+  mov QWORD PTR [rbp-4048], r15
+  mov r14, QWORD PTR [rbp-4048]
+  mov r15, r14
+  mov QWORD PTR [rbp-4056], r15
+  mov r15, QWORD PTR [rbp-4040]
+  mov rax, QWORD PTR [rbp-4056]
   mov QWORD PTR [r15], rax
   lea r15, [rbp-2164]
-  mov QWORD PTR [rbp-4048], r15
+  mov QWORD PTR [rbp-4064], r15
   movsxd r15, DWORD PTR [rbp-2164]
-  mov QWORD PTR [rbp-4056], r15
-  mov QWORD PTR [rbp-4064], 1
-  mov r15, QWORD PTR [rbp-4056]
-  mov r14, QWORD PTR [rbp-4064]
-  add r15, r14
   mov QWORD PTR [rbp-4072], r15
-  mov r15, QWORD PTR [rbp-4048]
-  mov rax, QWORD PTR [rbp-4072]
+  mov QWORD PTR [rbp-4080], 1
+  mov r15, QWORD PTR [rbp-4072]
+  mov r14, QWORD PTR [rbp-4080]
+  add r15, r14
+  mov QWORD PTR [rbp-4088], r15
+  mov r15, QWORD PTR [rbp-4064]
+  mov rax, QWORD PTR [rbp-4088]
   mov DWORD PTR [r15], eax
 .L73:
 .L67:
@@ -2378,15 +2389,15 @@ main:
 .L51:
 .L47:
   lea r15, [rbp-2432]
-  mov QWORD PTR [rbp-4080], r15
+  mov QWORD PTR [rbp-4096], r15
   mov r15, QWORD PTR [rbp-2432]
-  mov QWORD PTR [rbp-4088], r15
-  mov QWORD PTR [rbp-4096], 1
-  mov r15, QWORD PTR [rbp-4088]
-  mov r14, QWORD PTR [rbp-4096]
+  mov QWORD PTR [rbp-4104], r15
+  mov QWORD PTR [rbp-4112], 1
+  mov r15, QWORD PTR [rbp-4104]
+  mov r14, QWORD PTR [rbp-4112]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-4080]
+  mov r15, QWORD PTR [rbp-4096]
   mov QWORD PTR [r15], rbx
   jmp .L44
 .L45:
@@ -2407,7 +2418,7 @@ main:
   mov rbx, rax
   mov rbx, 1
   mov rax, rbx
-  add rsp, 5544
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -2424,99 +2435,99 @@ main:
   mov DWORD PTR [rbp-2468], ebx
 .L76:
   movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-4104], r15
+  mov QWORD PTR [rbp-4120], r15
   movsxd r15, DWORD PTR [rbp-2164]
-  mov QWORD PTR [rbp-4272], r15
-  mov r15, QWORD PTR [rbp-4104]
-  mov r14, QWORD PTR [rbp-4272]
+  mov QWORD PTR [rbp-4288], r15
+  mov r15, QWORD PTR [rbp-4120]
+  mov r14, QWORD PTR [rbp-4288]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-4312], rax
-  mov r15, QWORD PTR [rbp-4312]
+  mov QWORD PTR [rbp-4328], rax
+  mov r15, QWORD PTR [rbp-4328]
   test r15, r15
   jz .L77
   lea r15, [rbp-2160]
-  mov QWORD PTR [rbp-4112], r15
+  mov QWORD PTR [rbp-4128], r15
   movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-4120], r15
-  mov QWORD PTR [rbp-4128], 8
-  mov r15, QWORD PTR [rbp-4120]
-  mov r14, QWORD PTR [rbp-4128]
-  imul r15, r14
   mov QWORD PTR [rbp-4136], r15
-  mov r15, QWORD PTR [rbp-4112]
-  mov r14, QWORD PTR [rbp-4136]
-  add r15, r14
-  mov QWORD PTR [rbp-4144], r15
-  mov r15, QWORD PTR [rbp-4144]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4152], rax
+  mov QWORD PTR [rbp-4144], 8
+  mov r15, QWORD PTR [rbp-4136]
+  mov r14, QWORD PTR [rbp-4144]
+  imul r15, r14
+  mov QWORD PTR [rbp-4152], r15
+  mov r15, QWORD PTR [rbp-4128]
   mov r14, QWORD PTR [rbp-4152]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-4160], r15
   mov r15, QWORD PTR [rbp-4160]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-4168], rax
+  mov r14, QWORD PTR [rbp-4168]
+  mov r15, r14
+  mov QWORD PTR [rbp-4176], r15
+  mov r15, QWORD PTR [rbp-4176]
   mov QWORD PTR [rbp-2476], r15
   xor r10, r10
   mov r15, QWORD PTR [rbp-2476]
-  mov QWORD PTR [rbp-4168], r15
-  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_O_RDONLY]
   mov QWORD PTR [rbp-4184], r15
-  mov r15, QWORD PTR [rbp-4184]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4176], rax
-  mov QWORD PTR [rbp-4192], 0
-  mov rdi, QWORD PTR [rbp-4168]
-  mov rsi, QWORD PTR [rbp-4176]
-  mov rdx, QWORD PTR [rbp-4192]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_open
-  mov QWORD PTR [rbp-4200], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_O_RDONLY]
+  mov QWORD PTR [rbp-4200], r15
   mov r15, QWORD PTR [rbp-4200]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-4192], rax
+  mov QWORD PTR [rbp-4208], 0
+  mov rdi, QWORD PTR [rbp-4184]
+  mov rsi, QWORD PTR [rbp-4192]
+  mov rdx, QWORD PTR [rbp-4208]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_open
+  mov QWORD PTR [rbp-4216], rax
+  mov r15, QWORD PTR [rbp-4216]
   mov QWORD PTR [rbp-2484], r15
   mov r15, QWORD PTR [rbp-2484]
-  mov QWORD PTR [rbp-4208], r15
-  mov QWORD PTR [rbp-4216], 0
-  mov r15, QWORD PTR [rbp-4208]
-  mov r14, QWORD PTR [rbp-4216]
+  mov QWORD PTR [rbp-4224], r15
+  mov QWORD PTR [rbp-4232], 0
+  mov r15, QWORD PTR [rbp-4224]
+  mov r14, QWORD PTR [rbp-4232]
   xor rax, rax
   cmp r15, r14
   setge al
-  mov QWORD PTR [rbp-4224], rax
-  mov r15, QWORD PTR [rbp-4224]
+  mov QWORD PTR [rbp-4240], rax
+  mov r15, QWORD PTR [rbp-4240]
   test r15, r15
   jz .L78
   xor r10, r10
   mov r15, QWORD PTR [rbp-2484]
-  mov QWORD PTR [rbp-4232], r15
-  mov QWORD PTR [rbp-4240], 0
+  mov QWORD PTR [rbp-4248], r15
+  mov QWORD PTR [rbp-4256], 0
   lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_SEEK_END]
-  mov QWORD PTR [rbp-4256], r15
-  mov r15, QWORD PTR [rbp-4256]
+  mov QWORD PTR [rbp-4272], r15
+  mov r15, QWORD PTR [rbp-4272]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4248], rax
-  mov rdi, QWORD PTR [rbp-4232]
-  mov rsi, QWORD PTR [rbp-4240]
-  mov rdx, QWORD PTR [rbp-4248]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_lseek
   mov QWORD PTR [rbp-4264], rax
-  mov r15, QWORD PTR [rbp-4264]
+  mov rdi, QWORD PTR [rbp-4248]
+  mov rsi, QWORD PTR [rbp-4256]
+  mov rdx, QWORD PTR [rbp-4264]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_lseek
+  mov QWORD PTR [rbp-4280], rax
+  mov r15, QWORD PTR [rbp-4280]
   mov QWORD PTR [rbp-2492], r15
   lea r15, [rbp-2464]
-  mov QWORD PTR [rbp-4320], r15
+  mov QWORD PTR [rbp-4336], r15
   mov r15, QWORD PTR [rbp-2464]
-  mov QWORD PTR [rbp-4280], r15
-  mov r15, QWORD PTR [rbp-2492]
-  mov QWORD PTR [rbp-4288], r15
-  mov r15, QWORD PTR [rbp-4280]
-  mov r14, QWORD PTR [rbp-4288]
-  add r15, r14
   mov QWORD PTR [rbp-4296], r15
-  mov r15, QWORD PTR [rbp-4320]
-  mov rax, QWORD PTR [rbp-4296]
+  mov r15, QWORD PTR [rbp-2492]
+  mov QWORD PTR [rbp-4304], r15
+  mov r15, QWORD PTR [rbp-4296]
+  mov r14, QWORD PTR [rbp-4304]
+  add r15, r14
+  mov QWORD PTR [rbp-4312], r15
+  mov r15, QWORD PTR [rbp-4336]
+  mov rax, QWORD PTR [rbp-4312]
   mov QWORD PTR [r15], rax
   mov r15, QWORD PTR [rbp-2484]
-  mov QWORD PTR [rbp-4304], r15
-  mov rdi, QWORD PTR [rbp-4304]
+  mov QWORD PTR [rbp-4320], r15
+  mov rdi, QWORD PTR [rbp-4320]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_close
   mov r12, rax
   jmp .L79
@@ -2524,10 +2535,10 @@ main:
 .L79:
   lea r13, [rbp-2468]
   movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-4328], r15
-  mov QWORD PTR [rbp-4336], 1
-  mov r15, QWORD PTR [rbp-4328]
-  mov r14, QWORD PTR [rbp-4336]
+  mov QWORD PTR [rbp-4344], r15
+  mov QWORD PTR [rbp-4352], 1
+  mov r15, QWORD PTR [rbp-4344]
+  mov r14, QWORD PTR [rbp-4352]
   add r15, r14
   mov rbx, r15
   mov r15, r13
@@ -2560,9 +2571,9 @@ main:
   jz .L80
   lea rbx, [rbp-2500]
   mov r12, QWORD PTR [rbp-2500]
-  mov QWORD PTR [rbp-4344], 524288
+  mov QWORD PTR [rbp-4360], 524288
   mov r15, r12
-  mov r14, QWORD PTR [rbp-4344]
+  mov r14, QWORD PTR [rbp-4360]
   add r15, r14
   mov r13, r15
   mov r15, rbx
@@ -2632,25 +2643,25 @@ main:
 .L84:
 .L85:
   xor r10, r10
-  lea rbx, [rbp-5296]
+  lea rbx, [rbp-5312]
   mov r12, QWORD PTR [rbp-96]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_linker_init
   mov r12, rax
-  lea r12, [rbp-2732]
+  lea r12, [rbp-2748]
   push rcx
   push rsi
   push rdi
   mov rdi, r12
   mov rsi, rbx
-  mov rcx, 232
+  mov rcx, 248
   cld
   rep movsb
   pop rdi
   pop rsi
   pop rcx
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 116
   mov r15, rbx
   mov r14, r12
@@ -2659,7 +2670,7 @@ main:
   mov rbx, QWORD PTR [rbp-88]
   mov r15, r13
   mov QWORD PTR [r15], rbx
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 132
   mov r15, rbx
   mov r14, r12
@@ -2669,7 +2680,7 @@ main:
   mov r15, r13
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 136
   mov r15, rbx
   mov r14, r12
@@ -2679,7 +2690,7 @@ main:
   mov r15, r13
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 140
   mov r15, rbx
   mov r14, r12
@@ -2689,7 +2700,7 @@ main:
   mov r15, r13
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 144
   mov r15, rbx
   mov r14, r12
@@ -2710,7 +2721,7 @@ main:
   mov r15, r13
   test r15, r15
   jz .L86
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 148
   mov r15, rbx
   mov r14, r12
@@ -2719,9 +2730,9 @@ main:
   mov r10, r13
   movsxd rbx, DWORD PTR [rbp-2424]
   mov r12, rbx
-  mov QWORD PTR [rbp-4352], 8
+  mov QWORD PTR [rbp-4368], 8
   mov r15, r12
-  mov r14, QWORD PTR [rbp-4352]
+  mov r14, QWORD PTR [rbp-4368]
   imul r15, r14
   mov rbx, r15
   mov rdi, rbx
@@ -2729,7 +2740,7 @@ main:
   mov rbx, rax
   mov r15, r13
   mov QWORD PTR [r15], rbx
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 148
   mov r15, rbx
   mov r14, r12
@@ -2738,74 +2749,74 @@ main:
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-2740], r12
+  mov QWORD PTR [rbp-2756], r12
   mov rbx, 0
-  mov DWORD PTR [rbp-2744], ebx
+  mov DWORD PTR [rbp-2760], ebx
 .L88:
-  movsxd r15, DWORD PTR [rbp-2744]
-  mov QWORD PTR [rbp-4360], r15
+  movsxd r15, DWORD PTR [rbp-2760]
+  mov QWORD PTR [rbp-4376], r15
   movsxd r15, DWORD PTR [rbp-2424]
-  mov QWORD PTR [rbp-4456], r15
-  mov r15, QWORD PTR [rbp-4360]
-  mov r14, QWORD PTR [rbp-4456]
+  mov QWORD PTR [rbp-4472], r15
+  mov r15, QWORD PTR [rbp-4376]
+  mov r14, QWORD PTR [rbp-4472]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-4488], rax
-  mov r15, QWORD PTR [rbp-4488]
+  mov QWORD PTR [rbp-4504], rax
+  mov r15, QWORD PTR [rbp-4504]
   test r15, r15
   jz .L89
   lea r15, [rbp-2420]
-  mov QWORD PTR [rbp-4368], r15
-  movsxd r15, DWORD PTR [rbp-2744]
-  mov QWORD PTR [rbp-4376], r15
-  mov QWORD PTR [rbp-4384], 8
-  mov r15, QWORD PTR [rbp-4376]
-  mov r14, QWORD PTR [rbp-4384]
-  imul r15, r14
+  mov QWORD PTR [rbp-4384], r15
+  movsxd r15, DWORD PTR [rbp-2760]
   mov QWORD PTR [rbp-4392], r15
-  mov r15, QWORD PTR [rbp-4368]
-  mov r14, QWORD PTR [rbp-4392]
-  add r15, r14
-  mov QWORD PTR [rbp-4400], r15
-  mov r15, QWORD PTR [rbp-4400]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4408], rax
+  mov QWORD PTR [rbp-4400], 8
+  mov r15, QWORD PTR [rbp-4392]
+  mov r14, QWORD PTR [rbp-4400]
+  imul r15, r14
+  mov QWORD PTR [rbp-4408], r15
+  mov r15, QWORD PTR [rbp-4384]
   mov r14, QWORD PTR [rbp-4408]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-4416], r15
   mov r15, QWORD PTR [rbp-4416]
-  mov QWORD PTR [rbp-2752], r15
-  mov r15, QWORD PTR [rbp-2740]
-  mov QWORD PTR [rbp-4424], r15
-  movsxd r15, DWORD PTR [rbp-2744]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-4424], rax
+  mov r14, QWORD PTR [rbp-4424]
+  mov r15, r14
   mov QWORD PTR [rbp-4432], r15
-  mov QWORD PTR [rbp-4440], 8
   mov r15, QWORD PTR [rbp-4432]
-  mov r14, QWORD PTR [rbp-4440]
-  imul r15, r14
+  mov QWORD PTR [rbp-2768], r15
+  mov r15, QWORD PTR [rbp-2756]
+  mov QWORD PTR [rbp-4440], r15
+  movsxd r15, DWORD PTR [rbp-2760]
   mov QWORD PTR [rbp-4448], r15
-  mov r15, QWORD PTR [rbp-4424]
-  mov r14, QWORD PTR [rbp-4448]
+  mov QWORD PTR [rbp-4456], 8
+  mov r15, QWORD PTR [rbp-4448]
+  mov r14, QWORD PTR [rbp-4456]
+  imul r15, r14
+  mov QWORD PTR [rbp-4464], r15
+  mov r15, QWORD PTR [rbp-4440]
+  mov r14, QWORD PTR [rbp-4464]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-2752]
-  mov QWORD PTR [rbp-4464], r15
-  mov rdi, QWORD PTR [rbp-4464]
-  call lib_to_soname
-  mov QWORD PTR [rbp-4472], rax
-  mov r14, QWORD PTR [rbp-4472]
-  mov r15, r14
+  mov r15, QWORD PTR [rbp-2768]
   mov QWORD PTR [rbp-4480], r15
-  mov r15, rbx
-  mov rax, QWORD PTR [rbp-4480]
-  mov QWORD PTR [r15], rax
-  lea r12, [rbp-2744]
-  movsxd r15, DWORD PTR [rbp-2744]
+  mov rdi, QWORD PTR [rbp-4480]
+  call lib_to_soname
+  mov QWORD PTR [rbp-4488], rax
+  mov r14, QWORD PTR [rbp-4488]
+  mov r15, r14
   mov QWORD PTR [rbp-4496], r15
-  mov QWORD PTR [rbp-4504], 1
-  mov r15, QWORD PTR [rbp-4496]
-  mov r14, QWORD PTR [rbp-4504]
+  mov r15, rbx
+  mov rax, QWORD PTR [rbp-4496]
+  mov QWORD PTR [r15], rax
+  lea r12, [rbp-2760]
+  movsxd r15, DWORD PTR [rbp-2760]
+  mov QWORD PTR [rbp-4512], r15
+  mov QWORD PTR [rbp-4520], 1
+  mov r15, QWORD PTR [rbp-4512]
+  mov r14, QWORD PTR [rbp-4520]
   add r15, r14
   mov r13, r15
   mov r15, r12
@@ -2813,7 +2824,7 @@ main:
   mov DWORD PTR [r15], eax
   jmp .L88
 .L89:
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 156
   mov r15, rbx
   mov r14, r12
@@ -2826,7 +2837,7 @@ main:
   jmp .L87
 .L86:
 .L87:
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 104
   mov r15, rbx
   mov r14, r12
@@ -2835,9 +2846,9 @@ main:
   mov r10, r13
   movsxd rbx, DWORD PTR [rbp-2164]
   mov r12, rbx
-  mov QWORD PTR [rbp-4512], 8
+  mov QWORD PTR [rbp-4528], 8
   mov r15, r12
-  mov r14, QWORD PTR [rbp-4512]
+  mov r14, QWORD PTR [rbp-4528]
   imul r15, r14
   mov rbx, r15
   mov rdi, rbx
@@ -2845,7 +2856,7 @@ main:
   mov rbx, rax
   mov r15, r13
   mov QWORD PTR [r15], rbx
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 112
   mov r15, rbx
   mov r14, r12
@@ -2862,89 +2873,89 @@ main:
   mov DWORD PTR [r15], eax
 .L90:
   movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-4520], r15
+  mov QWORD PTR [rbp-4536], r15
   movsxd r15, DWORD PTR [rbp-2164]
-  mov QWORD PTR [rbp-4664], r15
-  mov r15, QWORD PTR [rbp-4520]
-  mov r14, QWORD PTR [rbp-4664]
+  mov QWORD PTR [rbp-4680], r15
+  mov r15, QWORD PTR [rbp-4536]
+  mov r14, QWORD PTR [rbp-4680]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-4680], rax
-  mov r15, QWORD PTR [rbp-4680]
+  mov QWORD PTR [rbp-4696], rax
+  mov r15, QWORD PTR [rbp-4696]
   test r15, r15
   jz .L91
   lea r15, [rbp-2160]
-  mov QWORD PTR [rbp-4528], r15
+  mov QWORD PTR [rbp-4544], r15
   movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-4536], r15
-  mov QWORD PTR [rbp-4544], 8
-  mov r15, QWORD PTR [rbp-4536]
-  mov r14, QWORD PTR [rbp-4544]
-  imul r15, r14
   mov QWORD PTR [rbp-4552], r15
-  mov r15, QWORD PTR [rbp-4528]
-  mov r14, QWORD PTR [rbp-4552]
-  add r15, r14
-  mov QWORD PTR [rbp-4560], r15
-  mov r15, QWORD PTR [rbp-4560]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4568], rax
+  mov QWORD PTR [rbp-4560], 8
+  mov r15, QWORD PTR [rbp-4552]
+  mov r14, QWORD PTR [rbp-4560]
+  imul r15, r14
+  mov QWORD PTR [rbp-4568], r15
+  mov r15, QWORD PTR [rbp-4544]
   mov r14, QWORD PTR [rbp-4568]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-4576], r15
   mov r15, QWORD PTR [rbp-4576]
-  mov QWORD PTR [rbp-2760], r15
-  mov QWORD PTR [rbp-4584], 160
-  mov rdi, QWORD PTR [rbp-4584]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_mem_cst_galloc
-  mov QWORD PTR [rbp-4592], rax
-  mov r14, QWORD PTR [rbp-4592]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-4584], rax
+  mov r14, QWORD PTR [rbp-4584]
   mov r15, r14
-  mov QWORD PTR [rbp-4600], r15
-  mov r15, QWORD PTR [rbp-4600]
-  mov QWORD PTR [rbp-2768], r15
-  xor r10, r10
-  mov r15, QWORD PTR [rbp-2760]
-  mov QWORD PTR [rbp-4608], r15
-  mov r15, QWORD PTR [rbp-2768]
+  mov QWORD PTR [rbp-4592], r15
+  mov r15, QWORD PTR [rbp-4592]
+  mov QWORD PTR [rbp-2776], r15
+  mov QWORD PTR [rbp-4600], 160
+  mov rdi, QWORD PTR [rbp-4600]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_mem_cst_galloc
+  mov QWORD PTR [rbp-4608], rax
+  mov r14, QWORD PTR [rbp-4608]
+  mov r15, r14
   mov QWORD PTR [rbp-4616], r15
-  mov rdi, QWORD PTR [rbp-4608]
-  mov rsi, QWORD PTR [rbp-4616]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_obj
-  mov QWORD PTR [rbp-4624], rax
-  mov r15, QWORD PTR [rbp-4624]
-  mov DWORD PTR [rbp-2772], r15d
-  movsxd r15, DWORD PTR [rbp-2772]
+  mov r15, QWORD PTR [rbp-4616]
+  mov QWORD PTR [rbp-2784], r15
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-2776]
+  mov QWORD PTR [rbp-4624], r15
+  mov r15, QWORD PTR [rbp-2784]
   mov QWORD PTR [rbp-4632], r15
-  mov QWORD PTR [rbp-4640], 0
-  mov r15, QWORD PTR [rbp-4632]
-  mov r14, QWORD PTR [rbp-4640]
+  mov rdi, QWORD PTR [rbp-4624]
+  mov rsi, QWORD PTR [rbp-4632]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_obj
+  mov QWORD PTR [rbp-4640], rax
+  mov r15, QWORD PTR [rbp-4640]
+  mov DWORD PTR [rbp-2788], r15d
+  movsxd r15, DWORD PTR [rbp-2788]
+  mov QWORD PTR [rbp-4648], r15
+  mov QWORD PTR [rbp-4656], 0
+  mov r15, QWORD PTR [rbp-4648]
+  mov r14, QWORD PTR [rbp-4656]
   xor rax, rax
   cmp r15, r14
   setne al
-  mov QWORD PTR [rbp-4648], rax
-  mov r15, QWORD PTR [rbp-4648]
+  mov QWORD PTR [rbp-4664], rax
+  mov r15, QWORD PTR [rbp-4664]
   test r15, r15
   jz .L92
   lea r15, [rip+.LC102]
-  mov QWORD PTR [rbp-4656], r15
-  mov rdi, QWORD PTR [rbp-4656]
-  call print_str
-  mov QWORD PTR [rbp-4696], rax
-  mov r15, QWORD PTR [rbp-2760]
   mov QWORD PTR [rbp-4672], r15
   mov rdi, QWORD PTR [rbp-4672]
   call print_str
-  mov r12, rax
-  lea r15, [rip+.LC103]
+  mov QWORD PTR [rbp-4712], rax
+  mov r15, QWORD PTR [rbp-2776]
   mov QWORD PTR [rbp-4688], r15
   mov rdi, QWORD PTR [rbp-4688]
   call print_str
+  mov r12, rax
+  lea r15, [rip+.LC103]
+  mov QWORD PTR [rbp-4704], r15
+  mov rdi, QWORD PTR [rbp-4704]
+  call print_str
   mov r13, rax
-  mov QWORD PTR [rbp-4704], 1
-  mov rax, QWORD PTR [rbp-4704]
-  add rsp, 5544
+  mov QWORD PTR [rbp-4720], 1
+  mov rax, QWORD PTR [rbp-4720]
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -2955,216 +2966,216 @@ main:
   jmp .L93
 .L92:
 .L93:
-  lea r15, [rbp-2732]
-  mov QWORD PTR [rbp-4712], r15
-  mov QWORD PTR [rbp-4720], 104
-  mov r15, QWORD PTR [rbp-4712]
-  mov r14, QWORD PTR [rbp-4720]
-  add r15, r14
+  lea r15, [rbp-2748]
   mov QWORD PTR [rbp-4728], r15
+  mov QWORD PTR [rbp-4736], 104
   mov r15, QWORD PTR [rbp-4728]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4736], rax
   mov r14, QWORD PTR [rbp-4736]
-  mov r15, r14
+  add r15, r14
   mov QWORD PTR [rbp-4744], r15
   mov r15, QWORD PTR [rbp-4744]
-  mov QWORD PTR [rbp-2780], r15
-  mov r15, QWORD PTR [rbp-2780]
-  mov QWORD PTR [rbp-4752], r15
-  movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-4760], r15
-  mov QWORD PTR [rbp-4768], 8
-  mov r15, QWORD PTR [rbp-4760]
-  mov r14, QWORD PTR [rbp-4768]
-  imul r15, r14
-  mov QWORD PTR [rbp-4776], r15
-  mov r15, QWORD PTR [rbp-4752]
-  mov r14, QWORD PTR [rbp-4776]
-  add r15, r14
-  mov QWORD PTR [rbp-4784], r15
-  mov r15, QWORD PTR [rbp-2768]
-  mov QWORD PTR [rbp-4792], r15
-  mov r14, QWORD PTR [rbp-4792]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-4752], rax
+  mov r14, QWORD PTR [rbp-4752]
   mov r15, r14
+  mov QWORD PTR [rbp-4760], r15
+  mov r15, QWORD PTR [rbp-4760]
+  mov QWORD PTR [rbp-2796], r15
+  mov r15, QWORD PTR [rbp-2796]
+  mov QWORD PTR [rbp-4768], r15
+  movsxd r15, DWORD PTR [rbp-2468]
+  mov QWORD PTR [rbp-4776], r15
+  mov QWORD PTR [rbp-4784], 8
+  mov r15, QWORD PTR [rbp-4776]
+  mov r14, QWORD PTR [rbp-4784]
+  imul r15, r14
+  mov QWORD PTR [rbp-4792], r15
+  mov r15, QWORD PTR [rbp-4768]
+  mov r14, QWORD PTR [rbp-4792]
+  add r15, r14
   mov QWORD PTR [rbp-4800], r15
-  mov r15, QWORD PTR [rbp-4784]
-  mov rax, QWORD PTR [rbp-4800]
+  mov r15, QWORD PTR [rbp-2784]
+  mov QWORD PTR [rbp-4808], r15
+  mov r14, QWORD PTR [rbp-4808]
+  mov r15, r14
+  mov QWORD PTR [rbp-4816], r15
+  mov r15, QWORD PTR [rbp-4800]
+  mov rax, QWORD PTR [rbp-4816]
   mov QWORD PTR [r15], rax
   movsxd r15, DWORD PTR [rbp-100]
-  mov QWORD PTR [rbp-4808], r15
-  mov QWORD PTR [rbp-4816], 1
-  mov r15, QWORD PTR [rbp-4808]
-  mov r14, QWORD PTR [rbp-4816]
+  mov QWORD PTR [rbp-4824], r15
+  mov QWORD PTR [rbp-4832], 1
+  mov r15, QWORD PTR [rbp-4824]
+  mov r14, QWORD PTR [rbp-4832]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-4824], rax
-  mov r15, QWORD PTR [rbp-4824]
+  mov QWORD PTR [rbp-4840], rax
+  mov r15, QWORD PTR [rbp-4840]
   test r15, r15
   jz .L94
   lea r15, [rip+.LC104]
-  mov QWORD PTR [rbp-4832], r15
-  mov rdi, QWORD PTR [rbp-4832]
-  call print_str
-  mov QWORD PTR [rbp-4840], rax
-  mov r15, QWORD PTR [rbp-2760]
   mov QWORD PTR [rbp-4848], r15
   mov rdi, QWORD PTR [rbp-4848]
   call print_str
   mov QWORD PTR [rbp-4856], rax
-  lea r15, [rip+.LC105]
+  mov r15, QWORD PTR [rbp-2776]
   mov QWORD PTR [rbp-4864], r15
   mov rdi, QWORD PTR [rbp-4864]
   call print_str
   mov QWORD PTR [rbp-4872], rax
-  mov r15, QWORD PTR [rbp-2768]
+  lea r15, [rip+.LC105]
   mov QWORD PTR [rbp-4880], r15
-  mov QWORD PTR [rbp-4888], 24
-  mov r15, QWORD PTR [rbp-4880]
-  mov r14, QWORD PTR [rbp-4888]
-  add r15, r14
+  mov rdi, QWORD PTR [rbp-4880]
+  call print_str
+  mov QWORD PTR [rbp-4888], rax
+  mov r15, QWORD PTR [rbp-2784]
   mov QWORD PTR [rbp-4896], r15
-  mov QWORD PTR [rbp-4904], 8
+  mov QWORD PTR [rbp-4904], 24
   mov r15, QWORD PTR [rbp-4896]
   mov r14, QWORD PTR [rbp-4904]
   add r15, r14
   mov QWORD PTR [rbp-4912], r15
+  mov QWORD PTR [rbp-4920], 8
   mov r15, QWORD PTR [rbp-4912]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4920], rax
-  mov rdi, QWORD PTR [rbp-4920]
-  call print_int
-  mov QWORD PTR [rbp-4928], rax
-  lea r15, [rip+.LC106]
-  mov QWORD PTR [rbp-4936], r15
-  mov rdi, QWORD PTR [rbp-4936]
-  call print_str
-  mov QWORD PTR [rbp-4944], rax
-  mov r15, QWORD PTR [rbp-2768]
-  mov QWORD PTR [rbp-4952], r15
-  mov QWORD PTR [rbp-4960], 48
-  mov r15, QWORD PTR [rbp-4952]
-  mov r14, QWORD PTR [rbp-4960]
+  mov r14, QWORD PTR [rbp-4920]
   add r15, r14
+  mov QWORD PTR [rbp-4928], r15
+  mov r15, QWORD PTR [rbp-4928]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-4936], rax
+  mov rdi, QWORD PTR [rbp-4936]
+  call print_int
+  mov QWORD PTR [rbp-4944], rax
+  lea r15, [rip+.LC106]
+  mov QWORD PTR [rbp-4952], r15
+  mov rdi, QWORD PTR [rbp-4952]
+  call print_str
+  mov QWORD PTR [rbp-4960], rax
+  mov r15, QWORD PTR [rbp-2784]
   mov QWORD PTR [rbp-4968], r15
-  mov QWORD PTR [rbp-4976], 8
+  mov QWORD PTR [rbp-4976], 48
   mov r15, QWORD PTR [rbp-4968]
   mov r14, QWORD PTR [rbp-4976]
   add r15, r14
   mov QWORD PTR [rbp-4984], r15
+  mov QWORD PTR [rbp-4992], 8
   mov r15, QWORD PTR [rbp-4984]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-4992], rax
-  mov rdi, QWORD PTR [rbp-4992]
-  call print_int
-  mov QWORD PTR [rbp-5000], rax
-  lea r15, [rip+.LC107]
-  mov QWORD PTR [rbp-5008], r15
-  mov rdi, QWORD PTR [rbp-5008]
-  call print_str
-  mov QWORD PTR [rbp-5016], rax
-  mov r15, QWORD PTR [rbp-2768]
-  mov QWORD PTR [rbp-5024], r15
-  mov QWORD PTR [rbp-5032], 72
-  mov r15, QWORD PTR [rbp-5024]
-  mov r14, QWORD PTR [rbp-5032]
+  mov r14, QWORD PTR [rbp-4992]
   add r15, r14
+  mov QWORD PTR [rbp-5000], r15
+  mov r15, QWORD PTR [rbp-5000]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-5008], rax
+  mov rdi, QWORD PTR [rbp-5008]
+  call print_int
+  mov QWORD PTR [rbp-5016], rax
+  lea r15, [rip+.LC107]
+  mov QWORD PTR [rbp-5024], r15
+  mov rdi, QWORD PTR [rbp-5024]
+  call print_str
+  mov QWORD PTR [rbp-5032], rax
+  mov r15, QWORD PTR [rbp-2784]
   mov QWORD PTR [rbp-5040], r15
-  mov QWORD PTR [rbp-5048], 8
+  mov QWORD PTR [rbp-5048], 72
   mov r15, QWORD PTR [rbp-5040]
   mov r14, QWORD PTR [rbp-5048]
   add r15, r14
   mov QWORD PTR [rbp-5056], r15
+  mov QWORD PTR [rbp-5064], 8
   mov r15, QWORD PTR [rbp-5056]
+  mov r14, QWORD PTR [rbp-5064]
+  add r15, r14
+  mov QWORD PTR [rbp-5072], r15
+  mov r15, QWORD PTR [rbp-5072]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-5064], rax
-  mov rdi, QWORD PTR [rbp-5064]
-  call print_int
-  mov QWORD PTR [rbp-5072], rax
-  lea r15, [rip+.LC108]
-  mov QWORD PTR [rbp-5080], r15
+  mov QWORD PTR [rbp-5080], rax
   mov rdi, QWORD PTR [rbp-5080]
-  call print_str
+  call print_int
   mov QWORD PTR [rbp-5088], rax
-  mov r15, QWORD PTR [rbp-2768]
+  lea r15, [rip+.LC108]
   mov QWORD PTR [rbp-5096], r15
-  mov QWORD PTR [rbp-5104], 96
-  mov r15, QWORD PTR [rbp-5096]
-  mov r14, QWORD PTR [rbp-5104]
-  add r15, r14
-  mov QWORD PTR [rbp-5112], r15
-  mov r15, QWORD PTR [rbp-5112]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-5120], rax
-  mov rdi, QWORD PTR [rbp-5120]
-  call print_int
-  mov QWORD PTR [rbp-5128], rax
-  lea r15, [rip+.LC109]
-  mov QWORD PTR [rbp-5136], r15
-  mov rdi, QWORD PTR [rbp-5136]
+  mov rdi, QWORD PTR [rbp-5096]
   call print_str
-  mov QWORD PTR [rbp-5144], rax
-  mov r15, QWORD PTR [rbp-2768]
-  mov QWORD PTR [rbp-5152], r15
-  mov QWORD PTR [rbp-5160], 112
-  mov r15, QWORD PTR [rbp-5152]
-  mov r14, QWORD PTR [rbp-5160]
+  mov QWORD PTR [rbp-5104], rax
+  mov r15, QWORD PTR [rbp-2784]
+  mov QWORD PTR [rbp-5112], r15
+  mov QWORD PTR [rbp-5120], 96
+  mov r15, QWORD PTR [rbp-5112]
+  mov r14, QWORD PTR [rbp-5120]
   add r15, r14
-  mov QWORD PTR [rbp-5168], r15
-  mov r15, QWORD PTR [rbp-5168]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-5176], rax
-  mov r14, QWORD PTR [rbp-5176]
-  mov r15, r14
-  mov QWORD PTR [rbp-5184], r15
-  mov rdi, QWORD PTR [rbp-5184]
+  mov QWORD PTR [rbp-5128], r15
+  mov r15, QWORD PTR [rbp-5128]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-5136], rax
+  mov rdi, QWORD PTR [rbp-5136]
   call print_int
+  mov QWORD PTR [rbp-5144], rax
+  lea r15, [rip+.LC109]
+  mov QWORD PTR [rbp-5152], r15
+  mov rdi, QWORD PTR [rbp-5152]
+  call print_str
+  mov QWORD PTR [rbp-5160], rax
+  mov r15, QWORD PTR [rbp-2784]
+  mov QWORD PTR [rbp-5168], r15
+  mov QWORD PTR [rbp-5176], 112
+  mov r15, QWORD PTR [rbp-5168]
+  mov r14, QWORD PTR [rbp-5176]
+  add r15, r14
+  mov QWORD PTR [rbp-5184], r15
+  mov r15, QWORD PTR [rbp-5184]
+  movsxd rax, DWORD PTR [r15]
   mov QWORD PTR [rbp-5192], rax
-  lea r15, [rip+.LC110]
+  mov r14, QWORD PTR [rbp-5192]
+  mov r15, r14
   mov QWORD PTR [rbp-5200], r15
   mov rdi, QWORD PTR [rbp-5200]
-  call print_str
-  mov QWORD PTR [rbp-5208], rax
-  mov r15, QWORD PTR [rbp-2768]
-  mov QWORD PTR [rbp-5216], r15
-  mov QWORD PTR [rbp-5224], 124
-  mov r15, QWORD PTR [rbp-5216]
-  mov r14, QWORD PTR [rbp-5224]
-  add r15, r14
-  mov QWORD PTR [rbp-5232], r15
-  mov r15, QWORD PTR [rbp-5232]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-5240], rax
-  mov r14, QWORD PTR [rbp-5240]
-  mov r15, r14
-  mov QWORD PTR [rbp-5248], r15
-  mov rdi, QWORD PTR [rbp-5248]
   call print_int
+  mov QWORD PTR [rbp-5208], rax
+  lea r15, [rip+.LC110]
+  mov QWORD PTR [rbp-5216], r15
+  mov rdi, QWORD PTR [rbp-5216]
+  call print_str
+  mov QWORD PTR [rbp-5224], rax
+  mov r15, QWORD PTR [rbp-2784]
+  mov QWORD PTR [rbp-5232], r15
+  mov QWORD PTR [rbp-5240], 124
+  mov r15, QWORD PTR [rbp-5232]
+  mov r14, QWORD PTR [rbp-5240]
+  add r15, r14
+  mov QWORD PTR [rbp-5248], r15
+  mov r15, QWORD PTR [rbp-5248]
+  movsxd rax, DWORD PTR [r15]
   mov QWORD PTR [rbp-5256], rax
-  lea r15, [rip+.LC111]
+  mov r14, QWORD PTR [rbp-5256]
+  mov r15, r14
   mov QWORD PTR [rbp-5264], r15
   mov rdi, QWORD PTR [rbp-5264]
-  call print_str
+  call print_int
   mov QWORD PTR [rbp-5272], rax
+  lea r15, [rip+.LC111]
+  mov QWORD PTR [rbp-5280], r15
+  mov rdi, QWORD PTR [rbp-5280]
+  call print_str
+  mov QWORD PTR [rbp-5288], rax
   jmp .L95
 .L94:
 .L95:
   lea r15, [rbp-2468]
-  mov QWORD PTR [rbp-5280], r15
+  mov QWORD PTR [rbp-5296], r15
   movsxd r15, DWORD PTR [rbp-2468]
-  mov QWORD PTR [rbp-5288], r15
-  mov QWORD PTR [rbp-5296], 1
-  mov r15, QWORD PTR [rbp-5288]
-  mov r14, QWORD PTR [rbp-5296]
+  mov QWORD PTR [rbp-5304], r15
+  mov QWORD PTR [rbp-5312], 1
+  mov r15, QWORD PTR [rbp-5304]
+  mov r14, QWORD PTR [rbp-5312]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-5280]
+  mov r15, QWORD PTR [rbp-5296]
   mov rax, rbx
   mov DWORD PTR [r15], eax
   jmp .L90
 .L91:
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_merge_sections
   mov rbx, rax
@@ -3183,7 +3194,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 72
   mov r15, rbx
   mov r14, r12
@@ -3198,7 +3209,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 80
   mov r15, rbx
   mov r14, r12
@@ -3213,7 +3224,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 88
   mov r15, rbx
   mov r14, r12
@@ -3228,7 +3239,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 24
   mov r15, rbx
   mov r14, r12
@@ -3246,7 +3257,7 @@ main:
   jmp .L97
 .L96:
 .L97:
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_assign_addresses
   mov rbx, rax
@@ -3265,7 +3276,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 40
   mov r15, rbx
   mov r14, r12
@@ -3280,7 +3291,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 56
   mov r15, rbx
   mov r14, r12
@@ -3299,12 +3310,12 @@ main:
 .L98:
 .L99:
   xor r10, r10
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_symtab
   mov rbx, rax
-  mov DWORD PTR [rbp-2784], ebx
-  movsxd rbx, DWORD PTR [rbp-2784]
+  mov DWORD PTR [rbp-2800], ebx
+  movsxd rbx, DWORD PTR [rbp-2800]
   mov r12, 0
   mov r15, rbx
   mov r14, r12
@@ -3317,7 +3328,7 @@ main:
   jz .L100
   mov rbx, 1
   mov rax, rbx
-  add rsp, 5544
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -3344,12 +3355,12 @@ main:
   call print_str
   mov rbx, rax
   xor r10, r10
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_gsyms
   mov rbx, rax
-  mov QWORD PTR [rbp-2792], rbx
-  mov rbx, QWORD PTR [rbp-2792]
+  mov QWORD PTR [rbp-2808], rbx
+  mov rbx, QWORD PTR [rbp-2808]
   mov r12, 8
   mov r15, rbx
   mov r14, r12
@@ -3369,8 +3380,8 @@ main:
 .L102:
 .L103:
   mov rbx, 0
-  mov DWORD PTR [rbp-2796], ebx
-  lea rbx, [rbp-2732]
+  mov DWORD PTR [rbp-2812], ebx
+  lea rbx, [rbp-2748]
   mov r12, 156
   mov r15, rbx
   mov r14, r12
@@ -3403,7 +3414,7 @@ main:
   mov rdi, rbx
   call print_str
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, 156
   mov r15, rbx
   mov r14, r12
@@ -3422,17 +3433,17 @@ main:
   jmp .L107
 .L106:
 .L107:
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_collect_dynamic_syms
   mov rbx, rax
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_dynamic_bufs
   mov rbx, rax
-  lea rbx, [rbp-2796]
+  lea rbx, [rbp-2812]
   mov r10, rbx
-  lea r12, [rbp-2732]
+  lea r12, [rbp-2748]
   mov r13, QWORD PTR [rbp-80]
   mov rdi, r12
   mov rsi, r13
@@ -3443,13 +3454,13 @@ main:
   mov DWORD PTR [r15], eax
   jmp .L105
 .L104:
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_apply_relocations
   mov rbx, rax
-  lea rbx, [rbp-2796]
+  lea rbx, [rbp-2812]
   mov r10, rbx
-  lea r12, [rbp-2732]
+  lea r12, [rbp-2748]
   mov r13, QWORD PTR [rbp-80]
   mov rdi, r12
   mov rsi, r13
@@ -3459,7 +3470,7 @@ main:
   mov rax, r12
   mov DWORD PTR [r15], eax
 .L105:
-  movsxd rbx, DWORD PTR [rbp-2796]
+  movsxd rbx, DWORD PTR [rbp-2812]
   mov r12, 0
   mov r15, rbx
   mov r14, r12
@@ -3472,7 +3483,7 @@ main:
   jz .L108
   mov rbx, 1
   mov rax, rbx
-  add rsp, 5544
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -3494,7 +3505,7 @@ main:
   mov r15, r13
   test r15, r15
   jz .L110
-  lea rbx, [rbp-2732]
+  lea rbx, [rbp-2748]
   mov r12, QWORD PTR [rbp-80]
   mov rdi, rbx
   mov rsi, r12
@@ -3543,7 +3554,7 @@ main:
   mov rbx, rax
   mov rbx, 0
   mov rax, rbx
-  add rsp, 5544
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -3553,7 +3564,7 @@ main:
   ret
   mov rbx, 0
   mov rax, rbx
-  add rsp, 5544
+  add rsp, 5576
   pop r15
   pop r14
   pop r13
@@ -10465,17 +10476,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   push r13
   push r14
   push r15
-  sub rsp, 808
-  mov QWORD PTR [rbp-368], rdi
-  mov QWORD PTR [rbp-360], rsi
-  mov QWORD PTR [rbp-352], rdx
-  mov QWORD PTR [rbp-344], rcx
-  mov QWORD PTR [rbp-336], r8
-  mov QWORD PTR [rbp-328], r9
+  sub rsp, 856
+  mov QWORD PTR [rbp-384], rdi
+  mov QWORD PTR [rbp-376], rsi
+  mov QWORD PTR [rbp-368], rdx
+  mov QWORD PTR [rbp-360], rcx
+  mov QWORD PTR [rbp-352], r8
+  mov QWORD PTR [rbp-344], r9
   mov rbx, rdi
   mov r12, rsi
   mov QWORD PTR [rbp-56], r12
-  lea r12, [rbp-288]
+  lea r12, [rbp-304]
   mov r10, r12
   mov r13, 65536
   mov rdi, r13
@@ -10483,52 +10494,34 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r12
   mov QWORD PTR [r15], r13
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-376], 8
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-376]
-  add r15, r14
-  mov r13, r15
-  mov r10, r13
-  mov r12, 4096
-  mov rdi, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_bytebuf
-  mov r12, rax
-  mov r15, r13
-  mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-384], 16
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-384]
-  add r15, r14
-  mov r13, r15
-  mov r10, r13
-  mov r12, 4096
-  mov rdi, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_bytebuf
-  mov r12, rax
-  mov r15, r13
-  mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-392], 24
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-392], 8
   mov r15, r12
   mov r14, QWORD PTR [rbp-392]
   add r15, r14
   mov r13, r15
-  mov r12, 0
+  mov r10, r13
+  mov r12, 4096
+  mov rdi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_bytebuf
+  mov r12, rax
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-400], 32
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-400], 16
   mov r15, r12
   mov r14, QWORD PTR [rbp-400]
   add r15, r14
   mov r13, r15
-  mov r12, QWORD PTR [rbp-56]
+  mov r10, r13
+  mov r12, 4096
+  mov rdi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_bytebuf
+  mov r12, rax
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-408], 40
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-408], 24
   mov r15, r12
   mov r14, QWORD PTR [rbp-408]
   add r15, r14
@@ -10536,17 +10529,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, 0
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-416], 48
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-416], 32
   mov r15, r12
   mov r14, QWORD PTR [rbp-416]
   add r15, r14
   mov r13, r15
-  mov r12, 0
+  mov r12, QWORD PTR [rbp-56]
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-424], 56
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-424], 40
   mov r15, r12
   mov r14, QWORD PTR [rbp-424]
   add r15, r14
@@ -10554,8 +10547,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, 0
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-432], 64
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-432], 48
   mov r15, r12
   mov r14, QWORD PTR [rbp-432]
   add r15, r14
@@ -10563,8 +10556,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, 0
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-440], 72
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-440], 56
   mov r15, r12
   mov r14, QWORD PTR [rbp-440]
   add r15, r14
@@ -10572,8 +10565,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, 0
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-448], 80
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-448], 64
   mov r15, r12
   mov r14, QWORD PTR [rbp-448]
   add r15, r14
@@ -10581,10 +10574,28 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, 0
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-456], 88
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-456], 72
   mov r15, r12
   mov r14, QWORD PTR [rbp-456]
+  add r15, r14
+  mov r13, r15
+  mov r12, 0
+  mov r15, r13
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-464], 80
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-464]
+  add r15, r14
+  mov r13, r15
+  mov r12, 0
+  mov r15, r13
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-472], 88
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-472]
   add r15, r14
   mov r13, r15
   mov r12, 0
@@ -10595,16 +10606,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rdi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_mem_cst_galloc
   mov r12, rax
-  mov QWORD PTR [rbp-296], r12
-  mov r12, QWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-312], r12
+  mov r12, QWORD PTR [rbp-312]
   mov r13, r12
-  mov QWORD PTR [rbp-304], r13
+  mov QWORD PTR [rbp-320], r13
   xor r10, r10
-  lea r12, [rbp-776]
+  lea r12, [rbp-824]
   mov rdi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_gsym_init
   mov r13, rax
-  lea r13, [rbp-320]
+  lea r13, [rbp-336]
   push rcx
   push rsi
   push rdi
@@ -10616,119 +10627,99 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rdi
   pop rsi
   pop rcx
-  mov r12, QWORD PTR [rbp-304]
-  lea r15, [rbp-320]
-  mov QWORD PTR [rbp-464], r15
-  mov r15, QWORD PTR [rbp-464]
+  mov r12, QWORD PTR [rbp-320]
+  lea r15, [rbp-336]
+  mov QWORD PTR [rbp-480], r15
+  mov r15, QWORD PTR [rbp-480]
   mov r13, QWORD PTR [r15]
   mov r15, r12
   mov QWORD PTR [r15], r13
-  mov r12, QWORD PTR [rbp-304]
-  mov QWORD PTR [rbp-472], 8
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-472]
-  add r15, r14
-  mov r13, r15
-  lea r15, [rbp-320]
-  mov QWORD PTR [rbp-480], r15
+  mov r12, QWORD PTR [rbp-320]
   mov QWORD PTR [rbp-488], 8
-  mov r15, QWORD PTR [rbp-480]
+  mov r15, r12
   mov r14, QWORD PTR [rbp-488]
   add r15, r14
+  mov r13, r15
+  lea r15, [rbp-336]
   mov QWORD PTR [rbp-496], r15
+  mov QWORD PTR [rbp-504], 8
   mov r15, QWORD PTR [rbp-496]
-  movsxd r12, DWORD PTR [r15]
-  mov r15, r13
-  mov rax, r12
-  mov DWORD PTR [r15], eax
-  mov r12, QWORD PTR [rbp-304]
-  mov QWORD PTR [rbp-504], 12
-  mov r15, r12
   mov r14, QWORD PTR [rbp-504]
   add r15, r14
-  mov r13, r15
-  lea r15, [rbp-320]
   mov QWORD PTR [rbp-512], r15
-  mov QWORD PTR [rbp-520], 12
   mov r15, QWORD PTR [rbp-512]
-  mov r14, QWORD PTR [rbp-520]
-  add r15, r14
-  mov QWORD PTR [rbp-528], r15
-  mov r15, QWORD PTR [rbp-528]
   movsxd r12, DWORD PTR [r15]
   mov r15, r13
   mov rax, r12
   mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-536], 96
+  mov r12, QWORD PTR [rbp-320]
+  mov QWORD PTR [rbp-520], 12
   mov r15, r12
+  mov r14, QWORD PTR [rbp-520]
+  add r15, r14
+  mov r13, r15
+  lea r15, [rbp-336]
+  mov QWORD PTR [rbp-528], r15
+  mov QWORD PTR [rbp-536], 12
+  mov r15, QWORD PTR [rbp-528]
   mov r14, QWORD PTR [rbp-536]
   add r15, r14
-  mov r13, r15
-  mov r12, QWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-544], r15
+  mov r15, QWORD PTR [rbp-544]
+  movsxd r12, DWORD PTR [r15]
   mov r15, r13
-  mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-544], 104
+  mov rax, r12
+  mov DWORD PTR [r15], eax
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-552], 96
   mov r15, r12
-  mov r14, QWORD PTR [rbp-544]
+  mov r14, QWORD PTR [rbp-552]
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-552], 0
-  mov r14, QWORD PTR [rbp-552]
-  mov r12, r14
+  mov r12, QWORD PTR [rbp-312]
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-560], 112
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-560], 104
   mov r15, r12
   mov r14, QWORD PTR [rbp-560]
   add r15, r14
   mov r13, r15
-  mov r12, 0
-  mov r15, r13
-  mov rax, r12
-  mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-568], 116
-  mov r15, r12
+  mov QWORD PTR [rbp-568], 0
   mov r14, QWORD PTR [rbp-568]
-  add r15, r14
-  mov r13, r15
-  lea r12, [rip+.LC26]
+  mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-576], 124
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-576], 112
   mov r15, r12
   mov r14, QWORD PTR [rbp-576]
   add r15, r14
   mov r13, r15
   mov r12, 0
   mov r15, r13
-  mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-584], 132
+  mov rax, r12
+  mov DWORD PTR [r15], eax
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-584], 116
   mov r15, r12
   mov r14, QWORD PTR [rbp-584]
   add r15, r14
   mov r13, r15
-  mov r12, 0
+  lea r12, [rip+.LC26]
   mov r15, r13
-  mov rax, r12
-  mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-592], 136
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-592], 124
   mov r15, r12
   mov r14, QWORD PTR [rbp-592]
   add r15, r14
   mov r13, r15
   mov r12, 0
   mov r15, r13
-  mov rax, r12
-  mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-600], 140
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-600], 132
   mov r15, r12
   mov r14, QWORD PTR [rbp-600]
   add r15, r14
@@ -10737,8 +10728,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rax, r12
   mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-608], 144
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-608], 136
   mov r15, r12
   mov r14, QWORD PTR [rbp-608]
   add r15, r14
@@ -10747,40 +10738,49 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rax, r12
   mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-616], 148
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-616], 140
   mov r15, r12
   mov r14, QWORD PTR [rbp-616]
-  add r15, r14
-  mov r13, r15
-  mov QWORD PTR [rbp-624], 0
-  mov r14, QWORD PTR [rbp-624]
-  mov r12, r14
-  mov r15, r13
-  mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-632], 156
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-632]
   add r15, r14
   mov r13, r15
   mov r12, 0
   mov r15, r13
   mov rax, r12
   mov DWORD PTR [r15], eax
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-640], 160
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-624], 144
   mov r15, r12
-  mov r14, QWORD PTR [rbp-640]
+  mov r14, QWORD PTR [rbp-624]
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-648], 0
-  mov r14, QWORD PTR [rbp-648]
+  mov r12, 0
+  mov r15, r13
+  mov rax, r12
+  mov DWORD PTR [r15], eax
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-632], 148
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-632]
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-640], 0
+  mov r14, QWORD PTR [rbp-640]
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-656], 168
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-648], 156
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-648]
+  add r15, r14
+  mov r13, r15
+  mov r12, 0
+  mov r15, r13
+  mov rax, r12
+  mov DWORD PTR [r15], eax
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-656], 160
   mov r15, r12
   mov r14, QWORD PTR [rbp-656]
   add r15, r14
@@ -10790,8 +10790,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-672], 176
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-672], 168
   mov r15, r12
   mov r14, QWORD PTR [rbp-672]
   add r15, r14
@@ -10801,8 +10801,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-688], 184
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-688], 176
   mov r15, r12
   mov r14, QWORD PTR [rbp-688]
   add r15, r14
@@ -10812,8 +10812,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-704], 192
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-704], 184
   mov r15, r12
   mov r14, QWORD PTR [rbp-704]
   add r15, r14
@@ -10823,8 +10823,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-720], 200
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-720], 192
   mov r15, r12
   mov r14, QWORD PTR [rbp-720]
   add r15, r14
@@ -10834,8 +10834,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-736], 208
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-736], 200
   mov r15, r12
   mov r14, QWORD PTR [rbp-736]
   add r15, r14
@@ -10845,8 +10845,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-752], 216
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-752], 208
   mov r15, r12
   mov r14, QWORD PTR [rbp-752]
   add r15, r14
@@ -10856,8 +10856,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
-  mov QWORD PTR [rbp-768], 224
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-768], 216
   mov r15, r12
   mov r14, QWORD PTR [rbp-768]
   add r15, r14
@@ -10867,20 +10867,53 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, r14
   mov r15, r13
   mov QWORD PTR [r15], r12
-  lea r12, [rbp-288]
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-784], 224
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-784]
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-792], 0
+  mov r14, QWORD PTR [rbp-792]
+  mov r12, r14
+  mov r15, r13
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-800], 232
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-800]
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-808], 0
+  mov r14, QWORD PTR [rbp-808]
+  mov r12, r14
+  mov r15, r13
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
+  mov QWORD PTR [rbp-816], 240
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-816]
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-824], 0
+  mov r14, QWORD PTR [rbp-824]
+  mov r12, r14
+  mov r15, r13
+  mov QWORD PTR [r15], r12
+  lea r12, [rbp-304]
   push rcx
   push rsi
   push rdi
   mov rdi, rbx
   mov rsi, r12
-  mov rcx, 232
+  mov rcx, 248
   cld
   rep movsb
   pop rdi
   pop rsi
   pop rcx
   mov rax, rbx
-  add rsp, 808
+  add rsp, 856
   pop r15
   pop r14
   pop r13
@@ -10890,7 +10923,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   ret
   mov rbx, 0
   mov rax, rbx
-  add rsp, 808
+  add rsp, 856
   pop r15
   pop r14
   pop r13
@@ -13636,13 +13669,13 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   push r13
   push r14
   push r15
-  sub rsp, 1672
-  mov QWORD PTR [rbp-192], rdi
-  mov QWORD PTR [rbp-184], rsi
-  mov QWORD PTR [rbp-176], rdx
-  mov QWORD PTR [rbp-168], rcx
-  mov QWORD PTR [rbp-160], r8
-  mov QWORD PTR [rbp-152], r9
+  sub rsp, 2232
+  mov QWORD PTR [rbp-216], rdi
+  mov QWORD PTR [rbp-208], rsi
+  mov QWORD PTR [rbp-200], rdx
+  mov QWORD PTR [rbp-192], rcx
+  mov QWORD PTR [rbp-184], r8
+  mov QWORD PTR [rbp-176], r9
   mov rbx, rdi
   mov QWORD PTR [rbp-56], rbx
   xor r10, r10
@@ -13661,469 +13694,469 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov DWORD PTR [rbp-76], ebx
 .L378:
   movsxd r15, DWORD PTR [rbp-76]
-  mov QWORD PTR [rbp-200], r15
+  mov QWORD PTR [rbp-224], r15
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-512], r15
-  mov QWORD PTR [rbp-616], 112
-  mov r15, QWORD PTR [rbp-512]
-  mov r14, QWORD PTR [rbp-616]
+  mov QWORD PTR [rbp-536], r15
+  mov QWORD PTR [rbp-640], 112
+  mov r15, QWORD PTR [rbp-536]
+  mov r14, QWORD PTR [rbp-640]
   add r15, r14
-  mov QWORD PTR [rbp-208], r15
-  mov r15, QWORD PTR [rbp-208]
+  mov QWORD PTR [rbp-232], r15
+  mov r15, QWORD PTR [rbp-232]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-216], rax
-  mov r15, QWORD PTR [rbp-200]
-  mov r14, QWORD PTR [rbp-216]
+  mov QWORD PTR [rbp-240], rax
+  mov r15, QWORD PTR [rbp-224]
+  mov r14, QWORD PTR [rbp-240]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-224], rax
-  mov r15, QWORD PTR [rbp-224]
+  mov QWORD PTR [rbp-248], rax
+  mov r15, QWORD PTR [rbp-248]
   test r15, r15
   jz .L379
   xor r10, r10
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-232], r15
+  mov QWORD PTR [rbp-256], r15
   movsxd r15, DWORD PTR [rbp-76]
-  mov QWORD PTR [rbp-240], r15
-  mov rdi, QWORD PTR [rbp-232]
-  mov rsi, QWORD PTR [rbp-240]
+  mov QWORD PTR [rbp-264], r15
+  mov rdi, QWORD PTR [rbp-256]
+  mov rsi, QWORD PTR [rbp-264]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_obj
-  mov QWORD PTR [rbp-248], rax
-  mov r15, QWORD PTR [rbp-248]
+  mov QWORD PTR [rbp-272], rax
+  mov r15, QWORD PTR [rbp-272]
   mov QWORD PTR [rbp-84], r15
-  mov QWORD PTR [rbp-256], 0
-  mov r15, QWORD PTR [rbp-256]
+  mov QWORD PTR [rbp-280], 0
+  mov r15, QWORD PTR [rbp-280]
   mov DWORD PTR [rbp-88], r15d
 .L380:
   movsxd r15, DWORD PTR [rbp-88]
-  mov QWORD PTR [rbp-264], r15
-  mov r15, QWORD PTR [rbp-84]
-  mov QWORD PTR [rbp-272], r15
-  mov QWORD PTR [rbp-280], 124
-  mov r15, QWORD PTR [rbp-272]
-  mov r14, QWORD PTR [rbp-280]
-  add r15, r14
   mov QWORD PTR [rbp-288], r15
-  mov r15, QWORD PTR [rbp-288]
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-296], r15
+  mov QWORD PTR [rbp-304], 124
+  mov r15, QWORD PTR [rbp-296]
+  mov r14, QWORD PTR [rbp-304]
+  add r15, r14
+  mov QWORD PTR [rbp-312], r15
+  mov r15, QWORD PTR [rbp-312]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-296], rax
-  mov r15, QWORD PTR [rbp-264]
-  mov r14, QWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-320], rax
+  mov r15, QWORD PTR [rbp-288]
+  mov r14, QWORD PTR [rbp-320]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-304], rax
-  mov r15, QWORD PTR [rbp-304]
+  mov QWORD PTR [rbp-328], rax
+  mov r15, QWORD PTR [rbp-328]
   test r15, r15
   jz .L381
   xor r10, r10
   mov r15, QWORD PTR [rbp-84]
-  mov QWORD PTR [rbp-312], r15
+  mov QWORD PTR [rbp-336], r15
   movsxd r15, DWORD PTR [rbp-88]
-  mov QWORD PTR [rbp-320], r15
-  mov rdi, QWORD PTR [rbp-312]
-  mov rsi, QWORD PTR [rbp-320]
+  mov QWORD PTR [rbp-344], r15
+  mov rdi, QWORD PTR [rbp-336]
+  mov rsi, QWORD PTR [rbp-344]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_reloc_get
-  mov QWORD PTR [rbp-328], rax
-  mov r15, QWORD PTR [rbp-328]
+  mov QWORD PTR [rbp-352], rax
+  mov r15, QWORD PTR [rbp-352]
   mov QWORD PTR [rbp-96], r15
   xor r10, r10
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-336], r15
+  mov QWORD PTR [rbp-360], r15
   mov r15, QWORD PTR [rbp-84]
-  mov QWORD PTR [rbp-344], r15
-  mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-352], r15
-  mov QWORD PTR [rbp-360], 8
-  mov r15, QWORD PTR [rbp-352]
-  mov r14, QWORD PTR [rbp-360]
-  add r15, r14
   mov QWORD PTR [rbp-368], r15
-  mov r15, QWORD PTR [rbp-368]
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-376], r15
+  mov QWORD PTR [rbp-384], 8
+  mov r15, QWORD PTR [rbp-376]
+  mov r14, QWORD PTR [rbp-384]
+  add r15, r14
+  mov QWORD PTR [rbp-392], r15
+  mov r15, QWORD PTR [rbp-392]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-376], rax
-  mov rdi, QWORD PTR [rbp-336]
-  mov rsi, QWORD PTR [rbp-344]
-  mov rdx, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-400], rax
+  mov rdi, QWORD PTR [rbp-360]
+  mov rsi, QWORD PTR [rbp-368]
+  mov rdx, QWORD PTR [rbp-400]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_resolve_reloc_sym
-  mov QWORD PTR [rbp-384], rax
-  mov r15, QWORD PTR [rbp-384]
+  mov QWORD PTR [rbp-408], rax
+  mov r15, QWORD PTR [rbp-408]
   mov QWORD PTR [rbp-104], r15
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-392], r15
-  mov QWORD PTR [rbp-400], 20
-  mov r15, QWORD PTR [rbp-392]
-  mov r14, QWORD PTR [rbp-400]
-  add r15, r14
-  mov QWORD PTR [rbp-408], r15
-  mov r15, QWORD PTR [rbp-408]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-416], rax
+  mov QWORD PTR [rbp-416], r15
+  mov QWORD PTR [rbp-424], 20
   mov r15, QWORD PTR [rbp-416]
-  mov QWORD PTR [rbp-112], r15
-  mov QWORD PTR [rbp-424], 0
-  mov r15, QWORD PTR [rbp-424]
-  mov QWORD PTR [rbp-120], r15
-  mov QWORD PTR [rbp-432], 0
-  mov r14, QWORD PTR [rbp-432]
-  mov r15, r14
-  mov QWORD PTR [rbp-440], r15
+  mov r14, QWORD PTR [rbp-424]
+  add r15, r14
+  mov QWORD PTR [rbp-432], r15
+  mov r15, QWORD PTR [rbp-432]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-440], rax
   mov r15, QWORD PTR [rbp-440]
-  mov QWORD PTR [rbp-128], r15
+  mov QWORD PTR [rbp-112], r15
   mov QWORD PTR [rbp-448], 0
   mov r15, QWORD PTR [rbp-448]
+  mov QWORD PTR [rbp-120], r15
+  mov QWORD PTR [rbp-456], 0
+  mov r14, QWORD PTR [rbp-456]
+  mov r15, r14
+  mov QWORD PTR [rbp-464], r15
+  mov r15, QWORD PTR [rbp-464]
+  mov QWORD PTR [rbp-128], r15
+  mov QWORD PTR [rbp-472], 0
+  mov r15, QWORD PTR [rbp-472]
   mov QWORD PTR [rbp-136], r15
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-456], r15
-  mov QWORD PTR [rbp-464], 28
-  mov r15, QWORD PTR [rbp-456]
-  mov r14, QWORD PTR [rbp-464]
+  mov QWORD PTR [rbp-480], r15
+  mov QWORD PTR [rbp-488], 28
+  mov r15, QWORD PTR [rbp-480]
+  mov r14, QWORD PTR [rbp-488]
   add r15, r14
-  mov QWORD PTR [rbp-472], r15
-  mov r15, QWORD PTR [rbp-472]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-480], rax
-  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_SECIDX_TEXT]
   mov QWORD PTR [rbp-496], r15
   mov r15, QWORD PTR [rbp-496]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-488], rax
-  mov r15, QWORD PTR [rbp-480]
-  mov r14, QWORD PTR [rbp-488]
+  mov QWORD PTR [rbp-504], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_SECIDX_TEXT]
+  mov QWORD PTR [rbp-520], r15
+  mov r15, QWORD PTR [rbp-520]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-512], rax
+  mov r15, QWORD PTR [rbp-504]
+  mov r14, QWORD PTR [rbp-512]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-504], rax
-  mov r15, QWORD PTR [rbp-504]
+  mov QWORD PTR [rbp-528], rax
+  mov r15, QWORD PTR [rbp-528]
   test r15, r15
   jz .L382
   lea r15, [rbp-120]
-  mov QWORD PTR [rbp-640], r15
+  mov QWORD PTR [rbp-664], r15
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-520], r15
-  mov QWORD PTR [rbp-528], 40
-  mov r15, QWORD PTR [rbp-520]
-  mov r14, QWORD PTR [rbp-528]
-  add r15, r14
-  mov QWORD PTR [rbp-536], r15
-  mov r15, QWORD PTR [rbp-536]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-544], rax
-  mov r15, QWORD PTR [rbp-84]
-  mov QWORD PTR [rbp-552], r15
-  mov QWORD PTR [rbp-560], 128
-  mov r15, QWORD PTR [rbp-552]
-  mov r14, QWORD PTR [rbp-560]
-  add r15, r14
-  mov QWORD PTR [rbp-568], r15
-  mov r15, QWORD PTR [rbp-568]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-576], rax
+  mov QWORD PTR [rbp-544], r15
+  mov QWORD PTR [rbp-552], 40
   mov r15, QWORD PTR [rbp-544]
-  mov r14, QWORD PTR [rbp-576]
+  mov r14, QWORD PTR [rbp-552]
   add r15, r14
-  mov QWORD PTR [rbp-584], r15
-  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-560], r15
+  mov r15, QWORD PTR [rbp-560]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-568], rax
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-576], r15
+  mov QWORD PTR [rbp-584], 128
+  mov r15, QWORD PTR [rbp-576]
+  mov r14, QWORD PTR [rbp-584]
+  add r15, r14
   mov QWORD PTR [rbp-592], r15
   mov r15, QWORD PTR [rbp-592]
   mov rax, QWORD PTR [r15]
   mov QWORD PTR [rbp-600], rax
-  mov r15, QWORD PTR [rbp-584]
+  mov r15, QWORD PTR [rbp-568]
   mov r14, QWORD PTR [rbp-600]
   add r15, r14
   mov QWORD PTR [rbp-608], r15
-  mov r15, QWORD PTR [rbp-640]
-  mov rax, QWORD PTR [rbp-608]
-  mov QWORD PTR [r15], rax
-  lea r15, [rbp-128]
-  mov QWORD PTR [rbp-1256], r15
-  mov r15, QWORD PTR [rbp-64]
-  mov QWORD PTR [rbp-624], r15
-  mov r15, QWORD PTR [rbp-624]
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-616], r15
+  mov r15, QWORD PTR [rbp-616]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-632], rax
-  mov r15, QWORD PTR [rbp-1256]
+  mov QWORD PTR [rbp-624], rax
+  mov r15, QWORD PTR [rbp-608]
+  mov r14, QWORD PTR [rbp-624]
+  add r15, r14
+  mov QWORD PTR [rbp-632], r15
+  mov r15, QWORD PTR [rbp-664]
   mov rax, QWORD PTR [rbp-632]
   mov QWORD PTR [r15], rax
-  lea r15, [rbp-136]
-  mov QWORD PTR [rbp-1272], r15
-  mov r15, QWORD PTR [rbp-84]
+  lea r15, [rbp-128]
+  mov QWORD PTR [rbp-1280], r15
+  mov r15, QWORD PTR [rbp-64]
   mov QWORD PTR [rbp-648], r15
-  mov QWORD PTR [rbp-656], 128
   mov r15, QWORD PTR [rbp-648]
-  mov r14, QWORD PTR [rbp-656]
-  add r15, r14
-  mov QWORD PTR [rbp-664], r15
-  mov r15, QWORD PTR [rbp-664]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-672], rax
-  mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-680], r15
-  mov r15, QWORD PTR [rbp-680]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-688], rax
+  mov QWORD PTR [rbp-656], rax
+  mov r15, QWORD PTR [rbp-1280]
+  mov rax, QWORD PTR [rbp-656]
+  mov QWORD PTR [r15], rax
+  lea r15, [rbp-136]
+  mov QWORD PTR [rbp-1296], r15
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-672], r15
+  mov QWORD PTR [rbp-680], 128
   mov r15, QWORD PTR [rbp-672]
-  mov r14, QWORD PTR [rbp-688]
+  mov r14, QWORD PTR [rbp-680]
   add r15, r14
-  mov QWORD PTR [rbp-696], r15
-  mov r15, QWORD PTR [rbp-1272]
-  mov rax, QWORD PTR [rbp-696]
+  mov QWORD PTR [rbp-688], r15
+  mov r15, QWORD PTR [rbp-688]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-696], rax
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-704], r15
+  mov r15, QWORD PTR [rbp-704]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-712], rax
+  mov r15, QWORD PTR [rbp-696]
+  mov r14, QWORD PTR [rbp-712]
+  add r15, r14
+  mov QWORD PTR [rbp-720], r15
+  mov r15, QWORD PTR [rbp-1296]
+  mov rax, QWORD PTR [rbp-720]
   mov QWORD PTR [r15], rax
   jmp .L383
 .L382:
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-704], r15
-  mov QWORD PTR [rbp-712], 28
-  mov r15, QWORD PTR [rbp-704]
-  mov r14, QWORD PTR [rbp-712]
+  mov QWORD PTR [rbp-728], r15
+  mov QWORD PTR [rbp-736], 28
+  mov r15, QWORD PTR [rbp-728]
+  mov r14, QWORD PTR [rbp-736]
   add r15, r14
-  mov QWORD PTR [rbp-720], r15
-  mov r15, QWORD PTR [rbp-720]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-728], rax
-  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_SECIDX_DATA]
   mov QWORD PTR [rbp-744], r15
   mov r15, QWORD PTR [rbp-744]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-736], rax
-  mov r15, QWORD PTR [rbp-728]
-  mov r14, QWORD PTR [rbp-736]
+  mov QWORD PTR [rbp-752], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_SECIDX_DATA]
+  mov QWORD PTR [rbp-768], r15
+  mov r15, QWORD PTR [rbp-768]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-760], rax
+  mov r15, QWORD PTR [rbp-752]
+  mov r14, QWORD PTR [rbp-760]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-752], rax
-  mov r15, QWORD PTR [rbp-752]
+  mov QWORD PTR [rbp-776], rax
+  mov r15, QWORD PTR [rbp-776]
   test r15, r15
   jz .L384
   lea r15, [rbp-120]
-  mov QWORD PTR [rbp-760], r15
-  mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-768], r15
-  mov QWORD PTR [rbp-776], 56
-  mov r15, QWORD PTR [rbp-768]
-  mov r14, QWORD PTR [rbp-776]
-  add r15, r14
   mov QWORD PTR [rbp-784], r15
-  mov r15, QWORD PTR [rbp-784]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-792], rax
-  mov r15, QWORD PTR [rbp-84]
-  mov QWORD PTR [rbp-800], r15
-  mov QWORD PTR [rbp-808], 136
-  mov r15, QWORD PTR [rbp-800]
-  mov r14, QWORD PTR [rbp-808]
-  add r15, r14
-  mov QWORD PTR [rbp-816], r15
-  mov r15, QWORD PTR [rbp-816]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-824], rax
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-792], r15
+  mov QWORD PTR [rbp-800], 56
   mov r15, QWORD PTR [rbp-792]
-  mov r14, QWORD PTR [rbp-824]
+  mov r14, QWORD PTR [rbp-800]
   add r15, r14
-  mov QWORD PTR [rbp-832], r15
-  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-808], r15
+  mov r15, QWORD PTR [rbp-808]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-816], rax
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-824], r15
+  mov QWORD PTR [rbp-832], 136
+  mov r15, QWORD PTR [rbp-824]
+  mov r14, QWORD PTR [rbp-832]
+  add r15, r14
   mov QWORD PTR [rbp-840], r15
   mov r15, QWORD PTR [rbp-840]
   mov rax, QWORD PTR [r15]
   mov QWORD PTR [rbp-848], rax
-  mov r15, QWORD PTR [rbp-832]
+  mov r15, QWORD PTR [rbp-816]
   mov r14, QWORD PTR [rbp-848]
   add r15, r14
   mov QWORD PTR [rbp-856], r15
-  mov r15, QWORD PTR [rbp-760]
-  mov rax, QWORD PTR [rbp-856]
-  mov QWORD PTR [r15], rax
-  lea r15, [rbp-128]
+  mov r15, QWORD PTR [rbp-96]
   mov QWORD PTR [rbp-864], r15
-  mov r15, QWORD PTR [rbp-72]
-  mov QWORD PTR [rbp-872], r15
-  mov r15, QWORD PTR [rbp-872]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-880], rax
   mov r15, QWORD PTR [rbp-864]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-872], rax
+  mov r15, QWORD PTR [rbp-856]
+  mov r14, QWORD PTR [rbp-872]
+  add r15, r14
+  mov QWORD PTR [rbp-880], r15
+  mov r15, QWORD PTR [rbp-784]
   mov rax, QWORD PTR [rbp-880]
   mov QWORD PTR [r15], rax
-  lea r15, [rbp-136]
+  lea r15, [rbp-128]
   mov QWORD PTR [rbp-888], r15
-  mov r15, QWORD PTR [rbp-84]
+  mov r15, QWORD PTR [rbp-72]
   mov QWORD PTR [rbp-896], r15
-  mov QWORD PTR [rbp-904], 136
   mov r15, QWORD PTR [rbp-896]
-  mov r14, QWORD PTR [rbp-904]
-  add r15, r14
-  mov QWORD PTR [rbp-912], r15
-  mov r15, QWORD PTR [rbp-912]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-920], rax
-  mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-928], r15
-  mov r15, QWORD PTR [rbp-928]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-936], rax
-  mov r15, QWORD PTR [rbp-920]
-  mov r14, QWORD PTR [rbp-936]
-  add r15, r14
-  mov QWORD PTR [rbp-944], r15
+  mov QWORD PTR [rbp-904], rax
   mov r15, QWORD PTR [rbp-888]
-  mov rax, QWORD PTR [rbp-944]
+  mov rax, QWORD PTR [rbp-904]
+  mov QWORD PTR [r15], rax
+  lea r15, [rbp-136]
+  mov QWORD PTR [rbp-912], r15
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-920], r15
+  mov QWORD PTR [rbp-928], 136
+  mov r15, QWORD PTR [rbp-920]
+  mov r14, QWORD PTR [rbp-928]
+  add r15, r14
+  mov QWORD PTR [rbp-936], r15
+  mov r15, QWORD PTR [rbp-936]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-944], rax
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-952], r15
+  mov r15, QWORD PTR [rbp-952]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-960], rax
+  mov r15, QWORD PTR [rbp-944]
+  mov r14, QWORD PTR [rbp-960]
+  add r15, r14
+  mov QWORD PTR [rbp-968], r15
+  mov r15, QWORD PTR [rbp-912]
+  mov rax, QWORD PTR [rbp-968]
   mov QWORD PTR [r15], rax
   jmp .L385
 .L384:
 .L385:
 .L383:
   mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-952], r15
-  mov r14, QWORD PTR [rbp-952]
+  mov QWORD PTR [rbp-976], r15
+  mov r14, QWORD PTR [rbp-976]
   mov r15, r14
-  mov QWORD PTR [rbp-960], r15
-  mov QWORD PTR [rbp-968], 0
-  mov r15, QWORD PTR [rbp-960]
-  mov r14, QWORD PTR [rbp-968]
+  mov QWORD PTR [rbp-984], r15
+  mov QWORD PTR [rbp-992], 0
+  mov r15, QWORD PTR [rbp-984]
+  mov r14, QWORD PTR [rbp-992]
   xor rax, rax
   cmp r15, r14
   setne al
-  mov QWORD PTR [rbp-976], rax
-  mov r15, QWORD PTR [rbp-976]
+  mov QWORD PTR [rbp-1000], rax
+  mov r15, QWORD PTR [rbp-1000]
   test r15, r15
   jz .L386
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-992], r15
-  mov QWORD PTR [rbp-1000], 12
-  mov r15, QWORD PTR [rbp-992]
-  mov r14, QWORD PTR [rbp-1000]
+  mov QWORD PTR [rbp-1016], r15
+  mov QWORD PTR [rbp-1024], 12
+  mov r15, QWORD PTR [rbp-1016]
+  mov r14, QWORD PTR [rbp-1024]
   add r15, r14
-  mov QWORD PTR [rbp-1008], r15
-  mov r15, QWORD PTR [rbp-1008]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-1016], rax
-  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_PC32]
   mov QWORD PTR [rbp-1032], r15
   mov r15, QWORD PTR [rbp-1032]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-1024], rax
-  mov r15, QWORD PTR [rbp-1016]
-  mov r14, QWORD PTR [rbp-1024]
+  mov QWORD PTR [rbp-1040], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_PC32]
+  mov QWORD PTR [rbp-1056], r15
+  mov r15, QWORD PTR [rbp-1056]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-1048], rax
+  mov r15, QWORD PTR [rbp-1040]
+  mov r14, QWORD PTR [rbp-1048]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-1040], rax
-  mov r15, QWORD PTR [rbp-1040]
+  mov QWORD PTR [rbp-1064], rax
+  mov r15, QWORD PTR [rbp-1064]
   test r15, r15
   jnz .L390
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-1048], r15
-  mov QWORD PTR [rbp-1056], 12
-  mov r15, QWORD PTR [rbp-1048]
-  mov r14, QWORD PTR [rbp-1056]
+  mov QWORD PTR [rbp-1072], r15
+  mov QWORD PTR [rbp-1080], 12
+  mov r15, QWORD PTR [rbp-1072]
+  mov r14, QWORD PTR [rbp-1080]
   add r15, r14
-  mov QWORD PTR [rbp-1064], r15
-  mov r15, QWORD PTR [rbp-1064]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-1072], rax
-  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_PLT32]
   mov QWORD PTR [rbp-1088], r15
   mov r15, QWORD PTR [rbp-1088]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-1080], rax
-  mov r15, QWORD PTR [rbp-1072]
-  mov r14, QWORD PTR [rbp-1080]
+  mov QWORD PTR [rbp-1096], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_PLT32]
+  mov QWORD PTR [rbp-1112], r15
+  mov r15, QWORD PTR [rbp-1112]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-1104], rax
+  mov r15, QWORD PTR [rbp-1096]
+  mov r14, QWORD PTR [rbp-1104]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-1096], rax
-  mov r15, QWORD PTR [rbp-1096]
+  mov QWORD PTR [rbp-1120], rax
+  mov r15, QWORD PTR [rbp-1120]
   test r15, r15
   jnz .L390
-  mov QWORD PTR [rbp-984], 0
+  mov QWORD PTR [rbp-1008], 0
   jmp .L391
 .L390:
-  mov QWORD PTR [rbp-984], 1
+  mov QWORD PTR [rbp-1008], 1
 .L391:
-  mov r15, QWORD PTR [rbp-984]
+  mov r15, QWORD PTR [rbp-1008]
   test r15, r15
   jz .L388
   mov r15, QWORD PTR [rbp-104]
-  mov QWORD PTR [rbp-1104], r15
-  mov r15, QWORD PTR [rbp-112]
-  mov QWORD PTR [rbp-1112], r15
-  mov r15, QWORD PTR [rbp-1104]
-  mov r14, QWORD PTR [rbp-1112]
-  add r15, r14
-  mov QWORD PTR [rbp-1120], r15
-  mov r15, QWORD PTR [rbp-120]
   mov QWORD PTR [rbp-1128], r15
-  mov r15, QWORD PTR [rbp-1120]
-  mov r14, QWORD PTR [rbp-1128]
-  sub r15, r14
+  mov r15, QWORD PTR [rbp-112]
   mov QWORD PTR [rbp-1136], r15
-  mov r15, QWORD PTR [rbp-1136]
+  mov r15, QWORD PTR [rbp-1128]
+  mov r14, QWORD PTR [rbp-1136]
+  add r15, r14
+  mov QWORD PTR [rbp-1144], r15
+  mov r15, QWORD PTR [rbp-120]
+  mov QWORD PTR [rbp-1152], r15
+  mov r15, QWORD PTR [rbp-1144]
+  mov r14, QWORD PTR [rbp-1152]
+  sub r15, r14
+  mov QWORD PTR [rbp-1160], r15
+  mov r15, QWORD PTR [rbp-1160]
   mov QWORD PTR [rbp-144], r15
   mov r15, QWORD PTR [rbp-144]
-  mov QWORD PTR [rbp-1152], r15
-  mov QWORD PTR [rbp-1160], 2147483647
-  mov r15, QWORD PTR [rbp-1152]
-  mov r14, QWORD PTR [rbp-1160]
-  xor rax, rax
-  cmp r15, r14
-  setg al
-  mov QWORD PTR [rbp-1168], rax
-  mov r15, QWORD PTR [rbp-1168]
-  test r15, r15
-  jnz .L394
-  mov r15, QWORD PTR [rbp-144]
   mov QWORD PTR [rbp-1176], r15
-  mov QWORD PTR [rbp-1184], -2147483648
+  mov QWORD PTR [rbp-1184], 2147483647
   mov r15, QWORD PTR [rbp-1176]
   mov r14, QWORD PTR [rbp-1184]
   xor rax, rax
   cmp r15, r14
-  setl al
+  setg al
   mov QWORD PTR [rbp-1192], rax
   mov r15, QWORD PTR [rbp-1192]
   test r15, r15
   jnz .L394
-  mov QWORD PTR [rbp-1144], 0
+  mov r15, QWORD PTR [rbp-144]
+  mov QWORD PTR [rbp-1200], r15
+  mov QWORD PTR [rbp-1208], -2147483648
+  mov r15, QWORD PTR [rbp-1200]
+  mov r14, QWORD PTR [rbp-1208]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-1216], rax
+  mov r15, QWORD PTR [rbp-1216]
+  test r15, r15
+  jnz .L394
+  mov QWORD PTR [rbp-1168], 0
   jmp .L395
 .L394:
-  mov QWORD PTR [rbp-1144], 1
+  mov QWORD PTR [rbp-1168], 1
 .L395:
-  mov r15, QWORD PTR [rbp-1144]
+  mov r15, QWORD PTR [rbp-1168]
   test r15, r15
   jz .L392
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1200], r15
-  mov QWORD PTR [rbp-1208], 132
-  mov r15, QWORD PTR [rbp-1200]
-  mov r14, QWORD PTR [rbp-1208]
-  add r15, r14
-  mov QWORD PTR [rbp-1216], r15
-  mov r15, QWORD PTR [rbp-1216]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-1224], rax
-  mov QWORD PTR [rbp-1232], 1
+  mov QWORD PTR [rbp-1224], r15
+  mov QWORD PTR [rbp-1232], 132
   mov r15, QWORD PTR [rbp-1224]
   mov r14, QWORD PTR [rbp-1232]
+  add r15, r14
+  mov QWORD PTR [rbp-1240], r15
+  mov r15, QWORD PTR [rbp-1240]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-1248], rax
+  mov QWORD PTR [rbp-1256], 1
+  mov r15, QWORD PTR [rbp-1248]
+  mov r14, QWORD PTR [rbp-1256]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-1240], rax
-  mov r15, QWORD PTR [rbp-1240]
+  mov QWORD PTR [rbp-1264], rax
+  mov r15, QWORD PTR [rbp-1264]
   test r15, r15
   jz .L396
   lea r15, [rip+.LC35]
-  mov QWORD PTR [rbp-1248], r15
-  mov rdi, QWORD PTR [rbp-1248]
+  mov QWORD PTR [rbp-1272], r15
+  mov rdi, QWORD PTR [rbp-1272]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
-  mov QWORD PTR [rbp-1288], rax
+  mov QWORD PTR [rbp-1312], rax
   mov r15, QWORD PTR [rbp-120]
-  mov QWORD PTR [rbp-1264], r15
-  mov rdi, QWORD PTR [rbp-1264]
+  mov QWORD PTR [rbp-1288], r15
+  mov rdi, QWORD PTR [rbp-1288]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov r12, rax
   lea r15, [rip+.LC36]
-  mov QWORD PTR [rbp-1280], r15
-  mov rdi, QWORD PTR [rbp-1280]
+  mov QWORD PTR [rbp-1304], r15
+  mov rdi, QWORD PTR [rbp-1304]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov r13, rax
   jmp .L397
@@ -14133,156 +14166,357 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
 .L392:
 .L393:
   mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-1296], r15
-  mov r15, QWORD PTR [rbp-136]
-  mov QWORD PTR [rbp-1304], r15
-  mov r15, QWORD PTR [rbp-1296]
-  mov r14, QWORD PTR [rbp-1304]
-  add r15, r14
-  mov QWORD PTR [rbp-1312], r15
-  mov r15, QWORD PTR [rbp-144]
   mov QWORD PTR [rbp-1320], r15
-  mov QWORD PTR [rbp-1328], 255
-  mov r14, QWORD PTR [rbp-1320]
-  mov r15, QWORD PTR [rbp-1328]
-  and r14, r15
-  mov QWORD PTR [rbp-1336], r14
-  mov r14, QWORD PTR [rbp-1336]
-  movzx r15, r14b
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-1328], r15
+  mov r15, QWORD PTR [rbp-1320]
+  mov r14, QWORD PTR [rbp-1328]
+  add r15, r14
+  mov QWORD PTR [rbp-1336], r15
+  mov r15, QWORD PTR [rbp-144]
   mov QWORD PTR [rbp-1344], r15
-  mov r15, QWORD PTR [rbp-1312]
-  mov rax, QWORD PTR [rbp-1344]
-  mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-1352], r15
-  mov r15, QWORD PTR [rbp-136]
-  mov QWORD PTR [rbp-1360], r15
-  mov QWORD PTR [rbp-1368], 1
-  mov r15, QWORD PTR [rbp-1360]
-  mov r14, QWORD PTR [rbp-1368]
-  add r15, r14
-  mov QWORD PTR [rbp-1376], r15
+  mov QWORD PTR [rbp-1352], 255
+  mov r14, QWORD PTR [rbp-1344]
   mov r15, QWORD PTR [rbp-1352]
-  mov r14, QWORD PTR [rbp-1376]
-  add r15, r14
+  and r14, r15
+  mov QWORD PTR [rbp-1360], r14
+  mov r14, QWORD PTR [rbp-1360]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-1368], r15
+  mov r15, QWORD PTR [rbp-1336]
+  mov rax, QWORD PTR [rbp-1368]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-1376], r15
+  mov r15, QWORD PTR [rbp-136]
   mov QWORD PTR [rbp-1384], r15
-  mov r15, QWORD PTR [rbp-144]
-  mov QWORD PTR [rbp-1392], r15
-  mov QWORD PTR [rbp-1400], 8
-  mov rcx, QWORD PTR [rbp-1400]
-  mov r15, QWORD PTR [rbp-1392]
-  shr r15, cl
-  mov QWORD PTR [rbp-1408], r15
-  mov QWORD PTR [rbp-1416], 255
-  mov r14, QWORD PTR [rbp-1408]
-  mov r15, QWORD PTR [rbp-1416]
-  and r14, r15
-  mov QWORD PTR [rbp-1424], r14
-  mov r14, QWORD PTR [rbp-1424]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-1432], r15
+  mov QWORD PTR [rbp-1392], 1
   mov r15, QWORD PTR [rbp-1384]
-  mov rax, QWORD PTR [rbp-1432]
-  mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-1440], r15
-  mov r15, QWORD PTR [rbp-136]
-  mov QWORD PTR [rbp-1448], r15
-  mov QWORD PTR [rbp-1456], 2
-  mov r15, QWORD PTR [rbp-1448]
-  mov r14, QWORD PTR [rbp-1456]
+  mov r14, QWORD PTR [rbp-1392]
   add r15, r14
-  mov QWORD PTR [rbp-1464], r15
+  mov QWORD PTR [rbp-1400], r15
+  mov r15, QWORD PTR [rbp-1376]
+  mov r14, QWORD PTR [rbp-1400]
+  add r15, r14
+  mov QWORD PTR [rbp-1408], r15
+  mov r15, QWORD PTR [rbp-144]
+  mov QWORD PTR [rbp-1416], r15
+  mov QWORD PTR [rbp-1424], 8
+  mov rcx, QWORD PTR [rbp-1424]
+  mov r15, QWORD PTR [rbp-1416]
+  shr r15, cl
+  mov QWORD PTR [rbp-1432], r15
+  mov QWORD PTR [rbp-1440], 255
+  mov r14, QWORD PTR [rbp-1432]
   mov r15, QWORD PTR [rbp-1440]
-  mov r14, QWORD PTR [rbp-1464]
-  add r15, r14
-  mov QWORD PTR [rbp-1472], r15
-  mov r15, QWORD PTR [rbp-144]
-  mov QWORD PTR [rbp-1480], r15
-  mov QWORD PTR [rbp-1488], 16
-  mov rcx, QWORD PTR [rbp-1488]
-  mov r15, QWORD PTR [rbp-1480]
-  shr r15, cl
-  mov QWORD PTR [rbp-1496], r15
-  mov QWORD PTR [rbp-1504], 255
-  mov r14, QWORD PTR [rbp-1496]
-  mov r15, QWORD PTR [rbp-1504]
   and r14, r15
-  mov QWORD PTR [rbp-1512], r14
-  mov r14, QWORD PTR [rbp-1512]
+  mov QWORD PTR [rbp-1448], r14
+  mov r14, QWORD PTR [rbp-1448]
   movzx r15, r14b
-  mov QWORD PTR [rbp-1520], r15
-  mov r15, QWORD PTR [rbp-1472]
-  mov rax, QWORD PTR [rbp-1520]
+  mov QWORD PTR [rbp-1456], r15
+  mov r15, QWORD PTR [rbp-1408]
+  mov rax, QWORD PTR [rbp-1456]
   mov BYTE PTR [r15], al
   mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-1528], r15
+  mov QWORD PTR [rbp-1464], r15
   mov r15, QWORD PTR [rbp-136]
-  mov QWORD PTR [rbp-1536], r15
-  mov QWORD PTR [rbp-1544], 3
-  mov r15, QWORD PTR [rbp-1536]
-  mov r14, QWORD PTR [rbp-1544]
+  mov QWORD PTR [rbp-1472], r15
+  mov QWORD PTR [rbp-1480], 2
+  mov r15, QWORD PTR [rbp-1472]
+  mov r14, QWORD PTR [rbp-1480]
   add r15, r14
-  mov QWORD PTR [rbp-1552], r15
-  mov r15, QWORD PTR [rbp-1528]
-  mov r14, QWORD PTR [rbp-1552]
+  mov QWORD PTR [rbp-1488], r15
+  mov r15, QWORD PTR [rbp-1464]
+  mov r14, QWORD PTR [rbp-1488]
   add r15, r14
-  mov QWORD PTR [rbp-1560], r15
+  mov QWORD PTR [rbp-1496], r15
   mov r15, QWORD PTR [rbp-144]
-  mov QWORD PTR [rbp-1568], r15
-  mov QWORD PTR [rbp-1576], 24
-  mov rcx, QWORD PTR [rbp-1576]
-  mov r15, QWORD PTR [rbp-1568]
+  mov QWORD PTR [rbp-1504], r15
+  mov QWORD PTR [rbp-1512], 16
+  mov rcx, QWORD PTR [rbp-1512]
+  mov r15, QWORD PTR [rbp-1504]
   shr r15, cl
-  mov QWORD PTR [rbp-1584], r15
-  mov QWORD PTR [rbp-1592], 255
-  mov r14, QWORD PTR [rbp-1584]
-  mov r15, QWORD PTR [rbp-1592]
+  mov QWORD PTR [rbp-1520], r15
+  mov QWORD PTR [rbp-1528], 255
+  mov r14, QWORD PTR [rbp-1520]
+  mov r15, QWORD PTR [rbp-1528]
   and r14, r15
-  mov QWORD PTR [rbp-1600], r14
-  mov r14, QWORD PTR [rbp-1600]
+  mov QWORD PTR [rbp-1536], r14
+  mov r14, QWORD PTR [rbp-1536]
   movzx r15, r14b
-  mov QWORD PTR [rbp-1608], r15
+  mov QWORD PTR [rbp-1544], r15
+  mov r15, QWORD PTR [rbp-1496]
+  mov rax, QWORD PTR [rbp-1544]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-1552], r15
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-1560], r15
+  mov QWORD PTR [rbp-1568], 3
   mov r15, QWORD PTR [rbp-1560]
-  mov rax, QWORD PTR [rbp-1608]
+  mov r14, QWORD PTR [rbp-1568]
+  add r15, r14
+  mov QWORD PTR [rbp-1576], r15
+  mov r15, QWORD PTR [rbp-1552]
+  mov r14, QWORD PTR [rbp-1576]
+  add r15, r14
+  mov QWORD PTR [rbp-1584], r15
+  mov r15, QWORD PTR [rbp-144]
+  mov QWORD PTR [rbp-1592], r15
+  mov QWORD PTR [rbp-1600], 24
+  mov rcx, QWORD PTR [rbp-1600]
+  mov r15, QWORD PTR [rbp-1592]
+  shr r15, cl
+  mov QWORD PTR [rbp-1608], r15
+  mov QWORD PTR [rbp-1616], 255
+  mov r14, QWORD PTR [rbp-1608]
+  mov r15, QWORD PTR [rbp-1616]
+  and r14, r15
+  mov QWORD PTR [rbp-1624], r14
+  mov r14, QWORD PTR [rbp-1624]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-1632], r15
+  mov r15, QWORD PTR [rbp-1584]
+  mov rax, QWORD PTR [rbp-1632]
   mov BYTE PTR [r15], al
   jmp .L389
 .L388:
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-1640], r15
+  mov QWORD PTR [rbp-1648], 12
+  mov r15, QWORD PTR [rbp-1640]
+  mov r14, QWORD PTR [rbp-1648]
+  add r15, r14
+  mov QWORD PTR [rbp-1656], r15
+  mov r15, QWORD PTR [rbp-1656]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-1664], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GOTPCREL]
+  mov QWORD PTR [rbp-1680], r15
+  mov r15, QWORD PTR [rbp-1680]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-1672], rax
+  mov r15, QWORD PTR [rbp-1664]
+  mov r14, QWORD PTR [rbp-1672]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-1688], rax
+  mov r15, QWORD PTR [rbp-1688]
+  test r15, r15
+  jz .L398
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-1696], r15
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-1704], r15
+  mov QWORD PTR [rbp-1712], 8
+  mov r15, QWORD PTR [rbp-1704]
+  mov r14, QWORD PTR [rbp-1712]
+  add r15, r14
+  mov QWORD PTR [rbp-1720], r15
+  mov r15, QWORD PTR [rbp-1720]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-1728], rax
+  mov rdi, QWORD PTR [rbp-1696]
+  mov rsi, QWORD PTR [rbp-1728]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_sym_get
+  mov QWORD PTR [rbp-1736], rax
+  mov r15, QWORD PTR [rbp-1736]
+  mov QWORD PTR [rbp-152], r15
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-1744], r15
+  mov r15, QWORD PTR [rbp-152]
+  mov QWORD PTR [rbp-1752], r15
+  mov r15, QWORD PTR [rbp-1752]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-1760], rax
+  mov r15, QWORD PTR [rbp-152]
+  mov QWORD PTR [rbp-1768], r15
+  mov QWORD PTR [rbp-1776], 8
+  mov r15, QWORD PTR [rbp-1768]
+  mov r14, QWORD PTR [rbp-1776]
+  add r15, r14
+  mov QWORD PTR [rbp-1784], r15
+  mov r15, QWORD PTR [rbp-1784]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-1792], rax
+  mov rdi, QWORD PTR [rbp-1744]
+  mov rsi, QWORD PTR [rbp-1760]
+  mov rdx, QWORD PTR [rbp-1792]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_data_got_vaddr
+  mov QWORD PTR [rbp-1800], rax
+  mov r15, QWORD PTR [rbp-1800]
+  mov QWORD PTR [rbp-160], r15
+  mov r15, QWORD PTR [rbp-160]
+  mov QWORD PTR [rbp-1808], r15
+  mov r15, QWORD PTR [rbp-112]
+  mov QWORD PTR [rbp-1816], r15
+  mov r15, QWORD PTR [rbp-1808]
+  mov r14, QWORD PTR [rbp-1816]
+  add r15, r14
+  mov QWORD PTR [rbp-1824], r15
+  mov r15, QWORD PTR [rbp-120]
+  mov QWORD PTR [rbp-1832], r15
+  mov r15, QWORD PTR [rbp-1824]
+  mov r14, QWORD PTR [rbp-1832]
+  sub r15, r14
+  mov QWORD PTR [rbp-1840], r15
+  mov r15, QWORD PTR [rbp-1840]
+  mov QWORD PTR [rbp-168], r15
+  mov r15, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-1848], r15
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-1856], r15
+  mov r15, QWORD PTR [rbp-1848]
+  mov r14, QWORD PTR [rbp-1856]
+  add r15, r14
+  mov QWORD PTR [rbp-1864], r15
+  mov r15, QWORD PTR [rbp-168]
+  mov QWORD PTR [rbp-1872], r15
+  mov QWORD PTR [rbp-1880], 255
+  mov r14, QWORD PTR [rbp-1872]
+  mov r15, QWORD PTR [rbp-1880]
+  and r14, r15
+  mov QWORD PTR [rbp-1888], r14
+  mov r14, QWORD PTR [rbp-1888]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-1896], r15
+  mov r15, QWORD PTR [rbp-1864]
+  mov rax, QWORD PTR [rbp-1896]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-1904], r15
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-1912], r15
+  mov QWORD PTR [rbp-1920], 1
+  mov r15, QWORD PTR [rbp-1912]
+  mov r14, QWORD PTR [rbp-1920]
+  add r15, r14
+  mov QWORD PTR [rbp-1928], r15
+  mov r15, QWORD PTR [rbp-1904]
+  mov r14, QWORD PTR [rbp-1928]
+  add r15, r14
+  mov QWORD PTR [rbp-1936], r15
+  mov r15, QWORD PTR [rbp-168]
+  mov QWORD PTR [rbp-1944], r15
+  mov QWORD PTR [rbp-1952], 8
+  mov rcx, QWORD PTR [rbp-1952]
+  mov r15, QWORD PTR [rbp-1944]
+  shr r15, cl
+  mov QWORD PTR [rbp-1960], r15
+  mov QWORD PTR [rbp-1968], 255
+  mov r14, QWORD PTR [rbp-1960]
+  mov r15, QWORD PTR [rbp-1968]
+  and r14, r15
+  mov QWORD PTR [rbp-1976], r14
+  mov r14, QWORD PTR [rbp-1976]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-1984], r15
+  mov r15, QWORD PTR [rbp-1936]
+  mov rax, QWORD PTR [rbp-1984]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-1992], r15
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-2000], r15
+  mov QWORD PTR [rbp-2008], 2
+  mov r15, QWORD PTR [rbp-2000]
+  mov r14, QWORD PTR [rbp-2008]
+  add r15, r14
+  mov QWORD PTR [rbp-2016], r15
+  mov r15, QWORD PTR [rbp-1992]
+  mov r14, QWORD PTR [rbp-2016]
+  add r15, r14
+  mov QWORD PTR [rbp-2024], r15
+  mov r15, QWORD PTR [rbp-168]
+  mov QWORD PTR [rbp-2032], r15
+  mov QWORD PTR [rbp-2040], 16
+  mov rcx, QWORD PTR [rbp-2040]
+  mov r15, QWORD PTR [rbp-2032]
+  shr r15, cl
+  mov QWORD PTR [rbp-2048], r15
+  mov QWORD PTR [rbp-2056], 255
+  mov r14, QWORD PTR [rbp-2048]
+  mov r15, QWORD PTR [rbp-2056]
+  and r14, r15
+  mov QWORD PTR [rbp-2064], r14
+  mov r14, QWORD PTR [rbp-2064]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2072], r15
+  mov r15, QWORD PTR [rbp-2024]
+  mov rax, QWORD PTR [rbp-2072]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-2080], r15
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-2088], r15
+  mov QWORD PTR [rbp-2096], 3
+  mov r15, QWORD PTR [rbp-2088]
+  mov r14, QWORD PTR [rbp-2096]
+  add r15, r14
+  mov QWORD PTR [rbp-2104], r15
+  mov r15, QWORD PTR [rbp-2080]
+  mov r14, QWORD PTR [rbp-2104]
+  add r15, r14
+  mov QWORD PTR [rbp-2112], r15
+  mov r15, QWORD PTR [rbp-168]
+  mov QWORD PTR [rbp-2120], r15
+  mov QWORD PTR [rbp-2128], 24
+  mov rcx, QWORD PTR [rbp-2128]
+  mov r15, QWORD PTR [rbp-2120]
+  shr r15, cl
+  mov QWORD PTR [rbp-2136], r15
+  mov QWORD PTR [rbp-2144], 255
+  mov r14, QWORD PTR [rbp-2136]
+  mov r15, QWORD PTR [rbp-2144]
+  and r14, r15
+  mov QWORD PTR [rbp-2152], r14
+  mov r14, QWORD PTR [rbp-2152]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2160], r15
+  mov r15, QWORD PTR [rbp-2112]
+  mov rax, QWORD PTR [rbp-2160]
+  mov BYTE PTR [r15], al
+  jmp .L399
+.L398:
+.L399:
 .L389:
   jmp .L387
 .L386:
 .L387:
   lea r15, [rbp-88]
-  mov QWORD PTR [rbp-1616], r15
+  mov QWORD PTR [rbp-2168], r15
   movsxd r15, DWORD PTR [rbp-88]
-  mov QWORD PTR [rbp-1624], r15
-  mov QWORD PTR [rbp-1632], 1
-  mov r15, QWORD PTR [rbp-1624]
-  mov r14, QWORD PTR [rbp-1632]
+  mov QWORD PTR [rbp-2176], r15
+  mov QWORD PTR [rbp-2184], 1
+  mov r15, QWORD PTR [rbp-2176]
+  mov r14, QWORD PTR [rbp-2184]
   add r15, r14
-  mov QWORD PTR [rbp-1640], r15
-  mov r15, QWORD PTR [rbp-1616]
-  mov rax, QWORD PTR [rbp-1640]
+  mov QWORD PTR [rbp-2192], r15
+  mov r15, QWORD PTR [rbp-2168]
+  mov rax, QWORD PTR [rbp-2192]
   mov DWORD PTR [r15], eax
   jmp .L380
 .L381:
   lea r15, [rbp-76]
-  mov QWORD PTR [rbp-1648], r15
+  mov QWORD PTR [rbp-2200], r15
   movsxd r15, DWORD PTR [rbp-76]
-  mov QWORD PTR [rbp-1656], r15
-  mov QWORD PTR [rbp-1664], 1
-  mov r15, QWORD PTR [rbp-1656]
-  mov r14, QWORD PTR [rbp-1664]
+  mov QWORD PTR [rbp-2208], r15
+  mov QWORD PTR [rbp-2216], 1
+  mov r15, QWORD PTR [rbp-2208]
+  mov r14, QWORD PTR [rbp-2216]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-1648]
+  mov r15, QWORD PTR [rbp-2200]
   mov rax, rbx
   mov DWORD PTR [r15], eax
   jmp .L378
 .L379:
   mov rbx, 0
   mov rax, rbx
-  add rsp, 1672
+  add rsp, 2232
   pop r15
   pop r14
   pop r13
@@ -14425,7 +14659,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L398
+  jz .L400
   lea rbx, [rip+.LC37]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
@@ -14442,9 +14676,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rbx
   pop rbp
   ret
-  jmp .L399
-.L398:
-.L399:
+  jmp .L401
+.L400:
+.L401:
   mov rbx, QWORD PTR [rbp-88]
   lea r12, [rip+.LC38]
   mov r13, 30
@@ -14487,7 +14721,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-96], rbx
   mov rbx, 0
   mov DWORD PTR [rbp-100], ebx
-.L400:
+.L402:
   movsxd r15, DWORD PTR [rbp-100]
   mov QWORD PTR [rbp-216], r15
   mov r15, QWORD PTR [rbp-96]
@@ -14508,7 +14742,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-240], rax
   mov r15, QWORD PTR [rbp-240]
   test r15, r15
-  jz .L401
+  jz .L403
   xor r10, r10
   mov r15, QWORD PTR [rbp-96]
   mov QWORD PTR [rbp-248], r15
@@ -14539,7 +14773,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-312], rax
   mov r15, QWORD PTR [rbp-312]
   test r15, r15
-  jz .L402
+  jz .L404
   mov QWORD PTR [rbp-320], 84
   mov r15, QWORD PTR [rbp-320]
   mov DWORD PTR [rbp-112], r15d
@@ -14566,16 +14800,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-376], rax
   mov r15, QWORD PTR [rbp-376]
   test r15, r15
-  jz .L404
+  jz .L406
   lea r15, [rbp-112]
   mov QWORD PTR [rbp-528], r15
   mov QWORD PTR [rbp-392], 68
   mov r15, QWORD PTR [rbp-528]
   mov rax, QWORD PTR [rbp-392]
   mov DWORD PTR [r15], eax
-  jmp .L405
-.L404:
-.L405:
+  jmp .L407
+.L406:
+.L407:
   mov r15, QWORD PTR [rbp-108]
   mov QWORD PTR [rbp-400], r15
   mov QWORD PTR [rbp-408], 12
@@ -14599,16 +14833,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-448], rax
   mov r15, QWORD PTR [rbp-448]
   test r15, r15
-  jz .L406
+  jz .L408
   lea r15, [rbp-112]
   mov QWORD PTR [rbp-608], r15
   mov QWORD PTR [rbp-464], 82
   mov r15, QWORD PTR [rbp-608]
   mov rax, QWORD PTR [rbp-464]
   mov DWORD PTR [r15], eax
-  jmp .L407
-.L406:
-.L407:
+  jmp .L409
+.L408:
+.L409:
   mov r15, QWORD PTR [rbp-108]
   mov QWORD PTR [rbp-472], r15
   mov QWORD PTR [rbp-480], 12
@@ -14632,15 +14866,15 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-520], rax
   mov r15, QWORD PTR [rbp-520]
   test r15, r15
-  jz .L408
+  jz .L410
   lea r13, [rbp-112]
   mov QWORD PTR [rbp-536], 66
   mov r15, r13
   mov rax, QWORD PTR [rbp-536]
   mov DWORD PTR [r15], eax
-  jmp .L409
-.L408:
-.L409:
+  jmp .L411
+.L410:
+.L411:
   mov r15, QWORD PTR [rbp-88]
   mov QWORD PTR [rbp-544], r15
   mov r15, QWORD PTR [rbp-108]
@@ -14666,9 +14900,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rcx, QWORD PTR [rbp-600]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_write_map_entry
   mov rbx, rax
-  jmp .L403
-.L402:
-.L403:
+  jmp .L405
+.L404:
+.L405:
   lea r15, [rbp-100]
   mov QWORD PTR [rbp-616], r15
   movsxd r15, DWORD PTR [rbp-100]
@@ -14681,8 +14915,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, QWORD PTR [rbp-616]
   mov rax, r12
   mov DWORD PTR [r15], eax
-  jmp .L400
-.L401:
+  jmp .L402
+.L403:
   mov rbx, QWORD PTR [rbp-88]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_close
@@ -14747,7 +14981,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-98], rbx
   mov rbx, QWORD PTR [rbp-64]
   mov QWORD PTR [rbp-106], rbx
-.L410:
+.L412:
   mov r15, QWORD PTR [rbp-98]
   mov QWORD PTR [rbp-168], r15
   mov QWORD PTR [rbp-208], 16
@@ -14759,7 +14993,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-264], rax
   mov r15, QWORD PTR [rbp-264]
   test r15, r15
-  jz .L411
+  jz .L413
   lea r15, [rbp-90]
   mov QWORD PTR [rbp-176], r15
   mov QWORD PTR [rbp-184], 17
@@ -14813,8 +15047,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rbx, r15
   mov r15, r13
   mov QWORD PTR [r15], rbx
-  jmp .L410
-.L411:
+  jmp .L412
+.L413:
   mov rbx, QWORD PTR [rbp-56]
   lea r12, [rbp-90]
   mov QWORD PTR [rbp-320], 0
@@ -14966,7 +15200,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r14, QWORD PTR [rbp-152]
   mov r15, r14
   mov QWORD PTR [rbp-160], r15
-  mov QWORD PTR [rbp-168], 36
+  mov QWORD PTR [rbp-168], 48
   mov r14, QWORD PTR [rbp-168]
   mov r15, r14
   mov QWORD PTR [rbp-176], r15
@@ -15046,7 +15280,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rbx, r12
   movsxd r12, DWORD PTR [rbp-60]
   mov r13, r12
-  mov QWORD PTR [rbp-120], 36
+  mov QWORD PTR [rbp-120], 48
   mov r14, QWORD PTR [rbp-120]
   mov r15, r14
   mov QWORD PTR [rbp-128], r15
@@ -15124,7 +15358,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L412
+  jz .L414
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 12
   mov r15, rbx
@@ -15142,7 +15376,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   xor r10, r10
   movsxd rbx, DWORD PTR [rbp-72]
   mov r12, rbx
-  mov rbx, 36
+  mov rbx, 48
   mov r13, rbx
   mov r15, r12
   mov r14, r13
@@ -15169,7 +15403,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r14, QWORD PTR [rbp-176]
   mov r15, r14
   mov QWORD PTR [rbp-184], r15
-  mov QWORD PTR [rbp-192], 36
+  mov QWORD PTR [rbp-192], 48
   mov r14, QWORD PTR [rbp-192]
   mov r15, r14
   mov QWORD PTR [rbp-200], r15
@@ -15202,9 +15436,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L413
-.L412:
-.L413:
+  jmp .L415
+.L414:
+.L415:
   xor r10, r10
   mov rbx, QWORD PTR [rbp-56]
   mov r12, QWORD PTR [rbp-56]
@@ -15260,10 +15494,29 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, r15
   mov rbx, 0
   mov r15, r13
+  mov QWORD PTR [r15], rbx
+  mov rbx, QWORD PTR [rbp-88]
+  mov r12, 36
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, 0
+  mov r15, r13
   mov rax, rbx
   mov DWORD PTR [r15], eax
   mov rbx, QWORD PTR [rbp-88]
-  mov r12, 32
+  mov r12, 40
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, 0
+  mov r15, r13
+  mov rax, rbx
+  mov DWORD PTR [r15], eax
+  mov rbx, QWORD PTR [rbp-88]
+  mov r12, 44
   mov r15, rbx
   mov r14, r12
   add r15, r14
@@ -15350,7 +15603,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov DWORD PTR [rbp-68], ebx
   mov rbx, 0
   mov DWORD PTR [rbp-72], ebx
-.L414:
+.L416:
   movsxd r15, DWORD PTR [rbp-72]
   mov QWORD PTR [rbp-136], r15
   mov r15, QWORD PTR [rbp-56]
@@ -15371,7 +15624,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-160], rax
   mov r15, QWORD PTR [rbp-160]
   test r15, r15
-  jz .L415
+  jz .L417
   xor r10, r10
   mov r15, QWORD PTR [rbp-56]
   mov QWORD PTR [rbp-168], r15
@@ -15417,7 +15670,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-272], rax
   mov r15, QWORD PTR [rbp-272]
   test r15, r15
-  jz .L416
+  jz .L418
   movsxd r15, DWORD PTR [rbp-72]
   mov QWORD PTR [rbp-280], r15
   mov rax, QWORD PTR [rbp-280]
@@ -15429,9 +15682,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rbx
   pop rbp
   ret
-  jmp .L417
-.L416:
-.L417:
+  jmp .L419
+.L418:
+.L419:
   lea rbx, [rbp-72]
   movsxd r15, DWORD PTR [rbp-72]
   mov QWORD PTR [rbp-296], r15
@@ -15443,8 +15696,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-  jmp .L414
-.L415:
+  jmp .L416
+.L417:
   mov rbx, -1
   movsxd r12, ebx
   mov rax, r12
@@ -15521,13 +15774,13 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   push r13
   push r14
   push r15
-  sub rsp, 552
-  mov QWORD PTR [rbp-160], rdi
-  mov QWORD PTR [rbp-152], rsi
-  mov QWORD PTR [rbp-144], rdx
-  mov QWORD PTR [rbp-136], rcx
-  mov QWORD PTR [rbp-128], r8
-  mov QWORD PTR [rbp-120], r9
+  sub rsp, 1080
+  mov QWORD PTR [rbp-200], rdi
+  mov QWORD PTR [rbp-192], rsi
+  mov QWORD PTR [rbp-184], rdx
+  mov QWORD PTR [rbp-176], rcx
+  mov QWORD PTR [rbp-168], r8
+  mov QWORD PTR [rbp-160], r9
   mov rbx, rdi
   mov QWORD PTR [rbp-56], rbx
   xor r10, r10
@@ -15540,7 +15793,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r12, rbx
   mov QWORD PTR [rbp-72], r12
   xor r10, r10
-  lea rbx, [rbp-528]
+  lea rbx, [rbp-1056]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_init
   mov r12, rax
@@ -15569,9 +15822,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   add r15, r14
   mov r13, r15
   lea rbx, [rbp-88]
-  mov QWORD PTR [rbp-168], 8
+  mov QWORD PTR [rbp-208], 8
   mov r15, rbx
-  mov r14, QWORD PTR [rbp-168]
+  mov r14, QWORD PTR [rbp-208]
   add r15, r14
   mov r12, r15
   mov r15, r12
@@ -15586,9 +15839,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   add r15, r14
   mov r13, r15
   lea rbx, [rbp-88]
-  mov QWORD PTR [rbp-176], 12
+  mov QWORD PTR [rbp-216], 12
   mov r15, rbx
-  mov r14, QWORD PTR [rbp-176]
+  mov r14, QWORD PTR [rbp-216]
   add r15, r14
   mov r12, r15
   mov r15, r12
@@ -15613,84 +15866,69 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-96], rbx
   mov rbx, 0
   mov DWORD PTR [rbp-100], ebx
-.L418:
+.L420:
   movsxd r15, DWORD PTR [rbp-100]
-  mov QWORD PTR [rbp-184], r15
+  mov QWORD PTR [rbp-224], r15
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-344], r15
-  mov QWORD PTR [rbp-408], 8
-  mov r15, QWORD PTR [rbp-344]
-  mov r14, QWORD PTR [rbp-408]
+  mov QWORD PTR [rbp-384], r15
+  mov QWORD PTR [rbp-448], 8
+  mov r15, QWORD PTR [rbp-384]
+  mov r14, QWORD PTR [rbp-448]
   add r15, r14
-  mov QWORD PTR [rbp-192], r15
-  mov r15, QWORD PTR [rbp-192]
+  mov QWORD PTR [rbp-232], r15
+  mov r15, QWORD PTR [rbp-232]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-200], rax
-  mov r15, QWORD PTR [rbp-184]
-  mov r14, QWORD PTR [rbp-200]
+  mov QWORD PTR [rbp-240], rax
+  mov r15, QWORD PTR [rbp-224]
+  mov r14, QWORD PTR [rbp-240]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-208], rax
-  mov r15, QWORD PTR [rbp-208]
+  mov QWORD PTR [rbp-248], rax
+  mov r15, QWORD PTR [rbp-248]
   test r15, r15
-  jz .L419
+  jz .L421
   xor r10, r10
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-216], r15
+  mov QWORD PTR [rbp-256], r15
   movsxd r15, DWORD PTR [rbp-100]
-  mov QWORD PTR [rbp-224], r15
-  mov rdi, QWORD PTR [rbp-216]
-  mov rsi, QWORD PTR [rbp-224]
+  mov QWORD PTR [rbp-264], r15
+  mov rdi, QWORD PTR [rbp-256]
+  mov rsi, QWORD PTR [rbp-264]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_gsym_get
-  mov QWORD PTR [rbp-232], rax
-  mov r15, QWORD PTR [rbp-232]
+  mov QWORD PTR [rbp-272], rax
+  mov r15, QWORD PTR [rbp-272]
   mov QWORD PTR [rbp-108], r15
   mov r15, QWORD PTR [rbp-108]
-  mov QWORD PTR [rbp-240], r15
-  mov QWORD PTR [rbp-248], 28
-  mov r15, QWORD PTR [rbp-240]
-  mov r14, QWORD PTR [rbp-248]
+  mov QWORD PTR [rbp-280], r15
+  mov QWORD PTR [rbp-288], 28
+  mov r15, QWORD PTR [rbp-280]
+  mov r14, QWORD PTR [rbp-288]
   add r15, r14
-  mov QWORD PTR [rbp-256], r15
-  mov r15, QWORD PTR [rbp-256]
+  mov QWORD PTR [rbp-296], r15
+  mov r15, QWORD PTR [rbp-296]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-264], rax
-  mov QWORD PTR [rbp-272], 0
-  mov r15, QWORD PTR [rbp-264]
-  mov r14, QWORD PTR [rbp-272]
+  mov QWORD PTR [rbp-304], rax
+  mov QWORD PTR [rbp-312], 0
+  mov r15, QWORD PTR [rbp-304]
+  mov r14, QWORD PTR [rbp-312]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-280], rax
-  mov r15, QWORD PTR [rbp-280]
+  mov QWORD PTR [rbp-320], rax
+  mov r15, QWORD PTR [rbp-320]
   test r15, r15
-  jz .L420
+  jz .L422
   mov r15, QWORD PTR [rbp-72]
-  mov QWORD PTR [rbp-288], r15
-  mov r15, QWORD PTR [rbp-108]
-  mov QWORD PTR [rbp-296], r15
-  mov r15, QWORD PTR [rbp-296]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-304], rax
-  mov r15, QWORD PTR [rbp-108]
-  mov QWORD PTR [rbp-312], r15
-  mov QWORD PTR [rbp-320], 8
-  mov r15, QWORD PTR [rbp-312]
-  mov r14, QWORD PTR [rbp-320]
-  add r15, r14
   mov QWORD PTR [rbp-328], r15
-  mov r15, QWORD PTR [rbp-328]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-336], rax
-  mov rdi, QWORD PTR [rbp-288]
-  mov rsi, QWORD PTR [rbp-304]
-  mov rdx, QWORD PTR [rbp-336]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_add
-  mov QWORD PTR [rbp-488], rax
-  mov r15, QWORD PTR [rbp-56]
+  mov r15, QWORD PTR [rbp-108]
+  mov QWORD PTR [rbp-336], r15
+  mov r15, QWORD PTR [rbp-336]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-344], rax
+  mov r15, QWORD PTR [rbp-108]
   mov QWORD PTR [rbp-352], r15
-  mov QWORD PTR [rbp-360], 132
+  mov QWORD PTR [rbp-360], 8
   mov r15, QWORD PTR [rbp-352]
   mov r14, QWORD PTR [rbp-360]
   add r15, r14
@@ -15698,77 +15936,320 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, QWORD PTR [rbp-368]
   movsxd rax, DWORD PTR [r15]
   mov QWORD PTR [rbp-376], rax
-  mov QWORD PTR [rbp-384], 1
-  mov r15, QWORD PTR [rbp-376]
-  mov r14, QWORD PTR [rbp-384]
+  mov rdi, QWORD PTR [rbp-328]
+  mov rsi, QWORD PTR [rbp-344]
+  mov rdx, QWORD PTR [rbp-376]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_add
+  mov QWORD PTR [rbp-528], rax
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-392], r15
+  mov QWORD PTR [rbp-400], 132
+  mov r15, QWORD PTR [rbp-392]
+  mov r14, QWORD PTR [rbp-400]
+  add r15, r14
+  mov QWORD PTR [rbp-408], r15
+  mov r15, QWORD PTR [rbp-408]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-416], rax
+  mov QWORD PTR [rbp-424], 1
+  mov r15, QWORD PTR [rbp-416]
+  mov r14, QWORD PTR [rbp-424]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-392], rax
-  mov r15, QWORD PTR [rbp-392]
+  mov QWORD PTR [rbp-432], rax
+  mov r15, QWORD PTR [rbp-432]
   test r15, r15
-  jz .L422
+  jz .L424
   lea r15, [rip+.LC45]
-  mov QWORD PTR [rbp-400], r15
-  mov rdi, QWORD PTR [rbp-400]
+  mov QWORD PTR [rbp-440], r15
+  mov rdi, QWORD PTR [rbp-440]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov r12, rax
   lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_STDERR]
-  mov QWORD PTR [rbp-424], r15
-  mov r15, QWORD PTR [rbp-424]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-416], rax
-  mov r15, QWORD PTR [rbp-108]
-  mov QWORD PTR [rbp-432], r15
-  mov r15, QWORD PTR [rbp-432]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-440], rax
-  mov r15, QWORD PTR [rbp-108]
-  mov QWORD PTR [rbp-448], r15
-  mov QWORD PTR [rbp-456], 8
-  mov r15, QWORD PTR [rbp-448]
-  mov r14, QWORD PTR [rbp-456]
-  add r15, r14
   mov QWORD PTR [rbp-464], r15
   mov r15, QWORD PTR [rbp-464]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-456], rax
+  mov r15, QWORD PTR [rbp-108]
+  mov QWORD PTR [rbp-472], r15
+  mov r15, QWORD PTR [rbp-472]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-480], rax
+  mov r15, QWORD PTR [rbp-108]
+  mov QWORD PTR [rbp-488], r15
+  mov QWORD PTR [rbp-496], 8
+  mov r15, QWORD PTR [rbp-488]
+  mov r14, QWORD PTR [rbp-496]
+  add r15, r14
+  mov QWORD PTR [rbp-504], r15
+  mov r15, QWORD PTR [rbp-504]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-472], rax
-  mov r14, QWORD PTR [rbp-472]
+  mov QWORD PTR [rbp-512], rax
+  mov r14, QWORD PTR [rbp-512]
   mov r15, r14
-  mov QWORD PTR [rbp-480], r15
-  mov rdi, QWORD PTR [rbp-416]
-  mov rsi, QWORD PTR [rbp-440]
-  mov rdx, QWORD PTR [rbp-480]
+  mov QWORD PTR [rbp-520], r15
+  mov rdi, QWORD PTR [rbp-456]
+  mov rsi, QWORD PTR [rbp-480]
+  mov rdx, QWORD PTR [rbp-520]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_write
   mov r13, rax
   lea r15, [rip+.LC46]
-  mov QWORD PTR [rbp-496], r15
-  mov rdi, QWORD PTR [rbp-496]
+  mov QWORD PTR [rbp-536], r15
+  mov rdi, QWORD PTR [rbp-536]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
-  mov QWORD PTR [rbp-504], rax
+  mov QWORD PTR [rbp-544], rax
+  jmp .L425
+.L424:
+.L425:
   jmp .L423
 .L422:
 .L423:
-  jmp .L421
-.L420:
-.L421:
   lea r15, [rbp-100]
-  mov QWORD PTR [rbp-512], r15
+  mov QWORD PTR [rbp-552], r15
   movsxd r15, DWORD PTR [rbp-100]
-  mov QWORD PTR [rbp-520], r15
-  mov QWORD PTR [rbp-528], 1
-  mov r15, QWORD PTR [rbp-520]
-  mov r14, QWORD PTR [rbp-528]
+  mov QWORD PTR [rbp-560], r15
+  mov QWORD PTR [rbp-568], 1
+  mov r15, QWORD PTR [rbp-560]
+  mov r14, QWORD PTR [rbp-568]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-512]
+  mov r15, QWORD PTR [rbp-552]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L418
-.L419:
+  jmp .L420
+.L421:
+  mov rbx, 0
+  mov DWORD PTR [rbp-112], ebx
+.L426:
+  movsxd r15, DWORD PTR [rbp-112]
+  mov QWORD PTR [rbp-576], r15
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-992], r15
+  mov QWORD PTR [rbp-1008], 112
+  mov r15, QWORD PTR [rbp-992]
+  mov r14, QWORD PTR [rbp-1008]
+  add r15, r14
+  mov QWORD PTR [rbp-584], r15
+  mov r15, QWORD PTR [rbp-584]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-592], rax
+  mov r15, QWORD PTR [rbp-576]
+  mov r14, QWORD PTR [rbp-592]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-600], rax
+  mov r15, QWORD PTR [rbp-600]
+  test r15, r15
+  jz .L427
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-608], r15
+  movsxd r15, DWORD PTR [rbp-112]
+  mov QWORD PTR [rbp-616], r15
+  mov rdi, QWORD PTR [rbp-608]
+  mov rsi, QWORD PTR [rbp-616]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_obj
+  mov QWORD PTR [rbp-624], rax
+  mov r15, QWORD PTR [rbp-624]
+  mov QWORD PTR [rbp-120], r15
+  mov QWORD PTR [rbp-632], 0
+  mov r15, QWORD PTR [rbp-632]
+  mov DWORD PTR [rbp-124], r15d
+.L428:
+  movsxd r15, DWORD PTR [rbp-124]
+  mov QWORD PTR [rbp-640], r15
+  mov r15, QWORD PTR [rbp-120]
+  mov QWORD PTR [rbp-648], r15
+  mov QWORD PTR [rbp-656], 124
+  mov r15, QWORD PTR [rbp-648]
+  mov r14, QWORD PTR [rbp-656]
+  add r15, r14
+  mov QWORD PTR [rbp-664], r15
+  mov r15, QWORD PTR [rbp-664]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-672], rax
+  mov r15, QWORD PTR [rbp-640]
+  mov r14, QWORD PTR [rbp-672]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-680], rax
+  mov r15, QWORD PTR [rbp-680]
+  test r15, r15
+  jz .L429
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-120]
+  mov QWORD PTR [rbp-688], r15
+  movsxd r15, DWORD PTR [rbp-124]
+  mov QWORD PTR [rbp-696], r15
+  mov rdi, QWORD PTR [rbp-688]
+  mov rsi, QWORD PTR [rbp-696]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_reloc_get
+  mov QWORD PTR [rbp-704], rax
+  mov r15, QWORD PTR [rbp-704]
+  mov QWORD PTR [rbp-132], r15
+  mov r15, QWORD PTR [rbp-132]
+  mov QWORD PTR [rbp-712], r15
+  mov QWORD PTR [rbp-720], 12
+  mov r15, QWORD PTR [rbp-712]
+  mov r14, QWORD PTR [rbp-720]
+  add r15, r14
+  mov QWORD PTR [rbp-728], r15
+  mov r15, QWORD PTR [rbp-728]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-736], rax
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GOTPCREL]
+  mov QWORD PTR [rbp-752], r15
+  mov r15, QWORD PTR [rbp-752]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-744], rax
+  mov r15, QWORD PTR [rbp-736]
+  mov r14, QWORD PTR [rbp-744]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-760], rax
+  mov r15, QWORD PTR [rbp-760]
+  test r15, r15
+  jz .L430
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-120]
+  mov QWORD PTR [rbp-768], r15
+  mov r15, QWORD PTR [rbp-132]
+  mov QWORD PTR [rbp-776], r15
+  mov QWORD PTR [rbp-784], 8
+  mov r15, QWORD PTR [rbp-776]
+  mov r14, QWORD PTR [rbp-784]
+  add r15, r14
+  mov QWORD PTR [rbp-792], r15
+  mov r15, QWORD PTR [rbp-792]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-800], rax
+  mov rdi, QWORD PTR [rbp-768]
+  mov rsi, QWORD PTR [rbp-800]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_sym_get
+  mov QWORD PTR [rbp-808], rax
+  mov r15, QWORD PTR [rbp-808]
+  mov QWORD PTR [rbp-140], r15
+  mov r15, QWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-816], r15
+  mov QWORD PTR [rbp-824], 8
+  mov r15, QWORD PTR [rbp-816]
+  mov r14, QWORD PTR [rbp-824]
+  add r15, r14
+  mov QWORD PTR [rbp-832], r15
+  mov r15, QWORD PTR [rbp-832]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-840], rax
+  mov QWORD PTR [rbp-848], 0
+  mov r15, QWORD PTR [rbp-840]
+  mov r14, QWORD PTR [rbp-848]
+  xor rax, rax
+  cmp r15, r14
+  setg al
+  mov QWORD PTR [rbp-856], rax
+  mov r15, QWORD PTR [rbp-856]
+  test r15, r15
+  jz .L432
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-864], r15
+  mov r15, QWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-872], r15
+  mov r15, QWORD PTR [rbp-872]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-880], rax
+  mov r15, QWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-888], r15
+  mov QWORD PTR [rbp-896], 8
+  mov r15, QWORD PTR [rbp-888]
+  mov r14, QWORD PTR [rbp-896]
+  add r15, r14
+  mov QWORD PTR [rbp-904], r15
+  mov r15, QWORD PTR [rbp-904]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-912], rax
+  mov rdi, QWORD PTR [rbp-864]
+  mov rsi, QWORD PTR [rbp-880]
+  mov rdx, QWORD PTR [rbp-912]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_find
+  mov QWORD PTR [rbp-920], rax
+  mov r15, QWORD PTR [rbp-920]
+  mov DWORD PTR [rbp-144], r15d
+  movsxd r15, DWORD PTR [rbp-144]
+  mov QWORD PTR [rbp-928], r15
+  mov QWORD PTR [rbp-936], 0
+  mov r15, QWORD PTR [rbp-928]
+  mov r14, QWORD PTR [rbp-936]
+  xor rax, rax
+  cmp r15, r14
+  setge al
+  mov QWORD PTR [rbp-944], rax
+  mov r15, QWORD PTR [rbp-944]
+  test r15, r15
+  jz .L434
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-952], r15
+  movsxd r15, DWORD PTR [rbp-144]
+  mov QWORD PTR [rbp-960], r15
+  mov rdi, QWORD PTR [rbp-952]
+  mov rsi, QWORD PTR [rbp-960]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-968], rax
+  mov r15, QWORD PTR [rbp-968]
+  mov QWORD PTR [rbp-152], r15
+  mov r15, QWORD PTR [rbp-152]
+  mov QWORD PTR [rbp-976], r15
+  mov QWORD PTR [rbp-984], 36
+  mov r15, QWORD PTR [rbp-976]
+  mov r14, QWORD PTR [rbp-984]
+  add r15, r14
+  mov QWORD PTR [rbp-1040], r15
+  mov QWORD PTR [rbp-1000], 1
+  mov r15, QWORD PTR [rbp-1040]
+  mov rax, QWORD PTR [rbp-1000]
+  mov DWORD PTR [r15], eax
+  jmp .L435
+.L434:
+.L435:
+  jmp .L433
+.L432:
+.L433:
+  jmp .L431
+.L430:
+.L431:
+  lea r12, [rbp-124]
+  movsxd r15, DWORD PTR [rbp-124]
+  mov QWORD PTR [rbp-1016], r15
+  mov QWORD PTR [rbp-1024], 1
+  mov r15, QWORD PTR [rbp-1016]
+  mov r14, QWORD PTR [rbp-1024]
+  add r15, r14
+  mov QWORD PTR [rbp-1032], r15
+  mov r15, r12
+  mov rax, QWORD PTR [rbp-1032]
+  mov DWORD PTR [r15], eax
+  jmp .L428
+.L429:
+  lea r13, [rbp-112]
+  movsxd r15, DWORD PTR [rbp-112]
+  mov QWORD PTR [rbp-1048], r15
+  mov QWORD PTR [rbp-1056], 1
+  mov r15, QWORD PTR [rbp-1048]
+  mov r14, QWORD PTR [rbp-1056]
+  add r15, r14
+  mov rbx, r15
+  mov r15, r13
+  mov rax, rbx
+  mov DWORD PTR [r15], eax
+  jmp .L426
+.L427:
   mov rbx, 0
   mov rax, rbx
-  add rsp, 552
+  add rsp, 1080
   pop r15
   pop r14
   pop r13
@@ -15800,7 +16281,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-68], rbx
   mov rbx, 0
   mov DWORD PTR [rbp-72], ebx
-.L424:
+.L436:
   movsxd r15, DWORD PTR [rbp-72]
   mov QWORD PTR [rbp-136], r15
   movsxd r15, DWORD PTR [rbp-60]
@@ -15813,7 +16294,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-280], rax
   mov r15, QWORD PTR [rbp-280]
   test r15, r15
-  jz .L425
+  jz .L437
   lea r15, [rbp-68]
   mov QWORD PTR [rbp-328], r15
   mov r15, QWORD PTR [rbp-68]
@@ -15868,7 +16349,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-272], rax
   mov r15, QWORD PTR [rbp-272]
   test r15, r15
-  jz .L426
+  jz .L438
   lea r12, [rbp-68]
   mov r15, QWORD PTR [rbp-68]
   mov QWORD PTR [rbp-288], r15
@@ -15886,9 +16367,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r12
   mov rax, QWORD PTR [rbp-320]
   mov QWORD PTR [r15], rax
-  jmp .L427
-.L426:
-.L427:
+  jmp .L439
+.L438:
+.L439:
   lea r13, [rbp-68]
   mov r15, QWORD PTR [rbp-68]
   mov QWORD PTR [rbp-336], r15
@@ -15912,8 +16393,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, QWORD PTR [rbp-360]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L424
-.L425:
+  jmp .L436
+.L437:
   mov rbx, QWORD PTR [rbp-68]
   mov rax, rbx
   add rsp, 392
@@ -15943,13 +16424,13 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   push r13
   push r14
   push r15
-  sub rsp, 3064
-  mov QWORD PTR [rbp-512], rdi
-  mov QWORD PTR [rbp-504], rsi
-  mov QWORD PTR [rbp-496], rdx
-  mov QWORD PTR [rbp-488], rcx
-  mov QWORD PTR [rbp-480], r8
-  mov QWORD PTR [rbp-472], r9
+  sub rsp, 3192
+  mov QWORD PTR [rbp-520], rdi
+  mov QWORD PTR [rbp-512], rsi
+  mov QWORD PTR [rbp-504], rdx
+  mov QWORD PTR [rbp-496], rcx
+  mov QWORD PTR [rbp-488], r8
+  mov QWORD PTR [rbp-480], r9
   mov rbx, rdi
   mov QWORD PTR [rbp-56], rbx
   mov rbx, rsi
@@ -15968,13 +16449,15 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov QWORD PTR [rbp-112], rbx
   mov rbx, QWORD PTR [rbp+32]
   mov QWORD PTR [rbp-120], rbx
+  mov rbx, QWORD PTR [rbp+40]
+  mov QWORD PTR [rbp-128], rbx
   xor r10, r10
   mov rbx, QWORD PTR [rbp-56]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_dynsyms
   mov rbx, rax
-  mov QWORD PTR [rbp-128], rbx
-  mov rbx, QWORD PTR [rbp-128]
+  mov QWORD PTR [rbp-136], rbx
+  mov rbx, QWORD PTR [rbp-136]
   mov r12, 8
   mov r15, rbx
   mov r14, r12
@@ -15982,7 +16465,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, r15
   mov r15, r13
   movsxd rbx, DWORD PTR [r15]
-  mov DWORD PTR [rbp-132], ebx
+  mov DWORD PTR [rbp-140], ebx
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 184
   mov r15, rbx
@@ -15992,8 +16475,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-140], r12
-  mov rbx, QWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-148], r12
+  mov rbx, QWORD PTR [rbp-148]
   lea r12, [rip+.LC47]
   mov r13, 28
   mov rdi, rbx
@@ -16010,8 +16493,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-148], r12
-  mov rbx, QWORD PTR [rbp-148]
+  mov QWORD PTR [rbp-156], r12
+  mov rbx, QWORD PTR [rbp-156]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
@@ -16026,217 +16509,217 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-156], r12
+  mov QWORD PTR [rbp-164], r12
   mov rbx, 0
-  mov DWORD PTR [rbp-288], ebx
-.L428:
-  movsxd r15, DWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-520], r15
-  mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-584], r15
-  mov QWORD PTR [rbp-728], 156
-  mov r15, QWORD PTR [rbp-584]
-  mov r14, QWORD PTR [rbp-728]
-  add r15, r14
+  mov DWORD PTR [rbp-296], ebx
+.L440:
+  movsxd r15, DWORD PTR [rbp-296]
   mov QWORD PTR [rbp-528], r15
-  mov r15, QWORD PTR [rbp-528]
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-592], r15
+  mov QWORD PTR [rbp-736], 156
+  mov r15, QWORD PTR [rbp-592]
+  mov r14, QWORD PTR [rbp-736]
+  add r15, r14
+  mov QWORD PTR [rbp-536], r15
+  mov r15, QWORD PTR [rbp-536]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-536], rax
-  mov r15, QWORD PTR [rbp-520]
-  mov r14, QWORD PTR [rbp-536]
+  mov QWORD PTR [rbp-544], rax
+  mov r15, QWORD PTR [rbp-528]
+  mov r14, QWORD PTR [rbp-544]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-544], rax
-  mov r15, QWORD PTR [rbp-544]
-  test r15, r15
-  jz .L429
-  lea r15, [rbp-284]
-  mov QWORD PTR [rbp-552], r15
-  movsxd r15, DWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-560], r15
-  mov QWORD PTR [rbp-568], 4
-  mov r15, QWORD PTR [rbp-560]
-  mov r14, QWORD PTR [rbp-568]
-  imul r15, r14
-  mov QWORD PTR [rbp-576], r15
+  mov QWORD PTR [rbp-552], rax
   mov r15, QWORD PTR [rbp-552]
+  test r15, r15
+  jz .L441
+  lea r15, [rbp-292]
+  mov QWORD PTR [rbp-560], r15
+  movsxd r15, DWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-568], r15
+  mov QWORD PTR [rbp-576], 4
+  mov r15, QWORD PTR [rbp-568]
   mov r14, QWORD PTR [rbp-576]
-  add r15, r14
-  mov QWORD PTR [rbp-752], r15
-  mov r15, QWORD PTR [rbp-148]
-  mov QWORD PTR [rbp-592], r15
-  mov QWORD PTR [rbp-600], 8
-  mov r15, QWORD PTR [rbp-592]
-  mov r14, QWORD PTR [rbp-600]
-  add r15, r14
-  mov QWORD PTR [rbp-608], r15
-  mov r15, QWORD PTR [rbp-608]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-616], rax
-  mov r14, QWORD PTR [rbp-616]
-  movsxd r15, r14d
-  mov QWORD PTR [rbp-624], r15
-  mov r15, QWORD PTR [rbp-752]
-  mov rax, QWORD PTR [rbp-624]
-  mov DWORD PTR [r15], eax
-  mov r15, QWORD PTR [rbp-156]
-  mov QWORD PTR [rbp-632], r15
-  movsxd r15, DWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-640], r15
-  mov QWORD PTR [rbp-648], 8
-  mov r15, QWORD PTR [rbp-640]
-  mov r14, QWORD PTR [rbp-648]
   imul r15, r14
-  mov QWORD PTR [rbp-656], r15
-  mov r15, QWORD PTR [rbp-632]
-  mov r14, QWORD PTR [rbp-656]
+  mov QWORD PTR [rbp-584], r15
+  mov r15, QWORD PTR [rbp-560]
+  mov r14, QWORD PTR [rbp-584]
   add r15, r14
-  mov QWORD PTR [rbp-664], r15
-  mov r15, QWORD PTR [rbp-664]
+  mov QWORD PTR [rbp-760], r15
+  mov r15, QWORD PTR [rbp-156]
+  mov QWORD PTR [rbp-600], r15
+  mov QWORD PTR [rbp-608], 8
+  mov r15, QWORD PTR [rbp-600]
+  mov r14, QWORD PTR [rbp-608]
+  add r15, r14
+  mov QWORD PTR [rbp-616], r15
+  mov r15, QWORD PTR [rbp-616]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-672], rax
-  mov r14, QWORD PTR [rbp-672]
+  mov QWORD PTR [rbp-624], rax
+  mov r14, QWORD PTR [rbp-624]
+  movsxd r15, r14d
+  mov QWORD PTR [rbp-632], r15
+  mov r15, QWORD PTR [rbp-760]
+  mov rax, QWORD PTR [rbp-632]
+  mov DWORD PTR [r15], eax
+  mov r15, QWORD PTR [rbp-164]
+  mov QWORD PTR [rbp-640], r15
+  movsxd r15, DWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-648], r15
+  mov QWORD PTR [rbp-656], 8
+  mov r15, QWORD PTR [rbp-648]
+  mov r14, QWORD PTR [rbp-656]
+  imul r15, r14
+  mov QWORD PTR [rbp-664], r15
+  mov r15, QWORD PTR [rbp-640]
+  mov r14, QWORD PTR [rbp-664]
+  add r15, r14
+  mov QWORD PTR [rbp-672], r15
+  mov r15, QWORD PTR [rbp-672]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-680], rax
+  mov r14, QWORD PTR [rbp-680]
   mov r15, r14
-  mov QWORD PTR [rbp-680], r15
-  mov r15, QWORD PTR [rbp-680]
-  mov QWORD PTR [rbp-296], r15
-  xor r10, r10
-  mov r15, QWORD PTR [rbp-296]
   mov QWORD PTR [rbp-688], r15
-  mov rdi, QWORD PTR [rbp-688]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_strlen
-  mov QWORD PTR [rbp-696], rax
-  mov r15, QWORD PTR [rbp-696]
+  mov r15, QWORD PTR [rbp-688]
   mov QWORD PTR [rbp-304], r15
-  mov r15, QWORD PTR [rbp-148]
-  mov QWORD PTR [rbp-704], r15
-  mov r15, QWORD PTR [rbp-296]
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-304]
+  mov QWORD PTR [rbp-696], r15
+  mov rdi, QWORD PTR [rbp-696]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_strlen
+  mov QWORD PTR [rbp-704], rax
+  mov r15, QWORD PTR [rbp-704]
+  mov QWORD PTR [rbp-312], r15
+  mov r15, QWORD PTR [rbp-156]
   mov QWORD PTR [rbp-712], r15
   mov r15, QWORD PTR [rbp-304]
   mov QWORD PTR [rbp-720], r15
-  mov rdi, QWORD PTR [rbp-704]
-  mov rsi, QWORD PTR [rbp-712]
-  mov rdx, QWORD PTR [rbp-720]
+  mov r15, QWORD PTR [rbp-312]
+  mov QWORD PTR [rbp-728], r15
+  mov rdi, QWORD PTR [rbp-712]
+  mov rsi, QWORD PTR [rbp-720]
+  mov rdx, QWORD PTR [rbp-728]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov r12, rax
-  mov r15, QWORD PTR [rbp-148]
-  mov QWORD PTR [rbp-736], r15
-  mov QWORD PTR [rbp-744], 0
-  mov rdi, QWORD PTR [rbp-736]
-  mov rsi, QWORD PTR [rbp-744]
+  mov r15, QWORD PTR [rbp-156]
+  mov QWORD PTR [rbp-744], r15
+  mov QWORD PTR [rbp-752], 0
+  mov rdi, QWORD PTR [rbp-744]
+  mov rsi, QWORD PTR [rbp-752]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov r13, rax
-  lea r15, [rbp-288]
-  mov QWORD PTR [rbp-760], r15
-  movsxd r15, DWORD PTR [rbp-288]
+  lea r15, [rbp-296]
   mov QWORD PTR [rbp-768], r15
-  mov QWORD PTR [rbp-776], 1
-  mov r15, QWORD PTR [rbp-768]
-  mov r14, QWORD PTR [rbp-776]
+  movsxd r15, DWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-776], r15
+  mov QWORD PTR [rbp-784], 1
+  mov r15, QWORD PTR [rbp-776]
+  mov r14, QWORD PTR [rbp-784]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-760]
+  mov r15, QWORD PTR [rbp-768]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L428
-.L429:
+  jmp .L440
+.L441:
   mov rbx, 0
-  mov DWORD PTR [rbp-308], ebx
-.L430:
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-784], r15
-  movsxd r15, DWORD PTR [rbp-132]
-  mov QWORD PTR [rbp-832], r15
-  mov r15, QWORD PTR [rbp-784]
-  mov r14, QWORD PTR [rbp-832]
+  mov DWORD PTR [rbp-316], ebx
+.L442:
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-792], r15
+  movsxd r15, DWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-840], r15
+  mov r15, QWORD PTR [rbp-792]
+  mov r14, QWORD PTR [rbp-840]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-944], rax
-  mov r15, QWORD PTR [rbp-944]
+  mov QWORD PTR [rbp-952], rax
+  mov r15, QWORD PTR [rbp-952]
   test r15, r15
-  jz .L431
+  jz .L443
   xor r10, r10
-  mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-792], r15
-  movsxd r15, DWORD PTR [rbp-308]
+  mov r15, QWORD PTR [rbp-136]
   mov QWORD PTR [rbp-800], r15
-  mov rdi, QWORD PTR [rbp-792]
-  mov rsi, QWORD PTR [rbp-800]
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-808], r15
+  mov rdi, QWORD PTR [rbp-800]
+  mov rsi, QWORD PTR [rbp-808]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
-  mov QWORD PTR [rbp-808], rax
-  mov r15, QWORD PTR [rbp-808]
-  mov QWORD PTR [rbp-316], r15
-  mov r15, QWORD PTR [rbp-316]
-  mov QWORD PTR [rbp-816], r15
-  mov QWORD PTR [rbp-824], 32
+  mov QWORD PTR [rbp-816], rax
   mov r15, QWORD PTR [rbp-816]
-  mov r14, QWORD PTR [rbp-824]
+  mov QWORD PTR [rbp-324], r15
+  mov r15, QWORD PTR [rbp-324]
+  mov QWORD PTR [rbp-824], r15
+  mov QWORD PTR [rbp-832], 44
+  mov r15, QWORD PTR [rbp-824]
+  mov r14, QWORD PTR [rbp-832]
   add r15, r14
-  mov QWORD PTR [rbp-968], r15
-  mov r15, QWORD PTR [rbp-148]
-  mov QWORD PTR [rbp-840], r15
-  mov QWORD PTR [rbp-848], 8
-  mov r15, QWORD PTR [rbp-840]
-  mov r14, QWORD PTR [rbp-848]
+  mov QWORD PTR [rbp-976], r15
+  mov r15, QWORD PTR [rbp-156]
+  mov QWORD PTR [rbp-848], r15
+  mov QWORD PTR [rbp-856], 8
+  mov r15, QWORD PTR [rbp-848]
+  mov r14, QWORD PTR [rbp-856]
   add r15, r14
-  mov QWORD PTR [rbp-856], r15
-  mov r15, QWORD PTR [rbp-856]
+  mov QWORD PTR [rbp-864], r15
+  mov r15, QWORD PTR [rbp-864]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-864], rax
-  mov r14, QWORD PTR [rbp-864]
+  mov QWORD PTR [rbp-872], rax
+  mov r14, QWORD PTR [rbp-872]
   movsxd r15, r14d
-  mov QWORD PTR [rbp-872], r15
-  mov r15, QWORD PTR [rbp-968]
-  mov rax, QWORD PTR [rbp-872]
-  mov DWORD PTR [r15], eax
-  mov r15, QWORD PTR [rbp-148]
   mov QWORD PTR [rbp-880], r15
-  mov r15, QWORD PTR [rbp-316]
+  mov r15, QWORD PTR [rbp-976]
+  mov rax, QWORD PTR [rbp-880]
+  mov DWORD PTR [r15], eax
+  mov r15, QWORD PTR [rbp-156]
   mov QWORD PTR [rbp-888], r15
-  mov r15, QWORD PTR [rbp-888]
+  mov r15, QWORD PTR [rbp-324]
+  mov QWORD PTR [rbp-896], r15
+  mov r15, QWORD PTR [rbp-896]
   mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-896], rax
-  mov r15, QWORD PTR [rbp-316]
-  mov QWORD PTR [rbp-904], r15
-  mov QWORD PTR [rbp-912], 8
-  mov r15, QWORD PTR [rbp-904]
-  mov r14, QWORD PTR [rbp-912]
+  mov QWORD PTR [rbp-904], rax
+  mov r15, QWORD PTR [rbp-324]
+  mov QWORD PTR [rbp-912], r15
+  mov QWORD PTR [rbp-920], 8
+  mov r15, QWORD PTR [rbp-912]
+  mov r14, QWORD PTR [rbp-920]
   add r15, r14
-  mov QWORD PTR [rbp-920], r15
-  mov r15, QWORD PTR [rbp-920]
+  mov QWORD PTR [rbp-928], r15
+  mov r15, QWORD PTR [rbp-928]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-928], rax
-  mov r14, QWORD PTR [rbp-928]
+  mov QWORD PTR [rbp-936], rax
+  mov r14, QWORD PTR [rbp-936]
   mov r15, r14
-  mov QWORD PTR [rbp-936], r15
-  mov rdi, QWORD PTR [rbp-880]
-  mov rsi, QWORD PTR [rbp-896]
-  mov rdx, QWORD PTR [rbp-936]
+  mov QWORD PTR [rbp-944], r15
+  mov rdi, QWORD PTR [rbp-888]
+  mov rsi, QWORD PTR [rbp-904]
+  mov rdx, QWORD PTR [rbp-944]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov r12, rax
-  mov r15, QWORD PTR [rbp-148]
-  mov QWORD PTR [rbp-952], r15
-  mov QWORD PTR [rbp-960], 0
-  mov rdi, QWORD PTR [rbp-952]
-  mov rsi, QWORD PTR [rbp-960]
+  mov r15, QWORD PTR [rbp-156]
+  mov QWORD PTR [rbp-960], r15
+  mov QWORD PTR [rbp-968], 0
+  mov rdi, QWORD PTR [rbp-960]
+  mov rsi, QWORD PTR [rbp-968]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov r13, rax
-  lea r15, [rbp-308]
-  mov QWORD PTR [rbp-976], r15
-  movsxd r15, DWORD PTR [rbp-308]
+  lea r15, [rbp-316]
   mov QWORD PTR [rbp-984], r15
-  mov QWORD PTR [rbp-992], 1
-  mov r15, QWORD PTR [rbp-984]
-  mov r14, QWORD PTR [rbp-992]
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-992], r15
+  mov QWORD PTR [rbp-1000], 1
+  mov r15, QWORD PTR [rbp-992]
+  mov r14, QWORD PTR [rbp-1000]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-976]
+  mov r15, QWORD PTR [rbp-984]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L430
-.L431:
+  jmp .L442
+.L443:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 192
   mov r15, rbx
@@ -16246,157 +16729,187 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-324], r12
+  mov QWORD PTR [rbp-332], r12
   mov rbx, 0
-  mov DWORD PTR [rbp-328], ebx
-.L432:
-  movsxd r15, DWORD PTR [rbp-328]
-  mov QWORD PTR [rbp-1000], r15
-  mov QWORD PTR [rbp-1024], 24
-  mov r15, QWORD PTR [rbp-1000]
-  mov r14, QWORD PTR [rbp-1024]
+  mov DWORD PTR [rbp-336], ebx
+.L444:
+  movsxd r15, DWORD PTR [rbp-336]
+  mov QWORD PTR [rbp-1008], r15
+  mov QWORD PTR [rbp-1032], 24
+  mov r15, QWORD PTR [rbp-1008]
+  mov r14, QWORD PTR [rbp-1032]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-1032], rax
-  mov r15, QWORD PTR [rbp-1032]
+  mov QWORD PTR [rbp-1040], rax
+  mov r15, QWORD PTR [rbp-1040]
   test r15, r15
-  jz .L433
-  mov r15, QWORD PTR [rbp-324]
-  mov QWORD PTR [rbp-1008], r15
-  mov QWORD PTR [rbp-1016], 0
-  mov rdi, QWORD PTR [rbp-1008]
-  mov rsi, QWORD PTR [rbp-1016]
+  jz .L445
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1016], r15
+  mov QWORD PTR [rbp-1024], 0
+  mov rdi, QWORD PTR [rbp-1016]
+  mov rsi, QWORD PTR [rbp-1024]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea r12, [rbp-328]
-  movsxd r15, DWORD PTR [rbp-328]
-  mov QWORD PTR [rbp-1040], r15
-  mov QWORD PTR [rbp-1048], 1
-  mov r15, QWORD PTR [rbp-1040]
-  mov r14, QWORD PTR [rbp-1048]
+  lea r12, [rbp-336]
+  movsxd r15, DWORD PTR [rbp-336]
+  mov QWORD PTR [rbp-1048], r15
+  mov QWORD PTR [rbp-1056], 1
+  mov r15, QWORD PTR [rbp-1048]
+  mov r14, QWORD PTR [rbp-1056]
   add r15, r14
   mov r13, r15
   mov r15, r12
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L432
-.L433:
-  lea rbx, [rbp-308]
+  jmp .L444
+.L445:
+  lea rbx, [rbp-316]
   mov r12, 0
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-.L434:
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-1056], r15
-  movsxd r15, DWORD PTR [rbp-132]
-  mov QWORD PTR [rbp-1104], r15
-  mov r15, QWORD PTR [rbp-1056]
-  mov r14, QWORD PTR [rbp-1104]
+.L446:
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-1064], r15
+  movsxd r15, DWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-1112], r15
+  mov r15, QWORD PTR [rbp-1064]
+  mov r14, QWORD PTR [rbp-1112]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-1184], rax
-  mov r15, QWORD PTR [rbp-1184]
+  mov QWORD PTR [rbp-1192], rax
+  mov r15, QWORD PTR [rbp-1192]
   test r15, r15
-  jz .L435
+  jz .L447
   xor r10, r10
-  mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-1064], r15
-  movsxd r15, DWORD PTR [rbp-308]
+  mov r15, QWORD PTR [rbp-136]
   mov QWORD PTR [rbp-1072], r15
-  mov rdi, QWORD PTR [rbp-1064]
-  mov rsi, QWORD PTR [rbp-1072]
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-1080], r15
+  mov rdi, QWORD PTR [rbp-1072]
+  mov rsi, QWORD PTR [rbp-1080]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
-  mov QWORD PTR [rbp-1080], rax
-  mov r15, QWORD PTR [rbp-1080]
-  mov QWORD PTR [rbp-336], r15
-  mov r15, QWORD PTR [rbp-336]
-  mov QWORD PTR [rbp-1088], r15
-  mov QWORD PTR [rbp-1096], 28
+  mov QWORD PTR [rbp-1088], rax
   mov r15, QWORD PTR [rbp-1088]
-  mov r14, QWORD PTR [rbp-1096]
+  mov QWORD PTR [rbp-344], r15
+  mov r15, QWORD PTR [rbp-344]
+  mov QWORD PTR [rbp-1096], r15
+  mov QWORD PTR [rbp-1104], 40
+  mov r15, QWORD PTR [rbp-1096]
+  mov r14, QWORD PTR [rbp-1104]
   add r15, r14
-  mov QWORD PTR [rbp-1208], r15
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-1112], r15
-  mov QWORD PTR [rbp-1120], 1
-  mov r15, QWORD PTR [rbp-1112]
-  mov r14, QWORD PTR [rbp-1120]
+  mov QWORD PTR [rbp-1264], r15
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-1120], r15
+  mov QWORD PTR [rbp-1128], 1
+  mov r15, QWORD PTR [rbp-1120]
+  mov r14, QWORD PTR [rbp-1128]
   add r15, r14
-  mov QWORD PTR [rbp-1128], r15
-  mov r15, QWORD PTR [rbp-1208]
-  mov rax, QWORD PTR [rbp-1128]
-  mov DWORD PTR [r15], eax
-  mov r15, QWORD PTR [rbp-324]
   mov QWORD PTR [rbp-1136], r15
-  mov r15, QWORD PTR [rbp-336]
+  mov r15, QWORD PTR [rbp-1264]
+  mov rax, QWORD PTR [rbp-1136]
+  mov DWORD PTR [r15], eax
+  mov r15, QWORD PTR [rbp-332]
   mov QWORD PTR [rbp-1144], r15
-  mov QWORD PTR [rbp-1152], 32
-  mov r15, QWORD PTR [rbp-1144]
-  mov r14, QWORD PTR [rbp-1152]
+  mov r15, QWORD PTR [rbp-344]
+  mov QWORD PTR [rbp-1152], r15
+  mov QWORD PTR [rbp-1160], 44
+  mov r15, QWORD PTR [rbp-1152]
+  mov r14, QWORD PTR [rbp-1160]
   add r15, r14
-  mov QWORD PTR [rbp-1160], r15
-  mov r15, QWORD PTR [rbp-1160]
+  mov QWORD PTR [rbp-1168], r15
+  mov r15, QWORD PTR [rbp-1168]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-1168], rax
-  mov r14, QWORD PTR [rbp-1168]
+  mov QWORD PTR [rbp-1176], rax
+  mov r14, QWORD PTR [rbp-1176]
   mov r15, r14
-  mov QWORD PTR [rbp-1176], r15
-  mov rdi, QWORD PTR [rbp-1136]
-  mov rsi, QWORD PTR [rbp-1176]
+  mov QWORD PTR [rbp-1184], r15
+  mov rdi, QWORD PTR [rbp-1144]
+  mov rsi, QWORD PTR [rbp-1184]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov r12, rax
-  mov r15, QWORD PTR [rbp-324]
-  mov QWORD PTR [rbp-1192], r15
-  mov QWORD PTR [rbp-1200], 18
-  mov rdi, QWORD PTR [rbp-1192]
-  mov rsi, QWORD PTR [rbp-1200]
+  mov r15, QWORD PTR [rbp-344]
+  mov QWORD PTR [rbp-1200], r15
+  mov QWORD PTR [rbp-1208], 36
+  mov r15, QWORD PTR [rbp-1200]
+  mov r14, QWORD PTR [rbp-1208]
+  add r15, r14
+  mov QWORD PTR [rbp-1216], r15
+  mov r15, QWORD PTR [rbp-1216]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-1224], rax
+  mov QWORD PTR [rbp-1232], 1
+  mov r15, QWORD PTR [rbp-1224]
+  mov r14, QWORD PTR [rbp-1232]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-1240], rax
+  mov r15, QWORD PTR [rbp-1240]
+  test r15, r15
+  jz .L448
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1248], r15
+  mov QWORD PTR [rbp-1256], 17
+  mov rdi, QWORD PTR [rbp-1248]
+  mov rsi, QWORD PTR [rbp-1256]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov r13, rax
-  mov r15, QWORD PTR [rbp-324]
-  mov QWORD PTR [rbp-1216], r15
-  mov QWORD PTR [rbp-1224], 0
-  mov rdi, QWORD PTR [rbp-1216]
-  mov rsi, QWORD PTR [rbp-1224]
+  jmp .L449
+.L448:
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1272], r15
+  mov QWORD PTR [rbp-1280], 18
+  mov rdi, QWORD PTR [rbp-1272]
+  mov rsi, QWORD PTR [rbp-1280]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
-  mov QWORD PTR [rbp-1232], rax
-  mov r15, QWORD PTR [rbp-324]
-  mov QWORD PTR [rbp-1240], r15
-  mov QWORD PTR [rbp-1248], 0
-  mov rdi, QWORD PTR [rbp-1240]
-  mov rsi, QWORD PTR [rbp-1248]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
-  mov QWORD PTR [rbp-1256], rax
-  mov r15, QWORD PTR [rbp-324]
-  mov QWORD PTR [rbp-1264], r15
-  mov QWORD PTR [rbp-1272], 0
-  mov rdi, QWORD PTR [rbp-1264]
-  mov rsi, QWORD PTR [rbp-1272]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
-  mov QWORD PTR [rbp-1280], rax
-  mov r15, QWORD PTR [rbp-324]
-  mov QWORD PTR [rbp-1288], r15
-  mov QWORD PTR [rbp-1296], 0
-  mov rdi, QWORD PTR [rbp-1288]
-  mov rsi, QWORD PTR [rbp-1296]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
-  mov QWORD PTR [rbp-1304], rax
-  lea r15, [rbp-308]
-  mov QWORD PTR [rbp-1312], r15
-  movsxd r15, DWORD PTR [rbp-308]
+  mov QWORD PTR [rbp-1288], rax
+.L449:
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1296], r15
+  mov QWORD PTR [rbp-1304], 0
+  mov rdi, QWORD PTR [rbp-1296]
+  mov rsi, QWORD PTR [rbp-1304]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
+  mov QWORD PTR [rbp-1312], rax
+  mov r15, QWORD PTR [rbp-332]
   mov QWORD PTR [rbp-1320], r15
-  mov QWORD PTR [rbp-1328], 1
-  mov r15, QWORD PTR [rbp-1320]
-  mov r14, QWORD PTR [rbp-1328]
+  mov QWORD PTR [rbp-1328], 0
+  mov rdi, QWORD PTR [rbp-1320]
+  mov rsi, QWORD PTR [rbp-1328]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
+  mov QWORD PTR [rbp-1336], rax
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1344], r15
+  mov QWORD PTR [rbp-1352], 0
+  mov rdi, QWORD PTR [rbp-1344]
+  mov rsi, QWORD PTR [rbp-1352]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov QWORD PTR [rbp-1360], rax
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1368], r15
+  mov QWORD PTR [rbp-1376], 0
+  mov rdi, QWORD PTR [rbp-1368]
+  mov rsi, QWORD PTR [rbp-1376]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov QWORD PTR [rbp-1384], rax
+  lea r15, [rbp-316]
+  mov QWORD PTR [rbp-1392], r15
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-1400], r15
+  mov QWORD PTR [rbp-1408], 1
+  mov r15, QWORD PTR [rbp-1400]
+  mov r14, QWORD PTR [rbp-1408]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-1312]
+  mov r15, QWORD PTR [rbp-1392]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L434
-.L435:
+  jmp .L446
+.L447:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 208
   mov r15, rbx
@@ -16406,17 +16919,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-344], r12
-  movsxd rbx, DWORD PTR [rbp-132]
+  mov QWORD PTR [rbp-352], r12
+  movsxd rbx, DWORD PTR [rbp-140]
   mov r12, 1
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov DWORD PTR [rbp-348], r13d
-  movsxd rbx, DWORD PTR [rbp-132]
-  mov DWORD PTR [rbp-352], ebx
-  movsxd rbx, DWORD PTR [rbp-352]
+  mov DWORD PTR [rbp-356], r13d
+  movsxd rbx, DWORD PTR [rbp-140]
+  mov DWORD PTR [rbp-360], ebx
+  movsxd rbx, DWORD PTR [rbp-360]
   mov r12, 1
   mov r15, rbx
   mov r14, r12
@@ -16426,593 +16939,593 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L436
-  lea rbx, [rbp-352]
+  jz .L450
+  lea rbx, [rbp-360]
   mov r12, 1
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-  jmp .L437
-.L436:
-.L437:
-  mov rbx, QWORD PTR [rbp-344]
-  movsxd r12, DWORD PTR [rbp-352]
+  jmp .L451
+.L450:
+.L451:
+  mov rbx, QWORD PTR [rbp-352]
+  movsxd r12, DWORD PTR [rbp-360]
   mov r13, r12
   mov rdi, rbx
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-344]
-  movsxd r12, DWORD PTR [rbp-348]
+  mov rbx, QWORD PTR [rbp-352]
+  movsxd r12, DWORD PTR [rbp-356]
   mov r13, r12
   mov rdi, rbx
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
   mov rbx, 0
-  mov DWORD PTR [rbp-356], ebx
-.L438:
-  movsxd r15, DWORD PTR [rbp-356]
-  mov QWORD PTR [rbp-1336], r15
-  movsxd r15, DWORD PTR [rbp-352]
-  mov QWORD PTR [rbp-1360], r15
-  mov r15, QWORD PTR [rbp-1336]
-  mov r14, QWORD PTR [rbp-1360]
-  xor rax, rax
-  cmp r15, r14
-  setl al
-  mov QWORD PTR [rbp-1368], rax
-  mov r15, QWORD PTR [rbp-1368]
-  test r15, r15
-  jz .L439
-  mov r15, QWORD PTR [rbp-344]
-  mov QWORD PTR [rbp-1344], r15
-  mov QWORD PTR [rbp-1352], 0
-  mov rdi, QWORD PTR [rbp-1344]
-  mov rsi, QWORD PTR [rbp-1352]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
-  mov rbx, rax
-  lea r12, [rbp-356]
-  movsxd r15, DWORD PTR [rbp-356]
-  mov QWORD PTR [rbp-1376], r15
-  mov QWORD PTR [rbp-1384], 1
-  mov r15, QWORD PTR [rbp-1376]
-  mov r14, QWORD PTR [rbp-1384]
-  add r15, r14
-  mov r13, r15
-  mov r15, r12
-  mov rax, r13
-  mov DWORD PTR [r15], eax
-  jmp .L438
-.L439:
-  mov rbx, 0
-  mov DWORD PTR [rbp-360], ebx
-.L440:
-  movsxd r15, DWORD PTR [rbp-360]
-  mov QWORD PTR [rbp-1392], r15
-  movsxd r15, DWORD PTR [rbp-348]
+  mov DWORD PTR [rbp-364], ebx
+.L452:
+  movsxd r15, DWORD PTR [rbp-364]
   mov QWORD PTR [rbp-1416], r15
-  mov r15, QWORD PTR [rbp-1392]
-  mov r14, QWORD PTR [rbp-1416]
+  movsxd r15, DWORD PTR [rbp-360]
+  mov QWORD PTR [rbp-1440], r15
+  mov r15, QWORD PTR [rbp-1416]
+  mov r14, QWORD PTR [rbp-1440]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-1424], rax
-  mov r15, QWORD PTR [rbp-1424]
+  mov QWORD PTR [rbp-1448], rax
+  mov r15, QWORD PTR [rbp-1448]
   test r15, r15
-  jz .L441
-  mov r15, QWORD PTR [rbp-344]
-  mov QWORD PTR [rbp-1400], r15
-  mov QWORD PTR [rbp-1408], 0
-  mov rdi, QWORD PTR [rbp-1400]
-  mov rsi, QWORD PTR [rbp-1408]
+  jz .L453
+  mov r15, QWORD PTR [rbp-352]
+  mov QWORD PTR [rbp-1424], r15
+  mov QWORD PTR [rbp-1432], 0
+  mov rdi, QWORD PTR [rbp-1424]
+  mov rsi, QWORD PTR [rbp-1432]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea r12, [rbp-360]
-  movsxd r15, DWORD PTR [rbp-360]
-  mov QWORD PTR [rbp-1432], r15
-  mov QWORD PTR [rbp-1440], 1
-  mov r15, QWORD PTR [rbp-1432]
-  mov r14, QWORD PTR [rbp-1440]
+  lea r12, [rbp-364]
+  movsxd r15, DWORD PTR [rbp-364]
+  mov QWORD PTR [rbp-1456], r15
+  mov QWORD PTR [rbp-1464], 1
+  mov r15, QWORD PTR [rbp-1456]
+  mov r14, QWORD PTR [rbp-1464]
   add r15, r14
   mov r13, r15
   mov r15, r12
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L440
-.L441:
-  mov rbx, QWORD PTR [rbp-344]
+  jmp .L452
+.L453:
+  mov rbx, 0
+  mov DWORD PTR [rbp-368], ebx
+.L454:
+  movsxd r15, DWORD PTR [rbp-368]
+  mov QWORD PTR [rbp-1472], r15
+  movsxd r15, DWORD PTR [rbp-356]
+  mov QWORD PTR [rbp-1496], r15
+  mov r15, QWORD PTR [rbp-1472]
+  mov r14, QWORD PTR [rbp-1496]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-1504], rax
+  mov r15, QWORD PTR [rbp-1504]
+  test r15, r15
+  jz .L455
+  mov r15, QWORD PTR [rbp-352]
+  mov QWORD PTR [rbp-1480], r15
+  mov QWORD PTR [rbp-1488], 0
+  mov rdi, QWORD PTR [rbp-1480]
+  mov rsi, QWORD PTR [rbp-1488]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
+  mov rbx, rax
+  lea r12, [rbp-368]
+  movsxd r15, DWORD PTR [rbp-368]
+  mov QWORD PTR [rbp-1512], r15
+  mov QWORD PTR [rbp-1520], 1
+  mov r15, QWORD PTR [rbp-1512]
+  mov r14, QWORD PTR [rbp-1520]
+  add r15, r14
+  mov r13, r15
+  mov r15, r12
+  mov rax, r13
+  mov DWORD PTR [r15], eax
+  jmp .L454
+.L455:
+  mov rbx, QWORD PTR [rbp-352]
   mov r15, rbx
   mov r12, QWORD PTR [r15]
-  mov QWORD PTR [rbp-368], r12
-  lea rbx, [rbp-308]
+  mov QWORD PTR [rbp-376], r12
+  lea rbx, [rbp-316]
   mov r12, 0
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-.L442:
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-1448], r15
-  movsxd r15, DWORD PTR [rbp-132]
-  mov QWORD PTR [rbp-1712], r15
-  mov r15, QWORD PTR [rbp-1448]
-  mov r14, QWORD PTR [rbp-1712]
+.L456:
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-1528], r15
+  movsxd r15, DWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-1792], r15
+  mov r15, QWORD PTR [rbp-1528]
+  mov r14, QWORD PTR [rbp-1792]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-1784], rax
-  mov r15, QWORD PTR [rbp-1784]
+  mov QWORD PTR [rbp-1864], rax
+  mov r15, QWORD PTR [rbp-1864]
   test r15, r15
-  jz .L443
+  jz .L457
   xor r10, r10
-  mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-1456], r15
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-1464], r15
-  mov rdi, QWORD PTR [rbp-1456]
-  mov rsi, QWORD PTR [rbp-1464]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
-  mov QWORD PTR [rbp-1472], rax
-  mov r15, QWORD PTR [rbp-1472]
-  mov QWORD PTR [rbp-376], r15
-  xor r10, r10
-  mov r15, QWORD PTR [rbp-376]
-  mov QWORD PTR [rbp-1480], r15
-  mov r15, QWORD PTR [rbp-1480]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-1488], rax
-  mov r15, QWORD PTR [rbp-376]
-  mov QWORD PTR [rbp-1496], r15
-  mov QWORD PTR [rbp-1504], 8
-  mov r15, QWORD PTR [rbp-1496]
-  mov r14, QWORD PTR [rbp-1504]
-  add r15, r14
-  mov QWORD PTR [rbp-1512], r15
-  mov r15, QWORD PTR [rbp-1512]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-1520], rax
-  mov rdi, QWORD PTR [rbp-1488]
-  mov rsi, QWORD PTR [rbp-1520]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_elf_hash
-  mov QWORD PTR [rbp-1528], rax
-  mov r15, QWORD PTR [rbp-1528]
-  mov QWORD PTR [rbp-384], r15
-  mov r15, QWORD PTR [rbp-384]
+  mov r15, QWORD PTR [rbp-136]
   mov QWORD PTR [rbp-1536], r15
-  movsxd r15, DWORD PTR [rbp-352]
+  movsxd r15, DWORD PTR [rbp-316]
   mov QWORD PTR [rbp-1544], r15
-  mov r14, QWORD PTR [rbp-1544]
-  mov r15, r14
-  mov QWORD PTR [rbp-1552], r15
-  mov rax, QWORD PTR [rbp-1536]
+  mov rdi, QWORD PTR [rbp-1536]
+  mov rsi, QWORD PTR [rbp-1544]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-1552], rax
   mov r15, QWORD PTR [rbp-1552]
-  push rdx
-  cqo
-  idiv r15
-  mov r15, rdx
-  pop rdx
+  mov QWORD PTR [rbp-384], r15
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-384]
   mov QWORD PTR [rbp-1560], r15
-  mov r14, QWORD PTR [rbp-1560]
-  movsxd r15, r14d
-  mov QWORD PTR [rbp-1568], r15
-  mov r15, QWORD PTR [rbp-1568]
-  mov DWORD PTR [rbp-388], r15d
-  movsxd r15, DWORD PTR [rbp-308]
+  mov r15, QWORD PTR [rbp-1560]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-1568], rax
+  mov r15, QWORD PTR [rbp-384]
   mov QWORD PTR [rbp-1576], r15
-  mov QWORD PTR [rbp-1584], 1
+  mov QWORD PTR [rbp-1584], 8
   mov r15, QWORD PTR [rbp-1576]
   mov r14, QWORD PTR [rbp-1584]
   add r15, r14
   mov QWORD PTR [rbp-1592], r15
   mov r15, QWORD PTR [rbp-1592]
-  mov DWORD PTR [rbp-392], r15d
-  mov QWORD PTR [rbp-1600], 8
-  movsxd r15, DWORD PTR [rbp-388]
-  mov QWORD PTR [rbp-1608], r15
-  mov r14, QWORD PTR [rbp-1608]
-  mov r15, r14
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-1600], rax
+  mov rdi, QWORD PTR [rbp-1568]
+  mov rsi, QWORD PTR [rbp-1600]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_elf_hash
+  mov QWORD PTR [rbp-1608], rax
+  mov r15, QWORD PTR [rbp-1608]
+  mov QWORD PTR [rbp-392], r15
+  mov r15, QWORD PTR [rbp-392]
   mov QWORD PTR [rbp-1616], r15
-  mov QWORD PTR [rbp-1624], 4
-  mov r15, QWORD PTR [rbp-1616]
+  movsxd r15, DWORD PTR [rbp-360]
+  mov QWORD PTR [rbp-1624], r15
   mov r14, QWORD PTR [rbp-1624]
-  imul r15, r14
+  mov r15, r14
   mov QWORD PTR [rbp-1632], r15
-  mov r15, QWORD PTR [rbp-1600]
-  mov r14, QWORD PTR [rbp-1632]
-  add r15, r14
+  mov rax, QWORD PTR [rbp-1616]
+  mov r15, QWORD PTR [rbp-1632]
+  push rdx
+  cqo
+  idiv r15
+  mov r15, rdx
+  pop rdx
   mov QWORD PTR [rbp-1640], r15
-  mov r15, QWORD PTR [rbp-1640]
-  mov QWORD PTR [rbp-400], r15
-  xor r10, r10
-  mov r15, QWORD PTR [rbp-368]
+  mov r14, QWORD PTR [rbp-1640]
+  movsxd r15, r14d
   mov QWORD PTR [rbp-1648], r15
-  mov r15, QWORD PTR [rbp-400]
+  mov r15, QWORD PTR [rbp-1648]
+  mov DWORD PTR [rbp-396], r15d
+  movsxd r15, DWORD PTR [rbp-316]
   mov QWORD PTR [rbp-1656], r15
-  mov rdi, QWORD PTR [rbp-1648]
-  mov rsi, QWORD PTR [rbp-1656]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_u32
-  mov QWORD PTR [rbp-1664], rax
-  mov r15, QWORD PTR [rbp-1664]
-  mov QWORD PTR [rbp-408], r15
-  mov r15, QWORD PTR [rbp-408]
+  mov QWORD PTR [rbp-1664], 1
+  mov r15, QWORD PTR [rbp-1656]
+  mov r14, QWORD PTR [rbp-1664]
+  add r15, r14
   mov QWORD PTR [rbp-1672], r15
-  mov QWORD PTR [rbp-1680], 0
   mov r15, QWORD PTR [rbp-1672]
-  mov r14, QWORD PTR [rbp-1680]
+  mov DWORD PTR [rbp-400], r15d
+  mov QWORD PTR [rbp-1680], 8
+  movsxd r15, DWORD PTR [rbp-396]
+  mov QWORD PTR [rbp-1688], r15
+  mov r14, QWORD PTR [rbp-1688]
+  mov r15, r14
+  mov QWORD PTR [rbp-1696], r15
+  mov QWORD PTR [rbp-1704], 4
+  mov r15, QWORD PTR [rbp-1696]
+  mov r14, QWORD PTR [rbp-1704]
+  imul r15, r14
+  mov QWORD PTR [rbp-1712], r15
+  mov r15, QWORD PTR [rbp-1680]
+  mov r14, QWORD PTR [rbp-1712]
+  add r15, r14
+  mov QWORD PTR [rbp-1720], r15
+  mov r15, QWORD PTR [rbp-1720]
+  mov QWORD PTR [rbp-408], r15
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-1728], r15
+  mov r15, QWORD PTR [rbp-408]
+  mov QWORD PTR [rbp-1736], r15
+  mov rdi, QWORD PTR [rbp-1728]
+  mov rsi, QWORD PTR [rbp-1736]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_u32
+  mov QWORD PTR [rbp-1744], rax
+  mov r15, QWORD PTR [rbp-1744]
+  mov QWORD PTR [rbp-416], r15
+  mov r15, QWORD PTR [rbp-416]
+  mov QWORD PTR [rbp-1752], r15
+  mov QWORD PTR [rbp-1760], 0
+  mov r15, QWORD PTR [rbp-1752]
+  mov r14, QWORD PTR [rbp-1760]
   xor rax, rax
   cmp r15, r14
   sete al
-  mov QWORD PTR [rbp-1688], rax
-  mov r15, QWORD PTR [rbp-1688]
+  mov QWORD PTR [rbp-1768], rax
+  mov r15, QWORD PTR [rbp-1768]
   test r15, r15
-  jz .L444
-  mov r15, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-1696], r15
-  mov r15, QWORD PTR [rbp-400]
-  mov QWORD PTR [rbp-1704], r15
-  mov r15, QWORD PTR [rbp-1696]
-  mov r14, QWORD PTR [rbp-1704]
-  add r15, r14
-  mov QWORD PTR [rbp-1872], r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-1720], r15
-  mov QWORD PTR [rbp-1728], 255
-  mov r14, QWORD PTR [rbp-1720]
-  mov r15, QWORD PTR [rbp-1728]
-  and r14, r15
-  mov QWORD PTR [rbp-1736], r14
-  mov r14, QWORD PTR [rbp-1736]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-1744], r15
-  mov r15, QWORD PTR [rbp-1872]
-  mov rax, QWORD PTR [rbp-1744]
-  mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-1752], r15
-  mov r15, QWORD PTR [rbp-400]
-  mov QWORD PTR [rbp-1760], r15
-  mov QWORD PTR [rbp-1768], 1
-  mov r15, QWORD PTR [rbp-1760]
-  mov r14, QWORD PTR [rbp-1768]
-  add r15, r14
+  jz .L458
+  mov r15, QWORD PTR [rbp-376]
   mov QWORD PTR [rbp-1776], r15
-  mov r15, QWORD PTR [rbp-1752]
-  mov r14, QWORD PTR [rbp-1776]
-  add r15, r14
-  mov r12, r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-1792], r15
-  mov QWORD PTR [rbp-1800], 8
-  mov rcx, QWORD PTR [rbp-1800]
-  mov r15, QWORD PTR [rbp-1792]
-  shr r15, cl
-  mov QWORD PTR [rbp-1808], r15
-  mov QWORD PTR [rbp-1816], 255
-  mov r14, QWORD PTR [rbp-1808]
-  mov r15, QWORD PTR [rbp-1816]
-  and r14, r15
-  mov QWORD PTR [rbp-1824], r14
-  mov r14, QWORD PTR [rbp-1824]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-1832], r15
-  mov r15, r12
-  mov rax, QWORD PTR [rbp-1832]
-  mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-1840], r15
-  mov r15, QWORD PTR [rbp-400]
-  mov QWORD PTR [rbp-1848], r15
-  mov QWORD PTR [rbp-1856], 2
-  mov r15, QWORD PTR [rbp-1848]
-  mov r14, QWORD PTR [rbp-1856]
-  add r15, r14
-  mov QWORD PTR [rbp-1864], r15
-  mov r15, QWORD PTR [rbp-1840]
-  mov r14, QWORD PTR [rbp-1864]
-  add r15, r14
-  mov r13, r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-1880], r15
-  mov QWORD PTR [rbp-1888], 16
-  mov rcx, QWORD PTR [rbp-1888]
-  mov r15, QWORD PTR [rbp-1880]
-  shr r15, cl
-  mov QWORD PTR [rbp-1896], r15
-  mov QWORD PTR [rbp-1904], 255
-  mov r14, QWORD PTR [rbp-1896]
-  mov r15, QWORD PTR [rbp-1904]
-  and r14, r15
-  mov QWORD PTR [rbp-1912], r14
-  mov r14, QWORD PTR [rbp-1912]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-1920], r15
-  mov r15, r13
-  mov rax, QWORD PTR [rbp-1920]
-  mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-1928], r15
-  mov r15, QWORD PTR [rbp-400]
-  mov QWORD PTR [rbp-1936], r15
-  mov QWORD PTR [rbp-1944], 3
-  mov r15, QWORD PTR [rbp-1936]
-  mov r14, QWORD PTR [rbp-1944]
+  mov r15, QWORD PTR [rbp-408]
+  mov QWORD PTR [rbp-1784], r15
+  mov r15, QWORD PTR [rbp-1776]
+  mov r14, QWORD PTR [rbp-1784]
   add r15, r14
   mov QWORD PTR [rbp-1952], r15
-  mov r15, QWORD PTR [rbp-1928]
-  mov r14, QWORD PTR [rbp-1952]
-  add r15, r14
-  mov QWORD PTR [rbp-1960], r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-1968], r15
-  mov QWORD PTR [rbp-1976], 24
-  mov rcx, QWORD PTR [rbp-1976]
-  mov r15, QWORD PTR [rbp-1968]
-  shr r15, cl
-  mov QWORD PTR [rbp-1984], r15
-  mov QWORD PTR [rbp-1992], 255
-  mov r14, QWORD PTR [rbp-1984]
-  mov r15, QWORD PTR [rbp-1992]
+  movsxd r15, DWORD PTR [rbp-400]
+  mov QWORD PTR [rbp-1800], r15
+  mov QWORD PTR [rbp-1808], 255
+  mov r14, QWORD PTR [rbp-1800]
+  mov r15, QWORD PTR [rbp-1808]
   and r14, r15
-  mov QWORD PTR [rbp-2000], r14
-  mov r14, QWORD PTR [rbp-2000]
+  mov QWORD PTR [rbp-1816], r14
+  mov r14, QWORD PTR [rbp-1816]
   movzx r15, r14b
-  mov QWORD PTR [rbp-2008], r15
-  mov r15, QWORD PTR [rbp-1960]
-  mov rax, QWORD PTR [rbp-2008]
+  mov QWORD PTR [rbp-1824], r15
+  mov r15, QWORD PTR [rbp-1952]
+  mov rax, QWORD PTR [rbp-1824]
   mov BYTE PTR [r15], al
-  jmp .L445
-.L444:
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-1832], r15
+  mov r15, QWORD PTR [rbp-408]
+  mov QWORD PTR [rbp-1840], r15
+  mov QWORD PTR [rbp-1848], 1
+  mov r15, QWORD PTR [rbp-1840]
+  mov r14, QWORD PTR [rbp-1848]
+  add r15, r14
+  mov QWORD PTR [rbp-1856], r15
+  mov r15, QWORD PTR [rbp-1832]
+  mov r14, QWORD PTR [rbp-1856]
+  add r15, r14
+  mov r12, r15
+  movsxd r15, DWORD PTR [rbp-400]
+  mov QWORD PTR [rbp-1872], r15
+  mov QWORD PTR [rbp-1880], 8
+  mov rcx, QWORD PTR [rbp-1880]
+  mov r15, QWORD PTR [rbp-1872]
+  shr r15, cl
+  mov QWORD PTR [rbp-1888], r15
+  mov QWORD PTR [rbp-1896], 255
+  mov r14, QWORD PTR [rbp-1888]
+  mov r15, QWORD PTR [rbp-1896]
+  and r14, r15
+  mov QWORD PTR [rbp-1904], r14
+  mov r14, QWORD PTR [rbp-1904]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-1912], r15
+  mov r15, r12
+  mov rax, QWORD PTR [rbp-1912]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-1920], r15
+  mov r15, QWORD PTR [rbp-408]
+  mov QWORD PTR [rbp-1928], r15
+  mov QWORD PTR [rbp-1936], 2
+  mov r15, QWORD PTR [rbp-1928]
+  mov r14, QWORD PTR [rbp-1936]
+  add r15, r14
+  mov QWORD PTR [rbp-1944], r15
+  mov r15, QWORD PTR [rbp-1920]
+  mov r14, QWORD PTR [rbp-1944]
+  add r15, r14
+  mov r13, r15
+  movsxd r15, DWORD PTR [rbp-400]
+  mov QWORD PTR [rbp-1960], r15
+  mov QWORD PTR [rbp-1968], 16
+  mov rcx, QWORD PTR [rbp-1968]
+  mov r15, QWORD PTR [rbp-1960]
+  shr r15, cl
+  mov QWORD PTR [rbp-1976], r15
+  mov QWORD PTR [rbp-1984], 255
+  mov r14, QWORD PTR [rbp-1976]
+  mov r15, QWORD PTR [rbp-1984]
+  and r14, r15
+  mov QWORD PTR [rbp-1992], r14
+  mov r14, QWORD PTR [rbp-1992]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2000], r15
+  mov r15, r13
+  mov rax, QWORD PTR [rbp-2000]
+  mov BYTE PTR [r15], al
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-2008], r15
   mov r15, QWORD PTR [rbp-408]
   mov QWORD PTR [rbp-2016], r15
-  mov r14, QWORD PTR [rbp-2016]
-  movsxd r15, r14d
-  mov QWORD PTR [rbp-2024], r15
-  mov r15, QWORD PTR [rbp-2024]
-  mov DWORD PTR [rbp-412], r15d
-  mov QWORD PTR [rbp-2032], 8
-  movsxd r15, DWORD PTR [rbp-352]
+  mov QWORD PTR [rbp-2024], 3
+  mov r15, QWORD PTR [rbp-2016]
+  mov r14, QWORD PTR [rbp-2024]
+  add r15, r14
+  mov QWORD PTR [rbp-2032], r15
+  mov r15, QWORD PTR [rbp-2008]
+  mov r14, QWORD PTR [rbp-2032]
+  add r15, r14
   mov QWORD PTR [rbp-2040], r15
-  mov r14, QWORD PTR [rbp-2040]
-  mov r15, r14
+  movsxd r15, DWORD PTR [rbp-400]
   mov QWORD PTR [rbp-2048], r15
-  mov QWORD PTR [rbp-2056], 4
+  mov QWORD PTR [rbp-2056], 24
+  mov rcx, QWORD PTR [rbp-2056]
   mov r15, QWORD PTR [rbp-2048]
-  mov r14, QWORD PTR [rbp-2056]
-  imul r15, r14
+  shr r15, cl
   mov QWORD PTR [rbp-2064], r15
-  mov r15, QWORD PTR [rbp-2032]
+  mov QWORD PTR [rbp-2072], 255
   mov r14, QWORD PTR [rbp-2064]
-  add r15, r14
-  mov QWORD PTR [rbp-2072], r15
-  movsxd r15, DWORD PTR [rbp-412]
-  mov QWORD PTR [rbp-2080], r15
-  mov r14, QWORD PTR [rbp-2080]
-  mov r15, r14
-  mov QWORD PTR [rbp-2088], r15
-  mov QWORD PTR [rbp-2096], 4
-  mov r15, QWORD PTR [rbp-2088]
-  mov r14, QWORD PTR [rbp-2096]
-  imul r15, r14
-  mov QWORD PTR [rbp-2104], r15
   mov r15, QWORD PTR [rbp-2072]
-  mov r14, QWORD PTR [rbp-2104]
-  add r15, r14
-  mov QWORD PTR [rbp-2112], r15
-  mov r15, QWORD PTR [rbp-2112]
-  mov QWORD PTR [rbp-420], r15
-  xor r10, r10
-  mov r15, QWORD PTR [rbp-368]
+  and r14, r15
+  mov QWORD PTR [rbp-2080], r14
+  mov r14, QWORD PTR [rbp-2080]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2088], r15
+  mov r15, QWORD PTR [rbp-2040]
+  mov rax, QWORD PTR [rbp-2088]
+  mov BYTE PTR [r15], al
+  jmp .L459
+.L458:
+  mov r15, QWORD PTR [rbp-416]
+  mov QWORD PTR [rbp-2096], r15
+  mov r14, QWORD PTR [rbp-2096]
+  movsxd r15, r14d
+  mov QWORD PTR [rbp-2104], r15
+  mov r15, QWORD PTR [rbp-2104]
+  mov DWORD PTR [rbp-420], r15d
+  mov QWORD PTR [rbp-2112], 8
+  movsxd r15, DWORD PTR [rbp-360]
   mov QWORD PTR [rbp-2120], r15
-  mov r15, QWORD PTR [rbp-420]
+  mov r14, QWORD PTR [rbp-2120]
+  mov r15, r14
   mov QWORD PTR [rbp-2128], r15
-  mov rdi, QWORD PTR [rbp-2120]
-  mov rsi, QWORD PTR [rbp-2128]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_u32
-  mov QWORD PTR [rbp-2136], rax
-  mov r15, QWORD PTR [rbp-2136]
-  mov QWORD PTR [rbp-428], r15
-.L446:
-  mov r15, QWORD PTR [rbp-428]
+  mov QWORD PTR [rbp-2136], 4
+  mov r15, QWORD PTR [rbp-2128]
+  mov r14, QWORD PTR [rbp-2136]
+  imul r15, r14
   mov QWORD PTR [rbp-2144], r15
-  mov QWORD PTR [rbp-2152], 0
-  mov r15, QWORD PTR [rbp-2144]
-  mov r14, QWORD PTR [rbp-2152]
+  mov r15, QWORD PTR [rbp-2112]
+  mov r14, QWORD PTR [rbp-2144]
+  add r15, r14
+  mov QWORD PTR [rbp-2152], r15
+  movsxd r15, DWORD PTR [rbp-420]
+  mov QWORD PTR [rbp-2160], r15
+  mov r14, QWORD PTR [rbp-2160]
+  mov r15, r14
+  mov QWORD PTR [rbp-2168], r15
+  mov QWORD PTR [rbp-2176], 4
+  mov r15, QWORD PTR [rbp-2168]
+  mov r14, QWORD PTR [rbp-2176]
+  imul r15, r14
+  mov QWORD PTR [rbp-2184], r15
+  mov r15, QWORD PTR [rbp-2152]
+  mov r14, QWORD PTR [rbp-2184]
+  add r15, r14
+  mov QWORD PTR [rbp-2192], r15
+  mov r15, QWORD PTR [rbp-2192]
+  mov QWORD PTR [rbp-428], r15
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-2200], r15
+  mov r15, QWORD PTR [rbp-428]
+  mov QWORD PTR [rbp-2208], r15
+  mov rdi, QWORD PTR [rbp-2200]
+  mov rsi, QWORD PTR [rbp-2208]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_u32
+  mov QWORD PTR [rbp-2216], rax
+  mov r15, QWORD PTR [rbp-2216]
+  mov QWORD PTR [rbp-436], r15
+.L460:
+  mov r15, QWORD PTR [rbp-436]
+  mov QWORD PTR [rbp-2224], r15
+  mov QWORD PTR [rbp-2232], 0
+  mov r15, QWORD PTR [rbp-2224]
+  mov r14, QWORD PTR [rbp-2232]
   xor rax, rax
   cmp r15, r14
   setne al
-  mov QWORD PTR [rbp-2160], rax
-  mov r15, QWORD PTR [rbp-2160]
-  test r15, r15
-  jz .L447
-  lea r15, [rbp-412]
-  mov QWORD PTR [rbp-2168], r15
-  mov r15, QWORD PTR [rbp-428]
-  mov QWORD PTR [rbp-2176], r15
-  mov r14, QWORD PTR [rbp-2176]
-  movsxd r15, r14d
-  mov QWORD PTR [rbp-2184], r15
-  mov r15, QWORD PTR [rbp-2168]
-  mov rax, QWORD PTR [rbp-2184]
-  mov DWORD PTR [r15], eax
-  lea r15, [rbp-420]
-  mov QWORD PTR [rbp-2192], r15
-  mov QWORD PTR [rbp-2200], 8
-  movsxd r15, DWORD PTR [rbp-352]
-  mov QWORD PTR [rbp-2208], r15
-  mov r14, QWORD PTR [rbp-2208]
-  mov r15, r14
-  mov QWORD PTR [rbp-2216], r15
-  mov QWORD PTR [rbp-2224], 4
-  mov r15, QWORD PTR [rbp-2216]
-  mov r14, QWORD PTR [rbp-2224]
-  imul r15, r14
-  mov QWORD PTR [rbp-2232], r15
-  mov r15, QWORD PTR [rbp-2200]
-  mov r14, QWORD PTR [rbp-2232]
-  add r15, r14
-  mov QWORD PTR [rbp-2240], r15
-  movsxd r15, DWORD PTR [rbp-412]
-  mov QWORD PTR [rbp-2248], r15
-  mov r14, QWORD PTR [rbp-2248]
-  mov r15, r14
-  mov QWORD PTR [rbp-2256], r15
-  mov QWORD PTR [rbp-2264], 4
-  mov r15, QWORD PTR [rbp-2256]
-  mov r14, QWORD PTR [rbp-2264]
-  imul r15, r14
-  mov QWORD PTR [rbp-2272], r15
+  mov QWORD PTR [rbp-2240], rax
   mov r15, QWORD PTR [rbp-2240]
-  mov r14, QWORD PTR [rbp-2272]
-  add r15, r14
-  mov QWORD PTR [rbp-2280], r15
-  mov r15, QWORD PTR [rbp-2192]
-  mov rax, QWORD PTR [rbp-2280]
-  mov QWORD PTR [r15], rax
+  test r15, r15
+  jz .L461
+  lea r15, [rbp-420]
+  mov QWORD PTR [rbp-2248], r15
+  mov r15, QWORD PTR [rbp-436]
+  mov QWORD PTR [rbp-2256], r15
+  mov r14, QWORD PTR [rbp-2256]
+  movsxd r15, r14d
+  mov QWORD PTR [rbp-2264], r15
+  mov r15, QWORD PTR [rbp-2248]
+  mov rax, QWORD PTR [rbp-2264]
+  mov DWORD PTR [r15], eax
   lea r15, [rbp-428]
+  mov QWORD PTR [rbp-2272], r15
+  mov QWORD PTR [rbp-2280], 8
+  movsxd r15, DWORD PTR [rbp-360]
   mov QWORD PTR [rbp-2288], r15
-  mov r10, QWORD PTR [rbp-2288]
-  mov r15, QWORD PTR [rbp-368]
+  mov r14, QWORD PTR [rbp-2288]
+  mov r15, r14
   mov QWORD PTR [rbp-2296], r15
-  mov r15, QWORD PTR [rbp-420]
-  mov QWORD PTR [rbp-2304], r15
-  mov rdi, QWORD PTR [rbp-2296]
-  mov rsi, QWORD PTR [rbp-2304]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_u32
-  mov QWORD PTR [rbp-2312], rax
-  mov r15, QWORD PTR [rbp-2288]
-  mov rax, QWORD PTR [rbp-2312]
-  mov QWORD PTR [r15], rax
-  jmp .L446
-.L447:
-  mov r15, QWORD PTR [rbp-368]
+  mov QWORD PTR [rbp-2304], 4
+  mov r15, QWORD PTR [rbp-2296]
+  mov r14, QWORD PTR [rbp-2304]
+  imul r15, r14
+  mov QWORD PTR [rbp-2312], r15
+  mov r15, QWORD PTR [rbp-2280]
+  mov r14, QWORD PTR [rbp-2312]
+  add r15, r14
   mov QWORD PTR [rbp-2320], r15
-  mov r15, QWORD PTR [rbp-420]
+  movsxd r15, DWORD PTR [rbp-420]
   mov QWORD PTR [rbp-2328], r15
-  mov r15, QWORD PTR [rbp-2320]
   mov r14, QWORD PTR [rbp-2328]
-  add r15, r14
+  mov r15, r14
   mov QWORD PTR [rbp-2336], r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-2344], r15
-  mov QWORD PTR [rbp-2352], 255
-  mov r14, QWORD PTR [rbp-2344]
-  mov r15, QWORD PTR [rbp-2352]
-  and r14, r15
-  mov QWORD PTR [rbp-2360], r14
-  mov r14, QWORD PTR [rbp-2360]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-2368], r15
+  mov QWORD PTR [rbp-2344], 4
   mov r15, QWORD PTR [rbp-2336]
-  mov rax, QWORD PTR [rbp-2368]
-  mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-368]
+  mov r14, QWORD PTR [rbp-2344]
+  imul r15, r14
+  mov QWORD PTR [rbp-2352], r15
+  mov r15, QWORD PTR [rbp-2320]
+  mov r14, QWORD PTR [rbp-2352]
+  add r15, r14
+  mov QWORD PTR [rbp-2360], r15
+  mov r15, QWORD PTR [rbp-2272]
+  mov rax, QWORD PTR [rbp-2360]
+  mov QWORD PTR [r15], rax
+  lea r15, [rbp-436]
+  mov QWORD PTR [rbp-2368], r15
+  mov r10, QWORD PTR [rbp-2368]
+  mov r15, QWORD PTR [rbp-376]
   mov QWORD PTR [rbp-2376], r15
-  mov r15, QWORD PTR [rbp-420]
+  mov r15, QWORD PTR [rbp-428]
   mov QWORD PTR [rbp-2384], r15
-  mov QWORD PTR [rbp-2392], 1
-  mov r15, QWORD PTR [rbp-2384]
-  mov r14, QWORD PTR [rbp-2392]
-  add r15, r14
+  mov rdi, QWORD PTR [rbp-2376]
+  mov rsi, QWORD PTR [rbp-2384]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_read_u32
+  mov QWORD PTR [rbp-2392], rax
+  mov r15, QWORD PTR [rbp-2368]
+  mov rax, QWORD PTR [rbp-2392]
+  mov QWORD PTR [r15], rax
+  jmp .L460
+.L461:
+  mov r15, QWORD PTR [rbp-376]
   mov QWORD PTR [rbp-2400], r15
-  mov r15, QWORD PTR [rbp-2376]
-  mov r14, QWORD PTR [rbp-2400]
-  add r15, r14
+  mov r15, QWORD PTR [rbp-428]
   mov QWORD PTR [rbp-2408], r15
-  movsxd r15, DWORD PTR [rbp-392]
+  mov r15, QWORD PTR [rbp-2400]
+  mov r14, QWORD PTR [rbp-2408]
+  add r15, r14
   mov QWORD PTR [rbp-2416], r15
-  mov QWORD PTR [rbp-2424], 8
-  mov rcx, QWORD PTR [rbp-2424]
-  mov r15, QWORD PTR [rbp-2416]
-  shr r15, cl
-  mov QWORD PTR [rbp-2432], r15
-  mov QWORD PTR [rbp-2440], 255
-  mov r14, QWORD PTR [rbp-2432]
-  mov r15, QWORD PTR [rbp-2440]
+  movsxd r15, DWORD PTR [rbp-400]
+  mov QWORD PTR [rbp-2424], r15
+  mov QWORD PTR [rbp-2432], 255
+  mov r14, QWORD PTR [rbp-2424]
+  mov r15, QWORD PTR [rbp-2432]
   and r14, r15
-  mov QWORD PTR [rbp-2448], r14
-  mov r14, QWORD PTR [rbp-2448]
+  mov QWORD PTR [rbp-2440], r14
+  mov r14, QWORD PTR [rbp-2440]
   movzx r15, r14b
-  mov QWORD PTR [rbp-2456], r15
-  mov r15, QWORD PTR [rbp-2408]
-  mov rax, QWORD PTR [rbp-2456]
+  mov QWORD PTR [rbp-2448], r15
+  mov r15, QWORD PTR [rbp-2416]
+  mov rax, QWORD PTR [rbp-2448]
   mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-368]
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-2456], r15
+  mov r15, QWORD PTR [rbp-428]
   mov QWORD PTR [rbp-2464], r15
-  mov r15, QWORD PTR [rbp-420]
-  mov QWORD PTR [rbp-2472], r15
-  mov QWORD PTR [rbp-2480], 2
-  mov r15, QWORD PTR [rbp-2472]
+  mov QWORD PTR [rbp-2472], 1
+  mov r15, QWORD PTR [rbp-2464]
+  mov r14, QWORD PTR [rbp-2472]
+  add r15, r14
+  mov QWORD PTR [rbp-2480], r15
+  mov r15, QWORD PTR [rbp-2456]
   mov r14, QWORD PTR [rbp-2480]
   add r15, r14
   mov QWORD PTR [rbp-2488], r15
-  mov r15, QWORD PTR [rbp-2464]
-  mov r14, QWORD PTR [rbp-2488]
-  add r15, r14
+  movsxd r15, DWORD PTR [rbp-400]
   mov QWORD PTR [rbp-2496], r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-2504], r15
-  mov QWORD PTR [rbp-2512], 16
-  mov rcx, QWORD PTR [rbp-2512]
-  mov r15, QWORD PTR [rbp-2504]
-  shr r15, cl
-  mov QWORD PTR [rbp-2520], r15
-  mov QWORD PTR [rbp-2528], 255
-  mov r14, QWORD PTR [rbp-2520]
-  mov r15, QWORD PTR [rbp-2528]
-  and r14, r15
-  mov QWORD PTR [rbp-2536], r14
-  mov r14, QWORD PTR [rbp-2536]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-2544], r15
+  mov QWORD PTR [rbp-2504], 8
+  mov rcx, QWORD PTR [rbp-2504]
   mov r15, QWORD PTR [rbp-2496]
-  mov rax, QWORD PTR [rbp-2544]
+  shr r15, cl
+  mov QWORD PTR [rbp-2512], r15
+  mov QWORD PTR [rbp-2520], 255
+  mov r14, QWORD PTR [rbp-2512]
+  mov r15, QWORD PTR [rbp-2520]
+  and r14, r15
+  mov QWORD PTR [rbp-2528], r14
+  mov r14, QWORD PTR [rbp-2528]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2536], r15
+  mov r15, QWORD PTR [rbp-2488]
+  mov rax, QWORD PTR [rbp-2536]
   mov BYTE PTR [r15], al
-  mov r15, QWORD PTR [rbp-368]
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-2544], r15
+  mov r15, QWORD PTR [rbp-428]
   mov QWORD PTR [rbp-2552], r15
-  mov r15, QWORD PTR [rbp-420]
-  mov QWORD PTR [rbp-2560], r15
-  mov QWORD PTR [rbp-2568], 3
-  mov r15, QWORD PTR [rbp-2560]
+  mov QWORD PTR [rbp-2560], 2
+  mov r15, QWORD PTR [rbp-2552]
+  mov r14, QWORD PTR [rbp-2560]
+  add r15, r14
+  mov QWORD PTR [rbp-2568], r15
+  mov r15, QWORD PTR [rbp-2544]
   mov r14, QWORD PTR [rbp-2568]
   add r15, r14
   mov QWORD PTR [rbp-2576], r15
-  mov r15, QWORD PTR [rbp-2552]
-  mov r14, QWORD PTR [rbp-2576]
-  add r15, r14
+  movsxd r15, DWORD PTR [rbp-400]
   mov QWORD PTR [rbp-2584], r15
-  movsxd r15, DWORD PTR [rbp-392]
-  mov QWORD PTR [rbp-2592], r15
-  mov QWORD PTR [rbp-2600], 24
-  mov rcx, QWORD PTR [rbp-2600]
-  mov r15, QWORD PTR [rbp-2592]
-  shr r15, cl
-  mov QWORD PTR [rbp-2608], r15
-  mov QWORD PTR [rbp-2616], 255
-  mov r14, QWORD PTR [rbp-2608]
-  mov r15, QWORD PTR [rbp-2616]
-  and r14, r15
-  mov QWORD PTR [rbp-2624], r14
-  mov r14, QWORD PTR [rbp-2624]
-  movzx r15, r14b
-  mov QWORD PTR [rbp-2632], r15
+  mov QWORD PTR [rbp-2592], 16
+  mov rcx, QWORD PTR [rbp-2592]
   mov r15, QWORD PTR [rbp-2584]
-  mov rax, QWORD PTR [rbp-2632]
+  shr r15, cl
+  mov QWORD PTR [rbp-2600], r15
+  mov QWORD PTR [rbp-2608], 255
+  mov r14, QWORD PTR [rbp-2600]
+  mov r15, QWORD PTR [rbp-2608]
+  and r14, r15
+  mov QWORD PTR [rbp-2616], r14
+  mov r14, QWORD PTR [rbp-2616]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2624], r15
+  mov r15, QWORD PTR [rbp-2576]
+  mov rax, QWORD PTR [rbp-2624]
   mov BYTE PTR [r15], al
-.L445:
-  lea r15, [rbp-308]
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-2632], r15
+  mov r15, QWORD PTR [rbp-428]
   mov QWORD PTR [rbp-2640], r15
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-2648], r15
-  mov QWORD PTR [rbp-2656], 1
-  mov r15, QWORD PTR [rbp-2648]
+  mov QWORD PTR [rbp-2648], 3
+  mov r15, QWORD PTR [rbp-2640]
+  mov r14, QWORD PTR [rbp-2648]
+  add r15, r14
+  mov QWORD PTR [rbp-2656], r15
+  mov r15, QWORD PTR [rbp-2632]
   mov r14, QWORD PTR [rbp-2656]
   add r15, r14
+  mov QWORD PTR [rbp-2664], r15
+  movsxd r15, DWORD PTR [rbp-400]
+  mov QWORD PTR [rbp-2672], r15
+  mov QWORD PTR [rbp-2680], 24
+  mov rcx, QWORD PTR [rbp-2680]
+  mov r15, QWORD PTR [rbp-2672]
+  shr r15, cl
+  mov QWORD PTR [rbp-2688], r15
+  mov QWORD PTR [rbp-2696], 255
+  mov r14, QWORD PTR [rbp-2688]
+  mov r15, QWORD PTR [rbp-2696]
+  and r14, r15
+  mov QWORD PTR [rbp-2704], r14
+  mov r14, QWORD PTR [rbp-2704]
+  movzx r15, r14b
+  mov QWORD PTR [rbp-2712], r15
+  mov r15, QWORD PTR [rbp-2664]
+  mov rax, QWORD PTR [rbp-2712]
+  mov BYTE PTR [r15], al
+.L459:
+  lea r15, [rbp-316]
+  mov QWORD PTR [rbp-2720], r15
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-2728], r15
+  mov QWORD PTR [rbp-2736], 1
+  mov r15, QWORD PTR [rbp-2728]
+  mov r14, QWORD PTR [rbp-2736]
+  add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-2640]
+  mov r15, QWORD PTR [rbp-2720]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L442
-.L443:
+  jmp .L456
+.L457:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 216
   mov r15, rbx
@@ -17022,108 +17535,131 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-436], r12
-  lea rbx, [rbp-308]
+  mov QWORD PTR [rbp-444], r12
+  lea rbx, [rbp-316]
   mov r12, 0
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-.L448:
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-2664], r15
-  movsxd r15, DWORD PTR [rbp-132]
-  mov QWORD PTR [rbp-2736], r15
-  mov r15, QWORD PTR [rbp-2664]
-  mov r14, QWORD PTR [rbp-2736]
+.L462:
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-2744], r15
+  movsxd r15, DWORD PTR [rbp-140]
+  mov QWORD PTR [rbp-2864], r15
+  mov r15, QWORD PTR [rbp-2744]
+  mov r14, QWORD PTR [rbp-2864]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-2832], rax
-  mov r15, QWORD PTR [rbp-2832]
+  mov QWORD PTR [rbp-2960], rax
+  mov r15, QWORD PTR [rbp-2960]
   test r15, r15
-  jz .L449
+  jz .L463
   xor r10, r10
-  mov r15, QWORD PTR [rbp-128]
-  mov QWORD PTR [rbp-2672], r15
-  movsxd r15, DWORD PTR [rbp-308]
-  mov QWORD PTR [rbp-2680], r15
-  mov rdi, QWORD PTR [rbp-2672]
-  mov rsi, QWORD PTR [rbp-2680]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
-  mov QWORD PTR [rbp-2688], rax
-  mov r15, QWORD PTR [rbp-2688]
-  mov QWORD PTR [rbp-444], r15
-  mov r15, QWORD PTR [rbp-436]
-  mov QWORD PTR [rbp-2696], r15
-  mov r15, QWORD PTR [rbp-444]
-  mov QWORD PTR [rbp-2704], r15
-  mov QWORD PTR [rbp-2712], 20
-  mov r15, QWORD PTR [rbp-2704]
-  mov r14, QWORD PTR [rbp-2712]
-  add r15, r14
-  mov QWORD PTR [rbp-2720], r15
-  mov r15, QWORD PTR [rbp-2720]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-2728], rax
-  mov rdi, QWORD PTR [rbp-2696]
-  mov rsi, QWORD PTR [rbp-2728]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
-  mov QWORD PTR [rbp-2856], rax
-  mov r15, QWORD PTR [rbp-444]
-  mov QWORD PTR [rbp-2744], r15
-  mov QWORD PTR [rbp-2752], 28
-  mov r15, QWORD PTR [rbp-2744]
-  mov r14, QWORD PTR [rbp-2752]
-  add r15, r14
+  mov r15, QWORD PTR [rbp-136]
+  mov QWORD PTR [rbp-2752], r15
+  movsxd r15, DWORD PTR [rbp-316]
   mov QWORD PTR [rbp-2760], r15
-  mov r15, QWORD PTR [rbp-2760]
-  movsxd rax, DWORD PTR [r15]
+  mov rdi, QWORD PTR [rbp-2752]
+  mov rsi, QWORD PTR [rbp-2760]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
   mov QWORD PTR [rbp-2768], rax
-  mov r14, QWORD PTR [rbp-2768]
-  mov r15, r14
+  mov r15, QWORD PTR [rbp-2768]
+  mov QWORD PTR [rbp-452], r15
+  mov r15, QWORD PTR [rbp-452]
   mov QWORD PTR [rbp-2776], r15
-  mov r15, 4294967296
-  mov QWORD PTR [rbp-2784], r15
+  mov QWORD PTR [rbp-2784], 36
   mov r15, QWORD PTR [rbp-2776]
   mov r14, QWORD PTR [rbp-2784]
-  imul r15, r14
-  mov QWORD PTR [rbp-2792], r15
-  mov QWORD PTR [rbp-2800], 7
-  mov r15, QWORD PTR [rbp-2792]
-  mov r14, QWORD PTR [rbp-2800]
   add r15, r14
-  mov QWORD PTR [rbp-2808], r15
-  mov r15, QWORD PTR [rbp-2808]
-  mov QWORD PTR [rbp-452], r15
-  mov r15, QWORD PTR [rbp-436]
-  mov QWORD PTR [rbp-2816], r15
-  mov r15, QWORD PTR [rbp-452]
+  mov QWORD PTR [rbp-2792], r15
+  mov r15, QWORD PTR [rbp-2792]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-2800], rax
+  mov QWORD PTR [rbp-2808], 0
+  mov r15, QWORD PTR [rbp-2800]
+  mov r14, QWORD PTR [rbp-2808]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-2816], rax
+  mov r15, QWORD PTR [rbp-2816]
+  test r15, r15
+  jz .L464
+  mov r15, QWORD PTR [rbp-444]
   mov QWORD PTR [rbp-2824], r15
-  mov rdi, QWORD PTR [rbp-2816]
-  mov rsi, QWORD PTR [rbp-2824]
+  mov r15, QWORD PTR [rbp-452]
+  mov QWORD PTR [rbp-2832], r15
+  mov QWORD PTR [rbp-2840], 20
+  mov r15, QWORD PTR [rbp-2832]
+  mov r14, QWORD PTR [rbp-2840]
+  add r15, r14
+  mov QWORD PTR [rbp-2848], r15
+  mov r15, QWORD PTR [rbp-2848]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-2856], rax
+  mov rdi, QWORD PTR [rbp-2824]
+  mov rsi, QWORD PTR [rbp-2856]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
-  mov r12, rax
-  mov r15, QWORD PTR [rbp-436]
-  mov QWORD PTR [rbp-2840], r15
-  mov QWORD PTR [rbp-2848], 0
-  mov rdi, QWORD PTR [rbp-2840]
-  mov rsi, QWORD PTR [rbp-2848]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
-  mov r13, rax
-  lea r15, [rbp-308]
-  mov QWORD PTR [rbp-2864], r15
-  movsxd r15, DWORD PTR [rbp-308]
+  mov QWORD PTR [rbp-2984], rax
+  mov r15, QWORD PTR [rbp-452]
   mov QWORD PTR [rbp-2872], r15
-  mov QWORD PTR [rbp-2880], 1
+  mov QWORD PTR [rbp-2880], 40
   mov r15, QWORD PTR [rbp-2872]
   mov r14, QWORD PTR [rbp-2880]
   add r15, r14
+  mov QWORD PTR [rbp-2888], r15
+  mov r15, QWORD PTR [rbp-2888]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-2896], rax
+  mov r14, QWORD PTR [rbp-2896]
+  mov r15, r14
+  mov QWORD PTR [rbp-2904], r15
+  mov r15, 4294967296
+  mov QWORD PTR [rbp-2912], r15
+  mov r15, QWORD PTR [rbp-2904]
+  mov r14, QWORD PTR [rbp-2912]
+  imul r15, r14
+  mov QWORD PTR [rbp-2920], r15
+  mov QWORD PTR [rbp-2928], 7
+  mov r15, QWORD PTR [rbp-2920]
+  mov r14, QWORD PTR [rbp-2928]
+  add r15, r14
+  mov QWORD PTR [rbp-2936], r15
+  mov r15, QWORD PTR [rbp-2936]
+  mov QWORD PTR [rbp-460], r15
+  mov r15, QWORD PTR [rbp-444]
+  mov QWORD PTR [rbp-2944], r15
+  mov r15, QWORD PTR [rbp-460]
+  mov QWORD PTR [rbp-2952], r15
+  mov rdi, QWORD PTR [rbp-2944]
+  mov rsi, QWORD PTR [rbp-2952]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov r12, rax
+  mov r15, QWORD PTR [rbp-444]
+  mov QWORD PTR [rbp-2968], r15
+  mov QWORD PTR [rbp-2976], 0
+  mov rdi, QWORD PTR [rbp-2968]
+  mov rsi, QWORD PTR [rbp-2976]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov r13, rax
+  jmp .L465
+.L464:
+.L465:
+  lea r15, [rbp-316]
+  mov QWORD PTR [rbp-2992], r15
+  movsxd r15, DWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-3000], r15
+  mov QWORD PTR [rbp-3008], 1
+  mov r15, QWORD PTR [rbp-3000]
+  mov r14, QWORD PTR [rbp-3008]
+  add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-2864]
+  mov r15, QWORD PTR [rbp-2992]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L448
-.L449:
+  jmp .L462
+.L463:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 224
   mov r15, rbx
@@ -17133,127 +17669,127 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-460], r12
-  lea rbx, [rbp-288]
+  mov QWORD PTR [rbp-468], r12
+  lea rbx, [rbp-296]
   mov r12, 0
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-.L450:
-  movsxd r15, DWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-2888], r15
+.L466:
+  movsxd r15, DWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-3016], r15
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-2936], r15
-  mov QWORD PTR [rbp-3008], 156
-  mov r15, QWORD PTR [rbp-2936]
-  mov r14, QWORD PTR [rbp-3008]
+  mov QWORD PTR [rbp-3064], r15
+  mov QWORD PTR [rbp-3136], 156
+  mov r15, QWORD PTR [rbp-3064]
+  mov r14, QWORD PTR [rbp-3136]
   add r15, r14
-  mov QWORD PTR [rbp-2896], r15
-  mov r15, QWORD PTR [rbp-2896]
+  mov QWORD PTR [rbp-3024], r15
+  mov r15, QWORD PTR [rbp-3024]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-2904], rax
-  mov r15, QWORD PTR [rbp-2888]
-  mov r14, QWORD PTR [rbp-2904]
+  mov QWORD PTR [rbp-3032], rax
+  mov r15, QWORD PTR [rbp-3016]
+  mov r14, QWORD PTR [rbp-3032]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-2912], rax
-  mov r15, QWORD PTR [rbp-2912]
+  mov QWORD PTR [rbp-3040], rax
+  mov r15, QWORD PTR [rbp-3040]
   test r15, r15
-  jz .L451
-  mov r15, QWORD PTR [rbp-460]
-  mov QWORD PTR [rbp-2920], r15
-  mov QWORD PTR [rbp-2928], 1
-  mov rdi, QWORD PTR [rbp-2920]
-  mov rsi, QWORD PTR [rbp-2928]
+  jz .L467
+  mov r15, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-3048], r15
+  mov QWORD PTR [rbp-3056], 1
+  mov rdi, QWORD PTR [rbp-3048]
+  mov rsi, QWORD PTR [rbp-3056]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov r15, QWORD PTR [rbp-460]
-  mov QWORD PTR [rbp-2944], r15
-  lea r15, [rbp-284]
-  mov QWORD PTR [rbp-2952], r15
-  movsxd r15, DWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-2960], r15
-  mov QWORD PTR [rbp-2968], 4
-  mov r15, QWORD PTR [rbp-2960]
-  mov r14, QWORD PTR [rbp-2968]
+  mov r15, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-3072], r15
+  lea r15, [rbp-292]
+  mov QWORD PTR [rbp-3080], r15
+  movsxd r15, DWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-3088], r15
+  mov QWORD PTR [rbp-3096], 4
+  mov r15, QWORD PTR [rbp-3088]
+  mov r14, QWORD PTR [rbp-3096]
   imul r15, r14
-  mov QWORD PTR [rbp-2976], r15
-  mov r15, QWORD PTR [rbp-2952]
-  mov r14, QWORD PTR [rbp-2976]
+  mov QWORD PTR [rbp-3104], r15
+  mov r15, QWORD PTR [rbp-3080]
+  mov r14, QWORD PTR [rbp-3104]
   add r15, r14
-  mov QWORD PTR [rbp-2984], r15
-  mov r15, QWORD PTR [rbp-2984]
+  mov QWORD PTR [rbp-3112], r15
+  mov r15, QWORD PTR [rbp-3112]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-2992], rax
-  mov r14, QWORD PTR [rbp-2992]
+  mov QWORD PTR [rbp-3120], rax
+  mov r14, QWORD PTR [rbp-3120]
   mov r15, r14
-  mov QWORD PTR [rbp-3000], r15
-  mov rdi, QWORD PTR [rbp-2944]
-  mov rsi, QWORD PTR [rbp-3000]
+  mov QWORD PTR [rbp-3128], r15
+  mov rdi, QWORD PTR [rbp-3072]
+  mov rsi, QWORD PTR [rbp-3128]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov r12, rax
-  lea r15, [rbp-288]
-  mov QWORD PTR [rbp-3016], r15
-  movsxd r15, DWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-3024], r15
-  mov QWORD PTR [rbp-3032], 1
-  mov r15, QWORD PTR [rbp-3024]
-  mov r14, QWORD PTR [rbp-3032]
+  lea r15, [rbp-296]
+  mov QWORD PTR [rbp-3144], r15
+  movsxd r15, DWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-3152], r15
+  mov QWORD PTR [rbp-3160], 1
+  mov r15, QWORD PTR [rbp-3152]
+  mov r14, QWORD PTR [rbp-3160]
   add r15, r14
   mov r13, r15
-  mov r15, QWORD PTR [rbp-3016]
+  mov r15, QWORD PTR [rbp-3144]
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L450
-.L451:
-  mov rbx, QWORD PTR [rbp-460]
+  jmp .L466
+.L467:
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 4
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, QWORD PTR [rbp-104]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 5
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, QWORD PTR [rbp-96]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 6
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, QWORD PTR [rbp-88]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 10
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
-  mov r12, QWORD PTR [rbp-148]
-  mov QWORD PTR [rbp-3040], 8
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, QWORD PTR [rbp-156]
+  mov QWORD PTR [rbp-3168], 8
   mov r15, r12
-  mov r14, QWORD PTR [rbp-3040]
+  mov r14, QWORD PTR [rbp-3168]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -17262,41 +17798,41 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 11
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 24
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 3
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, QWORD PTR [rbp-72]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 2
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
-  mov r12, QWORD PTR [rbp-436]
-  mov QWORD PTR [rbp-3048], 8
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, QWORD PTR [rbp-444]
+  mov QWORD PTR [rbp-3176], 8
   mov r15, r12
-  mov r14, QWORD PTR [rbp-3048]
+  mov r14, QWORD PTR [rbp-3176]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -17305,49 +17841,111 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 20
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 7
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 23
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, QWORD PTR [rbp-112]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 30
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 8
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_data_dynsyms
+  mov rbx, rax
+  mov DWORD PTR [rbp-472], ebx
+  movsxd rbx, DWORD PTR [rbp-472]
+  mov r12, 0
+  mov r15, rbx
+  mov r14, r12
+  xor rax, rax
+  cmp r15, r14
+  setg al
+  mov r13, rax
+  mov r15, r13
+  test r15, r15
+  jz .L468
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, 7
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, QWORD PTR [rbp-128]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, 8
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-468]
+  movsxd r12, DWORD PTR [rbp-472]
+  mov r13, r12
+  mov QWORD PTR [rbp-3184], 24
+  mov r15, r13
+  mov r14, QWORD PTR [rbp-3184]
+  imul r15, r14
+  mov r12, r15
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, 9
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-468]
+  mov r12, 24
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov rbx, rax
+  jmp .L469
+.L468:
+.L469:
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-460]
+  mov rbx, QWORD PTR [rbp-468]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
@@ -17355,7 +17953,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rbx, rax
   mov rbx, 0
   mov rax, rbx
-  add rsp, 3064
+  add rsp, 3192
   pop r15
   pop r14
   pop r13
@@ -17372,13 +17970,13 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   push r13
   push r14
   push r15
-  sub rsp, 840
-  mov QWORD PTR [rbp-264], rdi
-  mov QWORD PTR [rbp-256], rsi
-  mov QWORD PTR [rbp-248], rdx
-  mov QWORD PTR [rbp-240], rcx
-  mov QWORD PTR [rbp-232], r8
-  mov QWORD PTR [rbp-224], r9
+  sub rsp, 952
+  mov QWORD PTR [rbp-272], rdi
+  mov QWORD PTR [rbp-264], rsi
+  mov QWORD PTR [rbp-256], rdx
+  mov QWORD PTR [rbp-248], rcx
+  mov QWORD PTR [rbp-240], r8
+  mov QWORD PTR [rbp-232], r9
   mov rbx, rdi
   mov QWORD PTR [rbp-56], rbx
   mov rbx, rsi
@@ -17544,224 +18142,274 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rbx, rax
   mov rbx, 0
   mov DWORD PTR [rbp-160], ebx
-.L452:
+  mov rbx, 0
+  mov DWORD PTR [rbp-164], ebx
+.L470:
   movsxd r15, DWORD PTR [rbp-160]
-  mov QWORD PTR [rbp-272], r15
+  mov QWORD PTR [rbp-280], r15
   movsxd r15, DWORD PTR [rbp-84]
-  mov QWORD PTR [rbp-448], r15
-  mov r15, QWORD PTR [rbp-272]
-  mov r14, QWORD PTR [rbp-448]
+  mov QWORD PTR [rbp-360], r15
+  mov r15, QWORD PTR [rbp-280]
+  mov r14, QWORD PTR [rbp-360]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-480], rax
-  mov r15, QWORD PTR [rbp-480]
+  mov QWORD PTR [rbp-536], rax
+  mov r15, QWORD PTR [rbp-536]
   test r15, r15
-  jz .L453
+  jz .L471
   xor r10, r10
   mov r15, QWORD PTR [rbp-80]
-  mov QWORD PTR [rbp-280], r15
-  movsxd r15, DWORD PTR [rbp-160]
   mov QWORD PTR [rbp-288], r15
-  mov rdi, QWORD PTR [rbp-280]
-  mov rsi, QWORD PTR [rbp-288]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
-  mov QWORD PTR [rbp-296], rax
-  mov r15, QWORD PTR [rbp-296]
-  mov QWORD PTR [rbp-168], r15
-  mov r15, QWORD PTR [rbp-64]
-  mov QWORD PTR [rbp-304], r15
-  mov QWORD PTR [rbp-312], 16
-  mov r15, QWORD PTR [rbp-304]
-  mov r14, QWORD PTR [rbp-312]
-  add r15, r14
-  mov QWORD PTR [rbp-320], r15
   movsxd r15, DWORD PTR [rbp-160]
+  mov QWORD PTR [rbp-296], r15
+  mov rdi, QWORD PTR [rbp-288]
+  mov rsi, QWORD PTR [rbp-296]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-304], rax
+  mov r15, QWORD PTR [rbp-304]
+  mov QWORD PTR [rbp-172], r15
+  mov r15, QWORD PTR [rbp-172]
+  mov QWORD PTR [rbp-312], r15
+  mov QWORD PTR [rbp-320], 36
+  mov r15, QWORD PTR [rbp-312]
+  mov r14, QWORD PTR [rbp-320]
+  add r15, r14
   mov QWORD PTR [rbp-328], r15
-  mov r14, QWORD PTR [rbp-328]
-  mov r15, r14
-  mov QWORD PTR [rbp-336], r15
-  mov QWORD PTR [rbp-344], 16
+  mov r15, QWORD PTR [rbp-328]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-336], rax
+  mov QWORD PTR [rbp-344], 1
   mov r15, QWORD PTR [rbp-336]
   mov r14, QWORD PTR [rbp-344]
-  imul r15, r14
-  mov QWORD PTR [rbp-352], r15
-  mov r15, QWORD PTR [rbp-320]
-  mov r14, QWORD PTR [rbp-352]
-  add r15, r14
-  mov QWORD PTR [rbp-360], r15
-  mov r15, QWORD PTR [rbp-360]
-  mov QWORD PTR [rbp-176], r15
-  mov r15, QWORD PTR [rbp-72]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-352], rax
+  mov r15, QWORD PTR [rbp-352]
+  test r15, r15
+  jz .L472
+  lea r15, [rbp-160]
+  mov QWORD PTR [rbp-568], r15
+  movsxd r15, DWORD PTR [rbp-160]
   mov QWORD PTR [rbp-368], r15
-  mov QWORD PTR [rbp-376], 24
+  mov QWORD PTR [rbp-376], 1
   mov r15, QWORD PTR [rbp-368]
   mov r14, QWORD PTR [rbp-376]
   add r15, r14
   mov QWORD PTR [rbp-384], r15
-  movsxd r15, DWORD PTR [rbp-160]
+  mov r15, QWORD PTR [rbp-568]
+  mov rax, QWORD PTR [rbp-384]
+  mov DWORD PTR [r15], eax
+  jmp .L470
+  jmp .L473
+.L472:
+.L473:
+  mov r15, QWORD PTR [rbp-64]
   mov QWORD PTR [rbp-392], r15
-  mov r14, QWORD PTR [rbp-392]
-  mov r15, r14
-  mov QWORD PTR [rbp-400], r15
-  mov QWORD PTR [rbp-408], 8
-  mov r15, QWORD PTR [rbp-400]
-  mov r14, QWORD PTR [rbp-408]
-  imul r15, r14
-  mov QWORD PTR [rbp-416], r15
-  mov r15, QWORD PTR [rbp-384]
-  mov r14, QWORD PTR [rbp-416]
+  mov QWORD PTR [rbp-400], 16
+  mov r15, QWORD PTR [rbp-392]
+  mov r14, QWORD PTR [rbp-400]
   add r15, r14
+  mov QWORD PTR [rbp-408], r15
+  movsxd r15, DWORD PTR [rbp-164]
+  mov QWORD PTR [rbp-416], r15
+  mov r14, QWORD PTR [rbp-416]
+  mov r15, r14
   mov QWORD PTR [rbp-424], r15
+  mov QWORD PTR [rbp-432], 16
   mov r15, QWORD PTR [rbp-424]
-  mov QWORD PTR [rbp-184], r15
-  mov r15, QWORD PTR [rbp-168]
-  mov QWORD PTR [rbp-432], r15
-  mov QWORD PTR [rbp-440], 12
-  mov r15, QWORD PTR [rbp-432]
+  mov r14, QWORD PTR [rbp-432]
+  imul r15, r14
+  mov QWORD PTR [rbp-440], r15
+  mov r15, QWORD PTR [rbp-408]
   mov r14, QWORD PTR [rbp-440]
   add r15, r14
-  mov QWORD PTR [rbp-528], r15
-  mov r15, QWORD PTR [rbp-176]
+  mov QWORD PTR [rbp-448], r15
+  mov r15, QWORD PTR [rbp-448]
+  mov QWORD PTR [rbp-180], r15
+  mov r15, QWORD PTR [rbp-72]
   mov QWORD PTR [rbp-456], r15
-  mov r15, QWORD PTR [rbp-528]
-  mov rax, QWORD PTR [rbp-456]
-  mov QWORD PTR [r15], rax
-  mov r15, QWORD PTR [rbp-168]
-  mov QWORD PTR [rbp-464], r15
-  mov QWORD PTR [rbp-472], 20
-  mov r15, QWORD PTR [rbp-464]
-  mov r14, QWORD PTR [rbp-472]
+  mov QWORD PTR [rbp-464], 24
+  mov r15, QWORD PTR [rbp-456]
+  mov r14, QWORD PTR [rbp-464]
   add r15, r14
-  mov QWORD PTR [rbp-600], r15
-  mov r15, QWORD PTR [rbp-184]
+  mov QWORD PTR [rbp-472], r15
+  movsxd r15, DWORD PTR [rbp-164]
+  mov QWORD PTR [rbp-480], r15
+  mov r14, QWORD PTR [rbp-480]
+  mov r15, r14
   mov QWORD PTR [rbp-488], r15
-  mov r15, QWORD PTR [rbp-600]
-  mov rax, QWORD PTR [rbp-488]
+  mov QWORD PTR [rbp-496], 8
+  mov r15, QWORD PTR [rbp-488]
+  mov r14, QWORD PTR [rbp-496]
+  imul r15, r14
+  mov QWORD PTR [rbp-504], r15
+  mov r15, QWORD PTR [rbp-472]
+  mov r14, QWORD PTR [rbp-504]
+  add r15, r14
+  mov QWORD PTR [rbp-512], r15
+  mov r15, QWORD PTR [rbp-512]
+  mov QWORD PTR [rbp-188], r15
+  mov r15, QWORD PTR [rbp-172]
+  mov QWORD PTR [rbp-520], r15
+  mov QWORD PTR [rbp-528], 12
+  mov r15, QWORD PTR [rbp-520]
+  mov r14, QWORD PTR [rbp-528]
+  add r15, r14
+  mov QWORD PTR [rbp-616], r15
+  mov r15, QWORD PTR [rbp-180]
+  mov QWORD PTR [rbp-544], r15
+  mov r15, QWORD PTR [rbp-616]
+  mov rax, QWORD PTR [rbp-544]
+  mov QWORD PTR [r15], rax
+  mov r15, QWORD PTR [rbp-172]
+  mov QWORD PTR [rbp-552], r15
+  mov QWORD PTR [rbp-560], 20
+  mov r15, QWORD PTR [rbp-552]
+  mov r14, QWORD PTR [rbp-560]
+  add r15, r14
+  mov QWORD PTR [rbp-688], r15
+  mov r15, QWORD PTR [rbp-188]
+  mov QWORD PTR [rbp-576], r15
+  mov r15, QWORD PTR [rbp-688]
+  mov rax, QWORD PTR [rbp-576]
   mov QWORD PTR [r15], rax
   mov r15, QWORD PTR [rbp-100]
-  mov QWORD PTR [rbp-496], r15
-  mov r15, QWORD PTR [rbp-176]
-  mov QWORD PTR [rbp-504], r15
-  mov QWORD PTR [rbp-512], 6
-  mov r15, QWORD PTR [rbp-504]
-  mov r14, QWORD PTR [rbp-512]
-  add r15, r14
-  mov QWORD PTR [rbp-520], r15
-  mov rdi, QWORD PTR [rbp-496]
-  mov rsi, QWORD PTR [rbp-520]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
-  mov r13, rax
-  mov r15, QWORD PTR [rbp-176]
-  mov QWORD PTR [rbp-536], r15
-  mov QWORD PTR [rbp-544], 6
-  mov r15, QWORD PTR [rbp-536]
-  mov r14, QWORD PTR [rbp-544]
-  add r15, r14
-  mov QWORD PTR [rbp-552], r15
-  mov r15, QWORD PTR [rbp-552]
-  mov QWORD PTR [rbp-192], r15
-  mov r15, QWORD PTR [rbp-184]
-  mov QWORD PTR [rbp-560], r15
-  mov r15, QWORD PTR [rbp-192]
-  mov QWORD PTR [rbp-568], r15
-  mov r15, QWORD PTR [rbp-560]
-  mov r14, QWORD PTR [rbp-568]
-  sub r15, r14
-  mov QWORD PTR [rbp-576], r15
-  mov r15, QWORD PTR [rbp-576]
-  mov QWORD PTR [rbp-200], r15
-  mov r15, QWORD PTR [rbp-92]
   mov QWORD PTR [rbp-584], r15
-  mov QWORD PTR [rbp-592], 255
-  mov rdi, QWORD PTR [rbp-584]
-  mov rsi, QWORD PTR [rbp-592]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
-  mov QWORD PTR [rbp-624], rax
-  mov r15, QWORD PTR [rbp-92]
+  mov r15, QWORD PTR [rbp-180]
+  mov QWORD PTR [rbp-592], r15
+  mov QWORD PTR [rbp-600], 6
+  mov r15, QWORD PTR [rbp-592]
+  mov r14, QWORD PTR [rbp-600]
+  add r15, r14
   mov QWORD PTR [rbp-608], r15
-  mov QWORD PTR [rbp-616], 37
-  mov rdi, QWORD PTR [rbp-608]
-  mov rsi, QWORD PTR [rbp-616]
+  mov rdi, QWORD PTR [rbp-584]
+  mov rsi, QWORD PTR [rbp-608]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov QWORD PTR [rbp-712], rax
+  mov r15, QWORD PTR [rbp-180]
+  mov QWORD PTR [rbp-624], r15
+  mov QWORD PTR [rbp-632], 6
+  mov r15, QWORD PTR [rbp-624]
+  mov r14, QWORD PTR [rbp-632]
+  add r15, r14
+  mov QWORD PTR [rbp-640], r15
+  mov r15, QWORD PTR [rbp-640]
+  mov QWORD PTR [rbp-196], r15
+  mov r15, QWORD PTR [rbp-188]
+  mov QWORD PTR [rbp-648], r15
+  mov r15, QWORD PTR [rbp-196]
+  mov QWORD PTR [rbp-656], r15
+  mov r15, QWORD PTR [rbp-648]
+  mov r14, QWORD PTR [rbp-656]
+  sub r15, r14
+  mov QWORD PTR [rbp-664], r15
+  mov r15, QWORD PTR [rbp-664]
+  mov QWORD PTR [rbp-204], r15
+  mov r15, QWORD PTR [rbp-92]
+  mov QWORD PTR [rbp-672], r15
+  mov QWORD PTR [rbp-680], 255
+  mov rdi, QWORD PTR [rbp-672]
+  mov rsi, QWORD PTR [rbp-680]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov r12, rax
   mov r15, QWORD PTR [rbp-92]
-  mov QWORD PTR [rbp-632], r15
-  mov r15, QWORD PTR [rbp-200]
-  mov QWORD PTR [rbp-640], r15
-  mov rdi, QWORD PTR [rbp-632]
-  mov rsi, QWORD PTR [rbp-640]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
-  mov QWORD PTR [rbp-648], rax
-  mov r15, QWORD PTR [rbp-92]
-  mov QWORD PTR [rbp-656], r15
-  mov QWORD PTR [rbp-664], 104
-  mov rdi, QWORD PTR [rbp-656]
-  mov rsi, QWORD PTR [rbp-664]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
-  mov QWORD PTR [rbp-672], rax
-  mov r15, QWORD PTR [rbp-92]
-  mov QWORD PTR [rbp-680], r15
-  movsxd r15, DWORD PTR [rbp-160]
-  mov QWORD PTR [rbp-688], r15
-  mov r14, QWORD PTR [rbp-688]
-  mov r15, r14
   mov QWORD PTR [rbp-696], r15
-  mov rdi, QWORD PTR [rbp-680]
-  mov rsi, QWORD PTR [rbp-696]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
-  mov QWORD PTR [rbp-704], rax
-  mov r15, QWORD PTR [rbp-176]
-  mov QWORD PTR [rbp-712], r15
-  mov QWORD PTR [rbp-720], 16
-  mov r15, QWORD PTR [rbp-712]
-  mov r14, QWORD PTR [rbp-720]
-  add r15, r14
-  mov QWORD PTR [rbp-728], r15
-  mov r15, QWORD PTR [rbp-728]
-  mov QWORD PTR [rbp-208], r15
-  mov r15, QWORD PTR [rbp-108]
-  mov QWORD PTR [rbp-736], r15
-  mov r15, QWORD PTR [rbp-208]
-  mov QWORD PTR [rbp-744], r15
-  mov r15, QWORD PTR [rbp-736]
-  mov r14, QWORD PTR [rbp-744]
-  sub r15, r14
-  mov QWORD PTR [rbp-752], r15
-  mov r15, QWORD PTR [rbp-752]
-  mov QWORD PTR [rbp-216], r15
-  mov r15, QWORD PTR [rbp-92]
-  mov QWORD PTR [rbp-760], r15
-  mov QWORD PTR [rbp-768], 233
-  mov rdi, QWORD PTR [rbp-760]
-  mov rsi, QWORD PTR [rbp-768]
+  mov QWORD PTR [rbp-704], 37
+  mov rdi, QWORD PTR [rbp-696]
+  mov rsi, QWORD PTR [rbp-704]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
-  mov QWORD PTR [rbp-776], rax
+  mov r13, rax
   mov r15, QWORD PTR [rbp-92]
-  mov QWORD PTR [rbp-784], r15
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-792], r15
-  mov rdi, QWORD PTR [rbp-784]
-  mov rsi, QWORD PTR [rbp-792]
+  mov QWORD PTR [rbp-720], r15
+  mov r15, QWORD PTR [rbp-204]
+  mov QWORD PTR [rbp-728], r15
+  mov rdi, QWORD PTR [rbp-720]
+  mov rsi, QWORD PTR [rbp-728]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
-  mov QWORD PTR [rbp-800], rax
-  lea r15, [rbp-160]
-  mov QWORD PTR [rbp-808], r15
-  movsxd r15, DWORD PTR [rbp-160]
+  mov QWORD PTR [rbp-736], rax
+  mov r15, QWORD PTR [rbp-92]
+  mov QWORD PTR [rbp-744], r15
+  mov QWORD PTR [rbp-752], 104
+  mov rdi, QWORD PTR [rbp-744]
+  mov rsi, QWORD PTR [rbp-752]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
+  mov QWORD PTR [rbp-760], rax
+  mov r15, QWORD PTR [rbp-92]
+  mov QWORD PTR [rbp-768], r15
+  movsxd r15, DWORD PTR [rbp-164]
+  mov QWORD PTR [rbp-776], r15
+  mov r14, QWORD PTR [rbp-776]
+  mov r15, r14
+  mov QWORD PTR [rbp-784], r15
+  mov rdi, QWORD PTR [rbp-768]
+  mov rsi, QWORD PTR [rbp-784]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
+  mov QWORD PTR [rbp-792], rax
+  mov r15, QWORD PTR [rbp-180]
+  mov QWORD PTR [rbp-800], r15
+  mov QWORD PTR [rbp-808], 16
+  mov r15, QWORD PTR [rbp-800]
+  mov r14, QWORD PTR [rbp-808]
+  add r15, r14
   mov QWORD PTR [rbp-816], r15
-  mov QWORD PTR [rbp-824], 1
   mov r15, QWORD PTR [rbp-816]
-  mov r14, QWORD PTR [rbp-824]
+  mov QWORD PTR [rbp-212], r15
+  mov r15, QWORD PTR [rbp-108]
+  mov QWORD PTR [rbp-824], r15
+  mov r15, QWORD PTR [rbp-212]
+  mov QWORD PTR [rbp-832], r15
+  mov r15, QWORD PTR [rbp-824]
+  mov r14, QWORD PTR [rbp-832]
+  sub r15, r14
+  mov QWORD PTR [rbp-840], r15
+  mov r15, QWORD PTR [rbp-840]
+  mov QWORD PTR [rbp-220], r15
+  mov r15, QWORD PTR [rbp-92]
+  mov QWORD PTR [rbp-848], r15
+  mov QWORD PTR [rbp-856], 233
+  mov rdi, QWORD PTR [rbp-848]
+  mov rsi, QWORD PTR [rbp-856]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
+  mov QWORD PTR [rbp-864], rax
+  mov r15, QWORD PTR [rbp-92]
+  mov QWORD PTR [rbp-872], r15
+  mov r15, QWORD PTR [rbp-220]
+  mov QWORD PTR [rbp-880], r15
+  mov rdi, QWORD PTR [rbp-872]
+  mov rsi, QWORD PTR [rbp-880]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
+  mov QWORD PTR [rbp-888], rax
+  lea r15, [rbp-164]
+  mov QWORD PTR [rbp-896], r15
+  movsxd r15, DWORD PTR [rbp-164]
+  mov QWORD PTR [rbp-904], r15
+  mov QWORD PTR [rbp-912], 1
+  mov r15, QWORD PTR [rbp-904]
+  mov r14, QWORD PTR [rbp-912]
+  add r15, r14
+  mov QWORD PTR [rbp-920], r15
+  mov r15, QWORD PTR [rbp-896]
+  mov rax, QWORD PTR [rbp-920]
+  mov DWORD PTR [r15], eax
+  lea r15, [rbp-160]
+  mov QWORD PTR [rbp-928], r15
+  movsxd r15, DWORD PTR [rbp-160]
+  mov QWORD PTR [rbp-936], r15
+  mov QWORD PTR [rbp-944], 1
+  mov r15, QWORD PTR [rbp-936]
+  mov r14, QWORD PTR [rbp-944]
   add r15, r14
   mov rbx, r15
-  mov r15, QWORD PTR [rbp-808]
+  mov r15, QWORD PTR [rbp-928]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L452
-.L453:
+  jmp .L470
+.L471:
   mov rbx, 0
   mov rax, rbx
-  add rsp, 840
+  add rsp, 952
   pop r15
   pop r14
   pop r13
@@ -17891,6 +18539,32 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rbx, rax
   mov r15, r13
   mov QWORD PTR [r15], rbx
+  mov rbx, QWORD PTR [rbp-56]
+  mov r12, 232
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r10, r13
+  mov rbx, 4096
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_bytebuf
+  mov rbx, rax
+  mov r15, r13
+  mov QWORD PTR [r15], rbx
+  mov rbx, QWORD PTR [rbp-56]
+  mov r12, 240
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r10, r13
+  mov rbx, 4096
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_alloc_bytebuf
+  mov rbx, rax
+  mov r15, r13
+  mov QWORD PTR [r15], rbx
   mov rbx, 0
   mov rax, rbx
   add rsp, 120
@@ -17940,7 +18614,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L454
+  jz .L474
   mov rbx, 0
   mov rax, rbx
   add rsp, 136
@@ -17951,9 +18625,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rbx
   pop rbp
   ret
-  jmp .L455
-.L454:
-.L455:
+  jmp .L475
+.L474:
+.L475:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 160
   mov r15, rbx
@@ -17972,7 +18646,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L456
+  jz .L476
   mov rbx, 0
   mov rax, rbx
   add rsp, 136
@@ -17983,9 +18657,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rbx
   pop rbp
   ret
-  jmp .L457
-.L456:
-.L457:
+  jmp .L477
+.L476:
+.L477:
   xor r10, r10
   mov rbx, QWORD PTR [rbp-56]
   mov rdi, rbx
@@ -18012,7 +18686,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L458
+  jz .L478
   mov rbx, 1
   mov rax, rbx
   add rsp, 136
@@ -18023,9 +18697,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rbx
   pop rbp
   ret
-  jmp .L459
-.L458:
-.L459:
+  jmp .L479
+.L478:
+.L479:
   mov rbx, 0
   mov rax, rbx
   add rsp, 136
@@ -18094,7 +18768,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L460
+  jz .L480
   xor r10, r10
   mov rbx, QWORD PTR [rbp-76]
   movsxd r12, DWORD PTR [rbp-80]
@@ -18120,9 +18794,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   pop rbx
   pop rbp
   ret
-  jmp .L461
-.L460:
-.L461:
+  jmp .L481
+.L480:
+.L481:
   mov rbx, 0
   mov rax, rbx
   add rsp, 152
@@ -18136,6 +18810,699 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_l
   mov rbx, 0
   mov rax, rbx
   add rsp, 152
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_data_got_vaddr:
+  push rbp
+  mov rbp, rsp
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  sub rsp, 152
+  mov QWORD PTR [rbp-136], rdi
+  mov QWORD PTR [rbp-128], rsi
+  mov QWORD PTR [rbp-120], rdx
+  mov QWORD PTR [rbp-112], rcx
+  mov QWORD PTR [rbp-104], r8
+  mov QWORD PTR [rbp-96], r9
+  mov rbx, rdi
+  mov QWORD PTR [rbp-56], rbx
+  mov rbx, rsi
+  mov QWORD PTR [rbp-64], rbx
+  mov rbx, rdx
+  mov DWORD PTR [rbp-68], ebx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_dynsyms
+  mov rbx, rax
+  mov QWORD PTR [rbp-76], rbx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-76]
+  mov r12, QWORD PTR [rbp-64]
+  movsxd r13, DWORD PTR [rbp-68]
+  mov rdi, rbx
+  mov rsi, r12
+  mov rdx, r13
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_find
+  mov rbx, rax
+  mov DWORD PTR [rbp-80], ebx
+  movsxd rbx, DWORD PTR [rbp-80]
+  mov r12, 0
+  mov r15, rbx
+  mov r14, r12
+  xor rax, rax
+  cmp r15, r14
+  setge al
+  mov r13, rax
+  mov r15, r13
+  test r15, r15
+  jz .L482
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-76]
+  movsxd r12, DWORD PTR [rbp-80]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov rbx, rax
+  mov QWORD PTR [rbp-88], rbx
+  mov rbx, QWORD PTR [rbp-88]
+  mov r12, 28
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov rax, rbx
+  add rsp, 152
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+  jmp .L483
+.L482:
+.L483:
+  mov rbx, 0
+  mov rax, rbx
+  add rsp, 152
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+  mov rbx, 0
+  mov rax, rbx
+  add rsp, 152
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_data_dynsyms:
+  push rbp
+  mov rbp, rsp
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  sub rsp, 296
+  mov QWORD PTR [rbp-128], rdi
+  mov QWORD PTR [rbp-120], rsi
+  mov QWORD PTR [rbp-112], rdx
+  mov QWORD PTR [rbp-104], rcx
+  mov QWORD PTR [rbp-96], r8
+  mov QWORD PTR [rbp-88], r9
+  mov rbx, rdi
+  mov QWORD PTR [rbp-56], rbx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_dynsyms
+  mov rbx, rax
+  mov QWORD PTR [rbp-64], rbx
+  mov rbx, 0
+  mov DWORD PTR [rbp-68], ebx
+  mov rbx, 0
+  mov DWORD PTR [rbp-72], ebx
+.L484:
+  movsxd r15, DWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-136], r15
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-240], r15
+  mov QWORD PTR [rbp-272], 8
+  mov r15, QWORD PTR [rbp-240]
+  mov r14, QWORD PTR [rbp-272]
+  add r15, r14
+  mov QWORD PTR [rbp-144], r15
+  mov r15, QWORD PTR [rbp-144]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-152], rax
+  mov r15, QWORD PTR [rbp-136]
+  mov r14, QWORD PTR [rbp-152]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-160], rax
+  mov r15, QWORD PTR [rbp-160]
+  test r15, r15
+  jz .L485
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-168], r15
+  movsxd r15, DWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-176], r15
+  mov rdi, QWORD PTR [rbp-168]
+  mov rsi, QWORD PTR [rbp-176]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-184], rax
+  mov r15, QWORD PTR [rbp-184]
+  mov QWORD PTR [rbp-80], r15
+  mov r15, QWORD PTR [rbp-80]
+  mov QWORD PTR [rbp-192], r15
+  mov QWORD PTR [rbp-200], 36
+  mov r15, QWORD PTR [rbp-192]
+  mov r14, QWORD PTR [rbp-200]
+  add r15, r14
+  mov QWORD PTR [rbp-208], r15
+  mov r15, QWORD PTR [rbp-208]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-216], rax
+  mov QWORD PTR [rbp-224], 1
+  mov r15, QWORD PTR [rbp-216]
+  mov r14, QWORD PTR [rbp-224]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-232], rax
+  mov r15, QWORD PTR [rbp-232]
+  test r15, r15
+  jz .L486
+  lea rbx, [rbp-68]
+  movsxd r15, DWORD PTR [rbp-68]
+  mov QWORD PTR [rbp-248], r15
+  mov QWORD PTR [rbp-256], 1
+  mov r15, QWORD PTR [rbp-248]
+  mov r14, QWORD PTR [rbp-256]
+  add r15, r14
+  mov QWORD PTR [rbp-264], r15
+  mov r15, rbx
+  mov rax, QWORD PTR [rbp-264]
+  mov DWORD PTR [r15], eax
+  jmp .L487
+.L486:
+.L487:
+  lea r12, [rbp-72]
+  movsxd r15, DWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-280], r15
+  mov QWORD PTR [rbp-288], 1
+  mov r15, QWORD PTR [rbp-280]
+  mov r14, QWORD PTR [rbp-288]
+  add r15, r14
+  mov r13, r15
+  mov r15, r12
+  mov rax, r13
+  mov DWORD PTR [r15], eax
+  jmp .L484
+.L485:
+  movsxd rbx, DWORD PTR [rbp-68]
+  mov rax, rbx
+  add rsp, 296
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+  mov rbx, 0
+  mov rax, rbx
+  add rsp, 296
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_func_dynsyms:
+  push rbp
+  mov rbp, rsp
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  sub rsp, 296
+  mov QWORD PTR [rbp-128], rdi
+  mov QWORD PTR [rbp-120], rsi
+  mov QWORD PTR [rbp-112], rdx
+  mov QWORD PTR [rbp-104], rcx
+  mov QWORD PTR [rbp-96], r8
+  mov QWORD PTR [rbp-88], r9
+  mov rbx, rdi
+  mov QWORD PTR [rbp-56], rbx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_dynsyms
+  mov rbx, rax
+  mov QWORD PTR [rbp-64], rbx
+  mov rbx, 0
+  mov DWORD PTR [rbp-68], ebx
+  mov rbx, 0
+  mov DWORD PTR [rbp-72], ebx
+.L488:
+  movsxd r15, DWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-136], r15
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-240], r15
+  mov QWORD PTR [rbp-272], 8
+  mov r15, QWORD PTR [rbp-240]
+  mov r14, QWORD PTR [rbp-272]
+  add r15, r14
+  mov QWORD PTR [rbp-144], r15
+  mov r15, QWORD PTR [rbp-144]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-152], rax
+  mov r15, QWORD PTR [rbp-136]
+  mov r14, QWORD PTR [rbp-152]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-160], rax
+  mov r15, QWORD PTR [rbp-160]
+  test r15, r15
+  jz .L489
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-168], r15
+  movsxd r15, DWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-176], r15
+  mov rdi, QWORD PTR [rbp-168]
+  mov rsi, QWORD PTR [rbp-176]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-184], rax
+  mov r15, QWORD PTR [rbp-184]
+  mov QWORD PTR [rbp-80], r15
+  mov r15, QWORD PTR [rbp-80]
+  mov QWORD PTR [rbp-192], r15
+  mov QWORD PTR [rbp-200], 36
+  mov r15, QWORD PTR [rbp-192]
+  mov r14, QWORD PTR [rbp-200]
+  add r15, r14
+  mov QWORD PTR [rbp-208], r15
+  mov r15, QWORD PTR [rbp-208]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-216], rax
+  mov QWORD PTR [rbp-224], 0
+  mov r15, QWORD PTR [rbp-216]
+  mov r14, QWORD PTR [rbp-224]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-232], rax
+  mov r15, QWORD PTR [rbp-232]
+  test r15, r15
+  jz .L490
+  lea rbx, [rbp-68]
+  movsxd r15, DWORD PTR [rbp-68]
+  mov QWORD PTR [rbp-248], r15
+  mov QWORD PTR [rbp-256], 1
+  mov r15, QWORD PTR [rbp-248]
+  mov r14, QWORD PTR [rbp-256]
+  add r15, r14
+  mov QWORD PTR [rbp-264], r15
+  mov r15, rbx
+  mov rax, QWORD PTR [rbp-264]
+  mov DWORD PTR [r15], eax
+  jmp .L491
+.L490:
+.L491:
+  lea r12, [rbp-72]
+  movsxd r15, DWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-280], r15
+  mov QWORD PTR [rbp-288], 1
+  mov r15, QWORD PTR [rbp-280]
+  mov r14, QWORD PTR [rbp-288]
+  add r15, r14
+  mov r13, r15
+  mov r15, r12
+  mov rax, r13
+  mov DWORD PTR [r15], eax
+  jmp .L488
+.L489:
+  movsxd rbx, DWORD PTR [rbp-68]
+  mov rax, rbx
+  add rsp, 296
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+  mov rbx, 0
+  mov rax, rbx
+  add rsp, 296
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_data_got:
+  push rbp
+  mov rbp, rsp
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  sub rsp, 408
+  mov QWORD PTR [rbp-144], rdi
+  mov QWORD PTR [rbp-136], rsi
+  mov QWORD PTR [rbp-128], rdx
+  mov QWORD PTR [rbp-120], rcx
+  mov QWORD PTR [rbp-112], r8
+  mov QWORD PTR [rbp-104], r9
+  mov rbx, rdi
+  mov QWORD PTR [rbp-56], rbx
+  mov rbx, rsi
+  mov QWORD PTR [rbp-64], rbx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_dynsyms
+  mov rbx, rax
+  mov QWORD PTR [rbp-72], rbx
+  mov rbx, QWORD PTR [rbp-56]
+  mov r12, 232
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov r12, rbx
+  mov QWORD PTR [rbp-80], r12
+  mov rbx, 0
+  mov DWORD PTR [rbp-84], ebx
+  mov rbx, 0
+  mov DWORD PTR [rbp-88], ebx
+.L492:
+  movsxd r15, DWORD PTR [rbp-88]
+  mov QWORD PTR [rbp-152], r15
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-272], r15
+  mov QWORD PTR [rbp-344], 8
+  mov r15, QWORD PTR [rbp-272]
+  mov r14, QWORD PTR [rbp-344]
+  add r15, r14
+  mov QWORD PTR [rbp-160], r15
+  mov r15, QWORD PTR [rbp-160]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-168], rax
+  mov r15, QWORD PTR [rbp-152]
+  mov r14, QWORD PTR [rbp-168]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-176], rax
+  mov r15, QWORD PTR [rbp-176]
+  test r15, r15
+  jz .L493
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-184], r15
+  movsxd r15, DWORD PTR [rbp-88]
+  mov QWORD PTR [rbp-192], r15
+  mov rdi, QWORD PTR [rbp-184]
+  mov rsi, QWORD PTR [rbp-192]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-200], rax
+  mov r15, QWORD PTR [rbp-200]
+  mov QWORD PTR [rbp-96], r15
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-208], r15
+  mov QWORD PTR [rbp-216], 36
+  mov r15, QWORD PTR [rbp-208]
+  mov r14, QWORD PTR [rbp-216]
+  add r15, r14
+  mov QWORD PTR [rbp-224], r15
+  mov r15, QWORD PTR [rbp-224]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-232], rax
+  mov QWORD PTR [rbp-240], 1
+  mov r15, QWORD PTR [rbp-232]
+  mov r14, QWORD PTR [rbp-240]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-248], rax
+  mov r15, QWORD PTR [rbp-248]
+  test r15, r15
+  jz .L494
+  mov r15, QWORD PTR [rbp-96]
+  mov QWORD PTR [rbp-256], r15
+  mov QWORD PTR [rbp-264], 28
+  mov r15, QWORD PTR [rbp-256]
+  mov r14, QWORD PTR [rbp-264]
+  add r15, r14
+  mov QWORD PTR [rbp-352], r15
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-280], r15
+  movsxd r15, DWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-288], r15
+  mov r14, QWORD PTR [rbp-288]
+  mov r15, r14
+  mov QWORD PTR [rbp-296], r15
+  mov QWORD PTR [rbp-304], 8
+  mov r15, QWORD PTR [rbp-296]
+  mov r14, QWORD PTR [rbp-304]
+  imul r15, r14
+  mov QWORD PTR [rbp-312], r15
+  mov r15, QWORD PTR [rbp-280]
+  mov r14, QWORD PTR [rbp-312]
+  add r15, r14
+  mov QWORD PTR [rbp-320], r15
+  mov r15, QWORD PTR [rbp-352]
+  mov rax, QWORD PTR [rbp-320]
+  mov QWORD PTR [r15], rax
+  mov r15, QWORD PTR [rbp-80]
+  mov QWORD PTR [rbp-328], r15
+  mov QWORD PTR [rbp-336], 0
+  mov rdi, QWORD PTR [rbp-328]
+  mov rsi, QWORD PTR [rbp-336]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov r12, rax
+  lea r13, [rbp-84]
+  movsxd r15, DWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-360], r15
+  mov QWORD PTR [rbp-368], 1
+  mov r15, QWORD PTR [rbp-360]
+  mov r14, QWORD PTR [rbp-368]
+  add r15, r14
+  mov QWORD PTR [rbp-376], r15
+  mov r15, r13
+  mov rax, QWORD PTR [rbp-376]
+  mov DWORD PTR [r15], eax
+  jmp .L495
+.L494:
+.L495:
+  lea r15, [rbp-88]
+  mov QWORD PTR [rbp-384], r15
+  movsxd r15, DWORD PTR [rbp-88]
+  mov QWORD PTR [rbp-392], r15
+  mov QWORD PTR [rbp-400], 1
+  mov r15, QWORD PTR [rbp-392]
+  mov r14, QWORD PTR [rbp-400]
+  add r15, r14
+  mov rbx, r15
+  mov r15, QWORD PTR [rbp-384]
+  mov rax, rbx
+  mov DWORD PTR [r15], eax
+  jmp .L492
+.L493:
+  mov rbx, 0
+  mov rax, rbx
+  add rsp, 408
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  pop rbp
+  ret
+
+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_rela_dyn:
+  push rbp
+  mov rbp, rsp
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  sub rsp, 456
+  mov QWORD PTR [rbp-144], rdi
+  mov QWORD PTR [rbp-136], rsi
+  mov QWORD PTR [rbp-128], rdx
+  mov QWORD PTR [rbp-120], rcx
+  mov QWORD PTR [rbp-112], r8
+  mov QWORD PTR [rbp-104], r9
+  mov rbx, rdi
+  mov QWORD PTR [rbp-56], rbx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_dynsyms
+  mov rbx, rax
+  mov QWORD PTR [rbp-64], rbx
+  mov rbx, QWORD PTR [rbp-56]
+  mov r12, 240
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov r12, rbx
+  mov QWORD PTR [rbp-72], r12
+  mov rbx, 0
+  mov DWORD PTR [rbp-76], ebx
+.L496:
+  movsxd r15, DWORD PTR [rbp-76]
+  mov QWORD PTR [rbp-152], r15
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-296], r15
+  mov QWORD PTR [rbp-400], 8
+  mov r15, QWORD PTR [rbp-296]
+  mov r14, QWORD PTR [rbp-400]
+  add r15, r14
+  mov QWORD PTR [rbp-160], r15
+  mov r15, QWORD PTR [rbp-160]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-168], rax
+  mov r15, QWORD PTR [rbp-152]
+  mov r14, QWORD PTR [rbp-168]
+  xor rax, rax
+  cmp r15, r14
+  setl al
+  mov QWORD PTR [rbp-176], rax
+  mov r15, QWORD PTR [rbp-176]
+  test r15, r15
+  jz .L497
+  xor r10, r10
+  mov r15, QWORD PTR [rbp-64]
+  mov QWORD PTR [rbp-184], r15
+  movsxd r15, DWORD PTR [rbp-76]
+  mov QWORD PTR [rbp-192], r15
+  mov rdi, QWORD PTR [rbp-184]
+  mov rsi, QWORD PTR [rbp-192]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-200], rax
+  mov r15, QWORD PTR [rbp-200]
+  mov QWORD PTR [rbp-84], r15
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-208], r15
+  mov QWORD PTR [rbp-216], 36
+  mov r15, QWORD PTR [rbp-208]
+  mov r14, QWORD PTR [rbp-216]
+  add r15, r14
+  mov QWORD PTR [rbp-224], r15
+  mov r15, QWORD PTR [rbp-224]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-232], rax
+  mov QWORD PTR [rbp-240], 1
+  mov r15, QWORD PTR [rbp-232]
+  mov r14, QWORD PTR [rbp-240]
+  xor rax, rax
+  cmp r15, r14
+  sete al
+  mov QWORD PTR [rbp-248], rax
+  mov r15, QWORD PTR [rbp-248]
+  test r15, r15
+  jz .L498
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-256], r15
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-264], r15
+  mov QWORD PTR [rbp-272], 28
+  mov r15, QWORD PTR [rbp-264]
+  mov r14, QWORD PTR [rbp-272]
+  add r15, r14
+  mov QWORD PTR [rbp-280], r15
+  mov r15, QWORD PTR [rbp-280]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-288], rax
+  mov rdi, QWORD PTR [rbp-256]
+  mov rsi, QWORD PTR [rbp-288]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov QWORD PTR [rbp-424], rax
+  mov r15, QWORD PTR [rbp-84]
+  mov QWORD PTR [rbp-304], r15
+  mov QWORD PTR [rbp-312], 40
+  mov r15, QWORD PTR [rbp-304]
+  mov r14, QWORD PTR [rbp-312]
+  add r15, r14
+  mov QWORD PTR [rbp-320], r15
+  mov r15, QWORD PTR [rbp-320]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-328], rax
+  mov r14, QWORD PTR [rbp-328]
+  mov r15, r14
+  mov QWORD PTR [rbp-336], r15
+  mov QWORD PTR [rbp-344], 32
+  mov rcx, QWORD PTR [rbp-344]
+  mov r15, QWORD PTR [rbp-336]
+  shl r15, cl
+  mov QWORD PTR [rbp-352], r15
+  lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_R_X86_64_GLOB_DAT]
+  mov QWORD PTR [rbp-368], r15
+  mov r15, QWORD PTR [rbp-368]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-360], rax
+  mov r15, QWORD PTR [rbp-352]
+  mov r14, QWORD PTR [rbp-360]
+  add r15, r14
+  mov QWORD PTR [rbp-376], r15
+  mov r15, QWORD PTR [rbp-376]
+  mov QWORD PTR [rbp-92], r15
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-384], r15
+  mov r15, QWORD PTR [rbp-92]
+  mov QWORD PTR [rbp-392], r15
+  mov rdi, QWORD PTR [rbp-384]
+  mov rsi, QWORD PTR [rbp-392]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov r12, rax
+  mov r15, QWORD PTR [rbp-72]
+  mov QWORD PTR [rbp-408], r15
+  mov QWORD PTR [rbp-416], 0
+  mov rdi, QWORD PTR [rbp-408]
+  mov rsi, QWORD PTR [rbp-416]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
+  mov r13, rax
+  jmp .L499
+.L498:
+.L499:
+  lea r15, [rbp-76]
+  mov QWORD PTR [rbp-432], r15
+  movsxd r15, DWORD PTR [rbp-76]
+  mov QWORD PTR [rbp-440], r15
+  mov QWORD PTR [rbp-448], 1
+  mov r15, QWORD PTR [rbp-440]
+  mov r14, QWORD PTR [rbp-448]
+  add r15, r14
+  mov rbx, r15
+  mov r15, QWORD PTR [rbp-432]
+  mov rax, rbx
+  mov DWORD PTR [r15], eax
+  jmp .L496
+.L497:
+  mov rbx, 0
+  mov rax, rbx
+  add rsp, 456
   pop r15
   pop r14
   pop r13
@@ -18227,7 +19594,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jnz .L646
+  jnz .L684
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 24
   mov r15, rbx
@@ -18245,28 +19612,28 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jnz .L646
+  jnz .L684
   mov rbx, 0
-  jmp .L647
-.L646:
+  jmp .L685
+.L684:
   mov rbx, 1
-.L647:
+.L685:
   mov r15, rbx
   test r15, r15
-  jz .L644
+  jz .L682
   lea rbx, [rbp-128]
   mov r12, 1
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-  jmp .L645
-.L644:
+  jmp .L683
+.L682:
   lea rbx, [rbp-124]
   mov r12, 1
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-.L645:
+.L683:
   lea rbx, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_ELF_HDR_SIZE]
   mov r15, rbx
   mov r12, QWORD PTR [r15]
@@ -18327,7 +19694,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L650
+  jz .L688
   mov rbx, QWORD PTR [rbp-168]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PAGE_SIZE]
   mov r15, r12
@@ -18349,15 +19716,15 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L650
+  jz .L688
   mov rbx, 1
-  jmp .L651
-.L650:
+  jmp .L689
+.L688:
   mov rbx, 0
-.L651:
+.L689:
   mov r15, rbx
   test r15, r15
-  jz .L648
+  jz .L686
   lea rbx, [rbp-168]
   mov r12, QWORD PTR [rbp-168]
   lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PAGE_SIZE]
@@ -18390,9 +19757,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r12, r15
   mov r15, rbx
   mov QWORD PTR [r15], r12
-  jmp .L649
-.L648:
-.L649:
+  jmp .L687
+.L686:
+.L687:
   mov rbx, 0
   mov QWORD PTR [rbp-176], rbx
   mov rbx, 0
@@ -18495,7 +19862,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L652
+  jz .L690
   lea rbx, [rbp-208]
   mov r12, 0
   mov rdi, rbx
@@ -18667,7 +20034,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rbx, rax
   mov rbx, 0
   mov DWORD PTR [rbp-316], ebx
-.L654:
+.L692:
   movsxd r15, DWORD PTR [rbp-316]
   mov QWORD PTR [rbp-568], r15
   mov QWORD PTR [rbp-592], 24
@@ -18679,7 +20046,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-600], rax
   mov r15, QWORD PTR [rbp-600]
   test r15, r15
-  jz .L655
+  jz .L693
   lea r15, [rbp-232]
   mov QWORD PTR [rbp-576], r15
   mov QWORD PTR [rbp-584], 0
@@ -18698,8 +20065,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r12
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L654
-.L655:
+  jmp .L692
+.L693:
   lea rbx, [rbp-256]
   mov r12, 8
   mov r15, rbx
@@ -18767,7 +20134,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rbx, rax
   mov rbx, 0
   mov DWORD PTR [rbp-324], ebx
-.L656:
+.L694:
   movsxd r15, DWORD PTR [rbp-324]
   mov QWORD PTR [rbp-632], r15
   mov r15, QWORD PTR [rbp-120]
@@ -18788,7 +20155,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-656], rax
   mov r15, QWORD PTR [rbp-656]
   test r15, r15
-  jz .L657
+  jz .L695
   xor r10, r10
   mov r15, QWORD PTR [rbp-120]
   mov QWORD PTR [rbp-664], r15
@@ -18819,7 +20186,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-728], rax
   mov r15, QWORD PTR [rbp-728]
   test r15, r15
-  jz .L658
+  jz .L696
   lea r15, [rbp-256]
   mov QWORD PTR [rbp-736], r15
   mov QWORD PTR [rbp-744], 8
@@ -18904,7 +20271,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-968], rax
   mov r15, QWORD PTR [rbp-968]
   test r15, r15
-  jnz .L662
+  jnz .L700
   mov r15, QWORD PTR [rbp-332]
   mov QWORD PTR [rbp-976], r15
   mov QWORD PTR [rbp-984], 12
@@ -18928,24 +20295,24 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-1024], rax
   mov r15, QWORD PTR [rbp-1024]
   test r15, r15
-  jnz .L662
+  jnz .L700
   mov QWORD PTR [rbp-912], 0
-  jmp .L663
-.L662:
+  jmp .L701
+.L700:
   mov QWORD PTR [rbp-912], 1
-.L663:
+.L701:
   mov r15, QWORD PTR [rbp-912]
   test r15, r15
-  jz .L660
+  jz .L698
   lea r15, [rbp-340]
   mov QWORD PTR [rbp-1032], r15
   mov QWORD PTR [rbp-1040], 1
   mov r15, QWORD PTR [rbp-1032]
   mov rax, QWORD PTR [rbp-1040]
   mov DWORD PTR [r15], eax
-  jmp .L661
-.L660:
-.L661:
+  jmp .L699
+.L698:
+.L699:
   lea r15, [rbp-232]
   mov QWORD PTR [rbp-1048], r15
   movsxd r15, DWORD PTR [rbp-340]
@@ -18992,16 +20359,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-1168], rax
   mov r15, QWORD PTR [rbp-1168]
   test r15, r15
-  jz .L664
+  jz .L702
   lea r15, [rbp-344]
   mov QWORD PTR [rbp-1176], r15
   mov QWORD PTR [rbp-1184], 1
   mov r15, QWORD PTR [rbp-1176]
   mov rax, QWORD PTR [rbp-1184]
   mov DWORD PTR [r15], eax
-  jmp .L665
-.L664:
-.L665:
+  jmp .L703
+.L702:
+.L703:
   mov r15, QWORD PTR [rbp-332]
   mov QWORD PTR [rbp-1192], r15
   mov QWORD PTR [rbp-1200], 12
@@ -19025,16 +20392,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-1240], rax
   mov r15, QWORD PTR [rbp-1240]
   test r15, r15
-  jz .L666
+  jz .L704
   lea r15, [rbp-344]
   mov QWORD PTR [rbp-1248], r15
   mov QWORD PTR [rbp-1256], 2
   mov r15, QWORD PTR [rbp-1248]
   mov rax, QWORD PTR [rbp-1256]
   mov DWORD PTR [r15], eax
-  jmp .L667
-.L666:
-.L667:
+  jmp .L705
+.L704:
+.L705:
   mov r15, QWORD PTR [rbp-332]
   mov QWORD PTR [rbp-1264], r15
   mov QWORD PTR [rbp-1272], 12
@@ -19058,16 +20425,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-1312], rax
   mov r15, QWORD PTR [rbp-1312]
   test r15, r15
-  jz .L668
+  jz .L706
   lea r15, [rbp-344]
   mov QWORD PTR [rbp-1320], r15
   mov QWORD PTR [rbp-1328], 3
   mov r15, QWORD PTR [rbp-1320]
   mov rax, QWORD PTR [rbp-1328]
   mov DWORD PTR [r15], eax
-  jmp .L669
-.L668:
-.L669:
+  jmp .L707
+.L706:
+.L707:
   mov r15, QWORD PTR [rbp-332]
   mov QWORD PTR [rbp-1336], r15
   mov QWORD PTR [rbp-1344], 12
@@ -19091,16 +20458,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-1384], rax
   mov r15, QWORD PTR [rbp-1384]
   test r15, r15
-  jz .L670
+  jz .L708
   lea r15, [rbp-344]
   mov QWORD PTR [rbp-1392], r15
   mov QWORD PTR [rbp-1400], 4
   mov r15, QWORD PTR [rbp-1392]
   mov rax, QWORD PTR [rbp-1400]
   mov DWORD PTR [r15], eax
-  jmp .L671
-.L670:
-.L671:
+  jmp .L709
+.L708:
+.L709:
   lea r15, [rbp-232]
   mov QWORD PTR [rbp-1408], r15
   movsxd r15, DWORD PTR [rbp-344]
@@ -19132,9 +20499,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, QWORD PTR [rbp-1488]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov QWORD PTR [rbp-1496], rax
-  jmp .L659
-.L658:
-.L659:
+  jmp .L697
+.L696:
+.L697:
   lea r15, [rbp-324]
   mov QWORD PTR [rbp-1504], r15
   movsxd r15, DWORD PTR [rbp-324]
@@ -19147,8 +20514,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, QWORD PTR [rbp-1504]
   mov rax, rbx
   mov DWORD PTR [r15], eax
-  jmp .L656
-.L657:
+  jmp .L694
+.L695:
   mov rbx, QWORD PTR [rbp-168]
   mov r12, QWORD PTR [rbp-56]
   mov QWORD PTR [rbp-1528], 88
@@ -19173,7 +20540,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L672
+  jz .L710
   lea rbx, [rbp-352]
   mov r12, QWORD PTR [rbp-144]
   mov r15, QWORD PTR [rbp-160]
@@ -19184,9 +20551,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, r15
   mov r15, rbx
   mov QWORD PTR [r15], r13
-  jmp .L673
-.L672:
-.L673:
+  jmp .L711
+.L710:
+.L711:
   mov rbx, QWORD PTR [rbp-352]
   mov r12, 8
   mov rax, rbx
@@ -19206,7 +20573,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r12, rax
   mov r15, r12
   test r15, r15
-  jz .L674
+  jz .L712
   lea rbx, [rbp-352]
   mov r12, QWORD PTR [rbp-352]
   mov QWORD PTR [rbp-1544], 8
@@ -19231,9 +20598,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r12, r15
   mov r15, rbx
   mov QWORD PTR [r15], r12
-  jmp .L675
-.L674:
-.L675:
+  jmp .L713
+.L712:
+.L713:
   lea rbx, [rbp-292]
   mov r12, QWORD PTR [rbp-352]
   mov r15, rbx
@@ -19307,7 +20674,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r12, rax
   mov r15, r12
   test r15, r15
-  jz .L676
+  jz .L714
   lea rbx, [rbp-360]
   mov r12, QWORD PTR [rbp-360]
   mov QWORD PTR [rbp-1648], 8
@@ -19332,16 +20699,16 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r12, r15
   mov r15, rbx
   mov QWORD PTR [r15], r12
-  jmp .L677
-.L676:
-.L677:
+  jmp .L715
+.L714:
+.L715:
   lea rbx, [rbp-176]
   mov r12, QWORD PTR [rbp-360]
   mov r15, rbx
   mov QWORD PTR [r15], r12
-  jmp .L653
-.L652:
-.L653:
+  jmp .L691
+.L690:
+.L691:
   lea rbx, [rbp-88]
   mov r12, 127
   mov rdi, rbx
@@ -19586,7 +20953,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L678
+  jz .L716
   lea rbx, [rbp-88]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PT_LOAD]
   mov r15, r12
@@ -19694,9 +21061,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  jmp .L679
-.L678:
-.L679:
+  jmp .L717
+.L716:
+.L717:
   lea rbx, [rbp-88]
   mov r12, QWORD PTR [rbp-144]
   mov rdi, rbx
@@ -19738,7 +21105,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L680
+  jz .L718
   lea rbx, [rbp-88]
   mov r12, QWORD PTR [rbp-104]
   mov r15, r12
@@ -19757,9 +21124,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  jmp .L681
-.L680:
-.L681:
+  jmp .L719
+.L718:
+.L719:
   movsxd rbx, DWORD PTR [rbp-128]
   mov r12, 1
   mov r15, rbx
@@ -19770,7 +21137,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L682
+  jz .L720
   lea rbx, [rbp-88]
   mov r12, QWORD PTR [rbp-168]
   mov rdi, rbx
@@ -19794,7 +21161,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L684
+  jz .L722
   lea rbx, [rbp-88]
   mov r12, QWORD PTR [rbp-112]
   mov r15, r12
@@ -19813,12 +21180,12 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  jmp .L685
-.L684:
-.L685:
-  jmp .L683
-.L682:
-.L683:
+  jmp .L723
+.L722:
+.L723:
+  jmp .L721
+.L720:
+.L721:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 136
   mov r15, rbx
@@ -19836,7 +21203,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L686
+  jz .L724
   lea rbx, [rbp-88]
   mov r12, QWORD PTR [rbp-292]
   mov rdi, rbx
@@ -19905,7 +21272,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rbx, rax
   mov rbx, 0
   mov DWORD PTR [rbp-364], ebx
-.L688:
+.L726:
   movsxd r15, DWORD PTR [rbp-364]
   mov QWORD PTR [rbp-1960], r15
   mov QWORD PTR [rbp-1984], 64
@@ -19917,7 +21284,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov QWORD PTR [rbp-1992], rax
   mov r15, QWORD PTR [rbp-1992]
   test r15, r15
-  jz .L689
+  jz .L727
   lea r15, [rbp-88]
   mov QWORD PTR [rbp-1968], r15
   mov QWORD PTR [rbp-1976], 0
@@ -19936,8 +21303,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r12
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L688
-.L689:
+  jmp .L726
+.L727:
   lea rbx, [rbp-88]
   movsxd r12, DWORD PTR [rbp-260]
   mov r13, r12
@@ -20052,14 +21419,14 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L690
+  jz .L728
   lea rbx, [rbp-372]
   mov r12, QWORD PTR [rbp-168]
   mov r15, rbx
   mov QWORD PTR [r15], r12
-  jmp .L691
-.L690:
-.L691:
+  jmp .L729
+.L728:
+.L729:
   lea rbx, [rbp-88]
   movsxd r12, DWORD PTR [rbp-268]
   mov r13, r12
@@ -20123,7 +21490,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L692
+  jz .L730
   lea rbx, [rbp-380]
   mov r12, QWORD PTR [rbp-168]
   mov r15, QWORD PTR [rbp-56]
@@ -20142,9 +21509,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, r15
   mov r15, rbx
   mov QWORD PTR [r15], r13
-  jmp .L693
-.L692:
-.L693:
+  jmp .L731
+.L730:
+.L731:
   lea rbx, [rbp-88]
   movsxd r12, DWORD PTR [rbp-272]
   mov r13, r12
@@ -20326,9 +21693,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_write_shdr
   mov rbx, rax
   add rsp, 48
-  jmp .L687
-.L686:
-.L687:
+  jmp .L725
+.L724:
+.L725:
   xor r10, r10
   mov rbx, QWORD PTR [rbp-64]
   mov r12, 577
@@ -20349,7 +21716,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L694
+  jz .L732
   lea rbx, [rip+.LC56]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
@@ -20372,9 +21739,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   pop rbx
   pop rbp
   ret
-  jmp .L695
-.L694:
-.L695:
+  jmp .L733
+.L732:
+.L733:
   mov rbx, QWORD PTR [rbp-388]
   lea r12, [rbp-88]
   mov r15, r12
@@ -20564,7 +21931,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r12, rax
   mov r15, r12
   test r15, r15
-  jz .L696
+  jz .L734
   mov rbx, QWORD PTR [rbp-56]
   mov r12, QWORD PTR [rbp-64]
   mov r15, rbx
@@ -20595,9 +21962,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   pop rbx
   pop rbp
   ret
-  jmp .L697
-.L696:
-.L697:
+  jmp .L735
+.L734:
+.L735:
   mov rbx, QWORD PTR [rbp-56]
   mov rax, rbx
   add rsp, 136
@@ -20627,13 +21994,13 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   push r13
   push r14
   push r15
-  sub rsp, 1640
-  mov QWORD PTR [rbp-616], rdi
-  mov QWORD PTR [rbp-608], rsi
-  mov QWORD PTR [rbp-600], rdx
-  mov QWORD PTR [rbp-592], rcx
-  mov QWORD PTR [rbp-584], r8
-  mov QWORD PTR [rbp-576], r9
+  sub rsp, 1784
+  mov QWORD PTR [rbp-688], rdi
+  mov QWORD PTR [rbp-680], rsi
+  mov QWORD PTR [rbp-672], rdx
+  mov QWORD PTR [rbp-664], rcx
+  mov QWORD PTR [rbp-656], r8
+  mov QWORD PTR [rbp-648], r9
   mov rbx, rdi
   mov QWORD PTR [rbp-56], rbx
   mov rbx, rsi
@@ -20671,8 +22038,20 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   movsxd rbx, DWORD PTR [r15]
   mov DWORD PTR [rbp-100], ebx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_func_dynsyms
+  mov rbx, rax
+  mov DWORD PTR [rbp-104], ebx
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_count_data_dynsyms
+  mov rbx, rax
+  mov DWORD PTR [rbp-108], ebx
   mov rbx, 28
-  mov QWORD PTR [rbp-108], rbx
+  mov QWORD PTR [rbp-116], rbx
   movsxd rbx, DWORD PTR [rbp-100]
   mov r12, 1
   mov r15, rbx
@@ -20685,34 +22064,21 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   imul r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-116], r13
-  movsxd rbx, DWORD PTR [rbp-100]
+  mov QWORD PTR [rbp-124], r13
+  movsxd rbx, DWORD PTR [rbp-104]
   mov r12, rbx
   mov rbx, 24
   mov r15, r12
   mov r14, rbx
   imul r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-124], r13
-  mov rbx, 16
-  movsxd r12, DWORD PTR [rbp-100]
-  mov r13, r12
-  mov QWORD PTR [rbp-624], 16
-  mov r15, r13
-  mov r14, QWORD PTR [rbp-624]
-  imul r15, r14
-  mov r12, r15
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
   mov QWORD PTR [rbp-132], r13
-  mov rbx, 24
-  movsxd r12, DWORD PTR [rbp-100]
+  mov rbx, 16
+  movsxd r12, DWORD PTR [rbp-104]
   mov r13, r12
-  mov QWORD PTR [rbp-632], 8
+  mov QWORD PTR [rbp-696], 16
   mov r15, r13
-  mov r14, QWORD PTR [rbp-632]
+  mov r14, QWORD PTR [rbp-696]
   imul r15, r14
   mov r12, r15
   mov r15, rbx
@@ -20720,9 +22086,38 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   add r15, r14
   mov r13, r15
   mov QWORD PTR [rbp-140], r13
+  mov rbx, 24
+  movsxd r12, DWORD PTR [rbp-104]
+  mov r13, r12
+  mov QWORD PTR [rbp-704], 8
+  mov r15, r13
+  mov r14, QWORD PTR [rbp-704]
+  imul r15, r14
+  mov r12, r15
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-148], r13
+  movsxd rbx, DWORD PTR [rbp-108]
+  mov r12, rbx
+  mov rbx, 8
+  mov r15, r12
+  mov r14, rbx
+  imul r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-156], r13
+  movsxd rbx, DWORD PTR [rbp-108]
+  mov r12, rbx
+  mov rbx, 24
+  mov r15, r12
+  mov r14, rbx
+  imul r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-164], r13
   movsxd rbx, DWORD PTR [rbp-100]
-  mov DWORD PTR [rbp-144], ebx
-  movsxd rbx, DWORD PTR [rbp-144]
+  mov DWORD PTR [rbp-168], ebx
+  movsxd rbx, DWORD PTR [rbp-168]
   mov r12, 1
   mov r15, rbx
   mov r14, r12
@@ -20732,48 +22127,48 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L698
-  lea rbx, [rbp-144]
+  jz .L736
+  lea rbx, [rbp-168]
   mov r12, 1
   mov r15, rbx
   mov rax, r12
   mov DWORD PTR [r15], eax
-  jmp .L699
-.L698:
-.L699:
+  jmp .L737
+.L736:
+.L737:
   movsxd rbx, DWORD PTR [rbp-100]
   mov r12, 1
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov DWORD PTR [rbp-148], r13d
+  mov DWORD PTR [rbp-172], r13d
   mov rbx, 8
-  movsxd r12, DWORD PTR [rbp-144]
+  movsxd r12, DWORD PTR [rbp-168]
   mov r13, r12
-  mov QWORD PTR [rbp-640], 4
+  mov QWORD PTR [rbp-712], 4
   mov r15, r13
-  mov r14, QWORD PTR [rbp-640]
+  mov r14, QWORD PTR [rbp-712]
   imul r15, r14
   mov r12, r15
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  movsxd rbx, DWORD PTR [rbp-148]
+  movsxd rbx, DWORD PTR [rbp-172]
   mov r12, rbx
-  mov QWORD PTR [rbp-648], 4
+  mov QWORD PTR [rbp-720], 4
   mov r15, r12
-  mov r14, QWORD PTR [rbp-648]
+  mov r14, QWORD PTR [rbp-720]
   imul r15, r14
   mov rbx, r15
   mov r15, r13
   mov r14, rbx
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-156], r12
+  mov QWORD PTR [rbp-180], r12
   mov rbx, 1
-  mov QWORD PTR [rbp-164], rbx
+  mov QWORD PTR [rbp-188], rbx
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 148
   mov r15, rbx
@@ -20783,153 +22178,174 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-172], r12
+  mov QWORD PTR [rbp-196], r12
   mov rbx, 0
-  mov DWORD PTR [rbp-176], ebx
-.L700:
-  movsxd r15, DWORD PTR [rbp-176]
-  mov QWORD PTR [rbp-656], r15
+  mov DWORD PTR [rbp-200], ebx
+.L738:
+  movsxd r15, DWORD PTR [rbp-200]
+  mov QWORD PTR [rbp-728], r15
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-744], r15
-  mov QWORD PTR [rbp-800], 156
-  mov r15, QWORD PTR [rbp-744]
-  mov r14, QWORD PTR [rbp-800]
+  mov QWORD PTR [rbp-816], r15
+  mov QWORD PTR [rbp-872], 156
+  mov r15, QWORD PTR [rbp-816]
+  mov r14, QWORD PTR [rbp-872]
   add r15, r14
-  mov QWORD PTR [rbp-664], r15
-  mov r15, QWORD PTR [rbp-664]
+  mov QWORD PTR [rbp-736], r15
+  mov r15, QWORD PTR [rbp-736]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-672], rax
-  mov r15, QWORD PTR [rbp-656]
-  mov r14, QWORD PTR [rbp-672]
+  mov QWORD PTR [rbp-744], rax
+  mov r15, QWORD PTR [rbp-728]
+  mov r14, QWORD PTR [rbp-744]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-680], rax
-  mov r15, QWORD PTR [rbp-680]
-  test r15, r15
-  jz .L701
-  mov r15, QWORD PTR [rbp-172]
-  mov QWORD PTR [rbp-688], r15
-  movsxd r15, DWORD PTR [rbp-176]
-  mov QWORD PTR [rbp-696], r15
-  mov QWORD PTR [rbp-704], 8
-  mov r15, QWORD PTR [rbp-696]
-  mov r14, QWORD PTR [rbp-704]
-  imul r15, r14
-  mov QWORD PTR [rbp-712], r15
-  mov r15, QWORD PTR [rbp-688]
-  mov r14, QWORD PTR [rbp-712]
-  add r15, r14
-  mov QWORD PTR [rbp-720], r15
-  mov r15, QWORD PTR [rbp-720]
-  mov rax, QWORD PTR [r15]
-  mov QWORD PTR [rbp-728], rax
-  mov r14, QWORD PTR [rbp-728]
-  mov r15, r14
-  mov QWORD PTR [rbp-736], r15
-  mov r15, QWORD PTR [rbp-736]
-  mov QWORD PTR [rbp-184], r15
-  lea rbx, [rbp-164]
-  mov r15, QWORD PTR [rbp-164]
-  mov QWORD PTR [rbp-752], r15
-  mov r15, QWORD PTR [rbp-184]
-  mov QWORD PTR [rbp-760], r15
-  mov rdi, QWORD PTR [rbp-760]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_strlen
-  mov QWORD PTR [rbp-768], rax
+  mov QWORD PTR [rbp-752], rax
   mov r15, QWORD PTR [rbp-752]
-  mov r14, QWORD PTR [rbp-768]
-  add r15, r14
-  mov QWORD PTR [rbp-776], r15
-  mov QWORD PTR [rbp-784], 1
-  mov r15, QWORD PTR [rbp-776]
+  test r15, r15
+  jz .L739
+  mov r15, QWORD PTR [rbp-196]
+  mov QWORD PTR [rbp-760], r15
+  movsxd r15, DWORD PTR [rbp-200]
+  mov QWORD PTR [rbp-768], r15
+  mov QWORD PTR [rbp-776], 8
+  mov r15, QWORD PTR [rbp-768]
+  mov r14, QWORD PTR [rbp-776]
+  imul r15, r14
+  mov QWORD PTR [rbp-784], r15
+  mov r15, QWORD PTR [rbp-760]
   mov r14, QWORD PTR [rbp-784]
   add r15, r14
   mov QWORD PTR [rbp-792], r15
-  mov r15, rbx
-  mov rax, QWORD PTR [rbp-792]
-  mov QWORD PTR [r15], rax
-  lea r12, [rbp-176]
-  movsxd r15, DWORD PTR [rbp-176]
+  mov r15, QWORD PTR [rbp-792]
+  mov rax, QWORD PTR [r15]
+  mov QWORD PTR [rbp-800], rax
+  mov r14, QWORD PTR [rbp-800]
+  mov r15, r14
   mov QWORD PTR [rbp-808], r15
-  mov QWORD PTR [rbp-816], 1
   mov r15, QWORD PTR [rbp-808]
-  mov r14, QWORD PTR [rbp-816]
+  mov QWORD PTR [rbp-208], r15
+  lea rbx, [rbp-188]
+  mov r15, QWORD PTR [rbp-188]
+  mov QWORD PTR [rbp-824], r15
+  mov r15, QWORD PTR [rbp-208]
+  mov QWORD PTR [rbp-832], r15
+  mov rdi, QWORD PTR [rbp-832]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_strlen
+  mov QWORD PTR [rbp-840], rax
+  mov r15, QWORD PTR [rbp-824]
+  mov r14, QWORD PTR [rbp-840]
+  add r15, r14
+  mov QWORD PTR [rbp-848], r15
+  mov QWORD PTR [rbp-856], 1
+  mov r15, QWORD PTR [rbp-848]
+  mov r14, QWORD PTR [rbp-856]
+  add r15, r14
+  mov QWORD PTR [rbp-864], r15
+  mov r15, rbx
+  mov rax, QWORD PTR [rbp-864]
+  mov QWORD PTR [r15], rax
+  lea r12, [rbp-200]
+  movsxd r15, DWORD PTR [rbp-200]
+  mov QWORD PTR [rbp-880], r15
+  mov QWORD PTR [rbp-888], 1
+  mov r15, QWORD PTR [rbp-880]
+  mov r14, QWORD PTR [rbp-888]
   add r15, r14
   mov r13, r15
   mov r15, r12
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L700
-.L701:
+  jmp .L738
+.L739:
   mov rbx, 0
-  mov DWORD PTR [rbp-188], ebx
-.L702:
-  movsxd r15, DWORD PTR [rbp-188]
-  mov QWORD PTR [rbp-824], r15
+  mov DWORD PTR [rbp-212], ebx
+.L740:
+  movsxd r15, DWORD PTR [rbp-212]
+  mov QWORD PTR [rbp-896], r15
   movsxd r15, DWORD PTR [rbp-100]
-  mov QWORD PTR [rbp-856], r15
-  mov r15, QWORD PTR [rbp-824]
-  mov r14, QWORD PTR [rbp-856]
+  mov QWORD PTR [rbp-928], r15
+  mov r15, QWORD PTR [rbp-896]
+  mov r14, QWORD PTR [rbp-928]
   xor rax, rax
   cmp r15, r14
   setl al
-  mov QWORD PTR [rbp-936], rax
-  mov r15, QWORD PTR [rbp-936]
+  mov QWORD PTR [rbp-1008], rax
+  mov r15, QWORD PTR [rbp-1008]
   test r15, r15
-  jz .L703
+  jz .L741
   xor r10, r10
   mov r15, QWORD PTR [rbp-96]
-  mov QWORD PTR [rbp-832], r15
-  movsxd r15, DWORD PTR [rbp-188]
-  mov QWORD PTR [rbp-840], r15
-  mov rdi, QWORD PTR [rbp-832]
-  mov rsi, QWORD PTR [rbp-840]
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
-  mov QWORD PTR [rbp-848], rax
-  mov r15, QWORD PTR [rbp-848]
-  mov QWORD PTR [rbp-196], r15
-  lea rbx, [rbp-164]
-  mov r15, QWORD PTR [rbp-164]
-  mov QWORD PTR [rbp-864], r15
-  mov r15, QWORD PTR [rbp-196]
-  mov QWORD PTR [rbp-872], r15
-  mov QWORD PTR [rbp-880], 8
-  mov r15, QWORD PTR [rbp-872]
-  mov r14, QWORD PTR [rbp-880]
-  add r15, r14
-  mov QWORD PTR [rbp-888], r15
-  mov r15, QWORD PTR [rbp-888]
-  movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-896], rax
-  mov r14, QWORD PTR [rbp-896]
-  mov r15, r14
   mov QWORD PTR [rbp-904], r15
-  mov r15, QWORD PTR [rbp-864]
-  mov r14, QWORD PTR [rbp-904]
-  add r15, r14
+  movsxd r15, DWORD PTR [rbp-212]
   mov QWORD PTR [rbp-912], r15
-  mov QWORD PTR [rbp-920], 1
-  mov r15, QWORD PTR [rbp-912]
-  mov r14, QWORD PTR [rbp-920]
-  add r15, r14
-  mov QWORD PTR [rbp-928], r15
-  mov r15, rbx
-  mov rax, QWORD PTR [rbp-928]
-  mov QWORD PTR [r15], rax
-  lea r12, [rbp-188]
-  movsxd r15, DWORD PTR [rbp-188]
+  mov rdi, QWORD PTR [rbp-904]
+  mov rsi, QWORD PTR [rbp-912]
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_dynsym_get
+  mov QWORD PTR [rbp-920], rax
+  mov r15, QWORD PTR [rbp-920]
+  mov QWORD PTR [rbp-220], r15
+  lea rbx, [rbp-188]
+  mov r15, QWORD PTR [rbp-188]
+  mov QWORD PTR [rbp-936], r15
+  mov r15, QWORD PTR [rbp-220]
   mov QWORD PTR [rbp-944], r15
-  mov QWORD PTR [rbp-952], 1
+  mov QWORD PTR [rbp-952], 8
   mov r15, QWORD PTR [rbp-944]
   mov r14, QWORD PTR [rbp-952]
+  add r15, r14
+  mov QWORD PTR [rbp-960], r15
+  mov r15, QWORD PTR [rbp-960]
+  movsxd rax, DWORD PTR [r15]
+  mov QWORD PTR [rbp-968], rax
+  mov r14, QWORD PTR [rbp-968]
+  mov r15, r14
+  mov QWORD PTR [rbp-976], r15
+  mov r15, QWORD PTR [rbp-936]
+  mov r14, QWORD PTR [rbp-976]
+  add r15, r14
+  mov QWORD PTR [rbp-984], r15
+  mov QWORD PTR [rbp-992], 1
+  mov r15, QWORD PTR [rbp-984]
+  mov r14, QWORD PTR [rbp-992]
+  add r15, r14
+  mov QWORD PTR [rbp-1000], r15
+  mov r15, rbx
+  mov rax, QWORD PTR [rbp-1000]
+  mov QWORD PTR [r15], rax
+  lea r12, [rbp-212]
+  movsxd r15, DWORD PTR [rbp-212]
+  mov QWORD PTR [rbp-1016], r15
+  mov QWORD PTR [rbp-1024], 1
+  mov r15, QWORD PTR [rbp-1016]
+  mov r14, QWORD PTR [rbp-1024]
   add r15, r14
   mov r13, r15
   mov r15, r12
   mov rax, r13
   mov DWORD PTR [r15], eax
-  jmp .L702
-.L703:
+  jmp .L740
+.L741:
+  mov rbx, 0
+  mov DWORD PTR [rbp-224], ebx
+  movsxd rbx, DWORD PTR [rbp-108]
+  mov r12, 0
+  mov r15, rbx
+  mov r14, r12
+  xor rax, rax
+  cmp r15, r14
+  setg al
+  mov r13, rax
+  mov r15, r13
+  test r15, r15
+  jz .L742
+  lea rbx, [rbp-224]
+  mov r12, 3
+  mov r15, rbx
+  mov rax, r12
+  mov DWORD PTR [r15], eax
+  jmp .L743
+.L742:
+.L743:
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 156
   mov r15, rbx
@@ -20944,18 +22360,24 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, rbx
   add r15, r14
   mov r13, r15
-  mov rbx, 16
+  movsxd rbx, DWORD PTR [rbp-224]
+  mov r12, rbx
   mov r15, r13
-  mov r14, rbx
+  mov r14, r12
+  add r15, r14
+  mov rbx, r15
+  mov r12, 16
+  mov r15, rbx
+  mov r14, r12
   imul r15, r14
-  mov r12, r15
-  mov QWORD PTR [rbp-204], r12
+  mov r13, r15
+  mov QWORD PTR [rbp-232], r13
   mov rbx, 4
-  mov DWORD PTR [rbp-208], ebx
+  mov DWORD PTR [rbp-236], ebx
   lea rbx, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PAGE_SIZE]
   mov r15, rbx
   mov r12, QWORD PTR [r15]
-  mov QWORD PTR [rbp-216], r12
+  mov QWORD PTR [rbp-244], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 32
   mov r15, rbx
@@ -20971,14 +22393,14 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-224], r12
-  mov rbx, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-232], rbx
-  mov rbx, QWORD PTR [rbp-224]
-  mov QWORD PTR [rbp-240], rbx
+  mov QWORD PTR [rbp-252], r12
+  mov rbx, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-260], rbx
+  mov rbx, QWORD PTR [rbp-252]
+  mov QWORD PTR [rbp-268], rbx
   xor r10, r10
-  mov rbx, QWORD PTR [rbp-232]
-  mov r12, QWORD PTR [rbp-108]
+  mov rbx, QWORD PTR [rbp-260]
+  mov r12, QWORD PTR [rbp-116]
   mov r15, rbx
   mov r14, r12
   add r15, r14
@@ -20988,23 +22410,23 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
   mov rbx, rax
-  mov QWORD PTR [rbp-248], rbx
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-248]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-960], r15
+  mov QWORD PTR [rbp-276], rbx
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-276]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1032], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-960]
+  mov r14, QWORD PTR [rbp-1032]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-256], r12
+  mov QWORD PTR [rbp-284], r12
   xor r10, r10
-  mov rbx, QWORD PTR [rbp-248]
-  mov r12, QWORD PTR [rbp-156]
+  mov rbx, QWORD PTR [rbp-276]
+  mov r12, QWORD PTR [rbp-180]
   mov r15, rbx
   mov r14, r12
   add r15, r14
@@ -21014,69 +22436,95 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
   mov rbx, rax
-  mov QWORD PTR [rbp-264], rbx
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-264]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-968], r15
+  mov QWORD PTR [rbp-292], rbx
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-292]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1040], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-968]
+  mov r14, QWORD PTR [rbp-1040]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-272], r12
-  mov rbx, QWORD PTR [rbp-264]
-  mov r12, QWORD PTR [rbp-116]
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov QWORD PTR [rbp-280], r13
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-280]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-976], r15
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-976]
-  sub r15, r14
-  mov r13, r15
-  mov r15, rbx
-  mov r14, r13
-  add r15, r14
-  mov r12, r15
-  mov QWORD PTR [rbp-288], r12
-  xor r10, r10
-  mov rbx, QWORD PTR [rbp-280]
-  mov r12, QWORD PTR [rbp-164]
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, 8
-  mov rdi, r13
-  mov rsi, rbx
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
-  mov rbx, rax
-  mov QWORD PTR [rbp-296], rbx
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-296]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-984], r15
-  mov r15, r12
-  mov r14, QWORD PTR [rbp-984]
-  sub r15, r14
-  mov r13, r15
-  mov r15, rbx
-  mov r14, r13
-  add r15, r14
-  mov r12, r15
-  mov QWORD PTR [rbp-304], r12
-  xor r10, r10
-  mov rbx, QWORD PTR [rbp-296]
+  mov QWORD PTR [rbp-300], r12
+  mov rbx, QWORD PTR [rbp-292]
   mov r12, QWORD PTR [rbp-124]
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-308], r13
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-308]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1048], r15
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-1048]
+  sub r15, r14
+  mov r13, r15
+  mov r15, rbx
+  mov r14, r13
+  add r15, r14
+  mov r12, r15
+  mov QWORD PTR [rbp-316], r12
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-308]
+  mov r12, QWORD PTR [rbp-188]
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, 8
+  mov rdi, r13
+  mov rsi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
+  mov rbx, rax
+  mov QWORD PTR [rbp-324], rbx
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-324]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1056], r15
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-1056]
+  sub r15, r14
+  mov r13, r15
+  mov r15, rbx
+  mov r14, r13
+  add r15, r14
+  mov r12, r15
+  mov QWORD PTR [rbp-332], r12
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-324]
+  mov r12, QWORD PTR [rbp-132]
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, 8
+  mov rdi, r13
+  mov rsi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
+  mov rbx, rax
+  mov QWORD PTR [rbp-340], rbx
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-340]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1064], r15
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-1064]
+  sub r15, r14
+  mov r13, r15
+  mov r15, rbx
+  mov r14, r13
+  add r15, r14
+  mov r12, r15
+  mov QWORD PTR [rbp-348], r12
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-340]
+  mov r12, QWORD PTR [rbp-164]
   mov r15, rbx
   mov r14, r12
   add r15, r14
@@ -21086,45 +22534,45 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
   mov rbx, rax
-  mov QWORD PTR [rbp-312], rbx
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-312]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-992], r15
+  mov QWORD PTR [rbp-356], rbx
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-356]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1072], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-992]
+  mov r14, QWORD PTR [rbp-1072]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-320], r12
-  mov rbx, QWORD PTR [rbp-312]
-  mov r12, QWORD PTR [rbp-132]
+  mov QWORD PTR [rbp-364], r12
+  mov rbx, QWORD PTR [rbp-356]
+  mov r12, QWORD PTR [rbp-140]
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-328], r13
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-328]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-1000], r15
+  mov QWORD PTR [rbp-372], r13
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-372]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1080], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1000]
+  mov r14, QWORD PTR [rbp-1080]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-336], r12
-  mov rbx, QWORD PTR [rbp-328]
+  mov QWORD PTR [rbp-380], r12
+  mov rbx, QWORD PTR [rbp-372]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1008], 72
+  mov QWORD PTR [rbp-1088], 72
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1008]
+  mov r14, QWORD PTR [rbp-1088]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21133,25 +22581,25 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-344], r13
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-344]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-1016], r15
+  mov QWORD PTR [rbp-388], r13
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-388]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1096], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1016]
+  mov r14, QWORD PTR [rbp-1096]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-352], r12
-  mov rbx, QWORD PTR [rbp-344]
+  mov QWORD PTR [rbp-396], r12
+  mov rbx, QWORD PTR [rbp-388]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1024], 80
+  mov QWORD PTR [rbp-1104], 80
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1024]
+  mov r14, QWORD PTR [rbp-1104]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21160,9 +22608,9 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-360], r13
+  mov QWORD PTR [rbp-404], r13
   xor r10, r10
-  mov rbx, QWORD PTR [rbp-360]
+  mov rbx, QWORD PTR [rbp-404]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PAGE_SIZE]
   mov r15, r12
   mov r13, QWORD PTR [r15]
@@ -21170,14 +22618,14 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
   mov rbx, rax
-  mov QWORD PTR [rbp-368], rbx
+  mov QWORD PTR [rbp-412], rbx
   xor r10, r10
-  mov rbx, QWORD PTR [rbp-224]
-  mov r12, QWORD PTR [rbp-360]
-  mov r15, QWORD PTR [rbp-216]
-  mov QWORD PTR [rbp-1032], r15
+  mov rbx, QWORD PTR [rbp-252]
+  mov r12, QWORD PTR [rbp-404]
+  mov r15, QWORD PTR [rbp-244]
+  mov QWORD PTR [rbp-1112], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1032]
+  mov r14, QWORD PTR [rbp-1112]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
@@ -21191,14 +22639,14 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
   mov rbx, rax
-  mov QWORD PTR [rbp-376], rbx
-  mov rbx, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-384], rbx
-  mov rbx, QWORD PTR [rbp-376]
-  mov QWORD PTR [rbp-392], rbx
+  mov QWORD PTR [rbp-420], rbx
+  mov rbx, QWORD PTR [rbp-412]
+  mov QWORD PTR [rbp-428], rbx
+  mov rbx, QWORD PTR [rbp-420]
+  mov QWORD PTR [rbp-436], rbx
   xor r10, r10
-  mov rbx, QWORD PTR [rbp-384]
-  mov r12, QWORD PTR [rbp-140]
+  mov rbx, QWORD PTR [rbp-428]
+  mov r12, QWORD PTR [rbp-148]
   mov r15, rbx
   mov r14, r12
   add r15, r14
@@ -21208,45 +22656,71 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
   mov rbx, rax
-  mov QWORD PTR [rbp-400], rbx
-  mov rbx, QWORD PTR [rbp-376]
-  mov r12, QWORD PTR [rbp-400]
-  mov r15, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-1040], r15
+  mov QWORD PTR [rbp-444], rbx
+  mov rbx, QWORD PTR [rbp-420]
+  mov r12, QWORD PTR [rbp-444]
+  mov r15, QWORD PTR [rbp-412]
+  mov QWORD PTR [rbp-1120], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1040]
+  mov r14, QWORD PTR [rbp-1120]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-408], r12
-  mov rbx, QWORD PTR [rbp-400]
-  mov r12, QWORD PTR [rbp-204]
+  mov QWORD PTR [rbp-452], r12
+  xor r10, r10
+  mov rbx, QWORD PTR [rbp-444]
+  mov r12, QWORD PTR [rbp-156]
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-416], r13
-  mov rbx, QWORD PTR [rbp-376]
-  mov r12, QWORD PTR [rbp-416]
-  mov r15, QWORD PTR [rbp-368]
-  mov QWORD PTR [rbp-1048], r15
+  mov rbx, 8
+  mov rdi, r13
+  mov rsi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_align_up
+  mov rbx, rax
+  mov QWORD PTR [rbp-460], rbx
+  mov rbx, QWORD PTR [rbp-420]
+  mov r12, QWORD PTR [rbp-460]
+  mov r15, QWORD PTR [rbp-412]
+  mov QWORD PTR [rbp-1128], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1048]
+  mov r14, QWORD PTR [rbp-1128]
   sub r15, r14
   mov r13, r15
   mov r15, rbx
   mov r14, r13
   add r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-424], r12
-  mov rbx, QWORD PTR [rbp-424]
-  mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1056], 88
+  mov QWORD PTR [rbp-468], r12
+  mov rbx, QWORD PTR [rbp-460]
+  mov r12, QWORD PTR [rbp-232]
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov QWORD PTR [rbp-476], r13
+  mov rbx, QWORD PTR [rbp-420]
+  mov r12, QWORD PTR [rbp-476]
+  mov r15, QWORD PTR [rbp-412]
+  mov QWORD PTR [rbp-1136], r15
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1056]
+  mov r14, QWORD PTR [rbp-1136]
+  sub r15, r14
+  mov r13, r15
+  mov r15, rbx
+  mov r14, r13
+  add r15, r14
+  mov r12, r15
+  mov QWORD PTR [rbp-484], r12
+  mov rbx, QWORD PTR [rbp-484]
+  mov r12, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-1144], 88
+  mov r15, r12
+  mov r14, QWORD PTR [rbp-1144]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21255,12 +22729,12 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-432], r13
-  mov rbx, QWORD PTR [rbp-416]
+  mov QWORD PTR [rbp-492], r13
+  mov rbx, QWORD PTR [rbp-476]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1064], 88
+  mov QWORD PTR [rbp-1152], 88
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1064]
+  mov r14, QWORD PTR [rbp-1152]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21269,17 +22743,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-368]
+  mov rbx, QWORD PTR [rbp-412]
   mov r15, r13
   mov r14, rbx
   sub r15, r14
   mov r12, r15
-  mov QWORD PTR [rbp-440], r12
-  mov rbx, QWORD PTR [rbp-440]
+  mov QWORD PTR [rbp-500], r12
+  mov rbx, QWORD PTR [rbp-500]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1072], 24
+  mov QWORD PTR [rbp-1160], 24
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1072]
+  mov r14, QWORD PTR [rbp-1160]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21288,14 +22762,14 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov QWORD PTR [rbp-448], r13
+  mov QWORD PTR [rbp-508], r13
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 40
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-336]
+  mov rbx, QWORD PTR [rbp-380]
   mov r15, r13
   mov QWORD PTR [r15], rbx
   mov rbx, QWORD PTR [rbp-56]
@@ -21304,7 +22778,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-352]
+  mov rbx, QWORD PTR [rbp-396]
   mov r15, r13
   mov QWORD PTR [r15], rbx
   mov rbx, QWORD PTR [rbp-56]
@@ -21313,7 +22787,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-424]
+  mov rbx, QWORD PTR [rbp-484]
   mov r15, r13
   mov QWORD PTR [r15], rbx
   mov rbx, QWORD PTR [rbp-56]
@@ -21322,7 +22796,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-432]
+  mov rbx, QWORD PTR [rbp-492]
   mov r15, r13
   mov QWORD PTR [r15], rbx
   xor r10, r10
@@ -21330,8 +22804,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_get_gsyms
   mov rbx, rax
-  mov QWORD PTR [rbp-456], rbx
-  mov rbx, QWORD PTR [rbp-456]
+  mov QWORD PTR [rbp-516], rbx
+  mov rbx, QWORD PTR [rbp-516]
   mov r12, 8
   mov r15, rbx
   mov r14, r12
@@ -21346,8 +22820,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_symtab
   mov rbx, rax
-  mov DWORD PTR [rbp-460], ebx
-  movsxd rbx, DWORD PTR [rbp-460]
+  mov DWORD PTR [rbp-520], ebx
+  movsxd rbx, DWORD PTR [rbp-520]
   mov r12, 0
   mov r15, rbx
   mov r14, r12
@@ -21357,10 +22831,10 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L704
+  jz .L744
   mov rbx, 1
   mov rax, rbx
-  add rsp, 1640
+  add rsp, 1784
   pop r15
   pop r14
   pop r13
@@ -21368,52 +22842,65 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   pop rbx
   pop rbp
   ret
-  jmp .L705
-.L704:
-.L705:
+  jmp .L745
+.L744:
+.L745:
   mov rbx, QWORD PTR [rbp-56]
-  mov r12, QWORD PTR [rbp-320]
-  mov r13, QWORD PTR [rbp-392]
+  mov r12, QWORD PTR [rbp-364]
+  mov r13, QWORD PTR [rbp-436]
   mov rdi, rbx
   mov rsi, r12
   mov rdx, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_plt_got
   mov rbx, rax
   mov rbx, QWORD PTR [rbp-56]
+  mov r12, QWORD PTR [rbp-452]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_data_got
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-56]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_apply_relocations
   mov rbx, rax
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1080], r15
-  mov r12, QWORD PTR [rbp-320]
-  mov r13, QWORD PTR [rbp-392]
-  mov r15, QWORD PTR [rbp-240]
-  mov QWORD PTR [rbp-1088], r15
-  mov r15, QWORD PTR [rbp-272]
-  mov QWORD PTR [rbp-1096], r15
-  mov r15, QWORD PTR [rbp-288]
-  mov QWORD PTR [rbp-1104], r15
-  mov r15, QWORD PTR [rbp-256]
-  mov QWORD PTR [rbp-1112], r15
-  mov r15, QWORD PTR [rbp-304]
-  mov QWORD PTR [rbp-1120], r15
-  mov rbx, QWORD PTR [rbp-408]
-  sub rsp, 8
+  mov QWORD PTR [rbp-1168], r15
+  mov r12, QWORD PTR [rbp-364]
+  mov r13, QWORD PTR [rbp-436]
+  mov r15, QWORD PTR [rbp-268]
+  mov QWORD PTR [rbp-1176], r15
+  mov r15, QWORD PTR [rbp-300]
+  mov QWORD PTR [rbp-1184], r15
+  mov r15, QWORD PTR [rbp-316]
+  mov QWORD PTR [rbp-1192], r15
+  mov r15, QWORD PTR [rbp-284]
+  mov QWORD PTR [rbp-1200], r15
+  mov r15, QWORD PTR [rbp-332]
+  mov QWORD PTR [rbp-1208], r15
+  mov r15, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1216], r15
+  mov rbx, QWORD PTR [rbp-348]
   mov rax, rbx
   push rax
-  mov rax, QWORD PTR [rbp-1120]
+  mov rax, QWORD PTR [rbp-1216]
   push rax
-  mov rax, QWORD PTR [rbp-1112]
+  mov rax, QWORD PTR [rbp-1208]
   push rax
-  mov rdi, QWORD PTR [rbp-1080]
+  mov rax, QWORD PTR [rbp-1200]
+  push rax
+  mov rdi, QWORD PTR [rbp-1168]
   mov rsi, r12
   mov rdx, r13
-  mov rcx, QWORD PTR [rbp-1088]
-  mov r8, QWORD PTR [rbp-1096]
-  mov r9, QWORD PTR [rbp-1104]
+  mov rcx, QWORD PTR [rbp-1176]
+  mov r8, QWORD PTR [rbp-1184]
+  mov r9, QWORD PTR [rbp-1192]
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_dynamic_metadata
   mov rbx, rax
   add rsp, 32
+  mov rbx, QWORD PTR [rbp-56]
+  mov rdi, rbx
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_linker_cst_build_rela_dyn
+  mov rbx, rax
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 184
   mov r15, rbx
@@ -21423,7 +22910,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-468], r12
+  mov QWORD PTR [rbp-528], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 208
   mov r15, rbx
@@ -21433,7 +22920,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-476], r12
+  mov QWORD PTR [rbp-536], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 192
   mov r15, rbx
@@ -21443,7 +22930,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-484], r12
+  mov QWORD PTR [rbp-544], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 200
   mov r15, rbx
@@ -21453,7 +22940,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-492], r12
+  mov QWORD PTR [rbp-552], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 216
   mov r15, rbx
@@ -21463,7 +22950,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-500], r12
+  mov QWORD PTR [rbp-560], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 168
   mov r15, rbx
@@ -21473,7 +22960,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-508], r12
+  mov QWORD PTR [rbp-568], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 176
   mov r15, rbx
@@ -21483,7 +22970,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-516], r12
+  mov QWORD PTR [rbp-576], r12
   mov rbx, QWORD PTR [rbp-56]
   mov r12, 224
   mov r15, rbx
@@ -21493,161 +22980,35 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rbx, QWORD PTR [r15]
   mov r12, rbx
-  mov QWORD PTR [rbp-524], r12
-  mov rbx, QWORD PTR [rbp-516]
+  mov QWORD PTR [rbp-584], r12
+  mov rbx, QWORD PTR [rbp-576]
   mov r15, rbx
   mov r12, QWORD PTR [r15]
-  mov QWORD PTR [rbp-532], r12
-  mov rbx, QWORD PTR [rbp-532]
+  mov QWORD PTR [rbp-592], r12
+  mov rbx, QWORD PTR [rbp-592]
   mov r12, 0
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1128], 255
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1224], 255
   mov r14, rbx
-  mov r15, QWORD PTR [rbp-1128]
+  mov r15, QWORD PTR [rbp-1224]
   and r14, r15
   mov r12, r14
   movzx rbx, r12b
   mov r15, r13
   mov rax, rbx
   mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
+  mov rbx, QWORD PTR [rbp-592]
   mov r12, 1
   mov r15, rbx
   mov r14, r12
   add r15, r14
   mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1136], 8
-  mov rcx, QWORD PTR [rbp-1136]
-  mov r15, rbx
-  shr r15, cl
-  mov r12, r15
-  mov QWORD PTR [rbp-1144], 255
-  mov r14, r12
-  mov r15, QWORD PTR [rbp-1144]
-  and r14, r15
-  mov rbx, r14
-  movzx r12, bl
-  mov r15, r13
-  mov rax, r12
-  mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
-  mov r12, 2
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1152], 16
-  mov rcx, QWORD PTR [rbp-1152]
-  mov r15, rbx
-  shr r15, cl
-  mov r12, r15
-  mov QWORD PTR [rbp-1160], 255
-  mov r14, r12
-  mov r15, QWORD PTR [rbp-1160]
-  and r14, r15
-  mov rbx, r14
-  movzx r12, bl
-  mov r15, r13
-  mov rax, r12
-  mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
-  mov r12, 3
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1168], 24
-  mov rcx, QWORD PTR [rbp-1168]
-  mov r15, rbx
-  shr r15, cl
-  mov r12, r15
-  mov QWORD PTR [rbp-1176], 255
-  mov r14, r12
-  mov r15, QWORD PTR [rbp-1176]
-  and r14, r15
-  mov rbx, r14
-  movzx r12, bl
-  mov r15, r13
-  mov rax, r12
-  mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
-  mov r12, 4
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1184], 32
-  mov rcx, QWORD PTR [rbp-1184]
-  mov r15, rbx
-  shr r15, cl
-  mov r12, r15
-  mov QWORD PTR [rbp-1192], 255
-  mov r14, r12
-  mov r15, QWORD PTR [rbp-1192]
-  and r14, r15
-  mov rbx, r14
-  movzx r12, bl
-  mov r15, r13
-  mov rax, r12
-  mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
-  mov r12, 5
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1200], 40
-  mov rcx, QWORD PTR [rbp-1200]
-  mov r15, rbx
-  shr r15, cl
-  mov r12, r15
-  mov QWORD PTR [rbp-1208], 255
-  mov r14, r12
-  mov r15, QWORD PTR [rbp-1208]
-  and r14, r15
-  mov rbx, r14
-  movzx r12, bl
-  mov r15, r13
-  mov rax, r12
-  mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
-  mov r12, 6
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1216], 48
-  mov rcx, QWORD PTR [rbp-1216]
-  mov r15, rbx
-  shr r15, cl
-  mov r12, r15
-  mov QWORD PTR [rbp-1224], 255
-  mov r14, r12
-  mov r15, QWORD PTR [rbp-1224]
-  and r14, r15
-  mov rbx, r14
-  movzx r12, bl
-  mov r15, r13
-  mov rax, r12
-  mov BYTE PTR [r15], al
-  mov rbx, QWORD PTR [rbp-532]
-  mov r12, 7
-  mov r15, rbx
-  mov r14, r12
-  add r15, r14
-  mov r13, r15
-  mov rbx, QWORD PTR [rbp-408]
-  mov QWORD PTR [rbp-1232], 56
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1232], 8
   mov rcx, QWORD PTR [rbp-1232]
   mov r15, rbx
   shr r15, cl
@@ -21661,14 +23022,140 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r15, r13
   mov rax, r12
   mov BYTE PTR [r15], al
+  mov rbx, QWORD PTR [rbp-592]
+  mov r12, 2
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1248], 16
+  mov rcx, QWORD PTR [rbp-1248]
+  mov r15, rbx
+  shr r15, cl
+  mov r12, r15
+  mov QWORD PTR [rbp-1256], 255
+  mov r14, r12
+  mov r15, QWORD PTR [rbp-1256]
+  and r14, r15
+  mov rbx, r14
+  movzx r12, bl
+  mov r15, r13
+  mov rax, r12
+  mov BYTE PTR [r15], al
+  mov rbx, QWORD PTR [rbp-592]
+  mov r12, 3
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1264], 24
+  mov rcx, QWORD PTR [rbp-1264]
+  mov r15, rbx
+  shr r15, cl
+  mov r12, r15
+  mov QWORD PTR [rbp-1272], 255
+  mov r14, r12
+  mov r15, QWORD PTR [rbp-1272]
+  and r14, r15
+  mov rbx, r14
+  movzx r12, bl
+  mov r15, r13
+  mov rax, r12
+  mov BYTE PTR [r15], al
+  mov rbx, QWORD PTR [rbp-592]
+  mov r12, 4
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1280], 32
+  mov rcx, QWORD PTR [rbp-1280]
+  mov r15, rbx
+  shr r15, cl
+  mov r12, r15
+  mov QWORD PTR [rbp-1288], 255
+  mov r14, r12
+  mov r15, QWORD PTR [rbp-1288]
+  and r14, r15
+  mov rbx, r14
+  movzx r12, bl
+  mov r15, r13
+  mov rax, r12
+  mov BYTE PTR [r15], al
+  mov rbx, QWORD PTR [rbp-592]
+  mov r12, 5
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1296], 40
+  mov rcx, QWORD PTR [rbp-1296]
+  mov r15, rbx
+  shr r15, cl
+  mov r12, r15
+  mov QWORD PTR [rbp-1304], 255
+  mov r14, r12
+  mov r15, QWORD PTR [rbp-1304]
+  and r14, r15
+  mov rbx, r14
+  movzx r12, bl
+  mov r15, r13
+  mov rax, r12
+  mov BYTE PTR [r15], al
+  mov rbx, QWORD PTR [rbp-592]
+  mov r12, 6
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1312], 48
+  mov rcx, QWORD PTR [rbp-1312]
+  mov r15, rbx
+  shr r15, cl
+  mov r12, r15
+  mov QWORD PTR [rbp-1320], 255
+  mov r14, r12
+  mov r15, QWORD PTR [rbp-1320]
+  and r14, r15
+  mov rbx, r14
+  movzx r12, bl
+  mov r15, r13
+  mov rax, r12
+  mov BYTE PTR [r15], al
+  mov rbx, QWORD PTR [rbp-592]
+  mov r12, 7
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov rbx, QWORD PTR [rbp-468]
+  mov QWORD PTR [rbp-1328], 56
+  mov rcx, QWORD PTR [rbp-1328]
+  mov r15, rbx
+  shr r15, cl
+  mov r12, r15
+  mov QWORD PTR [rbp-1336], 255
+  mov r14, r12
+  mov r15, QWORD PTR [rbp-1336]
+  and r14, r15
+  mov rbx, r14
+  movzx r12, bl
+  mov r15, r13
+  mov rax, r12
+  mov BYTE PTR [r15], al
   xor r10, r10
-  lea rbx, [rbp-1600]
+  lea rbx, [rbp-1744]
   mov r12, 262144
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_init
   mov r12, rax
-  lea r12, [rbp-556]
+  lea r12, [rbp-616]
   push rcx
   push rsi
   push rdi
@@ -21680,61 +23167,61 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   pop rdi
   pop rsi
   pop rcx
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 127
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 69
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 76
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 70
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 2
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 1
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 1
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit8
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_ET_EXEC]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -21742,7 +23229,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_EM_X86_64]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -21750,17 +23237,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 1
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1248], 124
+  mov QWORD PTR [rbp-1344], 124
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1248]
+  mov r14, QWORD PTR [rbp-1344]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21769,7 +23256,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_ELF_HDR_SIZE]
   mov r15, r12
   mov r13, QWORD PTR [r15]
@@ -21777,55 +23264,55 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 64
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 56
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  movsxd r12, DWORD PTR [rbp-208]
+  lea rbx, [rbp-616]
+  movsxd r12, DWORD PTR [rbp-236]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 64
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit16_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PT_LOAD]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -21834,17 +23321,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_R]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
   lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_X]
-  mov QWORD PTR [rbp-1256], r15
-  mov r15, QWORD PTR [rbp-1256]
+  mov QWORD PTR [rbp-1352], r15
+  mov r15, QWORD PTR [rbp-1352]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-1264], rax
+  mov QWORD PTR [rbp-1360], rax
   mov r15, r13
-  mov r14, QWORD PTR [rbp-1264]
+  mov r14, QWORD PTR [rbp-1360]
   add r15, r14
   mov r12, r15
   mov r13, r12
@@ -21852,17 +23339,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 0
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1272], 32
+  mov QWORD PTR [rbp-1368], 32
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1272]
+  mov r14, QWORD PTR [rbp-1368]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21871,11 +23358,11 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1280], 32
+  mov QWORD PTR [rbp-1376], 32
   mov r15, r12
-  mov r14, QWORD PTR [rbp-1280]
+  mov r14, QWORD PTR [rbp-1376]
   add r15, r14
   mov r13, r15
   mov r15, r13
@@ -21884,19 +23371,19 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-360]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-404]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-360]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-404]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PAGE_SIZE]
   mov r15, r12
   mov r13, QWORD PTR [r15]
@@ -21904,7 +23391,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PT_LOAD]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -21913,17 +23400,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_R]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
   lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_W]
-  mov QWORD PTR [rbp-1288], r15
-  mov r15, QWORD PTR [rbp-1288]
+  mov QWORD PTR [rbp-1384], r15
+  mov r15, QWORD PTR [rbp-1384]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-1296], rax
+  mov QWORD PTR [rbp-1392], rax
   mov r15, r13
-  mov r14, QWORD PTR [rbp-1296]
+  mov r14, QWORD PTR [rbp-1392]
   add r15, r14
   mov r12, r15
   mov r13, r12
@@ -21931,37 +23418,37 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-368]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-412]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-376]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-420]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-376]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-420]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-440]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-500]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-448]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-508]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PAGE_SIZE]
   mov r15, r12
   mov r13, QWORD PTR [r15]
@@ -21969,7 +23456,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PT_INTERP]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -21978,7 +23465,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_R]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -21987,43 +23474,43 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-232]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-260]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-240]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-268]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-240]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-268]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-108]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-116]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-108]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-116]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 1
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PT_DYNAMIC]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
@@ -22032,17 +23519,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   lea r12, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_R]
   mov r15, r12
   movsxd r13, DWORD PTR [r15]
   lea r15, [rip+__run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_writer_cst_PF_W]
-  mov QWORD PTR [rbp-1304], r15
-  mov r15, QWORD PTR [rbp-1304]
+  mov QWORD PTR [rbp-1400], r15
+  mov r15, QWORD PTR [rbp-1400]
   movsxd rax, DWORD PTR [r15]
-  mov QWORD PTR [rbp-1312], rax
+  mov QWORD PTR [rbp-1408], rax
   mov r15, r13
-  mov r14, QWORD PTR [rbp-1312]
+  mov r14, QWORD PTR [rbp-1408]
   add r15, r14
   mov r12, r15
   mov r13, r12
@@ -22050,149 +23537,53 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rsi, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit32_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-400]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-460]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-408]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-468]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-408]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-468]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-204]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-232]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-204]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-232]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, 8
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_emit64_le
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-232]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-260]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-468]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-528]
   mov r15, r12
   mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-468]
-  mov QWORD PTR [rbp-1320], r15
-  mov QWORD PTR [rbp-1328], 8
-  mov r15, QWORD PTR [rbp-1320]
-  mov r14, QWORD PTR [rbp-1328]
-  add r15, r14
-  mov QWORD PTR [rbp-1336], r15
-  mov r15, QWORD PTR [rbp-1336]
-  mov r12, QWORD PTR [r15]
-  mov rdi, rbx
-  mov rsi, r13
-  mov rdx, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-248]
-  mov rdi, rbx
-  mov rsi, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-476]
-  mov r15, r12
-  mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-476]
-  mov QWORD PTR [rbp-1344], r15
-  mov QWORD PTR [rbp-1352], 8
-  mov r15, QWORD PTR [rbp-1344]
-  mov r14, QWORD PTR [rbp-1352]
-  add r15, r14
-  mov QWORD PTR [rbp-1360], r15
-  mov r15, QWORD PTR [rbp-1360]
-  mov r12, QWORD PTR [r15]
-  mov rdi, rbx
-  mov rsi, r13
-  mov rdx, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-264]
-  mov rdi, rbx
-  mov rsi, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-484]
-  mov r15, r12
-  mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-484]
-  mov QWORD PTR [rbp-1368], r15
-  mov QWORD PTR [rbp-1376], 8
-  mov r15, QWORD PTR [rbp-1368]
-  mov r14, QWORD PTR [rbp-1376]
-  add r15, r14
-  mov QWORD PTR [rbp-1384], r15
-  mov r15, QWORD PTR [rbp-1384]
-  mov r12, QWORD PTR [r15]
-  mov rdi, rbx
-  mov rsi, r13
-  mov rdx, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-280]
-  mov rdi, rbx
-  mov rsi, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-492]
-  mov r15, r12
-  mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-492]
-  mov QWORD PTR [rbp-1392], r15
-  mov QWORD PTR [rbp-1400], 8
-  mov r15, QWORD PTR [rbp-1392]
-  mov r14, QWORD PTR [rbp-1400]
-  add r15, r14
-  mov QWORD PTR [rbp-1408], r15
-  mov r15, QWORD PTR [rbp-1408]
-  mov r12, QWORD PTR [r15]
-  mov rdi, rbx
-  mov rsi, r13
-  mov rdx, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-296]
-  mov rdi, rbx
-  mov rsi, r12
-  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
-  mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-500]
-  mov r15, r12
-  mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-500]
+  mov r15, QWORD PTR [rbp-528]
   mov QWORD PTR [rbp-1416], r15
   mov QWORD PTR [rbp-1424], 8
   mov r15, QWORD PTR [rbp-1416]
@@ -22206,17 +23597,17 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-312]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-276]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-508]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-536]
   mov r15, r12
   mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-508]
+  mov r15, QWORD PTR [rbp-536]
   mov QWORD PTR [rbp-1440], r15
   mov QWORD PTR [rbp-1448], 8
   mov r15, QWORD PTR [rbp-1440]
@@ -22230,24 +23621,175 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-328]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-292]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-72]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-544]
   mov r15, r12
   mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-56]
+  mov r15, QWORD PTR [rbp-544]
   mov QWORD PTR [rbp-1464], r15
-  mov QWORD PTR [rbp-1472], 72
+  mov QWORD PTR [rbp-1472], 8
   mov r15, QWORD PTR [rbp-1464]
   mov r14, QWORD PTR [rbp-1472]
   add r15, r14
   mov QWORD PTR [rbp-1480], r15
   mov r15, QWORD PTR [rbp-1480]
+  mov r12, QWORD PTR [r15]
+  mov rdi, rbx
+  mov rsi, r13
+  mov rdx, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-308]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-552]
+  mov r15, r12
+  mov r13, QWORD PTR [r15]
+  mov r15, QWORD PTR [rbp-552]
+  mov QWORD PTR [rbp-1488], r15
+  mov QWORD PTR [rbp-1496], 8
+  mov r15, QWORD PTR [rbp-1488]
+  mov r14, QWORD PTR [rbp-1496]
+  add r15, r14
+  mov QWORD PTR [rbp-1504], r15
+  mov r15, QWORD PTR [rbp-1504]
+  mov r12, QWORD PTR [r15]
+  mov rdi, rbx
+  mov rsi, r13
+  mov rdx, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-324]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-560]
+  mov r15, r12
+  mov r13, QWORD PTR [r15]
+  mov r15, QWORD PTR [rbp-560]
+  mov QWORD PTR [rbp-1512], r15
+  mov QWORD PTR [rbp-1520], 8
+  mov r15, QWORD PTR [rbp-1512]
+  mov r14, QWORD PTR [rbp-1520]
+  add r15, r14
+  mov QWORD PTR [rbp-1528], r15
+  mov r15, QWORD PTR [rbp-1528]
+  mov r12, QWORD PTR [r15]
+  mov rdi, rbx
+  mov rsi, r13
+  mov rdx, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
+  mov rbx, rax
+  mov rbx, QWORD PTR [rbp-56]
+  mov r12, 240
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov r12, rbx
+  mov QWORD PTR [rbp-624], r12
+  mov rbx, QWORD PTR [rbp-624]
+  mov r12, 8
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov r12, 0
+  mov r15, rbx
+  mov r14, r12
+  xor rax, rax
+  cmp r15, r14
+  setg al
+  mov r13, rax
+  mov r15, r13
+  test r15, r15
+  jz .L746
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-340]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-624]
+  mov r15, r12
+  mov r13, QWORD PTR [r15]
+  mov r15, QWORD PTR [rbp-624]
+  mov QWORD PTR [rbp-1536], r15
+  mov QWORD PTR [rbp-1544], 8
+  mov r15, QWORD PTR [rbp-1536]
+  mov r14, QWORD PTR [rbp-1544]
+  add r15, r14
+  mov QWORD PTR [rbp-1552], r15
+  mov r15, QWORD PTR [rbp-1552]
+  mov r12, QWORD PTR [r15]
+  mov rdi, rbx
+  mov rsi, r13
+  mov rdx, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
+  mov rbx, rax
+  jmp .L747
+.L746:
+.L747:
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-356]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-568]
+  mov r15, r12
+  mov r13, QWORD PTR [r15]
+  mov r15, QWORD PTR [rbp-568]
+  mov QWORD PTR [rbp-1560], r15
+  mov QWORD PTR [rbp-1568], 8
+  mov r15, QWORD PTR [rbp-1560]
+  mov r14, QWORD PTR [rbp-1568]
+  add r15, r14
+  mov QWORD PTR [rbp-1576], r15
+  mov r15, QWORD PTR [rbp-1576]
+  mov r12, QWORD PTR [r15]
+  mov rdi, rbx
+  mov rsi, r13
+  mov rdx, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-372]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-72]
+  mov r15, r12
+  mov r13, QWORD PTR [r15]
+  mov r15, QWORD PTR [rbp-56]
+  mov QWORD PTR [rbp-1584], r15
+  mov QWORD PTR [rbp-1592], 72
+  mov r15, QWORD PTR [rbp-1584]
+  mov r14, QWORD PTR [rbp-1592]
+  add r15, r14
+  mov QWORD PTR [rbp-1600], r15
+  mov r15, QWORD PTR [rbp-1600]
   mov r12, QWORD PTR [r15]
   mov rdi, rbx
   mov rsi, r13
@@ -22271,70 +23813,125 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L706
-  lea rbx, [rbp-556]
+  jz .L748
+  lea rbx, [rbp-616]
   mov r12, QWORD PTR [rbp-80]
   mov r15, r12
   mov r13, QWORD PTR [r15]
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1488], r15
-  mov QWORD PTR [rbp-1496], 80
-  mov r15, QWORD PTR [rbp-1488]
-  mov r14, QWORD PTR [rbp-1496]
+  mov QWORD PTR [rbp-1608], r15
+  mov QWORD PTR [rbp-1616], 80
+  mov r15, QWORD PTR [rbp-1608]
+  mov r14, QWORD PTR [rbp-1616]
   add r15, r14
-  mov QWORD PTR [rbp-1504], r15
-  mov r15, QWORD PTR [rbp-1504]
+  mov QWORD PTR [rbp-1624], r15
+  mov r15, QWORD PTR [rbp-1624]
   mov r12, QWORD PTR [r15]
   mov rdi, rbx
   mov rsi, r13
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  jmp .L707
-.L706:
-.L707:
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-368]
+  jmp .L749
+.L748:
+.L749:
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-412]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-516]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-576]
   mov r15, r12
   mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-516]
-  mov QWORD PTR [rbp-1512], r15
-  mov QWORD PTR [rbp-1520], 8
-  mov r15, QWORD PTR [rbp-1512]
-  mov r14, QWORD PTR [rbp-1520]
+  mov r15, QWORD PTR [rbp-576]
+  mov QWORD PTR [rbp-1632], r15
+  mov QWORD PTR [rbp-1640], 8
+  mov r15, QWORD PTR [rbp-1632]
+  mov r14, QWORD PTR [rbp-1640]
   add r15, r14
-  mov QWORD PTR [rbp-1528], r15
-  mov r15, QWORD PTR [rbp-1528]
+  mov QWORD PTR [rbp-1648], r15
+  mov r15, QWORD PTR [rbp-1648]
   mov r12, QWORD PTR [r15]
   mov rdi, rbx
   mov rsi, r13
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-400]
+  mov rbx, QWORD PTR [rbp-56]
+  mov r12, 232
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov r12, rbx
+  mov QWORD PTR [rbp-632], r12
+  mov rbx, QWORD PTR [rbp-632]
+  mov r12, 8
+  mov r15, rbx
+  mov r14, r12
+  add r15, r14
+  mov r13, r15
+  mov r15, r13
+  mov rbx, QWORD PTR [r15]
+  mov r12, 0
+  mov r15, rbx
+  mov r14, r12
+  xor rax, rax
+  cmp r15, r14
+  setg al
+  mov r13, rax
+  mov r15, r13
+  test r15, r15
+  jz .L750
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-444]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
   mov rbx, rax
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-524]
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-632]
   mov r15, r12
   mov r13, QWORD PTR [r15]
-  mov r15, QWORD PTR [rbp-524]
-  mov QWORD PTR [rbp-1536], r15
-  mov QWORD PTR [rbp-1544], 8
-  mov r15, QWORD PTR [rbp-1536]
-  mov r14, QWORD PTR [rbp-1544]
+  mov r15, QWORD PTR [rbp-632]
+  mov QWORD PTR [rbp-1656], r15
+  mov QWORD PTR [rbp-1664], 8
+  mov r15, QWORD PTR [rbp-1656]
+  mov r14, QWORD PTR [rbp-1664]
   add r15, r14
-  mov QWORD PTR [rbp-1552], r15
-  mov r15, QWORD PTR [rbp-1552]
+  mov QWORD PTR [rbp-1672], r15
+  mov r15, QWORD PTR [rbp-1672]
+  mov r12, QWORD PTR [r15]
+  mov rdi, rbx
+  mov rsi, r13
+  mov rdx, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
+  mov rbx, rax
+  jmp .L751
+.L750:
+.L751:
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-460]
+  mov rdi, rbx
+  mov rsi, r12
+  call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
+  mov rbx, rax
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-584]
+  mov r15, r12
+  mov r13, QWORD PTR [r15]
+  mov r15, QWORD PTR [rbp-584]
+  mov QWORD PTR [rbp-1680], r15
+  mov QWORD PTR [rbp-1688], 8
+  mov r15, QWORD PTR [rbp-1680]
+  mov r14, QWORD PTR [rbp-1688]
+  add r15, r14
+  mov QWORD PTR [rbp-1696], r15
+  mov r15, QWORD PTR [rbp-1696]
   mov r12, QWORD PTR [r15]
   mov rdi, rbx
   mov rsi, r13
@@ -22358,34 +23955,34 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L708
-  lea rbx, [rbp-556]
-  mov r12, QWORD PTR [rbp-416]
+  jz .L752
+  lea rbx, [rbp-616]
+  mov r12, QWORD PTR [rbp-476]
   mov rdi, rbx
   mov rsi, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_pad_to
   mov rbx, rax
-  lea rbx, [rbp-556]
+  lea rbx, [rbp-616]
   mov r12, QWORD PTR [rbp-88]
   mov r15, r12
   mov r13, QWORD PTR [r15]
   mov r15, QWORD PTR [rbp-56]
-  mov QWORD PTR [rbp-1560], r15
-  mov QWORD PTR [rbp-1568], 88
-  mov r15, QWORD PTR [rbp-1560]
-  mov r14, QWORD PTR [rbp-1568]
+  mov QWORD PTR [rbp-1704], r15
+  mov QWORD PTR [rbp-1712], 88
+  mov r15, QWORD PTR [rbp-1704]
+  mov r14, QWORD PTR [rbp-1712]
   add r15, r14
-  mov QWORD PTR [rbp-1576], r15
-  mov r15, QWORD PTR [rbp-1576]
+  mov QWORD PTR [rbp-1720], r15
+  mov r15, QWORD PTR [rbp-1720]
   mov r12, QWORD PTR [r15]
   mov rdi, rbx
   mov rsi, r13
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_buf_append
   mov rbx, rax
-  jmp .L709
-.L708:
-.L709:
+  jmp .L753
+.L752:
+.L753:
   xor r10, r10
   mov rbx, QWORD PTR [rbp-64]
   mov r12, 577
@@ -22395,8 +23992,8 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdx, r13
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_open
   mov rbx, rax
-  mov QWORD PTR [rbp-564], rbx
-  mov rbx, QWORD PTR [rbp-564]
+  mov QWORD PTR [rbp-640], rbx
+  mov rbx, QWORD PTR [rbp-640]
   mov r12, 0
   mov r15, rbx
   mov r14, r12
@@ -22406,7 +24003,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L710
+  jz .L754
   lea rbx, [rip+.LC58]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
@@ -22421,7 +24018,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rbx, rax
   mov rbx, 1
   mov rax, rbx
-  add rsp, 1640
+  add rsp, 1784
   pop r15
   pop r14
   pop r13
@@ -22429,28 +24026,28 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   pop rbx
   pop rbp
   ret
-  jmp .L711
-.L710:
-.L711:
-  mov rbx, QWORD PTR [rbp-564]
-  lea r12, [rbp-556]
+  jmp .L755
+.L754:
+.L755:
+  mov rbx, QWORD PTR [rbp-640]
+  lea r12, [rbp-616]
   mov r15, r12
   mov r13, QWORD PTR [r15]
-  lea r15, [rbp-556]
-  mov QWORD PTR [rbp-1584], r15
-  mov QWORD PTR [rbp-1592], 8
-  mov r15, QWORD PTR [rbp-1584]
-  mov r14, QWORD PTR [rbp-1592]
+  lea r15, [rbp-616]
+  mov QWORD PTR [rbp-1728], r15
+  mov QWORD PTR [rbp-1736], 8
+  mov r15, QWORD PTR [rbp-1728]
+  mov r14, QWORD PTR [rbp-1736]
   add r15, r14
-  mov QWORD PTR [rbp-1600], r15
-  mov r15, QWORD PTR [rbp-1600]
+  mov QWORD PTR [rbp-1744], r15
+  mov r15, QWORD PTR [rbp-1744]
   mov r12, QWORD PTR [r15]
   mov rdi, rbx
   mov rsi, r13
   mov rdx, r12
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_write
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-564]
+  mov rbx, QWORD PTR [rbp-640]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_std_linux_cst_close
   mov rbx, rax
@@ -22471,7 +24068,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov r13, rax
   mov r15, r13
   test r15, r15
-  jz .L712
+  jz .L756
   lea rbx, [rip+.LC60]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
@@ -22480,7 +24077,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-240]
+  mov rbx, QWORD PTR [rbp-268]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22488,7 +24085,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-256]
+  mov rbx, QWORD PTR [rbp-284]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22496,7 +24093,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-272]
+  mov rbx, QWORD PTR [rbp-300]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22504,7 +24101,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-288]
+  mov rbx, QWORD PTR [rbp-316]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22512,7 +24109,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-304]
+  mov rbx, QWORD PTR [rbp-332]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22520,7 +24117,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-320]
+  mov rbx, QWORD PTR [rbp-364]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22528,7 +24125,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-336]
+  mov rbx, QWORD PTR [rbp-380]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22536,7 +24133,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-392]
+  mov rbx, QWORD PTR [rbp-436]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22544,7 +24141,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-408]
+  mov rbx, QWORD PTR [rbp-468]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22552,7 +24149,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  mov rbx, QWORD PTR [rbp-424]
+  mov rbx, QWORD PTR [rbp-484]
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_hex
   mov rbx, rax
@@ -22560,12 +24157,12 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   mov rdi, rbx
   call __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_elf_reader_cst_print_str
   mov rbx, rax
-  jmp .L713
-.L712:
-.L713:
+  jmp .L757
+.L756:
+.L757:
   mov rbx, 0
   mov rax, rbx
-  add rsp, 1640
+  add rsp, 1784
   pop r15
   pop r14
   pop r13
@@ -22575,7 +24172,7 @@ __run_media_caua_Caua_caua_Documentos_Projetos_Pessoais_Caustic_caustic_linker_e
   ret
   mov rbx, 0
   mov rax, rbx
-  add rsp, 1640
+  add rsp, 1784
   pop r15
   pop r14
   pop r13

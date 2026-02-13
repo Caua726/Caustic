@@ -122,21 +122,24 @@ static int emit_cast(int src_reg, Type *to_type, int line) {
     return emit_cast_from(src_reg, NULL, to_type, line);
 }
 
-static int emit_call(char *func_name, int is_variadic, int line) {
+static int emit_call(char *func_name, int is_variadic, Type *return_type, int xmm_arg_count, int line) {
     int dest = new_vreg();
     IRInst *inst = new_inst(IR_CALL);
     inst->dest = op_vreg(dest);
     inst->call_target_name = strdup(func_name);
     inst->is_variadic_call = is_variadic;
+    inst->cast_to_type = return_type; // Used by codegen to handle float returns
+    inst->src2 = op_imm(xmm_arg_count); // Number of xmm args (for AL in variadic calls)
     inst->line = line;
     emit(inst);
     return dest;
 }
 
-static void emit_set_arg(int arg_idx, int src_reg, int line) {
+static void emit_set_arg(int arg_idx, int src_reg, Type *arg_type, int line) {
     IRInst *inst = new_inst(IR_SET_ARG);
     inst->dest = op_imm(arg_idx);
     inst->src1 = op_vreg(src_reg);
+    inst->cast_to_type = arg_type; // Used by codegen for float args → xmm regs
     inst->line = line;
     emit(inst);
 }
@@ -753,6 +756,7 @@ static int gen_expr(Node *node) {
                 } else {
                     addr_inst->global_name = strdup(node->name);
                 }
+                addr_inst->is_extern_global = node->var->is_extern;
                 addr_inst->line = node->tok ? node->tok->line : 0;
                 emit(addr_inst);
 
@@ -813,42 +817,109 @@ static int gen_expr(Node *node) {
             }
 
             int *arg_vregs = calloc(arg_count, sizeof(int));
+            Type **arg_types = calloc(arg_count, sizeof(Type *));
             int i = 0;
             if (sret_addr_reg != -1) {
-                arg_vregs[i++] = sret_addr_reg;
+                arg_vregs[i] = sret_addr_reg;
+                arg_types[i] = type_i64; // sret is a pointer
+                i++;
             }
             for (Node *arg = node->args; arg; arg = arg->next) {
-                arg_vregs[i++] = gen_expr(arg);
+                arg_vregs[i] = gen_expr(arg);
+                arg_types[i] = arg->ty;
+                i++;
             }
 
-            int stack_args = (arg_count > 6) ? (arg_count - 6) : 0;
-            int padding = (stack_args % 2 != 0) ? 1 : 0;
+            // System V ABI: extern functions use separate GPR/XMM registers
+            // Internal Caustic functions pass everything in GPRs
+            int xmm_count = 0;
+            int stack_arg_count = 0;
 
-            if (padding) {
-                IRInst *align = new_inst(IR_ASM);
-                align->asm_str = strdup("sub rsp, 8");
-                align->line = node->tok ? node->tok->line : 0;
-                emit(align);
-            }
+            if (node->is_extern) {
+                // System V ABI: separate GPR and XMM register assignment
+                int gpr_idx = 0, xmm_idx = 0;
+                int *arg_reg_idx = calloc(arg_count, sizeof(int));
+                int *arg_on_stack = calloc(arg_count, sizeof(int));
 
-            // Emit stack args (Arg N ... Arg 6) in reverse order
-            for (int j = arg_count - 1; j >= 6; j--) {
-                emit_set_arg(j, arg_vregs[j], node->tok ? node->tok->line : 0);
-            }
+                for (int j = 0; j < arg_count; j++) {
+                    int is_float = arg_types[j] &&
+                        (arg_types[j]->kind == TY_F32 || arg_types[j]->kind == TY_F64);
+                    if (is_float && xmm_idx < 8) {
+                        arg_reg_idx[j] = xmm_idx++;
+                    } else if (!is_float && gpr_idx < 6) {
+                        arg_reg_idx[j] = gpr_idx++;
+                    } else {
+                        arg_reg_idx[j] = 99; // Forces push in codegen
+                        arg_on_stack[j] = 1;
+                    }
+                }
+                xmm_count = xmm_idx;
 
-            // Emit register args (Arg 0 ... Arg 5)
-            for (int j = 0; j < arg_count && j < 6; j++) {
-                emit_set_arg(j, arg_vregs[j], node->tok ? node->tok->line : 0);
+                for (int j = 0; j < arg_count; j++) {
+                    if (arg_on_stack[j]) stack_arg_count++;
+                }
+                int padding = (stack_arg_count % 2 != 0) ? 1 : 0;
+
+                if (padding) {
+                    IRInst *align = new_inst(IR_ASM);
+                    align->asm_str = strdup("sub rsp, 8");
+                    align->line = node->tok ? node->tok->line : 0;
+                    emit(align);
+                }
+
+                // Emit stack args in reverse order
+                for (int j = arg_count - 1; j >= 0; j--) {
+                    if (arg_on_stack[j]) {
+                        emit_set_arg(arg_reg_idx[j], arg_vregs[j], arg_types[j], node->tok ? node->tok->line : 0);
+                    }
+                }
+
+                // Emit register args
+                for (int j = 0; j < arg_count; j++) {
+                    if (!arg_on_stack[j]) {
+                        emit_set_arg(arg_reg_idx[j], arg_vregs[j], arg_types[j], node->tok ? node->tok->line : 0);
+                    }
+                }
+
+                free(arg_reg_idx);
+                free(arg_on_stack);
+
+                if (stack_arg_count > 0) {
+                    // Will clean up stack after call
+                }
+            } else {
+                // Caustic internal ABI: all args in GPRs (rdi, rsi, rdx, rcx, r8, r9)
+                stack_arg_count = (arg_count > 6) ? (arg_count - 6) : 0;
+                int padding = (stack_arg_count % 2 != 0) ? 1 : 0;
+
+                if (padding) {
+                    IRInst *align = new_inst(IR_ASM);
+                    align->asm_str = strdup("sub rsp, 8");
+                    align->line = node->tok ? node->tok->line : 0;
+                    emit(align);
+                }
+
+                // Emit stack args in reverse order
+                for (int j = arg_count - 1; j >= 6; j--) {
+                    emit_set_arg(j, arg_vregs[j], NULL, node->tok ? node->tok->line : 0);
+                }
+
+                // Emit register args
+                for (int j = 0; j < arg_count && j < 6; j++) {
+                    emit_set_arg(j, arg_vregs[j], NULL, node->tok ? node->tok->line : 0);
+                }
             }
 
             free(arg_vregs);
+            free(arg_types);
 
-            int ret_reg = emit_call(node->name, node->is_variadic, node->tok ? node->tok->line : 0);
+            int ret_reg = emit_call(node->name, node->is_variadic, node->ty, xmm_count, node->tok ? node->tok->line : 0);
 
-            if (stack_args > 0) {
+            if (stack_arg_count > 0) {
+                int pad = (stack_arg_count % 2 != 0) ? 1 : 0;
                 IRInst *cleanup = new_inst(IR_ASM);
                 char buf[32];
-                snprintf(buf, sizeof(buf), "add rsp, %d", (stack_args + padding) * 8);
+                snprintf(buf, sizeof(buf), "add rsp, %d", (stack_arg_count + pad) * 8);
                 cleanup->asm_str = strdup(buf);
                 cleanup->line = node->tok ? node->tok->line : 0;
                 emit(cleanup);

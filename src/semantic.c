@@ -1925,6 +1925,7 @@ void walk(Node *node) {
             if (node->name) free(node->name);  // Free original parsed name
             node->name = strdup(func->asm_name);
             node->is_variadic = func->is_variadic;
+            node->is_extern = func->is_extern;
 
             // fprintf(stderr, "Debug: Processing args for function '%s'\n", func->name);
             

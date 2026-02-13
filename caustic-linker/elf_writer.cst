@@ -293,11 +293,15 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     let is i32 as ndynsyms = dst.count;
 
     // Pre-calculate section sizes (before buffers are filled)
+    let is i32 as nfunc_syms = linker.count_func_dynsyms(ls);
+    let is i32 as ndata_syms = linker.count_data_dynsyms(ls);
     let is i64 as interp_size = 28;  // "/lib64/ld-linux-x86-64.so.2\0"
-    let is i64 as dynsym_size = cast(i64, ndynsyms + 1) * 24; // null + entries
-    let is i64 as relaplt_size = cast(i64, ndynsyms) * 24;
-    let is i64 as plt_size = 16 + cast(i64, ndynsyms) * 16;  // PLT0 + entries
-    let is i64 as got_size = 24 + cast(i64, ndynsyms) * 8;   // 3 reserved + entries
+    let is i64 as dynsym_size = cast(i64, ndynsyms + 1) * 24; // null + entries (all syms)
+    let is i64 as relaplt_size = cast(i64, nfunc_syms) * 24;  // only function syms
+    let is i64 as plt_size = 16 + cast(i64, nfunc_syms) * 16; // PLT0 + function entries
+    let is i64 as got_size = 24 + cast(i64, nfunc_syms) * 8;  // 3 reserved + function entries
+    let is i64 as data_got_size = cast(i64, ndata_syms) * 8;  // data GOT entries
+    let is i64 as reladyn_size = cast(i64, ndata_syms) * 24;  // GLOB_DAT entries
 
     // Pre-calculate .hash size: 8 + nbucket*4 + nchain*4
     let is i32 as nbucket with mut = ndynsyms;
@@ -324,7 +328,10 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     // Pre-calculate .dynamic size: DT entries * 16 bytes each
     // DT_NEEDED * nlibs + DT_HASH + DT_STRTAB + DT_SYMTAB + DT_STRSZ + DT_SYMENT
     // + DT_PLTGOT + DT_PLTRELSZ + DT_PLTREL + DT_JMPREL + DT_FLAGS + DT_NULL = nlibs + 11
-    let is i64 as dynamic_size = (cast(i64, ls.needed_count) + 11) * 16;
+    // + DT_RELA + DT_RELASZ + DT_RELAENT if data syms exist = +3
+    let is i32 as dyn_extra = 0;
+    if (ndata_syms > 0) { dyn_extra = 3; }
+    let is i64 as dynamic_size = (cast(i64, ls.needed_count) + 11 + cast(i64, dyn_extra)) * 16;
 
     // Layout: 4 program headers
     let is i32 as num_phdrs = 4;
@@ -349,7 +356,10 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     let is i64 as relaplt_foff = align_up(dynstr_foff + dynstr_size, 8);
     let is i64 as relaplt_vaddr = rx_vaddr_start + (relaplt_foff - rx_file_start);
 
-    let is i64 as plt_foff = align_up(relaplt_foff + relaplt_size, 16);
+    let is i64 as reladyn_foff = align_up(relaplt_foff + relaplt_size, 8);
+    let is i64 as reladyn_vaddr = rx_vaddr_start + (reladyn_foff - rx_file_start);
+
+    let is i64 as plt_foff = align_up(reladyn_foff + reladyn_size, 16);
     let is i64 as plt_vaddr = rx_vaddr_start + (plt_foff - rx_file_start);
 
     let is i64 as text_foff = plt_foff + plt_size;
@@ -364,11 +374,14 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     let is i64 as rw_file_start = align_up(rx_file_end, PAGE_SIZE);
     let is i64 as rw_vaddr_start = align_up(rx_vaddr_start + (rx_file_end - rx_file_start), PAGE_SIZE);
 
-    // R+W order: .got.plt, .dynamic, .data, .bss
+    // R+W order: .got.plt, .got (data), .dynamic, .data, .bss
     let is i64 as got_foff = rw_file_start;
     let is i64 as got_vaddr = rw_vaddr_start;
 
-    let is i64 as dynamic_foff = align_up(got_foff + got_size, 8);
+    let is i64 as data_got_foff = align_up(got_foff + got_size, 8);
+    let is i64 as data_got_vaddr = rw_vaddr_start + (data_got_foff - rw_file_start);
+
+    let is i64 as dynamic_foff = align_up(data_got_foff + data_got_size, 8);
     let is i64 as dynamic_vaddr = rw_vaddr_start + (dynamic_foff - rw_file_start);
 
     let is i64 as data_foff = dynamic_foff + dynamic_size;
@@ -394,13 +407,21 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     // Build PLT/GOT with real addresses
     linker.build_plt_got(ls, plt_vaddr, got_vaddr);
 
-    // Apply relocations (dynamic syms redirect to PLT)
+    // Build data GOT entries for GOTPCREL symbols
+    linker.build_data_got(ls, data_got_vaddr);
+
+    // Apply relocations (dynamic syms redirect to PLT, GOTPCREL to data GOT)
     linker.apply_relocations(ls);
 
-    // Build all dynamic metadata sections
+    // Build all dynamic metadata sections (sets dynsym_index for each symbol)
     linker.build_dynamic_metadata(ls, plt_vaddr, got_vaddr,
                                   interp_vaddr, dynsym_vaddr, dynstr_vaddr,
-                                  hash_vaddr, relaplt_vaddr, dynamic_vaddr);
+                                  hash_vaddr, relaplt_vaddr, dynamic_vaddr,
+                                  reladyn_vaddr);
+
+    // Build .rela.dyn with GLOB_DAT entries (must be after build_dynamic_metadata
+    // so dynsym_index is set)
+    linker.build_rela_dyn(ls);
 
     // Get the filled buffers
     let is *reader.ByteBuffer as interp_b = cast(*reader.ByteBuffer, ls.interp_buf);
@@ -510,6 +531,13 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     reader.buf_pad_to(&out, relaplt_foff);
     reader.buf_append(&out, relaplt_b.data, relaplt_b.len);
 
+    // .rela.dyn (GLOB_DAT for data GOT)
+    let is *reader.ByteBuffer as reladyn_b = cast(*reader.ByteBuffer, ls.reladyn_buf);
+    if (reladyn_b.len > 0) {
+        reader.buf_pad_to(&out, reladyn_foff);
+        reader.buf_append(&out, reladyn_b.data, reladyn_b.len);
+    }
+
     reader.buf_pad_to(&out, plt_foff);
     reader.buf_append(&out, plt_b.data, plt_b.len);
 
@@ -523,6 +551,13 @@ fn write_dynamic_executable(ls as *linker.LinkerState, output_path as *u8) as i3
     // Pad to R+W segment
     reader.buf_pad_to(&out, rw_file_start);
     reader.buf_append(&out, got_b.data, got_b.len);
+
+    // .got (data GOT for GOTPCREL)
+    let is *reader.ByteBuffer as data_got_b = cast(*reader.ByteBuffer, ls.data_got_buf);
+    if (data_got_b.len > 0) {
+        reader.buf_pad_to(&out, data_got_foff);
+        reader.buf_append(&out, data_got_b.data, data_got_b.len);
+    }
 
     reader.buf_pad_to(&out, dynamic_foff);
     reader.buf_append(&out, dynamic_b.data, dynamic_b.len);

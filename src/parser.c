@@ -267,12 +267,9 @@ static void parse_file_body(Node **cur_ptr) {
         }
 
         if (current_token.type == TOKEN_TYPE_EXTERN) {
-            // Peek ahead: extern fn ... or extern let ...
-            Token save = current_token;
-            Token save_la = lookahead_token;
-            consume(); // consume 'extern'
-            if (current_token.type == TOKEN_TYPE_LET) {
+            if (lookahead_token.type == TOKEN_TYPE_LET) {
                 // extern let is TYPE as NAME;
+                consume(); // consume 'extern'
                 expect(TOKEN_TYPE_LET);
                 expect(TOKEN_TYPE_IS);
                 Type *var_type = parse_type();
@@ -293,9 +290,6 @@ static void parse_file_body(Node **cur_ptr) {
                 cur->next = node;
                 cur = cur->next;
             } else {
-                // Restore and let parse_extern_fn handle it
-                current_token = save;
-                lookahead_token = save_la;
                 cur->next = parse_extern_fn();
                 cur = cur->next;
             }

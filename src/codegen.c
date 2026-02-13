@@ -1022,7 +1022,18 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             break;
 
         case IR_SET_ARG:
-            if (inst->dest.imm < num_arg_regs) {
+            if (inst->cast_to_type &&
+                (inst->cast_to_type->kind == TY_F32 || inst->cast_to_type->kind == TY_F64)) {
+                // Float arg: load into GPR temp then move to xmm register
+                static const char *xmm_regs[] = {"xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7"};
+                if (inst->dest.imm < 8) {
+                    load_operand(inst->src1.vreg, ctx, "rax");
+                    emit("movq %s, rax", xmm_regs[inst->dest.imm]);
+                } else {
+                    load_operand(inst->src1.vreg, ctx, "rax");
+                    emit("push rax");
+                }
+            } else if (inst->dest.imm < num_arg_regs) {
                 load_operand(inst->src1.vreg, ctx, arg_regs[inst->dest.imm]);
             } else {
                 load_operand(inst->src1.vreg, ctx, "rax"); // Use rax as temp
@@ -1084,10 +1095,20 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             // 3. Argument registers (rdi, etc.) are set immediately before call.
             // If we start using caller-saved regs for vars, we must save them here.
             if (inst->is_variadic_call) {
-                emit("xor eax, eax");
+                int xmm_count = (inst->src2.type == OPERAND_IMM) ? inst->src2.imm : 0;
+                if (xmm_count > 0) {
+                    emit("mov al, %d", xmm_count);
+                } else {
+                    emit("xor eax, eax");
+                }
             }
             emit("call %s", inst->call_target_name);
 
+            // Float-returning functions return in xmm0, not rax
+            if (inst->cast_to_type &&
+                (inst->cast_to_type->kind == TY_F32 || inst->cast_to_type->kind == TY_F64)) {
+                emit("movq rax, xmm0");
+            }
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 

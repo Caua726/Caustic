@@ -114,6 +114,8 @@ struct LinkerState {
     hash_buf as *u8;        // *reader.ByteBuffer — .hash
     relaplt_buf as *u8;     // *reader.ByteBuffer — .rela.plt
     dynamic_buf as *u8;     // *reader.ByteBuffer — .dynamic
+    data_got_buf as *u8;    // *reader.ByteBuffer — .got (for GOTPCREL data globals)
+    reladyn_buf as *u8;     // *reader.ByteBuffer — .rela.dyn (GLOB_DAT entries)
 }
 
 fn alloc_bytebuf(cap as i64) as *u8 {
@@ -179,6 +181,8 @@ fn linker_init(base_addr as i64) as LinkerState {
     ls.hash_buf = cast(*u8, 0);
     ls.relaplt_buf = cast(*u8, 0);
     ls.dynamic_buf = cast(*u8, 0);
+    ls.data_got_buf = cast(*u8, 0);
+    ls.reladyn_buf = cast(*u8, 0);
     return ls;
 }
 
@@ -475,6 +479,16 @@ fn apply_relocations(ls as *LinkerState) as void {
                     target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
                     target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
                 }
+                else if (rel.rtype == reader.R_X86_64_GOTPCREL) {
+                    // S = data GOT entry vaddr for this symbol
+                    let is *reader.ObjSym as sym = reader.sym_get(obj, rel.sym_idx);
+                    let is i64 as got_addr = get_data_got_vaddr(ls, sym.name, sym.name_len);
+                    let is i64 as value = got_addr + A - P;
+                    target_data[buf_offset]     = cast(u8, value & 255);
+                    target_data[buf_offset + 1] = cast(u8, (value >> 8) & 255);
+                    target_data[buf_offset + 2] = cast(u8, (value >> 16) & 255);
+                    target_data[buf_offset + 3] = cast(u8, (value >> 24) & 255);
+                }
             }
 
             ri = ri + 1;
@@ -561,6 +575,8 @@ struct DynSym {
     name_len as i32;
     plt_vaddr as i64;
     got_vaddr as i64;
+    data_got_vaddr as i64; // for GOTPCREL (data globals like stdout)
+    is_data as i32;        // 1 = data object (GOT), 0 = function (PLT)
     dynsym_index as i32;   // index in .dynsym (1-based, 0 is null)
     dynstr_offset as i32;  // offset of name in .dynstr
 }
@@ -597,6 +613,8 @@ fn dynsym_add(st as *DynSymTab, name as *u8, name_len as i32) as i32 {
     d.name_len = name_len;
     d.plt_vaddr = 0;
     d.got_vaddr = 0;
+    d.data_got_vaddr = 0;
+    d.is_data = 0;
     d.dynsym_index = 0;
     d.dynstr_offset = 0;
     st.count = st.count + 1;
@@ -643,6 +661,28 @@ fn collect_dynamic_syms(ls as *LinkerState) as void {
         }
         gi = gi + 1;
     }
+
+    // Scan relocations to detect GOTPCREL symbols (data objects)
+    let is i32 as oi with mut = 0;
+    while (oi < ls.obj_count) {
+        let is *reader.ObjFile as obj = get_obj(ls, oi);
+        let is i32 as ri with mut = 0;
+        while (ri < obj.reloc_count) {
+            let is *reader.ObjReloc as rel = reader.reloc_get(obj, ri);
+            if (rel.rtype == reader.R_X86_64_GOTPCREL) {
+                let is *reader.ObjSym as sym = reader.sym_get(obj, rel.sym_idx);
+                if (sym.name_len > 0) {
+                    let is i32 as di = dynsym_find(dst, sym.name, sym.name_len);
+                    if (di >= 0) {
+                        let is *DynSym as d = dynsym_get(dst, di);
+                        d.is_data = 1;
+                    }
+                }
+            }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
 }
 
 // ELF hash algorithm
@@ -667,7 +707,8 @@ fn build_dynamic_metadata(ls as *LinkerState,
                           plt_vaddr as i64, got_vaddr as i64,
                           interp_vaddr as i64, dynsym_vaddr as i64,
                           dynstr_vaddr as i64, hash_vaddr as i64,
-                          relaplt_vaddr as i64, dynamic_vaddr as i64) as void {
+                          relaplt_vaddr as i64, dynamic_vaddr as i64,
+                          reladyn_vaddr as i64) as void {
     let is *DynSymTab as dst = get_dynsyms(ls);
     let is i32 as ndynsyms = dst.count;
 
@@ -713,7 +754,11 @@ fn build_dynamic_metadata(ls as *LinkerState,
         let is *DynSym as d = dynsym_get(dst, di);
         d.dynsym_index = di + 1; // 1-based (0 is null)
         reader.buf_emit32_le(dynsym, cast(i64, d.dynstr_offset)); // st_name
-        reader.buf_emit8(dynsym, 18);  // st_info: STB_GLOBAL(1)<<4 | STT_FUNC(2) = 0x12
+        if (d.is_data == 1) {
+            reader.buf_emit8(dynsym, 17);  // st_info: STB_GLOBAL(1)<<4 | STT_OBJECT(1) = 0x11
+        } else {
+            reader.buf_emit8(dynsym, 18);  // st_info: STB_GLOBAL(1)<<4 | STT_FUNC(2) = 0x12
+        }
         reader.buf_emit8(dynsym, 0);   // st_other
         reader.buf_emit16_le(dynsym, 0);  // st_shndx: SHN_UNDEF
         reader.buf_emit64_le(dynsym, 0);  // st_value
@@ -782,18 +827,20 @@ fn build_dynamic_metadata(ls as *LinkerState,
         di = di + 1;
     }
 
-    // --- .rela.plt ---
+    // --- .rela.plt --- (only function syms)
     let is *reader.ByteBuffer as relaplt = cast(*reader.ByteBuffer, ls.relaplt_buf);
     di = 0;
     while (di < ndynsyms) {
         let is *DynSym as d = dynsym_get(dst, di);
-        // r_offset = GOT entry vaddr
-        reader.buf_emit64_le(relaplt, d.got_vaddr);
-        // r_info = (sym_index << 32) | R_X86_64_JUMP_SLOT(7)
-        let is i64 as r_info = cast(i64, d.dynsym_index) * 4294967296 + 7;
-        reader.buf_emit64_le(relaplt, r_info);
-        // r_addend = 0
-        reader.buf_emit64_le(relaplt, 0);
+        if (d.is_data == 0) {
+            // r_offset = GOT entry vaddr
+            reader.buf_emit64_le(relaplt, d.got_vaddr);
+            // r_info = (sym_index << 32) | R_X86_64_JUMP_SLOT(7)
+            let is i64 as r_info = cast(i64, d.dynsym_index) * 4294967296 + 7;
+            reader.buf_emit64_le(relaplt, r_info);
+            // r_addend = 0
+            reader.buf_emit64_le(relaplt, 0);
+        }
         di = di + 1;
     }
 
@@ -848,6 +895,20 @@ fn build_dynamic_metadata(ls as *LinkerState,
     reader.buf_emit64_le(dynamic, 30);
     reader.buf_emit64_le(dynamic, 8);
 
+    // .rela.dyn entries for data GOT (GLOB_DAT)
+    let is i32 as ndata = count_data_dynsyms(ls);
+    if (ndata > 0) {
+        // DT_RELA (7)
+        reader.buf_emit64_le(dynamic, 7);
+        reader.buf_emit64_le(dynamic, reladyn_vaddr);
+        // DT_RELASZ (8) — pre-calculated size
+        reader.buf_emit64_le(dynamic, 8);
+        reader.buf_emit64_le(dynamic, cast(i64, ndata) * 24);
+        // DT_RELAENT (9)
+        reader.buf_emit64_le(dynamic, 9);
+        reader.buf_emit64_le(dynamic, 24);
+    }
+
     // DT_NULL
     reader.buf_emit64_le(dynamic, 0);
     reader.buf_emit64_le(dynamic, 0);
@@ -898,12 +959,18 @@ fn build_plt_got(ls as *LinkerState, plt_base_vaddr as i64, got_base_vaddr as i6
     reader.buf_emit8(plt, 64);   // 40
     reader.buf_emit8(plt, 0);    // 00
 
-    // --- PLT[n] entries (16 bytes each) ---
+    // --- PLT[n] entries (16 bytes each) — only for function syms ---
     let is i32 as di with mut = 0;
+    let is i32 as plt_idx with mut = 0;
     while (di < ndynsyms) {
         let is *DynSym as d = dynsym_get(dst, di);
-        let is i64 as plt_entry_vaddr = plt_base_vaddr + 16 + cast(i64, di) * 16;
-        let is i64 as got_entry_vaddr = got_base_vaddr + 24 + cast(i64, di) * 8;
+        if (d.is_data == 1) {
+            // Data symbols don't get PLT entries
+            di = di + 1;
+            continue;
+        }
+        let is i64 as plt_entry_vaddr = plt_base_vaddr + 16 + cast(i64, plt_idx) * 16;
+        let is i64 as got_entry_vaddr = got_base_vaddr + 24 + cast(i64, plt_idx) * 8;
 
         d.plt_vaddr = plt_entry_vaddr;
         d.got_vaddr = got_entry_vaddr;
@@ -920,7 +987,7 @@ fn build_plt_got(ls as *LinkerState, plt_base_vaddr as i64, got_base_vaddr as i6
 
         // push n (relocation index)  (68 imm32)
         reader.buf_emit8(plt, 104);  // 68
-        reader.buf_emit32_le(plt, cast(i64, di));
+        reader.buf_emit32_le(plt, cast(i64, plt_idx));
 
         // jmp PLT[0]  (E9 rel32)
         let is i64 as jmp_site = plt_entry_vaddr + 16;  // end of this instruction
@@ -928,6 +995,7 @@ fn build_plt_got(ls as *LinkerState, plt_base_vaddr as i64, got_base_vaddr as i6
         reader.buf_emit8(plt, 233);  // E9
         reader.buf_emit32_le(plt, jmp_rel);
 
+        plt_idx = plt_idx + 1;
         di = di + 1;
     }
 }
@@ -942,6 +1010,8 @@ fn alloc_dynamic_bufs(ls as *LinkerState) as void {
     ls.hash_buf = alloc_bytebuf(4096);
     ls.relaplt_buf = alloc_bytebuf(4096);
     ls.dynamic_buf = alloc_bytebuf(4096);
+    ls.data_got_buf = alloc_bytebuf(4096);
+    ls.reladyn_buf = alloc_bytebuf(4096);
 }
 
 // Check if a global symbol is dynamic (should be resolved via PLT)
@@ -963,4 +1033,79 @@ fn get_plt_vaddr(ls as *LinkerState, name as *u8, name_len as i32) as i64 {
         return d.plt_vaddr;
     }
     return 0;
+}
+
+// Get data GOT vaddr for a GOTPCREL dynamic symbol
+fn get_data_got_vaddr(ls as *LinkerState, name as *u8, name_len as i32) as i64 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as idx = dynsym_find(dst, name, name_len);
+    if (idx >= 0) {
+        let is *DynSym as d = dynsym_get(dst, idx);
+        return d.data_got_vaddr;
+    }
+    return 0;
+}
+
+// Count data dynamic symbols (GOTPCREL)
+fn count_data_dynsyms(ls as *LinkerState) as i32 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as count with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 1) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// Count function dynamic symbols (PLT)
+fn count_func_dynsyms(ls as *LinkerState) as i32 {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is i32 as count with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// Build data GOT entries for GOTPCREL symbols
+fn build_data_got(ls as *LinkerState, data_got_base_vaddr as i64) as void {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is *reader.ByteBuffer as dgot = cast(*reader.ByteBuffer, ls.data_got_buf);
+    let is i32 as slot with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 1) {
+            d.data_got_vaddr = data_got_base_vaddr + cast(i64, slot) * 8;
+            // Emit 8 zero bytes (dynamic linker fills at runtime)
+            reader.buf_emit64_le(dgot, 0);
+            slot = slot + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Build .rela.dyn with GLOB_DAT entries for data GOT symbols
+fn build_rela_dyn(ls as *LinkerState) as void {
+    let is *DynSymTab as dst = get_dynsyms(ls);
+    let is *reader.ByteBuffer as rela = cast(*reader.ByteBuffer, ls.reladyn_buf);
+    let is i32 as i with mut = 0;
+    while (i < dst.count) {
+        let is *DynSym as d = dynsym_get(dst, i);
+        if (d.is_data == 1) {
+            // r_offset = data GOT entry vaddr
+            reader.buf_emit64_le(rela, d.data_got_vaddr);
+            // r_info = (sym_index << 32) | R_X86_64_GLOB_DAT(6)
+            let is i64 as r_info = (cast(i64, d.dynsym_index) << 32) + reader.R_X86_64_GLOB_DAT;
+            reader.buf_emit64_le(rela, r_info);
+            // r_addend = 0
+            reader.buf_emit64_le(rela, 0);
+        }
+        i = i + 1;
+    }
 }
