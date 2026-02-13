@@ -94,6 +94,12 @@ mem.galloc(1024);
 defer free(ptr);
 defer close(fd);
 
+// Function pointers
+let is *u8 as cb = fn_ptr(my_func);          // local function
+let is *u8 as cb = fn_ptr(mod.func);         // module function
+let is *u8 as cb = fn_ptr(max gen i32);      // generic function
+let is *u8 as cb = fn_ptr(Point_sum);        // impl method
+
 // Low-level
 syscall(1, 1, "hello", 5);  // direct syscall
 asm("mov rax, 1\n");        // inline asm

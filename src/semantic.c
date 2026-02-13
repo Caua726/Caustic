@@ -1653,24 +1653,47 @@ void walk(Node *node) {
 
         case NODE_KIND_FN_PTR: {
             char *fn_name = node->name;
-            char *module_name = node->member_name;
             Function *func = NULL;
 
-            if (module_name) {
+            if (node->generic_arg_count > 0) {
+                // Generic: fn_ptr(max gen i32) — name=mangled, member_name=original
+                func = lookup_function(fn_name);
+                if (!func && node->member_name) {
+                    GenericTemplate *tmpl = lookup_generic_template(node->member_name);
+                    if (tmpl && tmpl->is_function) {
+                        char *mangled = mangle_generic_name(tmpl->name, node->generic_args, node->generic_arg_count);
+                        free(node->name);
+                        node->name = strdup(mangled);
+                        instantiate_generic_func(tmpl, node->generic_args, node->generic_arg_count, mangled);
+                        func = lookup_function(mangled);
+                        free(mangled);
+                    }
+                }
+                if (!func) {
+                    error_at_token(*node->tok, "funcao '%s' nao encontrada", fn_name);
+                }
+                free(node->member_name);
+                node->member_name = NULL;
+                if (func->asm_name) {
+                    free(node->name);
+                    node->name = strdup(func->asm_name);
+                }
+            } else if (node->member_name) {
                 // Module-qualified: fn_ptr(mod.func)
                 Variable *var = symtab_lookup(fn_name);
                 if (!var || !var->is_module || !var->module_ref) {
                     error_at_token(*node->tok, "modulo '%s' nao encontrado", fn_name);
                 }
-                func = lookup_function_qualified(module_name, var->module_ref->path_prefix);
+                func = lookup_function_qualified(node->member_name, var->module_ref->path_prefix);
                 if (!func) {
-                    error_at_token(*node->tok, "funcao '%s.%s' nao encontrada", fn_name, module_name);
+                    error_at_token(*node->tok, "funcao '%s.%s' nao encontrada", fn_name, node->member_name);
                 }
                 free(node->name);
                 node->name = strdup(func->asm_name ? func->asm_name : func->name);
                 free(node->member_name);
                 node->member_name = NULL;
             } else {
+                // Simple: fn_ptr(func)
                 func = lookup_function(fn_name);
                 if (!func) {
                     error_at_token(*node->tok, "funcao '%s' nao encontrada", fn_name);

@@ -761,6 +761,67 @@ static Node *parse_primary() {
             return node;
         }
 
+        // Support generic: fn_ptr(max gen i32)
+        if (current_token.type == TOKEN_TYPE_GEN) {
+            consume();
+            char *original_name = strdup(fn_name);
+
+            int cap = 4;
+            Type **gen_args = calloc(cap, sizeof(Type*));
+            int gen_count = 0;
+            char mangled[512];
+            snprintf(mangled, sizeof(mangled), "%s", fn_name);
+
+            while (1) {
+                Type *arg_type = parse_type();
+                if (gen_count >= cap) {
+                    cap *= 2;
+                    gen_args = realloc(gen_args, cap * sizeof(Type*));
+                }
+                gen_args[gen_count++] = arg_type;
+
+                const char *tname = "unknown";
+                switch (arg_type->kind) {
+                    case TY_I8: tname = "i8"; break;
+                    case TY_I16: tname = "i16"; break;
+                    case TY_I32: tname = "i32"; break;
+                    case TY_I64: tname = "i64"; break;
+                    case TY_U8: tname = "u8"; break;
+                    case TY_U16: tname = "u16"; break;
+                    case TY_U32: tname = "u32"; break;
+                    case TY_U64: tname = "u64"; break;
+                    case TY_F32: tname = "f32"; break;
+                    case TY_F64: tname = "f64"; break;
+                    case TY_BOOL: tname = "bool"; break;
+                    case TY_CHAR: tname = "char"; break;
+                    case TY_STRING: tname = "string"; break;
+                    case TY_VOID: tname = "void"; break;
+                    case TY_PTR: tname = "ptr"; break;
+                    case TY_STRUCT: tname = arg_type->name ? arg_type->name : "struct"; break;
+                    default: break;
+                }
+                size_t cur_len = strlen(mangled);
+                snprintf(mangled + cur_len, sizeof(mangled) - cur_len, "_%s", tname);
+
+                if (current_token.type == TOKEN_TYPE_COMMA) {
+                    consume();
+                } else {
+                    break;
+                }
+            }
+
+            free(fn_name);
+            Node *node = new_node(NODE_KIND_FN_PTR);
+            node->tok = calloc(1, sizeof(Token));
+            *node->tok = fn_ptr_tok;
+            node->name = strdup(mangled);
+            node->member_name = original_name; // original name for template lookup
+            node->generic_args = gen_args;
+            node->generic_arg_count = gen_count;
+            expect(TOKEN_TYPE_RPAREN);
+            return node;
+        }
+
         Node *node = new_node(NODE_KIND_FN_PTR);
         node->tok = calloc(1, sizeof(Token));
         *node->tok = fn_ptr_tok;
