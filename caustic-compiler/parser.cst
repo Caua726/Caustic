@@ -1,0 +1,1266 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+use "tokens.cst" as tok;
+use "lexer.cst" as lex;
+use "ast.cst" as ast;
+
+// === Parser state ===
+let is *tok.TokenList as p_tl with mut;
+let is i32 as p_pos with mut;
+let is *u8 as p_src with mut;
+let is i64 as p_src_len with mut;
+let is *u8 as p_filename with mut;
+
+// === Token access ===
+fn cur() as *tok.Token { return tok.tl_get(p_tl, p_pos); }
+fn peek() as *tok.Token { return tok.tl_get(p_tl, p_pos + 1); }
+fn advance() as void { p_pos = p_pos + 1; }
+
+fn error_tok(msg as *u8) as void {
+    let is *tok.Token as t = cur();
+    lex.error_at(p_src, p_src_len, p_filename, t.line, t.col, msg);
+}
+
+fn expect(kind as i32) as void {
+    if (cur().kind != kind) { error_tok("unexpected token"); }
+    advance();
+}
+
+fn eat(kind as i32) as i32 {
+    if (cur().kind == kind) { advance(); return 1; }
+    return 0;
+}
+
+// === String helpers ===
+fn str_dup(ptr as *u8, len as i32) as *u8 {
+    let is *u8 as buf = mem.galloc(cast(i64, len) + 1);
+    mem.memcpy(buf, ptr, cast(i64, len));
+    buf[len] = cast(u8, 0);
+    return buf;
+}
+
+fn str_len(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn type_name_str(t as *ast.Type) as *u8 {
+    if (t.kind == ast.TY_I8)     { return "i8"; }
+    if (t.kind == ast.TY_I16)    { return "i16"; }
+    if (t.kind == ast.TY_I32)    { return "i32"; }
+    if (t.kind == ast.TY_I64)    { return "i64"; }
+    if (t.kind == ast.TY_U8)     { return "u8"; }
+    if (t.kind == ast.TY_U16)    { return "u16"; }
+    if (t.kind == ast.TY_U32)    { return "u32"; }
+    if (t.kind == ast.TY_U64)    { return "u64"; }
+    if (t.kind == ast.TY_F32)    { return "f32"; }
+    if (t.kind == ast.TY_F64)    { return "f64"; }
+    if (t.kind == ast.TY_BOOL)   { return "bool"; }
+    if (t.kind == ast.TY_CHAR)   { return "char"; }
+    if (t.kind == ast.TY_STRING) { return "string"; }
+    if (t.kind == ast.TY_VOID)   { return "void"; }
+    if (t.kind == ast.TY_PTR)    { return "ptr"; }
+    if (t.kind == ast.TY_STRUCT && t.name_len > 0) { return t.name_ptr; }
+    return "unknown";
+}
+
+// Build mangled name: base_type1_type2
+fn mangle_name(base_ptr as *u8, base_len as i32, args as *u8, arg_count as i32) as *u8 {
+    // Calculate total length
+    let is i32 as total with mut = base_len;
+    let is i32 as i with mut = 0;
+    while (i < arg_count) {
+        let is *u8 as tn = type_name_str(ast.ga_get(args, i));
+        total = total + 1 + str_len(tn); // underscore + name
+        i = i + 1;
+    }
+    let is *u8 as buf = mem.galloc(cast(i64, total) + 1);
+    mem.memcpy(buf, base_ptr, cast(i64, base_len));
+    let is i32 as pos with mut = base_len;
+    i = 0;
+    while (i < arg_count) {
+        buf[pos] = 95; // '_'
+        pos = pos + 1;
+        let is *u8 as tn = type_name_str(ast.ga_get(args, i));
+        let is i32 as tl = str_len(tn);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, pos)), tn, cast(i64, tl));
+        pos = pos + tl;
+        i = i + 1;
+    }
+    buf[pos] = cast(u8, 0);
+    return buf;
+}
+
+// Concat two strings with underscore: "Type" + "method" -> "Type_method"
+fn concat_underscore(a as *u8, alen as i32, b as *u8, blen as i32) as *u8 {
+    let is i32 as total = alen + 1 + blen;
+    let is *u8 as buf = mem.galloc(cast(i64, total) + 1);
+    mem.memcpy(buf, a, cast(i64, alen));
+    buf[alen] = 95; // '_'
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, alen) + 1), b, cast(i64, blen));
+    buf[total] = cast(u8, 0);
+    return buf;
+}
+
+// Note: Caustic resolves function calls by name at semantic analysis time,
+// so mutual recursion between parse_expr/parse_primary and parse_block/parse_stmt
+// works without forward declarations.
+
+// === Type parsing ===
+
+fn parse_type() as *ast.Type {
+    // Array: [N]T
+    if (cur().kind == tok.TK_LBRACKET) {
+        advance();
+        if (cur().kind != tok.TK_INTEGER) { error_tok("expected array size"); }
+        let is i32 as len = cast(i32, cur().int_val);
+        advance();
+        expect(tok.TK_RBRACKET);
+        let is *ast.Type as base = parse_type();
+        let is *ast.Type as ty = ast.new_type(ast.TY_ARRAY);
+        ty.base = base;
+        ty.array_len = len;
+        ty.size = len * base.size;
+        return ty;
+    }
+    // Pointer: *T
+    if (cur().kind == tok.TK_STAR) {
+        advance();
+        let is *ast.Type as base = parse_type();
+        let is *ast.Type as ty = ast.new_type(ast.TY_PTR);
+        ty.base = base;
+        ty.size = 8;
+        return ty;
+    }
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected type"); }
+
+    let is *u8 as name = cur().ptr;
+    let is i32 as nlen = cur().len;
+
+    // Check module-qualified type: mod.Type (only if not a primitive)
+    if (peek().kind == tok.TK_DOT) {
+        let is i32 as is_prim = 0;
+        if (tok.streq_lit(name, nlen, "i8") == 1 || tok.streq_lit(name, nlen, "i16") == 1 ||
+            tok.streq_lit(name, nlen, "i32") == 1 || tok.streq_lit(name, nlen, "i64") == 1 ||
+            tok.streq_lit(name, nlen, "u8") == 1 || tok.streq_lit(name, nlen, "u16") == 1 ||
+            tok.streq_lit(name, nlen, "u32") == 1 || tok.streq_lit(name, nlen, "u64") == 1 ||
+            tok.streq_lit(name, nlen, "f32") == 1 || tok.streq_lit(name, nlen, "f64") == 1 ||
+            tok.streq_lit(name, nlen, "bool") == 1 || tok.streq_lit(name, nlen, "char") == 1 ||
+            tok.streq_lit(name, nlen, "void") == 1) {
+            is_prim = 1;
+        }
+        if (is_prim == 0) {
+            let is *u8 as mod_ptr = name;
+            let is i32 as mod_len = nlen;
+            advance(); // module name
+            advance(); // dot
+            if (cur().kind != tok.TK_IDENT) { error_tok("expected type name after '.'"); }
+            // Build "module.Type" string
+            let is i32 as tlen = cur().len;
+            let is i32 as full_len = mod_len + 1 + tlen;
+            let is *u8 as full = mem.galloc(cast(i64, full_len) + 1);
+            mem.memcpy(full, mod_ptr, cast(i64, mod_len));
+            full[mod_len] = 46; // '.'
+            mem.memcpy(cast(*u8, cast(i64, full) + cast(i64, mod_len) + 1), cur().ptr, cast(i64, tlen));
+            full[full_len] = cast(u8, 0);
+            advance();
+            let is *ast.Type as ty = ast.new_type(ast.TY_STRUCT);
+            ty.name_ptr = full;
+            ty.name_len = full_len;
+            // Check for generic args
+            if (cur().kind == tok.TK_GEN) {
+                advance();
+                let is i32 as ga_cap with mut = 4;
+                let is *u8 as ga_buf = ast.ga_alloc(ga_cap);
+                let is i32 as ga_count with mut = 0;
+                while (1 == 1) {
+                    let is *ast.Type as arg = parse_type();
+                    if (ga_count >= ga_cap) {
+                        let is i32 as new_cap = ga_cap * 2;
+                        let is *u8 as new_buf = ast.ga_alloc(new_cap);
+                        mem.memcpy(new_buf, ga_buf, cast(i64, ga_count) * 8);
+                        ga_buf = new_buf;
+                        ga_cap = new_cap;
+                    }
+                    ast.ga_set(ga_buf, ga_count, arg);
+                    ga_count = ga_count + 1;
+                    if (eat(tok.TK_COMMA) == 0) { break; }
+                }
+                let is *u8 as mangled = mangle_name(full, full_len, ga_buf, ga_count);
+                ty.name_ptr = mangled;
+                ty.name_len = str_len(mangled);
+            }
+            return ty;
+        }
+    }
+
+    // Primitives
+    if (tok.streq_lit(name, nlen, "i8") == 1)     { advance(); return ast.type_i8; }
+    if (tok.streq_lit(name, nlen, "i16") == 1)    { advance(); return ast.type_i16; }
+    if (tok.streq_lit(name, nlen, "i32") == 1)    { advance(); return ast.type_i32; }
+    if (tok.streq_lit(name, nlen, "i64") == 1)    { advance(); return ast.type_i64; }
+    if (tok.streq_lit(name, nlen, "u8") == 1)     { advance(); return ast.type_u8; }
+    if (tok.streq_lit(name, nlen, "u16") == 1)    { advance(); return ast.type_u16; }
+    if (tok.streq_lit(name, nlen, "u32") == 1)    { advance(); return ast.type_u32; }
+    if (tok.streq_lit(name, nlen, "u64") == 1)    { advance(); return ast.type_u64; }
+    if (tok.streq_lit(name, nlen, "f32") == 1)    { advance(); return ast.type_f32; }
+    if (tok.streq_lit(name, nlen, "f64") == 1)    { advance(); return ast.type_f64; }
+    if (tok.streq_lit(name, nlen, "bool") == 1)   { advance(); return ast.type_bool; }
+    if (tok.streq_lit(name, nlen, "char") == 1)   { advance(); return ast.type_char; }
+    if (tok.streq_lit(name, nlen, "string") == 1) { advance(); return ast.type_string; }
+    if (tok.streq_lit(name, nlen, "void") == 1)   { advance(); return ast.type_void; }
+
+    // User-defined type (struct/enum)
+    let is *ast.Type as ty = ast.new_type(ast.TY_STRUCT);
+    ty.name_ptr = str_dup(name, nlen);
+    ty.name_len = nlen;
+    advance();
+
+    // Check for generic args: Type gen T1, T2
+    if (cur().kind == tok.TK_GEN) {
+        advance();
+        let is i32 as ga_cap with mut = 4;
+        let is *u8 as ga_buf = ast.ga_alloc(ga_cap);
+        let is i32 as ga_count with mut = 0;
+        while (1 == 1) {
+            let is *ast.Type as arg = parse_type();
+            if (ga_count >= ga_cap) {
+                let is i32 as new_cap = ga_cap * 2;
+                let is *u8 as new_buf = ast.ga_alloc(new_cap);
+                mem.memcpy(new_buf, ga_buf, cast(i64, ga_count) * 8);
+                ga_buf = new_buf;
+                ga_cap = new_cap;
+            }
+            ast.ga_set(ga_buf, ga_count, arg);
+            ga_count = ga_count + 1;
+            if (eat(tok.TK_COMMA) == 0) { break; }
+        }
+        let is *u8 as mangled = mangle_name(name, nlen, ga_buf, ga_count);
+        ty.name_ptr = mangled;
+        ty.name_len = str_len(mangled);
+    }
+
+    return ty;
+}
+
+// === Expression parsing ===
+
+// Helper to create binary node
+fn new_bin(kind as i32, lhs as *ast.Node, rhs as *ast.Node) as *ast.Node {
+    let is *ast.Node as n = ast.new_node(kind);
+    n.lhs = lhs;
+    n.rhs = rhs;
+    return n;
+}
+
+// Parse argument list: ( expr, expr, ... )
+fn parse_arg_list() as *ast.Node {
+    let is *ast.Node as first with mut = cast(*ast.Node, 0);
+    let is *ast.Node as last with mut = cast(*ast.Node, 0);
+    while (cur().kind != tok.TK_RPAREN) {
+        let is *ast.Node as arg = parse_expr();
+        if (cast(i64, first) == 0) { first = arg; } else { last.next = arg; }
+        last = arg;
+        if (eat(tok.TK_COMMA) == 0) { break; }
+    }
+    return first;
+}
+
+// Parse generic type args after 'gen': returns count, fills ga_buf
+fn parse_generic_args(out_buf as **u8, out_count as *i32) as void {
+    let is i32 as cap with mut = 4;
+    let is *u8 as buf = ast.ga_alloc(cap);
+    let is i32 as count with mut = 0;
+    while (1 == 1) {
+        let is *ast.Type as arg = parse_type();
+        if (count >= cap) {
+            let is i32 as nc = cap * 2;
+            let is *u8 as nb = ast.ga_alloc(nc);
+            mem.memcpy(nb, buf, cast(i64, count) * 8);
+            buf = nb;
+            cap = nc;
+        }
+        ast.ga_set(buf, count, arg);
+        count = count + 1;
+        if (eat(tok.TK_COMMA) == 0) { break; }
+    }
+    *out_buf = buf;
+    *out_count = count;
+}
+
+fn parse_primary() as *ast.Node {
+    let is *tok.Token as t = cur();
+
+    // sizeof(Type)
+    if (t.kind == tok.TK_SIZEOF) {
+        advance();
+        expect(tok.TK_LPAREN);
+        let is *ast.Type as ty = parse_type();
+        expect(tok.TK_RPAREN);
+        let is *ast.Node as n = ast.new_node(ast.NK_SIZEOF);
+        n.ty = ty;
+        return n;
+    }
+
+    // cast(Type, expr)
+    if (t.kind == tok.TK_CAST) {
+        advance();
+        expect(tok.TK_LPAREN);
+        let is *ast.Type as ty = parse_type();
+        expect(tok.TK_COMMA);
+        let is *ast.Node as e = parse_expr();
+        expect(tok.TK_RPAREN);
+        let is *ast.Node as n = ast.new_node(ast.NK_CAST);
+        n.ty = ty;
+        n.expr = e;
+        return n;
+    }
+
+    // fn_ptr(name) / fn_ptr(mod.func) / fn_ptr(name gen T)
+    if (t.kind == tok.TK_FN_PTR) {
+        let is i32 as tidx = p_pos;
+        advance();
+        expect(tok.TK_LPAREN);
+        if (cur().kind != tok.TK_IDENT) { error_tok("fn_ptr expects function name"); }
+        let is *u8 as fp_name = cur().ptr;
+        let is i32 as fp_len = cur().len;
+        advance();
+        // Module-qualified: fn_ptr(mod.func)
+        if (cur().kind == tok.TK_DOT) {
+            advance();
+            if (cur().kind != tok.TK_IDENT) { error_tok("expected function name after '.'"); }
+            let is *ast.Node as n = ast.new_node(ast.NK_FN_PTR);
+            n.tok_idx = tidx;
+            n.name_ptr = fp_name;
+            n.name_len = fp_len;
+            n.member_ptr = cur().ptr;
+            n.member_len = cur().len;
+            advance();
+            expect(tok.TK_RPAREN);
+            return n;
+        }
+        // Generic: fn_ptr(max gen i32)
+        if (cur().kind == tok.TK_GEN) {
+            advance();
+            let is *u8 as ga_buf with mut;
+            let is i32 as ga_count with mut = 0;
+            parse_generic_args(&ga_buf, &ga_count);
+            let is *u8 as mangled = mangle_name(fp_name, fp_len, ga_buf, ga_count);
+            let is *ast.Node as n = ast.new_node(ast.NK_FN_PTR);
+            n.tok_idx = tidx;
+            n.name_ptr = mangled;
+            n.name_len = str_len(mangled);
+            n.member_ptr = fp_name; // original name for template lookup
+            n.member_len = fp_len;
+            n.generic_args = ga_buf;
+            n.generic_arg_count = ga_count;
+            expect(tok.TK_RPAREN);
+            return n;
+        }
+        // Simple: fn_ptr(func)
+        let is *ast.Node as n = ast.new_node(ast.NK_FN_PTR);
+        n.tok_idx = tidx;
+        n.name_ptr = fp_name;
+        n.name_len = fp_len;
+        expect(tok.TK_RPAREN);
+        return n;
+    }
+
+    // Integer literal
+    if (t.kind == tok.TK_INTEGER) {
+        let is *ast.Node as n = ast.new_node(ast.NK_NUM);
+        n.val = t.int_val;
+        n.ty = ast.type_i64;
+        n.tok_idx = p_pos;
+        advance();
+        return n;
+    }
+
+    // Float literal
+    if (t.kind == tok.TK_FLOAT) {
+        let is *ast.Node as n = ast.new_node(ast.NK_NUM);
+        n.fval = lex.parse_float(p_src, cast(i64, t.ptr) - cast(i64, p_src), cast(i64, t.ptr) - cast(i64, p_src) + cast(i64, t.len));
+        n.ty = ast.type_f64;
+        n.tok_idx = p_pos;
+        advance();
+        return n;
+    }
+
+    // Char literal
+    if (t.kind == tok.TK_CHAR) {
+        let is *ast.Node as n = ast.new_node(ast.NK_NUM);
+        n.val = t.int_val;
+        n.ty = ast.type_char;
+        n.tok_idx = p_pos;
+        advance();
+        return n;
+    }
+
+    // String literal
+    if (t.kind == tok.TK_STRING) {
+        let is *ast.Node as n = ast.new_node(ast.NK_STRING);
+        n.name_ptr = t.ptr;
+        n.name_len = t.len;
+        n.tok_idx = p_pos;
+        advance();
+        return n;
+    }
+
+    // Parenthesized expression or C-style cast
+    if (t.kind == tok.TK_LPAREN) {
+        advance();
+        // Check for C-style cast: (i32)expr
+        if (cur().kind == tok.TK_IDENT) {
+            let is *u8 as nm = cur().ptr;
+            let is i32 as nl = cur().len;
+            let is *ast.Type as maybe with mut = cast(*ast.Type, 0);
+            if (tok.streq_lit(nm, nl, "i8") == 1)  { maybe = ast.type_i8; }
+            else if (tok.streq_lit(nm, nl, "i16") == 1) { maybe = ast.type_i16; }
+            else if (tok.streq_lit(nm, nl, "i32") == 1) { maybe = ast.type_i32; }
+            else if (tok.streq_lit(nm, nl, "i64") == 1) { maybe = ast.type_i64; }
+            else if (tok.streq_lit(nm, nl, "u8") == 1)  { maybe = ast.type_u8; }
+            else if (tok.streq_lit(nm, nl, "u16") == 1) { maybe = ast.type_u16; }
+            else if (tok.streq_lit(nm, nl, "u32") == 1) { maybe = ast.type_u32; }
+            else if (tok.streq_lit(nm, nl, "u64") == 1) { maybe = ast.type_u64; }
+            if (cast(i64, maybe) != 0) {
+                advance();
+                if (cur().kind == tok.TK_RPAREN) {
+                    advance();
+                    let is *ast.Node as e = parse_primary();
+                    let is *ast.Node as cn = ast.new_node(ast.NK_CAST);
+                    cn.expr = e;
+                    cn.ty = maybe;
+                    return cn;
+                }
+            }
+        }
+        let is *ast.Node as e = parse_expr();
+        expect(tok.TK_RPAREN);
+        return e;
+    }
+
+    // syscall(...)
+    if (t.kind == tok.TK_SYSCALL) {
+        advance();
+        expect(tok.TK_LPAREN);
+        let is *ast.Node as n = ast.new_node(ast.NK_SYSCALL);
+        n.ty = ast.type_i64;
+        n.args = parse_arg_list();
+        expect(tok.TK_RPAREN);
+        return n;
+    }
+
+    // Identifier, function call, generic call
+    if (t.kind == tok.TK_IDENT) {
+        let is *u8 as name = t.ptr;
+        let is i32 as nlen = t.len;
+
+        // true / false
+        if (tok.streq_lit(name, nlen, "true") == 1) {
+            let is *ast.Node as n = ast.new_node(ast.NK_NUM);
+            n.val = 1;
+            n.ty = ast.type_bool;
+            advance();
+            return n;
+        }
+        if (tok.streq_lit(name, nlen, "false") == 1) {
+            let is *ast.Node as n = ast.new_node(ast.NK_NUM);
+            n.val = 0;
+            n.ty = ast.type_bool;
+            advance();
+            return n;
+        }
+
+        // Generic function call: name gen T1, T2 (args)
+        if (peek().kind == tok.TK_GEN) {
+            advance(); // consume ident
+            advance(); // consume gen
+            let is *u8 as ga_buf with mut;
+            let is i32 as ga_count with mut = 0;
+            parse_generic_args(&ga_buf, &ga_count);
+            let is *u8 as mangled = mangle_name(name, nlen, ga_buf, ga_count);
+            let is i32 as mlen = str_len(mangled);
+
+            let is *ast.Node as id = ast.new_node(ast.NK_IDENT);
+            id.name_ptr = mangled;
+            id.name_len = mlen;
+            id.generic_args = ga_buf;
+            id.generic_arg_count = ga_count;
+            id.member_ptr = name; // original name
+            id.member_len = nlen;
+
+            if (cur().kind == tok.TK_LPAREN) {
+                let is *ast.Node as call = ast.new_node(ast.NK_FNCALL);
+                call.lhs = id;
+                call.generic_args = ga_buf;
+                call.generic_arg_count = ga_count;
+                call.member_ptr = name;
+                call.member_len = nlen;
+                expect(tok.TK_LPAREN);
+                call.args = parse_arg_list();
+                expect(tok.TK_RPAREN);
+                return call;
+            }
+            return id;
+        }
+
+        // Regular function call: name(args)
+        if (peek().kind == tok.TK_LPAREN) {
+            let is *ast.Node as id = ast.new_node(ast.NK_IDENT);
+            id.name_ptr = name;
+            id.name_len = nlen;
+            let is *ast.Node as call = ast.new_node(ast.NK_FNCALL);
+            call.lhs = id;
+            advance(); // ident
+            expect(tok.TK_LPAREN);
+            call.args = parse_arg_list();
+            expect(tok.TK_RPAREN);
+            return call;
+        }
+
+        // Plain identifier
+        let is *ast.Node as n = ast.new_node(ast.NK_IDENT);
+        n.name_ptr = name;
+        n.name_len = nlen;
+        advance();
+        return n;
+    }
+
+    error_tok("expected expression");
+    return cast(*ast.Node, 0);
+}
+
+fn parse_postfix() as *ast.Node {
+    let is *ast.Node as node with mut = parse_primary();
+    while (1 == 1) {
+        // Array index: [expr]
+        if (cur().kind == tok.TK_LBRACKET) {
+            advance();
+            let is *ast.Node as idx = parse_expr();
+            expect(tok.TK_RBRACKET);
+            let is *ast.Node as n = ast.new_node(ast.NK_INDEX);
+            n.lhs = node;
+            n.rhs = idx;
+            node = n;
+        }
+        // Member access: .name
+        else if (cur().kind == tok.TK_DOT) {
+            advance();
+            if (cur().kind != tok.TK_IDENT) { error_tok("expected member name after '.'"); }
+            // Check for module-qualified generic: x.Func gen T
+            if (node.kind == ast.NK_IDENT && peek().kind == tok.TK_GEN) {
+                // Combine: mod.func, then parse gen args
+                let is i32 as combined_len = node.name_len + 1 + cur().len;
+                let is *u8 as combined = mem.galloc(cast(i64, combined_len) + 1);
+                mem.memcpy(combined, node.name_ptr, cast(i64, node.name_len));
+                combined[node.name_len] = 46; // '.'
+                mem.memcpy(cast(*u8, cast(i64, combined) + cast(i64, node.name_len) + 1), cur().ptr, cast(i64, cur().len));
+                combined[combined_len] = cast(u8, 0);
+                advance(); // consume name
+                advance(); // consume gen
+                let is *u8 as ga_buf with mut;
+                let is i32 as ga_count with mut = 0;
+                parse_generic_args(&ga_buf, &ga_count);
+                let is *u8 as mangled = mangle_name(combined, combined_len, ga_buf, ga_count);
+                node.name_ptr = mangled;
+                node.name_len = str_len(mangled);
+                node.generic_args = ga_buf;
+                node.generic_arg_count = ga_count;
+                node.member_ptr = combined;
+                node.member_len = combined_len;
+            } else {
+                let is *ast.Node as n = ast.new_node(ast.NK_MEMBER);
+                n.lhs = node;
+                n.member_ptr = cur().ptr;
+                n.member_len = cur().len;
+                advance();
+                node = n;
+            }
+        }
+        // Postfix function call: expr(args)
+        else if (cur().kind == tok.TK_LPAREN) {
+            advance();
+            let is *ast.Node as call = ast.new_node(ast.NK_FNCALL);
+            call.lhs = node;
+            call.args = parse_arg_list();
+            expect(tok.TK_RPAREN);
+            node = call;
+        }
+        else { break; }
+    }
+    return node;
+}
+
+fn parse_unary() as *ast.Node {
+    if (cur().kind == tok.TK_AND) {
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_ADDR);
+        n.expr = parse_unary();
+        return n;
+    }
+    if (cur().kind == tok.TK_STAR) {
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_DEREF);
+        n.expr = parse_unary();
+        return n;
+    }
+    if (cur().kind == tok.TK_MINUS) {
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_NEG);
+        n.expr = parse_unary();
+        return n;
+    }
+    if (cur().kind == tok.TK_NOT) {
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_LNOT);
+        n.expr = parse_unary();
+        return n;
+    }
+    if (cur().kind == tok.TK_BITNOT) {
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_BNOT);
+        n.expr = parse_unary();
+        return n;
+    }
+    return parse_postfix();
+}
+
+fn parse_mul() as *ast.Node {
+    let is *ast.Node as node with mut = parse_unary();
+    while (cur().kind == tok.TK_STAR || cur().kind == tok.TK_SLASH || cur().kind == tok.TK_PERCENT) {
+        if (cur().kind == tok.TK_STAR) { advance(); node = new_bin(ast.NK_MUL, node, parse_unary()); }
+        else if (cur().kind == tok.TK_SLASH) { advance(); node = new_bin(ast.NK_DIV, node, parse_unary()); }
+        else { advance(); node = new_bin(ast.NK_MOD, node, parse_unary()); }
+    }
+    return node;
+}
+
+fn parse_add() as *ast.Node {
+    let is *ast.Node as node with mut = parse_mul();
+    while (cur().kind == tok.TK_PLUS || cur().kind == tok.TK_MINUS) {
+        if (cur().kind == tok.TK_PLUS) { advance(); node = new_bin(ast.NK_ADD, node, parse_mul()); }
+        else { advance(); node = new_bin(ast.NK_SUB, node, parse_mul()); }
+    }
+    return node;
+}
+
+fn parse_shift() as *ast.Node {
+    let is *ast.Node as node with mut = parse_add();
+    while (cur().kind == tok.TK_SHL || cur().kind == tok.TK_SHR) {
+        if (cur().kind == tok.TK_SHL) { advance(); node = new_bin(ast.NK_SHL, node, parse_add()); }
+        else { advance(); node = new_bin(ast.NK_SHR, node, parse_add()); }
+    }
+    return node;
+}
+
+fn parse_relational() as *ast.Node {
+    let is *ast.Node as node with mut = parse_shift();
+    while (1 == 1) {
+        if (cur().kind == tok.TK_LT) { advance(); node = new_bin(ast.NK_LT, node, parse_shift()); }
+        else if (cur().kind == tok.TK_LE) { advance(); node = new_bin(ast.NK_LE, node, parse_shift()); }
+        else if (cur().kind == tok.TK_GT) { advance(); node = new_bin(ast.NK_GT, node, parse_shift()); }
+        else if (cur().kind == tok.TK_GE) { advance(); node = new_bin(ast.NK_GE, node, parse_shift()); }
+        else { break; }
+    }
+    return node;
+}
+
+fn parse_equality() as *ast.Node {
+    let is *ast.Node as node with mut = parse_relational();
+    while (1 == 1) {
+        if (cur().kind == tok.TK_EQEQ) { advance(); node = new_bin(ast.NK_EQ, node, parse_relational()); }
+        else if (cur().kind == tok.TK_NE) { advance(); node = new_bin(ast.NK_NE, node, parse_relational()); }
+        else { break; }
+    }
+    return node;
+}
+
+fn parse_bitwise_and() as *ast.Node {
+    let is *ast.Node as node with mut = parse_equality();
+    while (cur().kind == tok.TK_AND) { advance(); node = new_bin(ast.NK_BAND, node, parse_equality()); }
+    return node;
+}
+
+fn parse_bitwise_xor() as *ast.Node {
+    let is *ast.Node as node with mut = parse_bitwise_and();
+    while (cur().kind == tok.TK_XOR) { advance(); node = new_bin(ast.NK_BXOR, node, parse_bitwise_and()); }
+    return node;
+}
+
+fn parse_bitwise_or() as *ast.Node {
+    let is *ast.Node as node with mut = parse_bitwise_xor();
+    while (cur().kind == tok.TK_OR) { advance(); node = new_bin(ast.NK_BOR, node, parse_bitwise_xor()); }
+    return node;
+}
+
+fn parse_logical_and() as *ast.Node {
+    let is *ast.Node as node with mut = parse_bitwise_or();
+    while (cur().kind == tok.TK_AND_AND) { advance(); node = new_bin(ast.NK_LAND, node, parse_bitwise_or()); }
+    return node;
+}
+
+fn parse_logical_or() as *ast.Node {
+    let is *ast.Node as node with mut = parse_logical_and();
+    while (cur().kind == tok.TK_OR_OR) { advance(); node = new_bin(ast.NK_LOR, node, parse_logical_and()); }
+    return node;
+}
+
+fn parse_expr() as *ast.Node {
+    let is *ast.Node as node = parse_logical_or();
+    if (cur().kind == tok.TK_EQ) {
+        advance();
+        let is *ast.Node as a = ast.new_node(ast.NK_ASSIGN);
+        a.lhs = node;
+        a.rhs = parse_expr();
+        return a;
+    }
+    return node;
+}
+
+// === Statement parsing ===
+
+fn parse_var_decl() as *ast.Node {
+    expect(tok.TK_LET);
+    expect(tok.TK_IS);
+    let is *ast.Type as vtype = parse_type();
+    expect(tok.TK_AS);
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected variable name"); }
+    let is *ast.Node as n = ast.new_node(ast.NK_LET);
+    n.name_ptr = cur().ptr;
+    n.name_len = cur().len;
+    n.ty = vtype;
+    advance();
+    // Flags: with mut/imut
+    let is i32 as vflags with mut = ast.VF_NONE;
+    if (cur().kind == tok.TK_WITH) {
+        advance();
+        while (cur().kind == tok.TK_IDENT) {
+            if (tok.streq_lit(cur().ptr, cur().len, "mut") == 1) { vflags = ast.VF_MUT; }
+            else if (tok.streq_lit(cur().ptr, cur().len, "imut") == 1) { vflags = ast.VF_IMUT; }
+            advance();
+        }
+    }
+    n.flags = vflags;
+    // Init expression
+    if (cur().kind == tok.TK_EQ) {
+        advance();
+        n.init_expr = parse_expr();
+    }
+    expect(tok.TK_SEMICOLON);
+    return n;
+}
+
+fn parse_block() as *ast.Node {
+    let is *ast.Node as blk = ast.new_node(ast.NK_BLOCK);
+    expect(tok.TK_LBRACE);
+    let is *ast.Node as first with mut = cast(*ast.Node, 0);
+    let is *ast.Node as last with mut = cast(*ast.Node, 0);
+    while (cur().kind != tok.TK_RBRACE) {
+        let is *ast.Node as s = parse_stmt();
+        if (cast(i64, first) == 0) { first = s; } else { last.next = s; }
+        last = s;
+    }
+    expect(tok.TK_RBRACE);
+    blk.stmts = first;
+    return blk;
+}
+
+fn parse_if_stmt() as *ast.Node {
+    expect(tok.TK_IF);
+    let is *ast.Node as n = ast.new_node(ast.NK_IF);
+    expect(tok.TK_LPAREN);
+    n.cond = parse_expr();
+    expect(tok.TK_RPAREN);
+    n.then_b = parse_block();
+    if (cur().kind == tok.TK_ELSE) {
+        advance();
+        if (cur().kind == tok.TK_IF) {
+            n.else_b = parse_if_stmt();
+        } else {
+            n.else_b = parse_block();
+        }
+    }
+    return n;
+}
+
+fn parse_while_stmt() as *ast.Node {
+    expect(tok.TK_WHILE);
+    let is *ast.Node as n = ast.new_node(ast.NK_WHILE);
+    expect(tok.TK_LPAREN);
+    n.cond = parse_expr();
+    expect(tok.TK_RPAREN);
+    n.body = parse_block();
+    return n;
+}
+
+fn parse_for_stmt() as *ast.Node {
+    expect(tok.TK_FOR);
+    expect(tok.TK_LPAREN);
+    let is *ast.Node as n = ast.new_node(ast.NK_FOR);
+    // Init
+    if (cur().kind != tok.TK_SEMICOLON) {
+        if (cur().kind == tok.TK_LET) {
+            n.for_init = parse_var_decl();
+            // parse_var_decl already consumed semicolon
+        } else {
+            n.for_init = parse_expr();
+            expect(tok.TK_SEMICOLON);
+        }
+    } else {
+        expect(tok.TK_SEMICOLON);
+    }
+    // Cond
+    if (cur().kind != tok.TK_SEMICOLON) {
+        n.cond = parse_expr();
+    }
+    expect(tok.TK_SEMICOLON);
+    // Step
+    if (cur().kind != tok.TK_RPAREN) {
+        n.for_step = parse_expr();
+    }
+    expect(tok.TK_RPAREN);
+    n.body = parse_block();
+    return n;
+}
+
+fn parse_do_while_stmt() as *ast.Node {
+    expect(tok.TK_DO);
+    let is *ast.Node as n = ast.new_node(ast.NK_DO_WHILE);
+    n.body = parse_block();
+    expect(tok.TK_WHILE);
+    expect(tok.TK_LPAREN);
+    n.cond = parse_expr();
+    expect(tok.TK_RPAREN);
+    expect(tok.TK_SEMICOLON);
+    return n;
+}
+
+fn parse_asm_stmt() as *ast.Node {
+    advance(); // asm
+    expect(tok.TK_LPAREN);
+    if (cur().kind != tok.TK_STRING) { error_tok("expected string after 'asm('"); }
+    let is *ast.Node as n = ast.new_node(ast.NK_ASM);
+    n.name_ptr = cur().ptr;
+    n.name_len = cur().len;
+    advance();
+    expect(tok.TK_RPAREN);
+    expect(tok.TK_SEMICOLON);
+    return n;
+}
+
+fn parse_match_stmt() as *ast.Node {
+    let is i32 as tidx = p_pos;
+    expect(tok.TK_MATCH);
+    let is *ast.Type as mtype = parse_type();
+    expect(tok.TK_LPAREN);
+    let is *ast.Node as mexpr = parse_expr();
+    expect(tok.TK_RPAREN);
+    expect(tok.TK_LBRACE);
+
+    let is *ast.Node as mn = ast.new_node(ast.NK_MATCH);
+    mn.tok_idx = tidx;
+    mn.expr = mexpr;
+    mn.match_type = mtype;
+
+    let is *ast.Node as cfirst with mut = cast(*ast.Node, 0);
+    let is *ast.Node as clast with mut = cast(*ast.Node, 0);
+
+    while (cur().kind != tok.TK_RBRACE) {
+        if (cur().kind == tok.TK_ELSE) {
+            advance();
+            mn.else_b = parse_block();
+            break;
+        }
+        expect(tok.TK_CASE);
+        if (cur().kind != tok.TK_IDENT) { error_tok("expected variant name after 'case'"); }
+        let is *ast.Node as cn = ast.new_node(ast.NK_BLOCK);
+        cn.name_ptr = cur().ptr;
+        cn.name_len = cur().len;
+        advance();
+        // Destructuring: case Variant(x, y) { ... }
+        if (cur().kind == tok.TK_LPAREN) {
+            advance();
+            let is *ast.Node as pfirst with mut = cast(*ast.Node, 0);
+            let is *ast.Node as plast with mut = cast(*ast.Node, 0);
+            while (cur().kind != tok.TK_RPAREN) {
+                if (cur().kind != tok.TK_IDENT) { error_tok("expected binding name"); }
+                let is *ast.Node as b = ast.new_node(ast.NK_LET);
+                b.name_ptr = cur().ptr;
+                b.name_len = cur().len;
+                advance();
+                if (cast(i64, pfirst) == 0) { pfirst = b; } else { plast.next = b; }
+                plast = b;
+                if (eat(tok.TK_COMMA) == 0) { break; }
+            }
+            expect(tok.TK_RPAREN);
+            cn.params = pfirst;
+        }
+        cn.body = parse_block();
+        if (cast(i64, cfirst) == 0) { cfirst = cn; } else { clast.next = cn; }
+        clast = cn;
+    }
+    expect(tok.TK_RBRACE);
+    mn.cases = cfirst;
+    return mn;
+}
+
+fn parse_stmt() as *ast.Node {
+    // Empty statement
+    if (cur().kind == tok.TK_SEMICOLON) {
+        advance();
+        return ast.new_node(ast.NK_BLOCK);
+    }
+    if (cur().kind == tok.TK_LET) { return parse_var_decl(); }
+    if (cur().kind == tok.TK_FOR) { return parse_for_stmt(); }
+    if (cur().kind == tok.TK_DO) { return parse_do_while_stmt(); }
+    if (cur().kind == tok.TK_IF) { return parse_if_stmt(); }
+    if (cur().kind == tok.TK_RETURN) {
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_RETURN);
+        if (cur().kind != tok.TK_SEMICOLON) {
+            n.expr = parse_expr();
+        }
+        expect(tok.TK_SEMICOLON);
+        return n;
+    }
+    if (cur().kind == tok.TK_LBRACE) { return parse_block(); }
+    if (cur().kind == tok.TK_ASM) { return parse_asm_stmt(); }
+    if (cur().kind == tok.TK_WHILE) { return parse_while_stmt(); }
+    if (cur().kind == tok.TK_MATCH) { return parse_match_stmt(); }
+    if (cur().kind == tok.TK_BREAK) {
+        advance();
+        expect(tok.TK_SEMICOLON);
+        return ast.new_node(ast.NK_BREAK);
+    }
+    if (cur().kind == tok.TK_CONTINUE) {
+        advance();
+        expect(tok.TK_SEMICOLON);
+        return ast.new_node(ast.NK_CONTINUE);
+    }
+    if (cur().kind == tok.TK_DEFER) {
+        let is i32 as tidx = p_pos;
+        advance();
+        let is *ast.Node as n = ast.new_node(ast.NK_DEFER);
+        n.tok_idx = tidx;
+        n.expr = parse_expr();
+        expect(tok.TK_SEMICOLON);
+        return n;
+    }
+    // Expression statement (including := assignment)
+    let is *ast.Node as e = parse_expr();
+    // Handle := assignment
+    if (cur().kind == tok.TK_ASSIGN) {
+        advance();
+        let is *ast.Node as a = ast.new_node(ast.NK_ASSIGN);
+        a.lhs = e;
+        a.rhs = parse_expr();
+        expect(tok.TK_SEMICOLON);
+        let is *ast.Node as es = ast.new_node(ast.NK_EXPR_STMT);
+        es.expr = a;
+        return es;
+    }
+    expect(tok.TK_SEMICOLON);
+    let is *ast.Node as es = ast.new_node(ast.NK_EXPR_STMT);
+    es.expr = e;
+    return es;
+}
+
+// === Top-level parsing ===
+
+fn parse_params(fn_node as *ast.Node) as void {
+    expect(tok.TK_LPAREN);
+    if (cur().kind == tok.TK_RPAREN) { expect(tok.TK_RPAREN); return; }
+    let is *ast.Node as first with mut = cast(*ast.Node, 0);
+    let is *ast.Node as last with mut = cast(*ast.Node, 0);
+    while (1 == 1) {
+        if (cur().kind == tok.TK_ELLIPSIS) {
+            fn_node.is_variadic = 1;
+            advance();
+            break;
+        }
+        if (cur().kind != tok.TK_IDENT) { error_tok("expected parameter name"); }
+        let is *ast.Node as p = ast.new_node(ast.NK_LET);
+        p.name_ptr = cur().ptr;
+        p.name_len = cur().len;
+        p.flags = ast.VF_NONE;
+        advance();
+        expect(tok.TK_AS);
+        p.ty = parse_type();
+        if (cast(i64, first) == 0) { first = p; } else { last.next = p; }
+        last = p;
+        if (eat(tok.TK_COMMA) == 0) { break; }
+    }
+    fn_node.params = first;
+    expect(tok.TK_RPAREN);
+}
+
+fn parse_generic_params_fn(node as *ast.Node) as void {
+    if (cur().kind != tok.TK_GEN) { return; }
+    advance();
+    let is i32 as cap with mut = 4;
+    let is *u8 as buf = ast.gp_alloc(cap);
+    let is i32 as count with mut = 0;
+    while (cur().kind == tok.TK_IDENT) {
+        if (count >= cap) {
+            let is i32 as nc = cap * 2;
+            let is *u8 as nb = ast.gp_alloc(nc);
+            mem.memcpy(nb, buf, cast(i64, count) * 12);
+            buf = nb;
+            cap = nc;
+        }
+        ast.gp_set(buf, count, cur().ptr, cur().len);
+        count = count + 1;
+        advance();
+        if (eat(tok.TK_COMMA) == 0) { break; }
+    }
+    node.generic_params = buf;
+    node.generic_param_count = count;
+}
+
+fn parse_fn() as *ast.Node {
+    expect(tok.TK_FN);
+    let is *ast.Node as fn_node = ast.new_node(ast.NK_FN);
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected function name"); }
+    fn_node.name_ptr = cur().ptr;
+    fn_node.name_len = cur().len;
+    advance();
+    parse_generic_params_fn(fn_node);
+    parse_params(fn_node);
+    if (cur().kind == tok.TK_AS) {
+        advance();
+        fn_node.return_type = parse_type();
+    } else {
+        fn_node.return_type = ast.type_i32;
+    }
+    fn_node.body = parse_block();
+    return fn_node;
+}
+
+fn parse_extern_fn() as *ast.Node {
+    advance(); // extern
+    expect(tok.TK_FN);
+    let is *ast.Node as fn_node = ast.new_node(ast.NK_FN);
+    fn_node.is_extern = 1;
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected function name after 'extern fn'"); }
+    fn_node.name_ptr = cur().ptr;
+    fn_node.name_len = cur().len;
+    advance();
+    parse_params(fn_node);
+    if (cur().kind == tok.TK_AS) {
+        advance();
+        fn_node.return_type = parse_type();
+    } else {
+        fn_node.return_type = ast.type_i32;
+    }
+    expect(tok.TK_SEMICOLON);
+    return fn_node;
+}
+
+fn parse_struct_decl() as *ast.Node {
+    expect(tok.TK_STRUCT);
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected struct name"); }
+    let is *ast.Type as stype = ast.new_type(ast.TY_STRUCT);
+    stype.name_ptr = str_dup(cur().ptr, cur().len);
+    stype.name_len = cur().len;
+    advance();
+    // Generic params
+    if (cur().kind == tok.TK_GEN) {
+        advance();
+        // Store generic params on the type (we'll use a simple count for now)
+        // For struct decls, we just note the count and skip params
+        while (cur().kind == tok.TK_IDENT) {
+            advance();
+            if (eat(tok.TK_COMMA) == 0) { break; }
+        }
+    }
+    expect(tok.TK_LBRACE);
+    // Parse fields as a linked list of NK_LET nodes
+    let is *ast.Node as ffirst with mut = cast(*ast.Node, 0);
+    let is *ast.Node as flast with mut = cast(*ast.Node, 0);
+    while (cur().kind != tok.TK_RBRACE) {
+        if (cur().kind != tok.TK_IDENT) { error_tok("expected field name"); }
+        let is *ast.Node as f = ast.new_node(ast.NK_LET);
+        f.name_ptr = cur().ptr;
+        f.name_len = cur().len;
+        advance();
+        expect(tok.TK_AS);
+        f.ty = parse_type();
+        expect(tok.TK_SEMICOLON);
+        if (cast(i64, ffirst) == 0) { ffirst = f; } else { flast.next = f; }
+        flast = f;
+    }
+    expect(tok.TK_RBRACE);
+    let is *ast.Node as n = ast.new_node(ast.NK_BLOCK);
+    n.ty = stype;
+    n.stmts = ffirst;
+    return n;
+}
+
+fn parse_enum_decl() as *ast.Node {
+    expect(tok.TK_ENUM);
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected enum name"); }
+    let is *ast.Type as etype = ast.new_type(ast.TY_ENUM);
+    etype.name_ptr = str_dup(cur().ptr, cur().len);
+    etype.name_len = cur().len;
+    advance();
+    // Generic params
+    if (cur().kind == tok.TK_GEN) {
+        advance();
+        while (cur().kind == tok.TK_IDENT) {
+            advance();
+            if (eat(tok.TK_COMMA) == 0) { break; }
+        }
+    }
+    expect(tok.TK_LBRACE);
+    let is *ast.Node as vfirst with mut = cast(*ast.Node, 0);
+    let is *ast.Node as vlast with mut = cast(*ast.Node, 0);
+    let is i32 as disc with mut = 0;
+    while (cur().kind != tok.TK_RBRACE) {
+        if (cur().kind != tok.TK_IDENT) { error_tok("expected variant name"); }
+        let is *ast.Node as v = ast.new_node(ast.NK_LET);
+        v.name_ptr = cur().ptr;
+        v.name_len = cur().len;
+        v.discriminant = disc;
+        disc = disc + 1;
+        advance();
+        // Optional payload: Variant as Type
+        if (cur().kind == tok.TK_AS) {
+            advance();
+            v.ty = parse_type();
+        }
+        expect(tok.TK_SEMICOLON);
+        if (cast(i64, vfirst) == 0) { vfirst = v; } else { vlast.next = v; }
+        vlast = v;
+    }
+    expect(tok.TK_RBRACE);
+    let is *ast.Node as n = ast.new_node(ast.NK_BLOCK);
+    n.ty = etype;
+    n.stmts = vfirst;
+    return n;
+}
+
+fn parse_use() as *ast.Node {
+    expect(tok.TK_USE);
+    if (cur().kind != tok.TK_STRING) { error_tok("expected path after 'use'"); }
+    let is *ast.Node as n = ast.new_node(ast.NK_USE);
+    n.name_ptr = cur().ptr;  // path string (with quotes)
+    n.name_len = cur().len;
+    advance();
+    if (cur().kind == tok.TK_AS) {
+        advance();
+        if (cur().kind != tok.TK_IDENT) { error_tok("expected alias after 'as'"); }
+        n.member_ptr = cur().ptr;
+        n.member_len = cur().len;
+        advance();
+    }
+    expect(tok.TK_SEMICOLON);
+    return n;
+}
+
+fn parse_impl(first as **ast.Node, last as **ast.Node) as void {
+    advance(); // impl
+    if (cur().kind != tok.TK_IDENT) { error_tok("expected type name after 'impl'"); }
+    let is *u8 as type_ptr = cur().ptr;
+    let is i32 as type_len = cur().len;
+    advance();
+    // Optional generic params
+    let is i32 as igp_count with mut = 0;
+    let is *u8 as igp_buf with mut = cast(*u8, 0);
+    if (cur().kind == tok.TK_GEN) {
+        advance();
+        let is i32 as cap with mut = 4;
+        igp_buf = ast.gp_alloc(cap);
+        while (cur().kind == tok.TK_IDENT) {
+            if (igp_count >= cap) {
+                let is i32 as nc = cap * 2;
+                let is *u8 as nb = ast.gp_alloc(nc);
+                mem.memcpy(nb, igp_buf, cast(i64, igp_count) * 12);
+                igp_buf = nb;
+                cap = nc;
+            }
+            ast.gp_set(igp_buf, igp_count, cur().ptr, cur().len);
+            igp_count = igp_count + 1;
+            advance();
+            if (eat(tok.TK_COMMA) == 0) { break; }
+        }
+    }
+    expect(tok.TK_LBRACE);
+    while (cur().kind != tok.TK_RBRACE) {
+        if (cur().kind != tok.TK_FN) { error_tok("expected 'fn' inside impl block"); }
+        let is *ast.Node as fn_node = parse_fn();
+        // Mangle name: Type_method
+        let is *u8 as mangled = concat_underscore(type_ptr, type_len, fn_node.name_ptr, fn_node.name_len);
+        fn_node.name_ptr = mangled;
+        fn_node.name_len = str_len(mangled);
+        fn_node.impl_ptr = type_ptr;
+        fn_node.impl_len = type_len;
+        // Copy generic params from impl to fn if fn doesn't have its own
+        if (igp_count > 0 && fn_node.generic_param_count == 0) {
+            let is *u8 as gp_copy = ast.gp_alloc(igp_count);
+            mem.memcpy(gp_copy, igp_buf, cast(i64, igp_count) * 12);
+            fn_node.generic_params = gp_copy;
+            fn_node.generic_param_count = igp_count;
+        }
+        // Append to list
+        if (cast(i64, *first) == 0) { *first = fn_node; } else { (*last).next = fn_node; }
+        *last = fn_node;
+    }
+    expect(tok.TK_RBRACE);
+}
+
+// === Entry point ===
+
+fn parse_file(tl as *tok.TokenList, src as *u8, src_len as i64, filename as *u8) as *ast.Node {
+    p_tl = tl;
+    p_pos = 0;
+    p_src = src;
+    p_src_len = src_len;
+    p_filename = filename;
+
+    let is *ast.Node as first with mut = cast(*ast.Node, 0);
+    let is *ast.Node as last with mut = cast(*ast.Node, 0);
+
+    while (cur().kind != tok.TK_EOF) {
+        let is *ast.Node as node with mut = cast(*ast.Node, 0);
+
+        if (cur().kind == tok.TK_USE) {
+            node = parse_use();
+        }
+        else if (cur().kind == tok.TK_STRUCT) {
+            node = parse_struct_decl();
+        }
+        else if (cur().kind == tok.TK_ENUM) {
+            node = parse_enum_decl();
+        }
+        else if (cur().kind == tok.TK_LET) {
+            node = parse_var_decl();
+        }
+        else if (cur().kind == tok.TK_EXTERN) {
+            if (peek().kind == tok.TK_LET) {
+                // extern let is TYPE as NAME;
+                advance(); // extern
+                node = parse_var_decl();
+                node.is_extern = 1;
+            } else {
+                node = parse_extern_fn();
+            }
+        }
+        else if (cur().kind == tok.TK_IMPL) {
+            parse_impl(&first, &last);
+        }
+        else if (cur().kind == tok.TK_FN) {
+            node = parse_fn();
+        }
+        else {
+            error_tok("expected top-level declaration");
+        }
+
+        if (cast(i64, node) != 0) {
+            if (cast(i64, first) == 0) { first = node; } else { last.next = node; }
+            last = node;
+        }
+    }
+
+    return first;
+}
