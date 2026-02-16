@@ -1,0 +1,274 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "defs.cst" as d;
+use "../io.cst" as io;
+use "../parser/ast.cst" as ast;
+
+// === Global state ===
+let is *d.Scope as all_scopes with mut;
+let is *d.Scope as current_scope with mut;
+let is *d.Scope as global_scope with mut;
+let is i32 as stack_offset with mut;
+let is *d.Function as function_table with mut;
+let is i32 as loop_depth with mut;
+let is *u8 as current_return_type with mut;
+let is *u8 as current_mod_prefix_ptr with mut;
+let is i32 as current_mod_prefix_len with mut;
+let is *u8 as current_source_dir_ptr with mut;
+let is i32 as current_source_dir_len with mut;
+
+// === Scope management ===
+
+fn symtab_init() as void {
+    all_scopes = cast(*d.Scope, 0);
+    current_scope = cast(*d.Scope, 0);
+    function_table = cast(*d.Function, 0);
+    loop_depth = 0;
+    current_return_type = cast(*u8, 0);
+    current_mod_prefix_ptr = cast(*u8, 0);
+    current_mod_prefix_len = 0;
+    current_source_dir_ptr = cast(*u8, 0);
+    current_source_dir_len = 0;
+
+    global_scope = d.new_scope();
+    global_scope.is_global = 1;
+    global_scope.next_all = all_scopes;
+    all_scopes = global_scope;
+    current_scope = global_scope;
+    stack_offset = 48;
+}
+
+fn enter_scope() as void {
+    let is *d.Scope as s = d.new_scope();
+    s.parent = current_scope;
+    s.next_all = all_scopes;
+    all_scopes = s;
+    current_scope = s;
+}
+
+fn exit_scope() as void {
+    if (cast(i64, current_scope) == 0) { return; }
+    current_scope = current_scope.parent;
+}
+
+// === Variable declaration / lookup ===
+
+fn declare_var(name_ptr as *u8, name_len as i32, ty as *u8, flags as i32) as *d.Variable {
+    // Check duplicate in current scope
+    let is *d.Variable as v with mut = current_scope.vars;
+    while (cast(i64, v) != 0) {
+        if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
+            return v;
+        }
+        v = v.next;
+    }
+
+    let is *d.Variable as nv = d.new_variable();
+    nv.name_ptr = d.str_dup(name_ptr, name_len);
+    nv.name_len = name_len;
+    nv.ty = ty;
+    nv.flags = flags;
+
+    let is *ast.Type as t = cast(*ast.Type, ty);
+
+    if (current_scope.is_global == 1) {
+        nv.is_global = 1;
+        nv.offset = 0;
+        // Mangle with module prefix
+        if (current_mod_prefix_len > 0) {
+            let is i32 as out_len with mut = 0;
+            nv.asm_name_ptr = d.str_concat3(current_mod_prefix_ptr, current_mod_prefix_len, "_", 1, name_ptr, name_len, &out_len);
+            nv.asm_name_len = out_len;
+        } else {
+            nv.asm_name_ptr = d.str_dup(name_ptr, name_len);
+            nv.asm_name_len = name_len;
+        }
+    } else {
+        nv.is_global = 0;
+        stack_offset = stack_offset + t.size;
+        nv.offset = stack_offset;
+    }
+
+    nv.next = current_scope.vars;
+    current_scope.vars = nv;
+    return nv;
+}
+
+fn lookup_var(name_ptr as *u8, name_len as i32) as *d.Variable {
+    let is *d.Scope as s with mut = current_scope;
+    while (cast(i64, s) != 0) {
+        let is *d.Variable as v with mut = s.vars;
+        while (cast(i64, v) != 0) {
+            if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
+                return v;
+            }
+            v = v.next;
+        }
+        s = s.parent;
+    }
+    return cast(*d.Variable, 0);
+}
+
+// === Function declaration / lookup ===
+
+fn declare_fn(name_ptr as *u8, name_len as i32, ret_ty as *u8, param_types as *u8, param_count as i32, is_variadic as i32, is_extern as i32) as void {
+    // Check for duplicate in same module
+    let is *d.Function as f with mut = function_table;
+    while (cast(i64, f) != 0) {
+        if (d.str_eq(f.name_ptr, f.name_len, name_ptr, name_len) == 1) {
+            // Same module check
+            let is i32 as same with mut = 0;
+            if (current_mod_prefix_len > 0 && f.mod_prefix_len > 0) {
+                if (d.str_eq(current_mod_prefix_ptr, current_mod_prefix_len, f.mod_prefix_ptr, f.mod_prefix_len) == 1) {
+                    same = 1;
+                }
+            }
+            if (current_mod_prefix_len == 0 && f.mod_prefix_len == 0) {
+                same = 1;
+            }
+            if (same == 1) { return; }
+        }
+        f = f.next;
+    }
+
+    let is *d.Function as nf = d.new_function();
+    nf.name_ptr = d.str_dup(name_ptr, name_len);
+    nf.name_len = name_len;
+    nf.return_type = ret_ty;
+    nf.param_types = param_types;
+    nf.param_count = param_count;
+    nf.is_variadic = is_variadic;
+    nf.is_extern = is_extern;
+
+    if (current_mod_prefix_len > 0) {
+        nf.mod_prefix_ptr = d.str_dup(current_mod_prefix_ptr, current_mod_prefix_len);
+        nf.mod_prefix_len = current_mod_prefix_len;
+    }
+
+    // Build asm_name
+    if (is_extern == 1) {
+        nf.asm_name_ptr = d.str_dup(name_ptr, name_len);
+        nf.asm_name_len = name_len;
+    } else if (current_mod_prefix_len > 0) {
+        let is i32 as out_len with mut = 0;
+        nf.asm_name_ptr = d.str_concat3(current_mod_prefix_ptr, current_mod_prefix_len, "_", 1, name_ptr, name_len, &out_len);
+        nf.asm_name_len = out_len;
+    } else {
+        nf.asm_name_ptr = d.str_dup(name_ptr, name_len);
+        nf.asm_name_len = name_len;
+    }
+
+    nf.next = function_table;
+    function_table = nf;
+}
+
+fn lookup_fn_qualified(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i32) as *d.Function {
+    let is *d.Function as f with mut = function_table;
+    while (cast(i64, f) != 0) {
+        if (d.str_eq(f.name_ptr, f.name_len, name_ptr, name_len) == 1) {
+            if (prefix_len == 0 && f.mod_prefix_len == 0) { return f; }
+            if (prefix_len > 0 && f.mod_prefix_len > 0) {
+                if (d.str_eq(prefix_ptr, prefix_len, f.mod_prefix_ptr, f.mod_prefix_len) == 1) {
+                    return f;
+                }
+            }
+        }
+        f = f.next;
+    }
+    return cast(*d.Function, 0);
+}
+
+fn lookup_fn(name_ptr as *u8, name_len as i32) as *d.Function {
+    // Try current module first
+    if (current_mod_prefix_len > 0) {
+        let is *d.Function as f = lookup_fn_qualified(name_ptr, name_len, current_mod_prefix_ptr, current_mod_prefix_len);
+        if (cast(i64, f) != 0) { return f; }
+    }
+    // Try global
+    return lookup_fn_qualified(name_ptr, name_len, cast(*u8, 0), 0);
+}
+
+// === Error helpers ===
+
+fn sem_error(msg as *u8) as void {
+    io.write_str(linux.STDERR, "Erro semantico: ");
+    io.write_str(linux.STDERR, msg);
+    io.write_str(linux.STDERR, "\n");
+    linux.exit(cast(i32, 1));
+}
+
+fn sem_error2(msg as *u8, name as *u8, nlen as i32) as void {
+    io.write_str(linux.STDERR, "Erro semantico: ");
+    io.write_str(linux.STDERR, msg);
+    io.write_str(linux.STDERR, " '");
+    io.write_n(linux.STDERR, name, cast(i64, nlen));
+    io.write_str(linux.STDERR, "'\n");
+    linux.exit(cast(i32, 1));
+}
+
+fn sem_error3(msg as *u8, a as *u8, alen as i32, b as *u8, blen as i32) as void {
+    io.write_str(linux.STDERR, "Erro semantico: ");
+    io.write_str(linux.STDERR, msg);
+    io.write_str(linux.STDERR, " '");
+    io.write_n(linux.STDERR, a, cast(i64, alen));
+    io.write_str(linux.STDERR, ".");
+    io.write_n(linux.STDERR, b, cast(i64, blen));
+    io.write_str(linux.STDERR, "'\n");
+    linux.exit(cast(i32, 1));
+}
+
+// === Module prefix helpers ===
+
+fn get_mod_prefix(path_ptr as *u8, path_len as i32) as *u8 {
+    // "std/mem.cst" -> "_std_mem_cst"
+    let is *u8 as buf = mem.galloc(cast(i64, path_len) + 2);
+    buf[0] = cast(u8, 95); // '_'
+    let is i32 as j with mut = 1;
+    let is i32 as i with mut = 0;
+    while (i < path_len) {
+        let is u8 as c = path_ptr[i];
+        if (c == 47 || c == 46 || c == 92 || c == 45) {
+            // '/' '.' '\' '-' -> '_'
+            buf[j] = cast(u8, 95);
+        } else {
+            buf[j] = c;
+        }
+        j = j + 1;
+        i = i + 1;
+    }
+    buf[j] = cast(u8, 0);
+    return buf;
+}
+
+fn get_mod_prefix_len(path_ptr as *u8, path_len as i32) as i32 {
+    return path_len + 1;
+}
+
+// Extract directory from path: "foo/bar/baz.cst" -> "foo/bar"
+// Returns length of dir part. If no '/', returns 0 (meaning ".")
+fn get_dir_len(path_ptr as *u8, path_len as i32) as i32 {
+    let is i32 as i with mut = path_len - 1;
+    while (i >= 0) {
+        if (path_ptr[i] == 47) { return i; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Resolve path relative to a directory: dir + "/" + path
+fn resolve_path(dir_ptr as *u8, dir_len as i32, path_ptr as *u8, path_len as i32, out_len as *i32) as *u8 {
+    if (dir_len == 0) {
+        // No directory, just use path as-is
+        *out_len = path_len;
+        return d.str_dup(path_ptr, path_len);
+    }
+    // Allocate: dir + "/" + path + null
+    let is i32 as total = dir_len + 1 + path_len;
+    let is *u8 as buf = mem.galloc(cast(i64, total) + 1);
+    mem.memcpy(buf, dir_ptr, cast(i64, dir_len));
+    buf[dir_len] = cast(u8, 47);
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, dir_len) + 1), path_ptr, cast(i64, path_len));
+    buf[total] = cast(u8, 0);
+    *out_len = total;
+    return buf;
+}

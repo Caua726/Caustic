@@ -1,0 +1,563 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "types.cst" as ty;
+use "../io.cst" as io;
+use "../parser/ast.cst" as ast;
+
+// === Global state ===
+let is *d.GenericTemplate as generic_templates with mut;
+let is *d.GenericInstance as generic_instances with mut;
+let is *ast.Node as ast_tail with mut;
+
+fn generics_init() as void {
+    generic_templates = cast(*d.GenericTemplate, 0);
+    generic_instances = cast(*d.GenericInstance, 0);
+    ast_tail = cast(*ast.Node, 0);
+}
+
+// === Template storage ===
+
+fn store_template(name_ptr as *u8, name_len as i32, params as *u8, count as i32, node as *u8, struct_type as *u8, is_fn as i32) as void {
+    let is *d.GenericTemplate as t = d.new_generic_template();
+    t.name_ptr = d.str_dup(name_ptr, name_len);
+    t.name_len = name_len;
+    // Clone generic params
+    t.params = ast.gp_alloc(count);
+    t.param_count = count;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        ast.gp_set(t.params, i, ast.gp_ptr(params, i), ast.gp_len(params, i));
+        i = i + 1;
+    }
+    t.ast = node;
+    t.struct_type = struct_type;
+    t.is_function = is_fn;
+    if (sc.current_mod_prefix_len > 0) {
+        t.mod_prefix_ptr = d.str_dup(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len);
+        t.mod_prefix_len = sc.current_mod_prefix_len;
+    }
+    t.next = generic_templates;
+    generic_templates = t;
+}
+
+fn lookup_template(name_ptr as *u8, name_len as i32) as *d.GenericTemplate {
+    let is *d.GenericTemplate as t with mut = generic_templates;
+    while (cast(i64, t) != 0) {
+        if (d.str_eq(t.name_ptr, t.name_len, name_ptr, name_len) == 1) {
+            return t;
+        }
+        t = t.next;
+    }
+    return cast(*d.GenericTemplate, 0);
+}
+
+fn is_instantiated(name_ptr as *u8, name_len as i32) as i32 {
+    let is *d.GenericInstance as i with mut = generic_instances;
+    while (cast(i64, i) != 0) {
+        if (d.str_eq(i.name_ptr, i.name_len, name_ptr, name_len) == 1) {
+            return 1;
+        }
+        i = i.next;
+    }
+    return 0;
+}
+
+fn mark_instantiated(name_ptr as *u8, name_len as i32) as void {
+    let is *d.GenericInstance as i = d.new_generic_instance();
+    i.name_ptr = d.str_dup(name_ptr, name_len);
+    i.name_len = name_len;
+    i.next = generic_instances;
+    generic_instances = i;
+}
+
+// === Name mangling ===
+
+fn mangle_generic(base_ptr as *u8, base_len as i32, concrete_args as *u8, count as i32) as *u8 {
+    // Build "base_type1_type2_..."
+    let is [512]u8 as buf;
+    mem.memcpy(&buf, base_ptr, cast(i64, base_len));
+    let is i32 as pos with mut = base_len;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        buf[pos] = cast(u8, 95); // '_'
+        pos = pos + 1;
+        let is *ast.Type as ct = ast.ga_get(concrete_args, i);
+        let is *u8 as tname = ty.type_name_str(cast(*u8, ct));
+        let is i32 as tlen = str_len(tname);
+        mem.memcpy(cast(*u8, cast(i64, &buf) + cast(i64, pos)), tname, cast(i64, tlen));
+        pos = pos + tlen;
+        i = i + 1;
+    }
+    buf[pos] = cast(u8, 0);
+    return d.str_dup(&buf, pos);
+}
+
+fn mangle_generic_len(base_ptr as *u8, base_len as i32, concrete_args as *u8, count as i32) as i32 {
+    let is *u8 as m = mangle_generic(base_ptr, base_len, concrete_args, count);
+    return str_len(m);
+}
+
+fn str_len(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+// === Type cloning ===
+
+fn clone_type_deep(ty_ptr as *u8) as *u8 {
+    if (cast(i64, ty_ptr) == 0) { return cast(*u8, 0); }
+    let is *ast.Type as t = cast(*ast.Type, ty_ptr);
+
+    // Don't clone primitive singletons
+    if (is_singleton(t) == 1) { return ty_ptr; }
+
+    let is *ast.Type as c = ast.new_type(t.kind);
+    c.size = t.size;
+    c.array_len = t.array_len;
+    c.variant_count = t.variant_count;
+    c.payload_offset = t.payload_offset;
+    c.max_payload = t.max_payload;
+
+    if (t.name_len > 0) {
+        c.name_ptr = d.str_dup(t.name_ptr, t.name_len);
+        c.name_len = t.name_len;
+    }
+    if (t.base_name_len > 0) {
+        c.base_name_ptr = d.str_dup(t.base_name_ptr, t.base_name_len);
+        c.base_name_len = t.base_name_len;
+    }
+
+    c.base = cast(*ast.Type, clone_type_deep(cast(*u8, t.base)));
+
+    // Clone fields (linked list of *Node)
+    if (cast(i64, t.fields) != 0) {
+        c.fields = cast(*u8, clone_node_list(cast(*ast.Node, t.fields)));
+    }
+
+    // Clone generic params
+    if (t.gen_param_count > 0) {
+        c.gen_params = ast.gp_alloc(t.gen_param_count);
+        c.gen_param_count = t.gen_param_count;
+        let is i32 as i with mut = 0;
+        while (i < t.gen_param_count) {
+            ast.gp_set(c.gen_params, i, ast.gp_ptr(t.gen_params, i), ast.gp_len(t.gen_params, i));
+            i = i + 1;
+        }
+    }
+
+    // Clone generic args (share concrete types)
+    if (t.gen_arg_count > 0) {
+        c.gen_args = ast.ga_alloc(t.gen_arg_count);
+        c.gen_arg_count = t.gen_arg_count;
+        let is i32 as i with mut = 0;
+        while (i < t.gen_arg_count) {
+            ast.ga_set(c.gen_args, i, ast.ga_get(t.gen_args, i));
+            i = i + 1;
+        }
+    }
+
+    return cast(*u8, c);
+}
+
+fn is_singleton(t as *ast.Type) as i32 {
+    let is i64 as p = cast(i64, t);
+    if (p == cast(i64, ast.type_void)) { return 1; }
+    if (p == cast(i64, ast.type_i8)) { return 1; }
+    if (p == cast(i64, ast.type_i16)) { return 1; }
+    if (p == cast(i64, ast.type_i32)) { return 1; }
+    if (p == cast(i64, ast.type_i64)) { return 1; }
+    if (p == cast(i64, ast.type_u8)) { return 1; }
+    if (p == cast(i64, ast.type_u16)) { return 1; }
+    if (p == cast(i64, ast.type_u32)) { return 1; }
+    if (p == cast(i64, ast.type_u64)) { return 1; }
+    if (p == cast(i64, ast.type_f32)) { return 1; }
+    if (p == cast(i64, ast.type_f64)) { return 1; }
+    if (p == cast(i64, ast.type_bool)) { return 1; }
+    if (p == cast(i64, ast.type_char)) { return 1; }
+    if (p == cast(i64, ast.type_string)) { return 1; }
+    return 0;
+}
+
+// === Node cloning ===
+
+fn clone_node_deep(n as *ast.Node) as *ast.Node {
+    if (cast(i64, n) == 0) { return cast(*ast.Node, 0); }
+    let is *ast.Node as c = cast(*ast.Node, mem.galloc(sizeof(ast.Node)));
+    mem.memcpy(cast(*u8, c), cast(*u8, n), sizeof(ast.Node));
+    c.next = cast(*ast.Node, 0);
+    // Clear semantic fields
+    c.var_offset = 0;
+    c.is_global = 0;
+    c.asm_name_ptr = cast(*u8, 0);
+    c.asm_name_len = 0;
+
+    // Deep clone types (non-singleton)
+    if (cast(i64, c.ty) != 0 && is_singleton(c.ty) == 0) {
+        c.ty = cast(*ast.Type, clone_type_deep(cast(*u8, c.ty)));
+    }
+    if (cast(i64, c.return_type) != 0 && is_singleton(c.return_type) == 0) {
+        c.return_type = cast(*ast.Type, clone_type_deep(cast(*u8, c.return_type)));
+    }
+
+    // Clone generic params on node
+    if (c.generic_param_count > 0) {
+        let is *u8 as gp = ast.gp_alloc(c.generic_param_count);
+        let is i32 as i with mut = 0;
+        while (i < c.generic_param_count) {
+            ast.gp_set(gp, i, ast.gp_ptr(n.generic_params, i), ast.gp_len(n.generic_params, i));
+            i = i + 1;
+        }
+        c.generic_params = gp;
+    }
+    // Clone generic args on node (share types)
+    if (c.generic_arg_count > 0) {
+        let is *u8 as ga = ast.ga_alloc(c.generic_arg_count);
+        let is i32 as i with mut = 0;
+        while (i < c.generic_arg_count) {
+            ast.ga_set(ga, i, ast.ga_get(n.generic_args, i));
+            i = i + 1;
+        }
+        c.generic_args = ga;
+    }
+
+    // Deep clone children by kind
+    let is i32 as k = n.kind;
+    if (k == ast.NK_FN) {
+        c.params = clone_node_list(n.params);
+        c.body = clone_node_deep(n.body);
+    } else if (k == ast.NK_BLOCK) {
+        c.stmts = clone_node_list(n.stmts);
+    } else if (k == ast.NK_RETURN || k == ast.NK_EXPR_STMT || k == ast.NK_CAST || k == ast.NK_ADDR || k == ast.NK_DEREF || k == ast.NK_NEG || k == ast.NK_BNOT || k == ast.NK_LNOT || k == ast.NK_DEFER) {
+        c.expr = clone_node_deep(n.expr);
+    } else if (k == ast.NK_LET) {
+        c.init_expr = clone_node_deep(n.init_expr);
+    } else if (k == ast.NK_FNCALL || k == ast.NK_SYSCALL) {
+        c.lhs = clone_node_deep(n.lhs);
+        c.args = clone_node_list(n.args);
+    } else if (k == ast.NK_IF) {
+        c.cond = clone_node_deep(n.cond);
+        c.then_b = clone_node_deep(n.then_b);
+        c.else_b = clone_node_deep(n.else_b);
+    } else if (k == ast.NK_WHILE) {
+        c.cond = clone_node_deep(n.cond);
+        c.else_b = clone_node_deep(n.else_b);
+    } else if (k == ast.NK_DO_WHILE) {
+        c.cond = clone_node_deep(n.cond);
+        c.else_b = clone_node_deep(n.else_b);
+    } else if (k == ast.NK_FOR) {
+        c.for_init = clone_node_deep(n.for_init);
+        c.cond = clone_node_deep(n.cond);
+        c.for_step = clone_node_deep(n.for_step);
+        c.else_b = clone_node_deep(n.else_b);
+    } else if (k == ast.NK_ASSIGN || k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV || k == ast.NK_MOD || k == ast.NK_EQ || k == ast.NK_NE || k == ast.NK_LT || k == ast.NK_LE || k == ast.NK_GT || k == ast.NK_GE || k == ast.NK_INDEX || k == ast.NK_LAND || k == ast.NK_LOR || k == ast.NK_SHL || k == ast.NK_SHR || k == ast.NK_BAND || k == ast.NK_BOR || k == ast.NK_BXOR || k == ast.NK_MEMBER) {
+        c.lhs = clone_node_deep(n.lhs);
+        c.rhs = clone_node_deep(n.rhs);
+    } else if (k == ast.NK_ENUM_LIT) {
+        c.payload_args = clone_node_list(n.payload_args);
+    } else if (k == ast.NK_MATCH) {
+        c.expr = clone_node_deep(n.expr);
+        c.match_type = cast(*ast.Type, clone_type_deep(cast(*u8, n.match_type)));
+        c.cases = clone_node_list(n.cases);
+        c.else_b = clone_node_deep(n.else_b);
+    } else if (k == ast.NK_USE) {
+        // Share module body
+    }
+    // NUM, IDENT, STRING, ASM, BREAK, CONTINUE, SIZEOF: no deep children
+
+    return c;
+}
+
+fn clone_node_list(n as *ast.Node) as *ast.Node {
+    if (cast(i64, n) == 0) { return cast(*ast.Node, 0); }
+    let is *ast.Node as head = clone_node_deep(n);
+    let is *ast.Node as cur with mut = head;
+    let is *ast.Node as src with mut = n.next;
+    while (cast(i64, src) != 0) {
+        cur.next = clone_node_deep(src);
+        cur = cur.next;
+        src = src.next;
+    }
+    return head;
+}
+
+// === Type substitution ===
+
+fn find_generic_sub(ty as *ast.Type, param_buf as *u8, concrete_args as *u8, count as i32) as *ast.Type {
+    if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
+        let is i32 as i with mut = 0;
+        while (i < count) {
+            if (d.str_eq(ty.name_ptr, ty.name_len, ast.gp_ptr(param_buf, i), ast.gp_len(param_buf, i)) == 1) {
+                return ast.ga_get(concrete_args, i);
+            }
+            i = i + 1;
+        }
+    }
+    return cast(*ast.Type, 0);
+}
+
+fn substitute_type(ty_ptr as *u8, param_buf as *u8, concrete_args as *u8, count as i32) as void {
+    if (cast(i64, ty_ptr) == 0) { return; }
+    let is *ast.Type as t = cast(*ast.Type, ty_ptr);
+
+    // Check if type IS a generic param
+    if (t.kind == ast.TY_STRUCT && cast(i64, t.fields) == 0 && t.name_len > 0) {
+        let is i32 as i with mut = 0;
+        while (i < count) {
+            if (d.str_eq(t.name_ptr, t.name_len, ast.gp_ptr(param_buf, i), ast.gp_len(param_buf, i)) == 1) {
+                let is *ast.Type as concrete = ast.ga_get(concrete_args, i);
+                t.kind = concrete.kind;
+                t.size = concrete.size;
+                if (concrete.name_len > 0) {
+                    t.name_ptr = d.str_dup(concrete.name_ptr, concrete.name_len);
+                    t.name_len = concrete.name_len;
+                } else {
+                    t.name_ptr = cast(*u8, 0);
+                    t.name_len = 0;
+                }
+                t.base = concrete.base;
+                t.fields = concrete.fields;
+                t.array_len = concrete.array_len;
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Recurse into base
+    if (cast(i64, t.base) != 0) {
+        substitute_type(cast(*u8, t.base), param_buf, concrete_args, count);
+    }
+
+    // Substitute generic args and re-mangle name
+    if (t.gen_arg_count > 0 && t.base_name_len > 0) {
+        let is i32 as gi with mut = 0;
+        while (gi < t.gen_arg_count) {
+            let is *ast.Type as arg = ast.ga_get(t.gen_args, gi);
+            let is *ast.Type as sub = find_generic_sub(arg, param_buf, concrete_args, count);
+            if (cast(i64, sub) != 0) {
+                ast.ga_set(t.gen_args, gi, sub);
+            } else {
+                substitute_type(cast(*u8, arg), param_buf, concrete_args, count);
+            }
+            gi = gi + 1;
+        }
+        // Re-mangle name
+        let is *u8 as new_name = mangle_generic(t.base_name_ptr, t.base_name_len, t.gen_args, t.gen_arg_count);
+        let is i32 as new_len = str_len(new_name);
+        t.name_ptr = new_name;
+        t.name_len = new_len;
+    }
+
+    // Recurse into struct fields
+    if (cast(i64, t.fields) != 0 && t.kind == ast.TY_STRUCT) {
+        let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, f) != 0) {
+            if (cast(i64, f.ty) != 0) {
+                let is *ast.Type as sub = find_generic_sub(f.ty, param_buf, concrete_args, count);
+                if (cast(i64, sub) != 0) {
+                    f.ty = sub;
+                } else {
+                    substitute_type(cast(*u8, f.ty), param_buf, concrete_args, count);
+                }
+            }
+            f = f.next;
+        }
+    }
+}
+
+fn substitute_in_node(node as *ast.Node, param_buf as *u8, concrete_args as *u8, count as i32) as void {
+    if (cast(i64, node) == 0) { return; }
+
+    // Substitute in node's type
+    if (cast(i64, node.ty) != 0) {
+        let is *ast.Type as sub = find_generic_sub(node.ty, param_buf, concrete_args, count);
+        if (cast(i64, sub) != 0) {
+            node.ty = sub;
+        } else if (is_singleton(node.ty) == 0) {
+            substitute_type(cast(*u8, node.ty), param_buf, concrete_args, count);
+        }
+    }
+    if (cast(i64, node.return_type) != 0) {
+        let is *ast.Type as sub = find_generic_sub(node.return_type, param_buf, concrete_args, count);
+        if (cast(i64, sub) != 0) {
+            node.return_type = sub;
+        } else if (is_singleton(node.return_type) == 0) {
+            substitute_type(cast(*u8, node.return_type), param_buf, concrete_args, count);
+        }
+    }
+
+    // Recurse into children
+    let is i32 as k = node.kind;
+    if (k == ast.NK_FN) {
+        let is *ast.Node as p with mut = node.params;
+        while (cast(i64, p) != 0) { substitute_in_node(p, param_buf, concrete_args, count); p = p.next; }
+        substitute_in_node(node.body, param_buf, concrete_args, count);
+    } else if (k == ast.NK_BLOCK) {
+        let is *ast.Node as s with mut = node.stmts;
+        while (cast(i64, s) != 0) { substitute_in_node(s, param_buf, concrete_args, count); s = s.next; }
+    } else if (k == ast.NK_RETURN || k == ast.NK_EXPR_STMT || k == ast.NK_CAST || k == ast.NK_ADDR || k == ast.NK_DEREF || k == ast.NK_NEG || k == ast.NK_BNOT || k == ast.NK_LNOT || k == ast.NK_DEFER) {
+        substitute_in_node(node.expr, param_buf, concrete_args, count);
+    } else if (k == ast.NK_LET) {
+        substitute_in_node(node.init_expr, param_buf, concrete_args, count);
+    } else if (k == ast.NK_FNCALL || k == ast.NK_SYSCALL) {
+        // Handle nested generic calls
+        if (node.generic_arg_count > 0 && node.member_len > 0) {
+            let is i32 as gi with mut = 0;
+            while (gi < node.generic_arg_count) {
+                let is *ast.Type as arg = ast.ga_get(node.generic_args, gi);
+                let is *ast.Type as sub = find_generic_sub(arg, param_buf, concrete_args, count);
+                if (cast(i64, sub) != 0) { ast.ga_set(node.generic_args, gi, sub); }
+                gi = gi + 1;
+            }
+            // Rebuild mangled name
+            let is *u8 as new_name = mangle_generic(node.member_ptr, node.member_len, node.generic_args, node.generic_arg_count);
+            let is i32 as new_len = str_len(new_name);
+            if (cast(i64, node.lhs) != 0) {
+                node.lhs.name_ptr = new_name;
+                node.lhs.name_len = new_len;
+            }
+        }
+        substitute_in_node(node.lhs, param_buf, concrete_args, count);
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { substitute_in_node(a, param_buf, concrete_args, count); a = a.next; }
+    } else if (k == ast.NK_IF) {
+        substitute_in_node(node.cond, param_buf, concrete_args, count);
+        substitute_in_node(node.then_b, param_buf, concrete_args, count);
+        substitute_in_node(node.else_b, param_buf, concrete_args, count);
+    } else if (k == ast.NK_WHILE || k == ast.NK_DO_WHILE) {
+        substitute_in_node(node.cond, param_buf, concrete_args, count);
+        substitute_in_node(node.else_b, param_buf, concrete_args, count);
+    } else if (k == ast.NK_FOR) {
+        substitute_in_node(node.for_init, param_buf, concrete_args, count);
+        substitute_in_node(node.cond, param_buf, concrete_args, count);
+        substitute_in_node(node.for_step, param_buf, concrete_args, count);
+        substitute_in_node(node.else_b, param_buf, concrete_args, count);
+    } else if (k == ast.NK_ASSIGN || k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV || k == ast.NK_MOD || k == ast.NK_EQ || k == ast.NK_NE || k == ast.NK_LT || k == ast.NK_LE || k == ast.NK_GT || k == ast.NK_GE || k == ast.NK_INDEX || k == ast.NK_LAND || k == ast.NK_LOR || k == ast.NK_SHL || k == ast.NK_SHR || k == ast.NK_BAND || k == ast.NK_BOR || k == ast.NK_BXOR || k == ast.NK_MEMBER) {
+        substitute_in_node(node.lhs, param_buf, concrete_args, count);
+        substitute_in_node(node.rhs, param_buf, concrete_args, count);
+    } else if (k == ast.NK_ENUM_LIT) {
+        let is *ast.Node as a with mut = node.payload_args;
+        while (cast(i64, a) != 0) { substitute_in_node(a, param_buf, concrete_args, count); a = a.next; }
+    } else if (k == ast.NK_MATCH) {
+        substitute_in_node(node.expr, param_buf, concrete_args, count);
+        if (cast(i64, node.match_type) != 0) {
+            let is *ast.Type as sub = find_generic_sub(node.match_type, param_buf, concrete_args, count);
+            if (cast(i64, sub) != 0) { node.match_type = sub; }
+            else if (is_singleton(node.match_type) == 0) {
+                substitute_type(cast(*u8, node.match_type), param_buf, concrete_args, count);
+            }
+        }
+        let is *ast.Node as cs with mut = node.cases;
+        while (cast(i64, cs) != 0) {
+            let is *ast.Node as pb with mut = cs.params;
+            while (cast(i64, pb) != 0) { substitute_in_node(pb, param_buf, concrete_args, count); pb = pb.next; }
+            substitute_in_node(cs.body, param_buf, concrete_args, count);
+            cs = cs.next;
+        }
+        substitute_in_node(node.else_b, param_buf, concrete_args, count);
+    }
+}
+
+// === Instantiation ===
+// Returns the cloned fn node. Caller (walk.cst) must call walk() on it.
+
+fn instantiate_fn(tmpl as *d.GenericTemplate, concrete_args as *u8, count as i32, mangled_ptr as *u8, mangled_len as i32) as *ast.Node {
+    if (is_instantiated(mangled_ptr, mangled_len) == 1) { return cast(*ast.Node, 0); }
+    mark_instantiated(mangled_ptr, mangled_len);
+
+    // Clone template AST
+    let is *ast.Node as fn_clone = clone_node_deep(cast(*ast.Node, tmpl.ast));
+
+    // Substitute type params
+    substitute_in_node(fn_clone, tmpl.params, concrete_args, count);
+
+    // Rename function
+    fn_clone.name_ptr = d.str_dup(mangled_ptr, mangled_len);
+    fn_clone.name_len = mangled_len;
+
+    // Clear generic params
+    fn_clone.generic_params = cast(*u8, 0);
+    fn_clone.generic_param_count = 0;
+
+    // Register function
+    let is i32 as param_count with mut = 0;
+    let is *ast.Node as p with mut = fn_clone.params;
+    while (cast(i64, p) != 0) {
+        ty.resolve_type_ref(cast(*u8, p.ty));
+        param_count = param_count + 1;
+        p = p.next;
+    }
+    ty.resolve_type_ref(cast(*u8, fn_clone.return_type));
+
+    let is *u8 as pt = d.pt_alloc(param_count);
+    let is i32 as i with mut = 0;
+    p = fn_clone.params;
+    while (cast(i64, p) != 0) {
+        d.pt_set(pt, i, cast(*u8, p.ty));
+        i = i + 1;
+        p = p.next;
+    }
+    sc.declare_fn(mangled_ptr, mangled_len, cast(*u8, fn_clone.return_type), pt, param_count, fn_clone.is_variadic, 0);
+
+    // Append to AST tail for IR generation
+    if (cast(i64, ast_tail) != 0) {
+        ast_tail.next = fn_clone;
+        ast_tail = fn_clone;
+    }
+
+    return fn_clone;
+}
+
+fn instantiate_struct(tmpl as *d.GenericTemplate, concrete_args as *u8, count as i32, mangled_ptr as *u8, mangled_len as i32) as void {
+    if (is_instantiated(mangled_ptr, mangled_len) == 1) { return; }
+    mark_instantiated(mangled_ptr, mangled_len);
+
+    // Clone struct type
+    let is *u8 as new_ty = clone_type_deep(tmpl.struct_type);
+    let is *ast.Type as nt = cast(*ast.Type, new_ty);
+
+    // Substitute type params in fields
+    let is *ast.Node as f with mut = cast(*ast.Node, nt.fields);
+    while (cast(i64, f) != 0) {
+        if (cast(i64, f.ty) != 0) {
+            let is *ast.Type as sub = find_generic_sub(f.ty, tmpl.params, concrete_args, count);
+            if (cast(i64, sub) != 0) {
+                f.ty = sub;
+            } else {
+                substitute_type(cast(*u8, f.ty), tmpl.params, concrete_args, count);
+            }
+        }
+        f = f.next;
+    }
+
+    // Rename
+    nt.name_ptr = d.str_dup(mangled_ptr, mangled_len);
+    nt.name_len = mangled_len;
+
+    // Clear generic params
+    nt.gen_params = cast(*u8, 0);
+    nt.gen_param_count = 0;
+
+    // Resolve field types and calc offsets
+    f = cast(*ast.Node, nt.fields);
+    let is i32 as foffset with mut = 0;
+    while (cast(i64, f) != 0) {
+        if (cast(i64, f.ty) != 0) {
+            ty.resolve_type_ref(cast(*u8, f.ty));
+            f.var_offset = foffset;
+            foffset = foffset + f.ty.size;
+        }
+        f = f.next;
+    }
+    nt.size = foffset;
+
+    // Register
+    if (nt.kind == ast.TY_ENUM) {
+        ty.declare_enum(mangled_ptr, mangled_len, new_ty);
+    } else {
+        ty.declare_struct(mangled_ptr, mangled_len, new_ty);
+    }
+}

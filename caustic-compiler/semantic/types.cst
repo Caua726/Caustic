@@ -1,0 +1,304 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "../io.cst" as io;
+use "../parser/ast.cst" as ast;
+
+// === Global state ===
+let is *d.StructDef as struct_defs with mut;
+let is *d.EnumDef as enum_defs with mut;
+
+// Forward declaration (implemented in generics.cst, called from resolve_type_ref)
+// We'll use function pointers set at init time.
+let is *u8 as fn_instantiate_struct with mut;
+let is *u8 as fn_lookup_template with mut;
+
+fn types_init() as void {
+    struct_defs = cast(*d.StructDef, 0);
+    enum_defs = cast(*d.EnumDef, 0);
+    fn_instantiate_struct = cast(*u8, 0);
+    fn_lookup_template = cast(*u8, 0);
+}
+
+// === Struct/Enum lookup ===
+
+fn lookup_struct(name_ptr as *u8, name_len as i32) as *u8 {
+    let is *d.StructDef as s with mut = struct_defs;
+    while (cast(i64, s) != 0) {
+        if (d.str_eq(s.name_ptr, s.name_len, name_ptr, name_len) == 1) {
+            return s.ty;
+        }
+        s = s.next;
+    }
+    return cast(*u8, 0);
+}
+
+fn lookup_enum(name_ptr as *u8, name_len as i32) as *u8 {
+    let is *d.EnumDef as e with mut = enum_defs;
+    while (cast(i64, e) != 0) {
+        if (d.str_eq(e.name_ptr, e.name_len, name_ptr, name_len) == 1) {
+            return e.ty;
+        }
+        e = e.next;
+    }
+    return cast(*u8, 0);
+}
+
+// === Struct/Enum registration ===
+
+fn declare_struct(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    // Check duplicate
+    let is *d.StructDef as s with mut = struct_defs;
+    while (cast(i64, s) != 0) {
+        if (d.str_eq(s.name_ptr, s.name_len, name_ptr, name_len) == 1) { return; }
+        s = s.next;
+    }
+    let is *d.StructDef as ns = d.new_struct_def();
+    ns.name_ptr = d.str_dup(name_ptr, name_len);
+    ns.name_len = name_len;
+    ns.ty = ty;
+    ns.next = struct_defs;
+    struct_defs = ns;
+}
+
+fn declare_enum(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    let is *d.EnumDef as e with mut = enum_defs;
+    while (cast(i64, e) != 0) {
+        if (d.str_eq(e.name_ptr, e.name_len, name_ptr, name_len) == 1) { return; }
+        e = e.next;
+    }
+    let is *d.EnumDef as ne = d.new_enum_def();
+    ne.name_ptr = d.str_dup(name_ptr, name_len);
+    ne.name_len = name_len;
+    ne.ty = ty;
+    ne.next = enum_defs;
+    enum_defs = ne;
+
+    // Calculate enum layout
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i32 as has_payload with mut = 0;
+    let is i32 as max_payload with mut = 0;
+    let is i32 as vcount with mut = 0;
+    let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+    while (cast(i64, f) != 0) {
+        vcount = vcount + 1;
+        if (cast(i64, f.ty) != 0) {
+            has_payload = 1;
+            let is *ast.Type as ft = f.ty;
+            // Resolve variant payload type
+            if (ft.kind == ast.TY_STRUCT && cast(i64, ft.fields) != 0) {
+                // Anonymous struct payload — resolve each field
+                let is *ast.Node as pf with mut = cast(*ast.Node, ft.fields);
+                while (cast(i64, pf) != 0) {
+                    resolve_type_ref(cast(*u8, pf.ty));
+                    pf = pf.next;
+                }
+            } else {
+                resolve_type_ref(cast(*u8, ft));
+            }
+            if (ft.size > max_payload) { max_payload = ft.size; }
+        }
+        f = f.next;
+    }
+
+    t.variant_count = vcount;
+    if (has_payload == 1) {
+        t.payload_offset = 8;
+        t.max_payload = max_payload;
+        t.size = 8 + max_payload;
+    } else {
+        t.payload_offset = 0;
+        t.max_payload = 0;
+        t.size = 4;
+    }
+}
+
+// === Resolve type reference ===
+
+fn resolve_type_ref(ty_ptr as *u8) as void {
+    if (cast(i64, ty_ptr) == 0) { return; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+
+    // Resolve struct/enum name references
+    if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
+        let is *u8 as def with mut = lookup_struct(ty.name_ptr, ty.name_len);
+
+        // 1. Try mangled name (internal reference)
+        if (cast(i64, def) == 0 && sc.current_mod_prefix_len > 0) {
+            let is i32 as mlen with mut = 0;
+            let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &mlen);
+            def = lookup_struct(mangled, mlen);
+            if (cast(i64, def) == 0) {
+                mem.gfree(mangled);
+            }
+        }
+
+        // 2. Try alias.Type (external reference with dot)
+        if (cast(i64, def) == 0) {
+            let is i32 as dot_pos with mut = find_dot(ty.name_ptr, ty.name_len);
+            if (dot_pos >= 0) {
+                let is *u8 as alias_ptr = ty.name_ptr;
+                let is i32 as alias_len = dot_pos;
+                let is *u8 as tname_ptr = cast(*u8, cast(i64, ty.name_ptr) + cast(i64, dot_pos) + 1);
+                let is i32 as tname_len = ty.name_len - dot_pos - 1;
+                let is *d.Variable as var = sc.lookup_var(alias_ptr, alias_len);
+                if (cast(i64, var) != 0 && var.is_module == 1 && cast(i64, var.module_ref) != 0) {
+                    let is *d.Module as modd = cast(*d.Module, var.module_ref);
+                    let is i32 as mlen with mut = 0;
+                    let is *u8 as mangled = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tname_ptr, tname_len, &mlen);
+                    def = lookup_struct(mangled, mlen);
+                    if (cast(i64, def) == 0) {
+                        mem.gfree(mangled);
+                    }
+                }
+            }
+        }
+
+        // 3. Try generic instantiation
+        if (cast(i64, def) == 0 && ty.gen_arg_count > 0 && ty.base_name_len > 0) {
+            // Generic struct instantiation handled in walk.cst via callback
+            // For now, just try lookup with the mangled name as-is
+        }
+
+        if (cast(i64, def) == 0) {
+            // Try enum lookup
+            let is *u8 as edef with mut = lookup_enum(ty.name_ptr, ty.name_len);
+            if (cast(i64, edef) == 0 && sc.current_mod_prefix_len > 0) {
+                let is i32 as mlen with mut = 0;
+                let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &mlen);
+                edef = lookup_enum(mangled, mlen);
+                if (cast(i64, edef) == 0) { mem.gfree(mangled); }
+            }
+            if (cast(i64, edef) != 0) {
+                let is *ast.Type as et = cast(*ast.Type, edef);
+                ty.kind = ast.TY_ENUM;
+                ty.fields = et.fields;
+                ty.size = et.size;
+                ty.variant_count = et.variant_count;
+                ty.payload_offset = et.payload_offset;
+                ty.max_payload = et.max_payload;
+            } else {
+                io.write_str(linux.STDERR, "Erro: tipo nao definido: '");
+                io.write_n(linux.STDERR, ty.name_ptr, cast(i64, ty.name_len));
+                io.write_str(linux.STDERR, "'\n");
+                linux.exit(cast(i32, 1));
+            }
+        } else {
+            // Copy from struct def
+            let is *ast.Type as dt = cast(*ast.Type, def);
+            ty.fields = dt.fields;
+            ty.size = dt.size;
+        }
+    }
+
+    // Recurse into pointer/array base
+    if (ty.kind == ast.TY_PTR || ty.kind == ast.TY_ARRAY) {
+        if (cast(i64, ty.base) != 0) {
+            resolve_type_ref(cast(*u8, ty.base));
+        }
+    }
+}
+
+// === Type checking helpers ===
+
+fn is_integer_type(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i32 as k = t.kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    if (k == ast.TY_U8 || k == ast.TY_U16 || k == ast.TY_U32 || k == ast.TY_U64) { return 1; }
+    return 0;
+}
+
+fn is_float_type(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_F32 || t.kind == ast.TY_F64) { return 1; }
+    return 0;
+}
+
+fn is_numeric_type(ty as *u8) as i32 {
+    if (is_integer_type(ty) == 1) { return 1; }
+    if (is_float_type(ty) == 1) { return 1; }
+    return 0;
+}
+
+fn is_bool_or_int(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_BOOL) { return 1; }
+    return is_integer_type(ty);
+}
+
+fn is_signed_type(ty as *u8) as i32 {
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i32 as k = t.kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    if (k == ast.TY_F32 || k == ast.TY_F64) { return 1; }
+    if (k == ast.TY_CHAR) { return 1; }
+    return 0;
+}
+
+fn is_safe_conversion(from as *u8, to as *u8) as i32 {
+    if (cast(i64, from) == cast(i64, to)) { return 1; }
+    let is *ast.Type as f = cast(*ast.Type, from);
+    let is *ast.Type as t = cast(*ast.Type, to);
+    if (f.size > t.size) { return 0; }
+    if (is_signed_type(from) != is_signed_type(to)) { return 0; }
+    return 1;
+}
+
+fn pointer_to(ty as *u8) as *u8 {
+    let is *ast.Type as p = ast.new_type(ast.TY_PTR);
+    p.base = cast(*ast.Type, ty);
+    p.size = 8;
+    return cast(*u8, p);
+}
+
+// === Literal narrowing ===
+
+fn can_narrow_literal(val as i64, target as *u8) as i32 {
+    let is i64 as tv = cast(i64, target);
+    if (tv == cast(i64, ast.type_i8) && val >= 0 - 128 && val <= 127) { return 1; }
+    if (tv == cast(i64, ast.type_i16) && val >= 0 - 32768 && val <= 32767) { return 1; }
+    if (tv == cast(i64, ast.type_i32) && val >= 0 - 2147483648 && val <= 2147483647) { return 1; }
+    if (tv == cast(i64, ast.type_u8) && val >= 0 && val <= 255) { return 1; }
+    if (tv == cast(i64, ast.type_u16) && val >= 0 && val <= 65535) { return 1; }
+    if (tv == cast(i64, ast.type_u32) && val >= 0 && val <= 4294967295) { return 1; }
+    if (tv == cast(i64, ast.type_i64)) { return 1; }
+    if (tv == cast(i64, ast.type_u64) && val >= 0) { return 1; }
+    return 0;
+}
+
+// === Helpers ===
+
+fn find_dot(s as *u8, len as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < len) {
+        if (s[i] == 46) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0) - cast(i32, 1);
+}
+
+fn type_name_str(ty as *u8) as *u8 {
+    if (cast(i64, ty) == 0) { return "unknown"; }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_VOID) { return "void"; }
+    if (t.kind == ast.TY_I8) { return "i8"; }
+    if (t.kind == ast.TY_I16) { return "i16"; }
+    if (t.kind == ast.TY_I32) { return "i32"; }
+    if (t.kind == ast.TY_I64) { return "i64"; }
+    if (t.kind == ast.TY_U8) { return "u8"; }
+    if (t.kind == ast.TY_U16) { return "u16"; }
+    if (t.kind == ast.TY_U32) { return "u32"; }
+    if (t.kind == ast.TY_U64) { return "u64"; }
+    if (t.kind == ast.TY_F32) { return "f32"; }
+    if (t.kind == ast.TY_F64) { return "f64"; }
+    if (t.kind == ast.TY_BOOL) { return "bool"; }
+    if (t.kind == ast.TY_CHAR) { return "char"; }
+    if (t.kind == ast.TY_STRING) { return "string"; }
+    if (t.kind == ast.TY_PTR) { return "*ptr"; }
+    if (t.kind == ast.TY_ARRAY) { return "array"; }
+    if (t.kind == ast.TY_STRUCT && t.name_len > 0) { return t.name_ptr; }
+    if (t.kind == ast.TY_ENUM && t.name_len > 0) { return t.name_ptr; }
+    return "unknown";
+}
