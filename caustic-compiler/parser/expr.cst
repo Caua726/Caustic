@@ -4,6 +4,7 @@ use "../lexer/util.cst" as lu;
 use "ast.cst" as ast;
 use "util.cst" as pu;
 use "type.cst" as pt;
+
 fn new_bin(kind as i32, l as *ast.Node, r as *ast.Node) as *ast.Node {
     let is *ast.Node as n = ast.new_node(kind);
     n.tok_idx = l.tok_idx; n.lhs = l; n.rhs = r;
@@ -42,14 +43,17 @@ fn parse_generic_args(out_buf as **u8, out_count as *i32) as void {
 }
 
 fn parse_primary() as *ast.Node {
+    if (pu.p_panic_mode == 1) { return ast.new_node(ast.NK_NUM); }
     let is *tok.Token as t = pu.cur();
     let is i32 as tidx = pu.p_pos;
+
     if (t.kind == tok.TK_SIZEOF) {
         pu.advance(); pu.expect(tok.TK_LPAREN);
         let is *ast.Node as n = ast.new_node(ast.NK_SIZEOF);
         n.tok_idx = tidx; n.ty = pt.parse_type();
         pu.expect(tok.TK_RPAREN); return n;
     }
+
     if (t.kind == tok.TK_CAST) {
         pu.advance(); pu.expect(tok.TK_LPAREN);
         let is *ast.Node as n = ast.new_node(ast.NK_CAST);
@@ -57,6 +61,7 @@ fn parse_primary() as *ast.Node {
         pu.expect(tok.TK_COMMA); n.expr = parse_expr();
         pu.expect(tok.TK_RPAREN); return n;
     }
+
     if (t.kind == tok.TK_FN_PTR) {
         pu.advance(); pu.expect(tok.TK_LPAREN);
         let is *tok.Token as nt = pu.cur();
@@ -80,27 +85,35 @@ fn parse_primary() as *ast.Node {
         }
         pu.expect(tok.TK_RPAREN); return n;
     }
+
     if (t.kind == tok.TK_INTEGER) {
         let is *ast.Node as n = ast.new_node(ast.NK_NUM);
         n.tok_idx = tidx; n.val = t.int_val; n.ty = ast.type_i64;
         pu.advance(); return n;
     }
+
     if (t.kind == tok.TK_FLOAT) {
         let is *ast.Node as n = ast.new_node(ast.NK_NUM);
         n.tok_idx = tidx; n.ty = ast.type_f64;
         n.fval = lu.parse_float(pu.p_src, cast(i64, t.ptr - pu.p_src), cast(i64, t.ptr - pu.p_src) + cast(i64, t.len));
         pu.advance(); return n;
     }
+
     if (t.kind == tok.TK_CHAR) {
         let is *ast.Node as n = ast.new_node(ast.NK_NUM);
         n.tok_idx = tidx; n.val = t.int_val; n.ty = ast.type_char;
         pu.advance(); return n;
     }
+
     if (t.kind == tok.TK_STRING) {
         let is *ast.Node as n = ast.new_node(ast.NK_STRING);
-        n.tok_idx = tidx; n.name_ptr = t.ptr; n.name_len = t.len;
+        n.tok_idx = tidx;
+        let is i32 as slen with mut = 0;
+        n.name_ptr = pu.process_string(t.ptr, t.len, &slen);
+        n.name_len = slen;
         pu.advance(); return n;
     }
+
     if (t.kind == tok.TK_LPAREN) {
         if (pu.peek().kind == tok.TK_IDENT && pu.peek_n(2).kind == tok.TK_RPAREN) {
             let is *ast.Type as maybe = pt.try_primitive(pu.peek().ptr, pu.peek().len);
@@ -115,12 +128,14 @@ fn parse_primary() as *ast.Node {
         let is *ast.Node as e = parse_expr();
         pu.expect(tok.TK_RPAREN); return e;
     }
+
     if (t.kind == tok.TK_SYSCALL) {
         pu.advance(); pu.expect(tok.TK_LPAREN);
         let is *ast.Node as n = ast.new_node(ast.NK_SYSCALL);
         n.tok_idx = tidx; n.ty = ast.type_i64; n.args = parse_arg_list();
         pu.expect(tok.TK_RPAREN); return n;
     }
+
     if (t.kind == tok.TK_IDENT) {
         if (tok.streq_lit(t.ptr, t.len, "true") == 1) {
             let is *ast.Node as n = ast.new_node(ast.NK_NUM);
@@ -165,18 +180,24 @@ fn parse_primary() as *ast.Node {
         n.tok_idx = tidx; n.name_ptr = t.ptr; n.name_len = t.len;
         pu.advance(); return n;
     }
-    pu.error_tok("expected expression");
-    return cast(*ast.Node, 0);
+
+    pu.error_expected("expected expression");
+    return ast.new_node(ast.NK_NUM);
 }
+
 fn parse_postfix() as *ast.Node {
     let is *ast.Node as node with mut = parse_primary();
     while (1) {
+        if (pu.p_panic_mode == 1) { return node; }
+
         if (pu.cur().kind == tok.TK_LBRACKET) {
+            let is i32 as tidx = pu.p_pos;
             pu.advance();
             let is *ast.Node as idx = ast.new_node(ast.NK_INDEX);
-            idx.tok_idx = pu.p_pos; idx.lhs = node; idx.rhs = parse_expr();
+            idx.tok_idx = tidx; idx.lhs = node; idx.rhs = parse_expr();
             pu.expect(tok.TK_RBRACKET); node = idx;
         } else if (pu.cur().kind == tok.TK_DOT) {
+            let is i32 as tidx = pu.p_pos;
             pu.advance();
             if (node.kind == ast.NK_IDENT && pu.cur().kind == tok.TK_IDENT && pu.peek().kind == tok.TK_GEN) {
                 let is *tok.Token as ft = pu.cur();
@@ -195,7 +216,7 @@ fn parse_postfix() as *ast.Node {
                 node.member_ptr = full; node.member_len = fl;
             } else {
                 let is *ast.Node as mn = ast.new_node(ast.NK_MEMBER);
-                mn.tok_idx = pu.p_pos; mn.lhs = node;
+                mn.tok_idx = tidx; mn.lhs = node;
                 mn.member_ptr = pu.cur().ptr; mn.member_len = pu.cur().len;
                 pu.advance(); node = mn;
             }
@@ -212,11 +233,26 @@ fn parse_postfix() as *ast.Node {
 
 fn parse_unary() as *ast.Node {
     let is i32 as tidx = pu.p_pos;
-    if (pu.cur().kind == tok.TK_AND) { pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_ADDR); n.tok_idx = tidx; n.expr = parse_unary(); return n; }
-    if (pu.cur().kind == tok.TK_STAR) { pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_DEREF); n.tok_idx = tidx; n.expr = parse_unary(); return n; }
-    if (pu.cur().kind == tok.TK_MINUS) { pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_NEG); n.tok_idx = tidx; n.expr = parse_unary(); return n; }
-    if (pu.cur().kind == tok.TK_NOT) { pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_LNOT); n.tok_idx = tidx; n.expr = parse_unary(); return n; }
-    if (pu.cur().kind == tok.TK_BITNOT) { pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_BNOT); n.tok_idx = tidx; n.expr = parse_unary(); return n; }
+    if (pu.cur().kind == tok.TK_AND) {
+        pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_ADDR);
+        n.tok_idx = tidx; n.expr = parse_unary(); return n;
+    }
+    if (pu.cur().kind == tok.TK_STAR) {
+        pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_DEREF);
+        n.tok_idx = tidx; n.expr = parse_unary(); return n;
+    }
+    if (pu.cur().kind == tok.TK_MINUS) {
+        pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_NEG);
+        n.tok_idx = tidx; n.expr = parse_unary(); return n;
+    }
+    if (pu.cur().kind == tok.TK_NOT) {
+        pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_LNOT);
+        n.tok_idx = tidx; n.expr = parse_unary(); return n;
+    }
+    if (pu.cur().kind == tok.TK_BITNOT) {
+        pu.advance(); let is *ast.Node as n = ast.new_node(ast.NK_BNOT);
+        n.tok_idx = tidx; n.expr = parse_unary(); return n;
+    }
     return parse_postfix();
 }
 
@@ -229,6 +265,7 @@ fn parse_mul() as *ast.Node {
     }
     return n;
 }
+
 fn parse_add() as *ast.Node {
     let is *ast.Node as n with mut = parse_mul();
     while (pu.cur().kind == tok.TK_PLUS || pu.cur().kind == tok.TK_MINUS) {
@@ -237,6 +274,7 @@ fn parse_add() as *ast.Node {
     }
     return n;
 }
+
 fn parse_shift() as *ast.Node {
     let is *ast.Node as n with mut = parse_add();
     while (pu.cur().kind == tok.TK_SHL || pu.cur().kind == tok.TK_SHR) {
@@ -245,6 +283,7 @@ fn parse_shift() as *ast.Node {
     }
     return n;
 }
+
 fn parse_relational() as *ast.Node {
     let is *ast.Node as n with mut = parse_shift();
     while (pu.cur().kind == tok.TK_LT || pu.cur().kind == tok.TK_LE || pu.cur().kind == tok.TK_GT || pu.cur().kind == tok.TK_GE) {
@@ -255,6 +294,7 @@ fn parse_relational() as *ast.Node {
     }
     return n;
 }
+
 fn parse_equality() as *ast.Node {
     let is *ast.Node as n with mut = parse_relational();
     while (pu.cur().kind == tok.TK_EQEQ || pu.cur().kind == tok.TK_NE) {
@@ -263,32 +303,39 @@ fn parse_equality() as *ast.Node {
     }
     return n;
 }
+
 fn parse_bitwise_and() as *ast.Node {
     let is *ast.Node as n with mut = parse_equality();
     while (pu.cur().kind == tok.TK_AND) { pu.advance(); n = new_bin(ast.NK_BAND, n, parse_equality()); }
     return n;
 }
+
 fn parse_bitwise_xor() as *ast.Node {
     let is *ast.Node as n with mut = parse_bitwise_and();
     while (pu.cur().kind == tok.TK_XOR) { pu.advance(); n = new_bin(ast.NK_BXOR, n, parse_bitwise_and()); }
     return n;
 }
+
 fn parse_bitwise_or() as *ast.Node {
     let is *ast.Node as n with mut = parse_bitwise_xor();
     while (pu.cur().kind == tok.TK_OR) { pu.advance(); n = new_bin(ast.NK_BOR, n, parse_bitwise_xor()); }
     return n;
 }
+
 fn parse_logical_and() as *ast.Node {
     let is *ast.Node as n with mut = parse_bitwise_or();
     while (pu.cur().kind == tok.TK_AND_AND) { pu.advance(); n = new_bin(ast.NK_LAND, n, parse_bitwise_or()); }
     return n;
 }
+
 fn parse_logical_or() as *ast.Node {
     let is *ast.Node as n with mut = parse_logical_and();
     while (pu.cur().kind == tok.TK_OR_OR) { pu.advance(); n = new_bin(ast.NK_LOR, n, parse_logical_and()); }
     return n;
 }
+
 fn parse_expr() as *ast.Node {
+    if (pu.p_panic_mode == 1) { return ast.new_node(ast.NK_NUM); }
     let is *ast.Node as n = parse_logical_or();
     if (pu.cur().kind == tok.TK_EQ) {
         pu.advance();

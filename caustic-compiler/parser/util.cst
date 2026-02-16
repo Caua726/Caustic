@@ -2,6 +2,7 @@ use "../../std/linux.cst" as linux;
 use "../../std/mem.cst" as mem;
 use "../lexer/tokens.cst" as tok;
 use "../lexer/lexer.cst" as lex;
+use "../lexer/util.cst" as lu;
 use "ast.cst" as ast;
 
 let is *tok.TokenList as p_tl with mut;
@@ -10,33 +11,134 @@ let is *u8 as p_src with mut;
 let is i64 as p_src_len with mut;
 let is *u8 as p_filename with mut;
 let is i32 as p_in_params with mut;
+let is i32 as p_had_error with mut;
+let is i32 as p_panic_mode with mut;
 
 fn cur() as *tok.Token { return tok.tl_get(p_tl, p_pos); }
 fn peek() as *tok.Token { return tok.tl_get(p_tl, p_pos + 1); }
 fn peek_n(n as i32) as *tok.Token { return tok.tl_get(p_tl, p_pos + n); }
 fn advance() as void { p_pos = p_pos + 1; }
 
+fn tok_desc(t as *tok.Token) as *u8 {
+    if (t.kind == tok.TK_EOF)       { return "end of file"; }
+    if (t.kind == tok.TK_INTEGER)   { return "integer"; }
+    if (t.kind == tok.TK_FLOAT)     { return "float"; }
+    if (t.kind == tok.TK_STRING)    { return "string literal"; }
+    if (t.kind == tok.TK_CHAR)      { return "character"; }
+    if (t.kind == tok.TK_SEMICOLON) { return "';'"; }
+    if (t.kind == tok.TK_LPAREN)    { return "'('"; }
+    if (t.kind == tok.TK_RPAREN)    { return "')'"; }
+    if (t.kind == tok.TK_LBRACE)    { return "'{'"; }
+    if (t.kind == tok.TK_RBRACE)    { return "'}'"; }
+    if (t.kind == tok.TK_LBRACKET)  { return "'['"; }
+    if (t.kind == tok.TK_RBRACKET)  { return "']'"; }
+    if (t.kind == tok.TK_COMMA)     { return "','"; }
+    if (t.kind == tok.TK_DOT)       { return "'.'"; }
+    if (t.kind == tok.TK_EQ)        { return "'='"; }
+    if (t.kind == tok.TK_ASSIGN)    { return "':='"; }
+    if (t.kind == tok.TK_STAR)      { return "'*'"; }
+    if (t.kind == tok.TK_PLUS)      { return "'+'"; }
+    if (t.kind == tok.TK_MINUS)     { return "'-'"; }
+    if (t.kind == tok.TK_AND)       { return "'&'"; }
+    if (t.kind == tok.TK_FN)        { return "'fn'"; }
+    if (t.kind == tok.TK_LET)       { return "'let'"; }
+    if (t.kind == tok.TK_AS)        { return "'as'"; }
+    if (t.kind == tok.TK_IS)        { return "'is'"; }
+    if (t.kind == tok.TK_RETURN)    { return "'return'"; }
+    if (t.kind == tok.TK_IF)        { return "'if'"; }
+    if (t.kind == tok.TK_ELSE)      { return "'else'"; }
+    if (t.kind == tok.TK_WHILE)     { return "'while'"; }
+    if (t.kind == tok.TK_FOR)       { return "'for'"; }
+    if (t.kind == tok.TK_STRUCT)    { return "'struct'"; }
+    if (t.kind == tok.TK_ENUM)      { return "'enum'"; }
+    if (t.kind == tok.TK_IMPL)      { return "'impl'"; }
+    if (t.kind == tok.TK_USE)       { return "'use'"; }
+    if (t.kind == tok.TK_EXTERN)    { return "'extern'"; }
+    if (t.kind == tok.TK_GEN)       { return "'gen'"; }
+    if (t.kind == tok.TK_MATCH)     { return "'match'"; }
+    if (t.kind == tok.TK_CASE)      { return "'case'"; }
+    if (t.kind == tok.TK_PLUS_EQ)   { return "'+='"; }
+    if (t.kind == tok.TK_MINUS_EQ)  { return "'-='"; }
+    if (t.kind == tok.TK_STAR_EQ)   { return "'*='"; }
+    if (t.kind == tok.TK_SLASH_EQ)  { return "'/='"; }
+    if (t.kind == tok.TK_PERCENT_EQ) { return "'%='"; }
+    if (t.kind == tok.TK_SHL_EQ)    { return "'<<='"; }
+    if (t.kind == tok.TK_SHR_EQ)    { return "'>>='"; }
+    if (t.kind == tok.TK_AND_EQ)    { return "'&='"; }
+    if (t.kind == tok.TK_OR_EQ)     { return "'|='"; }
+    if (t.kind == tok.TK_XOR_EQ)    { return "'^='"; }
+    if (t.kind == tok.TK_IDENT && t.len > 0) { return str_dup(t.ptr, t.len); }
+    return "token";
+}
+
+// Build "expected X, found Y" message
+fn err_msg(expected as *u8, found as *u8) as *u8 {
+    let is i32 as elen with mut = 0;
+    while (expected[elen] != 0) { elen = elen + 1; }
+    let is i32 as flen with mut = 0;
+    while (found[flen] != 0) { flen = flen + 1; }
+    let is i32 as total = elen + 8 + flen;
+    let is *u8 as buf = mem.galloc(cast(i64, total) + 1);
+    mem.memcpy(buf, expected, cast(i64, elen));
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, elen)), ", found ", 8);
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, elen) + 8), found, cast(i64, flen));
+    buf[total] = cast(u8, 0);
+    return buf;
+}
+
 fn error_tok(msg as *u8) as void {
+    if (p_panic_mode == 1) { return; }
+    p_panic_mode = 1;
+    p_had_error = 1;
     let is *tok.Token as t = cur();
-    lex.error_at(p_src, p_src_len, p_filename, t.line, t.col, msg);
+    lex.error_at_report(p_src, p_src_len, p_filename, t.line, t.col, msg);
+}
+
+fn error_expected(expected as *u8) as void {
+    let is *u8 as msg = err_msg(expected, tok_desc(cur()));
+    error_tok(msg);
+}
+
+fn sync_stmt() as void {
+    p_panic_mode = 0;
+    while (cur().kind != tok.TK_EOF) {
+        if (cur().kind == tok.TK_SEMICOLON) { advance(); return; }
+        if (cur().kind == tok.TK_RBRACE) { return; }
+        advance();
+    }
+}
+
+fn sync_toplevel() as void {
+    p_panic_mode = 0;
+    while (cur().kind != tok.TK_EOF) {
+        if (cur().kind == tok.TK_FN) { return; }
+        if (cur().kind == tok.TK_STRUCT) { return; }
+        if (cur().kind == tok.TK_ENUM) { return; }
+        if (cur().kind == tok.TK_LET) { return; }
+        if (cur().kind == tok.TK_USE) { return; }
+        if (cur().kind == tok.TK_IMPL) { return; }
+        if (cur().kind == tok.TK_EXTERN) { return; }
+        advance();
+    }
 }
 
 fn expect(kind as i32) as void {
     if (cur().kind != kind) {
-        if (kind == tok.TK_SEMICOLON)  { error_tok("expected ';'"); }
-        else if (kind == tok.TK_LPAREN)   { error_tok("expected '('"); }
-        else if (kind == tok.TK_RPAREN)   { error_tok("expected ')'"); }
-        else if (kind == tok.TK_LBRACE)   { error_tok("expected '{'"); }
-        else if (kind == tok.TK_RBRACE)   { error_tok("expected '}'"); }
-        else if (kind == tok.TK_LBRACKET) { error_tok("expected '['"); }
-        else if (kind == tok.TK_RBRACKET) { error_tok("expected ']'"); }
-        else if (kind == tok.TK_COMMA)    { error_tok("expected ','"); }
-        else if (kind == tok.TK_AS)       { error_tok("expected 'as'"); }
-        else if (kind == tok.TK_IS)       { error_tok("expected 'is'"); }
-        else if (kind == tok.TK_LET)      { error_tok("expected 'let'"); }
-        else if (kind == tok.TK_FN)       { error_tok("expected 'fn'"); }
-        else if (kind == tok.TK_EQ)       { error_tok("expected '='"); }
-        else { error_tok("unexpected token"); }
+        if (kind == tok.TK_SEMICOLON)  { error_expected("expected ';'"); }
+        else if (kind == tok.TK_LPAREN)   { error_expected("expected '('"); }
+        else if (kind == tok.TK_RPAREN)   { error_expected("expected ')'"); }
+        else if (kind == tok.TK_LBRACE)   { error_expected("expected '{'"); }
+        else if (kind == tok.TK_RBRACE)   { error_expected("expected '}'"); }
+        else if (kind == tok.TK_LBRACKET) { error_expected("expected '['"); }
+        else if (kind == tok.TK_RBRACKET) { error_expected("expected ']'"); }
+        else if (kind == tok.TK_COMMA)    { error_expected("expected ','"); }
+        else if (kind == tok.TK_AS)       { error_expected("expected 'as'"); }
+        else if (kind == tok.TK_IS)       { error_expected("expected 'is'"); }
+        else if (kind == tok.TK_LET)      { error_expected("expected 'let'"); }
+        else if (kind == tok.TK_FN)       { error_expected("expected 'fn'"); }
+        else if (kind == tok.TK_EQ)       { error_expected("expected '='"); }
+        else { error_expected("unexpected"); }
+        return;
     }
     advance();
 }
@@ -119,4 +221,66 @@ fn is_param_boundary() as i32 {
     if (cur().kind != tok.TK_COMMA) { return 0; }
     if (peek().kind == tok.TK_IDENT && peek_n(2).kind == tok.TK_AS) { return 1; }
     return 0;
+}
+
+// Process string literal: strip quotes and resolve escape sequences.
+// Input: ptr points to opening quote, len includes both quotes.
+// Returns new buffer with processed content, sets *out_len to content length.
+fn process_string(ptr as *u8, len as i32, out_len as *i32) as *u8 {
+    let is *u8 as buf = mem.galloc(cast(i64, len));
+    let is i32 as j with mut = 0;
+    let is i32 as i with mut = 1;
+    let is i32 as end = len - 1;
+    while (i < end) {
+        if (ptr[i] == 92) {
+            i = i + 1;
+            if (i < end) {
+                let is u8 as ec = ptr[i];
+                if (ec == 110)     { buf[j] = 10; }
+                else if (ec == 116) { buf[j] = 9; }
+                else if (ec == 114) { buf[j] = 13; }
+                else if (ec == 48)  { buf[j] = 0; }
+                else if (ec == 92)  { buf[j] = 92; }
+                else if (ec == 34)  { buf[j] = 34; }
+                else if (ec == 39)  { buf[j] = 39; }
+                else { buf[j] = ec; }
+                j = j + 1;
+            }
+        } else {
+            buf[j] = ptr[i];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    buf[j] = cast(u8, 0);
+    *out_len = j;
+    return buf;
+}
+
+fn is_compound_assign(kind as i32) as i32 {
+    if (kind == tok.TK_PLUS_EQ) { return 1; }
+    if (kind == tok.TK_MINUS_EQ) { return 1; }
+    if (kind == tok.TK_STAR_EQ) { return 1; }
+    if (kind == tok.TK_SLASH_EQ) { return 1; }
+    if (kind == tok.TK_PERCENT_EQ) { return 1; }
+    if (kind == tok.TK_SHL_EQ) { return 1; }
+    if (kind == tok.TK_SHR_EQ) { return 1; }
+    if (kind == tok.TK_AND_EQ) { return 1; }
+    if (kind == tok.TK_OR_EQ) { return 1; }
+    if (kind == tok.TK_XOR_EQ) { return 1; }
+    return 0;
+}
+
+fn compound_to_binop(kind as i32) as i32 {
+    if (kind == tok.TK_PLUS_EQ) { return ast.NK_ADD; }
+    if (kind == tok.TK_MINUS_EQ) { return ast.NK_SUB; }
+    if (kind == tok.TK_STAR_EQ) { return ast.NK_MUL; }
+    if (kind == tok.TK_SLASH_EQ) { return ast.NK_DIV; }
+    if (kind == tok.TK_PERCENT_EQ) { return ast.NK_MOD; }
+    if (kind == tok.TK_SHL_EQ) { return ast.NK_SHL; }
+    if (kind == tok.TK_SHR_EQ) { return ast.NK_SHR; }
+    if (kind == tok.TK_AND_EQ) { return ast.NK_BAND; }
+    if (kind == tok.TK_OR_EQ) { return ast.NK_BOR; }
+    if (kind == tok.TK_XOR_EQ) { return ast.NK_BXOR; }
+    return ast.NK_ADD;
 }
