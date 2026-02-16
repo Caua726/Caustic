@@ -1,42 +1,10 @@
 use "../std/linux.cst" as linux;
 use "../std/mem.cst" as mem;
-use "tokens.cst" as tok;
-use "lexer.cst" as lex;
-use "ast.cst" as ast;
-use "parser.cst" as par;
-
-// === I/O helpers ===
-
-fn strlen(s as *u8) as i64 {
-    let is i64 as i with mut = 0;
-    while (s[i] != 0) { i = i + 1; }
-    return i;
-}
-
-fn print_str(s as *u8) as void {
-    linux.write(linux.STDOUT, s, strlen(s));
-}
-
-fn write_n(s as *u8, n as i64) as void {
-    linux.write(linux.STDOUT, s, n);
-}
-
-fn print_int(n as i64) as void {
-    if (n == 0) { linux.write(linux.STDOUT, "0", 1); return; }
-    let is [24]u8 as buf;
-    let is i64 as val with mut = n;
-    let is i64 as neg with mut = 0;
-    if (val < 0) { neg = 1; val = 0 - val; }
-    let is i32 as pos with mut = 23;
-    while (val > 0) {
-        buf[pos] = cast(u8, (val % 10) + 48);
-        val = val / 10;
-        pos = pos - 1;
-    }
-    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
-    let is i64 as start = cast(i64, pos) + 1;
-    linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + start), 24 - start);
-}
+use "lexer/tokens.cst" as tok;
+use "lexer/lexer.cst" as lex;
+use "parser/ast.cst" as ast;
+use "parser/top.cst" as top;
+use "parser/dump.cst" as d;
 
 fn read_file(path as *u8, out_size as *i64) as *u8 {
     let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
@@ -52,391 +20,35 @@ fn read_file(path as *u8, out_size as *i64) as *u8 {
     return buf;
 }
 
-// === Node kind name lookup ===
-
-fn nk_name(kind as i32) as *u8 {
-    if (kind == ast.NK_NUM)       { return "NUM"; }
-    if (kind == ast.NK_IDENT)     { return "IDENT"; }
-    if (kind == ast.NK_STRING)    { return "STRING"; }
-    if (kind == ast.NK_ADD)       { return "ADD"; }
-    if (kind == ast.NK_SUB)       { return "SUB"; }
-    if (kind == ast.NK_MUL)       { return "MUL"; }
-    if (kind == ast.NK_DIV)       { return "DIV"; }
-    if (kind == ast.NK_MOD)       { return "MOD"; }
-    if (kind == ast.NK_EQ)        { return "EQ"; }
-    if (kind == ast.NK_NE)        { return "NE"; }
-    if (kind == ast.NK_LT)        { return "LT"; }
-    if (kind == ast.NK_LE)        { return "LE"; }
-    if (kind == ast.NK_GT)        { return "GT"; }
-    if (kind == ast.NK_GE)        { return "GE"; }
-    if (kind == ast.NK_ASSIGN)    { return "ASSIGN"; }
-    if (kind == ast.NK_EXPR_STMT) { return "EXPR_STMT"; }
-    if (kind == ast.NK_RETURN)    { return "RETURN"; }
-    if (kind == ast.NK_FN)        { return "FN"; }
-    if (kind == ast.NK_FNCALL)    { return "FNCALL"; }
-    if (kind == ast.NK_BLOCK)     { return "BLOCK"; }
-    if (kind == ast.NK_LET)       { return "LET"; }
-    if (kind == ast.NK_IF)        { return "IF"; }
-    if (kind == ast.NK_ASM)       { return "ASM"; }
-    if (kind == ast.NK_WHILE)     { return "WHILE"; }
-    if (kind == ast.NK_CAST)      { return "CAST"; }
-    if (kind == ast.NK_ADDR)      { return "ADDR"; }
-    if (kind == ast.NK_DEREF)     { return "DEREF"; }
-    if (kind == ast.NK_INDEX)     { return "INDEX"; }
-    if (kind == ast.NK_SYSCALL)   { return "SYSCALL"; }
-    if (kind == ast.NK_MEMBER)    { return "MEMBER"; }
-    if (kind == ast.NK_LAND)      { return "LAND"; }
-    if (kind == ast.NK_LOR)       { return "LOR"; }
-    if (kind == ast.NK_BREAK)     { return "BREAK"; }
-    if (kind == ast.NK_CONTINUE)  { return "CONTINUE"; }
-    if (kind == ast.NK_SHL)       { return "SHL"; }
-    if (kind == ast.NK_SHR)       { return "SHR"; }
-    if (kind == ast.NK_BAND)      { return "BAND"; }
-    if (kind == ast.NK_BOR)       { return "BOR"; }
-    if (kind == ast.NK_SIZEOF)    { return "SIZEOF"; }
-    if (kind == ast.NK_USE)       { return "USE"; }
-    if (kind == ast.NK_FOR)       { return "FOR"; }
-    if (kind == ast.NK_DO_WHILE)  { return "DO_WHILE"; }
-    if (kind == ast.NK_BXOR)      { return "BXOR"; }
-    if (kind == ast.NK_BNOT)      { return "BNOT"; }
-    if (kind == ast.NK_LNOT)      { return "LNOT"; }
-    if (kind == ast.NK_NEG)       { return "NEG"; }
-    if (kind == ast.NK_ENUM_LIT)  { return "ENUM_LIT"; }
-    if (kind == ast.NK_MATCH)     { return "MATCH"; }
-    if (kind == ast.NK_DEFER)     { return "DEFER"; }
-    if (kind == ast.NK_FN_PTR)    { return "FN_PTR"; }
-    return "UNKNOWN";
-}
-
-// === Type name for display ===
-
-fn type_str(t as *ast.Type) as *u8 {
-    if (cast(i64, t) == 0) { return "?"; }
-    if (t.kind == ast.TY_VOID)   { return "void"; }
-    if (t.kind == ast.TY_I8)     { return "i8"; }
-    if (t.kind == ast.TY_I16)    { return "i16"; }
-    if (t.kind == ast.TY_I32)    { return "i32"; }
-    if (t.kind == ast.TY_I64)    { return "i64"; }
-    if (t.kind == ast.TY_U8)     { return "u8"; }
-    if (t.kind == ast.TY_U16)    { return "u16"; }
-    if (t.kind == ast.TY_U32)    { return "u32"; }
-    if (t.kind == ast.TY_U64)    { return "u64"; }
-    if (t.kind == ast.TY_F32)    { return "f32"; }
-    if (t.kind == ast.TY_F64)    { return "f64"; }
-    if (t.kind == ast.TY_BOOL)   { return "bool"; }
-    if (t.kind == ast.TY_CHAR)   { return "char"; }
-    if (t.kind == ast.TY_STRING) { return "string"; }
-    if (t.kind == ast.TY_PTR)    { return "*T"; }
-    if (t.kind == ast.TY_ARRAY)  { return "[N]T"; }
-    if (t.kind == ast.TY_STRUCT && t.name_len > 0) { return t.name_ptr; }
-    if (t.kind == ast.TY_ENUM && t.name_len > 0)   { return t.name_ptr; }
-    return "?type";
-}
-
-// === Print indentation ===
-
-fn print_indent(depth as i32) as void {
-    let is i32 as i with mut = 0;
-    while (i < depth) {
-        print_str("  ");
-        i = i + 1;
-    }
-}
-
-// === AST dumper ===
-
-fn dump_ast(node as *ast.Node, depth as i32) as void {
-    if (cast(i64, node) == 0) { return; }
-
-    print_indent(depth);
-    print_str(nk_name(node.kind));
-
-    // Print extra info based on kind
-    if (node.kind == ast.NK_NUM) {
-        if (cast(i64, node.ty) != 0 && (node.ty.kind == ast.TY_F32 || node.ty.kind == ast.TY_F64)) {
-            print_str(" <float>");
-        } else {
-            print_str(" ");
-            print_int(node.val);
-        }
-    }
-    else if (node.kind == ast.NK_IDENT) {
-        print_str(" '");
-        write_n(node.name_ptr, cast(i64, node.name_len));
-        print_str("'");
-    }
-    else if (node.kind == ast.NK_STRING) {
-        print_str(" \"");
-        write_n(node.name_ptr, cast(i64, node.name_len));
-        print_str("\"");
-    }
-    else if (node.kind == ast.NK_FN) {
-        print_str(" '");
-        write_n(node.name_ptr, cast(i64, node.name_len));
-        print_str("' -> ");
-        print_str(type_str(node.return_type));
-        if (node.is_extern == 1) { print_str(" [extern]"); }
-        if (node.generic_param_count > 0) {
-            print_str(" gen<");
-            print_int(cast(i64, node.generic_param_count));
-            print_str(">");
-        }
-    }
-    else if (node.kind == ast.NK_FNCALL) {
-        if (cast(i64, node.lhs) != 0) {
-            if (node.lhs.kind == ast.NK_IDENT) {
-                print_str(" '");
-                write_n(node.lhs.name_ptr, cast(i64, node.lhs.name_len));
-                print_str("'");
-            }
-            else if (node.lhs.kind == ast.NK_MEMBER) {
-                print_str(" '.");
-                write_n(node.lhs.member_ptr, cast(i64, node.lhs.member_len));
-                print_str("'");
-            }
-        }
-    }
-    else if (node.kind == ast.NK_LET) {
-        print_str(" '");
-        write_n(node.name_ptr, cast(i64, node.name_len));
-        print_str("' : ");
-        print_str(type_str(node.ty));
-        if (node.flags == ast.VF_MUT) { print_str(" [mut]"); }
-        else if (node.flags == ast.VF_IMUT) { print_str(" [imut]"); }
-    }
-    else if (node.kind == ast.NK_MEMBER) {
-        print_str(" .");
-        write_n(node.member_ptr, cast(i64, node.member_len));
-    }
-    else if (node.kind == ast.NK_USE) {
-        print_str(" \"");
-        write_n(node.name_ptr, cast(i64, node.name_len));
-        print_str("\"");
-        if (node.member_len > 0) {
-            print_str(" as ");
-            write_n(node.member_ptr, cast(i64, node.member_len));
-        }
-    }
-    else if (node.kind == ast.NK_CAST) {
-        print_str(" -> ");
-        print_str(type_str(node.ty));
-    }
-    else if (node.kind == ast.NK_SIZEOF) {
-        print_str(" ");
-        print_str(type_str(node.ty));
-    }
-    else if (node.kind == ast.NK_ASM) {
-        print_str(" \"...\"");
-    }
-    else if (node.kind == ast.NK_FN_PTR) {
-        print_str(" '");
-        write_n(node.name_ptr, cast(i64, node.name_len));
-        print_str("'");
-    }
-    else if (node.kind == ast.NK_BLOCK) {
-        // Struct/enum decl block
-        if (cast(i64, node.ty) != 0) {
-            if (node.ty.kind == ast.TY_STRUCT) {
-                print_str(" struct '");
-                write_n(node.ty.name_ptr, cast(i64, node.ty.name_len));
-                print_str("'");
-            }
-            else if (node.ty.kind == ast.TY_ENUM) {
-                print_str(" enum '");
-                write_n(node.ty.name_ptr, cast(i64, node.ty.name_len));
-                print_str("'");
-            }
-            if (node.generic_param_count > 0) {
-                print_str(" gen<");
-                print_int(cast(i64, node.generic_param_count));
-                print_str(">");
-            }
-        }
-    }
-
-    print_str("\n");
-
-    // Recurse into children
-    let is i32 as d = depth + 1;
-
-    // Binary ops
-    if (node.kind == ast.NK_ADD || node.kind == ast.NK_SUB || node.kind == ast.NK_MUL ||
-        node.kind == ast.NK_DIV || node.kind == ast.NK_MOD || node.kind == ast.NK_EQ ||
-        node.kind == ast.NK_NE || node.kind == ast.NK_LT || node.kind == ast.NK_LE ||
-        node.kind == ast.NK_GT || node.kind == ast.NK_GE || node.kind == ast.NK_LAND ||
-        node.kind == ast.NK_LOR || node.kind == ast.NK_SHL || node.kind == ast.NK_SHR ||
-        node.kind == ast.NK_BAND || node.kind == ast.NK_BOR || node.kind == ast.NK_BXOR ||
-        node.kind == ast.NK_ASSIGN || node.kind == ast.NK_INDEX) {
-        dump_ast(node.lhs, d);
-        dump_ast(node.rhs, d);
-    }
-    // Unary ops
-    else if (node.kind == ast.NK_ADDR || node.kind == ast.NK_DEREF ||
-             node.kind == ast.NK_NEG || node.kind == ast.NK_LNOT ||
-             node.kind == ast.NK_BNOT) {
-        dump_ast(node.expr, d);
-    }
-    // Cast
-    else if (node.kind == ast.NK_CAST) {
-        dump_ast(node.expr, d);
-    }
-    // Return
-    else if (node.kind == ast.NK_RETURN) {
-        dump_ast(node.expr, d);
-    }
-    // Expr stmt
-    else if (node.kind == ast.NK_EXPR_STMT) {
-        dump_ast(node.expr, d);
-    }
-    // Defer
-    else if (node.kind == ast.NK_DEFER) {
-        dump_ast(node.expr, d);
-    }
-    // Let
-    else if (node.kind == ast.NK_LET) {
-        dump_ast(node.init_expr, d);
-    }
-    // Function
-    else if (node.kind == ast.NK_FN) {
-        // Params
-        let is *ast.Node as p with mut = node.params;
-        while (cast(i64, p) != 0) {
-            dump_ast(p, d);
-            p = p.next;
-        }
-        dump_ast(node.body, d);
-    }
-    // Function call
-    else if (node.kind == ast.NK_FNCALL) {
-        // Don't dump lhs (already shown in header), dump args
-        let is *ast.Node as a with mut = node.args;
-        while (cast(i64, a) != 0) {
-            dump_ast(a, d);
-            a = a.next;
-        }
-    }
-    // Syscall
-    else if (node.kind == ast.NK_SYSCALL) {
-        let is *ast.Node as a with mut = node.args;
-        while (cast(i64, a) != 0) {
-            dump_ast(a, d);
-            a = a.next;
-        }
-    }
-    // Block
-    else if (node.kind == ast.NK_BLOCK) {
-        let is *ast.Node as s with mut = node.stmts;
-        while (cast(i64, s) != 0) {
-            dump_ast(s, d);
-            s = s.next;
-        }
-    }
-    // If
-    else if (node.kind == ast.NK_IF) {
-        print_indent(d); print_str("[cond]\n");
-        dump_ast(node.cond, d + 1);
-        print_indent(d); print_str("[then]\n");
-        dump_ast(node.then_b, d + 1);
-        if (cast(i64, node.else_b) != 0) {
-            print_indent(d); print_str("[else]\n");
-            dump_ast(node.else_b, d + 1);
-        }
-    }
-    // While
-    else if (node.kind == ast.NK_WHILE) {
-        print_indent(d); print_str("[cond]\n");
-        dump_ast(node.cond, d + 1);
-        print_indent(d); print_str("[body]\n");
-        dump_ast(node.body, d + 1);
-    }
-    // For
-    else if (node.kind == ast.NK_FOR) {
-        if (cast(i64, node.for_init) != 0) {
-            print_indent(d); print_str("[init]\n");
-            dump_ast(node.for_init, d + 1);
-        }
-        if (cast(i64, node.cond) != 0) {
-            print_indent(d); print_str("[cond]\n");
-            dump_ast(node.cond, d + 1);
-        }
-        if (cast(i64, node.for_step) != 0) {
-            print_indent(d); print_str("[step]\n");
-            dump_ast(node.for_step, d + 1);
-        }
-        print_indent(d); print_str("[body]\n");
-        dump_ast(node.body, d + 1);
-    }
-    // Do-while
-    else if (node.kind == ast.NK_DO_WHILE) {
-        print_indent(d); print_str("[body]\n");
-        dump_ast(node.body, d + 1);
-        print_indent(d); print_str("[cond]\n");
-        dump_ast(node.cond, d + 1);
-    }
-    // Match
-    else if (node.kind == ast.NK_MATCH) {
-        dump_ast(node.expr, d);
-        let is *ast.Node as c with mut = node.cases;
-        while (cast(i64, c) != 0) {
-            print_indent(d); print_str("[case '");
-            write_n(c.name_ptr, cast(i64, c.name_len));
-            print_str("']\n");
-            dump_ast(c.body, d + 1);
-            c = c.next;
-        }
-        if (cast(i64, node.else_b) != 0) {
-            print_indent(d); print_str("[else]\n");
-            dump_ast(node.else_b, d + 1);
-        }
-    }
-    // Member access
-    else if (node.kind == ast.NK_MEMBER) {
-        dump_ast(node.lhs, d);
-    }
-}
-
-// === Main ===
-
 fn main(argc as i64, argv as i64) as i32 {
     if (argc < 2) {
-        linux.write(linux.STDERR, "Usage: caustic <source.cst>\n", 28);
+        linux.write(linux.STDERR, "Usage: caustic-cc <source.cst>\n", 31);
         return 1;
     }
-
-    mem.gheapinit(4194304); // 4MB heap
-
+    mem.gheapinit(4194304);
     let is *i64 as argv_arr = cast(*i64, argv);
     let is *u8 as filename = cast(*u8, argv_arr[1]);
-
     let is i64 as file_size with mut = 0;
     let is *u8 as src = read_file(filename, &file_size);
     if (cast(i64, src) == 0) {
         linux.write(linux.STDERR, "Error: cannot read file\n", 24);
         return 1;
     }
-
-    // Lex
     let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
-
-    print_str("caustic: ");
-    print_str(filename);
-    print_str(" (");
-    print_int(file_size);
-    print_str(" bytes, ");
-    print_int(cast(i64, tokens.count));
-    print_str(" tokens)\n");
-
-    // Parse
+    d.print_str("caustic-cc: ");
+    d.print_str(filename);
+    d.print_str(" (");
+    d.print_int(file_size);
+    d.print_str(" bytes, ");
+    d.print_int(cast(i64, tokens.count));
+    d.print_str(" tokens)\n");
     ast.types_init();
-    let is *ast.Node as root = par.parse_file(&tokens, src, file_size, filename);
-
-    print_str("\n=== AST ===\n");
-
+    let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
+    d.print_str("\n=== AST ===\n");
     let is *ast.Node as n with mut = root;
     while (cast(i64, n) != 0) {
-        dump_ast(n, 0);
+        d.dump_ast(n, 0);
         n = n.next;
     }
-
     return 0;
 }
