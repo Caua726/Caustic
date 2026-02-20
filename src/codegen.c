@@ -337,8 +337,13 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             load_operand(inst->src1.vreg, ctx, "rax");
             load_operand(inst->src2.vreg, ctx, "r15");
             emit("push rdx");
-            emit("cqo");
-            emit("idiv r15");
+            if (inst->cast_to_type && !inst->cast_to_type->is_signed) {
+                emit("xor rdx, rdx");
+                emit("div r15");
+            } else {
+                emit("cqo");
+                emit("idiv r15");
+            }
             emit("mov r15, rax");
             emit("pop rdx");
             store_operand(inst->dest.vreg, ctx, "r15");
@@ -348,8 +353,13 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             load_operand(inst->src1.vreg, ctx, "rax");
             load_operand(inst->src2.vreg, ctx, "r15");
             emit("push rdx");
-            emit("cqo");
-            emit("idiv r15");
+            if (inst->cast_to_type && !inst->cast_to_type->is_signed) {
+                emit("xor rdx, rdx");
+                emit("div r15");
+            } else {
+                emit("cqo");
+                emit("idiv r15");
+            }
             emit("mov r15, rdx");
             emit("pop rdx");
             store_operand(inst->dest.vreg, ctx, "r15");
@@ -488,7 +498,10 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             load_operand(inst->src2.vreg, ctx, "r14");
             emit("xor rax, rax");
             emit("cmp r15, r14");
-            emit("setl al");
+            if (inst->cast_to_type && !inst->cast_to_type->is_signed)
+                emit("setb al");
+            else
+                emit("setl al");
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
@@ -497,7 +510,10 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             load_operand(inst->src2.vreg, ctx, "r14");
             emit("xor rax, rax");
             emit("cmp r15, r14");
-            emit("setle al");
+            if (inst->cast_to_type && !inst->cast_to_type->is_signed)
+                emit("setbe al");
+            else
+                emit("setle al");
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
@@ -506,7 +522,10 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             load_operand(inst->src2.vreg, ctx, "r14");
             emit("xor rax, rax");
             emit("cmp r15, r14");
-            emit("setg al");
+            if (inst->cast_to_type && !inst->cast_to_type->is_signed)
+                emit("seta al");
+            else
+                emit("setg al");
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
@@ -515,7 +534,10 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
             load_operand(inst->src2.vreg, ctx, "r14");
             emit("xor rax, rax");
             emit("cmp r15, r14");
-            emit("setge al");
+            if (inst->cast_to_type && !inst->cast_to_type->is_signed)
+                emit("setae al");
+            else
+                emit("setge al");
             store_operand(inst->dest.vreg, ctx, "rax");
             break;
 
@@ -529,7 +551,10 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
         case IR_SHR:
             load_operand(inst->src2.vreg, ctx, "rcx");
             load_operand(inst->src1.vreg, ctx, "r15");
-            emit("shr r15, cl");
+            if (inst->cast_to_type && inst->cast_to_type->is_signed)
+                emit("sar r15, cl");
+            else
+                emit("shr r15, cl");
             store_operand(inst->dest.vreg, ctx, "r15");
             break;
 

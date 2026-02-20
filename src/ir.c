@@ -104,6 +104,12 @@ static int emit_binary(IROp op, int lhs_reg, int rhs_reg, int line) {
     return dest;
 }
 
+static int emit_binary_typed(IROp op, int lhs_reg, int rhs_reg, int line, Type *ty) {
+    int dest = emit_binary(op, lhs_reg, rhs_reg, line);
+    ctx.inst_tail->cast_to_type = ty;
+    return dest;
+}
+
 
 
 static int emit_cast_from(int src_reg, Type *from_type, Type *to_type, int line) {
@@ -526,7 +532,7 @@ static int gen_expr(Node *node) {
             if (node->ty->kind == TY_F32 || node->ty->kind == TY_F64) {
                 return emit_binary(IR_FDIV, lhs, rhs, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_DIV, lhs, rhs, node->tok ? node->tok->line : 0, node->ty);
         }
 
         case NODE_KIND_MOD: {
@@ -545,7 +551,7 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_MOD, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_MOD, lhs, rhs, node->tok ? node->tok->line : 0, node->ty);
         }
 
         case NODE_KIND_EQ: {
@@ -581,7 +587,7 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_LT, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_LT, lhs, rhs, node->tok ? node->tok->line : 0, node->lhs->ty);
         }
 
         case NODE_KIND_LE: {
@@ -593,7 +599,7 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_LE, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_LE, lhs, rhs, node->tok ? node->tok->line : 0, node->lhs->ty);
         }
 
         case NODE_KIND_GT: {
@@ -605,7 +611,7 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_GT, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_GT, lhs, rhs, node->tok ? node->tok->line : 0, node->lhs->ty);
         }
 
         case NODE_KIND_GE: {
@@ -617,7 +623,7 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_GE, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_GE, lhs, rhs, node->tok ? node->tok->line : 0, node->lhs->ty);
         }
 
         case NODE_KIND_SHL: {
@@ -641,7 +647,7 @@ static int gen_expr(Node *node) {
             if (node->rhs->ty != node->ty) {
                 rhs = emit_cast(rhs, node->ty, node->tok ? node->tok->line : 0);
             }
-            return emit_binary(IR_SHR, lhs, rhs, node->tok ? node->tok->line : 0);
+            return emit_binary_typed(IR_SHR, lhs, rhs, node->tok ? node->tok->line : 0, node->ty);
         }
 
         case NODE_KIND_BITWISE_AND: {
