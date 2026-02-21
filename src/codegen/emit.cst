@@ -782,6 +782,34 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
+
+    // VA_START
+    if (op == d.IR_VA_START) {
+        let is i32 as num_args = cast(i32, inst.src2.imm);
+        load_op(inst.src1.vreg, ctx, "r15");
+        // gp_offset = num_args * 8 (DWORD at [r15+0])
+        out_cstr("  mov DWORD PTR [r15], ");
+        out_int(cast(i64, num_args) * 8);
+        out_char(10);
+        // fp_offset = 48 (DWORD at [r15+4])
+        out_line("mov DWORD PTR [r15+4], 48");
+        // overflow_arg_area = rbp + 16 (QWORD at [r15+8])
+        // stack args start at rbp+16 for args beyond 6
+        let is i64 as overflow_off with mut = 16;
+        if (num_args > 6) {
+            overflow_off = 16 + cast(i64, num_args - 6) * 8;
+        }
+        out_cstr("  lea rax, [rbp+");
+        out_int(overflow_off);
+        out_cstr("]\n");
+        out_line("mov QWORD PTR [r15+8], rax");
+        // reg_save_area = rbp - va_save_offset (QWORD at [r15+16])
+        out_cstr("  lea rax, [rbp-");
+        out_int(cast(i64, ctx.va_save_offset));
+        out_cstr("]\n");
+        out_line("mov QWORD PTR [r15+16], rax");
+        return;
+    }
 }
 
 // === gen_func ===
@@ -807,7 +835,9 @@ fn gen_func(func as *d.IRFunction) as void {
     let is i32 as local_size = func.stack_size;
     let is i32 as spill_size = ctx.stack_slots * 8;
     let is i32 as alloc_size = func.alloc_stack_size;
-    let is i32 as total with mut = local_size + spill_size + alloc_size;
+    let is i32 as va_size with mut = 0;
+    if (func.is_variadic == 1) { va_size = 48; }
+    let is i32 as total with mut = local_size + spill_size + alloc_size + va_size;
     // Align to 16
     // call pushes 8 (ret addr) + push rbp (8) + 5 pushes (40) = 56 bytes
     // 56 % 16 = 8, so we need total to be 8 mod 16 for alignment
@@ -834,6 +864,20 @@ fn gen_func(func as *d.IRFunction) as void {
         out_cstr("  sub rsp, ");
         out_int(cast(i64, ctx.aligned_stack_size));
         out_char(10);
+    }
+
+    // Variadic prologue: save 6 arg registers to register save area
+    if (func.is_variadic == 1) {
+        // va_save_offset = total offset from rbp to start of 48-byte save area
+        // Layout: [rbp - va_save_offset] = rdi (first), ..., [rbp - va_save_offset + 40] = r9 (last)
+        let is i32 as vso = local_size + spill_size + alloc_size + 48;
+        ctx.va_save_offset = vso;
+        out_cstr("  mov QWORD PTR [rbp-"); out_int(cast(i64, vso)); out_cstr("], rdi\n");
+        out_cstr("  mov QWORD PTR [rbp-"); out_int(cast(i64, vso - 8)); out_cstr("], rsi\n");
+        out_cstr("  mov QWORD PTR [rbp-"); out_int(cast(i64, vso - 16)); out_cstr("], rdx\n");
+        out_cstr("  mov QWORD PTR [rbp-"); out_int(cast(i64, vso - 24)); out_cstr("], rcx\n");
+        out_cstr("  mov QWORD PTR [rbp-"); out_int(cast(i64, vso - 32)); out_cstr("], r8\n");
+        out_cstr("  mov QWORD PTR [rbp-"); out_int(cast(i64, vso - 40)); out_cstr("], r9\n");
     }
 
     // Instructions
