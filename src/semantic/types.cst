@@ -8,6 +8,7 @@ use "../parser/ast.cst" as ast;
 // === Global state ===
 let is *d.StructDef as struct_defs with mut;
 let is *d.EnumDef as enum_defs with mut;
+let is *d.TypeAliasDef as type_aliases with mut;
 
 // Forward declaration (implemented in generics.cst, called from resolve_type_ref)
 // We'll use function pointers set at init time.
@@ -17,8 +18,64 @@ let is *u8 as fn_lookup_template with mut;
 fn types_init() as void {
     struct_defs = cast(*d.StructDef, 0);
     enum_defs = cast(*d.EnumDef, 0);
+    type_aliases = cast(*d.TypeAliasDef, 0);
     fn_instantiate_struct = cast(*u8, 0);
     fn_lookup_template = cast(*u8, 0);
+}
+
+// === Type alias lookup/declare ===
+
+fn declare_type_alias(name_ptr as *u8, name_len as i32, ty as *u8) as void {
+    // Resolve primitive aliases to their singleton pointer
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is *u8 as resolved with mut = ty;
+    if (t.kind == ast.TY_I8)  { resolved = cast(*u8, ast.type_i8); }
+    if (t.kind == ast.TY_I16) { resolved = cast(*u8, ast.type_i16); }
+    if (t.kind == ast.TY_I32) { resolved = cast(*u8, ast.type_i32); }
+    if (t.kind == ast.TY_I64) { resolved = cast(*u8, ast.type_i64); }
+    if (t.kind == ast.TY_U8)  { resolved = cast(*u8, ast.type_u8); }
+    if (t.kind == ast.TY_U16) { resolved = cast(*u8, ast.type_u16); }
+    if (t.kind == ast.TY_U32) { resolved = cast(*u8, ast.type_u32); }
+    if (t.kind == ast.TY_U64) { resolved = cast(*u8, ast.type_u64); }
+    if (t.kind == ast.TY_F32) { resolved = cast(*u8, ast.type_f32); }
+    if (t.kind == ast.TY_F64) { resolved = cast(*u8, ast.type_f64); }
+    if (t.kind == ast.TY_BOOL) { resolved = cast(*u8, ast.type_bool); }
+    if (t.kind == ast.TY_CHAR) { resolved = cast(*u8, ast.type_char); }
+    if (t.kind == ast.TY_VOID) { resolved = cast(*u8, ast.type_void); }
+    let is *d.TypeAliasDef as ta = d.new_type_alias_def();
+    ta.name_ptr = d.str_dup(name_ptr, name_len);
+    ta.name_len = name_len;
+    ta.ty = resolved;
+    ta.next = type_aliases;
+    type_aliases = ta;
+}
+
+fn lookup_type_alias(name_ptr as *u8, name_len as i32) as *u8 {
+    let is *d.TypeAliasDef as ta with mut = type_aliases;
+    while (cast(i64, ta) != 0) {
+        if (d.str_eq(ta.name_ptr, ta.name_len, name_ptr, name_len) == 1) {
+            return ta.ty;
+        }
+        ta = ta.next;
+    }
+    return cast(*u8, 0);
+}
+
+// Resolve a type reference that might be an alias, returning the proper *Type
+fn resolve_alias(ty_ptr as *u8) as *u8 {
+    if (cast(i64, ty_ptr) == 0) { return ty_ptr; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
+        let is *u8 as alias with mut = lookup_type_alias(ty.name_ptr, ty.name_len);
+        if (cast(i64, alias) == 0 && sc.current_mod_prefix_len > 0) {
+            let is i32 as amlen with mut = 0;
+            let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
+            alias = lookup_type_alias(amangled, amlen);
+            if (cast(i64, alias) == 0) { mem.gfree(amangled); }
+        }
+        if (cast(i64, alias) != 0) { return alias; }
+    }
+    return ty_ptr;
 }
 
 // === Struct/Enum lookup ===
@@ -179,10 +236,23 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
                 ty.payload_offset = et.payload_offset;
                 ty.max_payload = et.max_payload;
             } else {
-                io.write_str(linux.STDERR, "Erro: tipo nao definido: '");
-                io.write_bytes(linux.STDERR, ty.name_ptr, cast(i64, ty.name_len));
-                io.write_str(linux.STDERR, "'\n");
-                linux.exit(cast(i32, 1));
+                // Try type alias
+                let is *u8 as alias_ty with mut = lookup_type_alias(ty.name_ptr, ty.name_len);
+                if (cast(i64, alias_ty) == 0 && sc.current_mod_prefix_len > 0) {
+                    let is i32 as amlen with mut = 0;
+                    let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
+                    alias_ty = lookup_type_alias(amangled, amlen);
+                    if (cast(i64, alias_ty) == 0) { mem.gfree(amangled); }
+                }
+                if (cast(i64, alias_ty) != 0) {
+                    let is *ast.Type as at = cast(*ast.Type, alias_ty);
+                    mem.memcpy(cast(*u8, ty), cast(*u8, at), sizeof(ast.Type));
+                } else {
+                    io.write_str(linux.STDERR, "Erro: tipo nao definido: '");
+                    io.write_bytes(linux.STDERR, ty.name_ptr, cast(i64, ty.name_len));
+                    io.write_str(linux.STDERR, "'\n");
+                    linux.exit(cast(i32, 1));
+                }
             }
         } else {
             // Copy from struct def
