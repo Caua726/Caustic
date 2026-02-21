@@ -96,6 +96,36 @@ use "std/io.cst" as io;
 io.printf("works\n");
 ```
 
+## Error Position Reporting
+
+All compiler errors include the file name, line number, column number, and the source line with a caret (`^`) pointing to the exact location of the error:
+
+```
+/tmp/test.cst:3:5: Erro semantico: type mismatch
+    let is i32 as x = "hello";
+    ^
+```
+
+This applies to lexer, parser, and semantic errors. The position information helps quickly locate the problem in your code.
+
+## Warnings
+
+The compiler emits warnings for certain conditions that do not prevent compilation:
+
+### Unused variables
+
+```
+/tmp/test.cst:2:5: Aviso: variavel 'x' nao utilizada
+    let is i32 as x = 42;
+    ^
+```
+
+A variable that is declared but never read produces a warning. To suppress this warning, prefix the variable name with an underscore:
+
+```cst
+let is i32 as _unused = compute_side_effect();
+```
+
 ## Debugging Tips
 
 When you hit an error you do not understand, use the debug flags to inspect what the compiler sees at each stage:

@@ -56,6 +56,7 @@ Source (.cst) → Lexer → Parser → Semantic → IR → Codegen → Assembly 
 
 - **Primitives**: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `char`, `string`, `void`
 - **Composite**: Pointers (`*T`), Arrays (`[N]T`), Structs
+- **Type Aliases**: `type Name = ExistingType;`
 - **Floats**: Use SSE instructions (addsd, subsd, mulsd, divsd)
 
 ### Key Conventions
@@ -81,6 +82,10 @@ fn name(a as i64, b as *u8) as i32 {
 
 // Structs
 struct Point { x as i32; y as i32; }
+
+// Type aliases
+type Byte = u8;
+type Size = i64;
 
 // Modules
 use "std/mem.cst" as mem;
@@ -108,6 +113,7 @@ cast(*u8, address);         // type cast
 - `mem.cst` - Heap allocator with free-list coalescing
 - `string.cst` - Dynamic strings (String struct with ptr/len/cap)
 - `io.cst` - Buffered I/O, line reading, printf
+- `slice.cst` - Generic dynamic array (`Slice gen T` with push/get/set/pop/free)
 
 ## Adding New Operators/Features
 
@@ -145,3 +151,5 @@ fn work() as i32 {
 - **Float literals**: Must match variable type (`10.0` for f64, not `10`)
 - **Char literals**: Now properly typed, no cast needed for `let is char as c = 'A'`
 - **Return via exit code**: `return N` from main becomes process exit code (0-255)
+- **Unused variable warnings**: Variables declared but never used produce a warning (prefix with `_` to suppress)
+- **Debug info**: Generated assembly includes `.file` and `.loc` DWARF directives for source-level debugging with GDB

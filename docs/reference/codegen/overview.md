@@ -18,7 +18,7 @@ Source (.cst)
 
 ## Input and Output
 
-- **Input**: A pointer to an `IRProgram` struct and a file descriptor for output.
+- **Input**: A pointer to an `IRProgram` struct, a file descriptor for output, and the source filename (for debug info emission).
 - **Output**: x86_64 assembly text (Intel syntax with `noprefix`) suitable for assembly by
   `caustic-as`.
 
@@ -40,7 +40,7 @@ Codegen lives under `src/codegen/`:
 
 ## Code Generation Flow
 
-The entry point is `codegen(prog, fd)`:
+The entry point is `codegen(prog, fd, filename, filename_len)`:
 
 1. **Initialize output buffer**: A 4 MB heap-allocated buffer for batched writes.
 2. **Emit `.intel_syntax noprefix`**: Assembler mode directive at the top of the file.
@@ -90,6 +90,24 @@ main:
   pop rbp
   ret
 ```
+
+## Debug Info
+
+The codegen phase emits DWARF-compatible `.file` and `.loc` directives that map generated assembly back to source lines. This enables source-level debugging with tools like GDB.
+
+At the start of the `.text` section, the compiler emits:
+
+```asm
+.file 1 "program.cst"
+```
+
+Before each instruction where the source line changes, it emits:
+
+```asm
+.loc 1 <line> 0
+```
+
+The line numbers are resolved from the token list during IR generation -- each IR instruction carries the source line of the AST node that produced it.
 
 ## Scratch Registers
 

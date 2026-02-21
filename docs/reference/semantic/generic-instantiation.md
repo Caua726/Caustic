@@ -120,6 +120,24 @@ Instantiated generics receive mangled names formed by appending type arguments s
 
 This name is used in assembly output and for deduplication.
 
+## Cross-Module Generic Instantiation
+
+When a generic template is defined in one module and instantiated from another, the compiler handles module-prefixed names:
+
+```cst
+// std/slice.cst
+struct Slice gen T { ptr as *T; len as i32; cap as i32; }
+fn slice_new gen T (cap as i32) as Slice gen T { ... }
+```
+
+```cst
+// main.cst
+use "std/slice.cst" as sl;
+let is sl.Slice gen i32 as s = sl.slice_new gen i32 (16);
+```
+
+The compiler resolves the dot-qualified name (`sl.Slice`), looks up the module alias to find the template's module prefix, and uses `lookup_template_prefixed()` to find the correct template. The instantiated struct and functions are registered with the template's module prefix so that type resolution works correctly across module boundaries.
+
 ## Skip Rules
 
 Generic templates (uninstantiated) must be skipped in several passes:

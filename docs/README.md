@@ -30,6 +30,7 @@ Learn the language from scratch.
 - [String Type](guide/types/string-type.md) — `string`, `"..."`
 - [Type Coercion](guide/types/type-coercion.md) — narrowing, widening
 - [Negative Literals](guide/types/negative-literals.md) — workarounds for `imut` globals
+- [Type Aliases](guide/types/type-aliases.md) — `type Name = ExistingType`
 
 ### Functions
 
@@ -237,4 +238,5 @@ Deep dive into the compiler internals.
 - [string.cst](reference/stdlib/string.md) — dynamic strings
 - [linux.cst](reference/stdlib/linux.md) — syscall wrappers
 - [types.cst](reference/stdlib/types.md) — Option, Result
+- [slice.cst](reference/stdlib/slice.md) — generic dynamic array
 - [compatcffi.cst](reference/stdlib/compatcffi.md) — C interop types

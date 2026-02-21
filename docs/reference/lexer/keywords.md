@@ -1,6 +1,6 @@
 # Keywords
 
-Caustic has 27 reserved keywords. These words cannot be used as variable names, function names, struct names, module aliases, or any other user-defined identifier. Each keyword has a dedicated token kind, so the parser never sees them as `TK_IDENT`.
+Caustic has 28 reserved keywords. These words cannot be used as variable names, function names, struct names, module aliases, or any other user-defined identifier. Each keyword has a dedicated token kind, so the parser never sees them as `TK_IDENT`.
 
 ## Keyword Table
 
@@ -33,6 +33,7 @@ Caustic has 27 reserved keywords. These words cannot be used as variable names, 
 | `fn_ptr` | `TK_FN_PTR` | 64 | 6 | Function pointer expression |
 | `syscall` | `TK_SYSCALL` | 65 | 7 | Direct Linux syscall invocation |
 | `continue` | `TK_CONTINUE` | 66 | 8 | Continue to next loop iteration |
+| `type` | `TK_TYPE` | 77 | 4 | Type alias declaration |
 
 ## Keyword Lookup Strategy
 
@@ -51,7 +52,7 @@ This avoids hash table overhead. Since keywords range from 2 to 8 characters, th
 |--------|----------|
 | 2 | `fn`, `is`, `as`, `if`, `do` |
 | 3 | `let`, `for`, `asm`, `use`, `gen` |
-| 4 | `with`, `else`, `case`, `cast`, `enum`, `impl` |
+| 4 | `with`, `else`, `case`, `cast`, `enum`, `impl`, `type` |
 | 5 | `while`, `break`, `match`, `defer` |
 | 6 | `return`, `struct`, `sizeof`, `extern`, `fn_ptr` |
 | 7 | `syscall` |

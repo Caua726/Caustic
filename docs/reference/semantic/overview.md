@@ -9,6 +9,7 @@ The semantic analyzer performs three core tasks:
 1. **Type resolution** -- Every expression, variable, and declaration is assigned a concrete type.
 2. **Validation** -- Type mismatches, undeclared identifiers, and invalid operations are detected and reported as compile-time errors.
 3. **Desugaring** -- High-level constructs like method calls (`obj.method()`) and generic instantiations (`func gen i32(x)`) are rewritten into simpler forms the IR generator can consume.
+4. **Diagnostics** -- Semantic errors now include file, line, and column information. Warnings (such as unused variable detection) are emitted without halting compilation.
 
 ## Sub-Phases
 
@@ -45,7 +46,7 @@ Generic template functions (those with `generic_param_count > 0`) are skipped du
 |------|---------|
 | `walk.cst` | Main AST walker; visits each node kind and sets `node.ty` |
 | `types.cst` | Type constructors, singleton globals, type comparison utilities |
-| `scope.cst` | Scope stack for lexical name resolution |
+| `scope.cst` | Scope stack, lexical name resolution, error/warning reporting with source position |
 | `modules.cst` | Module import, caching, and cross-module symbol lookup |
 | `generics.cst` | Generic template storage, AST cloning, type substitution |
 | `defs.cst` | Shared constants and definitions (node kinds, type kinds) |
