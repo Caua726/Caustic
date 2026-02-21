@@ -35,9 +35,20 @@ fn load_module(path_ptr as *u8, path_len as i32) as *u8 {
         sc.current_source_dir_len = 0;
     }
 
+    let is *tok.TokenList as tl_heap = cast(*tok.TokenList, mem.galloc(sizeof(tok.TokenList)));
     let is tok.TokenList as tokens = lex.tokenize(src, file_size, norm);
-    let is *ast.Node as root = top.parse_file(&tokens, src, file_size, norm);
-    return cast(*u8, root);
+    tl_heap.data = tokens.data;
+    tl_heap.count = tokens.count;
+    tl_heap.cap = tokens.cap;
+    let is *ast.Node as parsed_root = top.parse_file(tl_heap, src, file_size, norm);
+
+    // Save module src/tokens for error reporting
+    mod.last_loaded_src = src;
+    mod.last_loaded_src_len = file_size;
+    mod.last_loaded_tl = cast(*u8, tl_heap);
+    mod.last_loaded_filename = norm;
+
+    return cast(*u8, parsed_root);
 }
 
 // === Generic struct instantiation wrapper ===
@@ -104,7 +115,7 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_IDENT) {
         let is *d.Variable as var = sc.lookup_var(node.name_ptr, node.name_len);
         if (cast(i64, var) == 0) {
-            sc.sem_error2("variavel nao declarada", node.name_ptr, node.name_len);
+            sc.sem_error_at2(node, "variavel nao declarada", node.name_ptr, node.name_len);
         }
         node.ty = cast(*ast.Type, var.ty);
         node.var_offset = var.offset;
@@ -129,13 +140,13 @@ fn walk(node as *ast.Node) as void {
             }
             if (ty.is_safe_conversion(cast(*u8, node.expr.ty), sc.current_return_type) == 0) {
                 if (node.expr.kind != ast.NK_NUM || ty.can_narrow_literal(node.expr.val, sc.current_return_type) == 0) {
-                    sc.sem_error("tipo de retorno incompativel");
+                    sc.sem_error_at(node, "tipo de retorno incompativel");
                 }
             }
         } else {
             let is *ast.Type as rt = cast(*ast.Type, sc.current_return_type);
             if (cast(i64, rt) != cast(i64, ast.type_void)) {
-                sc.sem_error("retorno vazio em funcao nao-void");
+                sc.sem_error_at(node, "retorno vazio em funcao nao-void");
             }
         }
         return;
@@ -191,7 +202,7 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_LET) {
         resolve_type(cast(*u8, node.ty));
         if (node.ty.kind == ast.TY_VOID) {
-            sc.sem_error2("variavel nao pode ser void", node.name_ptr, node.name_len);
+            sc.sem_error_at2(node, "variavel nao pode ser void", node.name_ptr, node.name_len);
         }
         if (node.is_extern == 1) {
             let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
@@ -217,7 +228,7 @@ fn walk(node as *ast.Node) as void {
                 if (init_ty.kind == ast.TY_PTR && decl_ty.kind == ast.TY_PTR) { both_ptr = 1; }
                 if (both_ptr == 0) {
                     if (ty.is_safe_conversion(cast(*u8, init_ty), cast(*u8, decl_ty)) == 0) {
-                        sc.sem_error2("tipo incompativel na inicializacao de", node.name_ptr, node.name_len);
+                        sc.sem_error_at2(node, "tipo incompativel na inicializacao de", node.name_ptr, node.name_len);
                     }
                 }
             }
@@ -254,13 +265,13 @@ fn walk(node as *ast.Node) as void {
                 return;
             }
             if (node.rhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.lhs.ty)) == 1) {
-                if (k == ast.NK_SUB) { sc.sem_error("subtracao int - ptr invalida"); }
+                if (k == ast.NK_SUB) { sc.sem_error_at(node, "subtracao int - ptr invalida"); }
                 node.ty = node.rhs.ty;
                 return;
             }
             if (node.lhs.ty.kind == ast.TY_PTR && node.rhs.ty.kind == ast.TY_PTR) {
                 if (k == ast.NK_SUB) { node.ty = ast.type_i64; return; }
-                sc.sem_error("soma de dois ponteiros invalida");
+                sc.sem_error_at(node, "soma de dois ponteiros invalida");
             }
         }
         // Choose wider type
@@ -302,7 +313,7 @@ fn walk(node as *ast.Node) as void {
     // --- DEFER ---
     if (k == ast.NK_DEFER) {
         if (node.expr.kind != ast.NK_FNCALL) {
-            sc.sem_error("defer so aceita chamadas de funcao");
+            sc.sem_error_at(node, "defer so aceita chamadas de funcao");
         }
         walk(node.expr);
         return;
@@ -310,11 +321,11 @@ fn walk(node as *ast.Node) as void {
 
     // --- BREAK / CONTINUE ---
     if (k == ast.NK_BREAK) {
-        if (sc.loop_depth == 0) { sc.sem_error("break fora de loop"); }
+        if (sc.loop_depth == 0) { sc.sem_error_at(node, "break fora de loop"); }
         return;
     }
     if (k == ast.NK_CONTINUE) {
-        if (sc.loop_depth == 0) { sc.sem_error("continue fora de loop"); }
+        if (sc.loop_depth == 0) { sc.sem_error_at(node, "continue fora de loop"); }
         return;
     }
 
@@ -371,7 +382,7 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_DEREF) {
         walk(node.expr);
         if (node.expr.ty.kind != ast.TY_PTR) {
-            sc.sem_error("operador * requer ponteiro");
+            sc.sem_error_at(node, "operador * requer ponteiro");
         }
         node.ty = node.expr.ty.base;
         return;
@@ -403,7 +414,7 @@ fn walk(node as *ast.Node) as void {
         walk(node.lhs);
         walk(node.rhs);
         if (node.lhs.ty.kind != ast.TY_ARRAY && node.lhs.ty.kind != ast.TY_PTR) {
-            sc.sem_error("indexacao requer array ou ponteiro");
+            sc.sem_error_at(node, "indexacao requer array ou ponteiro");
         }
         node.ty = node.lhs.ty.base;
         return;
@@ -416,13 +427,13 @@ fn walk(node as *ast.Node) as void {
         // Check lvalue
         let is i32 as lk = node.lhs.kind;
         if (lk != ast.NK_IDENT && lk != ast.NK_DEREF && lk != ast.NK_INDEX && lk != ast.NK_MEMBER) {
-            sc.sem_error("alvo de atribuicao invalido");
+            sc.sem_error_at(node, "alvo de atribuicao invalido");
         }
         // Check immutability for identifiers
         if (lk == ast.NK_IDENT) {
             let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
             if (cast(i64, var) != 0 && var.flags != ast.VF_MUT) {
-                sc.sem_error2("nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
+                sc.sem_error_at2(node, "nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
             }
         }
         // Literal narrowing
@@ -540,7 +551,7 @@ fn walk_fncall(node as *ast.Node) as void {
             }
         }
         if (cast(i64, func) == 0) {
-            sc.sem_error2("funcao nao declarada", node.lhs.name_ptr, node.lhs.name_len);
+            sc.sem_error_at2(node, "funcao nao declarada", node.lhs.name_ptr, node.lhs.name_len);
         }
     }
     // Case 2: Member access call (mod.func() or Type.new() or obj.method())
@@ -555,7 +566,7 @@ fn walk_fncall(node as *ast.Node) as void {
                 let is *d.Module as modd = cast(*d.Module, var.module_ref);
                 func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, modd.prefix_ptr, modd.prefix_len);
                 if (cast(i64, func) == 0) {
-                    sc.sem_error3("funcao nao encontrada no modulo", lhs_expr.name_ptr, lhs_expr.name_len, node.lhs.member_ptr, node.lhs.member_len);
+                    sc.sem_error_at(node, "funcao nao encontrada no modulo");
                 }
             } else if (cast(i64, var) == 0) {
                 // Associated function: Type.new() or Type.method()
@@ -570,10 +581,10 @@ fn walk_fncall(node as *ast.Node) as void {
                     let is *u8 as afname = d.str_concat3(st.name_ptr, st.name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &aflen);
                     func = sc.lookup_fn(afname, aflen);
                     if (cast(i64, func) == 0) {
-                        sc.sem_error2("funcao associada nao encontrada", afname, aflen);
+                        sc.sem_error_at2(node, "funcao associada nao encontrada", afname, aflen);
                     }
                 } else {
-                    sc.sem_error2("nao e modulo, variavel ou tipo", lhs_expr.name_ptr, lhs_expr.name_len);
+                    sc.sem_error_at2(node, "nao e modulo, variavel ou tipo", lhs_expr.name_ptr, lhs_expr.name_len);
                 }
             } else {
                 // Method call: obj.method(args) -> Type_method(&obj, args)
@@ -623,17 +634,17 @@ fn walk_fncall(node as *ast.Node) as void {
                         self_arg.next = node.args;
                         node.args = self_arg;
                     } else {
-                        sc.sem_error3("metodo nao encontrado", base_ty.name_ptr, base_ty.name_len, node.lhs.member_ptr, node.lhs.member_len);
+                        sc.sem_error_at(node, "metodo nao encontrado");
                     }
                 } else {
-                    sc.sem_error("chamada de metodo em tipo nao suportado");
+                    sc.sem_error_at(node, "chamada de metodo em tipo nao suportado");
                 }
             }
         } else {
-            sc.sem_error("chamada em expressao complexa nao suportada");
+            sc.sem_error_at(node, "chamada em expressao complexa nao suportada");
         }
     } else {
-        sc.sem_error("tipo de chamada invalido");
+        sc.sem_error_at(node, "tipo de chamada invalido");
     }
 
     // Set return type and asm_name
@@ -650,11 +661,11 @@ fn walk_fncall(node as *ast.Node) as void {
 
     if (func.is_variadic == 1) {
         if (arg_count < func.param_count) {
-            sc.sem_error2("poucos argumentos para funcao", func.name_ptr, func.name_len);
+            sc.sem_error_at2(node, "poucos argumentos para funcao", func.name_ptr, func.name_len);
         }
     } else {
         if (arg_count != func.param_count) {
-            sc.sem_error2("numero incorreto de argumentos para funcao", func.name_ptr, func.name_len);
+            sc.sem_error_at2(node, "numero incorreto de argumentos para funcao", func.name_ptr, func.name_len);
         }
     }
 
@@ -695,7 +706,7 @@ fn walk_enum_constructor(node as *ast.Node, enum_ty as *ast.Type) as void {
         variant = variant.next;
     }
     if (cast(i64, variant) == 0) {
-        sc.sem_error2("variante nao existe no enum", variant_ptr, variant_len);
+        sc.sem_error_at2(node, "variante nao existe no enum", variant_ptr, variant_len);
     }
 
     // Walk args
@@ -720,7 +731,7 @@ fn walk_match(node as *ast.Node) as void {
 
     let is *ast.Type as mt = node.match_type;
     if (mt.kind != ast.TY_ENUM) {
-        sc.sem_error("match requer tipo enum");
+        sc.sem_error_at(node, "match requer tipo enum");
     }
 
     let is *ast.Node as c with mut = node.cases;
@@ -734,7 +745,7 @@ fn walk_match(node as *ast.Node) as void {
             variant = variant.next;
         }
         if (cast(i64, variant) == 0) {
-            sc.sem_error2("variante nao existe no enum (match)", c.name_ptr, c.name_len);
+            sc.sem_error_at2(node, "variante nao existe no enum (match)", c.name_ptr, c.name_len);
         }
         c.val = cast(i64, variant.discriminant);
 
@@ -742,7 +753,7 @@ fn walk_match(node as *ast.Node) as void {
         sc.enter_scope();
         if (cast(i64, c.params) != 0) {
             if (cast(i64, variant.ty) == 0) {
-                sc.sem_error2("variante sem dados para destructuring", c.name_ptr, c.name_len);
+                sc.sem_error_at2(node, "variante sem dados para destructuring", c.name_ptr, c.name_len);
             }
             let is *ast.Type as vty = variant.ty;
             if (vty.kind == ast.TY_STRUCT && cast(i64, vty.fields) != 0) {
@@ -803,7 +814,7 @@ fn walk_member(node as *ast.Node) as void {
                     variant = variant.next;
                 }
                 if (cast(i64, variant) == 0) {
-                    sc.sem_error2("variante nao existe no enum", node.member_ptr, node.member_len);
+                    sc.sem_error_at2(node, "variante nao existe no enum", node.member_ptr, node.member_len);
                 }
                 node.kind = ast.NK_ENUM_LIT;
                 node.ty = et;
@@ -842,7 +853,7 @@ fn walk_member(node as *ast.Node) as void {
                 }
                 mv = mv.next;
             }
-            sc.sem_error3("membro nao encontrado no modulo", node.lhs.name_ptr, node.lhs.name_len, node.member_ptr, node.member_len);
+            sc.sem_error_at(node, "membro nao encontrado no modulo");
         }
     }
 
@@ -851,7 +862,7 @@ fn walk_member(node as *ast.Node) as void {
     let is *ast.Type as struct_ty with mut = node.lhs.ty;
     if (struct_ty.kind == ast.TY_PTR) { struct_ty = struct_ty.base; }
     if (struct_ty.kind != ast.TY_STRUCT) {
-        sc.sem_error("operador . requer struct");
+        sc.sem_error_at(node, "operador . requer struct");
     }
 
     let is *ast.Node as field with mut = cast(*ast.Node, struct_ty.fields);
@@ -863,7 +874,7 @@ fn walk_member(node as *ast.Node) as void {
         }
         field = field.next;
     }
-    sc.sem_error3("membro nao encontrado em struct", struct_ty.name_ptr, struct_ty.name_len, node.member_ptr, node.member_len);
+    sc.sem_error_at2(node, "membro nao encontrado em struct", node.member_ptr, node.member_len);
 }
 
 // === FN_PTR handler ===
@@ -913,7 +924,7 @@ fn walk_fn_ptr_node(node as *ast.Node) as void {
     }
 
     if (cast(i64, func) == 0) {
-        sc.sem_error2("funcao nao encontrada (fn_ptr)", node.name_ptr, node.name_len);
+        sc.sem_error_at2(node, "funcao nao encontrada (fn_ptr)", node.name_ptr, node.name_len);
     }
 
     let is *ast.Type as p = ast.new_type(ast.TY_PTR);
@@ -960,6 +971,9 @@ fn register_structs(node as *u8) as void {
                         mm.prefix_ptr = d.str_dup(prefix, plen);
                         mm.prefix_len = plen;
                         mm.body = body;
+                        mm.src_ptr = mod.last_loaded_src;
+                        mm.src_size = mod.last_loaded_src_len;
+                        mm.token_list = mod.last_loaded_tl;
                         // Store source dir from normalized path
                         let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
                         if (sd_len > 0) {
@@ -1083,6 +1097,9 @@ fn register_aliases(node as *u8) as void {
                     modd.prefix_len = plen;
                     modd.scope = mod_scope;
                     modd.body = mod_body;
+                    modd.src_ptr = mod.last_loaded_src;
+                    modd.src_size = mod.last_loaded_src_len;
+                    modd.token_list = mod.last_loaded_tl;
                     let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
                     if (sd_len > 0) {
                         modd.source_dir_ptr = d.str_dup(norm, sd_len);
@@ -1305,6 +1322,10 @@ fn analyze_bodies(node as *u8) as void {
                 let is i32 as old_plen = sc.current_mod_prefix_len;
                 let is *u8 as old_dir = sc.current_source_dir_ptr;
                 let is i32 as old_dir_len = sc.current_source_dir_len;
+                let is *u8 as old_sem_src = sc.sem_src;
+                let is i64 as old_sem_src_len = sc.sem_src_len;
+                let is *u8 as old_sem_fn = sc.sem_filename;
+                let is *u8 as old_sem_tl = sc.sem_token_list;
                 sc.current_mod_prefix_ptr = prefix;
                 sc.current_mod_prefix_len = plen;
 
@@ -1322,6 +1343,12 @@ fn analyze_bodies(node as *u8) as void {
                     cached.bodies_done = 1;
                     sc.current_source_dir_ptr = cached.source_dir_ptr;
                     sc.current_source_dir_len = cached.source_dir_len;
+                    // Switch error reporting context to module
+                    if (cast(i64, cached.src_ptr) != 0) {
+                        sc.sem_src = cached.src_ptr;
+                        sc.sem_src_len = cached.src_size;
+                        sc.sem_token_list = cached.token_list;
+                    }
                     analyze_bodies(cached.body);
                 }
 
@@ -1330,6 +1357,10 @@ fn analyze_bodies(node as *u8) as void {
                 sc.current_mod_prefix_len = old_plen;
                 sc.current_source_dir_ptr = old_dir;
                 sc.current_source_dir_len = old_dir_len;
+                sc.sem_src = old_sem_src;
+                sc.sem_src_len = old_sem_src_len;
+                sc.sem_filename = old_sem_fn;
+                sc.sem_token_list = old_sem_tl;
             }
         } else if (n.kind == ast.NK_FN) {
             if (n.generic_param_count == 0 && n.is_extern == 0) {
@@ -1342,11 +1373,17 @@ fn analyze_bodies(node as *u8) as void {
 
 // === Entry point ===
 
-fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32) as void {
+fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, src_len as i64, tl as *u8) as void {
     sc.symtab_init();
     ty.types_init();
     gn.generics_init();
     mod.modules_init();
+
+    // Set error reporting context
+    sc.sem_src = src;
+    sc.sem_src_len = src_len;
+    sc.sem_filename = filename_ptr;
+    sc.sem_token_list = tl;
 
     // Set initial source directory from filename
     let is i32 as dir_len = sc.get_dir_len(filename_ptr, filename_len);
