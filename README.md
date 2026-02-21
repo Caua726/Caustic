@@ -2,19 +2,60 @@
 
 Self-hosted x86_64 Linux compiler — no LLVM, no libc, no runtime.
 
-The entire toolchain (compiler, assembler, linker) is written in Caustic itself.
+The entire toolchain (compiler, assembler, linker, build system) is written in Caustic itself.
 
-## Build & Run
+## Build
+
+Bootstrap the build system:
 
 ```sh
-make
+./caustic caustic-maker/main.cst
+./caustic-as caustic-maker/main.cst.s
+./caustic-ld caustic-maker/main.cst.s.o -o caustic-mk
 ```
 
-Compile a program:
+Then use `caustic-mk` for everything:
 
 ```sh
-./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program
-./program
+./caustic-mk build caustic       # compiler
+./caustic-mk build caustic-as    # assembler
+./caustic-mk build caustic-ld    # linker
+./caustic-mk build caustic-mk    # build system itself
+```
+
+Compile and run a program:
+
+```sh
+./caustic-mk build hello
+./build/hello
+```
+
+Other commands:
+
+```sh
+./caustic-mk run <name>          # run a script or target binary
+./caustic-mk test                # run the "test" script
+./caustic-mk clean               # remove .caustic/ and build/
+./caustic-mk init                # create a new Causticfile
+```
+
+### Causticfile
+
+Projects are configured via a `Causticfile`:
+
+```
+name "myproject"
+version "0.1.0"
+author "Name"
+
+target "myapp" {
+    src "src/main.cst"
+    out "myapp"
+}
+
+script "test" {
+    "bash run_tests.sh"
+}
 ```
 
 ## Capabilities
@@ -45,6 +86,7 @@ Compile a program:
   - [x] **Self-Hosted Compiler**
   - [x] **Assembler** (caustic-as)
   - [x] **Linker** (caustic-ld, static & dynamic)
+  - [x] **Build System** (caustic-mk)
   - [ ] **Optimization**
 
 ### Syntax Dump
