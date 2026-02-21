@@ -29,12 +29,12 @@ Compile a program:
 - [x] **Module System**
 - [x] **Functions**
 - [x] **Floats** (f32, f64 via SSE)
-- [-] **Standard Library**
+- [x] **Standard Library**
   - [x] **Memory Management**
   - [x] **Dynamic Strings**
   - [x] **String Operations** (eq, starts_with, ends_with, contains, char_at, parse_int)
   - [x] **Option & Result Types**
-  - [-] **IO Library**
+  - [x] **IO Library**
 - [-] **Language Extensions**
   - [x] **Generics**
   - [x] **Enums & Pattern Matching**
@@ -197,3 +197,10 @@ fn main() as i32 {
     return 0;
 }
 ```
+
+## Documentation
+
+Full documentation is available in [`docs/`](docs/README.md):
+
+- **[Guide](docs/README.md#guide)** — Learn the language from scratch
+- **[Reference](docs/README.md#reference)** — Compiler internals, IR, codegen, assembler, linker
