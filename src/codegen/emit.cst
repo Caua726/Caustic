@@ -1,0 +1,982 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "../io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../ir/defs.cst" as d;
+use "alloc.cst" as al;
+
+// === Output buffer ===
+let is *u8 as out_buf with mut;
+let is i64 as out_len with mut;
+let is i64 as out_cap with mut;
+let is i32 as out_fd with mut;
+
+fn out_init(fd as i32) as void {
+    out_cap = 4194304; // 4MB
+    out_buf = mem.galloc(out_cap);
+    out_len = 0;
+    out_fd = fd;
+}
+
+fn out_flush() as void {
+    if (out_len > 0) {
+        linux.write(cast(i64, out_fd), out_buf, out_len);
+        out_len = 0;
+    }
+}
+
+fn out_ensure(n as i64) as void {
+    if (out_len + n >= out_cap) {
+        out_flush();
+    }
+}
+
+fn out_char(c as u8) as void {
+    out_ensure(1);
+    out_buf[out_len] = c;
+    out_len = out_len + 1;
+}
+
+fn out_str(s as *u8, n as i32) as void {
+    out_ensure(cast(i64, n));
+    mem.memcpy(cast(*u8, cast(i64, out_buf) + out_len), s, cast(i64, n));
+    out_len = out_len + cast(i64, n);
+}
+
+fn out_cstr(s as *u8) as void {
+    let is i32 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    out_str(s, i);
+}
+
+fn out_int(n as i64) as void {
+    if (n == 0) { out_char(48); return; }
+    let is i64 as val with mut = n;
+    let is i32 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is [24]u8 as buf;
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    out_str(cast(*u8, cast(i64, &buf) + cast(i64, pos) + 1), 23 - pos);
+}
+
+fn out_line(s as *u8) as void {
+    out_cstr("  ");
+    out_cstr(s);
+    out_char(10);
+}
+
+fn out_line2(a as *u8, b as *u8) as void {
+    out_cstr("  ");
+    out_cstr(a);
+    out_cstr(b);
+    out_char(10);
+}
+
+fn out_line3(a as *u8, b as *u8, c as *u8) as void {
+    out_cstr("  ");
+    out_cstr(a);
+    out_cstr(b);
+    out_cstr(c);
+    out_char(10);
+}
+
+// === Register name tables ===
+// regs[0..11] = rax,rcx,rdx,rbx,rsi,rdi,r8,r9,r10,r11,r12,r13
+
+fn reg64(idx as i32) as *u8 {
+    if (idx == 0) { return "rax"; }
+    if (idx == 1) { return "rcx"; }
+    if (idx == 2) { return "rdx"; }
+    if (idx == 3) { return "rbx"; }
+    if (idx == 4) { return "rsi"; }
+    if (idx == 5) { return "rdi"; }
+    if (idx == 6) { return "r8"; }
+    if (idx == 7) { return "r9"; }
+    if (idx == 8) { return "r10"; }
+    if (idx == 9) { return "r11"; }
+    if (idx == 10) { return "r12"; }
+    if (idx == 11) { return "r13"; }
+    return "rax";
+}
+
+fn reg32(idx as i32) as *u8 {
+    if (idx == 0) { return "eax"; }
+    if (idx == 1) { return "ecx"; }
+    if (idx == 2) { return "edx"; }
+    if (idx == 3) { return "ebx"; }
+    if (idx == 4) { return "esi"; }
+    if (idx == 5) { return "edi"; }
+    if (idx == 6) { return "r8d"; }
+    if (idx == 7) { return "r9d"; }
+    if (idx == 8) { return "r10d"; }
+    if (idx == 9) { return "r11d"; }
+    if (idx == 10) { return "r12d"; }
+    if (idx == 11) { return "r13d"; }
+    return "eax";
+}
+
+fn reg16(idx as i32) as *u8 {
+    if (idx == 0) { return "ax"; }
+    if (idx == 1) { return "cx"; }
+    if (idx == 2) { return "dx"; }
+    if (idx == 3) { return "bx"; }
+    if (idx == 4) { return "si"; }
+    if (idx == 5) { return "di"; }
+    if (idx == 6) { return "r8w"; }
+    if (idx == 7) { return "r9w"; }
+    if (idx == 8) { return "r10w"; }
+    if (idx == 9) { return "r11w"; }
+    if (idx == 10) { return "r12w"; }
+    if (idx == 11) { return "r13w"; }
+    return "ax";
+}
+
+fn reg8(idx as i32) as *u8 {
+    if (idx == 0) { return "al"; }
+    if (idx == 1) { return "cl"; }
+    if (idx == 2) { return "dl"; }
+    if (idx == 3) { return "bl"; }
+    if (idx == 4) { return "sil"; }
+    if (idx == 5) { return "dil"; }
+    if (idx == 6) { return "r8b"; }
+    if (idx == 7) { return "r9b"; }
+    if (idx == 8) { return "r10b"; }
+    if (idx == 9) { return "r11b"; }
+    if (idx == 10) { return "r12b"; }
+    if (idx == 11) { return "r13b"; }
+    return "al";
+}
+
+fn arg_reg64(idx as i32) as *u8 {
+    if (idx == 0) { return "rdi"; }
+    if (idx == 1) { return "rsi"; }
+    if (idx == 2) { return "rdx"; }
+    if (idx == 3) { return "rcx"; }
+    if (idx == 4) { return "r8"; }
+    if (idx == 5) { return "r9"; }
+    return "rax";
+}
+
+fn syscall_reg(idx as i32) as *u8 {
+    if (idx == 0) { return "rax"; }
+    if (idx == 1) { return "rdi"; }
+    if (idx == 2) { return "rsi"; }
+    if (idx == 3) { return "rdx"; }
+    if (idx == 4) { return "r10"; }
+    if (idx == 5) { return "r8"; }
+    if (idx == 6) { return "r9"; }
+    return "rax";
+}
+
+// === Operand helpers ===
+// load vreg value into target register
+
+fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 0) {
+        let is *u8 as rn = reg64(loc);
+        if (cast(i64, rn) != cast(i64, target)) {
+            out_cstr("  mov ");
+            out_cstr(target);
+            out_cstr(", ");
+            out_cstr(rn);
+            out_char(10);
+        }
+    } else {
+        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        out_cstr("  mov ");
+        out_cstr(target);
+        out_cstr(", QWORD PTR [rbp-");
+        out_int(off);
+        out_cstr("]\n");
+    }
+}
+
+fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 0) {
+        let is *u8 as rn = reg64(loc);
+        if (cast(i64, rn) != cast(i64, source)) {
+            out_cstr("  mov ");
+            out_cstr(rn);
+            out_cstr(", ");
+            out_cstr(source);
+            out_char(10);
+        }
+    } else {
+        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        out_cstr("  mov QWORD PTR [rbp-");
+        out_int(off);
+        out_cstr("], ");
+        out_cstr(source);
+        out_char(10);
+    }
+}
+
+// Emit "  mov DST_LOC, IMM" handling 64-bit large immediates
+fn emit_mov_imm(vreg as i32, ctx as *al.AllocCtx, val as i64) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    let is i32 as is_large with mut = 0;
+    if (val > 2147483647 || val < 0 - 2147483647) { is_large = 1; }
+    if (loc >= 0) {
+        if (is_large == 1) {
+            out_cstr("  mov ");
+            out_cstr(reg64(loc));
+            out_cstr(", ");
+            out_int(val);
+            out_char(10);
+        } else {
+            out_cstr("  mov ");
+            out_cstr(reg64(loc));
+            out_cstr(", ");
+            out_int(val);
+            out_char(10);
+        }
+    } else {
+        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        if (is_large == 1) {
+            out_cstr("  mov r15, ");
+            out_int(val);
+            out_char(10);
+            out_cstr("  mov QWORD PTR [rbp-");
+            out_int(off);
+            out_cstr("], r15\n");
+        } else {
+            out_cstr("  mov QWORD PTR [rbp-");
+            out_int(off);
+            out_cstr("], ");
+            out_int(val);
+            out_char(10);
+        }
+    }
+}
+
+fn get_type_size(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 8; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    return ty.size;
+}
+
+fn is_signed_type(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 1; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    let is i32 as k = ty.kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    if (k == ast.TY_CHAR) { return 0; }
+    return 0;
+}
+
+fn is_float_type(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 0; }
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    if (ty.kind == ast.TY_F32 || ty.kind == ast.TY_F64) { return 1; }
+    return 0;
+}
+
+// === gen_inst ===
+
+fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as op = inst.op;
+
+    // IR_IMM
+    if (op == d.IR_IMM) {
+        emit_mov_imm(inst.dest.vreg, ctx, inst.src1.imm);
+        return;
+    }
+
+    // IR_MOV
+    if (op == d.IR_MOV) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+
+    // Binary ops: ADD, SUB, MUL
+    if (op == d.IR_ADD) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        load_op(inst.src2.vreg, ctx, "r14");
+        out_line("add r15, r14");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_SUB) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        load_op(inst.src2.vreg, ctx, "r14");
+        out_line("sub r15, r14");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_MUL) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        load_op(inst.src2.vreg, ctx, "r14");
+        out_line("imul r15, r14");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_DIV) {
+        load_op(inst.src1.vreg, ctx, "rax");
+        load_op(inst.src2.vreg, ctx, "r15");
+        out_line("push rdx");
+        if (is_signed_type(inst.cast_to) == 1) {
+            out_line("cqo");
+            out_line("idiv r15");
+        } else {
+            out_line("xor rdx, rdx");
+            out_line("div r15");
+        }
+        out_line("mov r15, rax");
+        out_line("pop rdx");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_MOD) {
+        load_op(inst.src1.vreg, ctx, "rax");
+        load_op(inst.src2.vreg, ctx, "r15");
+        out_line("push rdx");
+        if (is_signed_type(inst.cast_to) == 1) {
+            out_line("cqo");
+            out_line("idiv r15");
+        } else {
+            out_line("xor rdx, rdx");
+            out_line("div r15");
+        }
+        out_line("mov r15, rdx");
+        out_line("pop rdx");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_NEG) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_line("neg r15");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+
+    // Float arithmetic (SSE)
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV) {
+        load_op(inst.src1.vreg, ctx, "r14");
+        load_op(inst.src2.vreg, ctx, "r15");
+        out_line("movq xmm0, r14");
+        out_line("movq xmm1, r15");
+        if (op == d.IR_FADD) { out_line("addsd xmm0, xmm1"); }
+        if (op == d.IR_FSUB) { out_line("subsd xmm0, xmm1"); }
+        if (op == d.IR_FMUL) { out_line("mulsd xmm0, xmm1"); }
+        if (op == d.IR_FDIV) { out_line("divsd xmm0, xmm1"); }
+        out_line("movq r14, xmm0");
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+    if (op == d.IR_FNEG) {
+        load_op(inst.src1.vreg, ctx, "r14");
+        out_line("movq xmm0, r14");
+        out_line("mov r15, 0x8000000000000000");
+        out_line("movq xmm1, r15");
+        out_line("xorpd xmm0, xmm1");
+        out_line("movq r14, xmm0");
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+
+    // Comparisons
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        load_op(inst.src2.vreg, ctx, "r14");
+        out_line("xor rax, rax");
+        out_line("cmp r15, r14");
+        if (op == d.IR_EQ) { out_line("sete al"); }
+        if (op == d.IR_NE) { out_line("setne al"); }
+        let is i32 as sgn = is_signed_type(inst.cast_to);
+        if (op == d.IR_LT) { if (sgn == 1) { out_line("setl al"); } else { out_line("setb al"); } }
+        if (op == d.IR_LE) { if (sgn == 1) { out_line("setle al"); } else { out_line("setbe al"); } }
+        if (op == d.IR_GT) { if (sgn == 1) { out_line("setg al"); } else { out_line("seta al"); } }
+        if (op == d.IR_GE) { if (sgn == 1) { out_line("setge al"); } else { out_line("setae al"); } }
+        store_op(inst.dest.vreg, ctx, "rax");
+        return;
+    }
+
+    // Shifts
+    if (op == d.IR_SHL) {
+        load_op(inst.src2.vreg, ctx, "rcx");
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_line("shl r15, cl");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_SHR) {
+        load_op(inst.src2.vreg, ctx, "rcx");
+        load_op(inst.src1.vreg, ctx, "r15");
+        if (is_signed_type(inst.cast_to) == 1) {
+            out_line("sar r15, cl");
+        } else {
+            out_line("shr r15, cl");
+        }
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+
+    // Bitwise
+    if (op == d.IR_AND) {
+        load_op(inst.src1.vreg, ctx, "r14");
+        load_op(inst.src2.vreg, ctx, "r15");
+        out_line("and r14, r15");
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+    if (op == d.IR_OR) {
+        load_op(inst.src1.vreg, ctx, "r14");
+        load_op(inst.src2.vreg, ctx, "r15");
+        out_line("or r14, r15");
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+    if (op == d.IR_XOR) {
+        load_op(inst.src1.vreg, ctx, "r14");
+        load_op(inst.src2.vreg, ctx, "r15");
+        out_line("xor r14, r15");
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+    if (op == d.IR_NOT) {
+        load_op(inst.src1.vreg, ctx, "r14");
+        out_line("not r14");
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+
+    // Control flow
+    if (op == d.IR_RET) {
+        if (inst.src1.op_type != d.OP_NONE) {
+            load_op(inst.src1.vreg, ctx, "rax");
+        }
+        if (ctx.aligned_stack_size > 0) {
+            out_cstr("  add rsp, ");
+            out_int(cast(i64, ctx.aligned_stack_size));
+            out_char(10);
+        }
+        out_line("pop r15");
+        out_line("pop r14");
+        out_line("pop r13");
+        out_line("pop r12");
+        out_line("pop rbx");
+        out_line("pop rbp");
+        out_line("ret");
+        return;
+    }
+    if (op == d.IR_LABEL) {
+        out_cstr(".L");
+        out_int(cast(i64, inst.dest.label));
+        out_cstr(":\n");
+        return;
+    }
+    if (op == d.IR_JMP) {
+        out_cstr("  jmp .L");
+        out_int(cast(i64, inst.dest.label));
+        out_char(10);
+        return;
+    }
+    if (op == d.IR_JZ) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_line("test r15, r15");
+        out_cstr("  jz .L");
+        out_int(cast(i64, inst.dest.label));
+        out_char(10);
+        return;
+    }
+    if (op == d.IR_JNZ) {
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_line("test r15, r15");
+        out_cstr("  jnz .L");
+        out_int(cast(i64, inst.dest.label));
+        out_char(10);
+        return;
+    }
+
+    // Memory
+    if (op == d.IR_ADDR) {
+        out_cstr("  lea r15, [rbp-");
+        out_int(inst.src1.imm);
+        out_cstr("]\n");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_ADDR_GLOBAL) {
+        if (inst.is_extern_global == 1) {
+            out_cstr("  mov r15, QWORD PTR [rip+");
+            out_str(inst.global_name_ptr, inst.global_name_len);
+            out_cstr("]\n");
+        } else {
+            out_cstr("  lea r15, [rip+");
+            out_str(inst.global_name_ptr, inst.global_name_len);
+            out_cstr("]\n");
+        }
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_FN_ADDR) {
+        out_cstr("  lea r15, [rip+");
+        out_str(inst.global_name_ptr, inst.global_name_len);
+        out_cstr("]\n");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_GET_ALLOC_ADDR) {
+        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, ctx.stack_slots) * 8 + inst.src1.imm;
+        out_cstr("  lea r15, [rbp-");
+        out_int(off);
+        out_cstr("]\n");
+        store_op(inst.dest.vreg, ctx, "r15");
+        return;
+    }
+    if (op == d.IR_SET_CTX) {
+        if (inst.src1.op_type == d.OP_IMM) {
+            out_line("xor r10, r10");
+        } else {
+            load_op(inst.src1.vreg, ctx, "r10");
+        }
+        return;
+    }
+
+    // LOAD
+    if (op == d.IR_LOAD) {
+        let is i32 as sz = get_type_size(inst.cast_to);
+        let is i32 as sgn = is_signed_type(inst.cast_to);
+        if (inst.src1.op_type == d.OP_VREG) {
+            load_op(inst.src1.vreg, ctx, "r15");
+            if (sz == 8) {
+                out_line("mov r15, QWORD PTR [r15]");
+            } else if (sz == 4) {
+                if (sgn == 1) { out_line("movsxd r15, DWORD PTR [r15]"); }
+                else { out_line("mov r15d, DWORD PTR [r15]"); }
+            } else if (sz == 2) {
+                if (sgn == 1) { out_line("movsx r15, WORD PTR [r15]"); }
+                else { out_line("movzx r15, WORD PTR [r15]"); }
+            } else if (sz == 1) {
+                if (sgn == 1) { out_line("movsx r15, BYTE PTR [r15]"); }
+                else { out_line("movzx r15, BYTE PTR [r15]"); }
+            } else {
+                out_line("mov r15, QWORD PTR [r15]");
+            }
+            store_op(inst.dest.vreg, ctx, "r15");
+        } else {
+            // Stack offset (IMM)
+            if (sz == 8) {
+                out_cstr("  mov r15, QWORD PTR [rbp-");
+                out_int(inst.src1.imm);
+                out_cstr("]\n");
+            } else if (sz == 4) {
+                if (sgn == 1) {
+                    out_cstr("  movsxd r15, DWORD PTR [rbp-");
+                } else {
+                    out_cstr("  mov r15d, DWORD PTR [rbp-");
+                }
+                out_int(inst.src1.imm);
+                out_cstr("]\n");
+            } else if (sz == 2) {
+                if (sgn == 1) { out_cstr("  movsx r15, WORD PTR [rbp-"); }
+                else { out_cstr("  movzx r15, WORD PTR [rbp-"); }
+                out_int(inst.src1.imm);
+                out_cstr("]\n");
+            } else if (sz == 1) {
+                if (sgn == 1) { out_cstr("  movsx r15, BYTE PTR [rbp-"); }
+                else { out_cstr("  movzx r15, BYTE PTR [rbp-"); }
+                out_int(inst.src1.imm);
+                out_cstr("]\n");
+            } else {
+                out_cstr("  mov r15, QWORD PTR [rbp-");
+                out_int(inst.src1.imm);
+                out_cstr("]\n");
+            }
+            store_op(inst.dest.vreg, ctx, "r15");
+        }
+        return;
+    }
+
+    // STORE
+    if (op == d.IR_STORE) {
+        let is i32 as sz = get_type_size(inst.cast_to);
+        load_op(inst.src1.vreg, ctx, "rax");
+        if (inst.dest.op_type == d.OP_VREG) {
+            load_op(inst.dest.vreg, ctx, "r15");
+            if (sz == 8) { out_line("mov QWORD PTR [r15], rax"); }
+            else if (sz == 4) { out_line("mov DWORD PTR [r15], eax"); }
+            else if (sz == 2) { out_line("mov WORD PTR [r15], ax"); }
+            else if (sz == 1) { out_line("mov BYTE PTR [r15], al"); }
+            else { out_line("mov QWORD PTR [r15], rax"); }
+        } else {
+            // Stack offset (IMM)
+            if (sz == 8) {
+                out_cstr("  mov QWORD PTR [rbp-");
+                out_int(inst.dest.imm);
+                out_cstr("], rax\n");
+            } else if (sz == 4) {
+                out_cstr("  mov DWORD PTR [rbp-");
+                out_int(inst.dest.imm);
+                out_cstr("], eax\n");
+            } else if (sz == 2) {
+                out_cstr("  mov WORD PTR [rbp-");
+                out_int(inst.dest.imm);
+                out_cstr("], ax\n");
+            } else if (sz == 1) {
+                out_cstr("  mov BYTE PTR [rbp-");
+                out_int(inst.dest.imm);
+                out_cstr("], al\n");
+            } else {
+                // Struct > 8 bytes: rax is a pointer to the struct data.
+                // Copy from [rax] to [rbp-dest] using r15 as scratch.
+                out_line("mov r15, rax");
+                let is i32 as soff with mut = 0;
+                while (soff + 8 <= sz) {
+                    out_cstr("  mov rax, QWORD PTR [r15+");
+                    out_int(cast(i64, soff));
+                    out_cstr("]\n");
+                    out_cstr("  mov QWORD PTR [rbp-");
+                    out_int(inst.dest.imm - cast(i64, soff));
+                    out_cstr("], rax\n");
+                    soff = soff + 8;
+                }
+                if (soff + 4 <= sz) {
+                    out_cstr("  mov eax, DWORD PTR [r15+");
+                    out_int(cast(i64, soff));
+                    out_cstr("]\n");
+                    out_cstr("  mov DWORD PTR [rbp-");
+                    out_int(inst.dest.imm - cast(i64, soff));
+                    out_cstr("], eax\n");
+                    soff = soff + 4;
+                }
+                if (soff + 2 <= sz) {
+                    out_cstr("  movzx eax, WORD PTR [r15+");
+                    out_int(cast(i64, soff));
+                    out_cstr("]\n");
+                    out_cstr("  mov WORD PTR [rbp-");
+                    out_int(inst.dest.imm - cast(i64, soff));
+                    out_cstr("], ax\n");
+                    soff = soff + 2;
+                }
+                if (soff < sz) {
+                    out_cstr("  movzx eax, BYTE PTR [r15+");
+                    out_int(cast(i64, soff));
+                    out_cstr("]\n");
+                    out_cstr("  mov BYTE PTR [rbp-");
+                    out_int(inst.dest.imm - cast(i64, soff));
+                    out_cstr("], al\n");
+                }
+            }
+        }
+        return;
+    }
+
+    // COPY (memcpy)
+    if (op == d.IR_COPY) {
+        load_op(inst.dest.vreg, ctx, "rdi");
+        load_op(inst.src1.vreg, ctx, "rsi");
+        out_cstr("  mov rcx, ");
+        out_int(inst.src2.imm);
+        out_char(10);
+        out_line("cld");
+        out_line("rep movsb");
+        return;
+    }
+
+    // ASM
+    if (op == d.IR_ASM) {
+        out_cstr("  ");
+        out_str(inst.asm_str_ptr, inst.asm_str_len);
+        out_char(10);
+        return;
+    }
+
+    // CAST
+    if (op == d.IR_CAST) {
+        let is i32 as to_flt = is_float_type(inst.cast_to);
+        let is i32 as from_flt = is_float_type(inst.cast_from);
+        load_op(inst.src1.vreg, ctx, "r14");
+        // float -> int
+        if (from_flt == 1 && to_flt == 0) {
+            out_line("movq xmm0, r14");
+            out_line("cvttsd2si r14, xmm0");
+            store_op(inst.dest.vreg, ctx, "r14");
+            return;
+        }
+        // int -> float
+        if (from_flt == 0 && to_flt == 1) {
+            out_line("cvtsi2sd xmm0, r14");
+            out_line("movq r14, xmm0");
+            store_op(inst.dest.vreg, ctx, "r14");
+            return;
+        }
+        // int -> int: truncation / sign-extend
+        let is i32 as to_sz = get_type_size(inst.cast_to);
+        let is i32 as sgn = is_signed_type(inst.cast_to);
+        if (to_sz == 4) {
+            if (sgn == 1) { out_line("movsxd r14, r14d"); }
+            else { out_line("mov r14d, r14d"); }
+        } else if (to_sz == 2) {
+            if (sgn == 1) { out_line("movsx r14, r14w"); }
+            else { out_line("movzx r14, r14w"); }
+        } else if (to_sz == 1) {
+            if (sgn == 1) { out_line("movsx r14, r14b"); }
+            else { out_line("movzx r14, r14b"); }
+        }
+        store_op(inst.dest.vreg, ctx, "r14");
+        return;
+    }
+
+    // SET_ARG
+    if (op == d.IR_SET_ARG) {
+        let is i32 as idx = cast(i32, inst.dest.imm);
+        load_op(inst.src1.vreg, ctx, "r15");
+        if (idx < 6) {
+            out_cstr("  mov ");
+            out_cstr(arg_reg64(idx));
+            out_cstr(", r15\n");
+        } else {
+            out_line("push r15");
+        }
+        return;
+    }
+    // GET_ARG
+    if (op == d.IR_GET_ARG) {
+        let is i32 as idx = cast(i32, inst.src1.imm);
+        if (idx < 6) {
+            out_cstr("  mov r15, ");
+            out_cstr(arg_reg64(idx));
+            out_char(10);
+            store_op(inst.dest.vreg, ctx, "r15");
+        } else {
+            // Stack arg: [rbp + 16 + (idx-6)*8]
+            let is i64 as off = 16 + cast(i64, idx - 6) * 8;
+            out_cstr("  mov r15, QWORD PTR [rbp+");
+            out_int(off);
+            out_cstr("]\n");
+            store_op(inst.dest.vreg, ctx, "r15");
+        }
+        return;
+    }
+    // SET_SYS_ARG
+    if (op == d.IR_SET_SYS_ARG) {
+        let is i32 as idx = cast(i32, inst.dest.imm);
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_cstr("  mov ");
+        out_cstr(syscall_reg(idx));
+        out_cstr(", r15\n");
+        return;
+    }
+    // SYSCALL
+    if (op == d.IR_SYSCALL) {
+        out_line("syscall");
+        store_op(inst.dest.vreg, ctx, "rax");
+        return;
+    }
+    // CALL
+    if (op == d.IR_CALL) {
+        out_cstr("  call ");
+        out_str(inst.call_name_ptr, inst.call_name_len);
+        out_char(10);
+        // Caustic ABI: floats returned as bitcasted i64 in rax (no xmm0)
+        store_op(inst.dest.vreg, ctx, "rax");
+        return;
+    }
+}
+
+// === gen_func ===
+
+fn gen_func(func as *d.IRFunction) as void {
+    // Build intervals and allocate registers
+    let is *al.AllocCtx as ctx = al.new_alloc_ctx();
+    ctx.func = cast(*u8, func);
+    ctx.next_spill = 1;
+
+    al.build_intervals(func, ctx);
+    al.linear_scan_alloc(func, ctx);
+    io.write_str(linux.STDERR, "    alloc ok, vregs=");
+    io.write_int(linux.STDERR, cast(i64, func.vreg_count));
+    io.write_str(linux.STDERR, " spills=");
+    io.write_int(linux.STDERR, cast(i64, ctx.stack_slots));
+    io.write_str(linux.STDERR, "\n");
+
+    // Set arg_spill_base so spill slots don't overlap with local vars
+    ctx.arg_spill_base = func.stack_size;
+
+    // Compute total stack size needed
+    let is i32 as local_size = func.stack_size;
+    let is i32 as spill_size = ctx.stack_slots * 8;
+    let is i32 as alloc_size = func.alloc_stack_size;
+    let is i32 as total with mut = local_size + spill_size + alloc_size;
+    // Align to 16
+    // call pushes 8 (ret addr) + push rbp (8) + 5 pushes (40) = 56 bytes
+    // 56 % 16 = 8, so we need total to be 8 mod 16 for alignment
+    if (total % 16 != 8) {
+        total = total + (8 - (total % 8));
+        if (total % 16 != 8) { total = total + 8; }
+    }
+    if (total < 8) { total = 8; }
+    ctx.aligned_stack_size = total;
+
+    // Function label
+    out_str(func.asm_name_ptr, func.asm_name_len);
+    out_cstr(":\n");
+
+    // Prologue
+    out_line("push rbp");
+    out_line("mov rbp, rsp");
+    out_line("push rbx");
+    out_line("push r12");
+    out_line("push r13");
+    out_line("push r14");
+    out_line("push r15");
+    if (ctx.aligned_stack_size > 0) {
+        out_cstr("  sub rsp, ");
+        out_int(cast(i64, ctx.aligned_stack_size));
+        out_char(10);
+    }
+
+    // Instructions
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        gen_inst(inst, ctx);
+        inst = inst.next;
+    }
+}
+
+// === Data sections ===
+
+fn emit_rodata(prog as *d.IRProgram) as void {
+    if (cast(i64, prog.strings) == 0) { return; }
+    out_cstr(".section .rodata\n");
+    let is *d.StringEntry as s with mut = prog.strings;
+    while (cast(i64, s) != 0) {
+        out_cstr(".LC");
+        out_int(cast(i64, s.id));
+        out_cstr(":\n  .string \"");
+        // Output string with escaping
+        let is i32 as i with mut = 0;
+        while (i < s.len) {
+            let is u8 as c = s.ptr[i];
+            if (c == 10) { out_cstr("\\n"); }
+            else if (c == 9) { out_cstr("\\t"); }
+            else if (c == 0) { out_cstr("\\0"); }
+            else if (c == 34) { out_cstr("\\\""); }
+            else if (c == 92) { out_cstr("\\\\"); }
+            else { out_char(c); }
+            i = i + 1;
+        }
+        out_cstr("\"\n");
+        s = s.next;
+    }
+}
+
+fn emit_data(prog as *d.IRProgram) as void {
+    let is i32 as has_data with mut = 0;
+    let is i32 as has_bss with mut = 0;
+    // .data section (initialized)
+    let is *d.IRGlobal as g with mut = prog.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_reachable == 1 && g.is_initialized == 1) {
+            if (has_data == 0) {
+                out_cstr(".data\n");
+                has_data = 1;
+            }
+            out_cstr(".globl ");
+            out_str(g.name_ptr, g.name_len);
+            out_char(10);
+            out_str(g.name_ptr, g.name_len);
+            out_cstr(":\n");
+            if (g.size == 8) {
+                out_cstr("  .quad ");
+                out_int(g.init_value);
+                out_char(10);
+            } else if (g.size == 4) {
+                out_cstr("  .long ");
+                out_int(g.init_value);
+                out_char(10);
+            } else if (g.size == 2) {
+                out_cstr("  .short ");
+                out_int(g.init_value);
+                out_char(10);
+            } else if (g.size == 1) {
+                out_cstr("  .byte ");
+                out_int(g.init_value);
+                out_char(10);
+            } else {
+                out_cstr("  .zero ");
+                out_int(cast(i64, g.size));
+                out_char(10);
+            }
+        }
+        g = g.next;
+    }
+    // .bss section (uninitialized)
+    g = prog.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_reachable == 1 && g.is_initialized == 0) {
+            if (has_bss == 0) {
+                out_cstr(".bss\n");
+                has_bss = 1;
+            }
+            out_cstr(".globl ");
+            out_str(g.name_ptr, g.name_len);
+            out_char(10);
+            out_str(g.name_ptr, g.name_len);
+            out_cstr(":\n");
+            out_cstr("  .zero ");
+            out_int(cast(i64, g.size));
+            out_char(10);
+        }
+        g = g.next;
+    }
+}
+
+// === codegen entry ===
+
+fn codegen(prog as *u8, fd as i32) as void {
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    io.write_str(linux.STDERR, "codegen: init\n");
+    out_init(fd);
+
+    out_cstr(".intel_syntax noprefix\n");
+
+    // rodata
+    io.write_str(linux.STDERR, "codegen: rodata\n");
+    emit_rodata(p);
+
+    // data + bss
+    io.write_str(linux.STDERR, "codegen: data\n");
+    emit_data(p);
+
+    // .text
+    out_cstr(".text\n");
+
+    // Emit .globl for all reachable functions
+    io.write_str(linux.STDERR, "codegen: globl\n");
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            out_cstr(".globl ");
+            out_str(f.asm_name_ptr, f.asm_name_len);
+            out_char(10);
+        }
+        f = f.next;
+    }
+
+    // Generate code for each reachable function
+    io.write_str(linux.STDERR, "codegen: funcs\n");
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            io.write_str(linux.STDERR, "  gen: ");
+            io.write_n(linux.STDERR, f.asm_name_ptr, cast(i64, f.asm_name_len));
+            io.write_str(linux.STDERR, "\n");
+            gen_func(f);
+        }
+        f = f.next;
+    }
+
+    out_flush();
+    io.write_str(linux.STDERR, "codegen: done\n");
+}

@@ -46,11 +46,11 @@ Source (.cst) → Lexer → Parser → Semantic → IR → Codegen → Assembly 
 
 | Phase | Files | Purpose |
 |-------|-------|---------|
-| Lexer | `caustic-compiler/lexer/` | Tokenization (60+ token types) |
-| Parser | `caustic-compiler/parser/` | Recursive descent → AST (30+ node kinds) |
-| Semantic | `caustic-compiler/semantic/` | Type checking, symbol tables, module resolution |
-| IR | `caustic-compiler/ir/` | Virtual register IR (45+ operations, unlimited vregs) |
-| Codegen | `caustic-compiler/codegen/` | Register allocation + x86_64 assembly output |
+| Lexer | `src/lexer/` | Tokenization (60+ token types) |
+| Parser | `src/parser/` | Recursive descent → AST (30+ node kinds) |
+| Semantic | `src/semantic/` | Type checking, symbol tables, module resolution |
+| IR | `src/ir/` | Virtual register IR (45+ operations, unlimited vregs) |
+| Codegen | `src/codegen/` | Register allocation + x86_64 assembly output |
 
 ### Type System
 
@@ -112,11 +112,11 @@ cast(*u8, address);         // type cast
 ## Adding New Operators/Features
 
 File change sequence:
-1. `caustic-compiler/lexer/` - Add token type, lexer switch case
-2. `caustic-compiler/parser/` - Add NODE_KIND, parsing function
-3. `caustic-compiler/semantic/` - Type checking in `walk()` switch
-4. `caustic-compiler/ir/` - IR operation, emit in `gen_expr()`
-5. `caustic-compiler/codegen/` - Assembly generation case
+1. `src/lexer/` - Add token type, lexer switch case
+2. `src/parser/` - Add NODE_KIND, parsing function
+3. `src/semantic/` - Type checking in `walk()` switch
+4. `src/ir/` - IR operation, emit in `gen_expr()`
+5. `src/codegen/` - Assembly generation case
 
 ## Defer
 

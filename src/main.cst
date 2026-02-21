@@ -1,0 +1,103 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+use "io.cst" as io;
+use "lexer/tokens.cst" as tok;
+use "lexer/lexer.cst" as lex;
+use "parser/ast.cst" as ast;
+use "parser/top.cst" as top;
+use "semantic/walk.cst" as sem;
+use "ir/defs.cst" as ird;
+use "ir/gen.cst" as irg;
+use "codegen/emit.cst" as cg;
+
+fn read_file(path as *u8, out_size as *i64) as *u8 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
+    linux.lseek(fd, 0, linux.SEEK_SET);
+    if (size <= 0) { linux.close(fd); return cast(*u8, 0); }
+    let is *u8 as buf = mem.galloc(size + 1);
+    linux.read(fd, buf, size);
+    buf[size] = cast(u8, 0);
+    linux.close(fd);
+    *out_size = size;
+    return buf;
+}
+
+fn str_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    if (mem.memcmp(a, b, cast(i64, alen)) != 0) { return 0; }
+    return 1;
+}
+
+fn main(argc as i64, argv as i64) as i32 {
+    if (argc < 2) {
+        io.write_str(linux.STDERR, "Usage: caustic <source.cst>\n");
+        return 1;
+    }
+    mem.gheapinit(67108864);
+    let is *i64 as argv_arr = cast(*i64, argv);
+    let is *u8 as filename with mut = cast(*u8, argv_arr[1]);
+
+    // Check for -c flag
+    let is i32 as no_main with mut = 0;
+    if (argc >= 3) {
+        let is *u8 as arg1 = cast(*u8, argv_arr[1]);
+        if (str_eq(arg1, 2, "-c", 2) == 1) {
+            no_main = 1;
+            filename = cast(*u8, argv_arr[2]);
+        }
+    }
+
+    let is i64 as file_size with mut = 0;
+    let is *u8 as src = read_file(filename, &file_size);
+    if (cast(i64, src) == 0) {
+        io.write_str(linux.STDERR, "Error: cannot read file\n");
+        return 1;
+    }
+    let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
+    io.write_str(linux.STDOUT, "caustic: ");
+    io.write_str(linux.STDOUT, filename);
+    io.write_str(linux.STDOUT, " (");
+    io.write_int(linux.STDOUT, file_size);
+    io.write_str(linux.STDOUT, " bytes, ");
+    io.write_int(linux.STDOUT, cast(i64, tokens.count));
+    io.write_str(linux.STDOUT, " tokens)\n");
+    ast.types_init();
+    let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
+    // Compute filename length
+    let is i32 as fname_len with mut = 0;
+    while (filename[fname_len] != cast(u8, 0)) { fname_len = fname_len + 1; }
+    // Semantic analysis
+    sem.analyze(cast(*u8, root), filename, fname_len);
+    io.write_str(linux.STDOUT, "semantic: ok\n");
+
+    // IR generation
+    let is *ird.IRProgram as prog = irg.gen_ir(cast(*u8, root), no_main);
+    io.write_str(linux.STDOUT, "ir: ok\n");
+
+    // Build output path: filename + ".s"
+    let is i32 as out_len = fname_len + 2;
+    let is *u8 as out_path = mem.galloc(cast(i64, out_len) + 1);
+    mem.memcpy(out_path, filename, cast(i64, fname_len));
+    out_path[fname_len] = 46; // '.'
+    out_path[fname_len + 1] = 115; // 's'
+    out_path[fname_len + 2] = cast(u8, 0);
+
+    // Open output file
+    let is i64 as out_fd = linux.open(out_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+    if (out_fd < 0) {
+        io.write_str(linux.STDERR, "Error: cannot open output file\n");
+        return 1;
+    }
+
+    // Codegen
+    cg.codegen(cast(*u8, prog), cast(i32, out_fd));
+    linux.close(out_fd);
+
+    io.write_str(linux.STDOUT, "wrote: ");
+    io.write_str(linux.STDOUT, out_path);
+    io.write_str(linux.STDOUT, "\n");
+
+    return 0;
+}

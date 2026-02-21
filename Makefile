@@ -6,10 +6,10 @@ CAUSTIC_LD = ./caustic-ld
 # Build the compiler from source
 all: $(CAUSTIC)
 
-$(CAUSTIC): caustic-compiler/main.cst
-	$(CAUSTIC) caustic-compiler/main.cst
-	$(CAUSTIC_AS) caustic-compiler/main.cst.s
-	$(CAUSTIC_LD) caustic-compiler/main.cst.s.o -o $(CAUSTIC)
+$(CAUSTIC): src/main.cst
+	$(CAUSTIC) src/main.cst
+	$(CAUSTIC_AS) src/main.cst.s
+	$(CAUSTIC_LD) src/main.cst.s.o -o $(CAUSTIC)
 
 # Assembler
 assembler: $(CAUSTIC)
@@ -29,7 +29,7 @@ test-linker: $(CAUSTIC) linker assembler
 
 # Clean build artifacts
 clean:
-	rm -f caustic-compiler/main.cst.s caustic-compiler/main.cst.s.o
+	rm -f src/main.cst.s src/main.cst.s.o
 	rm -f caustic-assembler/main.cst.s caustic-assembler/main.cst.s.o
 	rm -f caustic-linker/main.cst.s caustic-linker/main.cst.s.o
 
