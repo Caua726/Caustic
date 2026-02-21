@@ -8,8 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 make              # Build the compiler (creates ./caustic binary)
 make assembler    # Build the assembler (creates ./caustic-as binary)
 make linker       # Build the linker (creates ./caustic-ld binary)
-make test-linker  # Run full linker test suite (36 tests)
-make run          # Build, compile main.cst, assemble with GCC, and run
+make test-linker  # Run full linker test suite
 make clean        # Remove build artifacts
 ```
 
@@ -21,11 +20,8 @@ make clean        # Remove build artifacts
 ./caustic -debugparser <file>    # Debug AST
 ./caustic -debugir <file>        # Debug IR generation
 
-# Full self-hosted pipeline (no gcc needed):
+# Full pipeline:
 ./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program && ./program
-
-# Legacy pipeline with gcc:
-./caustic program.cst && gcc program.cst.s -o program && ./program
 
 # Multi-object linking:
 ./caustic -c lib.cst && ./caustic main.cst
@@ -38,23 +34,23 @@ make clean        # Remove build artifacts
 
 ## Architecture
 
-Caustic is a native x86_64 Linux compiler written in C23, with no LLVM or runtime dependencies. Direct syscall-based execution.
+Caustic is a self-hosted native x86_64 Linux compiler, with no LLVM or runtime dependencies. Direct syscall-based execution.
 
 ### Compiler Pipeline (6 phases)
 
 ```
 Source (.cst) → Lexer → Parser → Semantic → IR → Codegen → Assembly (.s)
-                                                              ↓ (gcc)
+                                                              ↓ (caustic-as + caustic-ld)
                                                           Executable
 ```
 
 | Phase | Files | Purpose |
 |-------|-------|---------|
-| Lexer | `lexer.c/h` | Tokenization (60+ token types) |
-| Parser | `parser.c/h` | Recursive descent → AST (30+ node kinds) |
-| Semantic | `semantic.c/h` | Type checking, symbol tables, module resolution |
-| IR | `ir.c/h` | Virtual register IR (35+ operations, unlimited vregs) |
-| Codegen | `codegen.c/h` | Register allocation + x86_64 assembly output |
+| Lexer | `caustic-compiler/lexer/` | Tokenization (60+ token types) |
+| Parser | `caustic-compiler/parser/` | Recursive descent → AST (30+ node kinds) |
+| Semantic | `caustic-compiler/semantic/` | Type checking, symbol tables, module resolution |
+| IR | `caustic-compiler/ir/` | Virtual register IR (45+ operations, unlimited vregs) |
+| Codegen | `caustic-compiler/codegen/` | Register allocation + x86_64 assembly output |
 
 ### Type System
 
@@ -116,11 +112,11 @@ cast(*u8, address);         // type cast
 ## Adding New Operators/Features
 
 File change sequence:
-1. `lexer.h/c` - Add token type, lexer switch case
-2. `parser.h/c` - Add NODE_KIND, parsing function
-3. `semantic.c` - Type checking in `walk()` switch
-4. `ir.h/c` - IR operation, emit in `gen_expr()`
-5. `codegen.c` - Assembly generation case
+1. `caustic-compiler/lexer/` - Add token type, lexer switch case
+2. `caustic-compiler/parser/` - Add NODE_KIND, parsing function
+3. `caustic-compiler/semantic/` - Type checking in `walk()` switch
+4. `caustic-compiler/ir/` - IR operation, emit in `gen_expr()`
+5. `caustic-compiler/codegen/` - Assembly generation case
 
 ## Defer
 
