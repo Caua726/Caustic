@@ -68,10 +68,40 @@ fn try_instantiate_generic_struct(ty_ptr as *u8) as void {
             if (cast(i64, existing) != 0) { mem.gfree(mangled); return; }
             mem.gfree(mangled);
         }
-        // Look up template by base name
-        let is *d.GenericTemplate as tmpl = gn.lookup_template(t.base_name_ptr, t.base_name_len);
-        if (cast(i64, tmpl) != 0 && tmpl.is_function == 0) {
-            gn.instantiate_struct(tmpl, t.gen_args, t.gen_arg_count, t.name_ptr, t.name_len);
+        // Handle dot-qualified base names (e.g. "sl.Slice")
+        let is i32 as dot_pos = ty.find_dot(t.base_name_ptr, t.base_name_len);
+        if (dot_pos >= 0) {
+            let is *u8 as alias_ptr = t.base_name_ptr;
+            let is i32 as alias_len = dot_pos;
+            let is *u8 as tname_ptr = cast(*u8, cast(i64, t.base_name_ptr) + cast(i64, dot_pos) + 1);
+            let is i32 as tname_len = t.base_name_len - dot_pos - 1;
+            let is *d.Variable as var = sc.lookup_var(alias_ptr, alias_len);
+            if (cast(i64, var) != 0 && var.is_module == 1 && cast(i64, var.module_ref) != 0) {
+                let is *d.Module as modd = cast(*d.Module, var.module_ref);
+                // Look up template by type name with matching module prefix
+                let is *d.GenericTemplate as tmpl = gn.lookup_template_prefixed(tname_ptr, tname_len, modd.prefix_ptr, modd.prefix_len);
+                if (cast(i64, tmpl) != 0 && tmpl.is_function == 0) {
+                    // Build proper mangled name: prefix_TypeName_Args
+                    let is *u8 as real_base = gn.mangle_generic(tname_ptr, tname_len, t.gen_args, t.gen_arg_count);
+                    let is i32 as rb_len = gn.str_len(real_base);
+                    let is i32 as full_len with mut = 0;
+                    let is *u8 as full_name = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, real_base, rb_len, &full_len);
+                    // Check if already exists with proper name
+                    existing = ty.lookup_struct(full_name, full_len);
+                    if (cast(i64, existing) == 0) {
+                        gn.instantiate_struct(tmpl, t.gen_args, t.gen_arg_count, full_name, full_len);
+                    }
+                    // Update type to use proper mangled name
+                    t.name_ptr = full_name;
+                    t.name_len = full_len;
+                }
+            }
+        } else {
+            // Look up template by base name (no dot)
+            let is *d.GenericTemplate as tmpl = gn.lookup_template(t.base_name_ptr, t.base_name_len);
+            if (cast(i64, tmpl) != 0 && tmpl.is_function == 0) {
+                gn.instantiate_struct(tmpl, t.gen_args, t.gen_arg_count, t.name_ptr, t.name_len);
+            }
         }
     }
     // Recurse into pointer/array base
@@ -555,23 +585,63 @@ fn walk_fncall(node as *ast.Node) as void {
     if (node.lhs.kind == ast.NK_IDENT) {
         func = sc.lookup_fn(node.lhs.name_ptr, node.lhs.name_len);
         // Try generic instantiation
-        if (cast(i64, func) == 0 && node.generic_arg_count > 0 && node.member_len > 0) {
-            let is *d.GenericTemplate as tmpl = gn.lookup_template(node.member_ptr, node.member_len);
+        // Check generic args on FNCALL node or on lhs (dot+gen case from postfix)
+        let is i32 as ga_count with mut = node.generic_arg_count;
+        let is *u8 as ga_args with mut = node.generic_args;
+        let is *u8 as ga_member_ptr with mut = node.member_ptr;
+        let is i32 as ga_member_len with mut = node.member_len;
+        if (ga_count == 0 && node.lhs.generic_arg_count > 0) {
+            ga_count = node.lhs.generic_arg_count;
+            ga_args = node.lhs.generic_args;
+            ga_member_ptr = node.lhs.member_ptr;
+            ga_member_len = node.lhs.member_len;
+        }
+        if (cast(i64, func) == 0 && ga_count > 0 && ga_member_len > 0) {
+            let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(ga_member_ptr, ga_member_len);
+            // Handle dot-qualified names (e.g. "sl.slice_new")
+            if (cast(i64, tmpl) == 0) {
+                let is i32 as dp = ty.find_dot(ga_member_ptr, ga_member_len);
+                if (dp >= 0) {
+                    let is *u8 as al_ptr = ga_member_ptr;
+                    let is i32 as al_len = dp;
+                    let is *u8 as fname_ptr = cast(*u8, cast(i64, ga_member_ptr) + cast(i64, dp) + 1);
+                    let is i32 as fname_len = ga_member_len - dp - 1;
+                    let is *d.Variable as mv = sc.lookup_var(al_ptr, al_len);
+                    if (cast(i64, mv) != 0 && mv.is_module == 1 && cast(i64, mv.module_ref) != 0) {
+                        let is *d.Module as mm = cast(*d.Module, mv.module_ref);
+                        tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, mm.prefix_ptr, mm.prefix_len);
+                    }
+                }
+            }
             if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
-                let is *u8 as mangled = gn.mangle_generic(tmpl.name_ptr, tmpl.name_len, node.generic_args, node.generic_arg_count);
+                // Mangle with template's own name (without module prefix)
+                let is *u8 as mangled = gn.mangle_generic(tmpl.name_ptr, tmpl.name_len, ga_args, ga_count);
                 let is i32 as mlen = gn.str_len(mangled);
                 node.lhs.name_ptr = d.str_dup(mangled, mlen);
                 node.lhs.name_len = mlen;
-                let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, node.generic_args, node.generic_arg_count, mangled, mlen);
+                // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+                let is *u8 as old_mp = sc.current_mod_prefix_ptr;
+                let is i32 as old_ml = sc.current_mod_prefix_len;
+                if (tmpl.mod_prefix_len > 0) {
+                    sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
+                    sc.current_mod_prefix_len = tmpl.mod_prefix_len;
+                }
+                let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, ga_args, ga_count, mangled, mlen);
                 if (cast(i64, fn_clone) != 0) {
-                    // Walk with saved state
                     let is i32 as so = sc.stack_offset;
                     let is *d.Scope as ss = sc.current_scope;
                     walk(fn_clone);
                     sc.stack_offset = so;
                     sc.current_scope = ss;
                 }
-                func = sc.lookup_fn(mangled, mlen);
+                // Lookup with template's module prefix
+                if (tmpl.mod_prefix_len > 0) {
+                    func = sc.lookup_fn_qualified(mangled, mlen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
+                } else {
+                    func = sc.lookup_fn(mangled, mlen);
+                }
+                sc.current_mod_prefix_ptr = old_mp;
+                sc.current_mod_prefix_len = old_ml;
             }
         }
         if (cast(i64, func) == 0) {
@@ -624,12 +694,40 @@ fn walk_fncall(node as *ast.Node) as void {
 
                     // Try generic method
                     if (cast(i64, func) == 0 && base_ty.gen_arg_count > 0 && base_ty.base_name_len > 0) {
+                        // Resolve dot-qualified base name (e.g. "sl.Slice")
+                        let is *u8 as real_base_ptr with mut = base_ty.base_name_ptr;
+                        let is i32 as real_base_len with mut = base_ty.base_name_len;
+                        let is *u8 as method_prefix_ptr with mut = cast(*u8, 0);
+                        let is i32 as method_prefix_len with mut = 0;
+                        let is i32 as bdp = ty.find_dot(base_ty.base_name_ptr, base_ty.base_name_len);
+                        if (bdp >= 0) {
+                            let is *u8 as ba_ptr = base_ty.base_name_ptr;
+                            let is i32 as ba_len = bdp;
+                            real_base_ptr = cast(*u8, cast(i64, base_ty.base_name_ptr) + cast(i64, bdp) + 1);
+                            real_base_len = base_ty.base_name_len - bdp - 1;
+                            let is *d.Variable as bv = sc.lookup_var(ba_ptr, ba_len);
+                            if (cast(i64, bv) != 0 && bv.is_module == 1 && cast(i64, bv.module_ref) != 0) {
+                                let is *d.Module as bm = cast(*d.Module, bv.module_ref);
+                                method_prefix_ptr = bm.prefix_ptr;
+                                method_prefix_len = bm.prefix_len;
+                            }
+                        }
                         let is i32 as tmlen with mut = 0;
-                        let is *u8 as tmname = d.str_concat3(base_ty.base_name_ptr, base_ty.base_name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &tmlen);
-                        let is *d.GenericTemplate as tmpl = gn.lookup_template(tmname, tmlen);
+                        let is *u8 as tmname = d.str_concat3(real_base_ptr, real_base_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &tmlen);
+                        let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(tmname, tmlen);
+                        if (cast(i64, tmpl) == 0 && method_prefix_len > 0) {
+                            tmpl = gn.lookup_template_prefixed(tmname, tmlen, method_prefix_ptr, method_prefix_len);
+                        }
                         if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
                             let is *u8 as mangled = gn.mangle_generic(tmname, tmlen, base_ty.gen_args, base_ty.gen_arg_count);
                             let is i32 as mglen = gn.str_len(mangled);
+                            // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+                            let is *u8 as omp = sc.current_mod_prefix_ptr;
+                            let is i32 as oml = sc.current_mod_prefix_len;
+                            if (tmpl.mod_prefix_len > 0) {
+                                sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
+                                sc.current_mod_prefix_len = tmpl.mod_prefix_len;
+                            }
                             let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, base_ty.gen_args, base_ty.gen_arg_count, mangled, mglen);
                             if (cast(i64, fn_clone) != 0) {
                                 let is i32 as so = sc.stack_offset;
@@ -638,7 +736,14 @@ fn walk_fncall(node as *ast.Node) as void {
                                 sc.stack_offset = so;
                                 sc.current_scope = ss;
                             }
-                            func = sc.lookup_fn(mangled, mglen);
+                            // Lookup with template's module prefix
+                            if (tmpl.mod_prefix_len > 0) {
+                                func = sc.lookup_fn_qualified(mangled, mglen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
+                            } else {
+                                func = sc.lookup_fn(mangled, mglen);
+                            }
+                            sc.current_mod_prefix_ptr = omp;
+                            sc.current_mod_prefix_len = oml;
                         }
                     }
 
