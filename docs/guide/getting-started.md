@@ -102,3 +102,18 @@ fn main() as i32 {
 ```
 
 The heap must be initialized with `mem.gheapinit(size)` before any allocation functions are called.
+
+## Examples
+
+The [examples/](../../examples/) directory contains runnable programs covering common patterns:
+
+- **hello.cst** — Hello world with syscall and linux.write
+- **fibonacci.cst** — Recursive and iterative fibonacci
+- **strings.cst** — String operations (concat, find, compare)
+- **structs.cst** — Structs, impl blocks, methods, constructors
+- **files.cst** — File I/O with raw syscalls
+- **calculator.cst** — Interactive calculator reading from stdin
+- **linked_list.cst** — Heap-allocated linked list
+- **enums.cst** — Enums, tagged unions, pattern matching
+
+See [examples/README.md](../../examples/README.md) for build instructions.

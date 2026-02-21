@@ -96,3 +96,7 @@ fn main() as i32 {
 ```
 
 Check the exit code with `echo $?` after running the program.
+
+## See Also
+
+- [examples/hello.cst](../../examples/hello.cst) — runnable hello world example
