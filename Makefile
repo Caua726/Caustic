@@ -2,41 +2,32 @@
 CAUSTIC = ./caustic
 CAUSTIC_AS = ./caustic-as
 CAUSTIC_LD = ./caustic-ld
+CAUSTIC_MK = ./caustic-mk
 
-# Build the compiler from source
-all: $(CAUSTIC)
+# Build targets via caustic-mk
+all: $(CAUSTIC_MK)
+	$(CAUSTIC_MK) build caustic
 
-$(CAUSTIC): src/main.cst
-	$(CAUSTIC) src/main.cst
-	$(CAUSTIC_AS) src/main.cst.s
-	$(CAUSTIC_LD) src/main.cst.s.o -o $(CAUSTIC)
+assembler: $(CAUSTIC_MK)
+	$(CAUSTIC_MK) build caustic-as
 
-# Assembler
-assembler: $(CAUSTIC)
-	$(CAUSTIC) caustic-assembler/main.cst
-	$(CAUSTIC_AS) caustic-assembler/main.cst.s
-	$(CAUSTIC_LD) caustic-assembler/main.cst.s.o -o $(CAUSTIC_AS)
+linker: $(CAUSTIC_MK)
+	$(CAUSTIC_MK) build caustic-ld
 
-# Linker
-linker: $(CAUSTIC)
-	$(CAUSTIC) caustic-linker/main.cst
-	$(CAUSTIC_AS) caustic-linker/main.cst.s
-	$(CAUSTIC_LD) caustic-linker/main.cst.s.o -o $(CAUSTIC_LD)
-
-# Build system
+# Bootstrap: build caustic-mk itself (needs existing toolchain)
 maker: $(CAUSTIC)
 	$(CAUSTIC) caustic-maker/main.cst
 	$(CAUSTIC_AS) caustic-maker/main.cst.s
-	$(CAUSTIC_LD) caustic-maker/main.cst.s.o -o caustic-mk
+	$(CAUSTIC_LD) caustic-maker/main.cst.s.o -o $(CAUSTIC_MK)
 
-# Test linker
-test-linker: $(CAUSTIC) linker assembler
-	bash tests_asm/test_linker.sh
+test:
+	$(CAUSTIC_MK) test
 
-# Clean build artifacts
 clean:
+	$(CAUSTIC_MK) clean
 	rm -f src/main.cst.s src/main.cst.s.o
 	rm -f caustic-assembler/main.cst.s caustic-assembler/main.cst.s.o
 	rm -f caustic-linker/main.cst.s caustic-linker/main.cst.s.o
+	rm -f caustic-maker/main.cst.s caustic-maker/main.cst.s.o
 
-.PHONY: all clean assembler linker test-linker maker
+.PHONY: all clean assembler linker test maker
