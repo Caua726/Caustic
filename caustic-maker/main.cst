@@ -1,0 +1,180 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+use "parser.cst" as parser;
+use "executor.cst" as exec;
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn print(s as *u8) as void {
+    linux.write(1, s, strlen(s));
+}
+
+fn eprint(s as *u8) as void {
+    linux.write(2, s, strlen(s));
+}
+
+fn nl() as void {
+    linux.write(1, " ", 1);
+    // overwrite with newline byte
+    let is [1]u8 as b;
+    b[0] = 10;
+    linux.write(1, &b, 1);
+}
+
+fn streq_lit(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != 0) { return 0; }
+    return 1;
+}
+
+fn write_nl(fd as i64) as void {
+    let is [1]u8 as b;
+    b[0] = 10;
+    linux.write(fd, &b, 1);
+}
+
+fn print_usage() as void {
+    print("usage: caustic-mk <command> [args]");
+    write_nl(1);
+    write_nl(1);
+    print("commands:");
+    write_nl(1);
+    print("  build <target>  build a target");
+    write_nl(1);
+    print("  run <name>      run script or target");
+    write_nl(1);
+    print("  test            run 'test' script");
+    write_nl(1);
+    print("  clean           remove .caustic/ and build/");
+    write_nl(1);
+    print("  init            create a new Causticfile");
+    write_nl(1);
+}
+
+fn read_file(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) {
+        return cast(*u8, 0);
+    }
+    let is i64 as size = linux.lseek(fd, 0, 2);
+    linux.lseek(fd, 0, 0);
+    if (size <= 0) {
+        linux.close(fd);
+        return cast(*u8, 0);
+    }
+    let is *u8 as buf = mem.galloc(size + 1);
+    linux.read(fd, buf, size);
+    buf[size] = 0;
+    linux.close(fd);
+    return buf;
+}
+
+fn read_file_size(path as *u8) as i64 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    let is i64 as size = linux.lseek(fd, 0, 2);
+    linux.close(fd);
+    return size;
+}
+
+fn main(argc as i64, argv as i64) as i32 {
+    let is *i64 as argv_arr = cast(*i64, argv);
+
+    if (argc < 2) {
+        print_usage();
+        return 1;
+    }
+
+    let is *u8 as cmd = cast(*u8, argv_arr[1]);
+
+    // clean and init don't need Causticfile
+    if (streq_lit(cmd, "clean") == 1) {
+        mem.gheapinit(1048576);
+        return exec.exec_clean();
+    }
+    if (streq_lit(cmd, "init") == 1) {
+        mem.gheapinit(1048576);
+        return exec.exec_init();
+    }
+
+    // build without target = error (before Causticfile check)
+    if (streq_lit(cmd, "build") == 1 && argc < 3) {
+        eprint("error: no target specified");
+        write_nl(2);
+        eprint("usage: caustic-mk build <target>");
+        write_nl(2);
+        return 1;
+    }
+
+    // all other commands need Causticfile
+    let is i64 as file_size = read_file_size("Causticfile");
+    if (file_size == 0) {
+        eprint("error: Causticfile not found");
+        write_nl(2);
+        return 1;
+    }
+
+    let is i64 as heap_size with mut = 0;
+    heap_size = file_size * 50 + 4194304;
+    if (heap_size < 8388608) {
+        heap_size = 8388608;
+    }
+    mem.gheapinit(heap_size);
+
+    let is *u8 as src = read_file("Causticfile");
+    if (cast(i64, src) == 0) {
+        eprint("error: could not read Causticfile");
+        write_nl(2);
+        return 1;
+    }
+
+    let is parser.Project as proj = parser.parse(src, file_size);
+
+    if (streq_lit(cmd, "build") == 1) {
+        let is *u8 as target_name = cast(*u8, argv_arr[2]);
+        // check for --continue flag
+        let is i32 as continue_flag with mut = 0;
+        if (argc >= 4) {
+            let is *u8 as flag = cast(*u8, argv_arr[3]);
+            if (streq_lit(flag, "--continue") == 1) {
+                continue_flag = 1;
+            }
+        }
+        return exec.exec_build(&proj, target_name, continue_flag);
+    }
+
+    if (streq_lit(cmd, "run") == 1) {
+        if (argc < 3) {
+            eprint("error: no name specified");
+            write_nl(2);
+            eprint("usage: caustic-mk run <name>");
+            write_nl(2);
+            return 1;
+        }
+        let is *u8 as name = cast(*u8, argv_arr[2]);
+        return exec.exec_run(&proj, name);
+    }
+
+    if (streq_lit(cmd, "test") == 1) {
+        return exec.exec_test(&proj);
+    }
+
+    eprint("error: unknown command '");
+    linux.write(2, cmd, strlen(cmd));
+    eprint("'");
+    write_nl(2);
+    print_usage();
+    return 1;
+}

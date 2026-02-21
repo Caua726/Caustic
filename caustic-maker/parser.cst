@@ -1,0 +1,397 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+
+// Token types
+let is i32 as TK_IDENT with imut = 1;
+let is i32 as TK_STRING with imut = 2;
+let is i32 as TK_LBRACE with imut = 3;
+let is i32 as TK_RBRACE with imut = 4;
+let is i32 as TK_EOF with imut = 5;
+
+// Max counts
+let is i32 as MAX_TARGETS with imut = 32;
+let is i32 as MAX_DEPS with imut = 32;
+let is i32 as MAX_SCRIPTS with imut = 16;
+let is i32 as MAX_CMDS with imut = 32;
+
+struct Token {
+    kind as i32;
+    ptr as *u8;
+    len as i32;
+}
+
+struct Target {
+    name_ptr as *u8;
+    name_len as i32;
+    src_ptr as *u8;
+    src_len as i32;
+    out_ptr as *u8;
+    out_len as i32;
+    flags_ptr as *u8;
+    flags_len as i32;
+    depends_ptr as *u8;
+    depends_len as i32;
+    has_out as i32;
+}
+
+struct Dep {
+    name_ptr as *u8;
+    name_len as i32;
+    path_ptr as *u8;
+    path_len as i32;
+}
+
+struct ScriptCmd {
+    ptr as *u8;
+    len as i32;
+}
+
+struct Script {
+    name_ptr as *u8;
+    name_len as i32;
+    cmds as *u8;
+    cmd_count as i32;
+}
+
+struct Project {
+    name_ptr as *u8;
+    name_len as i32;
+    version_ptr as *u8;
+    version_len as i32;
+    author_ptr as *u8;
+    author_len as i32;
+    license_ptr as *u8;
+    license_len as i32;
+    targets as *u8;
+    target_count as i32;
+    deps as *u8;
+    dep_count as i32;
+    scripts as *u8;
+    script_count as i32;
+}
+
+// Lexer state
+let is *u8 as _src with mut;
+let is i64 as _src_len with mut = 0;
+let is i64 as _pos with mut = 0;
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn write_nl(fd as i64) as void {
+    let is [1]u8 as b;
+    b[0] = 10;
+    linux.write(fd, &b, 1);
+}
+
+fn eprint(s as *u8) as void {
+    linux.write(2, s, strlen(s));
+}
+
+fn streq(a as *u8, a_len as i32, b as *u8) as i32 {
+    let is i64 as b_len = strlen(b);
+    if (cast(i64, a_len) != b_len) {
+        return 0;
+    }
+    let is i64 as i with mut = 0;
+    while (i < b_len) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn skip_whitespace() as void {
+    while (_pos < _src_len) {
+        let is u8 as c = _src[_pos];
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            _pos = _pos + 1;
+        } else if (c == 47 && _pos + 1 < _src_len && _src[_pos + 1] == 47) {
+            // skip // comment
+            while (_pos < _src_len && _src[_pos] != 10) {
+                _pos = _pos + 1;
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+fn is_ident_char(c as u8) as i32 {
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c == 95) { return 1; }
+    if (c == 45) { return 1; }
+    return 0;
+}
+
+fn next_token() as Token {
+    let is Token as tok;
+    skip_whitespace();
+    if (_pos >= _src_len) {
+        tok.kind = TK_EOF;
+        tok.ptr = cast(*u8, 0);
+        tok.len = 0;
+        return tok;
+    }
+    let is u8 as c = _src[_pos];
+    if (c == 123) {
+        tok.kind = TK_LBRACE;
+        tok.ptr = cast(*u8, cast(i64, _src) + _pos);
+        tok.len = 1;
+        _pos = _pos + 1;
+        return tok;
+    }
+    if (c == 125) {
+        tok.kind = TK_RBRACE;
+        tok.ptr = cast(*u8, cast(i64, _src) + _pos);
+        tok.len = 1;
+        _pos = _pos + 1;
+        return tok;
+    }
+    if (c == 34) {
+        // string literal
+        _pos = _pos + 1;
+        let is i64 as start = _pos;
+        while (_pos < _src_len && _src[_pos] != 34) {
+            _pos = _pos + 1;
+        }
+        tok.kind = TK_STRING;
+        tok.ptr = cast(*u8, cast(i64, _src) + start);
+        tok.len = cast(i32, _pos - start);
+        if (_pos < _src_len) {
+            _pos = _pos + 1;
+        }
+        return tok;
+    }
+    if (is_ident_char(c) == 1) {
+        let is i64 as start = _pos;
+        while (_pos < _src_len && is_ident_char(_src[_pos]) == 1) {
+            _pos = _pos + 1;
+        }
+        tok.kind = TK_IDENT;
+        tok.ptr = cast(*u8, cast(i64, _src) + start);
+        tok.len = cast(i32, _pos - start);
+        return tok;
+    }
+    // unknown char, skip
+    _pos = _pos + 1;
+    tok.kind = TK_EOF;
+    tok.ptr = cast(*u8, 0);
+    tok.len = 0;
+    return tok;
+}
+
+fn expect_string(msg as *u8) as Token {
+    let is Token as tok = next_token();
+    if (tok.kind != TK_STRING) {
+        eprint("error: expected string for ");
+        linux.write(2, msg, strlen(msg));
+        write_nl(2);
+        linux.exit(1);
+    }
+    return tok;
+}
+
+fn expect_lbrace() as void {
+    let is Token as tok = next_token();
+    if (tok.kind != TK_LBRACE) {
+        eprint("error: expected '{'");
+        write_nl(2);
+        linux.exit(1);
+    }
+}
+
+fn get_target(proj as *Project, idx as i32) as *Target {
+    return cast(*Target, cast(i64, proj.targets) + cast(i64, idx) * sizeof(Target));
+}
+
+fn get_dep(proj as *Project, idx as i32) as *Dep {
+    return cast(*Dep, cast(i64, proj.deps) + cast(i64, idx) * sizeof(Dep));
+}
+
+fn get_script(proj as *Project, idx as i32) as *Script {
+    return cast(*Script, cast(i64, proj.scripts) + cast(i64, idx) * sizeof(Script));
+}
+
+fn get_script_cmd(scr as *Script, idx as i32) as *ScriptCmd {
+    return cast(*ScriptCmd, cast(i64, scr.cmds) + cast(i64, idx) * sizeof(ScriptCmd));
+}
+
+fn parse_target(proj as *Project) as void {
+    let is Token as name_tok = expect_string("target name");
+    expect_lbrace();
+
+    let is i32 as idx = proj.target_count;
+    if (idx >= MAX_TARGETS) {
+        eprint("error: too many targets");
+        write_nl(2);
+        linux.exit(1);
+    }
+    let is *Target as t = get_target(proj, idx);
+    t.name_ptr = name_tok.ptr;
+    t.name_len = name_tok.len;
+    t.src_ptr = cast(*u8, 0);
+    t.src_len = 0;
+    t.out_ptr = cast(*u8, 0);
+    t.out_len = 0;
+    t.flags_ptr = cast(*u8, 0);
+    t.flags_len = 0;
+    t.depends_ptr = cast(*u8, 0);
+    t.depends_len = 0;
+    t.has_out = 0;
+    proj.target_count = idx + 1;
+
+    let is Token as tok with mut;
+    tok = next_token();
+    while (tok.kind != TK_RBRACE && tok.kind != TK_EOF) {
+        if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "src") == 1) {
+            let is Token as val = expect_string("src");
+            t.src_ptr = val.ptr;
+            t.src_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "out") == 1) {
+            let is Token as val = expect_string("out");
+            t.out_ptr = val.ptr;
+            t.out_len = val.len;
+            t.has_out = 1;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "flags") == 1) {
+            let is Token as val = expect_string("flags");
+            t.flags_ptr = val.ptr;
+            t.flags_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depends") == 1) {
+            let is Token as val = expect_string("depends");
+            t.depends_ptr = val.ptr;
+            t.depends_len = val.len;
+        }
+        tok = next_token();
+    }
+}
+
+fn parse_dep(proj as *Project) as void {
+    let is Token as name_tok = expect_string("dep name");
+    expect_lbrace();
+
+    let is i32 as idx = proj.dep_count;
+    if (idx >= MAX_DEPS) {
+        eprint("error: too many deps");
+        write_nl(2);
+        linux.exit(1);
+    }
+    let is *Dep as d = get_dep(proj, idx);
+    d.name_ptr = name_tok.ptr;
+    d.name_len = name_tok.len;
+    d.path_ptr = cast(*u8, 0);
+    d.path_len = 0;
+    proj.dep_count = idx + 1;
+
+    let is Token as tok with mut;
+    tok = next_token();
+    while (tok.kind != TK_RBRACE && tok.kind != TK_EOF) {
+        if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "path") == 1) {
+            let is Token as val = expect_string("path");
+            d.path_ptr = val.ptr;
+            d.path_len = val.len;
+        }
+        tok = next_token();
+    }
+}
+
+fn parse_script(proj as *Project) as void {
+    let is Token as name_tok = expect_string("script name");
+    expect_lbrace();
+
+    let is i32 as idx = proj.script_count;
+    if (idx >= MAX_SCRIPTS) {
+        eprint("error: too many scripts");
+        write_nl(2);
+        linux.exit(1);
+    }
+    let is *Script as s = get_script(proj, idx);
+    s.name_ptr = name_tok.ptr;
+    s.name_len = name_tok.len;
+    s.cmds = mem.galloc(cast(i64, MAX_CMDS) * sizeof(ScriptCmd));
+    s.cmd_count = 0;
+    proj.script_count = idx + 1;
+
+    let is Token as tok with mut;
+    tok = next_token();
+    while (tok.kind != TK_RBRACE && tok.kind != TK_EOF) {
+        if (tok.kind == TK_STRING) {
+            if (s.cmd_count < MAX_CMDS) {
+                let is *ScriptCmd as cmd = get_script_cmd(s, s.cmd_count);
+                cmd.ptr = tok.ptr;
+                cmd.len = tok.len;
+                s.cmd_count = s.cmd_count + 1;
+            }
+        }
+        tok = next_token();
+    }
+}
+
+fn parse(src as *u8, src_len as i64) as Project {
+    _src = src;
+    _src_len = src_len;
+    _pos = 0;
+
+    let is Project as proj;
+    proj.name_ptr = cast(*u8, 0);
+    proj.name_len = 0;
+    proj.version_ptr = cast(*u8, 0);
+    proj.version_len = 0;
+    proj.author_ptr = cast(*u8, 0);
+    proj.author_len = 0;
+    proj.license_ptr = cast(*u8, 0);
+    proj.license_len = 0;
+    proj.targets = mem.galloc(cast(i64, MAX_TARGETS) * sizeof(Target));
+    proj.target_count = 0;
+    proj.deps = mem.galloc(cast(i64, MAX_DEPS) * sizeof(Dep));
+    proj.dep_count = 0;
+    proj.scripts = mem.galloc(cast(i64, MAX_SCRIPTS) * sizeof(Script));
+    proj.script_count = 0;
+
+    let is Token as tok with mut;
+    tok = next_token();
+    while (tok.kind != TK_EOF) {
+        if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "name") == 1) {
+            let is Token as val = expect_string("name");
+            proj.name_ptr = val.ptr;
+            proj.name_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "version") == 1) {
+            let is Token as val = expect_string("version");
+            proj.version_ptr = val.ptr;
+            proj.version_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "author") == 1) {
+            let is Token as val = expect_string("author");
+            proj.author_ptr = val.ptr;
+            proj.author_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "license") == 1) {
+            let is Token as val = expect_string("license");
+            proj.license_ptr = val.ptr;
+            proj.license_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "target") == 1) {
+            parse_target(&proj);
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "dep") == 1) {
+            parse_dep(&proj);
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "script") == 1) {
+            parse_script(&proj);
+        } else {
+            eprint("error: unexpected token: ");
+            if (tok.len > 0 && cast(i64, tok.ptr) != 0) {
+                linux.write(2, tok.ptr, cast(i64, tok.len));
+            }
+            write_nl(2);
+            linux.exit(1);
+        }
+        tok = next_token();
+    }
+
+    return proj;
+}

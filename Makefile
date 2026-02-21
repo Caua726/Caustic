@@ -23,6 +23,12 @@ linker: $(CAUSTIC)
 	$(CAUSTIC_AS) caustic-linker/main.cst.s
 	$(CAUSTIC_LD) caustic-linker/main.cst.s.o -o $(CAUSTIC_LD)
 
+# Build system
+maker: $(CAUSTIC)
+	$(CAUSTIC) caustic-maker/main.cst
+	$(CAUSTIC_AS) caustic-maker/main.cst.s
+	$(CAUSTIC_LD) caustic-maker/main.cst.s.o -o caustic-mk
+
 # Test linker
 test-linker: $(CAUSTIC) linker assembler
 	bash tests_asm/test_linker.sh
@@ -33,4 +39,4 @@ clean:
 	rm -f caustic-assembler/main.cst.s caustic-assembler/main.cst.s.o
 	rm -f caustic-linker/main.cst.s caustic-linker/main.cst.s.o
 
-.PHONY: all clean assembler linker test-linker
+.PHONY: all clean assembler linker test-linker maker

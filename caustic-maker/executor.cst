@@ -1,0 +1,439 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+use "parser.cst" as parser;
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn print(s as *u8) as void {
+    linux.write(1, s, strlen(s));
+}
+
+fn eprint(s as *u8) as void {
+    linux.write(2, s, strlen(s));
+}
+
+fn write_nl(fd as i64) as void {
+    let is [1]u8 as b;
+    b[0] = 10;
+    linux.write(fd, &b, 1);
+}
+
+fn write_quote(fd as i64) as void {
+    let is [1]u8 as b;
+    b[0] = 34;
+    linux.write(fd, &b, 1);
+}
+
+fn streq_lit(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != 0) { return 0; }
+    return 1;
+}
+
+// copy n bytes from src into a new null-terminated string
+fn str_dup(src as *u8, n as i32) as *u8 {
+    let is *u8 as buf = mem.galloc(cast(i64, n) + 1);
+    mem.memcpy(buf, src, cast(i64, n));
+    buf[n] = 0;
+    return buf;
+}
+
+// concat two null-terminated strings
+fn str_cat(a as *u8, b as *u8) as *u8 {
+    let is i64 as a_len = strlen(a);
+    let is i64 as b_len = strlen(b);
+    let is *u8 as buf = mem.galloc(a_len + b_len + 1);
+    mem.memcpy(buf, a, a_len);
+    mem.memcpy(cast(*u8, cast(i64, buf) + a_len), b, b_len);
+    buf[a_len + b_len] = 0;
+    return buf;
+}
+
+fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
+    let is i64 as a_len = strlen(a);
+    let is i64 as b_len = strlen(b);
+    let is i64 as c_len = strlen(c);
+    let is i64 as total = a_len + b_len + c_len;
+    let is *u8 as buf = mem.galloc(total + 1);
+    mem.memcpy(buf, a, a_len);
+    mem.memcpy(cast(*u8, cast(i64, buf) + a_len), b, b_len);
+    mem.memcpy(cast(*u8, cast(i64, buf) + a_len + b_len), c, c_len);
+    buf[total] = 0;
+    return buf;
+}
+
+// mkdir via syscall 83 (mode 0755 = 493)
+fn mkdir_p(path as *u8) as void {
+    syscall(83, path, 493);
+}
+
+// run a command by forking and execve'ing /bin/sh -c "cmd"
+// returns exit code
+fn run_cmd(cmd as *u8) as i32 {
+    print("  > ");
+    print(cmd);
+    write_nl(1);
+
+    // build argv: ["/bin/sh", "-c", cmd, NULL]
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "/bin/sh");
+    argv[1] = cast(i64, "-c");
+    argv[2] = cast(i64, cmd);
+    argv[3] = 0;
+
+    // build envp: inherit (NULL-terminated, we pass minimal)
+    let is [1]i64 as envp;
+    envp[0] = 0;
+
+    // fork = syscall 57
+    let is i64 as pid = syscall(57);
+
+    if (pid == 0) {
+        // child: execve
+        syscall(59, "/bin/sh", &argv, &envp);
+        // if execve fails
+        linux.exit(127);
+    }
+
+    if (pid < 0) {
+        eprint("error: fork failed");
+        write_nl(2);
+        return 1;
+    }
+
+    // parent: wait4(pid, &status, 0, NULL)
+    let is i32 as status with mut = 0;
+    syscall(61, pid, &status, 0, cast(*u8, 0));
+
+    // extract exit code: status >> 8 & 0xFF
+    let is i32 as code = (status >> 8) & 255;
+    return code;
+}
+
+// find a tool in PATH. returns heap-allocated full path or the name itself
+fn find_tool(name as *u8) as *u8 {
+    // first check if it exists in current directory
+    let is *u8 as local = str_cat("./", name);
+    // try access syscall 21 (F_OK = 0)
+    let is i64 as r = syscall(21, local, 0);
+    if (r == 0) {
+        return local;
+    }
+    mem.gfree(local);
+    // fallback: just use the name (let PATH resolve it via sh)
+    return name;
+}
+
+fn find_target(proj as *parser.Project, name as *u8) as *parser.Target {
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = str_dup(t.name_ptr, t.name_len);
+        if (streq_lit(tname, name) == 1) {
+            mem.gfree(tname);
+            return t;
+        }
+        mem.gfree(tname);
+        i = i + 1;
+    }
+    return cast(*parser.Target, 0);
+}
+
+fn find_script(proj as *parser.Project, name as *u8) as *parser.Script {
+    let is i32 as i with mut = 0;
+    while (i < proj.script_count) {
+        let is *parser.Script as s = parser.get_script(proj, i);
+        let is *u8 as sname = str_dup(s.name_ptr, s.name_len);
+        if (streq_lit(sname, name) == 1) {
+            mem.gfree(sname);
+            return s;
+        }
+        mem.gfree(sname);
+        i = i + 1;
+    }
+    return cast(*parser.Script, 0);
+}
+
+// extract basename from a path (after last /)
+fn basename(path as *u8) as *u8 {
+    let is i64 as len = strlen(path);
+    let is i64 as last_slash with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (path[i] == 47) {
+            last_slash = i;
+        }
+        i = i + 1;
+    }
+    if (last_slash >= 0) {
+        return cast(*u8, cast(i64, path) + last_slash + 1);
+    }
+    return path;
+}
+
+fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
+    let is *u8 as src = str_dup(t.src_ptr, t.src_len);
+    let is *u8 as target_name = str_dup(t.name_ptr, t.name_len);
+
+    // find tools
+    let is *u8 as caustic_bin = find_tool("caustic");
+    let is *u8 as as_bin = find_tool("caustic-as");
+    let is *u8 as ld_bin = find_tool("caustic-ld");
+
+    // 1. mkdir .caustic
+    mkdir_p(".caustic");
+
+    // 2. compile: caustic <src> [flags]
+    let is *u8 as compile_cmd with mut = str_cat3(caustic_bin, " ", src);
+    if (t.flags_len > 0) {
+        let is *u8 as flags = str_dup(t.flags_ptr, t.flags_len);
+        compile_cmd = str_cat3(compile_cmd, " ", flags);
+    }
+    let is i32 as rc with mut = 0;
+    rc = run_cmd(compile_cmd);
+    if (rc != 0) {
+        eprint("error: compilation failed");
+        write_nl(2);
+        return rc;
+    }
+
+    // 3. the .s file is at <src>.s, move to .caustic/
+    let is *u8 as s_file = str_cat(src, ".s");
+    let is *u8 as base = basename(s_file);
+    let is *u8 as cached_s = str_cat3(".caustic/", base, "");
+    // rename syscall 82
+    syscall(82, s_file, cached_s);
+
+    // 4. assemble: caustic-as .caustic/<base>.s
+    let is *u8 as asm_cmd = str_cat3(as_bin, " ", cached_s);
+    rc = run_cmd(asm_cmd);
+    if (rc != 0) {
+        eprint("error: assembly failed");
+        write_nl(2);
+        return rc;
+    }
+
+    // 5. the .o file is at .caustic/<base>.s.o
+    let is *u8 as cached_o = str_cat(cached_s, ".o");
+
+    // 6. determine output path
+    let is *u8 as out_path with mut;
+    if (t.has_out == 1) {
+        out_path = str_dup(t.out_ptr, t.out_len);
+    } else {
+        mkdir_p("build");
+        out_path = str_cat("build/", target_name);
+        eprint("warning: no 'out' specified for target '");
+        linux.write(2, t.name_ptr, cast(i64, t.name_len));
+        eprint("', using ");
+        eprint(out_path);
+        write_nl(2);
+    }
+
+    // 7. link: caustic-ld .caustic/<base>.o -o <out>
+    let is *u8 as link_cmd with mut = str_cat3(ld_bin, " ", cached_o);
+    link_cmd = str_cat3(link_cmd, " -o ", out_path);
+    rc = run_cmd(link_cmd);
+    if (rc != 0) {
+        eprint("error: linking failed");
+        write_nl(2);
+        return rc;
+    }
+
+    print("  built: ");
+    print(out_path);
+    write_nl(1);
+    return 0;
+}
+
+fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32) as i32 {
+    let is *parser.Target as t = find_target(proj, target_name);
+    if (cast(i64, t) == 0) {
+        eprint("error: target '");
+        eprint(target_name);
+        eprint("' not found");
+        write_nl(2);
+        return 1;
+    }
+
+    // resolve depends
+    if (t.depends_len > 0) {
+        let is *u8 as dep_name = str_dup(t.depends_ptr, t.depends_len);
+        let is i32 as rc = exec_build(proj, dep_name, continue_flag);
+        if (rc != 0 && continue_flag == 0) {
+            return rc;
+        }
+    }
+
+    print("building target: ");
+    print(target_name);
+    write_nl(1);
+
+    return run_pipeline(t, proj);
+}
+
+fn run_script(proj as *parser.Project, scr as *parser.Script) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < scr.cmd_count) {
+        let is *parser.ScriptCmd as cmd = parser.get_script_cmd(scr, i);
+        let is *u8 as cmd_str = str_dup(cmd.ptr, cmd.len);
+        let is i32 as rc = run_cmd(cmd_str);
+        if (rc != 0) {
+            return rc;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn exec_run(proj as *parser.Project, name as *u8) as i32 {
+    // check scripts first
+    let is *parser.Script as scr = find_script(proj, name);
+    if (cast(i64, scr) != 0) {
+        return run_script(proj, scr);
+    }
+
+    // check targets - run the built binary
+    let is *parser.Target as t = find_target(proj, name);
+    if (cast(i64, t) != 0) {
+        let is *u8 as out_path with mut;
+        if (t.has_out == 1) {
+            out_path = str_dup(t.out_ptr, t.out_len);
+        } else {
+            let is *u8 as tname = str_dup(t.name_ptr, t.name_len);
+            out_path = str_cat("build/", tname);
+        }
+        return run_cmd(out_path);
+    }
+
+    eprint("error: '");
+    eprint(name);
+    eprint("' is not a script or target");
+    write_nl(2);
+    return 1;
+}
+
+fn exec_test(proj as *parser.Project) as i32 {
+    return exec_run(proj, "test");
+}
+
+// remove files in a directory, then rmdir
+fn remove_dir(path as *u8) as void {
+    // open directory: syscall 2 (O_RDONLY | O_DIRECTORY = 0x10000)
+    let is i64 as fd = syscall(2, path, 65536, 0);
+    if (fd < 0) {
+        return;
+    }
+    let is [4096]u8 as buf;
+    let is i64 as nread with mut = 1;
+    while (nread > 0) {
+        // getdents64 = syscall 217
+        nread = syscall(217, fd, &buf, 4096);
+        if (nread <= 0) {
+            linux.close(fd);
+            // rmdir = syscall 84
+            syscall(84, path);
+            return;
+        }
+        let is i64 as pos with mut = 0;
+        while (pos < nread) {
+            // struct linux_dirent64: offset 0: d_ino(8), offset 8: d_off(8),
+            // offset 16: d_reclen(2), offset 18: d_type(1), offset 19: d_name
+            let is *u8 as entry = cast(*u8, cast(i64, &buf) + pos);
+            let is i32 as reclen = cast(i32, entry[16]) + cast(i32, entry[17]) * 256;
+            let is *u8 as d_name = cast(*u8, cast(i64, entry) + 19);
+            // skip . and ..
+            if (d_name[0] == 46 && d_name[1] == 0) {
+                // skip .
+            } else if (d_name[0] == 46 && d_name[1] == 46 && d_name[2] == 0) {
+                // skip ..
+            } else {
+                let is *u8 as full = str_cat3(path, "/", d_name);
+                // unlink = syscall 87
+                syscall(87, full);
+            }
+            pos = pos + cast(i64, reclen);
+        }
+    }
+    linux.close(fd);
+    // rmdir = syscall 84
+    syscall(84, path);
+}
+
+fn exec_clean() as i32 {
+    print("cleaning .caustic/ and build/");
+    write_nl(1);
+    remove_dir(".caustic");
+    remove_dir("build");
+    return 0;
+}
+
+fn exec_init() as i32 {
+    print("project name: ");
+    // read from stdin
+    let is [256]u8 as name_buf;
+    let is i64 as n with mut = 0;
+    n = linux.read(0, &name_buf, 255);
+    if (n <= 0) {
+        eprint("error: could not read name");
+        write_nl(2);
+        return 1;
+    }
+    // strip newline
+    if (n > 0 && name_buf[n - 1] == 10) {
+        n = n - 1;
+    }
+    name_buf[n] = 0;
+
+    // write Causticfile
+    let is i64 as fd = syscall(2, "Causticfile", 577, 420);
+    if (fd < 0) {
+        eprint("error: could not create Causticfile");
+        write_nl(2);
+        return 1;
+    }
+
+    linux.write(fd, "name ", 5);
+    write_quote(fd);
+    linux.write(fd, &name_buf, n);
+    write_quote(fd);
+    write_nl(fd);
+    linux.write(fd, "version ", 8);
+    write_quote(fd);
+    linux.write(fd, "0.1.0", 5);
+    write_quote(fd);
+    write_nl(fd);
+    linux.write(fd, "author ", 7);
+    write_quote(fd);
+    write_quote(fd);
+    write_nl(fd);
+    write_nl(fd);
+    linux.write(fd, "target ", 7);
+    write_quote(fd);
+    linux.write(fd, &name_buf, n);
+    write_quote(fd);
+    linux.write(fd, " {", 2);
+    write_nl(fd);
+    linux.write(fd, "    src ", 8);
+    write_quote(fd);
+    linux.write(fd, "src/main.cst", 12);
+    write_quote(fd);
+    write_nl(fd);
+    linux.write(fd, "}", 1);
+    write_nl(fd);
+
+    linux.close(fd);
+    print("created Causticfile");
+    write_nl(1);
+    return 0;
+}
