@@ -1,34 +1,34 @@
 # Caustic
 
-Compilator x86_64 (Linux) write in C (for now),
-without LLVM, without runtime
+Self-hosted x86_64 Linux compiler — no LLVM, no libc, no runtime.
+
+The entire toolchain (compiler, assembler, linker) is written in Caustic itself.
 
 ## Build & Run
 
 ```sh
-$ make
+make
 ```
 
-Or manually:
+Compile a program:
 
 ```sh
-$ make
-$ ./caustic main.cst
-$ gcc -no-pie main.cst.s -o main
-$ ./main
+./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program
+./program
 ```
 
 ## Capabilities
 
 ### Core
 
-- [x] **Native Code Generation** 
+- [x] **Native Code Generation**
 - [x] **Direct Syscalls**
 - [x] **Pointers, Arrays, Structs**
 - [x] **Global Variables**
 - [x] **String Literals**
 - [x] **Module System**
 - [x] **Functions**
+- [x] **Floats** (f32, f64 via SSE)
 - [-] **Standard Library**
   - [x] **Memory Management**
   - [x] **Dynamic Strings**
@@ -41,11 +41,11 @@ $ ./main
   - [x] **Defer**
   - [x] **FFI / C Interop**
   - [x] **Impl Blocks** (methods & associated functions)
-- [ ] **Compiler Evolution**
-  - [ ] **Assembler** (eliminate NASM/GCC dependency)
-  - [ ] **Linker** (produce ELF binaries directly)
+- [-] **Compiler Evolution**
+  - [x] **Self-Hosted Compiler**
+  - [x] **Assembler** (caustic-as)
+  - [x] **Linker** (caustic-ld, static & dynamic)
   - [ ] **Optimization**
-  - [ ] **Self Hosting**
 
 ### Syntax Dump
 
@@ -188,10 +188,12 @@ let is i32 as shifted = 1 << 4;
 
 #### Modules
 ```cst
-use "std/mem.cst";
+use "std/mem.cst" as mem;
 
 fn main() as i32 {
-    let is *u8 as mem = alloc(1024);
+    mem.gheapinit(1048576);
+    let is *u8 as ptr = mem.galloc(1024);
+    defer mem.gfree(ptr);
     return 0;
 }
 ```
