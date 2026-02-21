@@ -1150,8 +1150,9 @@ static void gen_inst(IRInst *inst, AllocCtx *ctx) {
                 break;
             }
 
-            // Float-returning functions return in xmm0, not rax
-            if (inst->cast_to_type &&
+            // Only extern functions return floats in xmm0 (C ABI)
+            // Caustic functions return floats as bitcasted i64 in rax
+            if (inst->is_extern_call && inst->cast_to_type &&
                 (inst->cast_to_type->kind == TY_F32 || inst->cast_to_type->kind == TY_F64)) {
                 emit("movq rax, xmm0");
             }

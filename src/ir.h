@@ -80,6 +80,7 @@ typedef struct IRInst {
     char *asm_str;
     char *call_target_name;
     int is_variadic_call;
+    int is_extern_call; // For float returns: use xmm0 instead of rax
     char *global_name; // For IR_ADDR_GLOBAL
     int is_extern_global; // For IR_ADDR_GLOBAL: load from GOT instead of lea
     Type *cast_to_type;

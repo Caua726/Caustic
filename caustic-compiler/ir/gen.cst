@@ -28,6 +28,11 @@ let is i32 as ir_depth with mut;
 let is [2048]u8 as ir_done_bodies with mut;
 let is i32 as ir_done_count with mut;
 
+fn is_float_kind(kind as i32) as i32 {
+    if (kind == ast.TY_F32 || kind == ast.TY_F64) { return 1; }
+    return 0;
+}
+
 // === Emit helpers ===
 
 fn emit(inst as *d.IRInst) as void {
@@ -355,6 +360,9 @@ fn gen_expr(node as *ast.Node) as i32 {
 
     // NK_NUM
     if (k == ast.NK_NUM) {
+        if (is_float_kind(node.ty.kind) == 1) {
+            return emit_imm(ast.f64_to_i64(node.fval), line);
+        }
         return emit_imm(node.val, line);
     }
 
@@ -497,6 +505,7 @@ fn gen_expr(node as *ast.Node) as i32 {
         }
         if (cast(i64, lty) != cast(i64, ty)) { lhs = emit_cast(lhs, cast(*u8, ty), line); }
         if (cast(i64, rty) != cast(i64, ty)) { rhs = emit_cast(rhs, cast(*u8, ty), line); }
+        if (is_float_kind(ty.kind) == 1) { return emit_binary(d.IR_FADD, lhs, rhs, line); }
         return emit_binary(d.IR_ADD, lhs, rhs, line);
     }
 
@@ -529,6 +538,7 @@ fn gen_expr(node as *ast.Node) as i32 {
         }
         if (cast(i64, lty) != cast(i64, ty)) { lhs = emit_cast(lhs, cast(*u8, ty), line); }
         if (cast(i64, rty) != cast(i64, ty)) { rhs = emit_cast(rhs, cast(*u8, ty), line); }
+        if (is_float_kind(ty.kind) == 1) { return emit_binary(d.IR_FSUB, lhs, rhs, line); }
         return emit_binary(d.IR_SUB, lhs, rhs, line);
     }
 
@@ -540,17 +550,19 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is i32 as rhs with mut = gen_expr(node.rhs);
         if (cast(i64, node.lhs.ty) != cast(i64, ty)) { lhs = emit_cast(lhs, cast(*u8, ty), line); }
         if (cast(i64, node.rhs.ty) != cast(i64, ty)) { rhs = emit_cast(rhs, cast(*u8, ty), line); }
+        if (is_float_kind(ty.kind) == 1) { return emit_binary(d.IR_FMUL, lhs, rhs, line); }
         return emit_binary(d.IR_MUL, lhs, rhs, line);
     }
 
     if (k == ast.NK_DIV) {
-        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM) {
+        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM && is_float_kind(ty.kind) == 0) {
             return emit_imm(node.lhs.val / node.rhs.val, line);
         }
         let is i32 as lhs with mut = gen_expr(node.lhs);
         let is i32 as rhs with mut = gen_expr(node.rhs);
         if (cast(i64, node.lhs.ty) != cast(i64, ty)) { lhs = emit_cast(lhs, cast(*u8, ty), line); }
         if (cast(i64, node.rhs.ty) != cast(i64, ty)) { rhs = emit_cast(rhs, cast(*u8, ty), line); }
+        if (is_float_kind(ty.kind) == 1) { return emit_binary(d.IR_FDIV, lhs, rhs, line); }
         let is i32 as dv = emit_binary(d.IR_DIV, lhs, rhs, line);
         ctx_tail.cast_to = cast(*u8, ty);
         return dv;
@@ -657,7 +669,9 @@ fn gen_expr(node as *ast.Node) as i32 {
     if (k == ast.NK_NEG) {
         let is i32 as src = gen_expr(node.expr);
         let is i32 as dest = new_vreg();
-        let is *d.IRInst as i = d.new_inst(d.IR_NEG);
+        let is i32 as neg_op with mut = d.IR_NEG;
+        if (is_float_kind(ty.kind) == 1) { neg_op = d.IR_FNEG; }
+        let is *d.IRInst as i = d.new_inst(neg_op);
         i.dest = d.op_vreg(dest);
         i.src1 = d.op_vreg(src);
         i.line = line;
@@ -731,8 +745,8 @@ fn gen_expr(node as *ast.Node) as i32 {
 
         let is i32 as sret_addr with mut = cast(i32, 0 - 1);
         if (use_sret == 1) {
-            let is i32 as offset = ctx_func.alloc_stack_size;
             ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + ty.size;
+            let is i32 as offset = ctx_func.alloc_stack_size;
             // align 16
             if (ctx_func.alloc_stack_size % 16 != 0) {
                 ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
@@ -870,11 +884,11 @@ fn gen_expr(node as *ast.Node) as i32 {
         // Tagged union with no payload but needs full allocation
         if (cast(i64, node.payload_args) == 0 && ty.size > 4) {
             let is i32 as total_size = ty.size;
-            let is i32 as offset = ctx_func.alloc_stack_size;
             ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + total_size;
             if (ctx_func.alloc_stack_size % 16 != 0) {
                 ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
             }
+            let is i32 as offset = ctx_func.alloc_stack_size;
             let is i32 as base_addr = new_vreg();
             let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
             ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; emit(ga);
@@ -886,11 +900,11 @@ fn gen_expr(node as *ast.Node) as i32 {
         }
         // Tagged union with payload
         let is i32 as total_size = ty.size;
-        let is i32 as offset = ctx_func.alloc_stack_size;
         ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + total_size;
         if (ctx_func.alloc_stack_size % 16 != 0) {
             ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
         }
+        let is i32 as offset = ctx_func.alloc_stack_size;
         let is i32 as base_addr = new_vreg();
         let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
         ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; emit(ga);

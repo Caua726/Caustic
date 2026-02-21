@@ -193,12 +193,13 @@ static SysVClassification classify_struct_sysv(Type *ty) {
     return result;
 }
 
-static int emit_call(char *func_name, int is_variadic, Type *return_type, int xmm_arg_count, int line) {
+static int emit_call(char *func_name, int is_variadic, int is_extern, Type *return_type, int xmm_arg_count, int line) {
     int dest = new_vreg();
     IRInst *inst = new_inst(IR_CALL);
     inst->dest = op_vreg(dest);
     inst->call_target_name = strdup(func_name);
     inst->is_variadic_call = is_variadic;
+    inst->is_extern_call = is_extern;
     inst->cast_to_type = return_type; // Used by codegen to handle float returns
     inst->src2 = op_imm(xmm_arg_count); // Number of xmm args (for AL in variadic calls)
     inst->line = line;
@@ -1141,7 +1142,7 @@ static int gen_expr(Node *node) {
             free(arg_vregs);
             free(arg_types);
 
-            int ret_reg = emit_call(node->name, node->is_variadic, node->ty, xmm_count, line);
+            int ret_reg = emit_call(node->name, node->is_variadic, node->is_extern, node->ty, xmm_count, line);
 
             if (stack_arg_count > 0) {
                 int pad = (stack_arg_count % 2 != 0) ? 1 : 0;
