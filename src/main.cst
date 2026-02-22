@@ -9,6 +9,16 @@ use "semantic/walk.cst" as sem;
 use "ir/defs.cst" as ird;
 use "ir/gen.cst" as irg;
 use "codegen/emit.cst" as cg;
+use "../caustic-assembler/main.cst" as asmmod;
+use "../caustic-linker/main.cst" as ldmod;
+
+fn read_file_size(path as *u8) as i64 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
+    linux.close(fd);
+    return size;
+}
 
 fn read_file(path as *u8, out_size as *i64) as *u8 {
     let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
@@ -30,6 +40,11 @@ fn str_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
     return 1;
 }
 
+fn starts_with_dash_l(s as *u8) as i32 {
+    if (s[0] == 45 && s[1] == 108 && s[2] != 0) { return 1; }
+    return 0;
+}
+
 fn get_dir_len(path_ptr as *u8, path_len as i32) as i32 {
     let is i32 as i with mut = path_len - 1;
     while (i >= 0) {
@@ -37,6 +52,65 @@ fn get_dir_len(path_ptr as *u8, path_len as i32) as i32 {
         i = i - 1;
     }
     return 0;
+}
+
+// Estimate total source size by scanning use "..." imports (no heap needed)
+fn estimate_source_size(filename as *u8, fname_len as i32) as i64 {
+    let is i64 as fsize = read_file_size(filename);
+    if (fsize <= 0) { return fsize; }
+    let is i64 as fd = linux.open(filename, linux.O_RDONLY, 0);
+    if (fd < 0) { return fsize; }
+    let is *u8 as buf = linux.mmap(cast(*u8, 0), fsize, 1, 2, fd, 0);
+    linux.close(fd);
+    if (cast(i64, buf) < 0) { return fsize; }
+
+    let is i64 as total with mut = fsize;
+    let is i32 as dir_len = get_dir_len(filename, fname_len);
+
+    // Scan for: use "path"
+    let is i64 as i with mut = 0;
+    while (i < fsize - 5) {
+        // Match: use "
+        if (buf[i] == 117 && buf[i + 1] == 115 && buf[i + 2] == 101 && buf[i + 3] == 32 && buf[i + 4] == 34) {
+            let is i64 as start = i + 5;
+            let is i64 as end with mut = start;
+            while (end < fsize && buf[end] != 34) { end = end + 1; }
+            let is i32 as path_len = cast(i32, end - start);
+            if (path_len > 0 && path_len < 512) {
+                // Build resolved path: dir + "/" + import_path
+                let is [1024]u8 as resolved;
+                let is i32 as rlen with mut = 0;
+                if (dir_len > 0) {
+                    let is i32 as di with mut = 0;
+                    while (di < dir_len) {
+                        resolved[rlen] = filename[di];
+                        rlen = rlen + 1;
+                        di = di + 1;
+                    }
+                    resolved[rlen] = 47; // '/'
+                    rlen = rlen + 1;
+                }
+                let is i32 as pi with mut = 0;
+                while (pi < path_len) {
+                    resolved[rlen] = buf[start + cast(i64, pi)];
+                    rlen = rlen + 1;
+                    pi = pi + 1;
+                }
+                resolved[rlen] = cast(u8, 0);
+                let is i64 as imp_size = read_file_size(&resolved);
+                if (imp_size > 0) { total = total + imp_size; }
+            }
+            i = end + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    linux.munmap(buf, fsize);
+    // 5x for transitive imports, then the total represents raw source
+    // When -o is used, the assembler+linker also use the heap,
+    // and the .s file can be ~5x the total source
+    return total * 5;
 }
 
 fn resolve_stdlib_dir() as void {
@@ -68,30 +142,42 @@ fn resolve_stdlib_dir() as void {
     sem.set_stdlib_dir(stdlib_path, total);
 }
 
-fn main(argc as i64, argv as i64) as i32 {
-    if (argc < 2) {
-        io.write_str(linux.STDERR, "Usage: caustic <source.cst>\n");
-        return 1;
-    }
-    mem.gheapinit(67108864);
-    resolve_stdlib_dir();
-    let is *i64 as argv_arr = cast(*i64, argv);
-    let is *u8 as filename with mut = cast(*u8, argv_arr[1]);
+fn strlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}
 
-    // Check for -c flag
-    let is i32 as no_main with mut = 0;
-    if (argc >= 3) {
-        let is *u8 as arg1 = cast(*u8, argv_arr[1]);
-        if (str_eq(arg1, 2, "-c", 2) == 1) {
-            no_main = 1;
-            filename = cast(*u8, argv_arr[2]);
-        }
+fn parse_int_arg(s as *u8) as i64 {
+    let is i64 as val with mut = 0;
+    let is i32 as i with mut = 0;
+    while (s[i] >= 48 && s[i] <= 57) {
+        val = val * 10 + cast(i64, s[i]) - 48;
+        i = i + 1;
     }
+    return val;
+}
 
+fn calc_heap_size(filename as *u8, max_ram as i64) as i64 {
+    let is i32 as flen with mut = 0;
+    while (filename[flen] != cast(u8, 0)) { flen = flen + 1; }
+    let is i64 as est_size = estimate_source_size(filename, flen);
+    let is i64 as heap_size with mut = est_size * 150 + 16777216;
+    if (heap_size < 33554432) { heap_size = 33554432; }
+    if (max_ram > 0 && heap_size > max_ram) { heap_size = max_ram; }
+    return heap_size;
+}
+
+// Compile one .cst file: lex → parse → semantic → IR → codegen → .s → assemble → .o
+// obj_path_out: stack buffer (at least 512 bytes) where the .o path is written
+// Returns 0 on success
+fn compile_one(filename as *u8, no_main as i32, obj_path_out as *u8) as i32 {
     let is i64 as file_size with mut = 0;
     let is *u8 as src = read_file(filename, &file_size);
     if (cast(i64, src) == 0) {
-        io.write_str(linux.STDERR, "Error: cannot read file\n");
+        io.write_str(linux.STDERR, "Error: cannot read file: ");
+        io.write_str(linux.STDERR, filename);
+        io.write_str(linux.STDERR, "\n");
         return 1;
     }
     let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
@@ -104,39 +190,276 @@ fn main(argc as i64, argv as i64) as i32 {
     io.write_str(linux.STDOUT, " tokens)\n");
     ast.types_init();
     let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
-    // Compute filename length
     let is i32 as fname_len with mut = 0;
     while (filename[fname_len] != cast(u8, 0)) { fname_len = fname_len + 1; }
-    // Semantic analysis
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
     io.write_str(linux.STDOUT, "semantic: ok\n");
 
-    // IR generation
+    irg.ir_reset();
     irg.ir_tl = cast(*u8, &tokens);
     let is *ird.IRProgram as prog = irg.gen_ir(cast(*u8, root), no_main);
     io.write_str(linux.STDOUT, "ir: ok\n");
 
-    // Build output path: filename + ".s"
-    let is i32 as out_len = fname_len + 2;
-    let is *u8 as out_path = mem.galloc(cast(i64, out_len) + 1);
-    mem.memcpy(out_path, filename, cast(i64, fname_len));
-    out_path[fname_len] = 46; // '.'
-    out_path[fname_len + 1] = 115; // 's'
-    out_path[fname_len + 2] = cast(u8, 0);
+    // Build asm path: filename + ".s"
+    let is i32 as asm_len = fname_len + 2;
+    let is *u8 as asm_path = mem.galloc(cast(i64, asm_len) + 1);
+    mem.memcpy(asm_path, filename, cast(i64, fname_len));
+    asm_path[fname_len] = 46;
+    asm_path[fname_len + 1] = 115;
+    asm_path[fname_len + 2] = cast(u8, 0);
 
-    // Open output file
-    let is i64 as out_fd = linux.open(out_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+    let is i64 as out_fd = linux.open(asm_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
     if (out_fd < 0) {
         io.write_str(linux.STDERR, "Error: cannot open output file\n");
         return 1;
     }
-
-    // Codegen
     cg.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
     linux.close(out_fd);
 
-    io.write_str(linux.STDOUT, "wrote: ");
-    io.write_str(linux.STDOUT, out_path);
+    // Build obj path: asm_path + ".o"
+    let is i32 as obj_len = asm_len + 2;
+    let is *u8 as obj_path = mem.galloc(cast(i64, obj_len) + 1);
+    mem.memcpy(obj_path, asm_path, cast(i64, asm_len));
+    obj_path[asm_len] = 46;
+    obj_path[asm_len + 1] = 111;
+    obj_path[asm_len + 2] = cast(u8, 0);
+
+    // Assemble
+    let is i32 as asm_err = asmmod.assemble_file(asm_path, obj_path);
+    if (asm_err != 0) {
+        io.write_str(linux.STDERR, "Error: assembly failed\n");
+        return 1;
+    }
+    linux.unlink(asm_path);
+
+    // Copy obj_path to stack buffer (survives heap reset)
+    let is i32 as oi with mut = 0;
+    while (oi < obj_len + 1) {
+        obj_path_out[oi] = obj_path[oi];
+        oi = oi + 1;
+    }
+    return 0;
+}
+
+fn main(argc as i64, argv as i64) as i32 {
+    if (argc < 2) {
+        io.write_str(linux.STDERR, "Usage: caustic <source.cst>... [-o output] [-llib] [-c] [--max-ram MB]\n");
+        return 1;
+    }
+    let is *i64 as argv_arr = cast(*i64, argv);
+
+    // Parse CLI args (no heap needed — all stack-based)
+    let is [64]i64 as input_files;   // pointers to argv strings
+    let is i32 as file_count with mut = 0;
+    let is *u8 as output_path with mut = cast(*u8, 0);
+    let is i32 as no_main with mut = 0;
+    let is i64 as max_ram with mut = 0; // 0 = unlimited
+    let is [32]i64 as lib_names;
+    let is i32 as lib_count with mut = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as arg = cast(*u8, argv_arr[ai]);
+        let is i32 as arglen = strlen(arg);
+
+        if (str_eq(arg, arglen, "-c", 2) == 1) {
+            no_main = 1;
+        } else if (str_eq(arg, arglen, "-o", 2) == 1) {
+            ai = ai + 1;
+            if (ai < argc) {
+                output_path = cast(*u8, argv_arr[ai]);
+            }
+        } else if (str_eq(arg, arglen, "--max-ram", 9) == 1) {
+            ai = ai + 1;
+            if (ai < argc) {
+                let is *u8 as val_str = cast(*u8, argv_arr[ai]);
+                let is i64 as mb = parse_int_arg(val_str);
+                if (mb == 0) {
+                    max_ram = 0;
+                } else {
+                    max_ram = mb * 1048576;
+                }
+            }
+        } else if (starts_with_dash_l(arg) == 1) {
+            lib_names[lib_count] = cast(i64, cast(*u8, cast(i64, arg) + 2));
+            lib_count = lib_count + 1;
+        } else if (str_eq(arg, arglen, "-debuglexer", 11) == 1) {
+            // pass through
+        } else if (str_eq(arg, arglen, "-debugparser", 12) == 1) {
+            // pass through
+        } else if (str_eq(arg, arglen, "-debugir", 8) == 1) {
+            // pass through
+        } else {
+            if (file_count < 64) {
+                input_files[file_count] = cast(i64, arg);
+                file_count = file_count + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+
+    if (file_count == 0) {
+        io.write_str(linux.STDERR, "Error: no input file\n");
+        return 1;
+    }
+
+    // === Single file, no -o: just output .s (backward compat) ===
+    if (file_count == 1 && cast(i64, output_path) == 0) {
+        let is *u8 as filename = cast(*u8, input_files[0]);
+        let is i64 as heap_size = calc_heap_size(filename, max_ram);
+        mem.gheapinit(heap_size);
+        resolve_stdlib_dir();
+
+        let is i64 as file_size with mut = 0;
+        let is *u8 as src = read_file(filename, &file_size);
+        if (cast(i64, src) == 0) {
+            io.write_str(linux.STDERR, "Error: cannot read file\n");
+            return 1;
+        }
+        let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
+        io.write_str(linux.STDOUT, "caustic: ");
+        io.write_str(linux.STDOUT, filename);
+        io.write_str(linux.STDOUT, " (");
+        io.write_int(linux.STDOUT, file_size);
+        io.write_str(linux.STDOUT, " bytes, ");
+        io.write_int(linux.STDOUT, cast(i64, tokens.count));
+        io.write_str(linux.STDOUT, " tokens)\n");
+        ast.types_init();
+        let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
+        let is i32 as fname_len with mut = 0;
+        while (filename[fname_len] != cast(u8, 0)) { fname_len = fname_len + 1; }
+        sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
+        io.write_str(linux.STDOUT, "semantic: ok\n");
+        irg.ir_tl = cast(*u8, &tokens);
+        let is *ird.IRProgram as prog = irg.gen_ir(cast(*u8, root), no_main);
+        io.write_str(linux.STDOUT, "ir: ok\n");
+        let is i32 as asm_len = fname_len + 2;
+        let is *u8 as asm_path = mem.galloc(cast(i64, asm_len) + 1);
+        mem.memcpy(asm_path, filename, cast(i64, fname_len));
+        asm_path[fname_len] = 46;
+        asm_path[fname_len + 1] = 115;
+        asm_path[fname_len + 2] = cast(u8, 0);
+        let is i64 as out_fd = linux.open(asm_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+        if (out_fd < 0) {
+            io.write_str(linux.STDERR, "Error: cannot open output file\n");
+            return 1;
+        }
+        cg.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
+        linux.close(out_fd);
+        io.write_str(linux.STDOUT, "wrote: ");
+        io.write_str(linux.STDOUT, asm_path);
+        io.write_str(linux.STDOUT, "\n");
+        return 0;
+    }
+
+    // === Compile + assemble + link mode (-o required for multi-file) ===
+
+    // Stack buffers for .o paths (survive heap reset)
+    // 64 files * 512 bytes per path = 32KB
+    let is [32768]u8 as obj_paths_buf;
+    let is [64]i32 as obj_path_offsets;
+    let is i32 as obj_buf_pos with mut = 0;
+
+    let is i32 as fi with mut = 0;
+    while (fi < file_count) {
+        let is *u8 as filename = cast(*u8, input_files[fi]);
+
+        // For multi-file: each file gets its own heap cycle
+        // For single file: first iteration inits, no reset needed
+        let is i64 as heap_size = calc_heap_size(filename, max_ram);
+        if (fi == 0) {
+            mem.gheapinit(heap_size);
+        } else {
+            mem.gheapreset(heap_size);
+        }
+        resolve_stdlib_dir();
+
+        // For multi-file, non-last files are always compiled with -c semantics
+        let is i32 as file_no_main with mut = no_main;
+        if (file_count > 1) { file_no_main = 1; }
+
+        // Compile + assemble this file
+        let is [512]u8 as one_obj_path;
+        let is i32 as err = compile_one(filename, file_no_main, &one_obj_path);
+        if (err != 0) { return 1; }
+
+        // Store .o path in stack buffer
+        obj_path_offsets[fi] = obj_buf_pos;
+        let is i32 as opi with mut = 0;
+        while (one_obj_path[opi] != cast(u8, 0)) {
+            obj_paths_buf[obj_buf_pos] = one_obj_path[opi];
+            obj_buf_pos = obj_buf_pos + 1;
+            opi = opi + 1;
+        }
+        obj_paths_buf[obj_buf_pos] = cast(u8, 0);
+        obj_buf_pos = obj_buf_pos + 1;
+
+        fi = fi + 1;
+    }
+
+    // === -c mode: no linking, output .o files ===
+    if (no_main == 1) {
+        if (file_count == 1 && cast(i64, output_path) != 0) {
+            // Rename the generated .o to the requested output path
+            let is *u8 as gen_obj = cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[0]));
+            linux.rename(gen_obj, output_path);
+            io.write_str(linux.STDOUT, "wrote: ");
+            io.write_str(linux.STDOUT, output_path);
+            io.write_str(linux.STDOUT, "\n");
+        } else {
+            let is i32 as pi with mut = 0;
+            while (pi < file_count) {
+                io.write_str(linux.STDOUT, "wrote: ");
+                io.write_str(linux.STDOUT, cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[pi])));
+                io.write_str(linux.STDOUT, "\n");
+                pi = pi + 1;
+            }
+        }
+        return 0;
+    }
+
+    if (cast(i64, output_path) == 0) {
+        io.write_str(linux.STDERR, "Error: -o required for multi-file compilation\n");
+        return 1;
+    }
+
+    // === Link all .o files ===
+    // Fresh heap for linker
+    let is i64 as link_heap with mut = 8388608; // 8MB base
+    let is i32 as lfi with mut = 0;
+    while (lfi < file_count) {
+        let is *u8 as opath = cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[lfi]));
+        link_heap = link_heap + read_file_size(opath) * 8;
+        lfi = lfi + 1;
+    }
+    if (link_heap < 4194304) { link_heap = 4194304; }
+    mem.gheapreset(link_heap);
+
+    // Build obj_arr for linker (pointers into stack buffer)
+    let is [64]i64 as obj_arr;
+    let is i32 as oi with mut = 0;
+    while (oi < file_count) {
+        obj_arr[oi] = cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[oi]);
+        oi = oi + 1;
+    }
+
+    let is i32 as link_err = ldmod.link_objs(cast(*u8, &obj_arr), file_count, output_path,
+                                              cast(*u8, &lib_names), lib_count);
+    if (link_err != 0) {
+        io.write_str(linux.STDERR, "Error: linking failed\n");
+        return 1;
+    }
+
+    // Cleanup .o files
+    let is i32 as ci with mut = 0;
+    while (ci < file_count) {
+        let is *u8 as opath = cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[ci]));
+        linux.unlink(opath);
+        ci = ci + 1;
+    }
+
+    io.write_str(linux.STDOUT, "caustic: ");
+    io.write_str(linux.STDOUT, output_path);
     io.write_str(linux.STDOUT, "\n");
 
     return 0;
