@@ -9,6 +9,7 @@ use "semantic/walk.cst" as sem;
 use "ir/defs.cst" as ird;
 use "ir/gen.cst" as irg;
 use "codegen/emit.cst" as cg;
+use "interface.cst" as iface;
 use "../caustic-assembler/main.cst" as asmmod;
 use "../caustic-linker/main.cst" as ldmod;
 
@@ -170,8 +171,9 @@ fn calc_heap_size(filename as *u8, max_ram as i64) as i64 {
 
 // Compile one .cst file: lex → parse → semantic → IR → codegen → .s → assemble → .o
 // obj_path_out: stack buffer (at least 512 bytes) where the .o path is written
+// emit_iface: if 1, emit .csti after semantic and skip IR/codegen/assemble
 // Returns 0 on success
-fn compile_one(filename as *u8, no_main as i32, obj_path_out as *u8) as i32 {
+fn compile_one(filename as *u8, no_main as i32, emit_iface as i32, obj_path_out as *u8) as i32 {
     let is i64 as file_size with mut = 0;
     let is *u8 as src = read_file(filename, &file_size);
     if (cast(i64, src) == 0) {
@@ -194,6 +196,29 @@ fn compile_one(filename as *u8, no_main as i32, obj_path_out as *u8) as i32 {
     while (filename[fname_len] != cast(u8, 0)) { fname_len = fname_len + 1; }
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
     io.write_str(linux.STDOUT, "semantic: ok\n");
+
+    // --emit-interface: write .csti and stop
+    if (emit_iface == 1) {
+        // Build .csti path: filename + "i"
+        let is *u8 as csti_path = mem.galloc(cast(i64, fname_len) + 2);
+        mem.memcpy(csti_path, filename, cast(i64, fname_len));
+        csti_path[fname_len] = 105; // 'i'
+        csti_path[fname_len + 1] = cast(u8, 0);
+        let is i64 as iface_fd = linux.open(csti_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+        if (iface_fd < 0) {
+            io.write_str(linux.STDERR, "Error: cannot open interface file: ");
+            io.write_str(linux.STDERR, csti_path);
+            io.write_str(linux.STDERR, "\n");
+            return 1;
+        }
+        iface.emit_csti(cast(*u8, root), iface_fd);
+        linux.close(iface_fd);
+        io.write_str(linux.STDOUT, "wrote: ");
+        io.write_str(linux.STDOUT, csti_path);
+        io.write_str(linux.STDOUT, "\n");
+        obj_path_out[0] = cast(u8, 0);
+        return 0;
+    }
 
     irg.ir_reset();
     irg.ir_tl = cast(*u8, &tokens);
@@ -253,6 +278,7 @@ fn main(argc as i64, argv as i64) as i32 {
     let is i32 as file_count with mut = 0;
     let is *u8 as output_path with mut = cast(*u8, 0);
     let is i32 as no_main with mut = 0;
+    let is i32 as emit_iface with mut = 0;
     let is i64 as max_ram with mut = 0; // 0 = unlimited
     let is [32]i64 as lib_names;
     let is i32 as lib_count with mut = 0;
@@ -283,6 +309,9 @@ fn main(argc as i64, argv as i64) as i32 {
         } else if (starts_with_dash_l(arg) == 1) {
             lib_names[lib_count] = cast(i64, cast(*u8, cast(i64, arg) + 2));
             lib_count = lib_count + 1;
+        } else if (str_eq(arg, arglen, "--emit-interface", 16) == 1) {
+            emit_iface = 1;
+            no_main = 1;
         } else if (str_eq(arg, arglen, "-debuglexer", 11) == 1) {
             // pass through
         } else if (str_eq(arg, arglen, "-debugparser", 12) == 1) {
@@ -301,6 +330,17 @@ fn main(argc as i64, argv as i64) as i32 {
     if (file_count == 0) {
         io.write_str(linux.STDERR, "Error: no input file\n");
         return 1;
+    }
+
+    // === --emit-interface: compile to semantic only, emit .csti ===
+    if (emit_iface == 1) {
+        let is *u8 as filename = cast(*u8, input_files[0]);
+        let is i64 as heap_size = calc_heap_size(filename, max_ram);
+        mem.gheapinit(heap_size);
+        resolve_stdlib_dir();
+        let is [512]u8 as dummy_obj;
+        let is i32 as err = compile_one(filename, 1, 1, &dummy_obj);
+        return err;
     }
 
     // === Single file, no -o: just output .s (backward compat) ===
@@ -380,7 +420,7 @@ fn main(argc as i64, argv as i64) as i32 {
 
         // Compile + assemble this file
         let is [512]u8 as one_obj_path;
-        let is i32 as err = compile_one(filename, file_no_main, &one_obj_path);
+        let is i32 as err = compile_one(filename, file_no_main, emit_iface, &one_obj_path);
         if (err != 0) { return 1; }
 
         // Store .o path in stack buffer

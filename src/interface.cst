@@ -1,0 +1,178 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+use "../std/io.cst" as io;
+use "parser/ast.cst" as ast;
+
+// Write a type as Caustic text to fd
+fn write_type(fd as i64, t as *ast.Type) as void {
+    if (cast(i64, t) == 0) { io.write_str(fd, "void"); return; }
+    let is i32 as k = t.kind;
+    if (k == ast.TY_VOID)   { io.write_str(fd, "void"); return; }
+    if (k == ast.TY_I8)     { io.write_str(fd, "i8"); return; }
+    if (k == ast.TY_I16)    { io.write_str(fd, "i16"); return; }
+    if (k == ast.TY_I32)    { io.write_str(fd, "i32"); return; }
+    if (k == ast.TY_I64)    { io.write_str(fd, "i64"); return; }
+    if (k == ast.TY_U8)     { io.write_str(fd, "u8"); return; }
+    if (k == ast.TY_U16)    { io.write_str(fd, "u16"); return; }
+    if (k == ast.TY_U32)    { io.write_str(fd, "u32"); return; }
+    if (k == ast.TY_U64)    { io.write_str(fd, "u64"); return; }
+    if (k == ast.TY_F32)    { io.write_str(fd, "f32"); return; }
+    if (k == ast.TY_F64)    { io.write_str(fd, "f64"); return; }
+    if (k == ast.TY_BOOL)   { io.write_str(fd, "bool"); return; }
+    if (k == ast.TY_CHAR)   { io.write_str(fd, "char"); return; }
+    if (k == ast.TY_STRING) { io.write_str(fd, "string"); return; }
+    if (k == ast.TY_PTR) {
+        io.write_str(fd, "*");
+        write_type(fd, t.base);
+        return;
+    }
+    if (k == ast.TY_ARRAY) {
+        io.write_str(fd, "[");
+        io.write_int(fd, cast(i64, t.array_len));
+        io.write_str(fd, "]");
+        write_type(fd, t.base);
+        return;
+    }
+    if (k == ast.TY_STRUCT || k == ast.TY_ENUM) {
+        if (t.name_len > 0) {
+            io.write_bytes(fd, t.name_ptr, cast(i64, t.name_len));
+        } else {
+            io.write_str(fd, "void");
+        }
+        return;
+    }
+    io.write_str(fd, "void");
+}
+
+// Emit .csti interface file from post-semantic AST
+fn emit_csti(root as *u8, fd as i64) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, root);
+    while (cast(i64, n) != 0) {
+        let is i32 as k = n.kind;
+
+        // Struct definition
+        if (k == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_STRUCT) {
+            // Skip generic templates
+            if (n.ty.gen_param_count > 0) { n = n.next; }
+            else {
+                io.write_str(fd, "struct ");
+                io.write_bytes(fd, n.ty.name_ptr, cast(i64, n.ty.name_len));
+                io.write_str(fd, " {");
+                // Walk fields
+                let is *ast.Node as f with mut = cast(*ast.Node, n.ty.fields);
+                while (cast(i64, f) != 0) {
+                    io.write_str(fd, " ");
+                    io.write_bytes(fd, f.name_ptr, cast(i64, f.name_len));
+                    io.write_str(fd, " as ");
+                    write_type(fd, f.ty);
+                    io.write_str(fd, ";");
+                    f = f.next;
+                }
+                io.write_str(fd, " }\n");
+                n = n.next;
+            }
+        }
+        // Enum definition
+        else if (k == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_ENUM) {
+            io.write_str(fd, "enum ");
+            io.write_bytes(fd, n.ty.name_ptr, cast(i64, n.ty.name_len));
+            io.write_str(fd, " {");
+            let is *ast.Node as v with mut = cast(*ast.Node, n.ty.fields);
+            while (cast(i64, v) != 0) {
+                io.write_str(fd, " ");
+                io.write_bytes(fd, v.name_ptr, cast(i64, v.name_len));
+                // Check if variant has payload fields
+                if (cast(i64, v.params) != 0) {
+                    io.write_str(fd, "(");
+                    let is *ast.Node as p with mut = v.params;
+                    let is i32 as first with mut = 1;
+                    while (cast(i64, p) != 0) {
+                        if (first == 0) { io.write_str(fd, ", "); }
+                        io.write_bytes(fd, p.name_ptr, cast(i64, p.name_len));
+                        io.write_str(fd, " as ");
+                        write_type(fd, p.ty);
+                        first = 0;
+                        p = p.next;
+                    }
+                    io.write_str(fd, ")");
+                }
+                io.write_str(fd, ";");
+                v = v.next;
+            }
+            io.write_str(fd, " }\n");
+            n = n.next;
+        }
+        // Type alias
+        else if (k == ast.NK_TYPE_ALIAS) {
+            io.write_str(fd, "type ");
+            io.write_bytes(fd, n.name_ptr, cast(i64, n.name_len));
+            io.write_str(fd, " = ");
+            write_type(fd, n.ty);
+            io.write_str(fd, ";\n");
+            n = n.next;
+        }
+        // Function -> extern fn declaration
+        else if (k == ast.NK_FN) {
+            // Skip generic templates
+            if (n.generic_param_count > 0) { n = n.next; }
+            // Skip extern (already extern)
+            else if (n.is_extern == 1) {
+                io.write_str(fd, "extern fn ");
+                io.write_bytes(fd, n.name_ptr, cast(i64, n.name_len));
+                io.write_str(fd, "(");
+                let is *ast.Node as p with mut = n.params;
+                let is i32 as first with mut = 1;
+                while (cast(i64, p) != 0) {
+                    if (first == 0) { io.write_str(fd, ", "); }
+                    io.write_bytes(fd, p.name_ptr, cast(i64, p.name_len));
+                    io.write_str(fd, " as ");
+                    write_type(fd, p.ty);
+                    first = 0;
+                    p = p.next;
+                }
+                io.write_str(fd, ") as ");
+                write_type(fd, n.return_type);
+                io.write_str(fd, ";\n");
+                n = n.next;
+            }
+            else {
+                // Regular function -> emit as extern fn
+                io.write_str(fd, "extern fn ");
+                io.write_bytes(fd, n.name_ptr, cast(i64, n.name_len));
+                io.write_str(fd, "(");
+                let is *ast.Node as p with mut = n.params;
+                let is i32 as first with mut = 1;
+                while (cast(i64, p) != 0) {
+                    if (first == 0) { io.write_str(fd, ", "); }
+                    io.write_bytes(fd, p.name_ptr, cast(i64, p.name_len));
+                    io.write_str(fd, " as ");
+                    write_type(fd, p.ty);
+                    first = 0;
+                    p = p.next;
+                }
+                io.write_str(fd, ") as ");
+                write_type(fd, n.return_type);
+                io.write_str(fd, ";\n");
+                n = n.next;
+            }
+        }
+        // Global imut variable
+        else if (k == ast.NK_LET && n.is_global == 1) {
+            // Only emit immutable globals (imut)
+            // Check flags for imut — the init_expr exists and it's a constant
+            if (cast(i64, n.init_expr) != 0 && n.init_expr.kind == ast.NK_NUM) {
+                io.write_str(fd, "let is ");
+                write_type(fd, n.ty);
+                io.write_str(fd, " as ");
+                io.write_bytes(fd, n.name_ptr, cast(i64, n.name_len));
+                io.write_str(fd, " with imut = ");
+                io.write_int(fd, n.init_expr.val);
+                io.write_str(fd, ";\n");
+            }
+            n = n.next;
+        }
+        else {
+            n = n.next;
+        }
+    }
+}
