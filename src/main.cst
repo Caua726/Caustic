@@ -172,100 +172,171 @@ fn calc_heap_size(filename as *u8, max_ram as i64) as i64 {
     return heap_size;
 }
 
+// Build a cache path: cache_dir + "/" + basename(filename) + suffix
+// Returns heap-allocated path, or null if cache_dir is null
+fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len as i32) as *u8 {
+    if (cast(i64, cache_dir) == 0) { return cast(*u8, 0); }
+    let is i32 as fname_len = strlen(filename);
+    // Find basename: last '/' + 1
+    let is i32 as base_start with mut = 0;
+    let is i32 as si with mut = 0;
+    while (si < fname_len) {
+        if (filename[si] == 47) { base_start = si + 1; }
+        si = si + 1;
+    }
+    let is i32 as base_len = fname_len - base_start;
+    let is i32 as dir_len = strlen(cache_dir);
+    let is i32 as total = dir_len + 1 + base_len + suffix_len;
+    let is *u8 as path = mem.galloc(cast(i64, total) + 1);
+    mem.memcpy(path, cache_dir, cast(i64, dir_len));
+    path[dir_len] = 47; // '/'
+    mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, dir_len) + 1), cast(*u8, cast(i64, filename) + cast(i64, base_start)), cast(i64, base_len));
+    mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, dir_len) + 1 + cast(i64, base_len)), suffix, cast(i64, suffix_len));
+    path[total] = cast(u8, 0);
+    return path;
+}
+
 // Compile one .cst file: lex → parse → semantic → IR → codegen → .s → assemble → .o
 // obj_path_out: stack buffer (at least 512 bytes) where the .o path is written
 // cache_flags: bit 0 = emit_iface, bit 1 = emit_tokens, bit 2 = emit_ast, bit 3 = emit_ir
+// cache_dir: if non-null, auto-cache (load + save) in this directory
 // Returns 0 on success
-fn compile_one(filename as *u8, no_main as i32, cache_flags as i32, obj_path_out as *u8) as i32 {
+fn compile_one(filename as *u8, no_main as i32, cache_flags as i32, cache_dir as *u8, obj_path_out as *u8) as i32 {
     let is i64 as file_size with mut = 0;
-    let is *u8 as src = read_file(filename, &file_size);
+    let is *u8 as src with mut = read_file(filename, &file_size);
     if (cast(i64, src) == 0) {
         io.write_str(linux.STDERR, "Error: cannot read file: ");
         io.write_str(linux.STDERR, filename);
         io.write_str(linux.STDERR, "\n");
         return 1;
     }
-    let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
-    io.write_str(linux.STDOUT, "caustic: ");
-    io.write_str(linux.STDOUT, filename);
-    io.write_str(linux.STDOUT, " (");
-    io.write_int(linux.STDOUT, file_size);
-    io.write_str(linux.STDOUT, " bytes, ");
-    io.write_int(linux.STDOUT, cast(i64, tokens.count));
-    io.write_str(linux.STDOUT, " tokens)\n");
+    let is i32 as fname_len = strlen(filename);
+    let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
 
-    // --emit-tokens
-    if ((cache_flags & 2) != 0) {
-        let is *u8 as tok_path = mem.galloc(file_size + 10);
-        let is i32 as flen = strlen(filename);
-        mem.memcpy(tok_path, filename, cast(i64, flen));
-        mem.memcpy(cast(*u8, cast(i64, tok_path) + cast(i64, flen)), ".tokens", 8);
-        tokcache.write_token_cache(tok_path, cast(*u8, &tokens), src, file_size);
-        io.write_str(linux.STDOUT, "wrote: ");
-        io.write_str(linux.STDOUT, tok_path);
-        io.write_str(linux.STDOUT, "\n");
-    }
-
-    ast.types_init();
-    let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
-    let is i32 as fname_len with mut = 0;
-    while (filename[fname_len] != cast(u8, 0)) { fname_len = fname_len + 1; }
-
-    // --emit-ast (pre-semantic — raw parsed AST)
-    if ((cache_flags & 4) != 0) {
-        let is *u8 as ast_path = mem.galloc(cast(i64, fname_len) + 8);
-        mem.memcpy(ast_path, filename, cast(i64, fname_len));
-        mem.memcpy(cast(*u8, cast(i64, ast_path) + cast(i64, fname_len)), ".ast", 5);
-        let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
-        astcache.write_ast_cache(ast_path, root, src_hash);
-        io.write_str(linux.STDOUT, "wrote: ");
-        io.write_str(linux.STDOUT, ast_path);
-        io.write_str(linux.STDOUT, "\n");
-    }
-
-    sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
-    io.write_str(linux.STDOUT, "semantic: ok\n");
-
-    // --emit-interface: write .csti and stop
-    if ((cache_flags & 1) != 0) {
-        let is *u8 as csti_path = mem.galloc(cast(i64, fname_len) + 2);
-        mem.memcpy(csti_path, filename, cast(i64, fname_len));
-        csti_path[fname_len] = 105; // 'i'
-        csti_path[fname_len + 1] = cast(u8, 0);
-        let is i64 as iface_fd = linux.open(csti_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
-        if (iface_fd < 0) {
-            io.write_str(linux.STDERR, "Error: cannot open interface file: ");
-            io.write_str(linux.STDERR, csti_path);
-            io.write_str(linux.STDERR, "\n");
-            return 1;
+    // === Try loading IR cache (skips lex+parse+semantic+IR) ===
+    let is *ird.IRProgram as prog with mut = cast(*ird.IRProgram, 0);
+    let is i32 as ir_cached with mut = 0;
+    if (cast(i64, cache_dir) != 0) {
+        let is *u8 as ir_path = build_cache_path(cache_dir, filename, ".ir", 3);
+        let is *u8 as loaded = ircache.read_ir_cache(ir_path, src_hash);
+        if (cast(i64, loaded) != 0) {
+            prog = cast(*ird.IRProgram, loaded);
+            ir_cached = 1;
+            io.write_str(linux.STDOUT, "caustic: ");
+            io.write_str(linux.STDOUT, filename);
+            io.write_str(linux.STDOUT, " (cached ir)\n");
         }
-        iface.emit_csti(cast(*u8, root), iface_fd);
-        linux.close(iface_fd);
-        io.write_str(linux.STDOUT, "wrote: ");
-        io.write_str(linux.STDOUT, csti_path);
-        io.write_str(linux.STDOUT, "\n");
-        obj_path_out[0] = cast(u8, 0);
-        return 0;
     }
 
-    irg.ir_reset();
-    irg.ir_tl = cast(*u8, &tokens);
-    let is *ird.IRProgram as prog = irg.gen_ir(cast(*u8, root), no_main);
-    io.write_str(linux.STDOUT, "ir: ok\n");
+    if (ir_cached == 0) {
+        // === Try loading token cache (skips lex) ===
+        let is tok.TokenList as tokens with mut;
+        let is i32 as tok_cached with mut = 0;
+        if (cast(i64, cache_dir) != 0) {
+            let is *u8 as tok_path = build_cache_path(cache_dir, filename, ".tokens", 7);
+            let is i32 as hash32 = cast(i32, src_hash & cast(i64, 2147483647));
+            let is i64 as cached_size with mut = 0;
+            let is *u8 as cached_src with mut = cast(*u8, 0);
+            let is i32 as tok_err = tokcache.read_token_cache(tok_path, cast(*u8, &tokens), cast(*u8, &cached_src), &cached_size, hash32);
+            if (tok_err == 0) {
+                src = cached_src;
+                file_size = cached_size;
+                tok_cached = 1;
+                io.write_str(linux.STDOUT, "caustic: ");
+                io.write_str(linux.STDOUT, filename);
+                io.write_str(linux.STDOUT, " (cached tokens, ");
+                io.write_int(linux.STDOUT, cast(i64, tokens.count));
+                io.write_str(linux.STDOUT, " tokens)\n");
+            }
+        }
 
-    // --emit-ir
-    if ((cache_flags & 8) != 0) {
-        let is *u8 as ir_path = mem.galloc(cast(i64, fname_len) + 8);
-        mem.memcpy(ir_path, filename, cast(i64, fname_len));
-        mem.memcpy(cast(*u8, cast(i64, ir_path) + cast(i64, fname_len)), ".ir", 4);
-        let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
-        ircache.write_ir_cache(ir_path, cast(*u8, prog), src_hash);
-        io.write_str(linux.STDOUT, "wrote: ");
-        io.write_str(linux.STDOUT, ir_path);
-        io.write_str(linux.STDOUT, "\n");
+        if (tok_cached == 0) {
+            tokens = lex.tokenize(src, file_size, filename);
+            io.write_str(linux.STDOUT, "caustic: ");
+            io.write_str(linux.STDOUT, filename);
+            io.write_str(linux.STDOUT, " (");
+            io.write_int(linux.STDOUT, file_size);
+            io.write_str(linux.STDOUT, " bytes, ");
+            io.write_int(linux.STDOUT, cast(i64, tokens.count));
+            io.write_str(linux.STDOUT, " tokens)\n");
+        }
+
+        // emit/cache tokens
+        if ((cache_flags & 2) != 0) {
+            let is *u8 as tok_path = mem.galloc(cast(i64, fname_len) + 10);
+            mem.memcpy(tok_path, filename, cast(i64, fname_len));
+            mem.memcpy(cast(*u8, cast(i64, tok_path) + cast(i64, fname_len)), ".tokens", 8);
+            tokcache.write_token_cache(tok_path, cast(*u8, &tokens), src, file_size);
+            io.write_str(linux.STDOUT, "wrote: ");
+            io.write_str(linux.STDOUT, tok_path);
+            io.write_str(linux.STDOUT, "\n");
+        }
+        if (cast(i64, cache_dir) != 0 && tok_cached == 0) {
+            let is *u8 as tok_cpath = build_cache_path(cache_dir, filename, ".tokens", 7);
+            tokcache.write_token_cache(tok_cpath, cast(*u8, &tokens), src, file_size);
+        }
+
+        ast.types_init();
+        let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
+
+        // emit ast
+        if ((cache_flags & 4) != 0) {
+            let is *u8 as ast_path = mem.galloc(cast(i64, fname_len) + 8);
+            mem.memcpy(ast_path, filename, cast(i64, fname_len));
+            mem.memcpy(cast(*u8, cast(i64, ast_path) + cast(i64, fname_len)), ".ast", 5);
+            astcache.write_ast_cache(ast_path, root, src_hash);
+            io.write_str(linux.STDOUT, "wrote: ");
+            io.write_str(linux.STDOUT, ast_path);
+            io.write_str(linux.STDOUT, "\n");
+        }
+
+        sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
+        io.write_str(linux.STDOUT, "semantic: ok\n");
+
+        // --emit-interface: write .csti and stop
+        if ((cache_flags & 1) != 0) {
+            let is *u8 as csti_path = mem.galloc(cast(i64, fname_len) + 2);
+            mem.memcpy(csti_path, filename, cast(i64, fname_len));
+            csti_path[fname_len] = 105; // 'i'
+            csti_path[fname_len + 1] = cast(u8, 0);
+            let is i64 as iface_fd = linux.open(csti_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+            if (iface_fd < 0) {
+                io.write_str(linux.STDERR, "Error: cannot open interface file: ");
+                io.write_str(linux.STDERR, csti_path);
+                io.write_str(linux.STDERR, "\n");
+                return 1;
+            }
+            iface.emit_csti(cast(*u8, root), iface_fd);
+            linux.close(iface_fd);
+            io.write_str(linux.STDOUT, "wrote: ");
+            io.write_str(linux.STDOUT, csti_path);
+            io.write_str(linux.STDOUT, "\n");
+            obj_path_out[0] = cast(u8, 0);
+            return 0;
+        }
+
+        irg.ir_reset();
+        irg.ir_tl = cast(*u8, &tokens);
+        prog = irg.gen_ir(cast(*u8, root), no_main);
+        io.write_str(linux.STDOUT, "ir: ok\n");
+
+        // emit/cache IR
+        if ((cache_flags & 8) != 0) {
+            let is *u8 as ir_path = mem.galloc(cast(i64, fname_len) + 8);
+            mem.memcpy(ir_path, filename, cast(i64, fname_len));
+            mem.memcpy(cast(*u8, cast(i64, ir_path) + cast(i64, fname_len)), ".ir", 4);
+            ircache.write_ir_cache(ir_path, cast(*u8, prog), src_hash);
+            io.write_str(linux.STDOUT, "wrote: ");
+            io.write_str(linux.STDOUT, ir_path);
+            io.write_str(linux.STDOUT, "\n");
+        }
+        if (cast(i64, cache_dir) != 0) {
+            let is *u8 as ir_cpath = build_cache_path(cache_dir, filename, ".ir", 3);
+            ircache.write_ir_cache(ir_cpath, cast(*u8, prog), src_hash);
+        }
     }
 
-    // Build asm path: filename + ".s"
+    // === Codegen → .s → assemble → .o ===
     let is i32 as asm_len = fname_len + 2;
     let is *u8 as asm_path = mem.galloc(cast(i64, asm_len) + 1);
     mem.memcpy(asm_path, filename, cast(i64, fname_len));
@@ -322,6 +393,7 @@ fn main(argc as i64, argv as i64) as i32 {
     let is i32 as emit_tokens with mut = 0;
     let is i32 as emit_ast with mut = 0;
     let is i32 as emit_ir with mut = 0;
+    let is *u8 as cache_dir with mut = cast(*u8, 0);
     let is i64 as max_ram with mut = 0; // 0 = unlimited
     let is [32]i64 as lib_names;
     let is i32 as lib_count with mut = 0;
@@ -361,6 +433,11 @@ fn main(argc as i64, argv as i64) as i32 {
             emit_ast = 1;
         } else if (str_eq(arg, arglen, "--emit-ir", 9) == 1) {
             emit_ir = 1;
+        } else if (str_eq(arg, arglen, "--cache", 7) == 1) {
+            ai = ai + 1;
+            if (ai < argc) {
+                cache_dir = cast(*u8, argv_arr[ai]);
+            }
         } else if (str_eq(arg, arglen, "-debuglexer", 11) == 1) {
             // pass through
         } else if (str_eq(arg, arglen, "-debugparser", 12) == 1) {
@@ -381,6 +458,11 @@ fn main(argc as i64, argv as i64) as i32 {
         return 1;
     }
 
+    // Create cache directory if specified
+    if (cast(i64, cache_dir) != 0) {
+        linux.mkdir(cache_dir, 493); // 0755
+    }
+
     // === --emit-interface: compile to semantic only, emit .csti ===
     if (emit_iface == 1) {
         let is *u8 as filename = cast(*u8, input_files[0]);
@@ -388,12 +470,12 @@ fn main(argc as i64, argv as i64) as i32 {
         mem.gheapinit(heap_size);
         resolve_stdlib_dir();
         let is [512]u8 as dummy_obj;
-        let is i32 as err = compile_one(filename, 1, 1, &dummy_obj);
+        let is i32 as err = compile_one(filename, 1, 1, cast(*u8, 0), &dummy_obj);
         return err;
     }
 
-    // === Single file, no -o: just output .s (backward compat) ===
-    if (file_count == 1 && cast(i64, output_path) == 0) {
+    // === Single file, no -o, no --cache: just output .s (backward compat) ===
+    if (file_count == 1 && cast(i64, output_path) == 0 && cast(i64, cache_dir) == 0) {
         let is *u8 as filename = cast(*u8, input_files[0]);
         let is i64 as heap_size = calc_heap_size(filename, max_ram);
         mem.gheapinit(heap_size);
@@ -509,7 +591,7 @@ fn main(argc as i64, argv as i64) as i32 {
         // Compile + assemble this file
         let is [512]u8 as one_obj_path;
         let is i32 as cflags = emit_iface + emit_tokens * 2 + emit_ast * 4 + emit_ir * 8;
-        let is i32 as err = compile_one(filename, file_no_main, cflags, &one_obj_path);
+        let is i32 as err = compile_one(filename, file_no_main, cflags, cache_dir, &one_obj_path);
         if (err != 0) { return 1; }
 
         // Store .o path in stack buffer
@@ -548,7 +630,7 @@ fn main(argc as i64, argv as i64) as i32 {
     }
 
     if (cast(i64, output_path) == 0) {
-        io.write_str(linux.STDERR, "Error: -o required for multi-file compilation\n");
+        io.write_str(linux.STDERR, "Error: -o required for linking\n");
         return 1;
     }
 
