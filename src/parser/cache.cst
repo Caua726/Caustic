@@ -1,0 +1,667 @@
+use "../../std/linux.cst" as linux;
+use "../../std/mem.cst" as mem;
+use "ast.cst" as ast;
+
+// ============================================================
+// Binary AST cache: serialize/deserialize the parsed AST
+// Format: header + string_table + type_table + node_table
+// ============================================================
+
+let is i32 as MAGIC   with imut = 1128354883; // 0x43415354 = "CAST"
+let is i32 as VERSION with imut = 1;
+
+// Serialized sizes per entry
+let is i32 as SER_TYPE_SIZE with imut = 48;  // 12 i32 fields
+let is i32 as SER_NODE_SIZE with imut = 168; // 38 i32 + 2 i64 fields
+let is i32 as HEADER_SIZE   with imut = 32;
+
+// Max capacity for collection pass
+let is i32 as MAX_NODES with imut = 65536;
+let is i32 as MAX_TYPES with imut = 16384;
+
+// ============================================================
+// Collection state: arrays of pointers for index mapping
+// ============================================================
+
+let is *u8 as node_ptrs with mut;  // array of *Node (i64 each)
+let is i32 as node_count with mut;
+
+let is *u8 as type_ptrs with mut;  // array of *Type (i64 each)
+let is i32 as type_count with mut;
+
+// String table buffer
+let is *u8 as str_buf with mut;
+let is i32 as str_len with mut;
+let is i32 as str_cap with mut;
+
+// ============================================================
+// Collection helpers
+// ============================================================
+
+fn node_ptr_get(idx as i32) as *ast.Node {
+    let is *i64 as p = cast(*i64, cast(i64, node_ptrs) + cast(i64, idx) * 8);
+    return cast(*ast.Node, *p);
+}
+
+fn node_ptr_set(idx as i32, n as *ast.Node) as void {
+    let is *i64 as p = cast(*i64, cast(i64, node_ptrs) + cast(i64, idx) * 8);
+    *p = cast(i64, n);
+}
+
+fn type_ptr_get(idx as i32) as *ast.Type {
+    let is *i64 as p = cast(*i64, cast(i64, type_ptrs) + cast(i64, idx) * 8);
+    return cast(*ast.Type, *p);
+}
+
+fn type_ptr_set(idx as i32, t as *ast.Type) as void {
+    let is *i64 as p = cast(*i64, cast(i64, type_ptrs) + cast(i64, idx) * 8);
+    *p = cast(i64, t);
+}
+
+// Find index of a node pointer, or -1 if null
+fn node_to_idx(n as *ast.Node) as i32 {
+    if (cast(i64, n) == 0) { return cast(i32, 0 - 1); }
+    let is i32 as i with mut = 0;
+    while (i < node_count) {
+        if (cast(i64, node_ptr_get(i)) == cast(i64, n)) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Find index of a type pointer, or -1 if null
+fn type_to_idx(t as *ast.Type) as i32 {
+    if (cast(i64, t) == 0) { return cast(i32, 0 - 1); }
+    let is i32 as i with mut = 0;
+    while (i < type_count) {
+        if (cast(i64, type_ptr_get(i)) == cast(i64, t)) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Check if node already registered
+fn has_node(n as *ast.Node) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < node_count) {
+        if (cast(i64, node_ptr_get(i)) == cast(i64, n)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Check if type already registered
+fn has_type(t as *ast.Type) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < type_count) {
+        if (cast(i64, type_ptr_get(i)) == cast(i64, t)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn register_node(n as *ast.Node) as void {
+    if (cast(i64, n) == 0) { return; }
+    if (has_node(n) == 1) { return; }
+    if (node_count >= MAX_NODES) { return; }
+    node_ptr_set(node_count, n);
+    node_count = node_count + 1;
+}
+
+fn register_type(t as *ast.Type) as void {
+    if (cast(i64, t) == 0) { return; }
+    if (has_type(t) == 1) { return; }
+    if (type_count >= MAX_TYPES) { return; }
+    type_ptr_set(type_count, t);
+    type_count = type_count + 1;
+}
+
+// ============================================================
+// String table
+// ============================================================
+
+fn str_tab_init() as void {
+    str_cap = 65536;
+    str_buf = mem.galloc(cast(i64, str_cap));
+    str_len = 0;
+}
+
+fn str_tab_add(ptr as *u8, slen as i32) as i32 {
+    if (cast(i64, ptr) == 0) { return 0; }
+    if (slen <= 0) { return 0; }
+    // Check if already in table (dedup)
+    let is i32 as i with mut = 0;
+    while (i + slen <= str_len) {
+        if (mem.memcmp(cast(*u8, cast(i64, str_buf) + cast(i64, i)), ptr, cast(i64, slen)) == 0) {
+            return i;
+        }
+        i = i + 1;
+    }
+    // Append
+    if (str_len + slen > str_cap) {
+        // Grow
+        let is i32 as new_cap = str_cap * 2;
+        let is *u8 as new_buf = mem.galloc(cast(i64, new_cap));
+        mem.memcpy(new_buf, str_buf, cast(i64, str_len));
+        str_buf = new_buf;
+        str_cap = new_cap;
+    }
+    let is i32 as off = str_len;
+    mem.memcpy(cast(*u8, cast(i64, str_buf) + cast(i64, str_len)), ptr, cast(i64, slen));
+    str_len = str_len + slen;
+    return off;
+}
+
+// ============================================================
+// Recursive AST collection: register all nodes and types
+// ============================================================
+
+fn collect_type(t as *ast.Type) as void {
+    if (cast(i64, t) == 0) { return; }
+    if (has_type(t) == 1) { return; }
+    register_type(t);
+    // Recurse into base type (for ptr, array)
+    collect_type(t.base);
+    // Collect field nodes (struct/enum fields are a linked list via *u8 cast)
+    if (t.field_count > 0 && cast(i64, t.fields) != 0) {
+        let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, f) != 0) {
+            collect_node(f);
+            f = f.next;
+        }
+    }
+    // Collect generic args (array of *Type)
+    if (t.gen_arg_count > 0 && cast(i64, t.gen_args) != 0) {
+        let is i32 as i with mut = 0;
+        while (i < t.gen_arg_count) {
+            collect_type(ast.ga_get(t.gen_args, i));
+            i = i + 1;
+        }
+    }
+}
+
+fn collect_node_list(n as *ast.Node) as void {
+    let is *ast.Node as cur with mut = n;
+    while (cast(i64, cur) != 0) {
+        collect_node(cur);
+        cur = cur.next;
+    }
+}
+
+fn collect_node(n as *ast.Node) as void {
+    if (cast(i64, n) == 0) { return; }
+    if (has_node(n) == 1) { return; }
+    register_node(n);
+
+    // Collect types referenced by this node
+    collect_type(n.ty);
+    collect_type(n.return_type);
+    collect_type(n.match_type);
+
+    // Collect child nodes (single pointers)
+    collect_node(n.lhs);
+    collect_node(n.rhs);
+    collect_node(n.expr);
+    collect_node(n.init_expr);
+    collect_node(n.body);
+    collect_node(n.cond);
+    collect_node(n.then_b);
+    collect_node(n.else_b);
+    collect_node(n.for_init);
+    collect_node(n.for_step);
+
+    // Collect linked lists
+    collect_node_list(n.params);
+    collect_node_list(n.args);
+    collect_node_list(n.stmts);
+    collect_node_list(n.cases);
+    collect_node_list(n.payload_args);
+
+    // Collect next (top-level linked list)
+    collect_node(n.next);
+}
+
+// ============================================================
+// Write helpers
+// ============================================================
+
+fn write_i32(buf as *u8, off as i32, val as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, buf) + cast(i64, off));
+    *p = val;
+}
+
+fn write_i64(buf as *u8, off as i32, val as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + cast(i64, off));
+    *p = val;
+}
+
+fn read_i32(buf as *u8, off as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, buf) + cast(i64, off));
+    return *p;
+}
+
+fn read_i64(buf as *u8, off as i32) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + cast(i64, off));
+    return *p;
+}
+
+// ============================================================
+// Serialize a single Type entry (48 bytes)
+// ============================================================
+
+fn serialize_type(buf as *u8, off as i32, t as *ast.Type) as void {
+    let is i64 as base = cast(i64, buf) + cast(i64, off);
+    let is *u8 as b = cast(*u8, base);
+
+    write_i32(b, 0, t.kind);
+    write_i32(b, 4, type_to_idx(t.base));
+    write_i32(b, 8, t.array_len);
+    write_i32(b, 12, str_tab_add(t.name_ptr, t.name_len));
+    write_i32(b, 16, t.name_len);
+    write_i32(b, 20, t.size);
+
+    // fields_idx: index of first field node (linked list head)
+    if (t.field_count > 0 && cast(i64, t.fields) != 0) {
+        write_i32(b, 24, node_to_idx(cast(*ast.Node, t.fields)));
+    } else {
+        write_i32(b, 24, 0 - 1);
+    }
+    write_i32(b, 28, t.field_count);
+    write_i32(b, 32, t.variant_count);
+    write_i32(b, 36, t.gen_param_count);
+    write_i32(b, 40, t.gen_arg_count);
+    write_i32(b, 44, t.payload_offset);
+}
+
+// ============================================================
+// Serialize a single Node entry (168 bytes)
+// 38 i32 fields + 2 i64 fields = 38*4 + 2*8 = 168
+// ============================================================
+// Layout (all offsets in bytes):
+//  0: kind(i32)       4: next_idx(i32)       8: ty_idx(i32)        12: tok_idx(i32)
+// 16: lhs_idx(i32)   20: rhs_idx(i32)       24: val(i64)           32: fval(i64)
+// 40: expr_idx(i32)  44: init_idx(i32)       48: name_off(i32)      52: name_len(i32)
+// 56: member_off(i32) 60: member_len(i32)    64: ret_type_idx(i32)  68: flags(i32)
+// 72: body_idx(i32)  76: params_idx(i32)     80: is_variadic(i32)   84: is_extern(i32)
+// 88: impl_off(i32)  92: impl_len(i32)       96: args_idx(i32)     100: gp_count(i32)
+//104: ga_count(i32) 108: stmts_idx(i32)     112: cond_idx(i32)     116: then_idx(i32)
+//120: else_idx(i32) 124: for_init_idx(i32)  128: for_step_idx(i32) 132: match_ty_idx(i32)
+//136: cases_idx(i32) 140: discriminant(i32) 144: payload_idx(i32)  148: var_offset(i32)
+//152: stack_size(i32) 156: is_global(i32)   160: asm_off(i32)      164: asm_len(i32)
+// Total: 168 bytes
+
+fn serialize_node(buf as *u8, off as i32, n as *ast.Node) as void {
+    let is i64 as base = cast(i64, buf) + cast(i64, off);
+    let is *u8 as b = cast(*u8, base);
+
+    write_i32(b,   0, n.kind);
+    write_i32(b,   4, node_to_idx(n.next));
+    write_i32(b,   8, type_to_idx(n.ty));
+    write_i32(b,  12, n.tok_idx);
+    write_i32(b,  16, node_to_idx(n.lhs));
+    write_i32(b,  20, node_to_idx(n.rhs));
+    write_i64(b,  24, n.val);
+    write_i64(b,  32, ast.f64_to_i64(n.fval));
+    write_i32(b,  40, node_to_idx(n.expr));
+    write_i32(b,  44, node_to_idx(n.init_expr));
+    write_i32(b,  48, str_tab_add(n.name_ptr, n.name_len));
+    write_i32(b,  52, n.name_len);
+    write_i32(b,  56, str_tab_add(n.member_ptr, n.member_len));
+    write_i32(b,  60, n.member_len);
+    write_i32(b,  64, type_to_idx(n.return_type));
+    write_i32(b,  68, n.flags);
+    write_i32(b,  72, node_to_idx(n.body));
+    write_i32(b,  76, node_to_idx(n.params));
+    write_i32(b,  80, n.is_variadic);
+    write_i32(b,  84, n.is_extern);
+    write_i32(b,  88, str_tab_add(n.impl_ptr, n.impl_len));
+    write_i32(b,  92, n.impl_len);
+    write_i32(b,  96, node_to_idx(n.args));
+    write_i32(b, 100, n.generic_param_count);
+    write_i32(b, 104, n.generic_arg_count);
+    write_i32(b, 108, node_to_idx(n.stmts));
+    write_i32(b, 112, node_to_idx(n.cond));
+    write_i32(b, 116, node_to_idx(n.then_b));
+    write_i32(b, 120, node_to_idx(n.else_b));
+    write_i32(b, 124, node_to_idx(n.for_init));
+    write_i32(b, 128, node_to_idx(n.for_step));
+    write_i32(b, 132, type_to_idx(n.match_type));
+    write_i32(b, 136, node_to_idx(n.cases));
+    write_i32(b, 140, n.discriminant);
+    write_i32(b, 144, node_to_idx(n.payload_args));
+    write_i32(b, 148, n.var_offset);
+    write_i32(b, 152, n.stack_size);
+    write_i32(b, 156, n.is_global);
+    write_i32(b, 160, str_tab_add(n.asm_name_ptr, n.asm_name_len));
+    write_i32(b, 164, n.asm_name_len);
+}
+
+// ============================================================
+// write_ast_cache: serialize entire AST to file
+// Returns 0 on success, -1 on error
+// ============================================================
+
+fn write_ast_cache(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
+    if (cast(i64, root) == 0) { return cast(i32, 0 - 1); }
+
+    // Init collection arrays
+    node_ptrs = mem.galloc(cast(i64, MAX_NODES) * 8);
+    type_ptrs = mem.galloc(cast(i64, MAX_TYPES) * 8);
+    node_count = 0;
+    type_count = 0;
+    str_tab_init();
+
+    // Pass 1: collect all nodes and types
+    collect_node(root);
+
+    // Pass 2: collect strings (done lazily in serialize_* via str_tab_add)
+    // Pass 3: build output buffer
+    let is i32 as root_idx = node_to_idx(root);
+    let is i32 as type_table_size = type_count * SER_TYPE_SIZE;
+    let is i32 as node_table_size = node_count * SER_NODE_SIZE;
+
+    // We need to serialize to collect strings first, then write header
+    let is *u8 as type_buf = mem.galloc(cast(i64, type_table_size) + 1);
+    let is *u8 as node_buf = mem.galloc(cast(i64, node_table_size) + 1);
+
+    // Serialize all types
+    let is i32 as ti with mut = 0;
+    while (ti < type_count) {
+        serialize_type(type_buf, ti * SER_TYPE_SIZE, type_ptr_get(ti));
+        ti = ti + 1;
+    }
+
+    // Serialize all nodes
+    let is i32 as ni with mut = 0;
+    while (ni < node_count) {
+        serialize_node(node_buf, ni * SER_NODE_SIZE, node_ptr_get(ni));
+        ni = ni + 1;
+    }
+
+    // Now str_len is final, compute total size
+    let is i32 as total_size = HEADER_SIZE + str_len + type_table_size + node_table_size;
+    let is *u8 as out = mem.galloc(cast(i64, total_size));
+
+    // Write header (32 bytes)
+    write_i32(out, 0, MAGIC);
+    write_i32(out, 4, VERSION);
+    write_i32(out, 8, node_count);
+    write_i32(out, 12, type_count);
+    write_i32(out, 16, str_len);
+    write_i32(out, 20, root_idx);
+    // Split source_hash into lo/hi i32 parts
+    write_i32(out, 24, cast(i32, source_hash & cast(i64, 2147483647)));
+    write_i32(out, 28, cast(i32, (source_hash >> 31) & cast(i64, 2147483647)));
+
+    // Write string table
+    let is i32 as str_off = HEADER_SIZE;
+    if (str_len > 0) {
+        mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, str_off)), str_buf, cast(i64, str_len));
+    }
+
+    // Write type table
+    let is i32 as type_off = str_off + str_len;
+    if (type_table_size > 0) {
+        mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, type_off)), type_buf, cast(i64, type_table_size));
+    }
+
+    // Write node table
+    let is i32 as node_off = type_off + type_table_size;
+    if (node_table_size > 0) {
+        mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, node_off)), node_buf, cast(i64, node_table_size));
+    }
+
+    // Write to file
+    let is i64 as fd = linux.open(path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 420);
+    if (fd < 0) { return cast(i32, 0 - 1); }
+    let is i64 as written = linux.write(fd, out, cast(i64, total_size));
+    linux.close(fd);
+
+    if (written != cast(i64, total_size)) { return cast(i32, 0 - 1); }
+    return 0;
+}
+
+// ============================================================
+// Deserialization helpers
+// ============================================================
+
+fn idx_to_node(nodes as *u8, idx as i32) as *ast.Node {
+    if (idx < 0) { return cast(*ast.Node, 0); }
+    return cast(*ast.Node, cast(i64, nodes) + cast(i64, idx) * cast(i64, sizeof(ast.Node)));
+}
+
+fn idx_to_type(types as *u8, idx as i32) as *ast.Type {
+    if (idx < 0) { return cast(*ast.Type, 0); }
+    return cast(*ast.Type, cast(i64, types) + cast(i64, idx) * cast(i64, sizeof(ast.Type)));
+}
+
+fn str_tab_ptr(strtab as *u8, off as i32, slen as i32) as *u8 {
+    if (slen <= 0) { return cast(*u8, 0); }
+    return cast(*u8, cast(i64, strtab) + cast(i64, off));
+}
+
+// ============================================================
+// Deserialize a single Type from the binary buffer
+// ============================================================
+
+fn deserialize_type(src as *u8, off as i32, t as *ast.Type, strtab as *u8, types_base as *u8) as void {
+    let is i64 as base = cast(i64, src) + cast(i64, off);
+    let is *u8 as b = cast(*u8, base);
+
+    t.kind         = read_i32(b, 0);
+    let is i32 as base_idx = read_i32(b, 4);
+    t.base         = idx_to_type(types_base, base_idx);
+    t.array_len    = read_i32(b, 8);
+    let is i32 as noff = read_i32(b, 12);
+    t.name_len     = read_i32(b, 16);
+    t.name_ptr     = str_tab_ptr(strtab, noff, t.name_len);
+    t.size         = read_i32(b, 20);
+    // fields_idx handled in second pass (needs nodes)
+    t.field_count  = read_i32(b, 28);
+    t.variant_count = read_i32(b, 32);
+    t.gen_param_count = read_i32(b, 36);
+    t.gen_arg_count = read_i32(b, 40);
+    t.payload_offset = read_i32(b, 44);
+
+    // Clear fields that need second pass
+    t.fields       = cast(*u8, 0);
+    t.gen_params   = cast(*u8, 0);
+    t.gen_args     = cast(*u8, 0);
+    t.max_payload  = 0;
+    t.base_name_ptr = cast(*u8, 0);
+    t.base_name_len = 0;
+}
+
+// ============================================================
+// Deserialize a single Node from the binary buffer
+// ============================================================
+
+fn deserialize_node(src as *u8, off as i32, n as *ast.Node, strtab as *u8,
+                    nodes_base as *u8, types_base as *u8) as void {
+    let is i64 as base = cast(i64, src) + cast(i64, off);
+    let is *u8 as b = cast(*u8, base);
+
+    n.kind       = read_i32(b, 0);
+    n.next       = idx_to_node(nodes_base, read_i32(b, 4));
+    n.ty         = idx_to_type(types_base, read_i32(b, 8));
+    n.tok_idx    = read_i32(b, 12);
+    n.lhs        = idx_to_node(nodes_base, read_i32(b, 16));
+    n.rhs        = idx_to_node(nodes_base, read_i32(b, 20));
+    n.val        = read_i64(b, 24);
+
+    // Restore fval from bitcast i64
+    let is i64 as fval_bits = read_i64(b, 32);
+    let is *i64 as fip = cast(*i64, cast(i64, &ast.bitcast_buf));
+    *fip = fval_bits;
+    let is *f64 as ffp = cast(*f64, cast(i64, &ast.bitcast_buf));
+    n.fval = *ffp;
+
+    n.expr       = idx_to_node(nodes_base, read_i32(b, 40));
+    n.init_expr  = idx_to_node(nodes_base, read_i32(b, 44));
+
+    let is i32 as noff = read_i32(b, 48);
+    n.name_len   = read_i32(b, 52);
+    n.name_ptr   = str_tab_ptr(strtab, noff, n.name_len);
+
+    let is i32 as moff = read_i32(b, 56);
+    n.member_len = read_i32(b, 60);
+    n.member_ptr = str_tab_ptr(strtab, moff, n.member_len);
+
+    n.return_type = idx_to_type(types_base, read_i32(b, 64));
+    n.flags      = read_i32(b, 68);
+    n.body       = idx_to_node(nodes_base, read_i32(b, 72));
+    n.params     = idx_to_node(nodes_base, read_i32(b, 76));
+    n.is_variadic = read_i32(b, 80);
+    n.is_extern  = read_i32(b, 84);
+
+    let is i32 as ioff = read_i32(b, 88);
+    n.impl_len   = read_i32(b, 92);
+    n.impl_ptr   = str_tab_ptr(strtab, ioff, n.impl_len);
+
+    n.args       = idx_to_node(nodes_base, read_i32(b, 96));
+    n.generic_param_count = read_i32(b, 100);
+    n.generic_arg_count   = read_i32(b, 104);
+    n.stmts      = idx_to_node(nodes_base, read_i32(b, 108));
+    n.cond       = idx_to_node(nodes_base, read_i32(b, 112));
+    n.then_b     = idx_to_node(nodes_base, read_i32(b, 116));
+    n.else_b     = idx_to_node(nodes_base, read_i32(b, 120));
+    n.for_init   = idx_to_node(nodes_base, read_i32(b, 124));
+    n.for_step   = idx_to_node(nodes_base, read_i32(b, 128));
+    n.match_type = idx_to_type(types_base, read_i32(b, 132));
+    n.cases      = idx_to_node(nodes_base, read_i32(b, 136));
+    n.discriminant = read_i32(b, 140);
+    n.payload_args = idx_to_node(nodes_base, read_i32(b, 144));
+    n.var_offset = read_i32(b, 148);
+    n.stack_size = read_i32(b, 152);
+    n.is_global  = read_i32(b, 156);
+
+    let is i32 as aoff = read_i32(b, 160);
+    n.asm_name_len = read_i32(b, 164);
+    n.asm_name_ptr = str_tab_ptr(strtab, aoff, n.asm_name_len);
+
+    // Clear fields not serialized (generic packed arrays)
+    n.generic_params = cast(*u8, 0);
+    n.generic_args   = cast(*u8, 0);
+}
+
+// ============================================================
+// Second pass: fixup type.fields pointers (need nodes array)
+// ============================================================
+
+fn fixup_type_fields(type_src as *u8, types_base as *u8, nodes_base as *u8,
+                     tc as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < tc) {
+        let is i32 as foff = i * SER_TYPE_SIZE + 24;
+        let is i32 as fields_idx = read_i32(type_src, foff);
+        let is *ast.Type as t = idx_to_type(types_base, i);
+        if (fields_idx >= 0) {
+            t.fields = cast(*u8, idx_to_node(nodes_base, fields_idx));
+        } else {
+            t.fields = cast(*u8, 0);
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// read_ast_cache: deserialize AST from file
+// Returns root node pointer or null on error/mismatch
+// ============================================================
+
+fn read_ast_cache(path as *u8, expected_hash as i64) as *ast.Node {
+    // Open file
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return cast(*ast.Node, 0); }
+
+    // Get file size
+    let is i64 as file_size = linux.lseek(fd, 0, linux.SEEK_END);
+    if (file_size < cast(i64, HEADER_SIZE)) {
+        linux.close(fd);
+        return cast(*ast.Node, 0);
+    }
+    linux.lseek(fd, 0, linux.SEEK_SET);
+
+    // Read entire file
+    let is *u8 as data = mem.galloc(file_size);
+    let is i64 as nread = linux.read(fd, data, file_size);
+    linux.close(fd);
+
+    if (nread != file_size) { return cast(*ast.Node, 0); }
+
+    // Validate header
+    let is i32 as magic = read_i32(data, 0);
+    if (magic != MAGIC) { return cast(*ast.Node, 0); }
+
+    let is i32 as version = read_i32(data, 4);
+    if (version != VERSION) { return cast(*ast.Node, 0); }
+
+    let is i32 as nc = read_i32(data, 8);
+    let is i32 as tc = read_i32(data, 12);
+    let is i32 as stab_size = read_i32(data, 16);
+    let is i32 as root_idx = read_i32(data, 20);
+    let is i32 as hash_lo = read_i32(data, 24);
+    let is i32 as hash_hi = read_i32(data, 28);
+
+    // Reconstruct and verify hash
+    let is i64 as stored_hash = cast(i64, hash_lo) + (cast(i64, hash_hi) << 31);
+    if (stored_hash != expected_hash) { return cast(*ast.Node, 0); }
+
+    // Verify file size matches expected
+    let is i64 as expected_size = cast(i64, HEADER_SIZE) + cast(i64, stab_size)
+        + cast(i64, tc) * cast(i64, SER_TYPE_SIZE)
+        + cast(i64, nc) * cast(i64, SER_NODE_SIZE);
+    if (file_size != expected_size) { return cast(*ast.Node, 0); }
+
+    // Pointers into the data buffer
+    let is *u8 as strtab = cast(*u8, cast(i64, data) + cast(i64, HEADER_SIZE));
+    let is *u8 as type_src = cast(*u8, cast(i64, strtab) + cast(i64, stab_size));
+    let is *u8 as node_src = cast(*u8, cast(i64, type_src) + cast(i64, tc) * cast(i64, SER_TYPE_SIZE));
+
+    // Allocate contiguous arrays for types and nodes
+    let is *u8 as types_base = mem.galloc(cast(i64, tc) * sizeof(ast.Type));
+    let is *u8 as nodes_base = mem.galloc(cast(i64, nc) * sizeof(ast.Node));
+
+    // Zero-fill
+    mem.memset(types_base, 0, cast(i64, tc) * sizeof(ast.Type));
+    mem.memset(nodes_base, 0, cast(i64, nc) * sizeof(ast.Node));
+
+    // Deserialize types (first pass: everything except fields)
+    let is i32 as ti with mut = 0;
+    while (ti < tc) {
+        let is *ast.Type as t = idx_to_type(types_base, ti);
+        deserialize_type(type_src, ti * SER_TYPE_SIZE, t, strtab, types_base);
+        ti = ti + 1;
+    }
+
+    // Deserialize nodes
+    let is i32 as ni with mut = 0;
+    while (ni < nc) {
+        let is *ast.Node as n = idx_to_node(nodes_base, ni);
+        deserialize_node(node_src, ni * SER_NODE_SIZE, n, strtab, nodes_base, types_base);
+        ni = ni + 1;
+    }
+
+    // Second pass: fixup type.fields pointers (needs nodes)
+    fixup_type_fields(type_src, types_base, nodes_base, tc);
+
+    // Validate root index
+    if (root_idx < 0 || root_idx >= nc) { return cast(*ast.Node, 0); }
+
+    return idx_to_node(nodes_base, root_idx);
+}
+
+// ============================================================
+// Simple hash for source file content
+// ============================================================
+
+fn hash_bytes(data as *u8, len as i64) as i64 {
+    let is i64 as h with mut = 5381;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        h = ((h << 5) + h) + cast(i64, data[i]);
+        i = i + 1;
+    }
+    // Keep positive by masking off sign bit
+    return h & cast(i64, 4611686018427387903);
+}

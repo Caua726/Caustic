@@ -1,0 +1,168 @@
+use "../../std/linux.cst" as linux;
+use "../../std/mem.cst" as mem;
+use "tokens.cst" as tok;
+
+let is i32 as CACHE_MAGIC   with imut = 1397571907; // 0x534B5443 "CTKS"
+let is i32 as CACHE_VERSION with imut = 1;
+let is i32 as HEADER_SIZE   with imut = 24;
+let is i32 as RECORD_SIZE   with imut = 28;
+
+// djb2 string hash, returns lower 64 bits
+fn djb2_hash(data as *u8, len as i64) as i64 {
+    let is i64 as hash with mut = 5381;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        hash = hash * 33 + cast(i64, data[i]);
+        i = i + 1;
+    }
+    return hash;
+}
+
+// Write i32 value at byte offset in buffer
+fn put_i32(buf as *u8, off as i64, val as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, buf) + off);
+    *p = val;
+}
+
+// Read i32 value at byte offset in buffer
+fn get_i32(buf as *u8, off as i64) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, buf) + off);
+    return *p;
+}
+
+// Write i64 value at byte offset in buffer
+fn put_i64(buf as *u8, off as i64, val as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + off);
+    *p = val;
+}
+
+// Read i64 value at byte offset in buffer
+fn get_i64(buf as *u8, off as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, buf) + off);
+    return *p;
+}
+
+// Serialize token list to binary cache file
+fn write_token_cache(path as *u8, tl_ptr as *u8, src as *u8, src_size as i64) as i32 {
+    let is *tok.TokenList as tl = cast(*tok.TokenList, tl_ptr);
+    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC;
+    let is i64 as fd = linux.open(path, flags, 438);
+    if (fd < 0) {
+        return 1;
+    }
+
+    let is i64 as hash = djb2_hash(src, src_size);
+    let is i32 as hash32 = cast(i32, hash & cast(i64, 2147483647));
+
+    // Write header
+    let is [24]u8 as hdr;
+    put_i32(&hdr, 0, CACHE_MAGIC);
+    put_i32(&hdr, 4, CACHE_VERSION);
+    put_i32(&hdr, 8, tl.count);
+    put_i32(&hdr, 12, cast(i32, src_size));
+    put_i32(&hdr, 16, 0);
+    put_i32(&hdr, 20, hash32);
+    linux.write(fd, &hdr, cast(i64, HEADER_SIZE));
+
+    // Write source blob
+    linux.write(fd, src, src_size);
+
+    // Write token records
+    let is [28]u8 as rec;
+    let is i32 as i with mut = 0;
+    while (i < tl.count) {
+        let is *tok.Token as t = cast(*tok.Token, cast(i64, tl.data) + cast(i64, i) * 32);
+        let is i32 as offset = cast(i32, cast(i64, t.ptr) - cast(i64, src));
+        put_i32(&rec, 0, t.kind);
+        put_i32(&rec, 4, offset);
+        put_i32(&rec, 8, t.len);
+        put_i32(&rec, 12, t.line);
+        put_i32(&rec, 16, t.col);
+        put_i64(&rec, 20, t.int_val);
+        linux.write(fd, &rec, cast(i64, RECORD_SIZE));
+        i = i + 1;
+    }
+
+    linux.close(fd);
+    return 0;
+}
+
+// Deserialize token list from binary cache file
+fn read_token_cache(path as *u8, tl_ptr as *u8, out_src as *u8, out_size as *i64, expected_hash as i32) as i32 {
+    let is *tok.TokenList as tl = cast(*tok.TokenList, tl_ptr);
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) {
+        return 1;
+    }
+
+    // Get file size via lseek
+    let is i64 as file_size = linux.lseek(fd, 0, linux.SEEK_END);
+    linux.lseek(fd, 0, linux.SEEK_SET);
+    if (file_size < cast(i64, HEADER_SIZE)) {
+        linux.close(fd);
+        return 1;
+    }
+
+    // Read entire file
+    let is *u8 as buf = mem.galloc(file_size);
+    linux.read(fd, buf, file_size);
+    linux.close(fd);
+
+    // Validate header
+    let is i32 as magic = get_i32(buf, 0);
+    let is i32 as version = get_i32(buf, 4);
+    if (magic != CACHE_MAGIC) {
+        mem.gfree(buf);
+        return 1;
+    }
+    if (version != CACHE_VERSION) {
+        mem.gfree(buf);
+        return 1;
+    }
+
+    let is i32 as token_count = get_i32(buf, 8);
+    let is i32 as source_size = get_i32(buf, 12);
+    let is i32 as stored_hash = get_i32(buf, 20);
+
+    if (stored_hash != expected_hash) {
+        mem.gfree(buf);
+        return 1;
+    }
+
+    // Copy source blob into null-terminated buffer
+    let is i64 as src_len = cast(i64, source_size);
+    let is *u8 as src = mem.galloc(src_len + 1);
+    mem.memcpy(src, cast(*u8, cast(i64, buf) + cast(i64, HEADER_SIZE)), src_len);
+    src[source_size] = cast(u8, 0);
+
+    // Output source pointer and size
+    let is *i64 as pp = cast(*i64, cast(i64, out_src));
+    *pp = cast(i64, src);
+    *out_size = src_len;
+
+    // Build token array
+    let is *u8 as tok_data = mem.galloc(cast(i64, token_count) * 32);
+    let is i64 as rec_base = cast(i64, HEADER_SIZE) + src_len;
+    let is i32 as i with mut = 0;
+    while (i < token_count) {
+        let is i64 as rec_off = rec_base + cast(i64, i) * cast(i64, RECORD_SIZE);
+        let is *u8 as r = cast(*u8, cast(i64, buf) + rec_off);
+
+        let is *tok.Token as t = cast(*tok.Token, cast(i64, tok_data) + cast(i64, i) * 32);
+        t.kind = get_i32(r, 0);
+        let is i32 as offset = get_i32(r, 4);
+        t.ptr = cast(*u8, cast(i64, src) + cast(i64, offset));
+        t.len = get_i32(r, 8);
+        t.line = get_i32(r, 12);
+        t.col = get_i32(r, 16);
+        t.int_val = get_i64(r, 20);
+        i = i + 1;
+    }
+
+    tl.data = tok_data;
+    tl.count = token_count;
+    tl.cap = token_count;
+
+    mem.gfree(buf);
+    return 0;
+}
