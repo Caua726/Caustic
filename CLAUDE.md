@@ -146,6 +146,7 @@ fn work() as i32 {
 
 ## Gotchas
 
+- **Stdlib resolution**: The compiler tries paths relative to the source file first, then falls back to `<binary_dir>/../lib/caustic/`, then `/usr/local/lib/caustic/`
 - **No libc**: Programs use raw Linux syscalls, not C library functions
 - **Syscall numbers**: x86_64 Linux (e.g., write=1, exit=60, mmap=9)
 - **Float literals**: Must match variable type (`10.0` for f64, not `10`)
