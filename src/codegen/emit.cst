@@ -15,6 +15,40 @@ let is i32 as out_fd with mut;
 let is *u8 as cg_filename with mut;
 let is i32 as cg_filename_len with mut;
 
+// === Per-function profiling ===
+// Each entry: name_ptr(8) + name_len(4) + vregs(4) + time_us(8) = 24 bytes
+let is i64 as cg_prof_buf with mut = 0;   // ptr to buffer
+let is i32 as cg_prof_count with mut = 0;
+let is i32 as cg_prof_max with mut = 0;
+let is i32 as cg_prof_enabled with mut = 0;
+
+fn cg_prof_init(max_entries as i32) as void {
+    cg_prof_buf = cast(i64, mem.galloc(cast(i64, max_entries) * 24));
+    cg_prof_count = 0;
+    cg_prof_max = max_entries;
+    cg_prof_enabled = 1;
+}
+
+fn cg_prof_get_time_us() as i64 {
+    let is [2]i64 as ts;
+    syscall(228, 1, &ts);
+    return ts[0] * 1000000 + ts[1] / 1000;
+}
+
+fn cg_prof_record(name_ptr as *u8, name_len as i32, vregs as i32, time_us as i64) as void {
+    if (cg_prof_count >= cg_prof_max) { return; }
+    let is i64 as off = cast(i64, cg_prof_count) * 24;
+    let is *i64 as p0 = cast(*i64, cg_prof_buf + off);
+    *p0 = cast(i64, name_ptr);
+    let is *i32 as p1 = cast(*i32, cg_prof_buf + off + 8);
+    *p1 = name_len;
+    let is *i32 as p2 = cast(*i32, cg_prof_buf + off + 12);
+    *p2 = vregs;
+    let is *i64 as p3 = cast(*i64, cg_prof_buf + off + 16);
+    *p3 = time_us;
+    cg_prof_count = cg_prof_count + 1;
+}
+
 fn out_init(fd as i32) as void {
     out_cap = 4194304; // 4MB
     out_buf = mem.galloc(out_cap);
@@ -1033,7 +1067,13 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
             io.write_str(linux.STDERR, "  gen: ");
             io.write_bytes(linux.STDERR, f.asm_name_ptr, cast(i64, f.asm_name_len));
             io.write_str(linux.STDERR, "\n");
-            gen_func(f);
+            if (cg_prof_enabled == 1) {
+                let is i64 as t0 = cg_prof_get_time_us();
+                gen_func(f);
+                cg_prof_record(f.asm_name_ptr, f.asm_name_len, f.vreg_count, cg_prof_get_time_us() - t0);
+            } else {
+                gen_func(f);
+            }
         }
         f = f.next;
     }
