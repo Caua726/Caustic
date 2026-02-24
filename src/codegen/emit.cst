@@ -140,6 +140,7 @@ fn reg64(idx as i32) as *u8 {
     if (idx == 9) { return "r11"; }
     if (idx == 10) { return "r12"; }
     if (idx == 11) { return "r13"; }
+    if (idx == 12) { return "r14"; }
     return "rax";
 }
 
@@ -156,6 +157,7 @@ fn reg32(idx as i32) as *u8 {
     if (idx == 9) { return "r11d"; }
     if (idx == 10) { return "r12d"; }
     if (idx == 11) { return "r13d"; }
+    if (idx == 12) { return "r14d"; }
     return "eax";
 }
 
@@ -172,6 +174,7 @@ fn reg16(idx as i32) as *u8 {
     if (idx == 9) { return "r11w"; }
     if (idx == 10) { return "r12w"; }
     if (idx == 11) { return "r13w"; }
+    if (idx == 12) { return "r14w"; }
     return "ax";
 }
 
@@ -188,6 +191,7 @@ fn reg8(idx as i32) as *u8 {
     if (idx == 9) { return "r11b"; }
     if (idx == 10) { return "r12b"; }
     if (idx == 11) { return "r13b"; }
+    if (idx == 12) { return "r14b"; }
     return "al";
 }
 
@@ -257,6 +261,28 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
     }
 }
 
+// Emit operand inline: register name or QWORD PTR [rbp-offset]
+fn emit_op(vreg as i32, ctx as *al.AllocCtx) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 0) {
+        out_cstr(reg64(loc));
+    } else {
+        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        out_cstr("QWORD PTR [rbp-");
+        out_int(off);
+        out_cstr("]");
+    }
+}
+
+// Emit src2 operand: either immediate or register/memory
+fn emit_src2(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    if (inst.src2.op_type == d.OP_IMM) {
+        out_int(inst.src2.imm);
+    } else {
+        emit_op(inst.src2.vreg, ctx);
+    }
+}
+
 // Emit "  mov DST_LOC, IMM" handling 64-bit large immediates
 fn emit_mov_imm(vreg as i32, ctx as *al.AllocCtx, val as i64) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
@@ -317,6 +343,44 @@ fn is_float_type(ty_ptr as *u8) as i32 {
     return 0;
 }
 
+// Helper: emit binary op using dest register directly when possible
+fn gen_binop(inst as *d.IRInst, ctx as *al.AllocCtx, op_name as *u8) as void {
+    let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
+    if (dest_loc >= 0) {
+        let is i32 as conflict with mut = 0;
+        if (inst.src2.op_type == d.OP_VREG) {
+            if (al.get_loc(inst.src2.vreg, ctx) == dest_loc) { conflict = 1; }
+        }
+        if (conflict == 0) {
+            let is *u8 as dr = reg64(dest_loc);
+            load_op(inst.src1.vreg, ctx, dr);
+            out_cstr("  ");
+            out_cstr(op_name);
+            out_cstr(" ");
+            out_cstr(dr);
+            out_cstr(", ");
+            emit_src2(inst, ctx);
+            out_char(10);
+        } else {
+            load_op(inst.src1.vreg, ctx, "r15");
+            out_cstr("  ");
+            out_cstr(op_name);
+            out_cstr(" r15, ");
+            out_cstr(reg64(dest_loc));
+            out_char(10);
+            store_op(inst.dest.vreg, ctx, "r15");
+        }
+    } else {
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_cstr("  ");
+        out_cstr(op_name);
+        out_cstr(" r15, ");
+        emit_src2(inst, ctx);
+        out_char(10);
+        store_op(inst.dest.vreg, ctx, "r15");
+    }
+}
+
 // === gen_inst ===
 
 fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
@@ -330,30 +394,40 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
     // IR_MOV
     if (op == d.IR_MOV) {
-        load_op(inst.src1.vreg, ctx, "r15");
-        store_op(inst.dest.vreg, ctx, "r15");
+        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
+        if (dloc >= 0) {
+            load_op(inst.src1.vreg, ctx, reg64(dloc));
+        } else {
+            let is i32 as sloc = al.get_loc(inst.src1.vreg, ctx);
+            if (sloc >= 0) {
+                store_op(inst.dest.vreg, ctx, reg64(sloc));
+            } else {
+                load_op(inst.src1.vreg, ctx, "r15");
+                store_op(inst.dest.vreg, ctx, "r15");
+            }
+        }
         return;
     }
 
     // Binary ops: ADD, SUB, MUL
     if (op == d.IR_ADD) {
-        load_op(inst.src1.vreg, ctx, "r15");
-        load_op(inst.src2.vreg, ctx, "r14");
-        out_line("add r15, r14");
-        store_op(inst.dest.vreg, ctx, "r15");
+        gen_binop(inst, ctx, "add");
         return;
     }
     if (op == d.IR_SUB) {
-        load_op(inst.src1.vreg, ctx, "r15");
-        load_op(inst.src2.vreg, ctx, "r14");
-        out_line("sub r15, r14");
-        store_op(inst.dest.vreg, ctx, "r15");
+        gen_binop(inst, ctx, "sub");
         return;
     }
     if (op == d.IR_MUL) {
         load_op(inst.src1.vreg, ctx, "r15");
-        load_op(inst.src2.vreg, ctx, "r14");
-        out_line("imul r15, r14");
+        if (al.is_mem(inst.src2.vreg, ctx) == 1) {
+            load_op(inst.src2.vreg, ctx, "rax");
+            out_line("imul r15, rax");
+        } else {
+            out_cstr("  imul r15, ");
+            emit_op(inst.src2.vreg, ctx);
+            out_char(10);
+        }
         store_op(inst.dest.vreg, ctx, "r15");
         return;
     }
@@ -398,61 +472,112 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
     // Float arithmetic (SSE)
     if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV) {
-        load_op(inst.src1.vreg, ctx, "r14");
+        load_op(inst.src1.vreg, ctx, "rax");
         load_op(inst.src2.vreg, ctx, "r15");
-        out_line("movq xmm0, r14");
+        out_line("movq xmm0, rax");
         out_line("movq xmm1, r15");
         if (op == d.IR_FADD) { out_line("addsd xmm0, xmm1"); }
         if (op == d.IR_FSUB) { out_line("subsd xmm0, xmm1"); }
         if (op == d.IR_FMUL) { out_line("mulsd xmm0, xmm1"); }
         if (op == d.IR_FDIV) { out_line("divsd xmm0, xmm1"); }
-        out_line("movq r14, xmm0");
-        store_op(inst.dest.vreg, ctx, "r14");
+        out_line("movq rax, xmm0");
+        store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
     if (op == d.IR_FNEG) {
-        load_op(inst.src1.vreg, ctx, "r14");
-        out_line("movq xmm0, r14");
+        load_op(inst.src1.vreg, ctx, "rax");
+        out_line("movq xmm0, rax");
         out_line("mov r15, 0x8000000000000000");
         out_line("movq xmm1, r15");
         out_line("xorpd xmm0, xmm1");
-        out_line("movq r14, xmm0");
-        store_op(inst.dest.vreg, ctx, "r14");
+        out_line("movq rax, xmm0");
+        store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
 
     // Comparisons
     if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) {
-        load_op(inst.src1.vreg, ctx, "r15");
-        load_op(inst.src2.vreg, ctx, "r14");
-        out_line("xor rax, rax");
-        out_line("cmp r15, r14");
-        if (op == d.IR_EQ) { out_line("sete al"); }
-        if (op == d.IR_NE) { out_line("setne al"); }
-        let is i32 as sgn = is_signed_type(inst.cast_to);
-        if (op == d.IR_LT) { if (sgn == 1) { out_line("setl al"); } else { out_line("setb al"); } }
-        if (op == d.IR_LE) { if (sgn == 1) { out_line("setle al"); } else { out_line("setbe al"); } }
-        if (op == d.IR_GT) { if (sgn == 1) { out_line("setg al"); } else { out_line("seta al"); } }
-        if (op == d.IR_GE) { if (sgn == 1) { out_line("setge al"); } else { out_line("setae al"); } }
-        store_op(inst.dest.vreg, ctx, "rax");
+        // Fuse compare+branch: if next instruction is JZ/JNZ on our dest vreg, emit cmp+jcc directly
+        let is i32 as fused with mut = 0;
+        let is *d.IRInst as nx = inst.next;
+        if (cast(i64, nx) != 0 && nx.is_dead != 1) {
+            let is i32 as nx_op = nx.op;
+            if ((nx_op == d.IR_JZ || nx_op == d.IR_JNZ) && nx.src1.vreg == inst.dest.vreg) {
+                load_op(inst.src1.vreg, ctx, "r15");
+                out_cstr("  cmp r15, ");
+                emit_src2(inst, ctx);
+                out_char(10);
+                let is i32 as sgn = is_signed_type(inst.cast_to);
+                if (nx_op == d.IR_JZ) {
+                    if (op == d.IR_EQ) { out_cstr("  jne .L"); }
+                    else if (op == d.IR_NE) { out_cstr("  je .L"); }
+                    else if (op == d.IR_LT) { if (sgn == 1) { out_cstr("  jge .L"); } else { out_cstr("  jae .L"); } }
+                    else if (op == d.IR_LE) { if (sgn == 1) { out_cstr("  jg .L"); } else { out_cstr("  ja .L"); } }
+                    else if (op == d.IR_GT) { if (sgn == 1) { out_cstr("  jle .L"); } else { out_cstr("  jbe .L"); } }
+                    else if (op == d.IR_GE) { if (sgn == 1) { out_cstr("  jl .L"); } else { out_cstr("  jb .L"); } }
+                } else {
+                    if (op == d.IR_EQ) { out_cstr("  je .L"); }
+                    else if (op == d.IR_NE) { out_cstr("  jne .L"); }
+                    else if (op == d.IR_LT) { if (sgn == 1) { out_cstr("  jl .L"); } else { out_cstr("  jb .L"); } }
+                    else if (op == d.IR_LE) { if (sgn == 1) { out_cstr("  jle .L"); } else { out_cstr("  jbe .L"); } }
+                    else if (op == d.IR_GT) { if (sgn == 1) { out_cstr("  jg .L"); } else { out_cstr("  ja .L"); } }
+                    else if (op == d.IR_GE) { if (sgn == 1) { out_cstr("  jge .L"); } else { out_cstr("  jae .L"); } }
+                }
+                out_int(cast(i64, nx.dest.label));
+                out_char(10);
+                nx.is_dead = 1;
+                fused = 1;
+            }
+        }
+        if (fused == 0) {
+            load_op(inst.src1.vreg, ctx, "r15");
+            out_line("xor eax, eax");
+            out_cstr("  cmp r15, ");
+            emit_src2(inst, ctx);
+            out_char(10);
+            if (op == d.IR_EQ) { out_line("sete al"); }
+            if (op == d.IR_NE) { out_line("setne al"); }
+            let is i32 as sgn2 = is_signed_type(inst.cast_to);
+            if (op == d.IR_LT) { if (sgn2 == 1) { out_line("setl al"); } else { out_line("setb al"); } }
+            if (op == d.IR_LE) { if (sgn2 == 1) { out_line("setle al"); } else { out_line("setbe al"); } }
+            if (op == d.IR_GT) { if (sgn2 == 1) { out_line("setg al"); } else { out_line("seta al"); } }
+            if (op == d.IR_GE) { if (sgn2 == 1) { out_line("setge al"); } else { out_line("setae al"); } }
+            store_op(inst.dest.vreg, ctx, "rax");
+        }
         return;
     }
 
     // Shifts
     if (op == d.IR_SHL) {
-        load_op(inst.src2.vreg, ctx, "rcx");
         load_op(inst.src1.vreg, ctx, "r15");
-        out_line("shl r15, cl");
+        if (inst.src2.op_type == d.OP_IMM) {
+            out_cstr("  shl r15, ");
+            out_int(inst.src2.imm);
+            out_char(10);
+        } else {
+            load_op(inst.src2.vreg, ctx, "rcx");
+            out_line("shl r15, cl");
+        }
         store_op(inst.dest.vreg, ctx, "r15");
         return;
     }
     if (op == d.IR_SHR) {
-        load_op(inst.src2.vreg, ctx, "rcx");
         load_op(inst.src1.vreg, ctx, "r15");
-        if (is_signed_type(inst.cast_to) == 1) {
-            out_line("sar r15, cl");
+        if (inst.src2.op_type == d.OP_IMM) {
+            if (is_signed_type(inst.cast_to) == 1) {
+                out_cstr("  sar r15, ");
+            } else {
+                out_cstr("  shr r15, ");
+            }
+            out_int(inst.src2.imm);
+            out_char(10);
         } else {
-            out_line("shr r15, cl");
+            load_op(inst.src2.vreg, ctx, "rcx");
+            if (is_signed_type(inst.cast_to) == 1) {
+                out_line("sar r15, cl");
+            } else {
+                out_line("shr r15, cl");
+            }
         }
         store_op(inst.dest.vreg, ctx, "r15");
         return;
@@ -460,30 +585,21 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
     // Bitwise
     if (op == d.IR_AND) {
-        load_op(inst.src1.vreg, ctx, "r14");
-        load_op(inst.src2.vreg, ctx, "r15");
-        out_line("and r14, r15");
-        store_op(inst.dest.vreg, ctx, "r14");
+        gen_binop(inst, ctx, "and");
         return;
     }
     if (op == d.IR_OR) {
-        load_op(inst.src1.vreg, ctx, "r14");
-        load_op(inst.src2.vreg, ctx, "r15");
-        out_line("or r14, r15");
-        store_op(inst.dest.vreg, ctx, "r14");
+        gen_binop(inst, ctx, "or");
         return;
     }
     if (op == d.IR_XOR) {
-        load_op(inst.src1.vreg, ctx, "r14");
-        load_op(inst.src2.vreg, ctx, "r15");
-        out_line("xor r14, r15");
-        store_op(inst.dest.vreg, ctx, "r14");
+        gen_binop(inst, ctx, "xor");
         return;
     }
     if (op == d.IR_NOT) {
-        load_op(inst.src1.vreg, ctx, "r14");
-        out_line("not r14");
-        store_op(inst.dest.vreg, ctx, "r14");
+        load_op(inst.src1.vreg, ctx, "r15");
+        out_line("not r15");
+        store_op(inst.dest.vreg, ctx, "r15");
         return;
     }
 
@@ -537,38 +653,70 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
     // Memory
     if (op == d.IR_ADDR) {
-        out_cstr("  lea r15, [rbp-");
-        out_int(inst.src1.imm);
-        out_cstr("]\n");
-        store_op(inst.dest.vreg, ctx, "r15");
+        let is i32 as aloc = al.get_loc(inst.dest.vreg, ctx);
+        if (aloc >= 0) {
+            let is *u8 as dr = reg64(aloc);
+            out_cstr("  lea ");
+            out_cstr(dr);
+            out_cstr(", [rbp-");
+            out_int(inst.src1.imm);
+            out_cstr("]\n");
+        } else {
+            out_cstr("  lea r15, [rbp-");
+            out_int(inst.src1.imm);
+            out_cstr("]\n");
+            store_op(inst.dest.vreg, ctx, "r15");
+        }
         return;
     }
     if (op == d.IR_ADDR_GLOBAL) {
+        let is i32 as gloc = al.get_loc(inst.dest.vreg, ctx);
+        let is *u8 as gr with mut = "r15";
+        if (gloc >= 0) { gr = reg64(gloc); }
         if (inst.is_extern_global == 1) {
-            out_cstr("  mov r15, QWORD PTR [rip+");
+            out_cstr("  mov ");
+            out_cstr(gr);
+            out_cstr(", QWORD PTR [rip+");
             out_str(inst.global_name_ptr, inst.global_name_len);
             out_cstr("]\n");
         } else {
-            out_cstr("  lea r15, [rip+");
+            out_cstr("  lea ");
+            out_cstr(gr);
+            out_cstr(", [rip+");
             out_str(inst.global_name_ptr, inst.global_name_len);
             out_cstr("]\n");
         }
-        store_op(inst.dest.vreg, ctx, "r15");
+        if (gloc < 0) { store_op(inst.dest.vreg, ctx, "r15"); }
         return;
     }
     if (op == d.IR_FN_ADDR) {
-        out_cstr("  lea r15, [rip+");
+        let is i32 as floc = al.get_loc(inst.dest.vreg, ctx);
+        let is *u8 as fr with mut = "r15";
+        if (floc >= 0) { fr = reg64(floc); }
+        out_cstr("  lea ");
+        out_cstr(fr);
+        out_cstr(", [rip+");
         out_str(inst.global_name_ptr, inst.global_name_len);
         out_cstr("]\n");
-        store_op(inst.dest.vreg, ctx, "r15");
+        if (floc < 0) { store_op(inst.dest.vreg, ctx, "r15"); }
         return;
     }
     if (op == d.IR_GET_ALLOC_ADDR) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, ctx.stack_slots) * 8 + inst.src1.imm;
-        out_cstr("  lea r15, [rbp-");
-        out_int(off);
-        out_cstr("]\n");
-        store_op(inst.dest.vreg, ctx, "r15");
+        let is i32 as aaloc = al.get_loc(inst.dest.vreg, ctx);
+        if (aaloc >= 0) {
+            let is *u8 as ar = reg64(aaloc);
+            out_cstr("  lea ");
+            out_cstr(ar);
+            out_cstr(", [rbp-");
+            out_int(off);
+            out_cstr("]\n");
+        } else {
+            out_cstr("  lea r15, [rbp-");
+            out_int(off);
+            out_cstr("]\n");
+            store_op(inst.dest.vreg, ctx, "r15");
+        }
         return;
     }
     if (op == d.IR_SET_CTX) {
@@ -733,47 +881,45 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_CAST) {
         let is i32 as to_flt = is_float_type(inst.cast_to);
         let is i32 as from_flt = is_float_type(inst.cast_from);
-        load_op(inst.src1.vreg, ctx, "r14");
+        load_op(inst.src1.vreg, ctx, "r15");
         // float -> int
         if (from_flt == 1 && to_flt == 0) {
-            out_line("movq xmm0, r14");
-            out_line("cvttsd2si r14, xmm0");
-            store_op(inst.dest.vreg, ctx, "r14");
+            out_line("movq xmm0, r15");
+            out_line("cvttsd2si r15, xmm0");
+            store_op(inst.dest.vreg, ctx, "r15");
             return;
         }
         // int -> float
         if (from_flt == 0 && to_flt == 1) {
-            out_line("cvtsi2sd xmm0, r14");
-            out_line("movq r14, xmm0");
-            store_op(inst.dest.vreg, ctx, "r14");
+            out_line("cvtsi2sd xmm0, r15");
+            out_line("movq r15, xmm0");
+            store_op(inst.dest.vreg, ctx, "r15");
             return;
         }
         // int -> int: truncation / sign-extend
         let is i32 as to_sz = get_type_size(inst.cast_to);
         let is i32 as sgn = is_signed_type(inst.cast_to);
         if (to_sz == 4) {
-            if (sgn == 1) { out_line("movsxd r14, r14d"); }
-            else { out_line("mov r14d, r14d"); }
+            if (sgn == 1) { out_line("movsxd r15, r15d"); }
+            else { out_line("mov r15d, r15d"); }
         } else if (to_sz == 2) {
-            if (sgn == 1) { out_line("movsx r14, r14w"); }
-            else { out_line("movzx r14, r14w"); }
+            if (sgn == 1) { out_line("movsx r15, r15w"); }
+            else { out_line("movzx r15, r15w"); }
         } else if (to_sz == 1) {
-            if (sgn == 1) { out_line("movsx r14, r14b"); }
-            else { out_line("movzx r14, r14b"); }
+            if (sgn == 1) { out_line("movsx r15, r15b"); }
+            else { out_line("movzx r15, r15b"); }
         }
-        store_op(inst.dest.vreg, ctx, "r14");
+        store_op(inst.dest.vreg, ctx, "r15");
         return;
     }
 
     // SET_ARG
     if (op == d.IR_SET_ARG) {
         let is i32 as idx = cast(i32, inst.dest.imm);
-        load_op(inst.src1.vreg, ctx, "r15");
         if (idx < 6) {
-            out_cstr("  mov ");
-            out_cstr(arg_reg64(idx));
-            out_cstr(", r15\n");
+            load_op(inst.src1.vreg, ctx, arg_reg64(idx));
         } else {
+            load_op(inst.src1.vreg, ctx, "r15");
             out_line("push r15");
         }
         return;
@@ -782,10 +928,7 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_GET_ARG) {
         let is i32 as idx = cast(i32, inst.src1.imm);
         if (idx < 6) {
-            out_cstr("  mov r15, ");
-            out_cstr(arg_reg64(idx));
-            out_char(10);
-            store_op(inst.dest.vreg, ctx, "r15");
+            store_op(inst.dest.vreg, ctx, arg_reg64(idx));
         } else {
             // Stack arg: [rbp + 16 + (idx-6)*8]
             let is i64 as off = 16 + cast(i64, idx - 6) * 8;
@@ -799,10 +942,7 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // SET_SYS_ARG
     if (op == d.IR_SET_SYS_ARG) {
         let is i32 as idx = cast(i32, inst.dest.imm);
-        load_op(inst.src1.vreg, ctx, "r15");
-        out_cstr("  mov ");
-        out_cstr(syscall_reg(idx));
-        out_cstr(", r15\n");
+        load_op(inst.src1.vreg, ctx, syscall_reg(idx));
         return;
     }
     // SYSCALL
@@ -928,7 +1068,9 @@ fn gen_func(func as *d.IRFunction) as void {
             out_cstr(" 0\n");
             last_line = inst.line;
         }
-        gen_inst(inst, ctx);
+        if (inst.is_dead != 1) {
+            gen_inst(inst, ctx);
+        }
         inst = inst.next;
     }
 }
