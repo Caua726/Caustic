@@ -15,6 +15,35 @@ let is i32 as out_fd with mut;
 let is *u8 as cg_filename with mut;
 let is i32 as cg_filename_len with mut;
 
+// === Peephole: track last spill store to skip redundant reload ===
+// After store_op writes a vreg to a spill slot, if the very next load_op
+// reads the same vreg into the same register, we skip the redundant load.
+let is i32 as ph_vreg with mut = 99999;       // last spilled vreg (99999 = none)
+let is i32 as ph_ridx with mut = 99999;       // register index that holds it
+
+fn ph_invalidate() as void { ph_vreg = 99999; }
+
+fn reg_name_to_idx(name as *u8) as i32 {
+    if (name[0] == 114) {
+        // r...
+        if (name[1] == 97) { return 0; } // rax
+        if (name[1] == 99) { return 1; } // rcx
+        if (name[1] == 100) { return 2; } // rdx
+        if (name[1] == 98) { return 3; } // rbx
+        if (name[1] == 115) { return 4; } // rsi
+        if (name[1] == 100 && name[2] == 105) { return 5; } // rdi
+        if (name[1] == 49 && name[2] == 53) { return 15; } // r15
+        if (name[1] == 49 && name[2] == 52) { return 14; } // r14
+        if (name[1] == 49 && name[2] == 51) { return 13; } // r13
+        if (name[1] == 49 && name[2] == 50) { return 12; } // r12
+        if (name[1] == 49 && name[2] == 49) { return 11; } // r11
+        if (name[1] == 49 && name[2] == 48) { return 10; } // r10
+        if (name[1] == 56) { return 8; }  // r8
+        if (name[1] == 57) { return 9; }  // r9
+    }
+    return 99999;
+}
+
 // === Per-function profiling ===
 // Each entry: name_ptr(8) + name_len(4) + vregs(4) + time_us(8) = 24 bytes
 let is i64 as cg_prof_buf with mut = 0;   // ptr to buffer
@@ -230,7 +259,14 @@ fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
             out_cstr(rn);
             out_char(10);
         }
+        ph_invalidate();
     } else {
+        // Peephole: skip redundant reload of same vreg to same register
+        if (ph_vreg == vreg && ph_ridx == reg_name_to_idx(target)) {
+            ph_invalidate();
+            return;
+        }
+        ph_invalidate();
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         out_cstr("  mov ");
         out_cstr(target);
@@ -251,6 +287,7 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
             out_cstr(source);
             out_char(10);
         }
+        ph_invalidate();
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         out_cstr("  mov QWORD PTR [rbp-");
@@ -258,6 +295,9 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
         out_cstr("], ");
         out_cstr(source);
         out_char(10);
+        // Track this spill store for peephole
+        ph_vreg = vreg;
+        ph_ridx = reg_name_to_idx(source);
     }
 }
 
@@ -386,6 +426,9 @@ fn gen_binop(inst as *d.IRInst, ctx as *al.AllocCtx, op_name as *u8) as void {
 fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
+    // Peephole: invalidate at function start to be safe
+    if (op == d.IR_CALL || op == d.IR_SYSCALL) { ph_invalidate(); }
+
     // IR_IMM
     if (op == d.IR_IMM) {
         emit_mov_imm(inst.dest.vreg, ctx, inst.src1.imm);
@@ -419,11 +462,18 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_MUL) {
-        load_op(inst.src1.vreg, ctx, "r15");
-        if (al.is_mem(inst.src2.vreg, ctx) == 1) {
+        if (inst.src2.op_type == d.OP_IMM) {
+            load_op(inst.src1.vreg, ctx, "r15");
+            out_cstr("  mov rax, ");
+            out_int(inst.src2.imm);
+            out_char(10);
+            out_line("imul r15, rax");
+        } else if (al.is_mem(inst.src2.vreg, ctx) == 1) {
+            load_op(inst.src1.vreg, ctx, "r15");
             load_op(inst.src2.vreg, ctx, "rax");
             out_line("imul r15, rax");
         } else {
+            load_op(inst.src1.vreg, ctx, "r15");
             out_cstr("  imul r15, ");
             emit_op(inst.src2.vreg, ctx);
             out_char(10);
@@ -432,8 +482,40 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_DIV) {
+        // Check for power-of-2 constant divisor
+        if (inst.src2.op_type == d.OP_IMM && inst.src2.imm > 0 && (inst.src2.imm & (inst.src2.imm - 1)) == 0) {
+            load_op(inst.src1.vreg, ctx, "r15");
+            // Count log2
+            let is i64 as shift with mut = 0;
+            let is i64 as tmp with mut = inst.src2.imm;
+            while (tmp > 1) { tmp = tmp >> 1; shift = shift + 1; }
+            if (is_signed_type(inst.cast_to) == 1) {
+                // Signed: add (x >> 63) >>> (64 - shift) before sar to round toward zero
+                // mov rax, r15; sar rax, 63; shr rax, (64-shift); add r15, rax; sar r15, shift
+                if (shift == 1) {
+                    out_line("mov rax, r15");
+                    out_line("shr rax, 63");
+                    out_line("add r15, rax");
+                    out_line("sar r15, 1");
+                } else {
+                    out_line("mov rax, r15");
+                    out_line("sar rax, 63");
+                    out_cstr("  shr rax, "); out_int(64 - shift); out_char(10);
+                    out_line("add r15, rax");
+                    out_cstr("  sar r15, "); out_int(shift); out_char(10);
+                }
+            } else {
+                out_cstr("  shr r15, "); out_int(shift); out_char(10);
+            }
+            store_op(inst.dest.vreg, ctx, "r15");
+            return;
+        }
         load_op(inst.src1.vreg, ctx, "rax");
-        load_op(inst.src2.vreg, ctx, "r15");
+        if (inst.src2.op_type == d.OP_IMM) {
+            out_cstr("  mov r15, "); out_int(inst.src2.imm); out_char(10);
+        } else {
+            load_op(inst.src2.vreg, ctx, "r15");
+        }
         out_line("push rdx");
         if (is_signed_type(inst.cast_to) == 1) {
             out_line("cqo");
@@ -448,8 +530,44 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_MOD) {
+        // Check for power-of-2 constant divisor
+        if (inst.src2.op_type == d.OP_IMM && inst.src2.imm > 0 && (inst.src2.imm & (inst.src2.imm - 1)) == 0) {
+            load_op(inst.src1.vreg, ctx, "r15");
+            let is i64 as mask = inst.src2.imm - 1;
+            if (is_signed_type(inst.cast_to) == 1) {
+                // Signed mod: result = x - (x/pow2)*pow2
+                // But simpler: use same div correction then compute remainder
+                // Or: mov rax, r15; and r15, mask; test rax,rax; jns .ok; neg trick
+                // Simplest correct: rax = r15; cdq-style; add+mask; sub
+                // Actually for signed mod pow2:
+                // result = ((x % pow2) + pow2) % pow2  but with sign of dividend
+                // Correct signed approach matching idiv semantics:
+                // mov rax, r15       ; save original
+                // sar r15, 63        ; sign = -1 or 0
+                // and r15, mask      ; sign & (pow2-1) = correction
+                // add rax, r15       ; x + correction
+                // and rax, mask      ; (x + correction) & mask
+                // sub rax, r15       ; subtract correction
+                // mov r15, rax
+                out_line("mov rax, r15");
+                out_line("sar r15, 63");
+                out_cstr("  and r15, "); out_int(mask); out_char(10);
+                out_line("add rax, r15");
+                out_cstr("  and rax, "); out_int(mask); out_char(10);
+                out_line("sub rax, r15");
+                out_line("mov r15, rax");
+            } else {
+                out_cstr("  and r15, "); out_int(mask); out_char(10);
+            }
+            store_op(inst.dest.vreg, ctx, "r15");
+            return;
+        }
         load_op(inst.src1.vreg, ctx, "rax");
-        load_op(inst.src2.vreg, ctx, "r15");
+        if (inst.src2.op_type == d.OP_IMM) {
+            out_cstr("  mov r15, "); out_int(inst.src2.imm); out_char(10);
+        } else {
+            load_op(inst.src2.vreg, ctx, "r15");
+        }
         out_line("push rdx");
         if (is_signed_type(inst.cast_to) == 1) {
             out_line("cqo");
@@ -623,12 +741,14 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_LABEL) {
+        ph_invalidate();
         out_cstr(".L");
         out_int(cast(i64, inst.dest.label));
         out_cstr(":\n");
         return;
     }
     if (op == d.IR_JMP) {
+        ph_invalidate();
         out_cstr("  jmp .L");
         out_int(cast(i64, inst.dest.label));
         out_char(10);

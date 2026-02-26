@@ -1,0 +1,619 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+
+// === Helpers ===
+
+fn is_power_of_2(v as i64) as i32 {
+    if (v <= 0) { return 0; }
+    if ((v & (v - 1)) == 0) { return 1; }
+    return 0;
+}
+
+fn log2_of(v as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as x with mut = v;
+    while (x > 1) { x = x >> 1; r = r + 1; }
+    return r;
+}
+
+fn resolve(copy_of as *i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as hops with mut = 0;
+    while (hops < 16) {
+        let is *i32 as p = cast(*i32, cast(i64, copy_of) + cast(i64, cur) * 4);
+        let is i32 as next = *p;
+        if (next < 0) { return cur; }
+        cur = next;
+        hops = hops + 1;
+    }
+    return cur;
+}
+
+fn has_side_effects(op as i32) as i32 {
+    if (op == d.IR_STORE) { return 1; }
+    if (op == d.IR_COPY) { return 1; }
+    if (op == d.IR_CALL) { return 1; }
+    if (op == d.IR_SYSCALL) { return 1; }
+    if (op == d.IR_ASM) { return 1; }
+    if (op == d.IR_RET) { return 1; }
+    if (op == d.IR_JMP) { return 1; }
+    if (op == d.IR_JZ) { return 1; }
+    if (op == d.IR_JNZ) { return 1; }
+    if (op == d.IR_LABEL) { return 1; }
+    if (op == d.IR_SET_ARG) { return 1; }
+    if (op == d.IR_SET_SYS_ARG) { return 1; }
+    if (op == d.IR_SET_CTX) { return 1; }
+    if (op == d.IR_VA_START) { return 1; }
+    return 0;
+}
+
+// === optimize_func ===
+
+fn optimize_func(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc == 0) { return; }
+
+    // Allocate tracking arrays
+    let is *i32 as is_const = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    let is *i64 as imm_val = cast(*i64, mem.galloc(cast(i64, vc) * 8));
+    let is *i32 as copy_of = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+
+    // Init
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, i) * 4);
+        *cp = 0;
+        let is *i64 as ip = cast(*i64, cast(i64, imm_val) + cast(i64, i) * 8);
+        *ip = 0;
+        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, i) * 4);
+        *pp = 0 - 1;
+        i = i + 1;
+    }
+
+    // === Pass 1: Constant Prop + Copy Prop (forward) ===
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 1) { inst = inst.next; }
+        else {
+            let is i32 as op = inst.op;
+
+            // Resolve src1 copy chain
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is i32 as r1 = resolve(copy_of, inst.src1.vreg);
+                if (r1 != inst.src1.vreg) { inst.src1.vreg = r1; }
+            }
+            // Resolve src2 copy chain
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as r2 = resolve(copy_of, inst.src2.vreg);
+                if (r2 != inst.src2.vreg) { inst.src2.vreg = r2; }
+            }
+            // Also resolve dest for STORE (dest is the address vreg)
+            if (op == d.IR_STORE && inst.dest.op_type == d.OP_VREG) {
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
+                if (rd != inst.dest.vreg) { inst.dest.vreg = rd; }
+            }
+            // Resolve for COPY (dest is address vreg)
+            if (op == d.IR_COPY && inst.dest.op_type == d.OP_VREG) {
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
+                if (rd != inst.dest.vreg) { inst.dest.vreg = rd; }
+            }
+            // Resolve for JZ/JNZ (src1 is condition)
+            // Already handled above
+
+            // Track IR_IMM
+            if (op == d.IR_IMM) {
+                let is i32 as dv = inst.dest.vreg;
+                let is *i32 as icp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                *icp = 1;
+                let is *i64 as ivp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                *ivp = inst.src1.imm;
+            }
+
+            // Track IR_MOV as copy
+            if (op == d.IR_MOV && inst.src1.op_type == d.OP_VREG) {
+                let is i32 as dv = inst.dest.vreg;
+                let is i32 as sv = inst.src1.vreg;
+                let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                *pp = sv;
+                inst.is_dead = 1;
+                // Propagate const info
+                let is *i32 as src_const = cast(*i32, cast(i64, is_const) + cast(i64, sv) * 4);
+                if (*src_const == 1) {
+                    let is *i32 as dst_const = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                    *dst_const = 1;
+                    let is *i64 as src_val = cast(*i64, cast(i64, imm_val) + cast(i64, sv) * 8);
+                    let is *i64 as dst_val = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                    *dst_val = *src_val;
+                }
+            }
+
+            // Identity elimination and constant folding for binary ops
+            if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL ||
+                op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR ||
+                op == d.IR_SHL || op == d.IR_SHR) {
+
+                let is i32 as s1v = inst.src1.vreg;
+                let is i32 as s2v = inst.src2.vreg;
+                let is *i32 as c1p = cast(*i32, cast(i64, is_const) + cast(i64, s1v) * 4);
+                let is *i32 as c2p = cast(*i32, cast(i64, is_const) + cast(i64, s2v) * 4);
+                let is i32 as c1 = *c1p;
+                let is i32 as c2 = *c2p;
+
+                if (c1 == 1 && c2 == 1) {
+                    // Constant folding: both operands constant
+                    let is *i64 as v1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                    let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                    let is i64 as v1 = *v1p;
+                    let is i64 as v2 = *v2p;
+                    let is i64 as result with mut = 0;
+                    if (op == d.IR_ADD) { result = v1 + v2; }
+                    if (op == d.IR_SUB) { result = v1 - v2; }
+                    if (op == d.IR_MUL) { result = v1 * v2; }
+                    if (op == d.IR_AND) { result = v1 & v2; }
+                    if (op == d.IR_OR) { result = v1 | v2; }
+                    if (op == d.IR_XOR) { result = v1 ^ v2; }
+                    if (op == d.IR_SHL) { result = v1 << v2; }
+                    if (op == d.IR_SHR) { result = v1 >> v2; }
+                    // Convert to IR_IMM
+                    inst.op = d.IR_IMM;
+                    inst.src1.op_type = d.OP_IMM;
+                    inst.src1.imm = result;
+                    inst.src2.op_type = d.OP_NONE;
+                    let is i32 as dv = inst.dest.vreg;
+                    let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                    *dcp = 1;
+                    let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                    *dvp = result;
+                } else if (c2 == 1) {
+                    // Right operand constant: identity elimination
+                    let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                    let is i64 as v2 = *v2p;
+
+                    // x + 0, x - 0, x | 0, x ^ 0, x << 0, x >> 0 → copy x
+                    if ((op == d.IR_ADD || op == d.IR_SUB || op == d.IR_OR ||
+                         op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR) && v2 == 0) {
+                        let is i32 as dv = inst.dest.vreg;
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s1v;
+                        inst.is_dead = 1;
+                        // Propagate const if src1 is const
+                        if (c1 == 1) {
+                            let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                            *dcp = 1;
+                            let is *i64 as sv1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                            let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                            *dvp = *sv1p;
+                        }
+                    }
+                    // x * 1 → copy x
+                    if (op == d.IR_MUL && v2 == 1) {
+                        let is i32 as dv = inst.dest.vreg;
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s1v;
+                        inst.is_dead = 1;
+                        if (c1 == 1) {
+                            let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                            *dcp = 1;
+                            let is *i64 as sv1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                            let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                            *dvp = *sv1p;
+                        }
+                    }
+                    // x * 0, x & 0 → IMM 0
+                    if ((op == d.IR_MUL || op == d.IR_AND) && v2 == 0) {
+                        inst.op = d.IR_IMM;
+                        inst.src1.op_type = d.OP_IMM;
+                        inst.src1.imm = 0;
+                        inst.src2.op_type = d.OP_NONE;
+                        let is i32 as dv = inst.dest.vreg;
+                        let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                        *dcp = 1;
+                        let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                        *dvp = 0;
+                    }
+                } else if (c1 == 1) {
+                    // Left operand constant: identity for commutative ops
+                    let is *i64 as v1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                    let is i64 as v1 = *v1p;
+
+                    // 0 + x, 0 | x, 0 ^ x → copy x
+                    if ((op == d.IR_ADD || op == d.IR_OR || op == d.IR_XOR) && v1 == 0) {
+                        let is i32 as dv = inst.dest.vreg;
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s2v;
+                        inst.is_dead = 1;
+                    }
+                    // 1 * x → copy x
+                    if (op == d.IR_MUL && v1 == 1) {
+                        let is i32 as dv = inst.dest.vreg;
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s2v;
+                        inst.is_dead = 1;
+                    }
+                    // 0 * x, 0 & x → IMM 0
+                    if ((op == d.IR_MUL || op == d.IR_AND) && v1 == 0) {
+                        inst.op = d.IR_IMM;
+                        inst.src1.op_type = d.OP_IMM;
+                        inst.src1.imm = 0;
+                        inst.src2.op_type = d.OP_NONE;
+                        let is i32 as dv = inst.dest.vreg;
+                        let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                        *dcp = 1;
+                        let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                        *dvp = 0;
+                    }
+                }
+            }
+
+            // Strength reduction: DIV/MOD/MUL with constant power-of-2
+            if (op == d.IR_DIV || op == d.IR_MOD || op == d.IR_MUL) {
+                if (inst.src2.op_type == d.OP_VREG) {
+                    let is i32 as s2v = inst.src2.vreg;
+                    let is *i32 as c2p = cast(*i32, cast(i64, is_const) + cast(i64, s2v) * 4);
+                    if (*c2p == 1) {
+                        let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                        let is i64 as v2 = *v2p;
+                        if (is_power_of_2(v2) == 1) {
+                            let is i64 as shift = log2_of(v2);
+                            // Check if unsigned: cast_to kind 5-8 are unsigned
+                            let is i32 as is_unsigned with mut = 0;
+                            if (cast(i64, inst.cast_to) != 0) {
+                                let is *i32 as kp = cast(*i32, inst.cast_to);
+                                let is i32 as kind = *kp;
+                                if (kind >= 5 && kind <= 8) { is_unsigned = 1; }
+                            }
+                            if (op == d.IR_MUL) {
+                                // x * pow2 → x << log2(pow2) (works for both signed/unsigned)
+                                inst.op = d.IR_SHL;
+                                // Set src2 to IMM shift amount
+                                inst.src2.op_type = d.OP_IMM;
+                                inst.src2.imm = shift;
+                            }
+                            if (op == d.IR_DIV && is_unsigned == 1) {
+                                // unsigned: x / pow2 → x >> log2(pow2)
+                                inst.op = d.IR_SHR;
+                                inst.src2.op_type = d.OP_IMM;
+                                inst.src2.imm = shift;
+                            }
+                            if (op == d.IR_MOD && is_unsigned == 1) {
+                                // unsigned: x % pow2 → x & (pow2-1)
+                                inst.op = d.IR_AND;
+                                inst.src2.op_type = d.OP_IMM;
+                                inst.src2.imm = v2 - 1;
+                            }
+                        }
+                    }
+                }
+                // Constant folding: both operands known
+                if (inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG) {
+                    let is i32 as s1v = inst.src1.vreg;
+                    let is i32 as s2v = inst.src2.vreg;
+                    let is *i32 as c1p = cast(*i32, cast(i64, is_const) + cast(i64, s1v) * 4);
+                    let is *i32 as c2p = cast(*i32, cast(i64, is_const) + cast(i64, s2v) * 4);
+                    if (*c1p == 1 && *c2p == 1) {
+                        let is *i64 as v1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                        let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                        let is i64 as v2 = *v2p;
+                        if (v2 != 0) {
+                            let is i64 as v1 = *v1p;
+                            let is i64 as result with mut = 0;
+                            if (op == d.IR_DIV) { result = v1 / v2; }
+                            if (op == d.IR_MOD) { result = v1 % v2; }
+                            if (op == d.IR_MUL) { result = v1 * v2; }
+                            inst.op = d.IR_IMM;
+                            inst.src1.op_type = d.OP_IMM;
+                            inst.src1.imm = result;
+                            inst.src2.op_type = d.OP_NONE;
+                            let is i32 as dv = inst.dest.vreg;
+                            let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                            *dcp = 1;
+                            let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                            *dvp = result;
+                        }
+                    }
+                }
+            }
+
+            // Constant folding for unary ops (NEG, NOT)
+            if (op == d.IR_NEG && inst.src1.op_type == d.OP_VREG) {
+                let is i32 as sv = inst.src1.vreg;
+                let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, sv) * 4);
+                if (*cp == 1) {
+                    let is *i64 as vp = cast(*i64, cast(i64, imm_val) + cast(i64, sv) * 8);
+                    let is i64 as result = 0 - *vp;
+                    inst.op = d.IR_IMM;
+                    inst.src1.op_type = d.OP_IMM;
+                    inst.src1.imm = result;
+                    let is i32 as dv = inst.dest.vreg;
+                    let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                    *dcp = 1;
+                    let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                    *dvp = result;
+                }
+            }
+            if (op == d.IR_NOT && inst.src1.op_type == d.OP_VREG) {
+                let is i32 as sv = inst.src1.vreg;
+                let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, sv) * 4);
+                if (*cp == 1) {
+                    let is *i64 as vp = cast(*i64, cast(i64, imm_val) + cast(i64, sv) * 8);
+                    // Bitwise NOT: ~x = -1 ^ x (or we can use 0 - 1 - x)
+                    let is i64 as all_ones = 0 - 1;
+                    let is i64 as result = all_ones ^ *vp;
+                    inst.op = d.IR_IMM;
+                    inst.src1.op_type = d.OP_IMM;
+                    inst.src1.imm = result;
+                    let is i32 as dv = inst.dest.vreg;
+                    let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                    *dcp = 1;
+                    let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                    *dvp = result;
+                }
+            }
+
+            // Invalidate const/copy tracking when dest is redefined by non-IMM/non-MOV
+            if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG) {
+                let is i32 as dv = inst.dest.vreg;
+                if (op != d.IR_IMM && op != d.IR_MOV) {
+                    // Check if we already folded this to IMM above
+                    let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                    if (inst.op != d.IR_IMM) {
+                        // Only invalidate if NOT already set by folding
+                        // (folding changes inst.op to IR_IMM, so if it's still not IR_IMM, invalidate)
+                        *dcp = 0;
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = 0 - 1;
+                    }
+                }
+            }
+
+            inst = inst.next;
+        }
+    }
+
+    // === Pass 1.1: Fuse ADDR+STORE/LOAD into direct stack ops ===
+    // Count uses of each vreg (as src1, src2, or dest-of-STORE/COPY)
+    let is *i32 as use_count = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    i = 0;
+    while (i < vc) {
+        let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, i) * 4);
+        *ucp = 0;
+        i = i + 1;
+    }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, inst.src1.vreg) * 4);
+                *ucp = *ucp + 1;
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, inst.src2.vreg) * 4);
+                *ucp = *ucp + 1;
+            }
+            // STORE/COPY dest is a use (address), not a def
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
+                let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, inst.dest.vreg) * 4);
+                *ucp = *ucp + 1;
+            }
+        }
+        inst = inst.next;
+    }
+    // Track which vregs come from IR_ADDR with IMM (local var address)
+    // addr_offset[v] = stack offset if v was defined by IR_ADDR(IMM), else -1
+    let is *i64 as addr_offset = cast(*i64, mem.galloc(cast(i64, vc) * 8));
+    i = 0;
+    while (i < vc) {
+        let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, i) * 8);
+        *aop = 0 - 1;
+        i = i + 1;
+    }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_ADDR && inst.src1.op_type == d.OP_IMM) {
+            let is i32 as dv = inst.dest.vreg;
+            let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, dv) * 8);
+            *aop = inst.src1.imm;
+        }
+        inst = inst.next;
+    }
+    // Now scan: for each STORE/LOAD whose address vreg comes from ADDR(IMM) with use_count==1
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            // Fuse ADDR+STORE: IR_STORE dest=vA(addr), src1=vB(value)
+            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_VREG) {
+                let is i32 as av = inst.dest.vreg;
+                let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, av) * 8);
+                let is i64 as off = *aop;
+                if (off >= 0) {
+                    let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, av) * 4);
+                    if (*ucp == 1) {
+                        // Replace STORE dest with direct IMM offset
+                        inst.dest.op_type = d.OP_IMM;
+                        inst.dest.imm = off;
+                        // Mark the ADDR instruction as dead (find it)
+                        let is *d.IRInst as scan with mut = func.instructions;
+                        while (cast(i64, scan) != 0) {
+                            if (scan.is_dead == 0 && scan.op == d.IR_ADDR && scan.dest.vreg == av) {
+                                scan.is_dead = 1;
+                            }
+                            scan = scan.next;
+                        }
+                    }
+                }
+            }
+            // Fuse ADDR+LOAD: IR_LOAD dest=vB, src1=vA(addr vreg)
+            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_VREG) {
+                let is i32 as av = inst.src1.vreg;
+                let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, av) * 8);
+                let is i64 as off = *aop;
+                if (off >= 0) {
+                    let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, av) * 4);
+                    if (*ucp == 1) {
+                        inst.src1.op_type = d.OP_IMM;
+                        inst.src1.imm = off;
+                        let is *d.IRInst as scan with mut = func.instructions;
+                        while (cast(i64, scan) != 0) {
+                            if (scan.is_dead == 0 && scan.op == d.IR_ADDR && scan.dest.vreg == av) {
+                                scan.is_dead = 1;
+                            }
+                            scan = scan.next;
+                        }
+                    }
+                }
+            }
+        }
+        inst = inst.next;
+    }
+    mem.gfree(cast(*u8, use_count));
+    mem.gfree(cast(*u8, addr_offset));
+
+    // === Pass 1.5: Fold constants into instruction operands ===
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as fop = inst.op;
+            // Fold src2 constant into immediate for binary ops and comparisons
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as s2v = inst.src2.vreg;
+                let is *i32 as c2p = cast(*i32, cast(i64, is_const) + cast(i64, s2v) * 4);
+                if (*c2p == 1) {
+                    let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                    let is i64 as v2 = *v2p;
+                    if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        if (fop == d.IR_ADD || fop == d.IR_SUB || fop == d.IR_MUL ||
+                            fop == d.IR_AND || fop == d.IR_OR || fop == d.IR_XOR ||
+                            fop == d.IR_EQ || fop == d.IR_NE ||
+                            fop == d.IR_LT || fop == d.IR_LE ||
+                            fop == d.IR_GT || fop == d.IR_GE) {
+                            inst.src2.op_type = d.OP_IMM;
+                            inst.src2.imm = v2;
+                        }
+                    }
+                    // DIV/MOD: fold constant divisor so codegen can optimize
+                    if (fop == d.IR_DIV || fop == d.IR_MOD) {
+                        inst.src2.op_type = d.OP_IMM;
+                        inst.src2.imm = v2;
+                    }
+                    // SHL/SHR: only fold if shift count fits in 0-63
+                    if ((fop == d.IR_SHL || fop == d.IR_SHR) && v2 >= 0 && v2 <= 63) {
+                        inst.src2.op_type = d.OP_IMM;
+                        inst.src2.imm = v2;
+                    }
+                }
+            }
+        }
+        inst = inst.next;
+    }
+
+    // === Pass 2: DCE (backward scan) ===
+
+    // Count instructions
+    let is i32 as inst_count with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        inst_count = inst_count + 1;
+        inst = inst.next;
+    }
+
+    if (inst_count == 0) {
+        mem.gfree(cast(*u8, is_const));
+        mem.gfree(cast(*u8, imm_val));
+        mem.gfree(cast(*u8, copy_of));
+        return;
+    }
+
+    // Build array of instruction pointers (forward scan)
+    let is *i64 as inst_arr = cast(*i64, mem.galloc(cast(i64, inst_count) * 8));
+    let is i32 as idx with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        let is *i64 as ap = cast(*i64, cast(i64, inst_arr) + cast(i64, idx) * 8);
+        *ap = cast(i64, inst);
+        idx = idx + 1;
+        inst = inst.next;
+    }
+
+    // Allocate used[] array
+    let is *i32 as used = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    i = 0;
+    while (i < vc) {
+        let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, i) * 4);
+        *up = 0;
+        i = i + 1;
+    }
+
+    // Backward scan
+    idx = inst_count - 1;
+    while (idx >= 0) {
+        let is *i64 as ap = cast(*i64, cast(i64, inst_arr) + cast(i64, idx) * 8);
+        inst = cast(*d.IRInst, *ap);
+
+        if (inst.is_dead == 0) {
+            // Mark operand vregs as used
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.src1.vreg) * 4);
+                *up = 1;
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.src2.vreg) * 4);
+                *up = 1;
+            }
+            // For STORE/COPY, dest vreg is also a use (address), not a def
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.dest.vreg) * 4);
+                *up = 1;
+            }
+
+            // Check if dest vreg is unused (and no side effects)
+            if (inst.dest.op_type == d.OP_VREG && has_side_effects(inst.op) == 0) {
+                let is i32 as dv = inst.dest.vreg;
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, dv) * 4);
+                if (*up == 0) {
+                    inst.is_dead = 1;
+                }
+            }
+        }
+        idx = idx - 1;
+    }
+
+    // === Pass 3: Final resolve (forward) ===
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is i32 as r1 = resolve(copy_of, inst.src1.vreg);
+                inst.src1.vreg = r1;
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as r2 = resolve(copy_of, inst.src2.vreg);
+                inst.src2.vreg = r2;
+            }
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
+                inst.dest.vreg = rd;
+            }
+        }
+        inst = inst.next;
+    }
+
+    // Cleanup
+    mem.gfree(cast(*u8, inst_arr));
+    mem.gfree(cast(*u8, used));
+    mem.gfree(cast(*u8, is_const));
+    mem.gfree(cast(*u8, imm_val));
+    mem.gfree(cast(*u8, copy_of));
+}
+
+// === Entry point ===
+
+fn optimize(prog as *u8) as void {
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    let is *d.IRFunction as func with mut = p.functions;
+    while (cast(i64, func) != 0) {
+        if (func.is_reachable == 1) {
+            optimize_func(func);
+        }
+        func = func.next;
+    }
+}
