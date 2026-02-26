@@ -26,6 +26,7 @@ struct AllocCtx {
     va_save_offset as i32;
     call_positions as *i32;
     call_count as i32;
+    active_idx as *i32;
 }
 
 let is i32 as INT_MAX with imut = 2147483647;
@@ -176,39 +177,89 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         }
         i = i + 1;
     }
-    // Insertion sort by start position
-    i = 1;
-    while (i < vc) {
-        let is LiveInterval as key;
-        mem.memcpy(cast(*u8, &key), cast(*u8, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval)), sizeof(LiveInterval));
-        let is i32 as j with mut = i - 1;
-        let is i32 as sort_done with mut = 0;
-        while (j >= 0 && sort_done == 0) {
-            let is *LiveInterval as jv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, j) * sizeof(LiveInterval));
-            if (jv.start > key.start || (jv.start == key.start && jv.end_pos > key.end_pos)) {
-                // Move j to j+1
-                let is *LiveInterval as jv1 = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, j + 1) * sizeof(LiveInterval));
-                mem.memcpy(cast(*u8, jv1), cast(*u8, jv), sizeof(LiveInterval));
-                j = j - 1;
-            } else {
-                sort_done = 1;
-            }
+    // Merge sort by start position
+    if (vc > 1) {
+        let is *LiveInterval as tmp = cast(*LiveInterval, mem.galloc(cast(i64, vc) * sizeof(LiveInterval)));
+        merge_sort(ctx.intervals, tmp, 0, vc - 1);
+        mem.gfree(cast(*u8, tmp));
+    }
+}
+
+fn merge_sort(arr as *LiveInterval, tmp as *LiveInterval, lo as i32, hi as i32) as void {
+    if (lo >= hi) { return; }
+    let is i32 as mid = lo + (hi - lo) / 2;
+    merge_sort(arr, tmp, lo, mid);
+    merge_sort(arr, tmp, mid + 1, hi);
+    let is i32 as i with mut = lo;
+    let is i32 as j with mut = mid + 1;
+    let is i32 as k with mut = lo;
+    while (i <= mid && j <= hi) {
+        let is *LiveInterval as a = cast(*LiveInterval, cast(i64, arr) + cast(i64, i) * sizeof(LiveInterval));
+        let is *LiveInterval as b = cast(*LiveInterval, cast(i64, arr) + cast(i64, j) * sizeof(LiveInterval));
+        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, tmp) + cast(i64, k) * sizeof(LiveInterval));
+        if (a.start < b.start || (a.start == b.start && a.end_pos <= b.end_pos)) {
+            mem.memcpy(cast(*u8, dst), cast(*u8, a), sizeof(LiveInterval));
+            i = i + 1;
+        } else {
+            mem.memcpy(cast(*u8, dst), cast(*u8, b), sizeof(LiveInterval));
+            j = j + 1;
         }
-        let is i32 as ins_pos = j + 1;
-        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ins_pos) * sizeof(LiveInterval));
-        mem.memcpy(cast(*u8, dst), cast(*u8, &key), sizeof(LiveInterval));
+        k = k + 1;
+    }
+    while (i <= mid) {
+        let is *LiveInterval as src = cast(*LiveInterval, cast(i64, arr) + cast(i64, i) * sizeof(LiveInterval));
+        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, tmp) + cast(i64, k) * sizeof(LiveInterval));
+        mem.memcpy(cast(*u8, dst), cast(*u8, src), sizeof(LiveInterval));
+        i = i + 1;
+        k = k + 1;
+    }
+    while (j <= hi) {
+        let is *LiveInterval as src = cast(*LiveInterval, cast(i64, arr) + cast(i64, j) * sizeof(LiveInterval));
+        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, tmp) + cast(i64, k) * sizeof(LiveInterval));
+        mem.memcpy(cast(*u8, dst), cast(*u8, src), sizeof(LiveInterval));
+        j = j + 1;
+        k = k + 1;
+    }
+    i = lo;
+    while (i <= hi) {
+        let is *LiveInterval as src = cast(*LiveInterval, cast(i64, tmp) + cast(i64, i) * sizeof(LiveInterval));
+        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, arr) + cast(i64, i) * sizeof(LiveInterval));
+        mem.memcpy(cast(*u8, dst), cast(*u8, src), sizeof(LiveInterval));
         i = i + 1;
     }
 }
 
-// Check if interval [start, end] spans any call position
+// Map physical register to active_idx slot (0-6)
+fn reg_to_slot(reg as i32) as i32 {
+    if (reg == 3) { return 0; }
+    if (reg == 10) { return 1; }
+    if (reg == 11) { return 2; }
+    if (reg == 12) { return 3; }
+    if (reg == 6) { return 4; }
+    if (reg == 7) { return 5; }
+    if (reg == 8) { return 6; }
+    return cast(i32, 0 - 1);
+}
+
+// Check if interval [start, end] spans any call position (binary search)
 fn spans_call(start as i32, end_pos as i32, ctx as *AllocCtx) as i32 {
-    let is i32 as ci with mut = 0;
-    while (ci < ctx.call_count) {
-        let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
-        let is i32 as cpos = *cp;
-        if (cpos >= start && cpos <= end_pos) { return 1; }
-        ci = ci + 1;
+    if (ctx.call_count == 0) { return 0; }
+    let is i32 as lo with mut = 0;
+    let is i32 as hi with mut = ctx.call_count - 1;
+    let is i32 as result with mut = ctx.call_count;
+    while (lo <= hi) {
+        let is i32 as mid = lo + (hi - lo) / 2;
+        let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, mid) * 4);
+        if (*cp >= start) {
+            result = mid;
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    if (result < ctx.call_count) {
+        let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, result) * 4);
+        if (*cp <= end_pos) { return 1; }
     }
     return 0;
 }
@@ -225,7 +276,6 @@ fn is_caller_saved(reg as i32) as i32 {
 // r15 reserved as scratch
 
 fn find_free_reg(ctx as *AllocCtx, pos as i32, iv_end as i32) as i32 {
-    // Try callee-saved first, then caller-saved
     let is [7]i32 as allowed;
     allowed[0] = 3;
     allowed[1] = 10;
@@ -241,60 +291,60 @@ fn find_free_reg(ctx as *AllocCtx, pos as i32, iv_end as i32) as i32 {
         if (crosses_call == 1 && is_caller_saved(ri) == 1) {
             ki = ki + 1;
         } else {
-        let is i32 as in_use with mut = 0;
-        let is i32 as ii with mut = 0;
-        while (ii < ctx.count) {
-            let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ii) * sizeof(LiveInterval));
-            if (iv.reg == ri && iv.end_pos >= pos && iv.start <= pos) {
-                in_use = 1;
+            let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ki) * 4);
+            let is i32 as ai = *ap;
+            if (ai < 0) { return ri; }
+            let is *LiveInterval as aiv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ai) * sizeof(LiveInterval));
+            if (aiv.end_pos < pos) {
+                *ap = cast(i32, 0 - 1);
+                return ri;
             }
-            ii = ii + 1;
-        }
-        if (in_use == 0) { return ri; }
-        ki = ki + 1;
+            ki = ki + 1;
         }
     }
     return cast(i32, 0 - 1);
 }
 
 fn spill_register(ctx as *AllocCtx, pos as i32) as i32 {
-    let is i32 as victim_reg with mut = cast(i32, 0 - 1);
-    let is i32 as victim_idx with mut = cast(i32, 0 - 1);
-    let is i32 as max_end with mut = cast(i32, 0 - 1);
     let is [7]i32 as allowed;
     allowed[0] = 3;
-    allowed[1] = 6;
-    allowed[2] = 7;
-    allowed[3] = 8;
-    allowed[4] = 10;
-    allowed[5] = 11;
-    allowed[6] = 12;
+    allowed[1] = 10;
+    allowed[2] = 11;
+    allowed[3] = 12;
+    allowed[4] = 6;
+    allowed[5] = 7;
+    allowed[6] = 8;
+    let is i32 as victim_slot with mut = cast(i32, 0 - 1);
+    let is i32 as min_cost with mut = INT_MAX;
+    let is i32 as max_end with mut = cast(i32, 0 - 1);
     let is i32 as ki with mut = 0;
     while (ki < 7) {
-        let is i32 as ri = allowed[ki];
-        let is i32 as ii with mut = 0;
-        while (ii < ctx.count) {
-            let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ii) * sizeof(LiveInterval));
-            if (iv.reg == ri && iv.end_pos >= pos) {
-                if (iv.end_pos > max_end) {
-                    max_end = iv.end_pos;
-                    victim_reg = ri;
-                    victim_idx = ii;
+        let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ki) * 4);
+        let is i32 as ai = *ap;
+        if (ai >= 0) {
+            let is *LiveInterval as aiv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ai) * sizeof(LiveInterval));
+            if (aiv.end_pos >= pos) {
+                if (aiv.spill_cost < min_cost || (aiv.spill_cost == min_cost && aiv.end_pos > max_end)) {
+                    min_cost = aiv.spill_cost;
+                    max_end = aiv.end_pos;
+                    victim_slot = ki;
                 }
             }
-            ii = ii + 1;
         }
         ki = ki + 1;
     }
-    if (victim_idx >= 0) {
-        let is *LiveInterval as viv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, victim_idx) * sizeof(LiveInterval));
+    if (victim_slot >= 0) {
+        let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, victim_slot) * 4);
+        let is i32 as ai = *ap;
+        let is *LiveInterval as viv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ai) * sizeof(LiveInterval));
         let is i32 as v = viv.vreg;
         let is i32 as spill = ctx.next_spill;
         ctx.next_spill = ctx.next_spill + 1;
         let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, v) * 4);
         *vp = 0 - spill;
         viv.reg = cast(i32, 0 - 1);
-        return victim_reg;
+        *ap = cast(i32, 0 - 1);
+        return allowed[victim_slot];
     }
     return cast(i32, 0 - 1);
 }
@@ -308,11 +358,31 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
         *vp = cast(i32, 0 - 1000);
         i = i + 1;
     }
+    // Init active set
+    ctx.active_idx = cast(*i32, mem.galloc(7 * 4));
+    let is i32 as ai with mut = 0;
+    while (ai < 7) {
+        let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ai) * 4);
+        *ap = cast(i32, 0 - 1);
+        ai = ai + 1;
+    }
     i = 0;
     while (i < ctx.count) {
         let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval));
         if (iv.start == INT_MAX) { i = i + 1; }
         else {
+            // Expire active intervals that ended before current start
+            let is i32 as ei with mut = 0;
+            while (ei < 7) {
+                let is *i32 as ep = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ei) * 4);
+                if (*ep >= 0) {
+                    let is *LiveInterval as eiv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, *ep) * sizeof(LiveInterval));
+                    if (eiv.end_pos < iv.start) {
+                        *ep = cast(i32, 0 - 1);
+                    }
+                }
+                ei = ei + 1;
+            }
             let is i32 as reg with mut = find_free_reg(ctx, iv.start, iv.end_pos);
             if (reg == cast(i32, 0 - 1)) {
                 reg = spill_register(ctx, iv.start);
@@ -321,6 +391,12 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
                 iv.reg = reg;
                 let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, iv.vreg) * 4);
                 *vp = reg;
+                // Update active set
+                let is i32 as slot = reg_to_slot(reg);
+                if (slot >= 0) {
+                    let is *i32 as sp = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, slot) * 4);
+                    *sp = i;
+                }
             } else {
                 let is i32 as spill = ctx.next_spill;
                 ctx.next_spill = ctx.next_spill + 1;
