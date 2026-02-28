@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="caua-oliveira/caustic"
+REPO="Caua726/Caustic"
 TARBALL="caustic-x86_64-linux.tar.gz"
 
 # --- detect arch ---
@@ -34,7 +34,7 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "downloading latest release ..."
-curl -sL "https://github.com/$REPO/releases/latest/download/$TARBALL" -o "$TMPDIR/$TARBALL"
+curl -fsSL "https://github.com/$REPO/releases/latest/download/$TARBALL" -o "$TMPDIR/$TARBALL"
 
 # --- extract ---
 echo "extracting ..."
