@@ -1,5 +1,6 @@
 use "../../std/mem.cst" as mem;
 use "defs.cst" as d;
+use "ssa.cst" as ssa;
 
 // === Helpers ===
 
@@ -50,17 +51,21 @@ fn has_side_effects(op as i32) as i32 {
 // === optimize_func ===
 
 fn optimize_func(func as *d.IRFunction) as void {
-    let is i32 as vc = func.vreg_count;
+    // SSA mem2reg (before ADDR fusion — only promotes vars already using IMM offsets)
+    ssa.mem2reg(func);
+
+    let is i32 as vc with mut = func.vreg_count;
     if (vc == 0) { return; }
 
-    // Allocate tracking arrays
-    let is *i32 as is_const = cast(*i32, mem.galloc(cast(i64, vc) * 4));
-    let is *i64 as imm_val = cast(*i64, mem.galloc(cast(i64, vc) * 8));
-    let is *i32 as copy_of = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    // Allocate tracking arrays (+512 headroom for mem2reg vregs added later)
+    let is i32 as vc_alloc = vc + 512;
+    let is *i32 as is_const = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
+    let is *i64 as imm_val = cast(*i64, mem.galloc(cast(i64, vc_alloc) * 8));
+    let is *i32 as copy_of = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
 
     // Init
     let is i32 as i with mut = 0;
-    while (i < vc) {
+    while (i < vc_alloc) {
         let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, i) * 4);
         *cp = 0;
         let is *i64 as ip = cast(*i64, cast(i64, imm_val) + cast(i64, i) * 8);
@@ -467,6 +472,112 @@ fn optimize_func(func as *d.IRFunction) as void {
     }
     mem.gfree(cast(*u8, use_count));
     mem.gfree(cast(*u8, addr_offset));
+
+    // === Pass 1.2: Store-Load Forwarding ===
+    // Within basic blocks, eliminate redundant loads from stack slots.
+    // If we load from [rbp-X] and later load from [rbp-X] again (with no
+    // intervening store to X), reuse the first loaded vreg.
+    let is [64]i64 as slf_offsets;
+    let is [64]i32 as slf_vregs;
+    let is i32 as slf_count with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as sop = inst.op;
+            // Invalidate at labels, calls, and indirect stores (may alias stack slots)
+            if (sop == d.IR_LABEL || sop == d.IR_CALL || sop == d.IR_SYSCALL) {
+                slf_count = 0;
+            }
+            else if (sop == d.IR_STORE && inst.dest.op_type == d.OP_VREG) {
+                // Indirect store through pointer: may write to any stack slot
+                slf_count = 0;
+            }
+            else if (sop == d.IR_COPY) {
+                // Memory copy: may overwrite stack slots
+                slf_count = 0;
+            }
+            else if (sop == d.IR_STORE && inst.dest.op_type == d.OP_IMM && inst.src1.op_type == d.OP_VREG) {
+                // Store to stack slot: only track 8-byte stores (i32 truncates, unsafe to forward)
+                let is i32 as st_sz with mut = 8;
+                if (cast(i64, inst.cast_to) != 0) {
+                    let is *i32 as stzp = cast(*i32, cast(i64, inst.cast_to) + 28);
+                    st_sz = *stzp;
+                }
+                if (st_sz == 8) {
+                    let is i64 as off = inst.dest.imm;
+                    let is i32 as sv = inst.src1.vreg;
+                    let is i32 as found with mut = 0;
+                    let is i32 as si with mut = 0;
+                    while (si < slf_count) {
+                        if (slf_offsets[si] == off) { slf_vregs[si] = sv; found = 1; si = slf_count; }
+                        si = si + 1;
+                    }
+                    if (found == 0 && slf_count < 64) {
+                        slf_offsets[slf_count] = off;
+                        slf_vregs[slf_count] = sv;
+                        slf_count = slf_count + 1;
+                    }
+                } else {
+                    // Partial-width store: invalidate any existing entry for this offset
+                    let is i64 as off = inst.dest.imm;
+                    let is i32 as si with mut = 0;
+                    while (si < slf_count) {
+                        if (slf_offsets[si] == off) {
+                            slf_offsets[si] = slf_offsets[slf_count - 1];
+                            slf_vregs[si] = slf_vregs[slf_count - 1];
+                            slf_count = slf_count - 1;
+                            si = slf_count;
+                        }
+                        si = si + 1;
+                    }
+                }
+            }
+            else if (sop == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) {
+                // Load from stack slot: only forward 8-byte loads (i32 needs sign extension)
+                let is i32 as ld_sz with mut = 8;
+                if (cast(i64, inst.cast_to) != 0) {
+                    let is *i32 as ldzp = cast(*i32, cast(i64, inst.cast_to) + 28);
+                    ld_sz = *ldzp;
+                }
+                if (ld_sz == 8) {
+                // Check if we have a forwarded value
+                let is i64 as off = inst.src1.imm;
+                let is i32 as si with mut = 0;
+                let is i32 as fwd with mut = 0;
+                while (si < slf_count) {
+                    if (slf_offsets[si] == off) {
+                        // Forward: replace load with MOV from tracked vreg
+                        inst.op = d.IR_MOV;
+                        inst.src1.op_type = d.OP_VREG;
+                        inst.src1.vreg = slf_vregs[si];
+                        fwd = 1;
+                        si = slf_count;
+                    }
+                    si = si + 1;
+                }
+                if (fwd == 0) {
+                    // First load of this offset: track the loaded vreg
+                    let is i32 as dv = inst.dest.vreg;
+                    if (slf_count < 64) {
+                        let is i32 as found2 with mut = 0;
+                        si = 0;
+                        while (si < slf_count) {
+                            if (slf_offsets[si] == off) { slf_vregs[si] = dv; found2 = 1; si = slf_count; }
+                            si = si + 1;
+                        }
+                        if (found2 == 0) {
+                            slf_offsets[slf_count] = off;
+                            slf_vregs[slf_count] = dv;
+                            slf_count = slf_count + 1;
+                        }
+                    }
+                }
+                } // end ld_sz == 8
+            }
+        }
+        inst = inst.next;
+    }
+
 
     // === Pass 1.5: Fold constants into instruction operands ===
     inst = func.instructions;

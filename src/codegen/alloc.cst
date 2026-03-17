@@ -275,7 +275,24 @@ fn is_caller_saved(reg as i32) as i32 {
 // Caller-saved regs (only between calls): r8(6), r9(7), r10(8)
 // r15 reserved as scratch
 
-fn find_free_reg(ctx as *AllocCtx, pos as i32, iv_end as i32) as i32 {
+fn find_free_reg(ctx as *AllocCtx, pos as i32, iv_end as i32, hint as i32) as i32 {
+    // Try hint register first (for coalescing MOVs)
+    if (hint >= 0) {
+        let is i32 as hs = reg_to_slot(hint);
+        if (hs >= 0) {
+            let is i32 as crosses_call = spans_call(pos, iv_end, ctx);
+            if (crosses_call == 0 || is_caller_saved(hint) == 0) {
+                let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, hs) * 4);
+                let is i32 as ai = *ap;
+                if (ai < 0) { return hint; }
+                let is *LiveInterval as aiv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ai) * sizeof(LiveInterval));
+                if (aiv.end_pos < pos) {
+                    *ap = cast(i32, 0 - 1);
+                    return hint;
+                }
+            }
+        }
+    }
     let is [7]i32 as allowed;
     allowed[0] = 3;
     allowed[1] = 10;
@@ -358,6 +375,28 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
         *vp = cast(i32, 0 - 1000);
         i = i + 1;
     }
+    // Build coalesce hints from IR_MOV: mov_partner[vreg] = partner vreg
+    let is *i32 as mov_partner = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    i = 0;
+    while (i < vc) {
+        let is *i32 as mp = cast(*i32, cast(i64, mov_partner) + cast(i64, i) * 4);
+        *mp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+    let is *d.IRInst as minst with mut = func.instructions;
+    while (cast(i64, minst) != 0) {
+        if (minst.is_dead == 0 && minst.op == d.IR_MOV && minst.src1.op_type == d.OP_VREG && minst.dest.op_type == d.OP_VREG) {
+            let is i32 as vd = minst.dest.vreg;
+            let is i32 as vs = minst.src1.vreg;
+            if (vd < vc && vs < vc) {
+                let is *i32 as pd = cast(*i32, cast(i64, mov_partner) + cast(i64, vd) * 4);
+                if (*pd < 0) { *pd = vs; }
+                let is *i32 as ps = cast(*i32, cast(i64, mov_partner) + cast(i64, vs) * 4);
+                if (*ps < 0) { *ps = vd; }
+            }
+        }
+        minst = minst.next;
+    }
     // Init active set
     ctx.active_idx = cast(*i32, mem.galloc(7 * 4));
     let is i32 as ai with mut = 0;
@@ -383,7 +422,15 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
                 }
                 ei = ei + 1;
             }
-            let is i32 as reg with mut = find_free_reg(ctx, iv.start, iv.end_pos);
+            // Compute coalesce hint
+            let is i32 as hint with mut = cast(i32, 0 - 1);
+            let is *i32 as mp = cast(*i32, cast(i64, mov_partner) + cast(i64, iv.vreg) * 4);
+            let is i32 as partner = *mp;
+            if (partner >= 0) {
+                let is *i32 as ploc = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, partner) * 4);
+                if (*ploc >= 0) { hint = *ploc; }
+            }
+            let is i32 as reg with mut = find_free_reg(ctx, iv.start, iv.end_pos, hint);
             if (reg == cast(i32, 0 - 1)) {
                 reg = spill_register(ctx, iv.start);
             }
@@ -408,6 +455,7 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
         }
     }
     ctx.stack_slots = ctx.next_spill - 1;
+    mem.gfree(cast(*u8, mov_partner));
 }
 
 // === get_operand_loc ===
