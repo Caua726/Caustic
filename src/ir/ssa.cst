@@ -1,24 +1,13 @@
 use "../../std/mem.cst" as mem;
 use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "dom.cst" as dom;
 
 // === SSA mem2reg pass ===
 // Promotes scalar stack variables (accessed via IR_LOAD/IR_STORE with IMM offsets)
 // to SSA vregs with phi nodes, then destructs SSA back to conventional form.
 
-let is i32 as MAX_BLOCKS with imut = 4096;
 let is i32 as MAX_SLOTS with imut = 256;
-
-// === Helper: insert instruction after target in linked list ===
-fn insert_after(target as *d.IRInst, newinst as *d.IRInst) as void {
-    newinst.next = target.next;
-    target.next = newinst;
-}
-
-// === Helper: insert instruction before target (need prev) ===
-fn insert_before(prev as *d.IRInst, target as *d.IRInst, newinst as *d.IRInst) as void {
-    newinst.next = target;
-    prev.next = newinst;
-}
 
 // === Step 0: Find promotable stack slots ===
 
@@ -105,429 +94,11 @@ fn slot_index(slots as *SlotInfo, count as i32, off as i64) as i32 {
     return cast(i32, 0 - 1);
 }
 
-// === Step 1: Build CFG ===
-
-struct BasicBlock {
-    first as *d.IRInst;
-    last as *d.IRInst;
-    succ0 as i32;       // fallthrough (-1 = none)
-    succ1 as i32;       // branch target (-1 = none)
-    idom as i32;
-    rpo as i32;          // reverse postorder number
-    df_start as i32;
-    df_count as i32;
-    pred_start as i32;
-    pred_count as i32;
-}
-
-fn build_cfg(func as *d.IRFunction, blocks as *BasicBlock, out_nblocks as *i32,
-             label_to_bb as *i32) as void {
-    // First pass: identify block starts (label targets + after branches)
-    let is i32 as nblocks with mut = 0;
-    let is i32 as lc = func.label_count + 1;
-
-    // Mark which positions start new blocks
-    // Use instruction index → block mapping
-    let is i32 as inst_count with mut = 0;
-    let is *d.IRInst as inst with mut = func.instructions;
-    while (cast(i64, inst) != 0) { inst_count = inst_count + 1; inst = inst.next; }
-
-    let is *i32 as inst_is_leader = cast(*i32, mem.galloc(cast(i64, inst_count + 1) * 4));
-    let is i32 as ii with mut = 0;
-    while (ii <= inst_count) {
-        let is *i32 as p = cast(*i32, cast(i64, inst_is_leader) + cast(i64, ii) * 4);
-        *p = 0;
-        ii = ii + 1;
-    }
-
-    // First instruction is always a leader
-    let is *i32 as p0 = cast(*i32, cast(i64, inst_is_leader));
-    *p0 = 1;
-
-    // Labels are leaders; instructions after branches are leaders
-    ii = 0;
-    inst = func.instructions;
-    while (cast(i64, inst) != 0) {
-        if (inst.op == d.IR_LABEL) {
-            let is *i32 as p = cast(*i32, cast(i64, inst_is_leader) + cast(i64, ii) * 4);
-            *p = 1;
-        }
-        if (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ || inst.op == d.IR_RET) {
-            if (ii + 1 < inst_count) {
-                let is *i32 as p = cast(*i32, cast(i64, inst_is_leader) + cast(i64, ii + 1) * 4);
-                *p = 1;
-            }
-        }
-        ii = ii + 1;
-        inst = inst.next;
-    }
-
-    // Build block array
-    let is *i32 as inst_to_bb = cast(*i32, mem.galloc(cast(i64, inst_count) * 4));
-    ii = 0;
-    inst = func.instructions;
-    let is i32 as cur_block with mut = cast(i32, 0 - 1);
-    while (cast(i64, inst) != 0) {
-        let is *i32 as lp = cast(*i32, cast(i64, inst_is_leader) + cast(i64, ii) * 4);
-        if (*lp == 1) {
-            cur_block = cur_block + 1;
-            if (cur_block < MAX_BLOCKS) {
-                let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, cur_block) * sizeof(BasicBlock));
-                bb.first = inst;
-                bb.last = inst;
-                bb.succ0 = cast(i32, 0 - 1);
-                bb.succ1 = cast(i32, 0 - 1);
-                bb.idom = cast(i32, 0 - 1);
-                bb.rpo = cast(i32, 0 - 1);
-                bb.df_start = 0;
-                bb.df_count = 0;
-                bb.pred_start = 0;
-                bb.pred_count = 0;
-            }
-        }
-        if (cur_block >= 0 && cur_block < MAX_BLOCKS) {
-            let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, cur_block) * sizeof(BasicBlock));
-            bb.last = inst;
-            // Map label → block
-            if (inst.op == d.IR_LABEL) {
-                let is i32 as lid = inst.dest.label;
-                if (lid < lc) {
-                    let is *i32 as lbp = cast(*i32, cast(i64, label_to_bb) + cast(i64, lid) * 4);
-                    *lbp = cur_block;
-                }
-            }
-        }
-        let is *i32 as ibp = cast(*i32, cast(i64, inst_to_bb) + cast(i64, ii) * 4);
-        *ibp = cur_block;
-        ii = ii + 1;
-        inst = inst.next;
-    }
-    nblocks = cur_block + 1;
-
-    // Set successors from terminators
-    ii = 0;
-    while (ii < nblocks) {
-        let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, ii) * sizeof(BasicBlock));
-        let is *d.IRInst as last = bb.last;
-        if (last.op == d.IR_JMP) {
-            let is *i32 as lbp = cast(*i32, cast(i64, label_to_bb) + cast(i64, last.dest.label) * 4);
-            bb.succ0 = *lbp;
-        } else if (last.op == d.IR_JZ || last.op == d.IR_JNZ) {
-            // Fallthrough
-            if (ii + 1 < nblocks) { bb.succ0 = ii + 1; }
-            // Branch target
-            let is *i32 as lbp = cast(*i32, cast(i64, label_to_bb) + cast(i64, last.dest.label) * 4);
-            bb.succ1 = *lbp;
-        } else if (last.op == d.IR_RET) {
-            // No successors
-        } else {
-            // Fallthrough
-            if (ii + 1 < nblocks) { bb.succ0 = ii + 1; }
-        }
-        ii = ii + 1;
-    }
-
-    mem.gfree(cast(*u8, inst_is_leader));
-    mem.gfree(cast(*u8, inst_to_bb));
-    *out_nblocks = nblocks;
-}
-
-// === Step 2: Compute dominance (Cooper-Harvey-Kennedy) ===
-
-fn compute_rpo(blocks as *BasicBlock, nblocks as i32, rpo_order as *i32, out_rpo_count as *i32) as void {
-    // Iterative DFS to compute reverse postorder
-    let is *i32 as visited = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
-    let is *i32 as stack = cast(*i32, mem.galloc(cast(i64, nblocks * 2 + 4) * 4));
-    let is *i32 as stack_state = cast(*i32, mem.galloc(cast(i64, nblocks * 2 + 4) * 4));
-    let is i32 as bi with mut = 0;
-    while (bi < nblocks) {
-        let is *i32 as vp = cast(*i32, cast(i64, visited) + cast(i64, bi) * 4);
-        *vp = 0;
-        bi = bi + 1;
-    }
-
-    let is i32 as sp with mut = 0;
-    let is i32 as rpo_idx with mut = nblocks;
-
-    // Push entry block
-    let is *i32 as sp0 = cast(*i32, cast(i64, stack));
-    *sp0 = 0;
-    let is *i32 as ss0 = cast(*i32, cast(i64, stack_state));
-    *ss0 = 0;
-    let is *i32 as v0 = cast(*i32, cast(i64, visited));
-    *v0 = 1;
-    sp = 1;
-
-    while (sp > 0) {
-        let is i32 as top = sp - 1;
-        let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, top) * 4);
-        let is i32 as b = *stp;
-        let is *i32 as ssp = cast(*i32, cast(i64, stack_state) + cast(i64, top) * 4);
-        let is i32 as state = *ssp;
-
-        let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(BasicBlock));
-
-        if (state == 0) {
-            // Push successors
-            *ssp = 1;
-            if (bb.succ1 >= 0) {
-                let is *i32 as vp = cast(*i32, cast(i64, visited) + cast(i64, bb.succ1) * 4);
-                if (*vp == 0) {
-                    *vp = 1;
-                    let is *i32 as nsp = cast(*i32, cast(i64, stack) + cast(i64, sp) * 4);
-                    *nsp = bb.succ1;
-                    let is *i32 as nss = cast(*i32, cast(i64, stack_state) + cast(i64, sp) * 4);
-                    *nss = 0;
-                    sp = sp + 1;
-                }
-            }
-            if (bb.succ0 >= 0) {
-                let is *i32 as vp = cast(*i32, cast(i64, visited) + cast(i64, bb.succ0) * 4);
-                if (*vp == 0) {
-                    *vp = 1;
-                    let is *i32 as nsp = cast(*i32, cast(i64, stack) + cast(i64, sp) * 4);
-                    *nsp = bb.succ0;
-                    let is *i32 as nss = cast(*i32, cast(i64, stack_state) + cast(i64, sp) * 4);
-                    *nss = 0;
-                    sp = sp + 1;
-                }
-            }
-        } else {
-            // Post-visit: assign RPO number
-            rpo_idx = rpo_idx - 1;
-            bb.rpo = rpo_idx;
-            let is *i32 as rp = cast(*i32, cast(i64, rpo_order) + cast(i64, rpo_idx) * 4);
-            *rp = b;
-            sp = sp - 1;
-        }
-    }
-
-    *out_rpo_count = nblocks - rpo_idx;
-    // Shift rpo_order to start at 0 if needed
-    if (rpo_idx > 0) {
-        let is i32 as ri with mut = 0;
-        while (ri < nblocks - rpo_idx) {
-            let is *i32 as dst = cast(*i32, cast(i64, rpo_order) + cast(i64, ri) * 4);
-            let is *i32 as src = cast(*i32, cast(i64, rpo_order) + cast(i64, ri + rpo_idx) * 4);
-            *dst = *src;
-            ri = ri + 1;
-        }
-    }
-
-    mem.gfree(cast(*u8, visited));
-    mem.gfree(cast(*u8, stack));
-    mem.gfree(cast(*u8, stack_state));
-}
-
-fn compute_idom(blocks as *BasicBlock, nblocks as i32, rpo_order as *i32, rpo_count as i32,
-                preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
-    // Cooper-Harvey-Kennedy iterative dominance
-    let is *BasicBlock as entry = cast(*BasicBlock, cast(i64, blocks));
-    entry.idom = 0; // entry dominates itself
-
-    let is i32 as changed with mut = 1;
-    while (changed == 1) {
-        changed = 0;
-        let is i32 as ri with mut = 0;
-        while (ri < rpo_count) {
-            let is *i32 as rp = cast(*i32, cast(i64, rpo_order) + cast(i64, ri) * 4);
-            let is i32 as b = *rp;
-            if (b == 0) { ri = ri + 1; }
-            else {
-                let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(BasicBlock));
-                let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, b) * 4);
-                let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, b) * 4);
-                let is i32 as ps = *psp;
-                let is i32 as pc = *pcp;
-
-                // Find first processed predecessor
-                let is i32 as new_idom with mut = cast(i32, 0 - 1);
-                let is i32 as pi with mut = 0;
-                while (pi < pc) {
-                    let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, ps + pi) * 4);
-                    let is i32 as pred = *pp;
-                    let is *BasicBlock as pbb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(BasicBlock));
-                    if (pbb.idom >= 0) {
-                        new_idom = pred;
-                        pi = pc; // break
-                    }
-                    pi = pi + 1;
-                }
-
-                if (new_idom >= 0) {
-                    // Intersect with other processed predecessors
-                    pi = 0;
-                    while (pi < pc) {
-                        let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, ps + pi) * 4);
-                        let is i32 as pred = *pp;
-                        if (pred != new_idom) {
-                            let is *BasicBlock as pbb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(BasicBlock));
-                            if (pbb.idom >= 0) {
-                                // Intersect
-                                let is i32 as a with mut = new_idom;
-                                let is i32 as bv with mut = pred;
-                                while (a != bv) {
-                                    let is *BasicBlock as abb with mut = cast(*BasicBlock, cast(i64, blocks) + cast(i64, a) * sizeof(BasicBlock));
-                                    let is *BasicBlock as bbb with mut = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bv) * sizeof(BasicBlock));
-                                    while (abb.rpo > bbb.rpo) {
-                                        a = abb.idom;
-                                        abb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, a) * sizeof(BasicBlock));
-                                    }
-                                    while (bbb.rpo > abb.rpo) {
-                                        bv = bbb.idom;
-                                        bbb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bv) * sizeof(BasicBlock));
-                                    }
-                                }
-                                new_idom = a;
-                            }
-                        }
-                        pi = pi + 1;
-                    }
-
-                    if (bb.idom != new_idom) {
-                        bb.idom = new_idom;
-                        changed = 1;
-                    }
-                }
-                ri = ri + 1;
-            }
-        }
-    }
-}
-
-// === Step 3: Compute dominance frontiers ===
-
-fn compute_df(blocks as *BasicBlock, nblocks as i32,
-              preds as *i32, pred_starts as *i32, pred_counts as *i32,
-              df_out as *i32, df_starts as *i32, df_counts as *i32) as void {
-    // Count DF entries first
-    let is *i32 as df_tmp = cast(*i32, mem.galloc(cast(i64, nblocks * nblocks) * 4));
-    let is i32 as bi with mut = 0;
-    while (bi < nblocks) {
-        let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, bi) * 4);
-        *dcp = 0;
-        bi = bi + 1;
-    }
-
-    bi = 0;
-    while (bi < nblocks) {
-        let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bi) * 4);
-        if (*pcp >= 2) {
-            let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, bi) * 4);
-            let is i32 as pi with mut = 0;
-            while (pi < *pcp) {
-                let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *psp + pi) * 4);
-                let is i32 as runner with mut = *pp;
-                let is *BasicBlock as bbb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
-                while (runner != bbb.idom && runner >= 0) {
-                    // Add bi to DF[runner] if not already there
-                    let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, runner) * 4);
-                    let is i32 as already with mut = 0;
-                    let is i32 as di with mut = 0;
-                    while (di < *dcp) {
-                        let is *i32 as dp = cast(*i32, cast(i64, df_tmp) + cast(i64, runner * nblocks + di) * 4);
-                        if (*dp == bi) { already = 1; di = *dcp; }
-                        di = di + 1;
-                    }
-                    if (already == 0) {
-                        let is *i32 as dp = cast(*i32, cast(i64, df_tmp) + cast(i64, runner * nblocks + *dcp) * 4);
-                        *dp = bi;
-                        *dcp = *dcp + 1;
-                    }
-                    let is *BasicBlock as rbb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, runner) * sizeof(BasicBlock));
-                    runner = rbb.idom;
-                }
-                pi = pi + 1;
-            }
-        }
-        bi = bi + 1;
-    }
-
-    // Flatten DF into output arrays
-    let is i32 as total with mut = 0;
-    bi = 0;
-    while (bi < nblocks) {
-        let is *i32 as dsp = cast(*i32, cast(i64, df_starts) + cast(i64, bi) * 4);
-        *dsp = total;
-        let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, bi) * 4);
-        let is i32 as di with mut = 0;
-        while (di < *dcp) {
-            let is *i32 as src = cast(*i32, cast(i64, df_tmp) + cast(i64, bi * nblocks + di) * 4);
-            let is *i32 as dst = cast(*i32, cast(i64, df_out) + cast(i64, total) * 4);
-            *dst = *src;
-            total = total + 1;
-            di = di + 1;
-        }
-        bi = bi + 1;
-    }
-
-    mem.gfree(cast(*u8, df_tmp));
-}
-
-// === Build predecessor lists from successors ===
-
-fn build_preds(blocks as *BasicBlock, nblocks as i32,
-               preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
-    // Count predecessors
-    let is i32 as bi with mut = 0;
-    while (bi < nblocks) {
-        let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bi) * 4);
-        *pcp = 0;
-        bi = bi + 1;
-    }
-    bi = 0;
-    while (bi < nblocks) {
-        let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
-        if (bb.succ0 >= 0) {
-            let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bb.succ0) * 4);
-            *pcp = *pcp + 1;
-        }
-        if (bb.succ1 >= 0) {
-            let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bb.succ1) * 4);
-            *pcp = *pcp + 1;
-        }
-        bi = bi + 1;
-    }
-    // Compute starts
-    let is i32 as total with mut = 0;
-    bi = 0;
-    while (bi < nblocks) {
-        let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, bi) * 4);
-        *psp = total;
-        let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bi) * 4);
-        total = total + *pcp;
-        *pcp = 0; // reset for fill pass
-        bi = bi + 1;
-    }
-    // Fill
-    bi = 0;
-    while (bi < nblocks) {
-        let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
-        if (bb.succ0 >= 0) {
-            let is i32 as s = bb.succ0;
-            let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, s) * 4);
-            let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, s) * 4);
-            let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *psp + *pcp) * 4);
-            *pp = bi;
-            *pcp = *pcp + 1;
-        }
-        if (bb.succ1 >= 0) {
-            let is i32 as s = bb.succ1;
-            let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, s) * 4);
-            let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, s) * 4);
-            let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *psp + *pcp) * 4);
-            *pp = bi;
-            *pcp = *pcp + 1;
-        }
-        bi = bi + 1;
-    }
-}
-
 // === Step 4: Insert phi nodes ===
 // Returns count of phis inserted. phi_block[i] = block of phi i, phi_slot[i] = slot index,
 // phi_vreg[i] = dest vreg of phi, phi_args[i * max_preds + j] = arg vreg from pred j
 
-fn insert_phis(blocks as *BasicBlock, nblocks as i32,
+fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
                slots as *SlotInfo, nslots as i32,
                df_out as *i32, df_starts as *i32, df_counts as *i32,
                func as *d.IRFunction,
@@ -556,7 +127,7 @@ fn insert_phis(blocks as *BasicBlock, nblocks as i32,
             let is i32 as wl_count with mut = 0;
             let is i32 as bi with mut = 0;
             while (bi < nblocks) {
-                let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
+                let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
                 let is *d.IRInst as inst with mut = bb.first;
                 let is i32 as found with mut = 0;
                 while (cast(i64, inst) != 0 && found == 0) {
@@ -625,7 +196,7 @@ fn insert_phis(blocks as *BasicBlock, nblocks as i32,
 // === Step 5: SSA Rename ===
 // DFS over dominator tree, maintaining a definition stack per slot
 
-fn ssa_rename(blocks as *BasicBlock, nblocks as i32,
+fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
               slots as *SlotInfo, nslots as i32,
               func as *d.IRFunction,
               phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
@@ -654,7 +225,7 @@ fn ssa_rename(blocks as *BasicBlock, nblocks as i32,
     }
     bi = 1; // skip entry
     while (bi < nblocks) {
-        let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
         if (bb.idom >= 0) {
             let is *i32 as dcp = cast(*i32, cast(i64, dom_child_count) + cast(i64, bb.idom) * 4);
             *dcp = *dcp + 1;
@@ -673,7 +244,7 @@ fn ssa_rename(blocks as *BasicBlock, nblocks as i32,
     }
     bi = 1;
     while (bi < nblocks) {
-        let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
         if (bb.idom >= 0) {
             let is i32 as par = bb.idom;
             let is *i32 as dsp = cast(*i32, cast(i64, dom_child_start) + cast(i64, par) * 4);
@@ -734,7 +305,7 @@ fn ssa_rename(blocks as *BasicBlock, nblocks as i32,
             }
 
             // Process instructions in block
-            let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(BasicBlock));
+            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
             let is *d.IRInst as inst with mut = bb.first;
             let is i32 as done with mut = 0;
             while (done == 0) {
@@ -897,7 +468,7 @@ fn ssa_rename(blocks as *BasicBlock, nblocks as i32,
 
 // === Step 6: SSA Destruction — resolve phis to copies ===
 
-fn destroy_ssa(blocks as *BasicBlock, nblocks as i32,
+fn destroy_ssa(blocks as *cfg.BasicBlock, nblocks as i32,
                func as *d.IRFunction,
                phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
                phi_args as *i32, max_preds as i32, nphi as i32,
@@ -921,7 +492,7 @@ fn destroy_ssa(blocks as *BasicBlock, nblocks as i32,
                 // Insert MOV phi_dst = arg_vreg before terminator of predecessor
                 let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *psp + ai) * 4);
                 let is i32 as pred = *pp;
-                let is *BasicBlock as pbb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(BasicBlock));
+                let is *cfg.BasicBlock as pbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(cfg.BasicBlock));
 
                 let is *d.IRInst as mov = d.new_inst(d.IR_MOV);
                 mov.dest.op_type = d.OP_VREG;
@@ -951,11 +522,11 @@ fn destroy_ssa(blocks as *BasicBlock, nblocks as i32,
                         }
                     } else {
                         while (cast(i64, prev.next) != cast(i64, term)) { prev = prev.next; }
-                        insert_after(prev, mov);
+                        cfg.insert_after(prev, mov);
                     }
                 } else {
                     // No terminator branch — insert after last instruction
-                    insert_after(term, mov);
+                    cfg.insert_after(term, mov);
                 }
             }
             ai = ai + 1;
@@ -985,7 +556,7 @@ fn mem2reg(func as *d.IRFunction) as void {
     if (any_promo == 0) { mem.gfree(cast(*u8, slots)); return; }
 
     // Step 1: build CFG
-    let is *BasicBlock as blocks = cast(*BasicBlock, mem.galloc(cast(i64, MAX_BLOCKS) * sizeof(BasicBlock)));
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, mem.galloc(cast(i64, cfg.MAX_BLOCKS) * sizeof(cfg.BasicBlock)));
     let is i32 as lc = func.label_count + 1;
     let is *i32 as label_to_bb = cast(*i32, mem.galloc(cast(i64, lc) * 4));
     let is i32 as li with mut = 0;
@@ -995,7 +566,7 @@ fn mem2reg(func as *d.IRFunction) as void {
         li = li + 1;
     }
     let is i32 as nblocks with mut = 0;
-    build_cfg(func, blocks, &nblocks, label_to_bb);
+    cfg.build_cfg(func, blocks, &nblocks, label_to_bb);
     if (nblocks <= 1) {
         mem.gfree(cast(*u8, slots));
         mem.gfree(cast(*u8, blocks));
@@ -1008,13 +579,13 @@ fn mem2reg(func as *d.IRFunction) as void {
     let is *i32 as preds_arr = cast(*i32, mem.galloc(cast(i64, max_edges) * 4));
     let is *i32 as pred_starts = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
     let is *i32 as pred_counts = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
-    build_preds(blocks, nblocks, preds_arr, pred_starts, pred_counts);
+    cfg.build_preds(blocks, nblocks, preds_arr, pred_starts, pred_counts);
 
     // Step 2: compute RPO + dominance
     let is *i32 as rpo_order = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
     let is i32 as rpo_count with mut = 0;
-    compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
-    compute_idom(blocks, nblocks, rpo_order, rpo_count, preds_arr, pred_starts, pred_counts);
+    cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
+    dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds_arr, pred_starts, pred_counts);
 
     // Step 3: compute dominance frontiers
     let is i32 as max_df with mut = nblocks * nblocks;
@@ -1022,7 +593,7 @@ fn mem2reg(func as *d.IRFunction) as void {
     let is *i32 as df_out = cast(*i32, mem.galloc(cast(i64, max_df) * 4));
     let is *i32 as df_starts = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
     let is *i32 as df_counts = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
-    compute_df(blocks, nblocks, preds_arr, pred_starts, pred_counts, df_out, df_starts, df_counts);
+    dom.compute_df(blocks, nblocks, preds_arr, pred_starts, pred_counts, df_out, df_starts, df_counts);
 
     // Step 4: insert phis
     let is i32 as max_preds with mut = 0;

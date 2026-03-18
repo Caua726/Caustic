@@ -1,0 +1,149 @@
+use "../../std/mem.cst" as mem;
+use "cfg.cst" as cfg;
+
+// === Dominance: immediate dominators and dominance frontiers ===
+
+fn compute_idom(blocks as *cfg.BasicBlock, nblocks as i32, rpo_order as *i32, rpo_count as i32,
+                preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
+    // Cooper-Harvey-Kennedy iterative dominance
+    let is *cfg.BasicBlock as entry = cast(*cfg.BasicBlock, cast(i64, blocks));
+    entry.idom = 0; // entry dominates itself
+
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        let is i32 as ri with mut = 0;
+        while (ri < rpo_count) {
+            let is *i32 as rp = cast(*i32, cast(i64, rpo_order) + cast(i64, ri) * 4);
+            let is i32 as b = *rp;
+            if (b == 0) { ri = ri + 1; }
+            else {
+                let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+                let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, b) * 4);
+                let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, b) * 4);
+                let is i32 as ps = *psp;
+                let is i32 as pc = *pcp;
+
+                // Find first processed predecessor
+                let is i32 as new_idom with mut = cast(i32, 0 - 1);
+                let is i32 as pi with mut = 0;
+                while (pi < pc) {
+                    let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, ps + pi) * 4);
+                    let is i32 as pred = *pp;
+                    let is *cfg.BasicBlock as pbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(cfg.BasicBlock));
+                    if (pbb.idom >= 0) {
+                        new_idom = pred;
+                        pi = pc; // break
+                    }
+                    pi = pi + 1;
+                }
+
+                if (new_idom >= 0) {
+                    // Intersect with other processed predecessors
+                    pi = 0;
+                    while (pi < pc) {
+                        let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, ps + pi) * 4);
+                        let is i32 as pred = *pp;
+                        if (pred != new_idom) {
+                            let is *cfg.BasicBlock as pbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(cfg.BasicBlock));
+                            if (pbb.idom >= 0) {
+                                // Intersect
+                                let is i32 as a with mut = new_idom;
+                                let is i32 as bv with mut = pred;
+                                while (a != bv) {
+                                    let is *cfg.BasicBlock as abb with mut = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, a) * sizeof(cfg.BasicBlock));
+                                    let is *cfg.BasicBlock as bbb with mut = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bv) * sizeof(cfg.BasicBlock));
+                                    while (abb.rpo > bbb.rpo) {
+                                        a = abb.idom;
+                                        abb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, a) * sizeof(cfg.BasicBlock));
+                                    }
+                                    while (bbb.rpo > abb.rpo) {
+                                        bv = bbb.idom;
+                                        bbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bv) * sizeof(cfg.BasicBlock));
+                                    }
+                                }
+                                new_idom = a;
+                            }
+                        }
+                        pi = pi + 1;
+                    }
+
+                    if (bb.idom != new_idom) {
+                        bb.idom = new_idom;
+                        changed = 1;
+                    }
+                }
+                ri = ri + 1;
+            }
+        }
+    }
+}
+
+// === Step 3: Compute dominance frontiers ===
+
+fn compute_df(blocks as *cfg.BasicBlock, nblocks as i32,
+              preds as *i32, pred_starts as *i32, pred_counts as *i32,
+              df_out as *i32, df_starts as *i32, df_counts as *i32) as void {
+    // Count DF entries first
+    let is *i32 as df_tmp = cast(*i32, mem.galloc(cast(i64, nblocks * nblocks) * 4));
+    let is i32 as bi with mut = 0;
+    while (bi < nblocks) {
+        let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, bi) * 4);
+        *dcp = 0;
+        bi = bi + 1;
+    }
+
+    bi = 0;
+    while (bi < nblocks) {
+        let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bi) * 4);
+        if (*pcp >= 2) {
+            let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, bi) * 4);
+            let is i32 as pi with mut = 0;
+            while (pi < *pcp) {
+                let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *psp + pi) * 4);
+                let is i32 as runner with mut = *pp;
+                let is *cfg.BasicBlock as bbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
+                while (runner != bbb.idom && runner >= 0) {
+                    // Add bi to DF[runner] if not already there
+                    let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, runner) * 4);
+                    let is i32 as already with mut = 0;
+                    let is i32 as di with mut = 0;
+                    while (di < *dcp) {
+                        let is *i32 as dp = cast(*i32, cast(i64, df_tmp) + cast(i64, runner * nblocks + di) * 4);
+                        if (*dp == bi) { already = 1; di = *dcp; }
+                        di = di + 1;
+                    }
+                    if (already == 0) {
+                        let is *i32 as dp = cast(*i32, cast(i64, df_tmp) + cast(i64, runner * nblocks + *dcp) * 4);
+                        *dp = bi;
+                        *dcp = *dcp + 1;
+                    }
+                    let is *cfg.BasicBlock as rbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, runner) * sizeof(cfg.BasicBlock));
+                    runner = rbb.idom;
+                }
+                pi = pi + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    // Flatten DF into output arrays
+    let is i32 as total with mut = 0;
+    bi = 0;
+    while (bi < nblocks) {
+        let is *i32 as dsp = cast(*i32, cast(i64, df_starts) + cast(i64, bi) * 4);
+        *dsp = total;
+        let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, bi) * 4);
+        let is i32 as di with mut = 0;
+        while (di < *dcp) {
+            let is *i32 as src = cast(*i32, cast(i64, df_tmp) + cast(i64, bi * nblocks + di) * 4);
+            let is *i32 as dst = cast(*i32, cast(i64, df_out) + cast(i64, total) * 4);
+            *dst = *src;
+            total = total + 1;
+            di = di + 1;
+        }
+        bi = bi + 1;
+    }
+
+    mem.gfree(cast(*u8, df_tmp));
+}
