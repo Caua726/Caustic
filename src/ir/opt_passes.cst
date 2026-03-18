@@ -694,3 +694,87 @@ fn pass_final_resolve(func as *d.IRFunction, copy_of as *i32) as void {
         inst = inst.next;
     }
 }
+
+// === LICM: Loop Invariant Code Motion (conservative) ===
+// Only hoists from loops that contain NO calls. Single pass, header block only.
+
+fn pass_licm(func as *d.IRFunction) as void {
+    let is i32 as inst_count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) { inst_count = inst_count + 1; inst = inst.next; }
+    if (inst_count < 4) { return; }
+
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_pos = cast(*i32, mem.galloc(cast(i64, lc) * 4));
+    let is i32 as li with mut = 0;
+    while (li < lc) { let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, li) * 4); *lp = cast(i32, 0 - 1); li = li + 1; }
+
+    let is i32 as vc = func.vreg_count;
+    let is *i32 as def_pos = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    let is i32 as vi with mut = 0;
+    while (vi < vc) { let is *i32 as dp = cast(*i32, cast(i64, def_pos) + cast(i64, vi) * 4); *dp = cast(i32, 0 - 1); vi = vi + 1; }
+
+    let is i32 as pos with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_LABEL && inst.dest.label < lc) { let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, inst.dest.label) * 4); *lp = pos; }
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+            let is i32 as dv = inst.dest.vreg;
+            if (dv < vc) { let is *i32 as dp = cast(*i32, cast(i64, def_pos) + cast(i64, dv) * 4); if (*dp < 0) { *dp = pos; } }
+        }
+        pos = pos + 1; inst = inst.next;
+    }
+
+    pos = 0; inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ) && inst.dest.label < lc) {
+            let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, inst.dest.label) * 4);
+            let is i32 as header = *lp;
+            if (header >= 0 && header < pos) {
+                // Check no CALL in loop
+                let is i32 as has_call with mut = 0;
+                let is *d.IRInst as chk with mut = func.instructions;
+                let is i32 as cp with mut = 0;
+                while (cast(i64, chk) != 0 && cp <= pos) {
+                    if (cp > header && cp < pos && chk.is_dead == 0 && (chk.op == d.IR_CALL || chk.op == d.IR_SYSCALL)) { has_call = 1; }
+                    cp = cp + 1; chk = chk.next;
+                }
+                if (has_call == 0) {
+                    // Find header block end
+                    let is i32 as hend with mut = pos;
+                    let is *d.IRInst as he with mut = func.instructions;
+                    let is i32 as hep with mut = 0;
+                    while (cast(i64, he) != 0 && hep <= pos) {
+                        if (hep > header && (he.op == d.IR_JZ || he.op == d.IR_JNZ || he.op == d.IR_JMP || he.op == d.IR_LABEL)) { hend = hep; he = cast(*d.IRInst, 0); }
+                        if (cast(i64, he) != 0) { hep = hep + 1; he = he.next; }
+                    }
+                    // Hoist invariants from header block
+                    let is *d.IRInst as scan with mut = func.instructions;
+                    let is *d.IRInst as sprev with mut = cast(*d.IRInst, 0);
+                    let is i32 as sp with mut = 0;
+                    while (cast(i64, scan) != 0) {
+                        let is *d.IRInst as snext = scan.next;
+                        if (sp > header && sp < hend && scan.is_dead == 0 && scan.dest.op_type == d.OP_VREG && (scan.op == d.IR_IMM || scan.op == d.IR_ADD || scan.op == d.IR_SUB || scan.op == d.IR_MUL || scan.op == d.IR_SHL || scan.op == d.IR_SHR || scan.op == d.IR_AND || scan.op == d.IR_OR || scan.op == d.IR_XOR)) {
+                            let is i32 as inv with mut = 1;
+                            if (scan.src1.op_type == d.OP_VREG && scan.src1.vreg < vc) { let is *i32 as sdp = cast(*i32, cast(i64, def_pos) + cast(i64, scan.src1.vreg) * 4); if (*sdp >= header && *sdp <= pos) { inv = 0; } }
+                            if (scan.src2.op_type == d.OP_VREG && inv == 1 && scan.src2.vreg < vc) { let is *i32 as sdp = cast(*i32, cast(i64, def_pos) + cast(i64, scan.src2.vreg) * 4); if (*sdp >= header && *sdp <= pos) { inv = 0; } }
+                            if (inv == 1 && cast(i64, sprev) != 0) {
+                                sprev.next = snext;
+                                let is *d.IRInst as hp with mut = func.instructions;
+                                let is *d.IRInst as hprev with mut = cast(*d.IRInst, 0);
+                                let is i32 as hpp with mut = 0;
+                                while (cast(i64, hp) != 0 && hpp < header) { hprev = hp; hp = hp.next; hpp = hpp + 1; }
+                                if (cast(i64, hprev) != 0) { scan.next = hp; hprev.next = scan; } else { scan.next = func.instructions; func.instructions = scan; }
+                                if (scan.dest.vreg < vc) { let is *i32 as mdp = cast(*i32, cast(i64, def_pos) + cast(i64, scan.dest.vreg) * 4); *mdp = header - 1; }
+                                scan = snext; sp = sp + 1;
+                            } else { sprev = scan; scan = snext; sp = sp + 1; }
+                        } else { sprev = scan; scan = snext; sp = sp + 1; }
+                    }
+                }
+            }
+        }
+        pos = pos + 1; inst = inst.next;
+    }
+    mem.gfree(cast(*u8, label_pos));
+    mem.gfree(cast(*u8, def_pos));
+}
