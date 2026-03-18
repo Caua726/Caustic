@@ -301,6 +301,244 @@ fn gen_addr(node as *ast.Node) as i32 {
     return 0;
 }
 
+// === Extracted helpers for gen_expr ===
+
+fn emit_load_from_addr(addr as i32, ty_ptr as *u8, line as i32) as i32 {
+    let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
+    if (ty.size > 8) { return addr; }
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as i = d.new_inst(d.IR_LOAD);
+    i.dest = d.op_vreg(dest);
+    i.src1 = d.op_vreg(addr);
+    i.cast_to = ty_ptr;
+    i.line = line;
+    emit(i);
+    return dest;
+}
+
+fn gen_cmp(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i32 {
+    let is i32 as lhs = gen_expr(node.lhs);
+    let is i32 as rhs = gen_expr(node.rhs);
+    let is i32 as r = emit_binary(op, lhs, rhs, line);
+    if (need_cast == 1) {
+        ctx_tail.cast_to = cast(*u8, node.lhs.ty);
+    }
+    return r;
+}
+
+fn gen_bitwise(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i32 {
+    let is i32 as lhs = gen_expr(node.lhs);
+    let is i32 as rhs = gen_expr(node.rhs);
+    let is i32 as r = emit_binary(op, lhs, rhs, line);
+    if (need_cast == 1) {
+        ctx_tail.cast_to = cast(*u8, node.ty);
+    }
+    return r;
+}
+
+fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
+    let is i32 as arg_count with mut = 0;
+    let is *ast.Node as a with mut = node.args;
+    while (cast(i64, a) != 0) { arg_count = arg_count + 1; a = a.next; }
+
+    // SRET for large struct return
+    let is i32 as use_sret with mut = 0;
+    if (ty.size > 8) { use_sret = 1; }
+
+    let is i32 as sret_addr with mut = cast(i32, 0 - 1);
+    if (use_sret == 1) {
+        ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + ty.size;
+        let is i32 as offset = ctx_func.alloc_stack_size;
+        // align 16
+        if (ctx_func.alloc_stack_size % 16 != 0) {
+            ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
+        }
+        sret_addr = new_vreg();
+        let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+        ga.dest = d.op_vreg(sret_addr);
+        ga.src1 = d.op_imm(cast(i64, offset));
+        ga.line = line;
+        emit(ga);
+        arg_count = arg_count + 1;
+    }
+
+    // Generate args - max 32 args
+    let is [256]u8 as arg_vregs;
+    let is i32 as ai with mut = 0;
+    if (sret_addr != cast(i32, 0 - 1)) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
+        *av = sret_addr;
+        ai = ai + 1;
+    }
+    a = node.args;
+    while (cast(i64, a) != 0) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
+        *av = gen_expr(a);
+        ai = ai + 1;
+        a = a.next;
+    }
+
+    // Internal Caustic ABI: all args in GPRs
+    let is i32 as stack_args with mut = 0;
+    if (arg_count > 6) { stack_args = arg_count - 6; }
+    let is i32 as padding with mut = 0;
+    if (stack_args % 2 != 0) { padding = 1; }
+    if (padding == 1) {
+        let is *d.IRInst as al = d.new_inst(d.IR_ASM);
+        al.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+        al.asm_str_len = 10;
+        al.line = line;
+        emit(al);
+    }
+    // Stack args in reverse
+    let is i32 as j with mut = arg_count - 1;
+    while (j >= 6) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+        emit_set_arg(j, *av, cast(*u8, 0), line);
+        j = j - 1;
+    }
+    // Register args
+    j = 0;
+    while (j < arg_count && j < 6) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+        emit_set_arg(j, *av, cast(*u8, 0), line);
+        j = j + 1;
+    }
+
+    // Use asm_name if available (for mangled names)
+    let is *u8 as cname with mut = node.name_ptr;
+    let is i32 as clen with mut = node.name_len;
+    if (node.asm_name_len > 0) {
+        cname = node.asm_name_ptr;
+        clen = node.asm_name_len;
+    }
+    let is i32 as ret_reg = emit_call(cname, clen, node.is_variadic, cast(*u8, ty), line);
+
+    if (stack_args > 0) {
+        let is i32 as pad2 with mut = 0;
+        if (stack_args % 2 != 0) { pad2 = 1; }
+        let is i32 as cleanup_bytes = (stack_args + pad2) * 8;
+        // Build "add rsp, N" string
+        let is [32]u8 as cbuf;
+        mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
+        let is i32 as cpos with mut = 9;
+        let is i32 as cv with mut = cleanup_bytes;
+        let is [10]u8 as nbuf;
+        let is i32 as ni with mut = 0;
+        while (cv > 0) {
+            nbuf[ni] = cast(u8, (cv % 10) + 48);
+            cv = cv / 10;
+            ni = ni + 1;
+        }
+        let is i32 as nj with mut = ni - 1;
+        while (nj >= 0) {
+            cbuf[cpos] = nbuf[nj];
+            cpos = cpos + 1;
+            nj = nj - 1;
+        }
+        let is *d.IRInst as cl = d.new_inst(d.IR_ASM);
+        cl.asm_str_ptr = d.str_dup(cast(*u8, &cbuf), cpos);
+        cl.asm_str_len = cpos;
+        cl.line = line;
+        emit(cl);
+    }
+
+    if (sret_addr != cast(i32, 0 - 1)) { return sret_addr; }
+    return ret_reg;
+}
+
+fn gen_syscall(node as *ast.Node, line as i32) as i32 {
+    let is i32 as arg_count with mut = 0;
+    let is [56]u8 as arg_vregs;
+    let is *ast.Node as a with mut = node.args;
+    while (cast(i64, a) != 0) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, arg_count) * 4);
+        *av = gen_expr(a);
+        arg_count = arg_count + 1;
+        a = a.next;
+    }
+    let is i32 as si with mut = 0;
+    while (si < arg_count) {
+        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, si) * 4);
+        let is *d.IRInst as sa = d.new_inst(d.IR_SET_SYS_ARG);
+        sa.dest = d.op_imm(cast(i64, si));
+        sa.src1 = d.op_vreg(*av);
+        sa.line = line;
+        emit(sa);
+        si = si + 1;
+    }
+    let is i32 as dest = new_vreg();
+    let is *d.IRInst as sc = d.new_inst(d.IR_SYSCALL);
+    sc.dest = d.op_vreg(dest);
+    sc.line = line;
+    emit(sc);
+    return dest;
+}
+
+fn gen_enum_lit(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
+    let is i32 as disc = node.discriminant;
+    // Simple enum (no payload, small)
+    if (cast(i64, node.payload_args) == 0 && ty.size <= 4) {
+        return emit_imm(cast(i64, disc), line);
+    }
+    // Tagged union with no payload but needs full allocation
+    if (cast(i64, node.payload_args) == 0 && ty.size > 4) {
+        let is i32 as total_size = ty.size;
+        ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + total_size;
+        if (ctx_func.alloc_stack_size % 16 != 0) {
+            ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
+        }
+        let is i32 as offset = ctx_func.alloc_stack_size;
+        let is i32 as base_addr = new_vreg();
+        let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+        ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; emit(ga);
+        let is i32 as disc_reg = emit_imm(cast(i64, disc), line);
+        let is *d.IRInst as st = d.new_inst(d.IR_STORE);
+        st.dest = d.op_vreg(base_addr); st.src1 = d.op_vreg(disc_reg);
+        st.cast_to = cast(*u8, ast.type_i32); st.line = line; emit(st);
+        return base_addr;
+    }
+    // Tagged union with payload
+    let is i32 as total_size = ty.size;
+    ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + total_size;
+    if (ctx_func.alloc_stack_size % 16 != 0) {
+        ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
+    }
+    let is i32 as offset = ctx_func.alloc_stack_size;
+    let is i32 as base_addr = new_vreg();
+    let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
+    ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; emit(ga);
+    // Store discriminant
+    let is i32 as disc_reg = emit_imm(cast(i64, disc), line);
+    let is *d.IRInst as st = d.new_inst(d.IR_STORE);
+    st.dest = d.op_vreg(base_addr); st.src1 = d.op_vreg(disc_reg);
+    st.cast_to = cast(*u8, ast.type_i32); st.line = line; emit(st);
+    // Store payload
+    let is i32 as payload_off = ty.payload_offset;
+    let is i32 as payload_addr with mut = base_addr;
+    if (payload_off > 0) {
+        let is i32 as ofreg = emit_imm(cast(i64, payload_off), line);
+        payload_addr = emit_binary(d.IR_ADD, base_addr, ofreg, line);
+    }
+    // Store each payload arg sequentially
+    let is *ast.Node as arg with mut = node.payload_args;
+    while (cast(i64, arg) != 0) {
+        let is i32 as val = gen_expr(arg);
+        let is *ast.Type as arg_ty = arg.ty;
+        if (arg_ty.size > 8) {
+            let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+            cp.dest = d.op_vreg(payload_addr); cp.src1 = d.op_vreg(val);
+            cp.src2 = d.op_imm(cast(i64, arg_ty.size)); cp.line = line; emit(cp);
+        } else {
+            let is *d.IRInst as sv = d.new_inst(d.IR_STORE);
+            sv.dest = d.op_vreg(payload_addr); sv.src1 = d.op_vreg(val);
+            sv.cast_to = cast(*u8, arg_ty); sv.line = line; emit(sv);
+        }
+        arg = arg.next;
+    }
+    return base_addr;
+}
+
 // === gen_expr ===
 
 fn gen_expr(node as *ast.Node) as i32 {
@@ -319,43 +557,19 @@ fn gen_expr(node as *ast.Node) as i32 {
     // NK_DEREF
     if (k == ast.NK_DEREF) {
         let is i32 as addr = gen_expr(node.expr);
-        if (ty.size > 8) { return addr; }
-        let is i32 as dest = new_vreg();
-        let is *d.IRInst as i = d.new_inst(d.IR_LOAD);
-        i.dest = d.op_vreg(dest);
-        i.src1 = d.op_vreg(addr);
-        i.cast_to = cast(*u8, ty);
-        i.line = line;
-        emit(i);
-        return dest;
+        return emit_load_from_addr(addr, cast(*u8, ty), line);
     }
 
     // NK_INDEX
     if (k == ast.NK_INDEX) {
         let is i32 as addr = gen_addr(node);
-        if (ty.size > 8) { return addr; }
-        let is i32 as dest = new_vreg();
-        let is *d.IRInst as i = d.new_inst(d.IR_LOAD);
-        i.dest = d.op_vreg(dest);
-        i.src1 = d.op_vreg(addr);
-        i.cast_to = cast(*u8, ty);
-        i.line = line;
-        emit(i);
-        return dest;
+        return emit_load_from_addr(addr, cast(*u8, ty), line);
     }
 
     // NK_MEMBER
     if (k == ast.NK_MEMBER) {
         let is i32 as addr = gen_addr(node);
-        if (ty.size > 8) { return addr; }
-        let is i32 as dest = new_vreg();
-        let is *d.IRInst as i = d.new_inst(d.IR_LOAD);
-        i.dest = d.op_vreg(dest);
-        i.src1 = d.op_vreg(addr);
-        i.cast_to = cast(*u8, ty);
-        i.line = line;
-        emit(i);
-        return dest;
+        return emit_load_from_addr(addr, cast(*u8, ty), line);
     }
 
     // NK_ASSIGN
@@ -611,73 +825,19 @@ fn gen_expr(node as *ast.Node) as i32 {
     }
 
     // Comparison ops
-    if (k == ast.NK_EQ) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        return emit_binary(d.IR_EQ, lhs, rhs, line);
-    }
-    if (k == ast.NK_NE) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        return emit_binary(d.IR_NE, lhs, rhs, line);
-    }
-    if (k == ast.NK_LT) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is i32 as r = emit_binary(d.IR_LT, lhs, rhs, line);
-        ctx_tail.cast_to = cast(*u8, node.lhs.ty);
-        return r;
-    }
-    if (k == ast.NK_LE) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is i32 as r = emit_binary(d.IR_LE, lhs, rhs, line);
-        ctx_tail.cast_to = cast(*u8, node.lhs.ty);
-        return r;
-    }
-    if (k == ast.NK_GT) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is i32 as r = emit_binary(d.IR_GT, lhs, rhs, line);
-        ctx_tail.cast_to = cast(*u8, node.lhs.ty);
-        return r;
-    }
-    if (k == ast.NK_GE) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is i32 as r = emit_binary(d.IR_GE, lhs, rhs, line);
-        ctx_tail.cast_to = cast(*u8, node.lhs.ty);
-        return r;
-    }
+    if (k == ast.NK_EQ) { return gen_cmp(node, d.IR_EQ, line, 0); }
+    if (k == ast.NK_NE) { return gen_cmp(node, d.IR_NE, line, 0); }
+    if (k == ast.NK_LT) { return gen_cmp(node, d.IR_LT, line, 1); }
+    if (k == ast.NK_LE) { return gen_cmp(node, d.IR_LE, line, 1); }
+    if (k == ast.NK_GT) { return gen_cmp(node, d.IR_GT, line, 1); }
+    if (k == ast.NK_GE) { return gen_cmp(node, d.IR_GE, line, 1); }
 
     // Bitwise ops
-    if (k == ast.NK_SHL) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        return emit_binary(d.IR_SHL, lhs, rhs, line);
-    }
-    if (k == ast.NK_SHR) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is i32 as r = emit_binary(d.IR_SHR, lhs, rhs, line);
-        ctx_tail.cast_to = cast(*u8, node.ty);
-        return r;
-    }
-    if (k == ast.NK_BAND) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        return emit_binary(d.IR_AND, lhs, rhs, line);
-    }
-    if (k == ast.NK_BOR) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        return emit_binary(d.IR_OR, lhs, rhs, line);
-    }
-    if (k == ast.NK_BXOR) {
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is i32 as rhs = gen_expr(node.rhs);
-        return emit_binary(d.IR_XOR, lhs, rhs, line);
-    }
+    if (k == ast.NK_SHL) { return gen_bitwise(node, d.IR_SHL, line, 0); }
+    if (k == ast.NK_SHR) { return gen_bitwise(node, d.IR_SHR, line, 1); }
+    if (k == ast.NK_BAND) { return gen_bitwise(node, d.IR_AND, line, 0); }
+    if (k == ast.NK_BOR) { return gen_bitwise(node, d.IR_OR, line, 0); }
+    if (k == ast.NK_BXOR) { return gen_bitwise(node, d.IR_XOR, line, 0); }
 
     // Unary ops
     if (k == ast.NK_BNOT) {
@@ -763,210 +923,13 @@ fn gen_expr(node as *ast.Node) as i32 {
     }
 
     // NK_FNCALL
-    if (k == ast.NK_FNCALL) {
-        let is i32 as arg_count with mut = 0;
-        let is *ast.Node as a with mut = node.args;
-        while (cast(i64, a) != 0) { arg_count = arg_count + 1; a = a.next; }
-
-        // SRET for large struct return
-        let is i32 as use_sret with mut = 0;
-        if (ty.size > 8) { use_sret = 1; }
-
-        let is i32 as sret_addr with mut = cast(i32, 0 - 1);
-        if (use_sret == 1) {
-            ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + ty.size;
-            let is i32 as offset = ctx_func.alloc_stack_size;
-            // align 16
-            if (ctx_func.alloc_stack_size % 16 != 0) {
-                ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
-            }
-            sret_addr = new_vreg();
-            let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
-            ga.dest = d.op_vreg(sret_addr);
-            ga.src1 = d.op_imm(cast(i64, offset));
-            ga.line = line;
-            emit(ga);
-            arg_count = arg_count + 1;
-        }
-
-        // Generate args - max 32 args
-        let is [256]u8 as arg_vregs;
-        let is i32 as ai with mut = 0;
-        if (sret_addr != cast(i32, 0 - 1)) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
-            *av = sret_addr;
-            ai = ai + 1;
-        }
-        a = node.args;
-        while (cast(i64, a) != 0) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
-            *av = gen_expr(a);
-            ai = ai + 1;
-            a = a.next;
-        }
-
-        // Internal Caustic ABI: all args in GPRs
-        let is i32 as stack_args with mut = 0;
-        if (arg_count > 6) { stack_args = arg_count - 6; }
-        let is i32 as padding with mut = 0;
-        if (stack_args % 2 != 0) { padding = 1; }
-        if (padding == 1) {
-            let is *d.IRInst as al = d.new_inst(d.IR_ASM);
-            al.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
-            al.asm_str_len = 10;
-            al.line = line;
-            emit(al);
-        }
-        // Stack args in reverse
-        let is i32 as j with mut = arg_count - 1;
-        while (j >= 6) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-            emit_set_arg(j, *av, cast(*u8, 0), line);
-            j = j - 1;
-        }
-        // Register args
-        j = 0;
-        while (j < arg_count && j < 6) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-            emit_set_arg(j, *av, cast(*u8, 0), line);
-            j = j + 1;
-        }
-
-        // Use asm_name if available (for mangled names)
-        let is *u8 as cname with mut = node.name_ptr;
-        let is i32 as clen with mut = node.name_len;
-        if (node.asm_name_len > 0) {
-            cname = node.asm_name_ptr;
-            clen = node.asm_name_len;
-        }
-        let is i32 as ret_reg = emit_call(cname, clen, node.is_variadic, cast(*u8, ty), line);
-
-        if (stack_args > 0) {
-            let is i32 as pad2 with mut = 0;
-            if (stack_args % 2 != 0) { pad2 = 1; }
-            let is i32 as cleanup_bytes = (stack_args + pad2) * 8;
-            // Build "add rsp, N" string
-            let is [32]u8 as cbuf;
-            mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
-            let is i32 as cpos with mut = 9;
-            let is i32 as cv with mut = cleanup_bytes;
-            let is [10]u8 as nbuf;
-            let is i32 as ni with mut = 0;
-            while (cv > 0) {
-                nbuf[ni] = cast(u8, (cv % 10) + 48);
-                cv = cv / 10;
-                ni = ni + 1;
-            }
-            let is i32 as nj with mut = ni - 1;
-            while (nj >= 0) {
-                cbuf[cpos] = nbuf[nj];
-                cpos = cpos + 1;
-                nj = nj - 1;
-            }
-            let is *d.IRInst as cl = d.new_inst(d.IR_ASM);
-            cl.asm_str_ptr = d.str_dup(cast(*u8, &cbuf), cpos);
-            cl.asm_str_len = cpos;
-            cl.line = line;
-            emit(cl);
-        }
-
-        if (sret_addr != cast(i32, 0 - 1)) { return sret_addr; }
-        return ret_reg;
-    }
+    if (k == ast.NK_FNCALL) { return gen_fncall(node, ty, line); }
 
     // NK_SYSCALL
-    if (k == ast.NK_SYSCALL) {
-        let is i32 as arg_count with mut = 0;
-        let is [56]u8 as arg_vregs;
-        let is *ast.Node as a with mut = node.args;
-        while (cast(i64, a) != 0) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, arg_count) * 4);
-            *av = gen_expr(a);
-            arg_count = arg_count + 1;
-            a = a.next;
-        }
-        let is i32 as si with mut = 0;
-        while (si < arg_count) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, si) * 4);
-            let is *d.IRInst as sa = d.new_inst(d.IR_SET_SYS_ARG);
-            sa.dest = d.op_imm(cast(i64, si));
-            sa.src1 = d.op_vreg(*av);
-            sa.line = line;
-            emit(sa);
-            si = si + 1;
-        }
-        let is i32 as dest = new_vreg();
-        let is *d.IRInst as sc = d.new_inst(d.IR_SYSCALL);
-        sc.dest = d.op_vreg(dest);
-        sc.line = line;
-        emit(sc);
-        return dest;
-    }
+    if (k == ast.NK_SYSCALL) { return gen_syscall(node, line); }
 
     // NK_ENUM_LIT
-    if (k == ast.NK_ENUM_LIT) {
-        let is i32 as disc = node.discriminant;
-        // Simple enum (no payload, small)
-        if (cast(i64, node.payload_args) == 0 && ty.size <= 4) {
-            return emit_imm(cast(i64, disc), line);
-        }
-        // Tagged union with no payload but needs full allocation
-        if (cast(i64, node.payload_args) == 0 && ty.size > 4) {
-            let is i32 as total_size = ty.size;
-            ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + total_size;
-            if (ctx_func.alloc_stack_size % 16 != 0) {
-                ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
-            }
-            let is i32 as offset = ctx_func.alloc_stack_size;
-            let is i32 as base_addr = new_vreg();
-            let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
-            ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; emit(ga);
-            let is i32 as disc_reg = emit_imm(cast(i64, disc), line);
-            let is *d.IRInst as st = d.new_inst(d.IR_STORE);
-            st.dest = d.op_vreg(base_addr); st.src1 = d.op_vreg(disc_reg);
-            st.cast_to = cast(*u8, ast.type_i32); st.line = line; emit(st);
-            return base_addr;
-        }
-        // Tagged union with payload
-        let is i32 as total_size = ty.size;
-        ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + total_size;
-        if (ctx_func.alloc_stack_size % 16 != 0) {
-            ctx_func.alloc_stack_size = ctx_func.alloc_stack_size + 16 - (ctx_func.alloc_stack_size % 16);
-        }
-        let is i32 as offset = ctx_func.alloc_stack_size;
-        let is i32 as base_addr = new_vreg();
-        let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
-        ga.dest = d.op_vreg(base_addr); ga.src1 = d.op_imm(cast(i64, offset)); ga.line = line; emit(ga);
-        // Store discriminant
-        let is i32 as disc_reg = emit_imm(cast(i64, disc), line);
-        let is *d.IRInst as st = d.new_inst(d.IR_STORE);
-        st.dest = d.op_vreg(base_addr); st.src1 = d.op_vreg(disc_reg);
-        st.cast_to = cast(*u8, ast.type_i32); st.line = line; emit(st);
-        // Store payload
-        let is i32 as payload_off = ty.payload_offset;
-        let is i32 as payload_addr with mut = base_addr;
-        if (payload_off > 0) {
-            let is i32 as ofreg = emit_imm(cast(i64, payload_off), line);
-            payload_addr = emit_binary(d.IR_ADD, base_addr, ofreg, line);
-        }
-        // Store each payload arg sequentially
-        let is *ast.Node as arg with mut = node.payload_args;
-        while (cast(i64, arg) != 0) {
-            let is i32 as val = gen_expr(arg);
-            let is *ast.Type as arg_ty = arg.ty;
-            if (arg_ty.size > 8) {
-                let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
-                cp.dest = d.op_vreg(payload_addr); cp.src1 = d.op_vreg(val);
-                cp.src2 = d.op_imm(cast(i64, arg_ty.size)); cp.line = line; emit(cp);
-            } else {
-                let is *d.IRInst as sv = d.new_inst(d.IR_STORE);
-                sv.dest = d.op_vreg(payload_addr); sv.src1 = d.op_vreg(val);
-                sv.cast_to = cast(*u8, arg_ty); sv.line = line; emit(sv);
-            }
-            arg = arg.next;
-        }
-        return base_addr;
-    }
+    if (k == ast.NK_ENUM_LIT) { return gen_enum_lit(node, ty, line); }
 
     // NK_VA_START
     if (k == ast.NK_VA_START) {

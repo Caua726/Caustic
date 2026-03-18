@@ -157,439 +157,279 @@ fn resolve_type_ptr(ty_ptr as *u8) as *ast.Type {
     return cast(*ast.Type, ty_ptr);
 }
 
+// === Extracted walk helpers ===
+
+fn walk_return(node as *ast.Node) as void {
+    if (cast(i64, node.expr) != 0) {
+        walk(node.expr);
+        let is *ast.Type as rt = cast(*ast.Type, sc.current_return_type);
+        if (node.expr.kind == ast.NK_NUM) {
+            if (ty.can_narrow_literal(node.expr.val, sc.current_return_type) == 1) {
+                node.expr.ty = rt;
+            }
+        }
+        if (ty.is_safe_conversion(cast(*u8, node.expr.ty), sc.current_return_type) == 0) {
+            if (node.expr.kind != ast.NK_NUM || ty.can_narrow_literal(node.expr.val, sc.current_return_type) == 0) {
+                sc.sem_error_at(node, "tipo de retorno incompativel");
+            }
+        }
+    } else {
+        let is *ast.Type as rt = cast(*ast.Type, sc.current_return_type);
+        if (cast(i64, rt) != cast(i64, ast.type_void)) {
+            sc.sem_error_at(node, "retorno vazio em funcao nao-void");
+        }
+    }
+}
+
+fn walk_fn_def(node as *ast.Node) as void {
+    sc.enter_scope();
+    sc.stack_offset = 48;
+    let is *ast.Node as param with mut = node.params;
+    while (cast(i64, param) != 0) {
+        let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags);
+        param.var_offset = var.offset;
+        param = param.next;
+    }
+    let is *d.Function as fs = sc.lookup_fn(node.name_ptr, node.name_len);
+    if (cast(i64, fs) != 0 && fs.asm_name_len > 0) {
+        node.asm_name_ptr = fs.asm_name_ptr;
+        node.asm_name_len = fs.asm_name_len;
+    }
+    let is *u8 as saved_rt = sc.current_return_type;
+    sc.current_return_type = cast(*u8, node.return_type);
+    walk(node.body);
+    node.stack_size = sc.stack_offset;
+    sc.current_return_type = saved_rt;
+    sc.exit_scope();
+}
+
+fn walk_block(node as *ast.Node) as void {
+    sc.enter_scope();
+    let is *ast.Node as s with mut = node.stmts;
+    while (cast(i64, s) != 0) {
+        walk(s);
+        s = s.next;
+    }
+    let is *d.Variable as bv with mut = sc.current_scope.vars;
+    while (cast(i64, bv) != 0) {
+        if (bv.is_used == 0 && bv.is_global == 0 && bv.is_module == 0) {
+            if (bv.name_len > 0 && bv.name_ptr[0] != cast(u8, 95)) {
+                let is *ast.Node as bwn = ast.new_node(ast.NK_IDENT);
+                bwn.tok_idx = bv.decl_tok_idx;
+                sc.sem_warn_at2(bwn, "variavel nao utilizada", bv.name_ptr, bv.name_len);
+            }
+        }
+        bv = bv.next;
+    }
+    sc.exit_scope();
+}
+
+fn walk_let(node as *ast.Node) as void {
+    node.ty = resolve_type_ptr(cast(*u8, node.ty));
+    if (node.ty.kind == ast.TY_VOID) {
+        sc.sem_error_at2(node, "variavel nao pode ser void", node.name_ptr, node.name_len);
+    }
+    if (node.is_extern == 1) {
+        let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
+        var.is_extern = 1;
+        node.var_offset = var.offset;
+        node.is_global = var.is_global;
+        return;
+    }
+    if (cast(i64, node.init_expr) != 0) {
+        walk(node.init_expr);
+        if (node.init_expr.kind == ast.NK_NUM) {
+            if (ty.can_narrow_literal(node.init_expr.val, cast(*u8, node.ty)) == 1) {
+                node.init_expr.ty = node.ty;
+            }
+        }
+        let is *ast.Type as init_ty = node.init_expr.ty;
+        if (cast(i64, init_ty) != 0 && cast(i64, init_ty) != cast(i64, node.ty)) {
+            let is *ast.Type as decl_ty = node.ty;
+            let is i32 as both_ptr with mut = 0;
+            if (init_ty.kind == ast.TY_PTR && decl_ty.kind == ast.TY_PTR) { both_ptr = 1; }
+            if (both_ptr == 0) {
+                if (ty.is_safe_conversion(cast(*u8, init_ty), cast(*u8, decl_ty)) == 0) {
+                    sc.sem_error_at2(node, "tipo incompativel na inicializacao de", node.name_ptr, node.name_len);
+                }
+            }
+        }
+    }
+    let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
+    var.decl_tok_idx = node.tok_idx;
+    node.var_offset = var.offset;
+    node.is_global = var.is_global;
+    if (var.asm_name_len > 0) {
+        node.asm_name_ptr = var.asm_name_ptr;
+        node.asm_name_len = var.asm_name_len;
+    }
+}
+
+fn walk_binop(node as *ast.Node) as void {
+    let is i32 as k = node.kind;
+    walk(node.lhs);
+    walk(node.rhs);
+    if (node.rhs.kind == ast.NK_NUM && node.lhs.kind != ast.NK_NUM) {
+        if (ty.can_narrow_literal(node.rhs.val, cast(*u8, node.lhs.ty)) == 1) {
+            node.rhs.ty = node.lhs.ty;
+        }
+    }
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
+        if (ty.can_narrow_literal(node.lhs.val, cast(*u8, node.rhs.ty)) == 1) {
+            node.lhs.ty = node.rhs.ty;
+        }
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB) {
+        if (node.lhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.rhs.ty)) == 1) {
+            node.ty = node.lhs.ty;
+            return;
+        }
+        if (node.rhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.lhs.ty)) == 1) {
+            if (k == ast.NK_SUB) { sc.sem_error_at(node, "subtracao int - ptr invalida"); }
+            node.ty = node.rhs.ty;
+            return;
+        }
+        if (node.lhs.ty.kind == ast.TY_PTR && node.rhs.ty.kind == ast.TY_PTR) {
+            if (k == ast.NK_SUB) { node.ty = ast.type_i64; return; }
+            sc.sem_error_at(node, "soma de dois ponteiros invalida");
+        }
+    }
+    if (node.lhs.ty.size > node.rhs.ty.size) {
+        node.ty = node.lhs.ty;
+    } else {
+        node.ty = node.rhs.ty;
+    }
+}
+
+fn walk_cmp(node as *ast.Node) as void {
+    walk(node.lhs);
+    walk(node.rhs);
+    if (node.rhs.kind == ast.NK_NUM && node.lhs.kind != ast.NK_NUM) {
+        if (ty.can_narrow_literal(node.rhs.val, cast(*u8, node.lhs.ty)) == 1) {
+            node.rhs.ty = node.lhs.ty;
+        }
+    }
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
+        if (ty.can_narrow_literal(node.lhs.val, cast(*u8, node.rhs.ty)) == 1) {
+            node.lhs.ty = node.rhs.ty;
+        }
+    }
+    node.ty = ast.type_bool;
+}
+
+fn walk_assign(node as *ast.Node) as void {
+    walk(node.lhs);
+    walk(node.rhs);
+    let is i32 as lk = node.lhs.kind;
+    if (lk != ast.NK_IDENT && lk != ast.NK_DEREF && lk != ast.NK_INDEX && lk != ast.NK_MEMBER) {
+        sc.sem_error_at(node, "alvo de atribuicao invalido");
+    }
+    if (lk == ast.NK_IDENT) {
+        let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
+        if (cast(i64, var) != 0 && var.flags != ast.VF_MUT) {
+            sc.sem_error_at2(node, "nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
+        }
+    }
+    if (node.rhs.kind == ast.NK_NUM) {
+        if (ty.can_narrow_literal(node.rhs.val, cast(*u8, node.lhs.ty)) == 1) {
+            node.rhs.ty = node.lhs.ty;
+        }
+    }
+    node.ty = node.lhs.ty;
+}
+
+fn walk_for(node as *ast.Node) as void {
+    sc.enter_scope();
+    if (cast(i64, node.for_init) != 0) { walk(node.for_init); }
+    if (cast(i64, node.cond) != 0) { walk(node.cond); }
+    if (cast(i64, node.for_step) != 0) { walk(node.for_step); }
+    sc.loop_depth = sc.loop_depth + 1;
+    walk(node.body);
+    sc.loop_depth = sc.loop_depth - 1;
+    sc.exit_scope();
+}
+
 // === Main walk function ===
 
 fn walk(node as *ast.Node) as void {
     if (cast(i64, node) == 0) { return; }
     let is i32 as k = node.kind;
 
-    // --- ASM ---
     if (k == ast.NK_ASM) { return; }
-
-    // --- NUM ---
-    if (k == ast.NK_NUM) {
-        if (cast(i64, node.ty) == 0) { node.ty = ast.type_i64; }
-        return;
-    }
-
-    // --- STRING ---
+    if (k == ast.NK_NUM) { if (cast(i64, node.ty) == 0) { node.ty = ast.type_i64; } return; }
     if (k == ast.NK_STRING) {
         let is *ast.Type as p = ast.new_type(ast.TY_PTR);
-        p.base = ast.type_u8;
-        p.size = 8;
-        node.ty = p;
-        return;
+        p.base = ast.type_u8; p.size = 8; node.ty = p; return;
     }
-
-    // --- IDENT ---
     if (k == ast.NK_IDENT) {
         let is *d.Variable as var = sc.lookup_var(node.name_ptr, node.name_len);
-        if (cast(i64, var) == 0) {
-            sc.sem_error_at2(node, "variavel nao declarada", node.name_ptr, node.name_len);
-        }
+        if (cast(i64, var) == 0) { sc.sem_error_at2(node, "variavel nao declarada", node.name_ptr, node.name_len); }
         var.is_used = 1;
         node.ty = cast(*ast.Type, var.ty);
         node.var_offset = var.offset;
         node.is_global = var.is_global;
-        if (var.asm_name_len > 0) {
-            node.asm_name_ptr = var.asm_name_ptr;
-            node.asm_name_len = var.asm_name_len;
-        }
+        if (var.asm_name_len > 0) { node.asm_name_ptr = var.asm_name_ptr; node.asm_name_len = var.asm_name_len; }
         return;
     }
-
-    // --- RETURN ---
-    if (k == ast.NK_RETURN) {
-        if (cast(i64, node.expr) != 0) {
-            walk(node.expr);
-            let is *ast.Type as rt = cast(*ast.Type, sc.current_return_type);
-            // Literal narrowing
-            if (node.expr.kind == ast.NK_NUM) {
-                if (ty.can_narrow_literal(node.expr.val, sc.current_return_type) == 1) {
-                    node.expr.ty = rt;
-                }
-            }
-            if (ty.is_safe_conversion(cast(*u8, node.expr.ty), sc.current_return_type) == 0) {
-                if (node.expr.kind != ast.NK_NUM || ty.can_narrow_literal(node.expr.val, sc.current_return_type) == 0) {
-                    sc.sem_error_at(node, "tipo de retorno incompativel");
-                }
-            }
-        } else {
-            let is *ast.Type as rt = cast(*ast.Type, sc.current_return_type);
-            if (cast(i64, rt) != cast(i64, ast.type_void)) {
-                sc.sem_error_at(node, "retorno vazio em funcao nao-void");
-            }
-        }
-        return;
-    }
-
-    // --- FN ---
-    if (k == ast.NK_FN) {
-        sc.enter_scope();
-        sc.stack_offset = 48;
-        // Declare params
-        let is *ast.Node as param with mut = node.params;
-        while (cast(i64, param) != 0) {
-            let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags);
-            param.var_offset = var.offset;
-            param = param.next;
-        }
-        // Set asm_name from function table
-        let is *d.Function as fs = sc.lookup_fn(node.name_ptr, node.name_len);
-        if (cast(i64, fs) != 0 && fs.asm_name_len > 0) {
-            node.asm_name_ptr = fs.asm_name_ptr;
-            node.asm_name_len = fs.asm_name_len;
-        }
-        // Save/set return type
-        let is *u8 as saved_rt = sc.current_return_type;
-        sc.current_return_type = cast(*u8, node.return_type);
-        walk(node.body);
-        // Save stack size
-        node.stack_size = sc.stack_offset;
-        sc.current_return_type = saved_rt;
-        sc.exit_scope();
-        return;
-    }
-
-    // --- EXPR_STMT ---
-    if (k == ast.NK_EXPR_STMT) {
-        walk(node.expr);
-        return;
-    }
-
-    // --- BLOCK ---
-    if (k == ast.NK_BLOCK) {
-        sc.enter_scope();
-        let is *ast.Node as s with mut = node.stmts;
-        while (cast(i64, s) != 0) {
-            walk(s);
-            s = s.next;
-        }
-        // Check unused variables in this block
-        let is *d.Variable as bv with mut = sc.current_scope.vars;
-        while (cast(i64, bv) != 0) {
-            if (bv.is_used == 0 && bv.is_global == 0 && bv.is_module == 0) {
-                if (bv.name_len > 0 && bv.name_ptr[0] != cast(u8, 95)) {
-                    let is *ast.Node as bwn = ast.new_node(ast.NK_IDENT);
-                    bwn.tok_idx = bv.decl_tok_idx;
-                    sc.sem_warn_at2(bwn, "variavel nao utilizada", bv.name_ptr, bv.name_len);
-                }
-            }
-            bv = bv.next;
-        }
-        sc.exit_scope();
-        return;
-    }
-
-    // --- LET ---
-    if (k == ast.NK_LET) {
-        node.ty = resolve_type_ptr(cast(*u8, node.ty));
-        if (node.ty.kind == ast.TY_VOID) {
-            sc.sem_error_at2(node, "variavel nao pode ser void", node.name_ptr, node.name_len);
-        }
-        if (node.is_extern == 1) {
-            let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
-            var.is_extern = 1;
-            node.var_offset = var.offset;
-            node.is_global = var.is_global;
-            return;
-        }
-        if (cast(i64, node.init_expr) != 0) {
-            walk(node.init_expr);
-            // Literal narrowing
-            if (node.init_expr.kind == ast.NK_NUM) {
-                if (ty.can_narrow_literal(node.init_expr.val, cast(*u8, node.ty)) == 1) {
-                    node.init_expr.ty = node.ty;
-                }
-            }
-            // Type compatibility check
-            let is *ast.Type as init_ty = node.init_expr.ty;
-            if (cast(i64, init_ty) != 0 && cast(i64, init_ty) != cast(i64, node.ty)) {
-                let is *ast.Type as decl_ty = node.ty;
-                // Allow pointer assignments (cast checks elsewhere)
-                let is i32 as both_ptr with mut = 0;
-                if (init_ty.kind == ast.TY_PTR && decl_ty.kind == ast.TY_PTR) { both_ptr = 1; }
-                if (both_ptr == 0) {
-                    if (ty.is_safe_conversion(cast(*u8, init_ty), cast(*u8, decl_ty)) == 0) {
-                        sc.sem_error_at2(node, "tipo incompativel na inicializacao de", node.name_ptr, node.name_len);
-                    }
-                }
-            }
-        }
-        let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
-        var.decl_tok_idx = node.tok_idx;
-        node.var_offset = var.offset;
-        node.is_global = var.is_global;
-        if (var.asm_name_len > 0) {
-            node.asm_name_ptr = var.asm_name_ptr;
-            node.asm_name_len = var.asm_name_len;
-        }
-        return;
-    }
-
-    // --- Binary ops ---
+    if (k == ast.NK_RETURN) { walk_return(node); return; }
+    if (k == ast.NK_FN) { walk_fn_def(node); return; }
+    if (k == ast.NK_EXPR_STMT) { walk(node.expr); return; }
+    if (k == ast.NK_BLOCK) { walk_block(node); return; }
+    if (k == ast.NK_LET) { walk_let(node); return; }
     if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV || k == ast.NK_MOD || k == ast.NK_SHL || k == ast.NK_SHR || k == ast.NK_BAND || k == ast.NK_BOR || k == ast.NK_BXOR) {
-        walk(node.lhs);
-        walk(node.rhs);
-        // Literal narrowing (rhs is NUM, lhs is typed)
-        if (node.rhs.kind == ast.NK_NUM && node.lhs.kind != ast.NK_NUM) {
-            if (ty.can_narrow_literal(node.rhs.val, cast(*u8, node.lhs.ty)) == 1) {
-                node.rhs.ty = node.lhs.ty;
-            }
-        }
-        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
-            if (ty.can_narrow_literal(node.lhs.val, cast(*u8, node.rhs.ty)) == 1) {
-                node.lhs.ty = node.rhs.ty;
-            }
-        }
-        // Pointer arithmetic
-        if (k == ast.NK_ADD || k == ast.NK_SUB) {
-            if (node.lhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.rhs.ty)) == 1) {
-                node.ty = node.lhs.ty;
-                return;
-            }
-            if (node.rhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.lhs.ty)) == 1) {
-                if (k == ast.NK_SUB) { sc.sem_error_at(node, "subtracao int - ptr invalida"); }
-                node.ty = node.rhs.ty;
-                return;
-            }
-            if (node.lhs.ty.kind == ast.TY_PTR && node.rhs.ty.kind == ast.TY_PTR) {
-                if (k == ast.NK_SUB) { node.ty = ast.type_i64; return; }
-                sc.sem_error_at(node, "soma de dois ponteiros invalida");
-            }
-        }
-        // Choose wider type
-        if (node.lhs.ty.size > node.rhs.ty.size) {
-            node.ty = node.lhs.ty;
-        } else {
-            node.ty = node.rhs.ty;
-        }
-        return;
+        walk_binop(node); return;
     }
-
-    // --- Comparison ops ---
     if (k == ast.NK_EQ || k == ast.NK_NE || k == ast.NK_LT || k == ast.NK_LE || k == ast.NK_GT || k == ast.NK_GE) {
-        walk(node.lhs);
-        walk(node.rhs);
-        // Literal narrowing
-        if (node.rhs.kind == ast.NK_NUM && node.lhs.kind != ast.NK_NUM) {
-            if (ty.can_narrow_literal(node.rhs.val, cast(*u8, node.lhs.ty)) == 1) {
-                node.rhs.ty = node.lhs.ty;
-            }
-        }
-        if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
-            if (ty.can_narrow_literal(node.lhs.val, cast(*u8, node.rhs.ty)) == 1) {
-                node.lhs.ty = node.rhs.ty;
-            }
-        }
-        node.ty = ast.type_bool;
-        return;
+        walk_cmp(node); return;
     }
-
-    // --- LAND / LOR ---
-    if (k == ast.NK_LAND || k == ast.NK_LOR) {
-        walk(node.lhs);
-        walk(node.rhs);
-        node.ty = ast.type_bool;
-        return;
-    }
-
-    // --- DEFER ---
+    if (k == ast.NK_LAND || k == ast.NK_LOR) { walk(node.lhs); walk(node.rhs); node.ty = ast.type_bool; return; }
     if (k == ast.NK_DEFER) {
-        if (node.expr.kind != ast.NK_FNCALL) {
-            sc.sem_error_at(node, "defer so aceita chamadas de funcao");
-        }
-        walk(node.expr);
-        return;
+        if (node.expr.kind != ast.NK_FNCALL) { sc.sem_error_at(node, "defer so aceita chamadas de funcao"); }
+        walk(node.expr); return;
     }
-
-    // --- BREAK / CONTINUE ---
-    if (k == ast.NK_BREAK) {
-        if (sc.loop_depth == 0) { sc.sem_error_at(node, "break fora de loop"); }
-        return;
-    }
-    if (k == ast.NK_CONTINUE) {
-        if (sc.loop_depth == 0) { sc.sem_error_at(node, "continue fora de loop"); }
-        return;
-    }
-
-    // --- IF ---
-    if (k == ast.NK_IF) {
-        walk(node.cond);
-        walk(node.then_b);
-        if (cast(i64, node.else_b) != 0) { walk(node.else_b); }
-        return;
-    }
-
-    // --- WHILE ---
-    if (k == ast.NK_WHILE) {
-        walk(node.cond);
-        sc.loop_depth = sc.loop_depth + 1;
-        walk(node.body);
-        sc.loop_depth = sc.loop_depth - 1;
-        return;
-    }
-
-    // --- DO_WHILE ---
-    if (k == ast.NK_DO_WHILE) {
-        sc.loop_depth = sc.loop_depth + 1;
-        walk(node.body);
-        sc.loop_depth = sc.loop_depth - 1;
-        walk(node.cond);
-        return;
-    }
-
-    // --- FOR ---
-    if (k == ast.NK_FOR) {
-        sc.enter_scope();
-        if (cast(i64, node.for_init) != 0) { walk(node.for_init); }
-        if (cast(i64, node.cond) != 0) { walk(node.cond); }
-        if (cast(i64, node.for_step) != 0) { walk(node.for_step); }
-        sc.loop_depth = sc.loop_depth + 1;
-        walk(node.body);
-        sc.loop_depth = sc.loop_depth - 1;
-        sc.exit_scope();
-        return;
-    }
-
-    // --- ADDR ---
+    if (k == ast.NK_BREAK) { if (sc.loop_depth == 0) { sc.sem_error_at(node, "break fora de loop"); } return; }
+    if (k == ast.NK_CONTINUE) { if (sc.loop_depth == 0) { sc.sem_error_at(node, "continue fora de loop"); } return; }
+    if (k == ast.NK_IF) { walk(node.cond); walk(node.then_b); if (cast(i64, node.else_b) != 0) { walk(node.else_b); } return; }
+    if (k == ast.NK_WHILE) { walk(node.cond); sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; return; }
+    if (k == ast.NK_DO_WHILE) { sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; walk(node.cond); return; }
+    if (k == ast.NK_FOR) { walk_for(node); return; }
     if (k == ast.NK_ADDR) {
         walk(node.expr);
         let is *ast.Type as p = ast.new_type(ast.TY_PTR);
-        p.base = node.expr.ty;
-        p.size = 8;
-        node.ty = p;
-        return;
+        p.base = node.expr.ty; p.size = 8; node.ty = p; return;
     }
-
-    // --- DEREF ---
     if (k == ast.NK_DEREF) {
         walk(node.expr);
-        if (node.expr.ty.kind != ast.TY_PTR) {
-            sc.sem_error_at(node, "operador * requer ponteiro");
-        }
-        node.ty = node.expr.ty.base;
-        return;
+        if (node.expr.ty.kind != ast.TY_PTR) { sc.sem_error_at(node, "operador * requer ponteiro"); }
+        node.ty = node.expr.ty.base; return;
     }
-
-    // --- NEG ---
-    if (k == ast.NK_NEG) {
-        walk(node.expr);
-        node.ty = node.expr.ty;
-        return;
-    }
-
-    // --- BNOT ---
-    if (k == ast.NK_BNOT) {
-        walk(node.expr);
-        node.ty = node.expr.ty;
-        return;
-    }
-
-    // --- LNOT ---
-    if (k == ast.NK_LNOT) {
-        walk(node.expr);
-        node.ty = ast.type_bool;
-        return;
-    }
-
-    // --- INDEX ---
+    if (k == ast.NK_NEG) { walk(node.expr); node.ty = node.expr.ty; return; }
+    if (k == ast.NK_BNOT) { walk(node.expr); node.ty = node.expr.ty; return; }
+    if (k == ast.NK_LNOT) { walk(node.expr); node.ty = ast.type_bool; return; }
     if (k == ast.NK_INDEX) {
-        walk(node.lhs);
-        walk(node.rhs);
-        if (node.lhs.ty.kind != ast.TY_ARRAY && node.lhs.ty.kind != ast.TY_PTR) {
-            sc.sem_error_at(node, "indexacao requer array ou ponteiro");
-        }
-        node.ty = node.lhs.ty.base;
-        return;
+        walk(node.lhs); walk(node.rhs);
+        if (node.lhs.ty.kind != ast.TY_ARRAY && node.lhs.ty.kind != ast.TY_PTR) { sc.sem_error_at(node, "indexacao requer array ou ponteiro"); }
+        node.ty = node.lhs.ty.base; return;
     }
-
-    // --- ASSIGN ---
-    if (k == ast.NK_ASSIGN) {
-        walk(node.lhs);
-        walk(node.rhs);
-        // Check lvalue
-        let is i32 as lk = node.lhs.kind;
-        if (lk != ast.NK_IDENT && lk != ast.NK_DEREF && lk != ast.NK_INDEX && lk != ast.NK_MEMBER) {
-            sc.sem_error_at(node, "alvo de atribuicao invalido");
-        }
-        // Check immutability for identifiers
-        if (lk == ast.NK_IDENT) {
-            let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
-            if (cast(i64, var) != 0 && var.flags != ast.VF_MUT) {
-                sc.sem_error_at2(node, "nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
-            }
-        }
-        // Literal narrowing
-        if (node.rhs.kind == ast.NK_NUM) {
-            if (ty.can_narrow_literal(node.rhs.val, cast(*u8, node.lhs.ty)) == 1) {
-                node.rhs.ty = node.lhs.ty;
-            }
-        }
-        node.ty = node.lhs.ty;
-        return;
-    }
-
-    // --- CAST ---
-    if (k == ast.NK_CAST) {
-        walk(node.expr);
-        node.ty = resolve_type_ptr(cast(*u8, node.ty));
-        return;
-    }
-
-    // --- SIZEOF ---
+    if (k == ast.NK_ASSIGN) { walk_assign(node); return; }
+    if (k == ast.NK_CAST) { walk(node.expr); node.ty = resolve_type_ptr(cast(*u8, node.ty)); return; }
     if (k == ast.NK_SIZEOF) {
         node.ty = resolve_type_ptr(cast(*u8, node.ty));
-        node.kind = ast.NK_NUM;
-        node.val = cast(i64, node.ty.size);
-        node.ty = ast.type_i32;
-        return;
+        node.kind = ast.NK_NUM; node.val = cast(i64, node.ty.size); node.ty = ast.type_i32; return;
     }
-
-    // --- FN_PTR ---
-    if (k == ast.NK_FN_PTR) {
-        walk_fn_ptr_node(node);
-        return;
-    }
-
-    // --- VA_START ---
-    if (k == ast.NK_VA_START) {
-        walk(node.expr);
-        node.ty = ast.type_void;
-        return;
-    }
-
-    // --- FNCALL ---
-    if (k == ast.NK_FNCALL) {
-        walk_fncall(node);
-        return;
-    }
-
-    // --- SYSCALL ---
+    if (k == ast.NK_FN_PTR) { walk_fn_ptr_node(node); return; }
+    if (k == ast.NK_VA_START) { walk(node.expr); node.ty = ast.type_void; return; }
+    if (k == ast.NK_FNCALL) { walk_fncall(node); return; }
     if (k == ast.NK_SYSCALL) {
         node.ty = ast.type_i64;
         let is *ast.Node as a with mut = node.args;
         while (cast(i64, a) != 0) { walk(a); a = a.next; }
         return;
     }
-
-    // --- USE ---
     if (k == ast.NK_USE) { return; }
-
-    // --- ENUM_LIT ---
     if (k == ast.NK_ENUM_LIT) { return; }
-
-    // --- MATCH ---
-    if (k == ast.NK_MATCH) {
-        walk_match(node);
-        return;
-    }
-
-    // --- MEMBER ---
-    if (k == ast.NK_MEMBER) {
-        walk_member(node);
-        return;
-    }
+    if (k == ast.NK_MATCH) { walk_match(node); return; }
+    if (k == ast.NK_MEMBER) { walk_member(node); return; }
 }
 
 // === FNCALL handler ===
@@ -1093,81 +933,210 @@ fn walk_fn_ptr_node(node as *ast.Node) as void {
 }
 
 // === Multi-pass analysis ===
+// Pass IDs: 1=register_structs, 2=register_aliases, 3=resolve_fields,
+//           4=register_vars, 5=register_fns, 6=analyze_bodies
+
+fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
+    let is i32 as raw_len with mut = 0;
+    let is *u8 as raw_path with mut = cast(*u8, 0);
+    if (n.member_len > 0) {
+        raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
+    }
+    if (raw_len == 0) { return; }
+
+    let is i32 as norm_len with mut = 0;
+    let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
+    let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
+    let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
+
+    // Save state
+    let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
+    let is i32 as old_plen = sc.current_mod_prefix_len;
+    let is *u8 as old_dir = sc.current_source_dir_ptr;
+    let is i32 as old_dir_len = sc.current_source_dir_len;
+    sc.current_mod_prefix_ptr = prefix;
+    sc.current_mod_prefix_len = plen;
+
+    // Pass 1: register_structs — load module if not cached
+    if (pass_id == 1) {
+        let is *d.Module as cached = mod.find_module(prefix, plen);
+        if (cast(i64, cached) == 0) {
+            let is *u8 as body = load_module(raw_path, raw_len);
+            n.body = cast(*ast.Node, body);
+            if (n.member_len > 0) {
+                let is *d.Module as mm = d.new_module();
+                mm.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+                mm.name_len = n.member_len;
+                mm.prefix_ptr = d.str_dup(prefix, plen);
+                mm.prefix_len = plen;
+                mm.body = body;
+                mm.src_ptr = mod.last_loaded_src;
+                mm.src_size = mod.last_loaded_src_len;
+                mm.token_list = mod.last_loaded_tl;
+                let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
+                if (sd_len > 0) {
+                    mm.source_dir_ptr = d.str_dup(norm, sd_len);
+                    mm.source_dir_len = sd_len;
+                }
+                mm.next = mod.module_list;
+                mod.module_list = mm;
+            }
+            register_structs(body);
+        } else {
+            n.body = cast(*ast.Node, cached.body);
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+        }
+        sc.current_mod_prefix_ptr = old_prefix;
+        sc.current_mod_prefix_len = old_plen;
+        sc.current_source_dir_ptr = old_dir;
+        sc.current_source_dir_len = old_dir_len;
+        return;
+    }
+
+    // Pass 2: register_aliases — create scope, register module var
+    if (pass_id == 2) {
+        let is *d.Scope as outer_scope = sc.current_scope;
+        let is *d.Scope as mod_scope with mut = outer_scope;
+        let is *d.Module as existing with mut = cast(*d.Module, 0);
+
+        if (n.member_len > 0) {
+            existing = mod.find_module(prefix, plen);
+            if (cast(i64, existing) != 0 && cast(i64, existing.scope) != 0) {
+                mod_scope = existing.scope;
+            } else {
+                mod_scope = d.new_scope();
+                mod_scope.next_all = sc.all_scopes;
+                sc.all_scopes = mod_scope;
+                mod_scope.parent = sc.global_scope;
+                mod_scope.is_global = 1;
+                if (cast(i64, existing) != 0) {
+                    existing.scope = mod_scope;
+                }
+            }
+            sc.current_scope = mod_scope;
+        }
+
+        let is *d.Module as cached = mod.find_module(prefix, plen);
+        let is *u8 as mod_body with mut = cast(*u8, 0);
+        if (cast(i64, cached) != 0 && cast(i64, cached.body) != 0) {
+            mod_body = cached.body;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+        } else {
+            mod_body = load_module(raw_path, raw_len);
+        }
+        if (n.member_len > 0 && cast(i64, existing) == 0) {
+            let is *d.Module as modd = d.new_module();
+            modd.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+            modd.name_len = n.member_len;
+            modd.prefix_ptr = d.str_dup(prefix, plen);
+            modd.prefix_len = plen;
+            modd.scope = mod_scope;
+            modd.body = mod_body;
+            modd.src_ptr = mod.last_loaded_src;
+            modd.src_size = mod.last_loaded_src_len;
+            modd.token_list = mod.last_loaded_tl;
+            let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
+            if (sd_len > 0) {
+                modd.source_dir_ptr = d.str_dup(norm, sd_len);
+                modd.source_dir_len = sd_len;
+            }
+            modd.next = mod.module_list;
+            mod.module_list = modd;
+            existing = modd;
+        }
+        register_aliases(mod_body);
+        sc.current_scope = outer_scope;
+        if (n.member_len > 0) {
+            let is *d.Variable as var = sc.declare_var(n.member_ptr, n.member_len, cast(*u8, ast.type_void), ast.VF_NONE);
+            var.is_module = 1;
+            var.module_ref = cast(*u8, existing);
+        }
+        sc.current_mod_prefix_ptr = old_prefix;
+        sc.current_mod_prefix_len = old_plen;
+        sc.current_source_dir_ptr = old_dir;
+        sc.current_source_dir_len = old_dir_len;
+        return;
+    }
+
+    // Passes 3-6: switch to module scope, recurse into cached body
+    let is *d.Scope as outer = sc.current_scope;
+    if (n.member_len > 0) {
+        let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
+        if (cast(i64, var) != 0 && var.is_module == 1) {
+            let is *d.Module as _mr = cast(*d.Module, var.module_ref);
+            sc.current_scope = _mr.scope;
+        }
+    }
+
+    let is *d.Module as cached = mod.find_module(prefix, plen);
+
+    if (pass_id == 3) {
+        if (cast(i64, cached) != 0) {
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            resolve_fields(cached.body);
+        }
+    }
+    if (pass_id == 4) {
+        if (cast(i64, cached) != 0 && cached.vars_done == 0) {
+            cached.vars_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            register_vars(cached.body);
+        }
+    }
+    if (pass_id == 5) {
+        if (cast(i64, cached) != 0) {
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            register_fns(cached.body);
+        }
+    }
+    if (pass_id == 6) {
+        let is *u8 as old_sem_src = sc.sem_src;
+        let is i64 as old_sem_src_len = sc.sem_src_len;
+        let is *u8 as old_sem_fn = sc.sem_filename;
+        let is *u8 as old_sem_tl = sc.sem_token_list;
+        if (cast(i64, cached) != 0 && cached.bodies_done == 0) {
+            cached.bodies_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            if (cast(i64, cached.src_ptr) != 0) {
+                sc.sem_src = cached.src_ptr;
+                sc.sem_src_len = cached.src_size;
+                sc.sem_token_list = cached.token_list;
+            }
+            analyze_bodies(cached.body);
+        }
+        sc.sem_src = old_sem_src;
+        sc.sem_src_len = old_sem_src_len;
+        sc.sem_filename = old_sem_fn;
+        sc.sem_token_list = old_sem_tl;
+    }
+
+    sc.current_scope = outer;
+    sc.current_mod_prefix_ptr = old_prefix;
+    sc.current_mod_prefix_len = old_plen;
+    sc.current_source_dir_ptr = old_dir;
+    sc.current_source_dir_len = old_dir_len;
+}
 
 fn register_structs(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
-            // Process use - recurse into module body
-            let is i32 as plen with mut = 0;
-            let is *u8 as raw_path with mut = cast(*u8, 0);
-            let is i32 as raw_len with mut = 0;
-            if (n.member_len > 0) {
-                raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
-                // Use member_ptr as alias, name_ptr as path
-            }
-            if (raw_len > 0) {
-                let is i32 as norm_len with mut = 0;
-                let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
-                let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
-                plen = sc.get_mod_prefix_len(norm, norm_len);
-                let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
-                let is i32 as old_plen = sc.current_mod_prefix_len;
-                let is *u8 as old_dir = sc.current_source_dir_ptr;
-                let is i32 as old_dir_len = sc.current_source_dir_len;
-                sc.current_mod_prefix_ptr = prefix;
-                sc.current_mod_prefix_len = plen;
-                // Load module if not cached
-                let is *d.Module as cached = mod.find_module(prefix, plen);
-                if (cast(i64, cached) == 0) {
-                    let is *u8 as body = load_module(raw_path, raw_len);
-                    n.body = cast(*ast.Node, body);
-                    // Register in cache to avoid duplicate loads
-                    if (n.member_len > 0) {
-                        let is *d.Module as mm = d.new_module();
-                        mm.name_ptr = d.str_dup(n.member_ptr, n.member_len);
-                        mm.name_len = n.member_len;
-                        mm.prefix_ptr = d.str_dup(prefix, plen);
-                        mm.prefix_len = plen;
-                        mm.body = body;
-                        mm.src_ptr = mod.last_loaded_src;
-                        mm.src_size = mod.last_loaded_src_len;
-                        mm.token_list = mod.last_loaded_tl;
-                        // Store source dir from normalized path
-                        let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
-                        if (sd_len > 0) {
-                            mm.source_dir_ptr = d.str_dup(norm, sd_len);
-                            mm.source_dir_len = sd_len;
-                        }
-                        mm.next = mod.module_list;
-                        mod.module_list = mm;
-                    }
-                    register_structs(body);
-                } else {
-                    n.body = cast(*ast.Node, cached.body);
-                    // Set source dir from cached module
-                    sc.current_source_dir_ptr = cached.source_dir_ptr;
-                    sc.current_source_dir_len = cached.source_dir_len;
-                }
-                sc.current_mod_prefix_ptr = old_prefix;
-                sc.current_mod_prefix_len = old_plen;
-                sc.current_source_dir_ptr = old_dir;
-                sc.current_source_dir_len = old_dir_len;
-            }
+            visit_use_module(n, 1);
         } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0) {
             if (n.ty.kind == ast.TY_STRUCT) {
-                // Generic template? Store and skip
                 if (n.generic_param_count > 0) {
-                    // Copy generic params to type
                     n.ty.gen_params = n.generic_params;
                     n.ty.gen_param_count = n.generic_param_count;
-                    // Store fields on type
                     n.ty.fields = cast(*u8, n.stmts);
                     gn.store_template(n.ty.name_ptr, n.ty.name_len, n.generic_params, n.generic_param_count, cast(*u8, 0), cast(*u8, n.ty), 0);
                 } else {
-                    // Store fields on type
                     n.ty.fields = cast(*u8, n.stmts);
-                    // Mangle name
                     if (sc.current_mod_prefix_len > 0) {
                         let is i32 as mlen with mut = 0;
                         let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.ty.name_ptr, n.ty.name_len, &mlen);
@@ -1177,7 +1146,6 @@ fn register_structs(node as *u8) as void {
                     }
                 }
             } else if (n.ty.kind == ast.TY_ENUM) {
-                // Store fields (variants) on type
                 n.ty.fields = cast(*u8, n.stmts);
                 if (n.generic_param_count > 0) {
                     n.ty.gen_params = n.generic_params;
@@ -1202,87 +1170,7 @@ fn register_aliases(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
-            let is i32 as raw_len with mut = 0;
-            let is *u8 as raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
-            if (raw_len > 0) {
-                let is i32 as norm_len with mut = 0;
-                let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
-                let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
-                let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
-                let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
-                let is i32 as old_plen = sc.current_mod_prefix_len;
-                let is *u8 as old_dir2 = sc.current_source_dir_ptr;
-                let is i32 as old_dir_len2 = sc.current_source_dir_len;
-                sc.current_mod_prefix_ptr = prefix;
-                sc.current_mod_prefix_len = plen;
-
-                let is *d.Scope as outer_scope = sc.current_scope;
-                let is *d.Scope as mod_scope with mut = outer_scope;
-                let is *d.Module as existing with mut = cast(*d.Module, 0);
-
-                if (n.member_len > 0) {
-                    existing = mod.find_module(prefix, plen);
-                    if (cast(i64, existing) != 0 && cast(i64, existing.scope) != 0) {
-                        mod_scope = existing.scope;
-                    } else {
-                        mod_scope = d.new_scope();
-                        mod_scope.next_all = sc.all_scopes;
-                        sc.all_scopes = mod_scope;
-                        mod_scope.parent = sc.global_scope;
-                        mod_scope.is_global = 1;
-                        if (cast(i64, existing) != 0) {
-                            existing.scope = mod_scope;
-                        }
-                    }
-                    sc.current_scope = mod_scope;
-                }
-
-                // Recurse into module
-                let is *d.Module as cached = mod.find_module(prefix, plen);
-                let is *u8 as mod_body with mut = cast(*u8, 0);
-                if (cast(i64, cached) != 0 && cast(i64, cached.body) != 0) {
-                    mod_body = cached.body;
-                    sc.current_source_dir_ptr = cached.source_dir_ptr;
-                    sc.current_source_dir_len = cached.source_dir_len;
-                } else {
-                    mod_body = load_module(raw_path, raw_len);
-                }
-                // Ensure module entry exists
-                if (n.member_len > 0 && cast(i64, existing) == 0) {
-                    let is *d.Module as modd = d.new_module();
-                    modd.name_ptr = d.str_dup(n.member_ptr, n.member_len);
-                    modd.name_len = n.member_len;
-                    modd.prefix_ptr = d.str_dup(prefix, plen);
-                    modd.prefix_len = plen;
-                    modd.scope = mod_scope;
-                    modd.body = mod_body;
-                    modd.src_ptr = mod.last_loaded_src;
-                    modd.src_size = mod.last_loaded_src_len;
-                    modd.token_list = mod.last_loaded_tl;
-                    let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
-                    if (sd_len > 0) {
-                        modd.source_dir_ptr = d.str_dup(norm, sd_len);
-                        modd.source_dir_len = sd_len;
-                    }
-                    modd.next = mod.module_list;
-                    mod.module_list = modd;
-                    existing = modd;
-                }
-                register_aliases(mod_body);
-
-                sc.current_scope = outer_scope;
-
-                if (n.member_len > 0) {
-                    let is *d.Variable as var = sc.declare_var(n.member_ptr, n.member_len, cast(*u8, ast.type_void), ast.VF_NONE);
-                    var.is_module = 1;
-                    var.module_ref = cast(*u8, existing);
-                }
-
-                sc.current_mod_prefix_ptr = old_prefix;
-                sc.current_mod_prefix_len = old_plen;
-                sc.current_source_dir_ptr = old_dir2;
-                sc.current_source_dir_len = old_dir_len2;
-            }
+            visit_use_module(n, 2);
         } else if (n.kind == ast.NK_TYPE_ALIAS) {
             resolve_type(cast(*u8, n.ty));
             if (sc.current_mod_prefix_len > 0) {
@@ -1301,42 +1189,7 @@ fn resolve_fields(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
-            let is i32 as raw_len with mut = 0;
-            let is *u8 as raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
-            if (raw_len > 0) {
-                let is i32 as norm_len with mut = 0;
-                let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
-                let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
-                let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
-                let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
-                let is i32 as old_plen = sc.current_mod_prefix_len;
-                let is *u8 as old_dir = sc.current_source_dir_ptr;
-                let is i32 as old_dir_len = sc.current_source_dir_len;
-                sc.current_mod_prefix_ptr = prefix;
-                sc.current_mod_prefix_len = plen;
-
-                let is *d.Scope as outer = sc.current_scope;
-                if (n.member_len > 0) {
-                    let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
-                    if (cast(i64, var) != 0 && var.is_module == 1) {
-                        let is *d.Module as _mr = cast(*d.Module, var.module_ref);
-                        sc.current_scope = _mr.scope;
-                    }
-                }
-
-                let is *d.Module as cached = mod.find_module(prefix, plen);
-                if (cast(i64, cached) != 0) {
-                    sc.current_source_dir_ptr = cached.source_dir_ptr;
-                    sc.current_source_dir_len = cached.source_dir_len;
-                    resolve_fields(cached.body);
-                }
-
-                sc.current_scope = outer;
-                sc.current_mod_prefix_ptr = old_prefix;
-                sc.current_mod_prefix_len = old_plen;
-                sc.current_source_dir_ptr = old_dir;
-                sc.current_source_dir_len = old_dir_len;
-            }
+            visit_use_module(n, 3);
         } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_STRUCT) {
             if (n.generic_param_count == 0) {
                 let is i32 as offset with mut = 0;
@@ -1360,43 +1213,7 @@ fn register_vars(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
-            let is i32 as raw_len with mut = 0;
-            let is *u8 as raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
-            if (raw_len > 0) {
-                let is i32 as norm_len with mut = 0;
-                let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
-                let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
-                let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
-                let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
-                let is i32 as old_plen = sc.current_mod_prefix_len;
-                let is *u8 as old_dir = sc.current_source_dir_ptr;
-                let is i32 as old_dir_len = sc.current_source_dir_len;
-                sc.current_mod_prefix_ptr = prefix;
-                sc.current_mod_prefix_len = plen;
-
-                let is *d.Scope as outer = sc.current_scope;
-                if (n.member_len > 0) {
-                    let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
-                    if (cast(i64, var) != 0 && var.is_module == 1) {
-                        let is *d.Module as _mr = cast(*d.Module, var.module_ref);
-                        sc.current_scope = _mr.scope;
-                    }
-                }
-
-                let is *d.Module as cached = mod.find_module(prefix, plen);
-                if (cast(i64, cached) != 0 && cached.vars_done == 0) {
-                    cached.vars_done = 1;
-                    sc.current_source_dir_ptr = cached.source_dir_ptr;
-                    sc.current_source_dir_len = cached.source_dir_len;
-                    register_vars(cached.body);
-                }
-
-                sc.current_scope = outer;
-                sc.current_mod_prefix_ptr = old_prefix;
-                sc.current_mod_prefix_len = old_plen;
-                sc.current_source_dir_ptr = old_dir;
-                sc.current_source_dir_len = old_dir_len;
-            }
+            visit_use_module(n, 4);
         } else if (n.kind == ast.NK_LET) {
             walk(n);
         }
@@ -1408,56 +1225,18 @@ fn register_fns(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
-            let is i32 as raw_len with mut = 0;
-            let is *u8 as raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
-            if (raw_len > 0) {
-                let is i32 as norm_len with mut = 0;
-                let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
-                let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
-                let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
-                let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
-                let is i32 as old_plen = sc.current_mod_prefix_len;
-                let is *u8 as old_dir = sc.current_source_dir_ptr;
-                let is i32 as old_dir_len = sc.current_source_dir_len;
-                sc.current_mod_prefix_ptr = prefix;
-                sc.current_mod_prefix_len = plen;
-
-                let is *d.Scope as outer = sc.current_scope;
-                if (n.member_len > 0) {
-                    let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
-                    if (cast(i64, var) != 0 && var.is_module == 1) {
-                        let is *d.Module as _mr = cast(*d.Module, var.module_ref);
-                        sc.current_scope = _mr.scope;
-                    }
-                }
-
-                let is *d.Module as cached = mod.find_module(prefix, plen);
-                if (cast(i64, cached) != 0) {
-                    sc.current_source_dir_ptr = cached.source_dir_ptr;
-                    sc.current_source_dir_len = cached.source_dir_len;
-                    register_fns(cached.body);
-                }
-
-                sc.current_scope = outer;
-                sc.current_mod_prefix_ptr = old_prefix;
-                sc.current_mod_prefix_len = old_plen;
-                sc.current_source_dir_ptr = old_dir;
-                sc.current_source_dir_len = old_dir_len;
-            }
+            visit_use_module(n, 5);
         } else if (n.kind == ast.NK_FN) {
             if (n.generic_param_count == 0) {
-                // Resolve params and return type
                 let is *ast.Node as p with mut = n.params;
                 while (cast(i64, p) != 0) {
                     resolve_type(cast(*u8, p.ty));
                     p = p.next;
                 }
                 resolve_type(cast(*u8, n.return_type));
-
                 let is i32 as pc with mut = 0;
                 p = n.params;
                 while (cast(i64, p) != 0) { pc = pc + 1; p = p.next; }
-
                 let is *u8 as pt = d.pt_alloc(pc);
                 let is i32 as i with mut = 0;
                 p = n.params;
@@ -1479,57 +1258,7 @@ fn analyze_bodies(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
-            let is i32 as raw_len with mut = 0;
-            let is *u8 as raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
-            if (raw_len > 0) {
-                let is i32 as norm_len with mut = 0;
-                let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
-                let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
-                let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
-                let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
-                let is i32 as old_plen = sc.current_mod_prefix_len;
-                let is *u8 as old_dir = sc.current_source_dir_ptr;
-                let is i32 as old_dir_len = sc.current_source_dir_len;
-                let is *u8 as old_sem_src = sc.sem_src;
-                let is i64 as old_sem_src_len = sc.sem_src_len;
-                let is *u8 as old_sem_fn = sc.sem_filename;
-                let is *u8 as old_sem_tl = sc.sem_token_list;
-                sc.current_mod_prefix_ptr = prefix;
-                sc.current_mod_prefix_len = plen;
-
-                let is *d.Scope as outer = sc.current_scope;
-                if (n.member_len > 0) {
-                    let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
-                    if (cast(i64, var) != 0 && var.is_module == 1) {
-                        let is *d.Module as _mr = cast(*d.Module, var.module_ref);
-                        sc.current_scope = _mr.scope;
-                    }
-                }
-
-                let is *d.Module as cached = mod.find_module(prefix, plen);
-                if (cast(i64, cached) != 0 && cached.bodies_done == 0) {
-                    cached.bodies_done = 1;
-                    sc.current_source_dir_ptr = cached.source_dir_ptr;
-                    sc.current_source_dir_len = cached.source_dir_len;
-                    // Switch error reporting context to module
-                    if (cast(i64, cached.src_ptr) != 0) {
-                        sc.sem_src = cached.src_ptr;
-                        sc.sem_src_len = cached.src_size;
-                        sc.sem_token_list = cached.token_list;
-                    }
-                    analyze_bodies(cached.body);
-                }
-
-                sc.current_scope = outer;
-                sc.current_mod_prefix_ptr = old_prefix;
-                sc.current_mod_prefix_len = old_plen;
-                sc.current_source_dir_ptr = old_dir;
-                sc.current_source_dir_len = old_dir_len;
-                sc.sem_src = old_sem_src;
-                sc.sem_src_len = old_sem_src_len;
-                sc.sem_filename = old_sem_fn;
-                sc.sem_token_list = old_sem_tl;
-            }
+            visit_use_module(n, 6);
         } else if (n.kind == ast.NK_FN) {
             if (n.generic_param_count == 0 && n.is_extern == 0) {
                 walk(n);
