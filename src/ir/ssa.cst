@@ -22,7 +22,21 @@ struct SlotInfo {
 fn find_promotable(func as *d.IRFunction, slots as *SlotInfo, out_count as *i32) as void {
     let is i32 as count with mut = 0;
 
-    // Scan for LOAD/STORE with IMM offsets
+    // Pass 1: collect address-taken offsets (IR_ADDR with IMM)
+    let is [256]i64 as addr_taken;
+    let is i32 as at_count with mut = 0;
+    let is *d.IRInst as pre with mut = func.instructions;
+    while (cast(i64, pre) != 0) {
+        if (pre.is_dead == 0 && pre.op == d.IR_ADDR && pre.src1.op_type == d.OP_IMM) {
+            if (at_count < 256) {
+                addr_taken[at_count] = pre.src1.imm;
+                at_count = at_count + 1;
+            }
+        }
+        pre = pre.next;
+    }
+
+    // Pass 2: scan LOAD/STORE with IMM offsets, skip address-taken
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0) {
@@ -66,19 +80,21 @@ fn find_promotable(func as *d.IRFunction, slots as *SlotInfo, out_count as *i32)
                     if (cast(i64, ty) != 0) { s.type_ptr = ty; }
                 }
             }
-
-            // IR_ADDR with IMM: address taken → not promotable
-            if (inst.op == d.IR_ADDR && inst.src1.op_type == d.OP_IMM) {
-                let is i64 as addr_off = inst.src1.imm;
-                let is i32 as si with mut = 0;
-                while (si < count) {
-                    let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, si) * sizeof(SlotInfo));
-                    if (s.offset == addr_off) { s.promotable = 0; si = count; }
-                    si = si + 1;
-                }
-            }
         }
         inst = inst.next;
+    }
+
+    // Mark address-taken slots as non-promotable
+    let is i32 as ai with mut = 0;
+    while (ai < at_count) {
+        let is i64 as addr_off = addr_taken[ai];
+        let is i32 as si with mut = 0;
+        while (si < count) {
+            let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, si) * sizeof(SlotInfo));
+            if (s.offset == addr_off) { s.promotable = 0; si = count; }
+            si = si + 1;
+        }
+        ai = ai + 1;
     }
 
     *out_count = count;
@@ -507,10 +523,7 @@ fn destroy_ssa(blocks as *cfg.BasicBlock, nblocks as i32,
                     let is *d.IRInst as prev with mut = pbb.first;
                     if (cast(i64, prev) == cast(i64, term)) {
                         // Block has only the terminator — insert before it
-                        // Need to find the instruction in the global list that points to term
-                        // Walk from first to find prev
                         mov.next = term;
-                        // Find what points to term
                         let is *d.IRInst as scan with mut = func.instructions;
                         if (cast(i64, scan) == cast(i64, term)) {
                             func.instructions = mov;
@@ -520,6 +533,7 @@ fn destroy_ssa(blocks as *cfg.BasicBlock, nblocks as i32,
                             }
                             if (cast(i64, scan) != 0) { scan.next = mov; }
                         }
+                        pbb.first = mov;
                     } else {
                         while (cast(i64, prev.next) != cast(i64, term)) { prev = prev.next; }
                         cfg.insert_after(prev, mov);
