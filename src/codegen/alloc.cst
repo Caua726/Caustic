@@ -664,6 +664,35 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *AllocCtx) as void {
         i = i + 1;
     }
 
+    // === GET_ARG param index map (for ABI register exclusion in SELECT) ===
+    // Prevents allocator from assigning a GET_ARG vreg to another param's ABI register,
+    // which would cause clobber when codegen emits sequential GET_ARG moves.
+    let is *i32 as ga_param = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    i = 0;
+    while (i < n) {
+        let is *i32 as gp = cast(*i32, cast(i64, ga_param) + cast(i64, i) * 4);
+        *gp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+    let is i32 as ga_nargs with mut = func.num_args;
+    if (ga_nargs > 6) { ga_nargs = 6; }
+    let is *d.IRInst as ga_scan with mut = func.instructions;
+    while (cast(i64, ga_scan) != 0) {
+        if (ga_scan.is_dead == 0 && ga_scan.op == d.IR_GET_ARG) {
+            let is i32 as ga_pidx = cast(i32, ga_scan.src1.imm);
+            if (ga_pidx < 6 && ga_scan.dest.vreg < n) {
+                let is *i32 as gp = cast(*i32, cast(i64, ga_param) + cast(i64, ga_scan.dest.vreg) * 4);
+                *gp = ga_pidx;
+            }
+        }
+        ga_scan = ga_scan.next;
+    }
+    // ABI param register → allocator slot: rdi=slot8, rsi=slot7, r8=slot4, r9=slot5
+    // rdx and rcx are not in the allocatable set, so no conflict possible.
+    let is [6]i32 as ga_abi_slot;
+    ga_abi_slot[0] = 8;  ga_abi_slot[1] = 7;  ga_abi_slot[2] = cast(i32, 0 - 1);
+    ga_abi_slot[3] = cast(i32, 0 - 1); ga_abi_slot[4] = 4; ga_abi_slot[5] = 5;
+
     // === Build bit matrix interference graph ===
     let is i64 as bm_bits = cast(i64, n) * cast(i64, n);
     let is i64 as bm_bytes = (bm_bits + 7) / 8;
@@ -750,7 +779,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *AllocCtx) as void {
 
     // === Spill cost computation (10^depth per use) ===
     let is [5]i32 as pow10;
-    pow10[0] = 1; pow10[1] = 10; pow10[2] = 100; pow10[3] = 1000; pow10[4] = 10000;
+    pow10[0] = 1; pow10[1] = 100; pow10[2] = 10000; pow10[3] = 100000; pow10[4] = 100000;
 
     // crosses_call
     i = 0;
@@ -1080,13 +1109,22 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *AllocCtx) as void {
                     let is i32 as best_cost with mut = INT_MAX;
                     let is *i32 as scp_b = cast(*i32, cast(i64, spill_cost) + cast(i64, *best_p) * 4);
                     best_cost = *scp_b;
+                    let is *i32 as bv2p = cast(*i32, cast(i64, v2iv) + cast(i64, *best_p) * 4);
+                    let is *LiveInterval as iv_best with mut = gc2_get_iv(ctx.intervals, *bv2p);
+                    let is i32 as range_best with mut = iv_best.end_pos - iv_best.start + 1;
+                    if (range_best < 1) { range_best = 1; }
                     let is i32 as si with mut = 1;
                     while (si < spill_cnt) {
                         let is *i32 as swp = cast(*i32, cast(i64, spill_wl) + cast(i64, si) * 4);
                         let is *i32 as sci = cast(*i32, cast(i64, spill_cost) + cast(i64, *swp) * 4);
-                        if (*sci < best_cost) {
+                        let is *i32 as cv2p = cast(*i32, cast(i64, v2iv) + cast(i64, *swp) * 4);
+                        let is *LiveInterval as iv_cur = gc2_get_iv(ctx.intervals, *cv2p);
+                        let is i32 as range_cur with mut = iv_cur.end_pos - iv_cur.start + 1;
+                        if (range_cur < 1) { range_cur = 1; }
+                        if (cast(i64, *sci) * cast(i64, range_best) < cast(i64, best_cost) * cast(i64, range_cur)) {
                             best_cost = *sci;
                             best = si;
+                            range_best = range_cur;
                         }
                         si = si + 1;
                     }
@@ -1165,6 +1203,19 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *AllocCtx) as void {
             used[6] = 1;  // r10
             used[7] = 1;  // rsi
             used[8] = 1;  // rdi
+        }
+
+        // Exclude other params' ABI registers for GET_ARG vregs
+        // Prevents sequential GET_ARG emission from clobbering later params' ABI regs.
+        let is *i32 as ga_v = cast(*i32, cast(i64, ga_param) + cast(i64, v) * 4);
+        if (*ga_v >= 0) {
+            let is i32 as ga_ai with mut = 0;
+            while (ga_ai < ga_nargs) {
+                if (ga_ai != *ga_v && ga_abi_slot[ga_ai] >= 0) {
+                    used[ga_abi_slot[ga_ai]] = 1;
+                }
+                ga_ai = ga_ai + 1;
+            }
         }
 
         // Try coalesce hint: check if v has alias partner with color
@@ -1286,5 +1337,6 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *AllocCtx) as void {
     mem.gfree(cast(*u8, simplify_wl));
     mem.gfree(cast(*u8, freeze_wl));
     mem.gfree(cast(*u8, spill_wl));
+    mem.gfree(cast(*u8, ga_param));
     mem.gfree(cast(*u8, stack));
 }
