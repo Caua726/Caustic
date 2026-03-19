@@ -1,6 +1,9 @@
 use "../../std/mem.cst" as mem;
 use "../ir/defs.cst" as d;
 
+// === Config ===
+let is i32 as al_opt_level with mut = 0;
+
 // === Register allocator structs ===
 
 struct LiveInterval {
@@ -492,4 +495,314 @@ fn get_loc(vreg as i32, ctx as *AllocCtx) as i32 {
 fn is_mem(vreg as i32, ctx as *AllocCtx) as i32 {
     if (get_loc(vreg, ctx) < 0) { return 1; }
     return 0;
+}
+
+// === Graph coloring register allocator (-O1) ===
+// Uses interference graph with Chaitin-Briggs simplification.
+
+fn gc_interferes(ctx as *AllocCtx, a as i32, b as i32) as i32 {
+    let is *LiveInterval as ia = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, a) * sizeof(LiveInterval));
+    let is *LiveInterval as ib = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, b) * sizeof(LiveInterval));
+    if (ia.start == INT_MAX || ib.start == INT_MAX) { return 0; }
+    // Overlap: a.start <= b.end && b.start <= a.end
+    if (ia.start <= ib.end_pos && ib.start <= ia.end_pos) { return 1; }
+    return 0;
+}
+
+fn gc_mark_callee(reg as i32, ctx as *AllocCtx) as void {
+    if (reg == 3) { ctx.used_callee_mask = ctx.used_callee_mask | 1; }
+    if (reg == 10) { ctx.used_callee_mask = ctx.used_callee_mask | 2; }
+    if (reg == 11) { ctx.used_callee_mask = ctx.used_callee_mask | 4; }
+    if (reg == 12) { ctx.used_callee_mask = ctx.used_callee_mask | 8; }
+    if (reg == 15) { ctx.used_callee_mask = ctx.used_callee_mask | 16; }
+}
+
+fn graph_coloring_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
+    let is i32 as vc = func.vreg_count;
+    ctx.vreg_to_loc = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, i) * 4);
+        *vp = cast(i32, 0 - 1000);
+        i = i + 1;
+    }
+    ctx.used_callee_mask = 0;
+    ctx.active_idx = cast(*i32, mem.galloc(10 * 4));
+    let is i32 as ai with mut = 0;
+    while (ai < 10) {
+        let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ai) * 4);
+        *ap = cast(i32, 0 - 1);
+        ai = ai + 1;
+    }
+
+    // Allocatable registers
+    let is [10]i32 as regs;
+    regs[0] = 3; regs[1] = 10; regs[2] = 11; regs[3] = 12;
+    regs[4] = 6; regs[5] = 7; regs[6] = 8;
+    regs[7] = 4; regs[8] = 5; regs[9] = 15;
+
+    // Build degree array and coalesce hints
+    let is *i32 as degree = cast(*i32, mem.galloc(cast(i64, ctx.count) * 4));
+    let is *i32 as color = cast(*i32, mem.galloc(cast(i64, ctx.count) * 4));
+    let is *i32 as on_stack = cast(*i32, mem.galloc(cast(i64, ctx.count) * 4));
+    let is *i32 as stack = cast(*i32, mem.galloc(cast(i64, ctx.count) * 4));
+    let is i32 as stack_top with mut = 0;
+
+    // Build MOV hints: mov_hint[interval_idx] = partner interval_idx
+    let is *i32 as mov_hint = cast(*i32, mem.galloc(cast(i64, ctx.count) * 4));
+
+    i = 0;
+    while (i < ctx.count) {
+        let is *i32 as dp = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
+        *dp = 0;
+        let is *i32 as cp = cast(*i32, cast(i64, color) + cast(i64, i) * 4);
+        *cp = cast(i32, 0 - 1);
+        let is *i32 as sp = cast(*i32, cast(i64, on_stack) + cast(i64, i) * 4);
+        *sp = 0;
+        let is *i32 as mp = cast(*i32, cast(i64, mov_hint) + cast(i64, i) * 4);
+        *mp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+
+    // Build coalesce hints from IR_MOV
+    let is *d.IRInst as minst with mut = func.instructions;
+    while (cast(i64, minst) != 0) {
+        if (minst.is_dead == 0 && minst.op == d.IR_MOV && minst.src1.op_type == d.OP_VREG && minst.dest.op_type == d.OP_VREG) {
+            let is i32 as vd = minst.dest.vreg;
+            let is i32 as vs = minst.src1.vreg;
+            // Find interval indices for these vregs
+            let is i32 as id with mut = cast(i32, 0 - 1);
+            let is i32 as is2 with mut = cast(i32, 0 - 1);
+            let is i32 as si with mut = 0;
+            while (si < ctx.count) {
+                let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, si) * sizeof(LiveInterval));
+                if (iv.vreg == vd) { id = si; }
+                if (iv.vreg == vs) { is2 = si; }
+                si = si + 1;
+            }
+            if (id >= 0 && is2 >= 0) {
+                let is *i32 as md = cast(*i32, cast(i64, mov_hint) + cast(i64, id) * 4);
+                if (*md < 0) { *md = is2; }
+                let is *i32 as ms = cast(*i32, cast(i64, mov_hint) + cast(i64, is2) * 4);
+                if (*ms < 0) { *ms = id; }
+            }
+        }
+        minst = minst.next;
+    }
+
+    // Compute degrees (count interfering intervals)
+    i = 0;
+    while (i < ctx.count) {
+        let is *LiveInterval as ia = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval));
+        if (ia.start != INT_MAX) {
+            let is i32 as j with mut = i + 1;
+            while (j < ctx.count) {
+                if (gc_interferes(ctx, i, j) == 1) {
+                    let is *i32 as di = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
+                    *di = *di + 1;
+                    let is *i32 as dj = cast(*i32, cast(i64, degree) + cast(i64, j) * 4);
+                    *dj = *dj + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Simplification: push low-degree nodes onto stack
+    let is i32 as remaining with mut = 0;
+    i = 0;
+    while (i < ctx.count) {
+        let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval));
+        if (iv.start != INT_MAX) { remaining = remaining + 1; }
+        i = i + 1;
+    }
+
+    while (remaining > 0) {
+        let is i32 as found with mut = 0;
+        // Find a node with degree < 10 (K=10 allocatable registers)
+        i = 0;
+        while (i < ctx.count && found == 0) {
+            let is *i32 as osp = cast(*i32, cast(i64, on_stack) + cast(i64, i) * 4);
+            if (*osp == 0) {
+                let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval));
+                if (iv.start != INT_MAX) {
+                    let is *i32 as dp = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
+                    if (*dp < 10) {
+                        // Push onto stack
+                        let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
+                        *stp = i;
+                        stack_top = stack_top + 1;
+                        *osp = 1;
+                        // Decrement neighbors' degrees
+                        let is i32 as j with mut = 0;
+                        while (j < ctx.count) {
+                            let is *i32 as osj = cast(*i32, cast(i64, on_stack) + cast(i64, j) * 4);
+                            if (*osj == 0 && gc_interferes(ctx, i, j) == 1) {
+                                let is *i32 as dj = cast(*i32, cast(i64, degree) + cast(i64, j) * 4);
+                                *dj = *dj - 1;
+                            }
+                            j = j + 1;
+                        }
+                        remaining = remaining - 1;
+                        found = 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (found == 0) {
+            // All remaining have degree >= K — must spill one
+            // Pick the one with lowest spill_cost
+            let is i32 as best with mut = cast(i32, 0 - 1);
+            let is i32 as best_cost with mut = INT_MAX;
+            i = 0;
+            while (i < ctx.count) {
+                let is *i32 as osp = cast(*i32, cast(i64, on_stack) + cast(i64, i) * 4);
+                if (*osp == 0) {
+                    let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval));
+                    if (iv.start != INT_MAX && iv.spill_cost < best_cost) {
+                        best_cost = iv.spill_cost;
+                        best = i;
+                    }
+                }
+                i = i + 1;
+            }
+            if (best >= 0) {
+                // Push as potential spill
+                let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
+                *stp = best;
+                stack_top = stack_top + 1;
+                let is *i32 as osp = cast(*i32, cast(i64, on_stack) + cast(i64, best) * 4);
+                *osp = 2; // 2 = potential spill
+                let is i32 as j with mut = 0;
+                while (j < ctx.count) {
+                    let is *i32 as osj = cast(*i32, cast(i64, on_stack) + cast(i64, j) * 4);
+                    if (*osj == 0 && gc_interferes(ctx, best, j) == 1) {
+                        let is *i32 as dj = cast(*i32, cast(i64, degree) + cast(i64, j) * 4);
+                        *dj = *dj - 1;
+                    }
+                    j = j + 1;
+                }
+                remaining = remaining - 1;
+            }
+        }
+    }
+
+    // Select: pop stack and assign colors
+    while (stack_top > 0) {
+        stack_top = stack_top - 1;
+        let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
+        let is i32 as idx = *stp;
+        let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, idx) * sizeof(LiveInterval));
+
+        // Find available colors: check all neighbors
+        let is [10]i32 as avail;
+        let is i32 as ri with mut = 0;
+        while (ri < 10) { avail[ri] = 1; ri = ri + 1; }
+
+        // Check call-crossing: if interval spans a call, exclude caller-saved
+        let is i32 as crosses_call = spans_call(iv.start, iv.end_pos, ctx);
+
+        let is i32 as j with mut = 0;
+        while (j < ctx.count) {
+            if (j != idx) {
+                let is *i32 as cj = cast(*i32, cast(i64, color) + cast(i64, j) * 4);
+                if (*cj >= 0 && gc_interferes(ctx, idx, j) == 1) {
+                    // Mark this color as unavailable
+                    let is i32 as slot = reg_to_slot(*cj);
+                    if (slot >= 0) { avail[slot] = 0; }
+                }
+            }
+            j = j + 1;
+        }
+
+        // Mark caller-saved as unavailable if interval spans a call
+        if (crosses_call == 1) {
+            avail[4] = 0; // r8
+            avail[5] = 0; // r9
+            avail[6] = 0; // r10
+            avail[7] = 0; // rsi
+            avail[8] = 0; // rdi
+        }
+
+        // Try coalesce hint first
+        let is i32 as chosen with mut = cast(i32, 0 - 1);
+        let is *i32 as mhp = cast(*i32, cast(i64, mov_hint) + cast(i64, idx) * 4);
+        if (*mhp >= 0) {
+            let is *i32 as partner_color = cast(*i32, cast(i64, color) + cast(i64, *mhp) * 4);
+            if (*partner_color >= 0) {
+                let is i32 as ps = reg_to_slot(*partner_color);
+                if (ps >= 0 && avail[ps] == 1) { chosen = *partner_color; }
+            }
+        }
+
+        // Pick first available color
+        if (chosen < 0) {
+            ri = 0;
+            while (ri < 10 && chosen < 0) {
+                if (avail[ri] == 1) { chosen = regs[ri]; }
+                ri = ri + 1;
+            }
+        }
+
+        if (chosen >= 0) {
+            let is *i32 as cp = cast(*i32, cast(i64, color) + cast(i64, idx) * 4);
+            *cp = chosen;
+            let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, iv.vreg) * 4);
+            *vp = chosen;
+            iv.reg = chosen;
+            gc_mark_callee(chosen, ctx);
+        } else {
+            // Actual spill
+            let is i32 as spill = ctx.next_spill;
+            ctx.next_spill = ctx.next_spill + 1;
+            let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, iv.vreg) * 4);
+            *vp = 0 - spill;
+            iv.spill_loc = spill;
+        }
+    }
+
+    ctx.stack_slots = ctx.next_spill - 1;
+
+    // Verify: no two interfering vregs share the same register
+    let is i32 as vi with mut = 0;
+    while (vi < ctx.count) {
+        let is *LiveInterval as iva = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, vi) * sizeof(LiveInterval));
+        if (iva.start != INT_MAX && iva.reg >= 0) {
+            // Check call-crossing safety
+            let is i32 as cc = spans_call(iva.start, iva.end_pos, ctx);
+            if (cc == 1 && is_caller_saved(iva.reg) == 1) {
+                // BUG: caller-saved register assigned across a call — force spill
+                let is i32 as spill = ctx.next_spill;
+                ctx.next_spill = ctx.next_spill + 1;
+                let is *i32 as vp2 = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, iva.vreg) * 4);
+                *vp2 = 0 - spill;
+                iva.reg = cast(i32, 0 - 1);
+                ctx.stack_slots = ctx.next_spill - 1;
+            }
+            // Check no conflicts with other allocated vregs
+            let is i32 as vj with mut = vi + 1;
+            while (vj < ctx.count) {
+                let is *LiveInterval as ivb = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, vj) * sizeof(LiveInterval));
+                if (ivb.start != INT_MAX && ivb.reg == iva.reg && gc_interferes(ctx, vi, vj) == 1) {
+                    // BUG: two interfering vregs have the same register — spill one
+                    let is i32 as spill = ctx.next_spill;
+                    ctx.next_spill = ctx.next_spill + 1;
+                    let is *i32 as vp2 = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, ivb.vreg) * 4);
+                    *vp2 = 0 - spill;
+                    ivb.reg = cast(i32, 0 - 1);
+                    ctx.stack_slots = ctx.next_spill - 1;
+                }
+                vj = vj + 1;
+            }
+        }
+        vi = vi + 1;
+    }
+
+    mem.gfree(cast(*u8, degree));
+    mem.gfree(cast(*u8, color));
+    mem.gfree(cast(*u8, on_stack));
+    mem.gfree(cast(*u8, stack));
+    mem.gfree(cast(*u8, mov_hint));
 }

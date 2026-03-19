@@ -15,31 +15,67 @@ let is i32 as out_fd with mut;
 let is *u8 as cg_filename with mut;
 let is i32 as cg_filename_len with mut;
 
-// === Peephole: track last spill store to skip redundant reload ===
-// After store_op writes a vreg to a spill slot, if the very next load_op
-// reads the same vreg into the same register, we skip the redundant load.
-let is i32 as ph_vreg with mut = 99999;       // last spilled vreg (99999 = none)
-let is i32 as ph_ridx with mut = 99999;       // register index that holds it
+// === Register cache: track which phys reg holds which spilled vreg ===
+// rc_vreg[reg_idx] = vreg currently cached in that register (99999 = empty)
+// Only tracks SPILLED vregs (register-allocated vregs don't need caching).
+let is [16]i32 as rc_vreg with mut;
 
-fn ph_invalidate() as void { ph_vreg = 99999; }
+fn rc_init() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
+}
+
+fn ph_invalidate() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
+}
+
+// Invalidate a specific register (e.g., when it's overwritten)
+fn rc_invalidate_reg(idx as i32) as void {
+    if (idx >= 0 && idx < 16) { rc_vreg[idx] = 99999; }
+}
+
+// Record that phys reg idx now holds spilled vreg
+fn rc_set(idx as i32, vreg as i32) as void {
+    if (idx >= 0 && idx < 16) { rc_vreg[idx] = vreg; }
+}
+
+// Find which register holds a given vreg. Returns reg idx or -1.
+fn rc_find(vreg as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 16) {
+        if (rc_vreg[i] == vreg) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Invalidate all entries for a vreg (when it's redefined)
+fn rc_invalidate_vreg(vreg as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) {
+        if (rc_vreg[i] == vreg) { rc_vreg[i] = 99999; }
+        i = i + 1;
+    }
+}
 
 fn reg_name_to_idx(name as *u8) as i32 {
     if (name[0] == 114) {
         // r...
         if (name[1] == 97) { return 0; } // rax
         if (name[1] == 99) { return 1; } // rcx
+        if (name[1] == 100 && name[2] == 105) { return 5; } // rdi (check before rdx!)
         if (name[1] == 100) { return 2; } // rdx
         if (name[1] == 98) { return 3; } // rbx
         if (name[1] == 115) { return 4; } // rsi
-        if (name[1] == 100 && name[2] == 105) { return 5; } // rdi
         if (name[1] == 49 && name[2] == 53) { return 15; } // r15
-        if (name[1] == 49 && name[2] == 52) { return 14; } // r14
-        if (name[1] == 49 && name[2] == 51) { return 13; } // r13
-        if (name[1] == 49 && name[2] == 50) { return 12; } // r12
-        if (name[1] == 49 && name[2] == 49) { return 11; } // r11
-        if (name[1] == 49 && name[2] == 48) { return 10; } // r10
-        if (name[1] == 56) { return 8; }  // r8
-        if (name[1] == 57) { return 9; }  // r9
+        if (name[1] == 49 && name[2] == 52) { return 12; } // r14 → idx 12
+        if (name[1] == 49 && name[2] == 51) { return 11; } // r13 → idx 11
+        if (name[1] == 49 && name[2] == 50) { return 10; } // r12 → idx 10
+        if (name[1] == 49 && name[2] == 49) { return 9; } // r11 → idx 9
+        if (name[1] == 49 && name[2] == 48) { return 8; } // r10 → idx 8
+        if (name[1] == 56) { return 6; }  // r8 → idx 6
+        if (name[1] == 57) { return 7; }  // r9 → idx 7
     }
     return 99999;
 }
@@ -270,6 +306,7 @@ fn get_scratch_idx(vreg as i32, ctx as *al.AllocCtx) as i32 {
 
 fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
+    let is i32 as tidx = reg_name_to_idx(target);
     if (loc >= 0) {
         let is *u8 as rn = reg64(loc);
         if (cast(i64, rn) != cast(i64, target)) {
@@ -279,25 +316,40 @@ fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
             out_cstr(rn);
             out_char(10);
         }
-        ph_invalidate();
+        // Register-allocated vreg moved to target — invalidate target's cache
+        rc_invalidate_reg(tidx);
     } else {
-        // Peephole: skip redundant reload of same vreg to same register
-        if (ph_vreg == vreg && ph_ridx == reg_name_to_idx(target)) {
-            ph_invalidate();
+        // Spilled vreg: check register cache
+        let is i32 as cached = rc_find(vreg);
+        if (cached >= 0) {
+            // Vreg is cached in a register
+            if (cached == tidx) {
+                // Already in target register — skip load entirely
+                return;
+            }
+            // In a different register — emit mov instead of memory load
+            out_cstr("  mov ");
+            out_cstr(target);
+            out_cstr(", ");
+            out_cstr(reg64(cached));
+            out_char(10);
+            rc_set(tidx, vreg);
             return;
         }
-        ph_invalidate();
+        // Not cached — load from spill slot
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         out_cstr("  mov ");
         out_cstr(target);
         out_cstr(", QWORD PTR [rbp-");
         out_int(off);
         out_cstr("]\n");
+        rc_set(tidx, vreg);
     }
 }
 
 fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
+    let is i32 as sidx = reg_name_to_idx(source);
     if (loc >= 0) {
         let is *u8 as rn = reg64(loc);
         if (cast(i64, rn) != cast(i64, source)) {
@@ -307,7 +359,10 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
             out_cstr(source);
             out_char(10);
         }
-        ph_invalidate();
+        // Invalidate source reg's cache since it was used as a temp
+        rc_invalidate_reg(sidx);
+        // Invalidate dest reg's cache (rn may have cached a spilled vreg)
+        rc_invalidate_reg(loc);
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         out_cstr("  mov QWORD PTR [rbp-");
@@ -315,9 +370,9 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
         out_cstr("], ");
         out_cstr(source);
         out_char(10);
-        // Track this spill store for peephole
-        ph_vreg = vreg;
-        ph_ridx = reg_name_to_idx(source);
+        // Track this spill store in register cache
+        rc_invalidate_vreg(vreg);
+        rc_set(sidx, vreg);
     }
 }
 
@@ -421,6 +476,9 @@ fn gen_binop(inst as *d.IRInst, ctx as *al.AllocCtx, op_name as *u8) as void {
             out_cstr(", ");
             emit_src2(inst, ctx);
             out_char(10);
+            // The op just clobbered dr — clear any stale cache entry
+            // (load_op may have set rc_set(dest_loc, src1.vreg) above)
+            rc_invalidate_reg(dest_loc);
         } else {
             load_op(inst.src1.vreg, ctx, "rax");
             out_cstr("  ");
@@ -840,6 +898,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_SET_CTX) {
         if (inst.src1.op_type == d.OP_IMM) {
             out_line("xor r10, r10");
+            rc_invalidate_reg(8); // r10 = idx 8
         } else {
             load_op(inst.src1.vreg, ctx, "r10");
         }
@@ -852,6 +911,28 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is *u8 as scr = reg64(si);
         let is *u8 as scr32 = reg32(si);
         if (inst.src1.op_type == d.OP_VREG) {
+            let is AddrMode as am = try_match_addr(inst.src1.vreg, ctx);
+            if (am.matched == 1) {
+                // Emit: mov/movsx scr, SIZE PTR [rax + rcx * scale]
+                // Both base and index are spilled (checked in try_match_addr)
+                load_op(am.base_vreg, ctx, "rax");
+                load_op(am.index_vreg, ctx, "rcx");
+                if (sz == 8) {
+                    out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                } else if (sz == 4) {
+                    if (sgn == 1) { out_cstr("  movsxd "); out_cstr(scr); } else { out_cstr("  mov "); out_cstr(scr32); }
+                    out_cstr(", DWORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                } else if (sz == 2) {
+                    if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
+                    out_cstr(scr); out_cstr(", WORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                } else if (sz == 1) {
+                    if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
+                    out_cstr(scr); out_cstr(", BYTE PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                } else {
+                    out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                }
+                store_op(inst.dest.vreg, ctx, scr);
+            } else {
             load_op(inst.src1.vreg, ctx, scr);
             if (sz == 8) {
                 out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR ["); out_cstr(scr); out_cstr("]\n");
@@ -868,6 +949,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR ["); out_cstr(scr); out_cstr("]\n");
             }
             store_op(inst.dest.vreg, ctx, scr);
+            }
         } else {
             // Stack offset (IMM)
             if (sz == 8) {
@@ -974,12 +1056,17 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         out_char(10);
         out_line("cld");
         out_line("rep movsb");
+        // rep movsb clobbers rdi, rsi, rcx
+        rc_invalidate_reg(5); // rdi
+        rc_invalidate_reg(4); // rsi
+        rc_invalidate_reg(1); // rcx
         return;
     }
     if (op == d.IR_ASM) {
         out_cstr("  ");
         out_str(inst.asm_str_ptr, inst.asm_str_len);
         out_char(10);
+        ph_invalidate(); // inline asm can clobber any register
         return;
     }
     // IR_CAST
@@ -1081,13 +1168,267 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     out_line("mov QWORD PTR [rcx+16], rax");
 }
 
+// === Instruction selection: use counts + pattern matching on IR ===
+// vreg_uses[v] = number of times v appears as src1, src2, or STORE/COPY dest
+let is *i32 as isel_uses with mut;
+let is i32 as isel_vc with mut = 0;
+
+fn isel_init(func as *d.IRFunction) as void {
+    isel_vc = func.vreg_count;
+    isel_uses = cast(*i32, mem.galloc(cast(i64, isel_vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < isel_vc) {
+        let is *i32 as p = cast(*i32, cast(i64, isel_uses) + cast(i64, i) * 4);
+        *p = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg < isel_vc) {
+                let is *i32 as p = cast(*i32, cast(i64, isel_uses) + cast(i64, inst.src1.vreg) * 4);
+                *p = *p + 1;
+            }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg < isel_vc) {
+                let is *i32 as p = cast(*i32, cast(i64, isel_uses) + cast(i64, inst.src2.vreg) * 4);
+                *p = *p + 1;
+            }
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG && inst.dest.vreg < isel_vc) {
+                let is *i32 as p = cast(*i32, cast(i64, isel_uses) + cast(i64, inst.dest.vreg) * 4);
+                *p = *p + 1;
+            }
+        }
+        inst = inst.next;
+    }
+}
+
+fn isel_get_uses(vreg as i32) as i32 {
+    if (vreg < 0 || vreg >= isel_vc) { return 99; }
+    let is *i32 as p = cast(*i32, cast(i64, isel_uses) + cast(i64, vreg) * 4);
+    return *p;
+}
+
+// vreg_def[v] = pointer to the IRInst that defines vreg v (0 = unknown)
+let is *i64 as isel_defs with mut;
+
+fn isel_init_defs(func as *d.IRFunction) as void {
+    isel_defs = cast(*i64, mem.galloc(cast(i64, isel_vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < isel_vc) {
+        let is *i64 as p = cast(*i64, cast(i64, isel_defs) + cast(i64, i) * 8);
+        *p = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG) {
+            let is i32 as dv = inst.dest.vreg;
+            if (dv >= 0 && dv < isel_vc) {
+                let is *i64 as p = cast(*i64, cast(i64, isel_defs) + cast(i64, dv) * 8);
+                *p = cast(i64, inst);
+            }
+        }
+        inst = inst.next;
+    }
+}
+
+fn isel_get_def(vreg as i32) as *d.IRInst {
+    if (vreg < 0 || vreg >= isel_vc) { return cast(*d.IRInst, 0); }
+    let is *i64 as p = cast(*i64, cast(i64, isel_defs) + cast(i64, vreg) * 8);
+    return cast(*d.IRInst, *p);
+}
+
+// Addressing mode result: [base_reg + index_reg * scale]
+// scale: 1, 2, 4, or 8. If scale=0, no index.
+struct AddrMode {
+    base_vreg as i32;
+    index_vreg as i32;
+    scale as i32;
+    matched as i32;
+}
+
+// Try to match addr = ADD(base, SHL(index, log2(scale))) where scale is 1/2/4/8
+// Returns matched=1 if successful, 0 otherwise.
+fn try_match_addr(addr_vreg as i32, ctx as *al.AllocCtx) as AddrMode {
+    let is AddrMode as r;
+    r.matched = 0;
+    r.base_vreg = addr_vreg;
+    r.index_vreg = 0;
+    r.scale = 0;
+    let is *d.IRInst as def = isel_get_def(addr_vreg);
+    if (cast(i64, def) == 0) { return r; }
+    if (def.op != d.IR_ADD) { return r; }
+    if (def.src1.op_type != d.OP_VREG || def.src2.op_type != d.OP_VREG) { return r; }
+    // Only fuse if the ADD result has exactly 1 use (this LOAD/STORE)
+    if (isel_get_uses(addr_vreg) != 1) { return r; }
+    // Check if src2 is SHL(index, shift) where shift is 0/1/2/3
+    let is *d.IRInst as shl_def = isel_get_def(def.src2.vreg);
+    if (cast(i64, shl_def) == 0) { return r; }
+    if (shl_def.op != d.IR_SHL) { return r; }
+    if (shl_def.src2.op_type != d.OP_IMM) { return r; }
+    let is i64 as shift = shl_def.src2.imm;
+    if (shift < 0 || shift > 3) { return r; }
+    // Only fuse if SHL result has exactly 1 use (the ADD)
+    if (isel_get_uses(def.src2.vreg) != 1) { return r; }
+    r.base_vreg = def.src1.vreg;
+    r.index_vreg = shl_def.src1.vreg;
+    // Safety: base and index must be spilled (not register-allocated) because
+    // the register allocator may have reused their physical registers for the
+    // ADD/SHL results by this point. Spilled values are always available.
+    if (al.is_mem(r.base_vreg, ctx) == 0 || al.is_mem(r.index_vreg, ctx) == 0) { return r; }
+    if (shift == 0) { r.scale = 1; }
+    else if (shift == 1) { r.scale = 2; }
+    else if (shift == 2) { r.scale = 4; }
+    else { r.scale = 8; }
+    r.matched = 1;
+    return r;
+}
+
+fn size_name(sz as i32) as *u8 {
+    if (sz == 8) { return "QWORD PTR"; }
+    if (sz == 4) { return "DWORD PTR"; }
+    if (sz == 2) { return "WORD PTR"; }
+    if (sz == 1) { return "BYTE PTR"; }
+    return "QWORD PTR";
+}
+
+fn size_reg(idx as i32, sz as i32) as *u8 {
+    if (sz == 8) { return reg64(idx); }
+    if (sz == 4) { return reg32(idx); }
+    if (sz == 2) { return reg16(idx); }
+    if (sz == 1) { return reg8(idx); }
+    return reg64(idx);
+}
+
+// Pattern: IR_IMM v=const + IR_STORE [addr]=v → mov PTR [addr], const
+// Only when addr is a vreg (indirect store) and imm fits 32-bit
+fn try_fuse_imm_store(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    let is *d.IRInst as nx = inst.next;
+    if (cast(i64, nx) == 0 || nx.is_dead == 1) { return 0; }
+    if (nx.op != d.IR_STORE) { return 0; }
+    if (nx.src1.op_type != d.OP_VREG || nx.src1.vreg != inst.dest.vreg) { return 0; }
+    // Safety: only fuse if the IMM vreg has exactly 1 use (the STORE)
+    if (isel_get_uses(inst.dest.vreg) != 1) { return 0; }
+    if (nx.dest.op_type != d.OP_VREG) { return 0; }
+    let is i64 as val = inst.src1.imm;
+    if (val > 2147483647 || val < 0 - 2147483647) { return 0; }
+    let is i32 as sz = get_type_size(nx.cast_to);
+    if (sz > 8) { return 0; }
+    // Emit: mov SIZE PTR [addr_reg], imm
+    load_op(nx.dest.vreg, ctx, "rcx");
+    out_cstr("  mov ");
+    out_cstr(size_name(sz));
+    out_cstr(" [rcx], ");
+    out_int(val);
+    out_char(10);
+    nx.is_dead = 1;
+    return 1;
+}
+
+// Pattern: IR_IMM v=const + IR_STORE dest=IMM(offset), src1=v → mov PTR [rbp-off], const
+// Store immediate to stack without loading into register first
+fn try_fuse_imm_store_stack(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    let is *d.IRInst as nx = inst.next;
+    if (cast(i64, nx) == 0 || nx.is_dead == 1) { return 0; }
+    if (nx.op != d.IR_STORE) { return 0; }
+    if (nx.src1.op_type != d.OP_VREG || nx.src1.vreg != inst.dest.vreg) { return 0; }
+    if (isel_get_uses(inst.dest.vreg) != 1) { return 0; }
+    if (nx.dest.op_type != d.OP_IMM) { return 0; }
+    let is i64 as val = inst.src1.imm;
+    if (val > 2147483647 || val < 0 - 2147483647) { return 0; }
+    let is i32 as sz = get_type_size(nx.cast_to);
+    if (sz > 8) { return 0; }
+    // Emit: mov SIZE PTR [rbp-off], imm
+    out_cstr("  mov ");
+    out_cstr(size_name(sz));
+    out_cstr(" [rbp-");
+    out_int(nx.dest.imm);
+    out_cstr("], ");
+    out_int(val);
+    out_char(10);
+    nx.is_dead = 1;
+    return 1;
+}
+
+// Pattern: IR_LOAD v1=[rbp-X] + IR_ADD/SUB v2=v1,imm + IR_STORE [rbp-X]=v2
+// → add/sub SIZE PTR [rbp-X], imm
+fn try_fuse_inc_stack(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    if (inst.src1.op_type != d.OP_IMM) { return 0; }
+    let is *d.IRInst as nx = inst.next;
+    if (cast(i64, nx) == 0 || nx.is_dead == 1) { return 0; }
+    if (nx.op != d.IR_ADD && nx.op != d.IR_SUB) { return 0; }
+    if (nx.src1.op_type != d.OP_VREG || nx.src1.vreg != inst.dest.vreg) { return 0; }
+    if (nx.src2.op_type != d.OP_IMM) { return 0; }
+    let is i64 as addval = nx.src2.imm;
+    if (addval > 2147483647 || addval < 0 - 2147483647) { return 0; }
+    let is *d.IRInst as nx2 = nx.next;
+    if (cast(i64, nx2) == 0 || nx2.is_dead == 1) { return 0; }
+    if (nx2.op != d.IR_STORE) { return 0; }
+    if (nx2.dest.op_type != d.OP_IMM) { return 0; }
+    if (nx2.dest.imm != inst.src1.imm) { return 0; }
+    if (nx2.src1.op_type != d.OP_VREG || nx2.src1.vreg != nx.dest.vreg) { return 0; }
+    let is i32 as sz = get_type_size(inst.cast_to);
+    if (sz > 8) { return 0; }
+    // Emit: add/sub SIZE PTR [rbp-X], imm
+    if (nx.op == d.IR_ADD) { out_cstr("  add "); }
+    else { out_cstr("  sub "); }
+    out_cstr(size_name(sz));
+    out_cstr(" [rbp-");
+    out_int(inst.src1.imm);
+    out_cstr("], ");
+    out_int(addval);
+    out_char(10);
+    // Mark consumed instructions dead but keep them for vreg tracking
+    nx.is_dead = 1;
+    nx2.is_dead = 1;
+    // The LOAD result (inst.dest) may still be needed if it has other uses
+    // For safety, still emit the load normally
+    return 0;
+}
+
 // === gen_inst: thin dispatcher ===
 
 fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
-    // Peephole: invalidate on calls
+    // Invalidate scratch registers (rax=0, rcx=1, rdx=2)
+    rc_invalidate_reg(0);
+    rc_invalidate_reg(1);
+    rc_invalidate_reg(2);
+
+    // Invalidate dest register — it will be overwritten by this instruction
+    if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
+        let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
+        if (dest_loc >= 0) {
+            rc_invalidate_reg(dest_loc);
+        }
+        // Also invalidate any cached entry for this vreg (it's being redefined)
+        rc_invalidate_vreg(inst.dest.vreg);
+    }
+
+    // Invalidate arg registers written by SET_ARG
+    if (op == d.IR_SET_ARG) {
+        let is i32 as aidx = cast(i32, inst.dest.imm);
+        if (aidx == 0) { rc_invalidate_reg(5); }
+        if (aidx == 1) { rc_invalidate_reg(4); }
+        if (aidx == 2) { rc_invalidate_reg(2); }
+        if (aidx == 3) { rc_invalidate_reg(1); }
+        if (aidx == 4) { rc_invalidate_reg(6); }
+        if (aidx == 5) { rc_invalidate_reg(7); }
+    }
+
+    // Full invalidation on calls (all caller-saved regs clobbered)
     if (op == d.IR_CALL || op == d.IR_SYSCALL) { ph_invalidate(); }
+
+    // Instruction selection: try fused patterns before standard emission
+    if (op == d.IR_IMM) {
+        if (try_fuse_imm_store(inst, ctx) == 1) { return; }
+        if (try_fuse_imm_store_stack(inst, ctx) == 1) { return; }
+    }
+    if (op == d.IR_LOAD) {
+        try_fuse_inc_stack(inst, ctx);
+        // Note: try_fuse_inc_stack returns 0 always — load still emitted normally
+    }
 
     if (op == d.IR_IMM || op == d.IR_MOV) { gen_inst_imm_mov(inst, ctx); return; }
     if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV || op == d.IR_MOD || op == d.IR_NEG) { gen_inst_arith(inst, ctx); return; }
@@ -1103,12 +1444,18 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 // === gen_func ===
 
 fn gen_func(func as *d.IRFunction) as void {
+    // Init register cache, instruction selection use counts, and def table
+    rc_init();
+    isel_init(func);
+    isel_init_defs(func);
+
     // Build intervals and allocate registers
     let is *al.AllocCtx as ctx = al.new_alloc_ctx();
     ctx.func = cast(*u8, func);
     ctx.next_spill = 1;
 
     al.build_intervals(func, ctx);
+    // GC disabled temporarily for debugging — using linear scan for all
     al.linear_scan_alloc(func, ctx);
     io.write_str(linux.STDERR, "    alloc ok, vregs=");
     io.write_int(linux.STDERR, cast(i64, func.vreg_count));
@@ -1281,6 +1628,10 @@ fn emit_data(prog as *d.IRProgram) as void {
 }
 
 // === codegen entry ===
+
+fn set_opt_level(level as i32) as void {
+    al.al_opt_level = level;
+}
 
 fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
     let is *d.IRProgram as p = cast(*d.IRProgram, prog);
