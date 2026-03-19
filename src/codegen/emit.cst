@@ -431,6 +431,7 @@ fn emit_mov_imm(vreg as i32, ctx as *al.AllocCtx, val as i64) as void {
             out_cstr("  mov QWORD PTR [rbp-");
             out_int(off);
             out_cstr("], rax\n");
+            if (al.al_opt_level >= 1) { rc_invalidate_reg(0); }
         } else {
             out_cstr("  mov QWORD PTR [rbp-");
             out_int(off);
@@ -540,6 +541,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
         if (inst.src2.op_type == d.OP_IMM) {
             load_op(inst.src1.vreg, ctx, scr);
+            if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
             out_cstr("  mov rcx, ");
             out_int(inst.src2.imm);
             out_char(10);
@@ -566,6 +568,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             let is i64 as tmp with mut = inst.src2.imm;
             while (tmp > 1) { tmp = tmp >> 1; shift = shift + 1; }
             if (is_signed_type(inst.cast_to) == 1) {
+                if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
                 if (shift == 1) {
                     out_cstr("  mov rcx, "); out_cstr(scr); out_char(10);
                     out_line("shr rcx, 63");
@@ -586,6 +589,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         }
         load_op(inst.src1.vreg, ctx, "rax");
         if (inst.src2.op_type == d.OP_IMM) {
+            if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
             out_cstr("  mov rcx, "); out_int(inst.src2.imm); out_char(10);
         } else {
             load_op(inst.src2.vreg, ctx, "rcx");
@@ -609,6 +613,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             load_op(inst.src1.vreg, ctx, scr);
             let is i64 as mask = inst.src2.imm - 1;
             if (is_signed_type(inst.cast_to) == 1) {
+                if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
                 out_cstr("  mov rcx, "); out_cstr(scr); out_char(10);
                 out_cstr("  sar "); out_cstr(scr); out_cstr(", 63\n");
                 out_cstr("  and "); out_cstr(scr); out_cstr(", "); out_int(mask); out_char(10);
@@ -624,6 +629,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         }
         load_op(inst.src1.vreg, ctx, "rax");
         if (inst.src2.op_type == d.OP_IMM) {
+            if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
             out_cstr("  mov rcx, "); out_int(inst.src2.imm); out_char(10);
         } else {
             load_op(inst.src2.vreg, ctx, "rcx");
@@ -655,6 +661,7 @@ fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_FNEG) {
         load_op(inst.src1.vreg, ctx, "rax");
         out_line("movq xmm0, rax");
+        if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
         out_line("mov rcx, 0x8000000000000000");
         out_line("movq xmm1, rcx");
         out_line("xorpd xmm0, xmm1");
@@ -1016,6 +1023,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             } else {
                 // Struct > 8 bytes: rax is a pointer to the struct data.
                 // Copy from [rax] to [rbp-dest] using rcx as scratch.
+                if (al.al_opt_level >= 1) { rc_invalidate_reg(0); rc_invalidate_reg(1); }
                 out_line("mov rcx, rax");
                 let is i32 as soff with mut = 0;
                 while (soff + 8 <= sz) {
@@ -1177,6 +1185,7 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     out_int(cast(i64, ctx.va_save_offset));
     out_cstr("]\n");
     out_line("mov QWORD PTR [rcx+16], rax");
+    if (al.al_opt_level >= 1) { rc_invalidate_reg(0); }
 }
 
 // === Instruction selection: use counts + pattern matching on IR ===
@@ -1403,11 +1412,6 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
     if (al.al_opt_level >= 1) {
-        // Invalidate scratch registers (rax=0, rcx=1, rdx=2)
-        rc_invalidate_reg(0);
-        rc_invalidate_reg(1);
-        rc_invalidate_reg(2);
-
         // Invalidate dest register — it will be overwritten by this instruction
         if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
             let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
@@ -1416,17 +1420,6 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             }
             // Also invalidate any cached entry for this vreg (it's being redefined)
             rc_invalidate_vreg(inst.dest.vreg);
-        }
-
-        // Invalidate arg registers written by SET_ARG
-        if (op == d.IR_SET_ARG) {
-            let is i32 as aidx = cast(i32, inst.dest.imm);
-            if (aidx == 0) { rc_invalidate_reg(5); }
-            if (aidx == 1) { rc_invalidate_reg(4); }
-            if (aidx == 2) { rc_invalidate_reg(2); }
-            if (aidx == 3) { rc_invalidate_reg(1); }
-            if (aidx == 4) { rc_invalidate_reg(6); }
-            if (aidx == 5) { rc_invalidate_reg(7); }
         }
 
         // Full invalidation on calls (all caller-saved regs clobbered)
