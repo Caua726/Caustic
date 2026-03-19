@@ -306,7 +306,6 @@ fn get_scratch_idx(vreg as i32, ctx as *al.AllocCtx) as i32 {
 
 fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
-    let is i32 as tidx = reg_name_to_idx(target);
     if (loc >= 0) {
         let is *u8 as rn = reg64(loc);
         if (cast(i64, rn) != cast(i64, target)) {
@@ -316,40 +315,44 @@ fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
             out_cstr(rn);
             out_char(10);
         }
-        // Register-allocated vreg moved to target — invalidate target's cache
-        rc_invalidate_reg(tidx);
+        if (al.al_opt_level >= 1) {
+            rc_invalidate_reg(reg_name_to_idx(target));
+        }
     } else {
-        // Spilled vreg: check register cache
-        let is i32 as cached = rc_find(vreg);
-        if (cached >= 0) {
-            // Vreg is cached in a register
-            if (cached == tidx) {
-                // Already in target register — skip load entirely
+        if (al.al_opt_level >= 1) {
+            // Spilled vreg: check register cache
+            let is i32 as tidx = reg_name_to_idx(target);
+            let is i32 as cached = rc_find(vreg);
+            if (cached >= 0) {
+                if (cached == tidx) { return; }
+                out_cstr("  mov ");
+                out_cstr(target);
+                out_cstr(", ");
+                out_cstr(reg64(cached));
+                out_char(10);
+                rc_set(tidx, vreg);
                 return;
             }
-            // In a different register — emit mov instead of memory load
+            let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
             out_cstr("  mov ");
             out_cstr(target);
-            out_cstr(", ");
-            out_cstr(reg64(cached));
-            out_char(10);
+            out_cstr(", QWORD PTR [rbp-");
+            out_int(off);
+            out_cstr("]\n");
             rc_set(tidx, vreg);
-            return;
+        } else {
+            let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+            out_cstr("  mov ");
+            out_cstr(target);
+            out_cstr(", QWORD PTR [rbp-");
+            out_int(off);
+            out_cstr("]\n");
         }
-        // Not cached — load from spill slot
-        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-        out_cstr("  mov ");
-        out_cstr(target);
-        out_cstr(", QWORD PTR [rbp-");
-        out_int(off);
-        out_cstr("]\n");
-        rc_set(tidx, vreg);
     }
 }
 
 fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
-    let is i32 as sidx = reg_name_to_idx(source);
     if (loc >= 0) {
         let is *u8 as rn = reg64(loc);
         if (cast(i64, rn) != cast(i64, source)) {
@@ -359,10 +362,11 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
             out_cstr(source);
             out_char(10);
         }
-        // Invalidate source reg's cache since it was used as a temp
-        rc_invalidate_reg(sidx);
-        // Invalidate dest reg's cache (rn may have cached a spilled vreg)
-        rc_invalidate_reg(loc);
+        if (al.al_opt_level >= 1) {
+            let is i32 as sidx = reg_name_to_idx(source);
+            rc_invalidate_reg(sidx);
+            rc_invalidate_reg(loc);
+        }
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         out_cstr("  mov QWORD PTR [rbp-");
@@ -370,9 +374,10 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
         out_cstr("], ");
         out_cstr(source);
         out_char(10);
-        // Track this spill store in register cache
-        rc_invalidate_vreg(vreg);
-        rc_set(sidx, vreg);
+        if (al.al_opt_level >= 1) {
+            rc_invalidate_vreg(vreg);
+            rc_set(reg_name_to_idx(source), vreg);
+        }
     }
 }
 
@@ -478,7 +483,7 @@ fn gen_binop(inst as *d.IRInst, ctx as *al.AllocCtx, op_name as *u8) as void {
             out_char(10);
             // The op just clobbered dr — clear any stale cache entry
             // (load_op may have set rc_set(dest_loc, src1.vreg) above)
-            rc_invalidate_reg(dest_loc);
+            if (al.al_opt_level >= 1) { rc_invalidate_reg(dest_loc); }
         } else {
             load_op(inst.src1.vreg, ctx, "rax");
             out_cstr("  ");
@@ -813,14 +818,14 @@ fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_LABEL) {
-        ph_invalidate();
+        if (al.al_opt_level >= 1) { ph_invalidate(); }
         out_cstr(".L");
         out_int(cast(i64, inst.dest.label));
         out_cstr(":\n");
         return;
     }
     if (op == d.IR_JMP) {
-        ph_invalidate();
+        if (al.al_opt_level >= 1) { ph_invalidate(); }
         out_cstr("  jmp .L");
         out_int(cast(i64, inst.dest.label));
         out_char(10);
@@ -898,7 +903,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_SET_CTX) {
         if (inst.src1.op_type == d.OP_IMM) {
             out_line("xor r10, r10");
-            rc_invalidate_reg(8); // r10 = idx 8
+            if (al.al_opt_level >= 1) { rc_invalidate_reg(8); }
         } else {
             load_op(inst.src1.vreg, ctx, "r10");
         }
@@ -911,7 +916,11 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is *u8 as scr = reg64(si);
         let is *u8 as scr32 = reg32(si);
         if (inst.src1.op_type == d.OP_VREG) {
-            let is AddrMode as am = try_match_addr(inst.src1.vreg, ctx);
+            let is AddrMode as am with mut;
+            am.matched = 0;
+            if (al.al_opt_level >= 1) {
+                am = try_match_addr(inst.src1.vreg, ctx);
+            }
             if (am.matched == 1) {
                 // Emit: mov/movsx scr, SIZE PTR [rax + rcx * scale]
                 // Both base and index are spilled (checked in try_match_addr)
@@ -1057,16 +1066,18 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         out_line("cld");
         out_line("rep movsb");
         // rep movsb clobbers rdi, rsi, rcx
-        rc_invalidate_reg(5); // rdi
-        rc_invalidate_reg(4); // rsi
-        rc_invalidate_reg(1); // rcx
+        if (al.al_opt_level >= 1) {
+            rc_invalidate_reg(5);
+            rc_invalidate_reg(4);
+            rc_invalidate_reg(1);
+        }
         return;
     }
     if (op == d.IR_ASM) {
         out_cstr("  ");
         out_str(inst.asm_str_ptr, inst.asm_str_len);
         out_char(10);
-        ph_invalidate(); // inline asm can clobber any register
+        if (al.al_opt_level >= 1) { ph_invalidate(); }
         return;
     }
     // IR_CAST
@@ -1391,43 +1402,45 @@ fn try_fuse_inc_stack(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
 fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
-    // Invalidate scratch registers (rax=0, rcx=1, rdx=2)
-    rc_invalidate_reg(0);
-    rc_invalidate_reg(1);
-    rc_invalidate_reg(2);
+    if (al.al_opt_level >= 1) {
+        // Invalidate scratch registers (rax=0, rcx=1, rdx=2)
+        rc_invalidate_reg(0);
+        rc_invalidate_reg(1);
+        rc_invalidate_reg(2);
 
-    // Invalidate dest register — it will be overwritten by this instruction
-    if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
-        let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
-        if (dest_loc >= 0) {
-            rc_invalidate_reg(dest_loc);
+        // Invalidate dest register — it will be overwritten by this instruction
+        if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
+            let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
+            if (dest_loc >= 0) {
+                rc_invalidate_reg(dest_loc);
+            }
+            // Also invalidate any cached entry for this vreg (it's being redefined)
+            rc_invalidate_vreg(inst.dest.vreg);
         }
-        // Also invalidate any cached entry for this vreg (it's being redefined)
-        rc_invalidate_vreg(inst.dest.vreg);
-    }
 
-    // Invalidate arg registers written by SET_ARG
-    if (op == d.IR_SET_ARG) {
-        let is i32 as aidx = cast(i32, inst.dest.imm);
-        if (aidx == 0) { rc_invalidate_reg(5); }
-        if (aidx == 1) { rc_invalidate_reg(4); }
-        if (aidx == 2) { rc_invalidate_reg(2); }
-        if (aidx == 3) { rc_invalidate_reg(1); }
-        if (aidx == 4) { rc_invalidate_reg(6); }
-        if (aidx == 5) { rc_invalidate_reg(7); }
-    }
+        // Invalidate arg registers written by SET_ARG
+        if (op == d.IR_SET_ARG) {
+            let is i32 as aidx = cast(i32, inst.dest.imm);
+            if (aidx == 0) { rc_invalidate_reg(5); }
+            if (aidx == 1) { rc_invalidate_reg(4); }
+            if (aidx == 2) { rc_invalidate_reg(2); }
+            if (aidx == 3) { rc_invalidate_reg(1); }
+            if (aidx == 4) { rc_invalidate_reg(6); }
+            if (aidx == 5) { rc_invalidate_reg(7); }
+        }
 
-    // Full invalidation on calls (all caller-saved regs clobbered)
-    if (op == d.IR_CALL || op == d.IR_SYSCALL) { ph_invalidate(); }
+        // Full invalidation on calls (all caller-saved regs clobbered)
+        if (op == d.IR_CALL || op == d.IR_SYSCALL) { ph_invalidate(); }
 
-    // Instruction selection: try fused patterns before standard emission
-    if (op == d.IR_IMM) {
-        if (try_fuse_imm_store(inst, ctx) == 1) { return; }
-        if (try_fuse_imm_store_stack(inst, ctx) == 1) { return; }
-    }
-    if (op == d.IR_LOAD) {
-        try_fuse_inc_stack(inst, ctx);
-        // Note: try_fuse_inc_stack returns 0 always — load still emitted normally
+        // Instruction selection: try fused patterns before standard emission
+        if (op == d.IR_IMM) {
+            if (try_fuse_imm_store(inst, ctx) == 1) { return; }
+            if (try_fuse_imm_store_stack(inst, ctx) == 1) { return; }
+        }
+        if (op == d.IR_LOAD) {
+            try_fuse_inc_stack(inst, ctx);
+            // Note: try_fuse_inc_stack returns 0 always — load still emitted normally
+        }
     }
 
     if (op == d.IR_IMM || op == d.IR_MOV) { gen_inst_imm_mov(inst, ctx); return; }
@@ -1446,8 +1459,10 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 fn gen_func(func as *d.IRFunction) as void {
     // Init register cache, instruction selection use counts, and def table
     rc_init();
-    isel_init(func);
-    isel_init_defs(func);
+    if (al.al_opt_level >= 1) {
+        isel_init(func);
+        isel_init_defs(func);
+    }
 
     // Build intervals and allocate registers
     let is *al.AllocCtx as ctx = al.new_alloc_ctx();
