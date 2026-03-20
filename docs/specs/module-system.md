@@ -60,16 +60,13 @@ When someone does `use "sdl3.cst" as sdl;`, all internal `use` aliases become su
 2. `.video` → submodule (the `use "video.cst" as video` inside the index)
 3. `.create_window()` → function inside `video.cst`
 
-### Module caching
-No changes needed. The existing module cache handles deduplication — if two files import the same submodule, it's parsed once.
-
 ### Internal `use` visibility
 All `use` statements inside a module become visible as submodules. There is no private/public distinction. A module's internal `use "std/mem.cst" as mem;` would technically be accessible as `sdl.mem.galloc()`, but this is acceptable — no performance cost and it's not harmful.
 
 ## Compiler changes
 
 ### Lexer
-- Add `TK_ONLY` keyword (token type for `only`)
+- Add `TK_ONLY` with imut = 78 (next available after TK_TYPE = 77)
 
 ### Parser (`parse_use`)
 Current: `use STRING as IDENT ;`
@@ -91,20 +88,41 @@ Add to the `use` node:
 - `only_names` — array of identifiers (null if no `only`)
 - `only_count` — number of identifiers in the filter
 
+### Semantic (defs.cst)
+Add a `SubModule` struct and submodule list to `Module`:
+
+```cst
+struct SubModule {
+    alias_ptr as *u8;   // "video", "events", etc.
+    alias_len as i32;
+    module_ref as *u8;  // pointer to the child Module
+    next as *u8;        // linked list
+}
+```
+
+Add to `Module`:
+- `submodules as *u8` — head of SubModule linked list (null if no submodules)
+- `submodule_count as i32`
+
 ### Semantic (`visit_use_module`)
 When processing a `use` with `only`:
 1. Parse the target module (the index file)
 2. For each `use` statement inside the index:
    - If `only` list is present and this `use` alias is NOT in the list → skip (don't parse/walk the submodule)
    - If `only` list is absent or alias IS in the list → process normally
-3. Store submodule references for dot-notation resolution
+3. For each processed submodule, create a `SubModule` entry and attach to the parent Module's `submodules` list
 
 ### Semantic (dot notation)
 Extend member access resolution to check if the left side is a module alias with submodules:
-- `sdl.video` → resolve `sdl` as module, find submodule `video`
-- `sdl.video.create_window` → resolve `sdl.video` as submodule, find function `create_window`
+- `sdl.video` → resolve `sdl` as Module, walk `submodules` list to find entry with alias `video`, return its `module_ref`
+- `sdl.video.create_window` → resolve `sdl.video` as sub-Module, find function `create_window` via normal function lookup
 
-This likely extends `walk_member` or the FNCALL resolution in `walk_fncall`.
+This extends `walk_fncall` (Case 2 — module.function) to handle chained dot access.
+
+### Module caching with `only`
+The `only` filter does NOT affect what is cached — it restricts what is **accessible**. All submodules of the same index file are always parsed into the same Module cache entry. The `only` filter controls which SubModule entries are created in the parent Module's submodule list. This avoids the problem where two files importing the same index with different `only` filters would get incompatible cache states.
+
+The "performance win" of `only` is therefore at the **name resolution** level (unused submodules are not linked/walked), not at the parse level. For large libraries, the main saving is in reduced codegen (functions from unimported submodules are not marked reachable).
 
 ## Files to change
 

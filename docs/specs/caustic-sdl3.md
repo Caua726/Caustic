@@ -187,38 +187,71 @@ fn poll() as i32 {
     return *tp;
 }
 
-// Typed accessors for the last polled event
+// Typed accessors — ONLY valid after poll() returns the matching event type.
+// Calling key_scancode() after a MOUSEMOTION event reads garbage.
+
+// Valid after KEYDOWN or KEYUP
 fn key_scancode() as i32 {
     let is *i32 as p = cast(*i32, cast(i64, &_ev) + 20);
     return *p;
 }
 
-fn mouse_x() as i32 {
-    // SDL_MouseMotionEvent.x offset
+// Valid after MOUSEMOTION
+fn mouse_x() as f32 {
     let is *f32 as p = cast(*f32, cast(i64, &_ev) + 24);
-    return cast(i32, *p);
+    return *p;
 }
 
-fn mouse_y() as i32 {
+fn mouse_y() as f32 {
     let is *f32 as p = cast(*f32, cast(i64, &_ev) + 28);
+    return *p;
+}
+
+// Valid after MOUSEBUTTONDOWN or MOUSEBUTTONUP
+fn mouse_button() as i32 {
+    let is *u8 as p = cast(*u8, cast(i64, &_ev) + 16);
     return cast(i32, *p);
 }
 ```
 
 ## Audio module design (queue-based, no callbacks)
 
+SDL3 separates devices and streams. Use `SDL_OpenAudioDeviceStream` (convenience function) for simple cases:
+
 ```cst
 // audio.cst
-extern fn SDL_OpenAudioDevice(freq as i32, format as i32) as i64;
+extern fn SDL_OpenAudioDeviceStream(devid as i32, spec as *u8, callback as *u8, userdata as *u8) as *u8;
+extern fn SDL_ResumeAudioStreamDevice(stream as *u8) as i32;
 extern fn SDL_PutAudioStreamData(stream as *u8, data as *u8, len as i32) as i32;
-extern fn SDL_CloseAudioDevice(dev as i64) as void;
+extern fn SDL_DestroyAudioStream(stream as *u8) as void;
 
-fn open_device(freq as i32) as i64 {
-    return SDL_OpenAudioDevice(freq, 32784); // AUDIO_S16
+// Constants
+let is i32 as AUDIO_DEVICE_DEFAULT with imut = 1;
+let is i32 as AUDIO_S16 with imut = 32784;
+
+// Convenience: open default device, no callback (queue-based)
+fn open_stream(freq as i32) as *u8 {
+    // Build SDL_AudioSpec struct (16 bytes: format i32, channels i32, freq i32, padding i32)
+    let is [16]u8 as spec;
+    let is *i32 as fmt = cast(*i32, &spec);
+    *fmt = AUDIO_S16;
+    let is *i32 as ch = cast(*i32, cast(i64, &spec) + 4);
+    *ch = 2;
+    let is *i32 as fr = cast(*i32, cast(i64, &spec) + 8);
+    *fr = freq;
+    return SDL_OpenAudioDeviceStream(AUDIO_DEVICE_DEFAULT, &spec, cast(*u8, 0), cast(*u8, 0));
 }
 
 fn queue(stream as *u8, data as *u8, len as i32) as i32 {
     return SDL_PutAudioStreamData(stream, data, len);
+}
+
+fn resume(stream as *u8) as i32 {
+    return SDL_ResumeAudioStreamDevice(stream);
+}
+
+fn close(stream as *u8) as void {
+    SDL_DestroyAudioStream(stream);
 }
 ```
 
