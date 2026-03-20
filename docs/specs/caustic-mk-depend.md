@@ -122,6 +122,25 @@ meu-jogo/
             └── ...
 ```
 
+## Caching
+
+### Dependency cache (`.caustic/deps/`)
+- Cloned repos are stored in `.caustic/deps/<name>/`
+- If the directory exists and matches the expected tag, skip clone
+- If the tag changes in the Causticfile, delete and re-clone
+- `caustic-mk clean` removes `.caustic/deps/` entirely (fresh clone on next build)
+
+### Compilation cache
+- The compiler's existing `.caustic/` module cache handles `.cst` files from deps transparently
+- Files from `.caustic/deps/sdl3/video.cst` are cached by absolute path like any other module
+- Rebuilding after dep update: `rm -rf .caustic` forces full reparse (existing behavior)
+
+### Tag pinning and reproducibility
+- When `tag` is specified, the clone is pinned to that exact git tag
+- Two developers with the same Causticfile get the same code
+- Without `tag`, HEAD is used — builds may differ over time (user's choice)
+- No lockfile mechanism (YAGNI — tag pinning is sufficient for now)
+
 ## Files to change
 
 | File | Change |

@@ -124,6 +124,17 @@ The `only` filter does NOT affect what is cached — it restricts what is **acce
 
 The "performance win" of `only` is therefore at the **name resolution** level (unused submodules are not linked/walked), not at the parse level. For large libraries, the main saving is in reduced codegen (functions from unimported submodules are not marked reachable).
 
+## Caching
+
+The existing `.caustic/` module cache works unchanged. When the compiler parses a `.cst` file, it caches the result by normalized path. Submodules imported via an index file are cached individually — `sdl3/video.cst` is cached once even if 10 files import it through `sdl3.cst`.
+
+With `only`, the index file is always fully parsed (to discover which `use` statements exist), but submodules not in the `only` list are not walked/compiled. Their cache entries are not created until something actually imports them. This means:
+- First compile with `only video`: parses `sdl3.cst` + `video.cst` (cached)
+- Second compile with `only video, events`: reuses `video.cst` from cache, parses `events.cst` (cached)
+- Third compile with full import: reuses everything from cache
+
+No cache invalidation needed — the existing file-modification-time check handles staleness.
+
 ## Files to change
 
 | File | Change |

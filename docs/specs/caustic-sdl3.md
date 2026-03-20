@@ -295,6 +295,18 @@ struct Rect { x as i32; y as i32; w as i32; h as i32; }
 ### Complex structs (SDL_Event, GPU descriptors)
 Use `compatcffi.cst` for correct C alignment, or raw pointer arithmetic with known offsets.
 
+## Caching
+
+The SDL3 modules benefit from the compiler's module cache automatically:
+
+- First compile of a project using SDL3: all imported `.cst` modules are parsed and cached in `.caustic/`
+- Subsequent compiles: cached modules are reused (no re-parse) unless source files changed
+- With `only` filter: only imported submodules are cached. If the user later adds `audio` to the `only` list, only `audio.cst` needs parsing — the rest comes from cache
+- The `extern fn` declarations have zero caching overhead — they produce no IR, just symbol references resolved at link time
+- Constants (`let is i32 as QUIT with imut = 256;`) are inlined at compile time, no runtime cost
+
+The SDL3 library itself is never "compiled" as a separate step — its `.cst` files are parsed inline by the compiler when imported. No `.o` or `.so` is generated from the Caustic side. Only `-lSDL3` (the system shared library) is linked.
+
 ## Implementation priority
 
 1. `init.cst` — bare minimum to start SDL3
