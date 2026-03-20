@@ -132,7 +132,7 @@ Each module follows the same pattern:
 ```cst
 extern fn SDL_CreateWindow(title as *u8, w as i32, h as i32, flags as i64) as *u8;
 extern fn SDL_DestroyWindow(window as *u8) as void;
-extern fn SDL_GetWindowSize(window as *u8, w as *i32, h as *i32) as void;
+extern fn SDL_GetWindowSize(window as *u8, w as *i32, h as *i32) as i32;  // returns bool
 ```
 
 ### 2. Constants
@@ -221,25 +221,26 @@ SDL3 separates devices and streams. Use `SDL_OpenAudioDeviceStream` (convenience
 ```cst
 // audio.cst
 extern fn SDL_OpenAudioDeviceStream(devid as i32, spec as *u8, callback as *u8, userdata as *u8) as *u8;
-extern fn SDL_ResumeAudioStreamDevice(stream as *u8) as i32;
-extern fn SDL_PutAudioStreamData(stream as *u8, data as *u8, len as i32) as i32;
+extern fn SDL_ResumeAudioStreamDevice(stream as *u8) as i32;  // returns bool
+extern fn SDL_PutAudioStreamData(stream as *u8, data as *u8, len as i32) as i32;  // returns bool
 extern fn SDL_DestroyAudioStream(stream as *u8) as void;
 
 // Constants
-let is i32 as AUDIO_DEVICE_DEFAULT with imut = 1;
-let is i32 as AUDIO_S16 with imut = 32784;
+// AUDIO_DEVICE_DEFAULT_PLAYBACK = 0xFFFFFFFF
+let is i32 as AUDIO_DEVICE_DEFAULT_PLAYBACK with imut = 0 - 1; // 4294967295 as unsigned
+let is i32 as AUDIO_S16LE with imut = 32784;
 
 // Convenience: open default device, no callback (queue-based)
 fn open_stream(freq as i32) as *u8 {
-    // Build SDL_AudioSpec struct (16 bytes: format i32, channels i32, freq i32, padding i32)
-    let is [16]u8 as spec;
+    // Build SDL_AudioSpec struct (12 bytes: format i32, channels i32, freq i32)
+    let is [12]u8 as spec;
     let is *i32 as fmt = cast(*i32, &spec);
-    *fmt = AUDIO_S16;
+    *fmt = AUDIO_S16LE;
     let is *i32 as ch = cast(*i32, cast(i64, &spec) + 4);
     *ch = 2;
     let is *i32 as fr = cast(*i32, cast(i64, &spec) + 8);
     *fr = freq;
-    return SDL_OpenAudioDeviceStream(AUDIO_DEVICE_DEFAULT, &spec, cast(*u8, 0), cast(*u8, 0));
+    return SDL_OpenAudioDeviceStream(AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, cast(*u8, 0), cast(*u8, 0));
 }
 
 fn queue(stream as *u8, data as *u8, len as i32) as i32 {
@@ -261,17 +262,18 @@ SDL_GPU is a Vulkan/Metal/D3D12 abstraction. All functions take/return opaque po
 
 ```cst
 // gpu.cst
-extern fn SDL_CreateGPUDevice(props as i64) as *u8;
-extern fn SDL_ClaimWindowForGPUDevice(dev as *u8, win as *u8) as i32;
+// SDL_CreateGPUDevice(format_flags, debug_mode, name) — name can be null
+extern fn SDL_CreateGPUDevice(format_flags as i32, debug_mode as i32, name as *u8) as *u8;
+extern fn SDL_ClaimWindowForGPUDevice(dev as *u8, win as *u8) as i32;  // returns bool
 extern fn SDL_AcquireGPUCommandBuffer(dev as *u8) as *u8;
 extern fn SDL_BeginGPURenderPass(cmd as *u8, info as *u8) as *u8;
 extern fn SDL_EndGPURenderPass(pass as *u8) as void;
-extern fn SDL_SubmitGPUCommandBuffer(cmd as *u8) as void;
+extern fn SDL_SubmitGPUCommandBuffer(cmd as *u8) as i32;  // returns bool
 extern fn SDL_CreateGPUShader(dev as *u8, info as *u8) as *u8;
 extern fn SDL_CreateGPUGraphicsPipeline(dev as *u8, info as *u8) as *u8;
 
 fn create_device() as *u8 {
-    return SDL_CreateGPUDevice(0);
+    return SDL_CreateGPUDevice(0, 0, cast(*u8, 0));
 }
 ```
 

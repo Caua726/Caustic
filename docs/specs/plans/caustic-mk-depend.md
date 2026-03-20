@@ -20,6 +20,7 @@
 |------|---------------|--------|
 | `caustic-maker/parser.cst` | Causticfile parsing | Modify: new Dep struct, parse depend/system |
 | `caustic-maker/executor.cst` | Build execution | Modify: clone deps, collect system libs, pass --path |
+| `caustic-maker/main.cst` | Entry point for caustic-mk | Modify: wire resolve_deps() into build flow |
 | `src/main.cst` | Compiler entry point | Modify: add --path flag |
 
 ---
@@ -35,7 +36,7 @@
 } else if (str_eq(arg, arglen, "--path", 6) == 1) {
     if (i + 1 < argc) {
         i = i + 1;
-        let is *u8 as path_arg = cast(*u8, *cast(*i64, cast(i64, argv) + cast(i64, i) * 8));
+        let is *u8 as path_arg = argv_arr[i];
         // Add to search path list (store in global array)
         if (g_extra_path_count < 16) {
             g_extra_paths[g_extra_path_count] = cast(i64, path_arg);
@@ -51,9 +52,27 @@ let is [16]i64 as g_extra_paths with mut;
 let is i32 as g_extra_path_count with mut = 0;
 ```
 
-- [ ] **Step 3:** In the module resolution code (`src/semantic/scope.cst`, `resolve_module_path` or similar), add the extra paths as fallback after stdlib resolution. For each `--path` entry, try `path/filename.cst`.
+- [ ] **Step 3:** Create a bridge function in `src/semantic/scope.cst` (or `walk.cst`) to pass the extra paths from main to the semantic layer:
 
-- [ ] **Step 4:** Test:
+```cst
+let is [16]i64 as extra_search_paths with mut;
+let is i32 as extra_search_path_count with mut = 0;
+
+fn set_extra_paths(paths as *i64, count as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < count && i < 16) {
+        extra_search_paths[i] = paths[i];
+        i = i + 1;
+    }
+    extra_search_path_count = count;
+}
+```
+
+Call `sc.set_extra_paths(&g_extra_paths, g_extra_path_count)` in `src/main.cst` after `parse_args` returns.
+
+- [ ] **Step 4:** In the module resolution code (`src/semantic/scope.cst`, `resolve_module_path` or similar), add the extra paths as fallback after stdlib resolution. For each `--path` entry, try `path/filename.cst`.
+
+- [ ] **Step 5:** Test:
 
 ```bash
 mkdir -p /tmp/test_path_lib
@@ -63,7 +82,7 @@ echo 'use "helper.cst" as h; fn main() as i32 { return h.helper_add(3, 4); }' > 
 # Expected: Exit: 7
 ```
 
-- [ ] **Step 5:** Bootstrap gen4 and commit:
+- [ ] **Step 6:** Bootstrap gen4 and commit:
 
 ```bash
 rm -rf .caustic
@@ -93,7 +112,11 @@ struct Dep {
 }
 ```
 
-- [ ] **Step 2:** Add system lib tracking to the project struct (or add global arrays):
+- [ ] **Step 2:** Remove the old `parse_dep` function (if it exists) and its dispatch branch in `parse()`, since dependency parsing is being replaced by the new `depend` syntax.
+
+- [ ] **Step 3:** Add a `deps as *u8` field (head of Dep linked list) to the `Target` struct so each target can track its own dependencies.
+
+- [ ] **Step 4:** Add system lib tracking to the project struct (or add global arrays):
 
 ```cst
 let is [16]i64 as system_lib_ptrs with mut;
@@ -101,7 +124,7 @@ let is [16]i32 as system_lib_lens with mut;
 let is i32 as system_lib_count with mut = 0;
 ```
 
-- [ ] **Step 3:** Parse `system "libname"` at top level:
+- [ ] **Step 5:** Parse `system "libname"` at top level:
 
 ```cst
 // In the main parse loop, when token is "system":
@@ -114,7 +137,7 @@ if (streq(tok, "system")) {
 }
 ```
 
-- [ ] **Step 4:** Parse `depend "name" in "url" [tag "version"]` inside target blocks:
+- [ ] **Step 6:** Parse `depend "name" in "url" [tag "version"]` inside target blocks:
 
 ```cst
 // In target parse loop, when token is "depend":
@@ -135,13 +158,13 @@ if (streq(tok, "depend")) {
 }
 ```
 
-- [ ] **Step 5:** Build caustic-mk and test parsing:
+- [ ] **Step 7:** Build caustic-mk and test parsing:
 
 ```bash
 ./caustic caustic-maker/main.cst && ./caustic-as caustic-maker/main.cst.s && ./caustic-ld caustic-maker/main.cst.s.o -o caustic-mk
 ```
 
-- [ ] **Step 6:** Commit:
+- [ ] **Step 8:** Commit:
 
 ```bash
 git add caustic-maker/parser.cst
@@ -176,7 +199,29 @@ fn resolve_deps(target as *Target) as void {
 }
 ```
 
-- [ ] **Step 2:** Build the git clone command:
+- [ ] **Step 2:** Add tag-pinning cache invalidation. When a dependency has a `tag`, store it in `.caustic/deps/<name>/.caustic-tag`. On next build, compare the stored tag with the requested tag -- if they differ, delete the cached clone and re-clone:
+
+```cst
+// Check if tag changed
+let is *u8 as tag_file = build_path(dep_dir, ".caustic-tag");
+if (file_exists(tag_file) == 1 && dep.tag_len > 0) {
+    let is *u8 as stored_tag = read_file(tag_file);
+    if (str_eq(stored_tag, str_len(stored_tag), dep.tag_ptr, dep.tag_len) == 0) {
+        // Tag changed — re-clone
+        run_cmd_fmt("rm -rf %s", dep_dir);
+    }
+}
+```
+
+After cloning, write the tag file:
+
+```cst
+if (dep.tag_len > 0) {
+    write_file(tag_file, dep.tag_ptr, dep.tag_len);
+}
+```
+
+- [ ] **Step 3:** Build the git clone command:
 
 ```cst
 fn build_clone_cmd(dep as *Dep) as *u8 {
@@ -185,20 +230,27 @@ fn build_clone_cmd(dep as *Dep) as *u8 {
 }
 ```
 
-- [ ] **Step 3:** When building the compiler command, append `--path` flags for each dependency:
+- [ ] **Step 4:** When building the compiler command, append `--path` flags for each dependency:
 
 ```cst
 // Instead of just "caustic src.cst"
 // Build: "caustic --path .caustic/deps/sdl3 --path .caustic/deps/other src.cst"
 ```
 
-- [ ] **Step 4:** When building the linker command, append `-l` flags for each inherited system lib:
+- [ ] **Step 5:** When building the linker command, append `-l` flags for each inherited system lib:
 
 ```cst
 // "caustic-ld src.cst.s.o -lSDL3 -o output"
 ```
 
-- [ ] **Step 5:** Test end-to-end with a mock dependency (local git repo):
+- [ ] **Step 6:** Wire `resolve_deps()` into the build flow. In `caustic-maker/main.cst`, call `resolve_deps(target)` before invoking the compiler, so dependencies are cloned and paths are available:
+
+```cst
+// In main build flow, after parsing Causticfile and before compiling:
+resolve_deps(target);
+```
+
+- [ ] **Step 7:** Test end-to-end with a mock dependency (local git repo):
 
 ```bash
 # Create a test lib repo
@@ -227,10 +279,10 @@ caustic-mk test
 # Expected: Exit: 7
 ```
 
-- [ ] **Step 6:** Commit:
+- [ ] **Step 8:** Commit:
 
 ```bash
-git add caustic-maker/executor.cst
+git add caustic-maker/executor.cst caustic-maker/main.cst
 git commit -m "caustic-mk: dependency resolution with git clone and --path"
 ```
 

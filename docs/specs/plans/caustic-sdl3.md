@@ -53,20 +53,30 @@ mkdir caustic-sdl3 && cd caustic-sdl3
 git init
 ```
 
-- [ ] **Step 2:** Create Causticfile:
+- [ ] **Step 2:** Verify SDL3 is installed on the system:
+
+```bash
+# Check that libSDL3.so is available
+ldconfig -p | grep SDL3
+# Or check pkg-config
+pkg-config --cflags --libs sdl3
+# If not installed, follow https://wiki.libsdl.org/SDL3/Installation
+```
+
+- [ ] **Step 3:** Create Causticfile:
 
 ```
 name "sdl3"
 system "SDL3"
 ```
 
-- [ ] **Step 3:** Create index file `sdl3.cst` (start with just init):
+- [ ] **Step 4:** Create index file `sdl3.cst` (start with just init):
 
 ```cst
 use "init.cst" as init;
 ```
 
-- [ ] **Step 4:** Commit:
+- [ ] **Step 5:** Commit:
 
 ```bash
 git add -A && git commit -m "init: repo structure and Causticfile"
@@ -82,21 +92,22 @@ git add -A && git commit -m "init: repo structure and Causticfile"
 
 ```cst
 // SDL3 init/quit
-extern fn SDL_Init(flags as i64) as i32;
+// NOTE: SDL3 SDL_Init returns bool (true=success, false=failure)
+extern fn SDL_Init(flags as i32) as i32;
 extern fn SDL_Quit() as void;
 extern fn SDL_GetError() as *u8;
 extern fn SDL_GetVersion() as i32;
 
-// Init flags (SDL_InitFlags)
-let is i64 as AUDIO with imut = 16;
-let is i64 as VIDEO with imut = 32;
-let is i64 as JOYSTICK with imut = 512;
-let is i64 as HAPTIC with imut = 4096;
-let is i64 as GAMEPAD with imut = 8192;
-let is i64 as EVENTS with imut = 16384;
-let is i64 as CAMERA with imut = 65536;
+// Init flags (SDL_InitFlags — Uint32 in SDL3)
+let is i32 as AUDIO with imut = 16;
+let is i32 as VIDEO with imut = 32;
+let is i32 as JOYSTICK with imut = 512;
+let is i32 as HAPTIC with imut = 4096;
+let is i32 as GAMEPAD with imut = 8192;
+let is i32 as EVENTS with imut = 16384;
+let is i32 as CAMERA with imut = 65536;
 
-fn init(flags as i64) as i32 { return SDL_Init(flags); }
+fn init(flags as i32) as i32 { return SDL_Init(flags); }
 fn quit() as void { SDL_Quit(); }
 fn get_error() as *u8 { return SDL_GetError(); }
 fn version() as i32 { return SDL_GetVersion(); }
@@ -109,8 +120,9 @@ fn version() as i32 { return SDL_GetVersion(); }
 use "sdl3.cst" as sdl;
 
 fn main() as i32 {
+    // SDL3 SDL_Init returns bool: true (non-zero) = success, false (0) = failure
     let is i32 as r = sdl.init.init(sdl.init.VIDEO);
-    if (r < 0) { return 1; }
+    if (r == 0) { return 1; }
     sdl.init.quit();
     return 0;
 }
@@ -206,7 +218,7 @@ git commit -m "init: SDL_Init, SDL_Quit, SDL_GetError"
 
 **Reference:** https://wiki.libsdl.org/SDL3/CategoryAudio
 
-- [ ] **Step 1:** Create `audio.cst` with SDL_OpenAudioDeviceStream (queue-based, no callback), SDL_PutAudioStreamData, SDL_ResumeAudioStreamDevice, SDL_DestroyAudioStream.
+- [ ] **Step 1:** Create `audio.cst` with SDL_OpenAudioDeviceStream (queue-based, no callback), SDL_PutAudioStreamData, SDL_ResumeAudioStreamDevice, SDL_DestroyAudioStream. Note: `AUDIO_DEVICE_DEFAULT_PLAYBACK` is `4294967295` (0xFFFFFFFF), not 1. `SDL_AudioSpec` is 12 bytes (format i32, channels i32, freq i32 -- no padding). The constant is `AUDIO_S16LE` (not `AUDIO_S16`). `SDL_ResumeAudioStreamDevice` and `SDL_PutAudioStreamData` return bool (i32 in Caustic), not void/int.
 - [ ] **Step 2:** Create `examples/play_sound.cst`.
 - [ ] **Step 3:** Add to `sdl3.cst` and commit.
 
@@ -235,7 +247,7 @@ git commit -m "init: SDL_Init, SDL_Quit, SDL_GetError"
 
 This is the most complex module. SDL_GPU uses many config structs (pipeline descriptors, render pass info, etc.) that need `compatcffi.cst` for correct C alignment.
 
-- [ ] **Step 1:** Create `gpu.cst` with core functions: SDL_CreateGPUDevice, SDL_ClaimWindowForGPUDevice, SDL_AcquireGPUCommandBuffer, SDL_BeginGPURenderPass, SDL_EndGPURenderPass, SDL_SubmitGPUCommandBuffer.
+- [ ] **Step 1:** Create `gpu.cst` with core functions: SDL_CreateGPUDevice, SDL_ClaimWindowForGPUDevice, SDL_AcquireGPUCommandBuffer, SDL_BeginGPURenderPass, SDL_EndGPURenderPass, SDL_SubmitGPUCommandBuffer. Note correct signatures: `SDL_CreateGPUDevice(format_flags as i32, debug_mode as i32, name as *u8) as *u8`, `SDL_ClaimWindowForGPUDevice(dev as *u8, win as *u8) as i32` (returns bool), `SDL_SubmitGPUCommandBuffer(cmd as *u8) as i32` (returns bool).
 - [ ] **Step 2:** Add shader and pipeline functions: SDL_CreateGPUShader, SDL_CreateGPUGraphicsPipeline.
 - [ ] **Step 3:** Add buffer functions: SDL_CreateGPUBuffer, SDL_UploadToGPUBuffer.
 - [ ] **Step 4:** Create `examples/gpu_triangle.cst` — basic GPU triangle.
@@ -246,7 +258,18 @@ This is the most complex module. SDL_GPU uses many config structs (pipeline desc
 ### Task 13: Final validation
 
 - [ ] **Step 1:** All examples compile and run.
-- [ ] **Step 2:** Test with `caustic-mk` (from depend plan):
+
+- [ ] **Step 2:** Reconciliation check -- verify all 18 modules are listed in `sdl3.cst`. The index must contain exactly these imports:
+
+```
+init, video, render, surface, rect, events, keyboard, mouse,
+gamepad, touch, haptic, audio, gpu, timer, filesystem, clipboard,
+messagebox, platform
+```
+
+Count lines in `sdl3.cst` and ensure each module file exists and compiles.
+
+- [ ] **Step 3:** Test with `caustic-mk` (from depend plan):
 
 ```
 // Test project Causticfile
@@ -262,7 +285,7 @@ target "test" {
 caustic-mk test && ./test
 ```
 
-- [ ] **Step 3:** Tag and release v0.1.0.
+- [ ] **Step 4:** Tag and release v0.1.0.
 
 ```bash
 git tag v0.1.0

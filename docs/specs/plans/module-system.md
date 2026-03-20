@@ -38,8 +38,10 @@ let is i32 as TK_ONLY with imut = 78;
 - [ ] **Step 2:** In the `keyword_lookup` function, find the `len == 4` branch (handles `with`, `else`, `cast`, `enum`, `impl`, `type`). Add `only` check:
 
 ```cst
-if (s[0] == 111 && s[1] == 110 && s[2] == 108 && s[3] == 121) { return TK_ONLY; } // only
+if (streq_lit(ptr, len, "only") == 1) { return TK_ONLY; }
 ```
+
+> **Note:** `src/lexer/lexer.cst` does NOT need changes — keyword routing is handled entirely by `keyword_lookup()` in `tokens.cst`.
 
 - [ ] **Step 3:** Build and test — compile should still work since nothing uses TK_ONLY yet:
 
@@ -83,12 +85,16 @@ git commit -m "lexer: add TK_ONLY keyword token"
 
 `only_names` stores a flat array: `[ptr0, len0, ptr1, len1, ...]` where each pair is `(*u8, i32)` = 12 bytes per entry (8 + 4).
 
-- [ ] **Step 2:** Build and bootstrap gen4:
+- [ ] **Step 2:** Build and bootstrap gen4 (Node struct size changes, so full verification is needed):
 
 ```bash
-rm -rf .caustic && ./caustic src/main.cst && ./caustic-as src/main.cst.s && ./caustic-ld src/main.cst.s.o -o /tmp/gen1
-rm -rf .caustic && /tmp/gen1 src/main.cst && ./caustic-as src/main.cst.s && ./caustic-ld src/main.cst.s.o -o /tmp/gen2
-echo "gen1=$(stat -c%s /tmp/gen1) gen2=$(stat -c%s /tmp/gen2)"
+rm -rf .caustic
+for g in 1 2 3 4; do
+    if [ $g -eq 1 ]; then ./caustic src/main.cst; else /tmp/gen$((g-1)) src/main.cst; fi
+    ./caustic-as src/main.cst.s && ./caustic-ld src/main.cst.s.o -o /tmp/gen$g
+done
+echo "gen2=$(stat -c%s /tmp/gen2) gen3=$(stat -c%s /tmp/gen3) gen4=$(stat -c%s /tmp/gen4)"
+# gen2=gen3=gen4
 ```
 
 - [ ] **Step 3:** Commit:
@@ -176,6 +182,10 @@ fn parse_use() as *ast.Node {
         n.member_ptr = pu.cur().ptr;
         n.member_len = pu.cur().len;
         pu.advance();
+    }
+    // 'as alias' is required when 'only' is used
+    if (n.only_count > 0 && n.member_len == 0) {
+        pu.error_expected("'as' required after 'only' filter");
     }
     pu.expect(tok.TK_SEMICOLON);
     return n;
@@ -299,9 +309,12 @@ let is *ast.Node as child with mut = cast(*ast.Node, body);
 while (cast(i64, child) != 0) {
     if (child.kind == ast.NK_USE && child.member_len > 0) {
         // This nested use becomes a submodule
-        let is *d.Module as child_cached = mod.find_module(
-            sc.get_mod_prefix(child.name_ptr + 1, child.name_len - 2),
-            sc.get_mod_prefix_len(child.name_ptr + 1, child.name_len - 2));
+        // Strip quotes from the path (same pattern as visit_use_module)
+        let is i32 as raw_len with mut = 0;
+        let is *u8 as raw_path = mod.strip_quotes(child.name_ptr, child.name_len, &raw_len);
+        let is *u8 as child_prefix = sc.get_mod_prefix(raw_path, raw_len);
+        let is i32 as child_plen = sc.get_mod_prefix_len(raw_path, raw_len);
+        let is *d.Module as child_cached = mod.find_module(child_prefix, child_plen);
         if (cast(i64, child_cached) != 0) {
             let is *d.SubModule as sm = d.new_submodule();
             sm.alias_ptr = d.str_dup(child.member_ptr, child.member_len);
@@ -338,7 +351,37 @@ fn is_in_only_list(name_ptr as *u8, name_len as i32, only_names as *u8, only_cou
 
 Then in the recursive processing, the parent `use` node's `only_count`/`only_names` should propagate to filter which child uses are processed. This needs careful threading — the `only` filter belongs to the import site, not the module itself.
 
-The simplest approach: store the parent's `only_names`/`only_count` in a global during `visit_use_module`, and check it before recursing into child uses.
+Add globals in `walk.cst` to hold the active only-filter during visit_use_module:
+
+```cst
+let is *u8 as current_only_names with mut;
+let is i32 as current_only_count with mut = 0;
+```
+
+Then in `visit_use_module`, before recursing into child uses, set them:
+
+```cst
+// Save/restore the only filter around child processing
+let is *u8 as prev_only_names = current_only_names;
+let is i32 as prev_only_count = current_only_count;
+current_only_names = n.only_names;
+current_only_count = n.only_count;
+```
+
+In the submodule-building loop (Task 5 Step 1), gate each child with:
+
+```cst
+if (is_in_only_list(child.member_ptr, child.member_len, current_only_names, current_only_count) == 1) {
+    // ... create SubModule entry ...
+}
+```
+
+After the loop, restore:
+
+```cst
+current_only_names = prev_only_names;
+current_only_count = prev_only_count;
+```
 
 - [ ] **Step 3:** Build and test with existing code (no `only` used yet, should not affect behavior):
 
@@ -403,22 +446,22 @@ if (lhs_expr.kind == ast.NK_MEMBER && lhs_expr.lhs.kind == ast.NK_IDENT) {
     if (cast(i64, parent_var) != 0 && parent_var.is_module == 1) {
         let is *d.Module as parent_mod = cast(*d.Module, parent_var.module_ref);
         // Find submodule by alias
+        let is i32 as found_sub with mut = 0;
         let is *d.SubModule as sm with mut = cast(*d.SubModule, parent_mod.submodules);
-        while (cast(i64, sm) != 0) {
+        while (cast(i64, sm) != 0 && found_sub == 0) {
             if (d.str_eq(sm.alias_ptr, sm.alias_len, lhs_expr.member_ptr, lhs_expr.member_len) == 1) {
                 // Found submodule — lookup function in it
+                found_sub = 1;
                 let is *d.Module as sub_mod = cast(*d.Module, sm.module_ref);
                 func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len,
                                               sub_mod.prefix_ptr, sub_mod.prefix_len);
                 if (cast(i64, func) == 0) {
                     sc.sem_error_at(node, "funcao nao encontrada no submodulo");
                 }
-                sm = cast(*d.SubModule, 0); // break
-            } else {
-                sm = cast(*d.SubModule, sm.next);
             }
+            sm = cast(*d.SubModule, sm.next);
         }
-        if (cast(i64, func) == 0 && cast(i64, sm) == 0) {
+        if (found_sub == 0) {
             sc.sem_error_at(node, "submodulo nao encontrado");
         }
     }
@@ -510,6 +553,41 @@ When `sdl.init.VIDEO` is encountered:
 3. `VIDEO` → variable in submodule's scope
 
 Look for the existing module variable access pattern (where it checks `var.is_module`) and extend it to handle the chained case.
+
+Add this code in the NK_MEMBER handler, before (or alongside) the existing single-level module access:
+
+```cst
+// Chained module variable access: sdl.init.VIDEO
+if (node.lhs.kind == ast.NK_MEMBER && node.lhs.lhs.kind == ast.NK_IDENT) {
+    let is *d.Variable as parent_var = sc.lookup_var(node.lhs.lhs.name_ptr, node.lhs.lhs.name_len);
+    if (cast(i64, parent_var) != 0 && parent_var.is_module == 1) {
+        let is *d.Module as parent_mod = cast(*d.Module, parent_var.module_ref);
+        // Find submodule matching the middle segment
+        let is i32 as found_sub with mut = 0;
+        let is *d.SubModule as sm with mut = cast(*d.SubModule, parent_mod.submodules);
+        while (cast(i64, sm) != 0 && found_sub == 0) {
+            if (d.str_eq(sm.alias_ptr, sm.alias_len, node.lhs.member_ptr, node.lhs.member_len) == 1) {
+                found_sub = 1;
+                let is *d.Module as sub_mod = cast(*d.Module, sm.module_ref);
+                // Lookup variable in submodule's scope
+                let is *d.Variable as target_var = sc.lookup_var_qualified(
+                    node.member_ptr, node.member_len,
+                    sub_mod.prefix_ptr, sub_mod.prefix_len);
+                if (cast(i64, target_var) == 0) {
+                    sc.sem_error_at(node, "variavel nao encontrada no submodulo");
+                }
+                node.var_ref = cast(*u8, target_var);
+                node.ty = target_var.ty;
+            }
+            sm = cast(*d.SubModule, sm.next);
+        }
+        if (found_sub == 0) {
+            sc.sem_error_at(node, "submodulo nao encontrado");
+        }
+        return;
+    }
+}
+```
 
 - [ ] **Step 2:** Test with constants:
 
