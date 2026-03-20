@@ -1,6 +1,9 @@
 use "../../std/mem.cst" as mem;
 use "../ir/defs.cst" as d;
 
+// === Config ===
+let is i32 as al_opt_level with mut = 0;
+
 // === Register allocator structs ===
 
 struct LiveInterval {
@@ -492,4 +495,848 @@ fn get_loc(vreg as i32, ctx as *AllocCtx) as i32 {
 fn is_mem(vreg as i32, ctx as *AllocCtx) as i32 {
     if (get_loc(vreg, ctx) < 0) { return 1; }
     return 0;
+}
+
+// === Graph coloring register allocator v2 (-O1) ===
+// Iterative Register Coalescing (George & Appel, 1996)
+// Bit matrix interference, George coalescing, optimistic coloring (Briggs)
+
+fn gc_mark_callee(reg as i32, ctx as *AllocCtx) as void {
+    if (reg == 3) { ctx.used_callee_mask = ctx.used_callee_mask | 1; }
+    if (reg == 10) { ctx.used_callee_mask = ctx.used_callee_mask | 2; }
+    if (reg == 11) { ctx.used_callee_mask = ctx.used_callee_mask | 4; }
+    if (reg == 12) { ctx.used_callee_mask = ctx.used_callee_mask | 8; }
+    if (reg == 15) { ctx.used_callee_mask = ctx.used_callee_mask | 16; }
+}
+
+// --- Bit matrix helpers ---
+fn bm_set(matrix as *u8, n as i32, i as i32, j as i32) as void {
+    let is i64 as bit = cast(i64, i) * cast(i64, n) + cast(i64, j);
+    let is i64 as byte_idx = bit / 8;
+    let is i32 as bit_off = cast(i32, bit - byte_idx * 8);
+    let is *u8 as bp = cast(*u8, cast(i64, matrix) + byte_idx);
+    *bp = cast(u8, cast(i32, *bp) | (1 << bit_off));
+    // Symmetric
+    let is i64 as bit2 = cast(i64, j) * cast(i64, n) + cast(i64, i);
+    let is i64 as byte_idx2 = bit2 / 8;
+    let is i32 as bit_off2 = cast(i32, bit2 - byte_idx2 * 8);
+    let is *u8 as bp2 = cast(*u8, cast(i64, matrix) + byte_idx2);
+    *bp2 = cast(u8, cast(i32, *bp2) | (1 << bit_off2));
+}
+
+fn bm_test(matrix as *u8, n as i32, i as i32, j as i32) as i32 {
+    let is i64 as bit = cast(i64, i) * cast(i64, n) + cast(i64, j);
+    let is i64 as byte_idx = bit / 8;
+    let is i32 as bit_off = cast(i32, bit - byte_idx * 8);
+    let is *u8 as bp = cast(*u8, cast(i64, matrix) + byte_idx);
+    if ((cast(i32, *bp) >> bit_off) & 1 == 1) { return 1; }
+    return 0;
+}
+
+// --- resolve_alias with path compression ---
+fn gc2_resolve(alias as *i32, v as i32) as i32 {
+    let is i32 as root with mut = v;
+    let is *i32 as ap with mut = cast(*i32, cast(i64, alias) + cast(i64, root) * 4);
+    while (*ap >= 0) { root = *ap; ap = cast(*i32, cast(i64, alias) + cast(i64, root) * 4); }
+    // Path compression
+    let is i32 as cur with mut = v;
+    ap = cast(*i32, cast(i64, alias) + cast(i64, cur) * 4);
+    while (*ap >= 0) {
+        let is i32 as nxt = *ap;
+        *ap = root;
+        cur = nxt;
+        ap = cast(*i32, cast(i64, alias) + cast(i64, cur) * 4);
+    }
+    return root;
+}
+
+// --- Worklist helpers (swap-with-last removal) ---
+fn wl_add(wl as *i32, cnt as *i32, v as i32) as void {
+    let is i32 as c = *cnt;
+    let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, c) * 4);
+    *wp = v;
+    *cnt = c + 1;
+}
+
+fn wl_remove(wl as *i32, cnt as *i32, v as i32) as void {
+    let is i32 as c = *cnt;
+    let is i32 as i with mut = 0;
+    while (i < c) {
+        let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, i) * 4);
+        if (*wp == v) {
+            let is *i32 as last = cast(*i32, cast(i64, wl) + cast(i64, c - 1) * 4);
+            *wp = *last;
+            *cnt = c - 1;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn wl_contains(wl as *i32, cnt as i32, v as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < cnt) {
+        let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, i) * 4);
+        if (*wp == v) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- Move list ---
+struct GCMove {
+    src as i32;
+    dst as i32;
+    status as i32;  // 0=active, 1=coalesced, 2=frozen, 3=constrained
+}
+
+fn gc2_get_iv(intervals as *LiveInterval, idx as i32) as *LiveInterval {
+    return cast(*LiveInterval, cast(i64, intervals) + cast(i64, idx) * sizeof(LiveInterval));
+}
+
+fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *AllocCtx) as void {
+    let is i32 as n = func.vreg_count;
+    if (n == 0) {
+        ctx.vreg_to_loc = cast(*i32, mem.galloc(4));
+        ctx.stack_slots = 0;
+        ctx.used_callee_mask = 0;
+        return;
+    }
+
+    ctx.vreg_to_loc = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, i) * 4);
+        *vp = cast(i32, 0 - 1000);
+        i = i + 1;
+    }
+    ctx.used_callee_mask = 0;
+
+    // Allocatable registers (same order as linear scan)
+    let is [10]i32 as regs;
+    regs[0] = 3; regs[1] = 10; regs[2] = 11; regs[3] = 12;
+    regs[4] = 6; regs[5] = 7; regs[6] = 8;
+    regs[7] = 4; regs[8] = 5; regs[9] = 15;
+
+    // === Build vreg_to_interval mapping ===
+    let is *i32 as v2iv = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    i = 0;
+    while (i < n) {
+        let is *i32 as vp = cast(*i32, cast(i64, v2iv) + cast(i64, i) * 4);
+        *vp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < ctx.count) {
+        let is *LiveInterval as iv = gc2_get_iv(ctx.intervals, i);
+        if (iv.vreg >= 0 && iv.vreg < n) {
+            let is *i32 as vp = cast(*i32, cast(i64, v2iv) + cast(i64, iv.vreg) * 4);
+            *vp = i;
+        }
+        i = i + 1;
+    }
+
+    // === Allocate per-vreg arrays ===
+    let is *i32 as degree = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is *i32 as color = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is *i32 as alias = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is *i32 as status = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is *i32 as is_mr = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is *i32 as spill_cost = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is *i32 as crosses_call = cast(*i32, mem.galloc(cast(i64, n) * 4));
+
+    i = 0;
+    while (i < n) {
+        let is *i32 as dp = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
+        *dp = 0;
+        let is *i32 as cp = cast(*i32, cast(i64, color) + cast(i64, i) * 4);
+        *cp = cast(i32, 0 - 1);
+        let is *i32 as ap = cast(*i32, cast(i64, alias) + cast(i64, i) * 4);
+        *ap = cast(i32, 0 - 1);
+        let is *i32 as sp = cast(*i32, cast(i64, status) + cast(i64, i) * 4);
+        *sp = 0;
+        let is *i32 as mp = cast(*i32, cast(i64, is_mr) + cast(i64, i) * 4);
+        *mp = 0;
+        let is *i32 as scp = cast(*i32, cast(i64, spill_cost) + cast(i64, i) * 4);
+        *scp = 0;
+        let is *i32 as ccp = cast(*i32, cast(i64, crosses_call) + cast(i64, i) * 4);
+        *ccp = 0;
+        i = i + 1;
+    }
+
+    // === GET_ARG param index map (for ABI register exclusion in SELECT) ===
+    // Prevents allocator from assigning a GET_ARG vreg to another param's ABI register,
+    // which would cause clobber when codegen emits sequential GET_ARG moves.
+    let is *i32 as ga_param = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    i = 0;
+    while (i < n) {
+        let is *i32 as gp = cast(*i32, cast(i64, ga_param) + cast(i64, i) * 4);
+        *gp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+    let is i32 as ga_nargs with mut = func.num_args;
+    if (ga_nargs > 6) { ga_nargs = 6; }
+    let is *d.IRInst as ga_scan with mut = func.instructions;
+    while (cast(i64, ga_scan) != 0) {
+        if (ga_scan.is_dead == 0 && ga_scan.op == d.IR_GET_ARG) {
+            let is i32 as ga_pidx = cast(i32, ga_scan.src1.imm);
+            if (ga_pidx < 6 && ga_scan.dest.vreg < n) {
+                let is *i32 as gp = cast(*i32, cast(i64, ga_param) + cast(i64, ga_scan.dest.vreg) * 4);
+                *gp = ga_pidx;
+            }
+        }
+        ga_scan = ga_scan.next;
+    }
+    // ABI param register → allocator slot: rdi=slot8, rsi=slot7, r8=slot4, r9=slot5
+    // rdx and rcx are not in the allocatable set, so no conflict possible.
+    let is [6]i32 as ga_abi_slot;
+    ga_abi_slot[0] = 8;  ga_abi_slot[1] = 7;  ga_abi_slot[2] = cast(i32, 0 - 1);
+    ga_abi_slot[3] = cast(i32, 0 - 1); ga_abi_slot[4] = 4; ga_abi_slot[5] = 5;
+
+    // === Build bit matrix interference graph ===
+    let is i64 as bm_bits = cast(i64, n) * cast(i64, n);
+    let is i64 as bm_bytes = (bm_bits + 7) / 8;
+    let is *u8 as matrix = cast(*u8, mem.galloc(bm_bytes));
+    memzero(matrix, bm_bytes);
+
+    i = 0;
+    while (i < n) {
+        let is *i32 as vi_p = cast(*i32, cast(i64, v2iv) + cast(i64, i) * 4);
+        let is i32 as ii = *vi_p;
+        if (ii < 0) { i = i + 1; }
+        else {
+            let is *LiveInterval as ia = gc2_get_iv(ctx.intervals, ii);
+            if (ia.start == INT_MAX) { i = i + 1; }
+            else {
+                let is i32 as j with mut = i + 1;
+                while (j < n) {
+                    let is *i32 as vj_p = cast(*i32, cast(i64, v2iv) + cast(i64, j) * 4);
+                    let is i32 as ji = *vj_p;
+                    if (ji >= 0) {
+                        let is *LiveInterval as ib = gc2_get_iv(ctx.intervals, ji);
+                        if (ib.start != INT_MAX) {
+                            if (ia.start <= ib.end_pos && ib.start <= ia.end_pos) {
+                                bm_set(matrix, n, i, j);
+                                let is *i32 as di = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
+                                *di = *di + 1;
+                                let is *i32 as dj = cast(*i32, cast(i64, degree) + cast(i64, j) * 4);
+                                *dj = *dj + 1;
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+        }
+    }
+
+    // === Loop depth detection ===
+    // Count instructions first
+    let is i32 as inst_count with mut = 0;
+    let is *d.IRInst as tinst with mut = func.instructions;
+    while (cast(i64, tinst) != 0) { inst_count = inst_count + 1; tinst = tinst.next; }
+
+    let is *i32 as inst_depth = cast(*i32, mem.galloc(cast(i64, inst_count + 1) * 4));
+    memzero(cast(*u8, inst_depth), cast(i64, inst_count + 1) * 4);
+
+    // Build label_pos map
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_pos2 = cast(*i32, mem.galloc(cast(i64, lc) * 4));
+    memzero(cast(*u8, label_pos2), cast(i64, lc) * 4);
+    let is i32 as pos with mut = 0;
+    tinst = func.instructions;
+    while (cast(i64, tinst) != 0) {
+        if (tinst.op == d.IR_LABEL) {
+            let is *i32 as lp = cast(*i32, cast(i64, label_pos2) + cast(i64, tinst.dest.label) * 4);
+            *lp = pos;
+        }
+        pos = pos + 1;
+        tinst = tinst.next;
+    }
+
+    // Find back-edges and mark loop depth
+    pos = 0;
+    tinst = func.instructions;
+    while (cast(i64, tinst) != 0) {
+        if (tinst.op == d.IR_JMP || tinst.op == d.IR_JZ || tinst.op == d.IR_JNZ) {
+            let is *i32 as lp = cast(*i32, cast(i64, label_pos2) + cast(i64, tinst.dest.label) * 4);
+            let is i32 as target = *lp;
+            if (target <= pos) {
+                // Back-edge: loop range [target, pos]
+                let is i32 as lp2 with mut = target;
+                while (lp2 <= pos) {
+                    let is *i32 as dp2 = cast(*i32, cast(i64, inst_depth) + cast(i64, lp2) * 4);
+                    *dp2 = *dp2 + 1;
+                    lp2 = lp2 + 1;
+                }
+            }
+        }
+        pos = pos + 1;
+        tinst = tinst.next;
+    }
+    mem.gfree(cast(*u8, label_pos2));
+
+    // === Spill cost computation (10^depth per use) ===
+    let is [5]i32 as pow10;
+    pow10[0] = 1; pow10[1] = 100; pow10[2] = 10000; pow10[3] = 100000; pow10[4] = 100000;
+
+    // crosses_call
+    i = 0;
+    while (i < n) {
+        let is *i32 as vi_p = cast(*i32, cast(i64, v2iv) + cast(i64, i) * 4);
+        let is i32 as ii = *vi_p;
+        if (ii >= 0) {
+            let is *LiveInterval as iv = gc2_get_iv(ctx.intervals, ii);
+            if (iv.start != INT_MAX) {
+                let is *i32 as ccp = cast(*i32, cast(i64, crosses_call) + cast(i64, i) * 4);
+                *ccp = spans_call(iv.start, iv.end_pos, ctx);
+            }
+        }
+        i = i + 1;
+    }
+
+    // Scan instructions for spill costs
+    pos = 0;
+    tinst = func.instructions;
+    while (cast(i64, tinst) != 0) {
+        if (tinst.is_dead == 0) {
+            let is *i32 as ddp = cast(*i32, cast(i64, inst_depth) + cast(i64, pos) * 4);
+            let is i32 as depth with mut = *ddp;
+            if (depth > 4) { depth = 4; }
+            let is i32 as weight = pow10[depth];
+
+            if (tinst.src1.op_type == d.OP_VREG && tinst.src1.vreg < n) {
+                let is *i32 as scp = cast(*i32, cast(i64, spill_cost) + cast(i64, tinst.src1.vreg) * 4);
+                *scp = *scp + weight;
+            }
+            if (tinst.src2.op_type == d.OP_VREG && tinst.src2.vreg < n) {
+                let is *i32 as scp = cast(*i32, cast(i64, spill_cost) + cast(i64, tinst.src2.vreg) * 4);
+                *scp = *scp + weight;
+            }
+            if (tinst.dest.op_type == d.OP_VREG && tinst.dest.vreg < n) {
+                let is *i32 as scp = cast(*i32, cast(i64, spill_cost) + cast(i64, tinst.dest.vreg) * 4);
+                *scp = *scp + weight;
+            }
+        }
+        pos = pos + 1;
+        tinst = tinst.next;
+    }
+    mem.gfree(cast(*u8, inst_depth));
+
+    // === Count MOVs and build move list ===
+    let is i32 as mov_count with mut = 0;
+    tinst = func.instructions;
+    while (cast(i64, tinst) != 0) {
+        if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
+            mov_count = mov_count + 1;
+        }
+        tinst = tinst.next;
+    }
+
+    let is *GCMove as moves = cast(*GCMove, mem.galloc(cast(i64, mov_count + 1) * sizeof(GCMove)));
+    let is i32 as mi with mut = 0;
+    tinst = func.instructions;
+    while (cast(i64, tinst) != 0) {
+        if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
+            let is i32 as vs = tinst.src1.vreg;
+            let is i32 as vd = tinst.dest.vreg;
+            if (vs < n && vd < n) {
+                let is *GCMove as mv = cast(*GCMove, cast(i64, moves) + cast(i64, mi) * sizeof(GCMove));
+                mv.src = vs;
+                mv.dst = vd;
+                mv.status = 0;
+                // Mark both as move-related
+                let is *i32 as ms = cast(*i32, cast(i64, is_mr) + cast(i64, vs) * 4);
+                *ms = 1;
+                let is *i32 as md = cast(*i32, cast(i64, is_mr) + cast(i64, vd) * 4);
+                *md = 1;
+                mi = mi + 1;
+            }
+        }
+        tinst = tinst.next;
+    }
+    mov_count = mi;
+
+    // === Worklists ===
+    let is *i32 as simplify_wl = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is i32 as simplify_cnt with mut = 0;
+    let is *i32 as freeze_wl = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is i32 as freeze_cnt with mut = 0;
+    let is *i32 as spill_wl = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is i32 as spill_cnt with mut = 0;
+    let is *i32 as stack = cast(*i32, mem.galloc(cast(i64, n) * 4));
+    let is i32 as stack_top with mut = 0;
+
+    // Init worklists
+    i = 0;
+    while (i < n) {
+        let is *i32 as vi_p = cast(*i32, cast(i64, v2iv) + cast(i64, i) * 4);
+        let is i32 as ii = *vi_p;
+        if (ii >= 0) {
+            let is *LiveInterval as iv = gc2_get_iv(ctx.intervals, ii);
+            if (iv.start != INT_MAX) {
+                let is *i32 as ccp = cast(*i32, cast(i64, crosses_call) + cast(i64, i) * 4);
+                let is i32 as k_eff with mut = 10;
+                if (*ccp == 1) { k_eff = 5; }
+                let is *i32 as dp = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
+                if (*dp >= k_eff) {
+                    wl_add(spill_wl, &spill_cnt, i);
+                } else {
+                    let is *i32 as mrp = cast(*i32, cast(i64, is_mr) + cast(i64, i) * 4);
+                    if (*mrp == 1) {
+                        wl_add(freeze_wl, &freeze_cnt, i);
+                    } else {
+                        wl_add(simplify_wl, &simplify_cnt, i);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // === Main loop ===
+    let is i32 as progress with mut = 1;
+    while (progress == 1) {
+        progress = 0;
+
+        // 1. SIMPLIFY
+        if (simplify_cnt > 0) {
+            simplify_cnt = simplify_cnt - 1;
+            let is *i32 as wp = cast(*i32, cast(i64, simplify_wl) + cast(i64, simplify_cnt) * 4);
+            let is i32 as v = *wp;
+            // Push onto stack
+            let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
+            *stp = v;
+            stack_top = stack_top + 1;
+            let is *i32 as st_v = cast(*i32, cast(i64, status) + cast(i64, v) * 4);
+            *st_v = 1;
+            // Decrement neighbors
+            let is i32 as nb with mut = 0;
+            while (nb < n) {
+                if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                    let is *i32 as st_nb = cast(*i32, cast(i64, status) + cast(i64, nb) * 4);
+                    if (*st_nb == 0) {
+                        let is *i32 as dnb = cast(*i32, cast(i64, degree) + cast(i64, nb) * 4);
+                        *dnb = *dnb - 1;
+                        let is *i32 as cc_nb = cast(*i32, cast(i64, crosses_call) + cast(i64, nb) * 4);
+                        let is i32 as k_nb with mut = 10;
+                        if (*cc_nb == 1) { k_nb = 5; }
+                        if (*dnb == k_nb - 1) {
+                            let is *i32 as mr_nb = cast(*i32, cast(i64, is_mr) + cast(i64, nb) * 4);
+                            if (*mr_nb == 1) {
+                                wl_remove(spill_wl, &spill_cnt, nb);
+                                wl_add(freeze_wl, &freeze_cnt, nb);
+                            } else {
+                                wl_remove(spill_wl, &spill_cnt, nb);
+                                wl_add(simplify_wl, &simplify_cnt, nb);
+                            }
+                        }
+                    }
+                }
+                nb = nb + 1;
+            }
+            progress = 1;
+        }
+
+        // 2. COALESCE / FREEZE / SPILL
+        else {
+            let is i32 as did_coalesce with mut = 0;
+            let is i32 as mci with mut = 0;
+            while (mci < mov_count && did_coalesce == 0) {
+                let is *GCMove as mv = cast(*GCMove, cast(i64, moves) + cast(i64, mci) * sizeof(GCMove));
+                if (mv.status == 0) {
+                    let is i32 as a = gc2_resolve(alias, mv.src);
+                    let is i32 as b = gc2_resolve(alias, mv.dst);
+                    if (a == b) {
+                        mv.status = 1;
+                        did_coalesce = 1;
+                    } else if (bm_test(matrix, n, a, b) == 1) {
+                        mv.status = 3;
+                        did_coalesce = 1;
+                    } else {
+                        // George criterion: can merge a into b?
+                        let is i32 as ok with mut = 1;
+                        let is i32 as t with mut = 0;
+                        while (t < n && ok == 1) {
+                            if (t != a && bm_test(matrix, n, a, t) == 1) {
+                                let is *i32 as st_t = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
+                                if (*st_t == 0) {
+                                    if (bm_test(matrix, n, t, b) == 0) {
+                                        let is *i32 as cc_t = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
+                                        let is i32 as k_t with mut = 10;
+                                        if (*cc_t == 1) { k_t = 5; }
+                                        let is *i32 as dt = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
+                                        if (*dt >= k_t) { ok = 0; }
+                                    }
+                                }
+                            }
+                            t = t + 1;
+                        }
+                        if (ok == 1) {
+                            // Merge a into b
+                            let is *i32 as al_a = cast(*i32, cast(i64, alias) + cast(i64, a) * 4);
+                            *al_a = b;
+                            let is *i32 as st_a = cast(*i32, cast(i64, status) + cast(i64, a) * 4);
+                            *st_a = 2;
+                            // Propagate call-crossing
+                            let is *i32 as cc_a = cast(*i32, cast(i64, crosses_call) + cast(i64, a) * 4);
+                            let is *i32 as cc_b = cast(*i32, cast(i64, crosses_call) + cast(i64, b) * 4);
+                            *cc_b = *cc_b | *cc_a;
+                            // Transfer move-relatedness
+                            let is *i32 as mr_a = cast(*i32, cast(i64, is_mr) + cast(i64, a) * 4);
+                            let is *i32 as mr_b = cast(*i32, cast(i64, is_mr) + cast(i64, b) * 4);
+                            *mr_b = *mr_b | *mr_a;
+                            // Transfer edges
+                            t = 0;
+                            while (t < n) {
+                                if (t != a && t != b && bm_test(matrix, n, a, t) == 1) {
+                                    let is *i32 as st_t2 = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
+                                    if (*st_t2 == 0) {
+                                        if (bm_test(matrix, n, t, b) == 0) {
+                                            bm_set(matrix, n, t, b);
+                                            let is *i32 as db = cast(*i32, cast(i64, degree) + cast(i64, b) * 4);
+                                            *db = *db + 1;
+                                            let is *i32 as dt2 = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
+                                            *dt2 = *dt2 + 1;
+                                        }
+                                    }
+                                }
+                                t = t + 1;
+                            }
+                            // Remove a from whatever worklist
+                            wl_remove(simplify_wl, &simplify_cnt, a);
+                            wl_remove(freeze_wl, &freeze_cnt, a);
+                            wl_remove(spill_wl, &spill_cnt, a);
+                            // Reclassify b
+                            wl_remove(simplify_wl, &simplify_cnt, b);
+                            wl_remove(freeze_wl, &freeze_cnt, b);
+                            wl_remove(spill_wl, &spill_cnt, b);
+                            let is *i32 as db2 = cast(*i32, cast(i64, degree) + cast(i64, b) * 4);
+                            let is i32 as k_b with mut = 10;
+                            if (*cc_b == 1) { k_b = 5; }
+                            if (*db2 >= k_b) {
+                                wl_add(spill_wl, &spill_cnt, b);
+                            } else if (*mr_b == 1) {
+                                wl_add(freeze_wl, &freeze_cnt, b);
+                            } else {
+                                wl_add(simplify_wl, &simplify_cnt, b);
+                            }
+                            // Check neighbors of b that may have become low-degree
+                            t = 0;
+                            while (t < n) {
+                                if (t != b && bm_test(matrix, n, b, t) == 1) {
+                                    let is *i32 as st_t3 = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
+                                    if (*st_t3 == 0) {
+                                        let is *i32 as dt3 = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
+                                        let is *i32 as cc_t3 = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
+                                        let is i32 as k_t3 with mut = 10;
+                                        if (*cc_t3 == 1) { k_t3 = 5; }
+                                        if (*dt3 < k_t3 && wl_contains(spill_wl, spill_cnt, t) == 1) {
+                                            wl_remove(spill_wl, &spill_cnt, t);
+                                            let is *i32 as mr_t3 = cast(*i32, cast(i64, is_mr) + cast(i64, t) * 4);
+                                            if (*mr_t3 == 1) {
+                                                wl_add(freeze_wl, &freeze_cnt, t);
+                                            } else {
+                                                wl_add(simplify_wl, &simplify_cnt, t);
+                                            }
+                                        }
+                                    }
+                                }
+                                t = t + 1;
+                            }
+                            mv.status = 1;
+                            did_coalesce = 1;
+                        }
+                    }
+                }
+                mci = mci + 1;
+            }
+            if (did_coalesce == 1) { progress = 1; }
+            else {
+                // 3. FREEZE
+                if (freeze_cnt > 0) {
+                    freeze_cnt = freeze_cnt - 1;
+                    let is *i32 as fwp = cast(*i32, cast(i64, freeze_wl) + cast(i64, freeze_cnt) * 4);
+                    let is i32 as fv = *fwp;
+                    // Freeze all moves involving fv
+                    let is i32 as fm with mut = 0;
+                    while (fm < mov_count) {
+                        let is *GCMove as fmv = cast(*GCMove, cast(i64, moves) + cast(i64, fm) * sizeof(GCMove));
+                        if (fmv.status == 0) {
+                            let is i32 as fa = gc2_resolve(alias, fmv.src);
+                            let is i32 as fb = gc2_resolve(alias, fmv.dst);
+                            if (fa == fv || fb == fv) {
+                                fmv.status = 2;
+                                // Check partner
+                                let is i32 as p with mut = fa;
+                                if (fa == fv) { p = fb; }
+                                // Check if p still has active moves
+                                let is i32 as has_active with mut = 0;
+                                let is i32 as pm with mut = 0;
+                                while (pm < mov_count) {
+                                    let is *GCMove as pmv = cast(*GCMove, cast(i64, moves) + cast(i64, pm) * sizeof(GCMove));
+                                    if (pmv.status == 0) {
+                                        let is i32 as pa = gc2_resolve(alias, pmv.src);
+                                        let is i32 as pb = gc2_resolve(alias, pmv.dst);
+                                        if (pa == p || pb == p) { has_active = 1; }
+                                    }
+                                    pm = pm + 1;
+                                }
+                                if (has_active == 0) {
+                                    let is *i32 as mr_p = cast(*i32, cast(i64, is_mr) + cast(i64, p) * 4);
+                                    *mr_p = 0;
+                                    let is *i32 as st_p = cast(*i32, cast(i64, status) + cast(i64, p) * 4);
+                                    if (*st_p == 0 && wl_contains(freeze_wl, freeze_cnt, p) == 1) {
+                                        wl_remove(freeze_wl, &freeze_cnt, p);
+                                        wl_add(simplify_wl, &simplify_cnt, p);
+                                    }
+                                }
+                            }
+                        }
+                        fm = fm + 1;
+                    }
+                    let is *i32 as mr_fv = cast(*i32, cast(i64, is_mr) + cast(i64, fv) * 4);
+                    *mr_fv = 0;
+                    wl_add(simplify_wl, &simplify_cnt, fv);
+                    progress = 1;
+                }
+                // 4. SPILL
+                else if (spill_cnt > 0) {
+                    // Pick lowest spill cost
+                    let is i32 as best with mut = 0;
+                    let is *i32 as best_p = cast(*i32, cast(i64, spill_wl) + 0);
+                    let is i32 as best_cost with mut = INT_MAX;
+                    let is *i32 as scp_b = cast(*i32, cast(i64, spill_cost) + cast(i64, *best_p) * 4);
+                    best_cost = *scp_b;
+                    let is *i32 as bv2p = cast(*i32, cast(i64, v2iv) + cast(i64, *best_p) * 4);
+                    let is *LiveInterval as iv_best with mut = gc2_get_iv(ctx.intervals, *bv2p);
+                    let is i32 as range_best with mut = iv_best.end_pos - iv_best.start + 1;
+                    if (range_best < 1) { range_best = 1; }
+                    let is i32 as si with mut = 1;
+                    while (si < spill_cnt) {
+                        let is *i32 as swp = cast(*i32, cast(i64, spill_wl) + cast(i64, si) * 4);
+                        let is *i32 as sci = cast(*i32, cast(i64, spill_cost) + cast(i64, *swp) * 4);
+                        let is *i32 as cv2p = cast(*i32, cast(i64, v2iv) + cast(i64, *swp) * 4);
+                        let is *LiveInterval as iv_cur = gc2_get_iv(ctx.intervals, *cv2p);
+                        let is i32 as range_cur with mut = iv_cur.end_pos - iv_cur.start + 1;
+                        if (range_cur < 1) { range_cur = 1; }
+                        if (cast(i64, *sci) * cast(i64, range_best) < cast(i64, best_cost) * cast(i64, range_cur)) {
+                            best_cost = *sci;
+                            best = si;
+                            range_best = range_cur;
+                        }
+                        si = si + 1;
+                    }
+                    let is *i32 as bwp = cast(*i32, cast(i64, spill_wl) + cast(i64, best) * 4);
+                    let is i32 as sv = *bwp;
+                    // Remove from spill_wl (swap with last)
+                    let is *i32 as last_sw = cast(*i32, cast(i64, spill_wl) + cast(i64, spill_cnt - 1) * 4);
+                    *bwp = *last_sw;
+                    spill_cnt = spill_cnt - 1;
+                    // Push onto stack as potential spill
+                    let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
+                    *stp = sv;
+                    stack_top = stack_top + 1;
+                    let is *i32 as st_sv = cast(*i32, cast(i64, status) + cast(i64, sv) * 4);
+                    *st_sv = 1;
+                    // Decrement neighbors
+                    let is i32 as snb with mut = 0;
+                    while (snb < n) {
+                        if (snb != sv && bm_test(matrix, n, sv, snb) == 1) {
+                            let is *i32 as st_snb = cast(*i32, cast(i64, status) + cast(i64, snb) * 4);
+                            if (*st_snb == 0) {
+                                let is *i32 as dsnb = cast(*i32, cast(i64, degree) + cast(i64, snb) * 4);
+                                *dsnb = *dsnb - 1;
+                                let is *i32 as cc_snb = cast(*i32, cast(i64, crosses_call) + cast(i64, snb) * 4);
+                                let is i32 as k_snb with mut = 10;
+                                if (*cc_snb == 1) { k_snb = 5; }
+                                if (*dsnb == k_snb - 1) {
+                                    let is *i32 as mr_snb = cast(*i32, cast(i64, is_mr) + cast(i64, snb) * 4);
+                                    if (*mr_snb == 1) {
+                                        wl_remove(spill_wl, &spill_cnt, snb);
+                                        wl_add(freeze_wl, &freeze_cnt, snb);
+                                    } else {
+                                        wl_remove(spill_wl, &spill_cnt, snb);
+                                        wl_add(simplify_wl, &simplify_cnt, snb);
+                                    }
+                                }
+                            }
+                        }
+                        snb = snb + 1;
+                    }
+                    progress = 1;
+                }
+            }
+        }
+    }
+
+    // === SELECT: pop stack LIFO, assign colors ===
+    while (stack_top > 0) {
+        stack_top = stack_top - 1;
+        let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
+        let is i32 as v = *stp;
+
+        // Build used colors set
+        let is [10]i32 as used;
+        let is i32 as ri with mut = 0;
+        while (ri < 10) { used[ri] = 0; ri = ri + 1; }
+
+        let is i32 as nb with mut = 0;
+        while (nb < n) {
+            if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                let is i32 as rnb = gc2_resolve(alias, nb);
+                let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
+                if (*cnb >= 0) {
+                    let is i32 as slot = reg_to_slot(*cnb);
+                    if (slot >= 0) { used[slot] = 1; }
+                }
+            }
+            nb = nb + 1;
+        }
+
+        // Exclude caller-saved if call-crossing
+        let is *i32 as cc_v = cast(*i32, cast(i64, crosses_call) + cast(i64, v) * 4);
+        if (*cc_v == 1) {
+            used[4] = 1;  // r8
+            used[5] = 1;  // r9
+            used[6] = 1;  // r10
+            used[7] = 1;  // rsi
+            used[8] = 1;  // rdi
+        }
+
+        // Exclude other params' ABI registers for GET_ARG vregs
+        // Prevents sequential GET_ARG emission from clobbering later params' ABI regs.
+        let is *i32 as ga_v = cast(*i32, cast(i64, ga_param) + cast(i64, v) * 4);
+        if (*ga_v >= 0) {
+            let is i32 as ga_ai with mut = 0;
+            while (ga_ai < ga_nargs) {
+                if (ga_ai != *ga_v && ga_abi_slot[ga_ai] >= 0) {
+                    used[ga_abi_slot[ga_ai]] = 1;
+                }
+                ga_ai = ga_ai + 1;
+            }
+        }
+
+        // Try coalesce hint: check if v has alias partner with color
+        let is i32 as chosen with mut = cast(i32, 0 - 1);
+        let is i32 as mh with mut = 0;
+        while (mh < mov_count && chosen < 0) {
+            let is *GCMove as hmv = cast(*GCMove, cast(i64, moves) + cast(i64, mh) * sizeof(GCMove));
+            let is i32 as ha = gc2_resolve(alias, hmv.src);
+            let is i32 as hb = gc2_resolve(alias, hmv.dst);
+            if (ha == v || hb == v) {
+                let is i32 as partner with mut = ha;
+                if (ha == v) { partner = hb; }
+                let is *i32 as cp2 = cast(*i32, cast(i64, color) + cast(i64, partner) * 4);
+                if (*cp2 >= 0) {
+                    let is i32 as ps = reg_to_slot(*cp2);
+                    if (ps >= 0 && used[ps] == 0) { chosen = *cp2; }
+                }
+            }
+            mh = mh + 1;
+        }
+
+        // First-fit
+        if (chosen < 0) {
+            ri = 0;
+            while (ri < 10 && chosen < 0) {
+                if (used[ri] == 0) { chosen = regs[ri]; }
+                ri = ri + 1;
+            }
+        }
+
+        if (chosen >= 0) {
+            let is *i32 as cv = cast(*i32, cast(i64, color) + cast(i64, v) * 4);
+            *cv = chosen;
+            let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, v) * 4);
+            *vp = chosen;
+            gc_mark_callee(chosen, ctx);
+        } else {
+            // Actual spill
+            let is i32 as sp = ctx.next_spill;
+            ctx.next_spill = ctx.next_spill + 1;
+            let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, v) * 4);
+            *vp = 0 - sp;
+        }
+    }
+
+    // Propagate colors to coalesced nodes
+    i = 0;
+    while (i < n) {
+        let is *i32 as al_i = cast(*i32, cast(i64, alias) + cast(i64, i) * 4);
+        if (*al_i >= 0) {
+            let is i32 as root = gc2_resolve(alias, i);
+            let is *i32 as cr = cast(*i32, cast(i64, color) + cast(i64, root) * 4);
+            if (*cr >= 0) {
+                let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, i) * 4);
+                *vp = *cr;
+                gc_mark_callee(*cr, ctx);
+            } else {
+                // Root was spilled — use same spill slot
+                let is *i32 as vpr = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, root) * 4);
+                let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, i) * 4);
+                *vp = *vpr;
+            }
+        }
+        i = i + 1;
+    }
+
+    ctx.stack_slots = ctx.next_spill - 1;
+
+    // === VERIFY: safety net ===
+    let is i32 as vi with mut = 0;
+    while (vi < n) {
+        let is *i32 as vi_p = cast(*i32, cast(i64, v2iv) + cast(i64, vi) * 4);
+        let is i32 as ii = *vi_p;
+        if (ii >= 0) {
+            let is *LiveInterval as iva = gc2_get_iv(ctx.intervals, ii);
+            if (iva.start != INT_MAX) {
+                let is *i32 as loc_vi = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, vi) * 4);
+                if (*loc_vi >= 0) {
+                    // Check call-crossing safety
+                    let is *i32 as cc_vi = cast(*i32, cast(i64, crosses_call) + cast(i64, vi) * 4);
+                    if (*cc_vi == 1 && is_caller_saved(*loc_vi) == 1) {
+                        let is i32 as sp2 = ctx.next_spill;
+                        ctx.next_spill = ctx.next_spill + 1;
+                        *loc_vi = 0 - sp2;
+                        ctx.stack_slots = ctx.next_spill - 1;
+                    }
+                    // Check interference conflicts
+                    let is i32 as vj with mut = vi + 1;
+                    while (vj < n) {
+                        let is *i32 as vj_p = cast(*i32, cast(i64, v2iv) + cast(i64, vj) * 4);
+                        if (*vj_p >= 0 && bm_test(matrix, n, vi, vj) == 1) {
+                            let is *i32 as loc_vj = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, vj) * 4);
+                            if (*loc_vj >= 0 && *loc_vj == *loc_vi) {
+                                let is i32 as sp3 = ctx.next_spill;
+                                ctx.next_spill = ctx.next_spill + 1;
+                                *loc_vj = 0 - sp3;
+                                ctx.stack_slots = ctx.next_spill - 1;
+                            }
+                        }
+                        vj = vj + 1;
+                    }
+                }
+            }
+        }
+        vi = vi + 1;
+    }
+
+    // Cleanup
+    mem.gfree(cast(*u8, v2iv));
+    mem.gfree(cast(*u8, degree));
+    mem.gfree(cast(*u8, color));
+    mem.gfree(cast(*u8, alias));
+    mem.gfree(cast(*u8, status));
+    mem.gfree(cast(*u8, is_mr));
+    mem.gfree(cast(*u8, spill_cost));
+    mem.gfree(cast(*u8, crosses_call));
+    mem.gfree(matrix);
+    mem.gfree(cast(*u8, moves));
+    mem.gfree(cast(*u8, simplify_wl));
+    mem.gfree(cast(*u8, freeze_wl));
+    mem.gfree(cast(*u8, spill_wl));
+    mem.gfree(cast(*u8, ga_param));
+    mem.gfree(cast(*u8, stack));
 }

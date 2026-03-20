@@ -1,0 +1,435 @@
+// Peephole optimizer: post-pass on generated .s assembly
+// Eliminates redundant MOVs and folds sign-extension patterns.
+//
+// Patterns:
+//   1. MOV + movsxd fusion: mov rA, rB + movsxd rA, rAd → movsxd rA, rBd
+//   2. MOV chain bypass: mov rA, rB + mov rC, rA → keep first, rewrite second to mov rC, rB
+//   3. Dead MOV elimination: mov rA, X; mov rA, Y → remove first
+//      (only when Y does not reference rA in any way)
+
+use "../../std/linux.cst" as linux;
+use "../../std/mem.cst" as mem;
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+fn ph_strlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn ph_streq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn ph_memcpy(dst as *u8, src as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[i] = src[i]; i = i + 1; }
+}
+
+// Check if haystack contains needle as substring
+fn str_contains(hay as *u8, hlen as i32, ndl as *u8, nlen as i32) as i32 {
+    if (nlen > hlen) { return 0; }
+    let is i32 as end = hlen - nlen;
+    let is i32 as i with mut = 0;
+    while (i <= end) {
+        let is i32 as j with mut = 0;
+        let is i32 as ok with mut = 1;
+        while (j < nlen) {
+            if (hay[i + j] != ndl[j]) { ok = 0; j = nlen; }
+            j = j + 1;
+        }
+        if (ok == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Line table ───────────────────────────────────────────────────────
+
+let is *u8 as line_offs with mut;
+let is *u8 as line_lens with mut;
+let is i32 as line_count with mut = 0;
+
+fn get_off(i as i32) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, line_offs) + cast(i64, i) * 8);
+    return *p;
+}
+
+fn set_off(i as i32, v as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, line_offs) + cast(i64, i) * 8);
+    *p = v;
+}
+
+fn get_len(i as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
+    return *p;
+}
+
+fn set_len(i as i32, v as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
+    *p = v;
+}
+
+// ── Parsing helpers ──────────────────────────────────────────────────
+
+fn skip_ws(buf as *u8, start as i64, len as i32) as i32 {
+    let is i32 as i with mut = 0;
+    let is *u8 as p = cast(*u8, cast(i64, buf) + start);
+    while (i < len) {
+        if (p[i] != 32 && p[i] != 9) { return i; }
+        i = i + 1;
+    }
+    return len;
+}
+
+// Returns offset to first operand, or 99999 if no match
+fn match_inst(buf as *u8, off as i64, len as i32, mnem as *u8, mlen as i32) as i32 {
+    let is i32 as ws = skip_ws(buf, off, len);
+    if (ws + mlen >= len) { return 99999; }
+    let is *u8 as p = cast(*u8, cast(i64, buf) + off + cast(i64, ws));
+    let is i32 as i with mut = 0;
+    while (i < mlen) {
+        if (p[i] != mnem[i]) { return 99999; }
+        i = i + 1;
+    }
+    if (p[mlen] != 32) { return 99999; }
+    return ws + mlen + 1;
+}
+
+fn get_operand(buf as *u8, off as i64, start as i32, len as i32, out_len as *i32) as *u8 {
+    let is *u8 as p = cast(*u8, cast(i64, buf) + off + cast(i64, start));
+    let is i32 as i with mut = 0;
+    let is i32 as max = len - start;
+    while (i < max) {
+        if (p[i] == 44) { *out_len = i; return p; }
+        i = i + 1;
+    }
+    *out_len = max;
+    return p;
+}
+
+fn is_reg64(op as *u8, olen as i32) as i32 {
+    if (olen < 2 || olen > 4) { return 0; }
+    if (op[0] != 114) { return 0; }
+    if (olen == 3) {
+        if (op[1] == 98 && op[2] == 112) { return 0; }
+        if (op[1] == 115 && op[2] == 112) { return 0; }
+        if (op[1] == 105 && op[2] == 112) { return 0; }
+    }
+    return 1;
+}
+
+fn reg64_to_32(op as *u8, olen as i32) as *u8 {
+    if (olen == 3 && op[0] == 114) {
+        if (op[1] == 97 && op[2] == 120) { return "eax"; }
+        if (op[1] == 99 && op[2] == 120) { return "ecx"; }
+        if (op[1] == 100 && op[2] == 120) { return "edx"; }
+        if (op[1] == 98 && op[2] == 120) { return "ebx"; }
+        if (op[1] == 115 && op[2] == 105) { return "esi"; }
+        if (op[1] == 100 && op[2] == 105) { return "edi"; }
+    }
+    if (olen == 2 && op[0] == 114) {
+        if (op[1] == 56) { return "r8d"; }
+        if (op[1] == 57) { return "r9d"; }
+    }
+    if (olen == 3 && op[0] == 114 && op[1] == 49) {
+        if (op[2] == 48) { return "r10d"; }
+        if (op[2] == 49) { return "r11d"; }
+        if (op[2] == 50) { return "r12d"; }
+        if (op[2] == 51) { return "r13d"; }
+        if (op[2] == 52) { return "r14d"; }
+        if (op[2] == 53) { return "r15d"; }
+    }
+    return cast(*u8, 0);
+}
+
+// ── Replacement buffer ───────────────────────────────────────────────
+
+let is *u8 as repl_buf with mut;
+let is i64 as repl_len with mut = 0;
+let is i64 as repl_cap with mut = 0;
+
+fn repl_line(s as *u8, slen as i32) as i64 {
+    if (repl_len + cast(i64, slen) > repl_cap) { return cast(i64, 0 - 1); }
+    let is i64 as off = repl_len;
+    ph_memcpy(cast(*u8, cast(i64, repl_buf) + repl_len), s, cast(i64, slen));
+    repl_len = repl_len + cast(i64, slen);
+    return off;
+}
+
+let is i32 as stat_removed with mut = 0;
+let is i32 as stat_fused with mut = 0;
+let is [128]u8 as pat_tmp with mut;
+
+let is i64 as REPL_MARKER with imut = 1000000000;
+
+// ── Pattern 1: MOV + movsxd fusion ──────────────────────────────────
+
+fn try_pat1(buf as *u8, i as i32) as i32 {
+    let is i64 as off1 = get_off(i);
+    let is i32 as len1 = get_len(i);
+    let is i64 as off2 = get_off(i + 1);
+    let is i32 as len2 = get_len(i + 1);
+
+    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
+    if (p1 == 99999) { return 0; }
+    let is i32 as a1l with mut = 0;
+    let is *u8 as a1 = get_operand(buf, off1, p1, len1, &a1l);
+    if (is_reg64(a1, a1l) == 0) { return 0; }
+    let is i32 as p1b = p1 + a1l + 2;
+    if (p1b >= len1) { return 0; }
+    let is i32 as b1l with mut = 0;
+    let is *u8 as b1 = get_operand(buf, off1, p1b, len1, &b1l);
+    if (is_reg64(b1, b1l) == 0) { return 0; }
+
+    let is i32 as p2 = match_inst(buf, off2, len2, "movsxd", 6);
+    if (p2 == 99999) { return 0; }
+    let is i32 as a2l with mut = 0;
+    let is *u8 as a2 = get_operand(buf, off2, p2, len2, &a2l);
+    if (ph_streq(a2, a2l, a1, a1l) == 0) { return 0; }
+    let is i32 as p2b = p2 + a2l + 2;
+    if (p2b >= len2) { return 0; }
+    let is i32 as b2l with mut = 0;
+    let is *u8 as b2 = get_operand(buf, off2, p2b, len2, &b2l);
+
+    let is *u8 as e32 = reg64_to_32(a2, a2l);
+    if (cast(i64, e32) == 0) { return 0; }
+    let is i32 as e32l = ph_strlen(e32);
+    if (ph_streq(b2, b2l, e32, e32l) == 0) { return 0; }
+
+    let is *u8 as rBd = reg64_to_32(b1, b1l);
+    if (cast(i64, rBd) == 0) { return 0; }
+    let is i32 as rBdl = ph_strlen(rBd);
+
+    let is i32 as tp with mut = 0;
+    pat_tmp[0] = 32; pat_tmp[1] = 32; tp = 2;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), "movsxd ", 7); tp = tp + 7;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), a1, cast(i64, a1l)); tp = tp + a1l;
+    pat_tmp[tp] = 44; tp = tp + 1;
+    pat_tmp[tp] = 32; tp = tp + 1;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), rBd, cast(i64, rBdl)); tp = tp + rBdl;
+
+    if (tp >= 128) { return 0; }
+    let is i64 as roff = repl_line(cast(*u8, &pat_tmp), tp);
+    if (roff < 0) { return 0; }
+    set_len(i, cast(i32, 0 - 1));
+    set_off(i + 1, REPL_MARKER + roff);
+    set_len(i + 1, tp);
+    stat_fused = stat_fused + 1;
+    return 1;
+}
+
+// ── Pattern 2: MOV chain bypass ──────────────────────────────────────
+
+fn try_pat2(buf as *u8, i as i32) as i32 {
+    let is i64 as off1 = get_off(i);
+    let is i32 as len1 = get_len(i);
+    let is i64 as off2 = get_off(i + 1);
+    let is i32 as len2 = get_len(i + 1);
+
+    // Line i: mov rA, rB (both reg64)
+    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
+    if (p1 == 99999) { return 0; }
+    let is i32 as a1l with mut = 0;
+    let is *u8 as a1 = get_operand(buf, off1, p1, len1, &a1l);
+    if (is_reg64(a1, a1l) == 0) { return 0; }
+    let is i32 as s1s = p1 + a1l + 2;
+    if (s1s >= len1) { return 0; }
+    let is i32 as s1l with mut = 0;
+    let is *u8 as s1 = get_operand(buf, off1, s1s, len1, &s1l);
+    if (is_reg64(s1, s1l) == 0) { return 0; }
+
+    // rA != rB (NOP otherwise, pattern 3 handles)
+    if (ph_streq(a1, a1l, s1, s1l) == 1) { return 0; }
+
+    // Line i+1: mov rC, rA
+    let is i32 as p2 = match_inst(buf, off2, len2, "mov", 3);
+    if (p2 == 99999) { return 0; }
+    let is i32 as a2l with mut = 0;
+    let is *u8 as a2 = get_operand(buf, off2, p2, len2, &a2l);
+    if (is_reg64(a2, a2l) == 0) { return 0; }
+    let is i32 as s2s = p2 + a2l + 2;
+    if (s2s >= len2) { return 0; }
+    let is i32 as s2l with mut = 0;
+    let is *u8 as s2 = get_operand(buf, off2, s2s, len2, &s2l);
+
+    // Source of i+1 must equal dest of i (rA)
+    if (ph_streq(s2, s2l, a1, a1l) == 0) { return 0; }
+
+    // rA != rC (NOP otherwise)
+    if (ph_streq(a1, a1l, a2, a2l) == 1) { return 0; }
+
+    // If rC == rB, the rewrite would be mov rC, rC (self-MOV) — delete i+1
+    if (ph_streq(a2, a2l, s1, s1l) == 1) {
+        set_len(i + 1, cast(i32, 0 - 1));
+        stat_removed = stat_removed + 1;
+        return 1;
+    }
+
+    // Rewrite i+1: mov rC, rB
+    let is i32 as tp with mut = 0;
+    pat_tmp[0] = 32; pat_tmp[1] = 32; tp = 2;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), "mov ", 4); tp = tp + 4;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), a2, cast(i64, a2l)); tp = tp + a2l;
+    pat_tmp[tp] = 44; tp = tp + 1;
+    pat_tmp[tp] = 32; tp = tp + 1;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), s1, cast(i64, s1l)); tp = tp + s1l;
+
+    if (tp >= 128) { return 0; }
+    let is i64 as roff = repl_line(cast(*u8, &pat_tmp), tp);
+    if (roff < 0) { return 0; }
+    set_off(i + 1, REPL_MARKER + roff);
+    set_len(i + 1, tp);
+    stat_fused = stat_fused + 1;
+    return 1;
+}
+
+// ── Pattern 3: Dead MOV elimination ──────────────────────────────────
+
+fn try_pat3(buf as *u8, i as i32) as i32 {
+    let is i64 as off1 = get_off(i);
+    let is i32 as len1 = get_len(i);
+    let is i64 as off2 = get_off(i + 1);
+    let is i32 as len2 = get_len(i + 1);
+
+    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
+    if (p1 == 99999) { return 0; }
+    let is i32 as p2 = match_inst(buf, off2, len2, "mov", 3);
+    if (p2 == 99999) { return 0; }
+
+    let is i32 as d1l with mut = 0;
+    let is *u8 as d1 = get_operand(buf, off1, p1, len1, &d1l);
+    let is i32 as d2l with mut = 0;
+    let is *u8 as d2 = get_operand(buf, off2, p2, len2, &d2l);
+
+    if (is_reg64(d1, d1l) == 0) { return 0; }
+    if (ph_streq(d1, d1l, d2, d2l) == 0) { return 0; }
+
+    let is i32 as s2s = p2 + d2l + 2;
+    if (s2s >= len2) { return 0; }
+    let is i32 as s2l with mut = 0;
+    let is *u8 as s2 = get_operand(buf, off2, s2s, len2, &s2l);
+    if (str_contains(s2, s2l, d1, d1l) == 1) { return 0; }
+    let is *u8 as d1_32 = reg64_to_32(d1, d1l);
+    if (cast(i64, d1_32) != 0) {
+        let is i32 as d1_32l = ph_strlen(d1_32);
+        if (str_contains(s2, s2l, d1_32, d1_32l) == 1) { return 0; }
+    }
+
+    set_len(i, cast(i32, 0 - 1));
+    stat_removed = stat_removed + 1;
+    return 1;
+}
+
+// ── Main pass ────────────────────────────────────────────────────────
+
+fn optimize_asm(path as *u8) as void {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return; }
+    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
+    linux.lseek(fd, 0, linux.SEEK_SET);
+    if (size <= 0) { linux.close(fd); return; }
+
+    let is i64 as buf_size = size + 4096;
+    let is *u8 as buf = cast(*u8, linux.mmap(cast(*u8, 0), buf_size, 3, 34, 0, 0));
+    if (cast(i64, buf) < 0) { return; }
+    linux.read(fd, buf, size);
+    buf[size] = cast(u8, 0);
+    linux.close(fd);
+
+    let is i64 as max_lines = size / 4 + 1024;
+    let is i64 as tbl_size = max_lines * 12 + 131072;
+    let is *u8 as tbl = cast(*u8, linux.mmap(cast(*u8, 0), tbl_size, 3, 34, 0, 0));
+    if (cast(i64, tbl) < 0) { return; }
+
+    line_offs = tbl;
+    line_lens = cast(*u8, cast(i64, tbl) + max_lines * 8);
+    line_count = 0;
+    repl_buf = cast(*u8, cast(i64, tbl) + max_lines * 12);
+    repl_len = 0;
+    repl_cap = 131072;
+    stat_removed = 0;
+    stat_fused = 0;
+
+    let is i64 as pos with mut = 0;
+    while (pos < size) {
+        if (cast(i64, line_count) >= max_lines) { return; }
+        let is i64 as start = pos;
+        while (pos < size && buf[pos] != 10) { pos = pos + 1; }
+        set_off(line_count, start);
+        let is i32 as llen with mut = cast(i32, pos - start);
+        if (llen > 0 && buf[start + cast(i64, llen) - 1] == 13) { llen = llen - 1; }
+        set_len(line_count, llen);
+        line_count = line_count + 1;
+        if (pos < size) { pos = pos + 1; }
+    }
+
+    let is i32 as changed with mut = 1;
+    let is i32 as pass with mut = 0;
+    while (changed == 1 && pass < 4) {
+        changed = 0;
+        let is i32 as i with mut = 0;
+        while (i < line_count - 1) {
+            if (get_len(i) >= 0 && get_len(i + 1) >= 0 && get_off(i) < REPL_MARKER && get_off(i + 1) < REPL_MARKER) {
+                // 8.3: pre-filter — only mov/movsxd start with 'm' (109)
+                let is i64 as pf_off = get_off(i);
+                let is i32 as pf_len = get_len(i);
+                let is i32 as pf_ws = skip_ws(buf, pf_off, pf_len);
+                if (pf_ws < pf_len && buf[pf_off + cast(i64, pf_ws)] == 109) {
+                    if (try_pat1(buf, i) == 1) { changed = 1; }
+                    if (get_len(i) >= 0 && try_pat2(buf, i) == 1) { changed = 1; }
+                    if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat3(buf, i) == 1) { changed = 1; }
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+
+    // 8.2: early exit — if no patterns matched, file is already correct
+    if (stat_removed == 0 && stat_fused == 0) { return; }
+
+    // 8.1: buffered write — compute total, write once
+    let is i64 as out_total with mut = 0;
+    let is i32 as li with mut = 0;
+    while (li < line_count) {
+        let is i32 as llen = get_len(li);
+        if (llen >= 0) { out_total = out_total + cast(i64, llen) + 1; }
+        li = li + 1;
+    }
+    // PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANONYMOUS=34
+    let is *u8 as out_buf = cast(*u8, linux.mmap(cast(*u8, 0), out_total + 4096, 3, 34, 0, 0));
+    if (cast(i64, out_buf) < 0) { return; }
+    let is i64 as out_pos with mut = 0;
+    li = 0;
+    while (li < line_count) {
+        let is i32 as llen = get_len(li);
+        if (llen >= 0) {
+            let is i64 as loff = get_off(li);
+            let is *u8 as lptr with mut = cast(*u8, 0);
+            if (loff >= REPL_MARKER) {
+                lptr = cast(*u8, cast(i64, repl_buf) + loff - REPL_MARKER);
+            } else {
+                lptr = cast(*u8, cast(i64, buf) + loff);
+            }
+            ph_memcpy(cast(*u8, cast(i64, out_buf) + out_pos), lptr, cast(i64, llen));
+            out_pos = out_pos + cast(i64, llen);
+            out_buf[out_pos] = 10;
+            out_pos = out_pos + 1;
+        }
+        li = li + 1;
+    }
+    let is i64 as wfd = linux.open(path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+    if (wfd >= 0) {
+        linux.write(wfd, out_buf, out_pos);
+        linux.close(wfd);
+    }
+    linux.munmap(out_buf, out_total + 4096);
+}

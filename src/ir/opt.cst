@@ -3,66 +3,45 @@ use "defs.cst" as d;
 use "ssa.cst" as ssa;
 use "opt_passes.cst" as passes;
 
-// === optimize_func ===
+let is *u8 as opt_prog_ptr with mut;
 
 fn optimize_func(func as *d.IRFunction) as void {
-    // SSA mem2reg (before ADDR fusion — only promotes vars already using IMM offsets)
-    ssa.mem2reg(func);
-
     let is i32 as vc with mut = func.vreg_count;
     if (vc == 0) { return; }
+    let is i32 as vc_alloc with mut = vc + 512;
 
-    // Allocate tracking arrays (+512 headroom for mem2reg vregs added later)
-    let is i32 as vc_alloc = vc + 512;
+    passes.pass_addr_fusion(func, vc_alloc);
+    ssa.mem2reg(func);
+    vc = func.vreg_count;
+    vc_alloc = vc + 512;
+
     let is *i32 as is_const = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
     let is *i64 as imm_val = cast(*i64, mem.galloc(cast(i64, vc_alloc) * 8));
     let is *i32 as copy_of = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
-
-    // Init
     let is i32 as i with mut = 0;
     while (i < vc_alloc) {
-        let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, i) * 4);
-        *cp = 0;
-        let is *i64 as ip = cast(*i64, cast(i64, imm_val) + cast(i64, i) * 8);
-        *ip = 0;
-        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, i) * 4);
-        *pp = 0 - 1;
+        let is *i32 as cp = cast(*i32, cast(i64, is_const) + cast(i64, i) * 4); *cp = 0;
+        let is *i64 as ip = cast(*i64, cast(i64, imm_val) + cast(i64, i) * 8); *ip = 0;
+        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, i) * 4); *pp = 0 - 1;
         i = i + 1;
     }
 
-    // Pass 1: Constant Prop + Copy Prop
     passes.pass_const_copy_prop(func, is_const, imm_val, copy_of, vc);
-
-    // Pass 1.1: Fuse ADDR+STORE/LOAD
-    passes.pass_addr_fusion(func, vc_alloc);
-
-    // Pass 1.2: Store-Load Forwarding
     passes.pass_store_load_fwd(func);
-
-    // Pass 1.5: Fold constants into operands
     passes.pass_fold_immediates(func, is_const, imm_val);
-
-    // Pass 1.8: LICM (no-call loops only)
     passes.pass_licm(func);
-
-    // Pass 2: DCE (backward scan)
+    passes.pass_strength_reduction(func);
     passes.pass_dce(func, vc_alloc, copy_of);
-
-    // Pass 3: Final resolve
     passes.pass_final_resolve(func, copy_of);
+    passes.pass_inline(func, opt_prog_ptr);
 
-    // Cleanup
     mem.gfree(cast(*u8, is_const));
     mem.gfree(cast(*u8, imm_val));
     mem.gfree(cast(*u8, copy_of));
-
-    // SSA mem2reg pass 2 (after all opts — promotes i32 vars fused by addr_fusion)
-    ssa.mem2reg(func);
 }
 
-// === Entry point ===
-
 fn optimize(prog as *u8) as void {
+    opt_prog_ptr = prog;
     let is *d.IRProgram as p = cast(*d.IRProgram, prog);
     let is *d.IRFunction as func with mut = p.functions;
     while (cast(i64, func) != 0) {
