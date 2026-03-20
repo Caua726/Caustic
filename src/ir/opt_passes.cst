@@ -29,25 +29,6 @@ fn resolve(copy_of as *i32, v as i32) as i32 {
     return cur;
 }
 
-fn resolve_sized(copy_of as *i32, vreg_size as *i32, v as i32, vc as i32) as i32 {
-    let is i32 as cur with mut = v;
-    let is i32 as hops with mut = 0;
-    while (hops < 16) {
-        let is *i32 as p = cast(*i32, cast(i64, copy_of) + cast(i64, cur) * 4);
-        let is i32 as next = *p;
-        if (next < 0) { return cur; }
-        // Stop if crossing a size boundary
-        if (cur < vc && next < vc) {
-            let is *i32 as sc = cast(*i32, cast(i64, vreg_size) + cast(i64, cur) * 4);
-            let is *i32 as sn = cast(*i32, cast(i64, vreg_size) + cast(i64, next) * 4);
-            if (*sc != *sn) { return cur; }
-        }
-        cur = next;
-        hops = hops + 1;
-    }
-    return cur;
-}
-
 fn has_side_effects(op as i32) as i32 {
     if (op == d.IR_STORE) { return 1; }
     if (op == d.IR_COPY) { return 1; }
@@ -72,14 +53,10 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
     let is i32 as vc_ext = vc + 512;
     // Pre-compute def counts: vregs with multiple defs cannot be safely marked const
     let is *i32 as ccp_defs = cast(*i32, mem.galloc(cast(i64, vc_ext) * 4));
-    // Build vreg_size: track operand width per vreg (default 8, smaller for IR_CAST/IR_LOAD with cast_to)
-    let is *i32 as vreg_size = cast(*i32, mem.galloc(cast(i64, vc_ext) * 4));
     let is i32 as cdi with mut = 0;
     while (cdi < vc_ext) {
         let is *i32 as cdp = cast(*i32, cast(i64, ccp_defs) + cast(i64, cdi) * 4);
         *cdp = 0;
-        let is *i32 as vsp = cast(*i32, cast(i64, vreg_size) + cast(i64, cdi) * 4);
-        *vsp = 8;
         cdi = cdi + 1;
     }
     let is *d.IRInst as cdinst with mut = func.instructions;
@@ -89,27 +66,6 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
             if (cdv >= 0 && cdv < vc_ext) {
                 let is *i32 as cdp = cast(*i32, cast(i64, ccp_defs) + cast(i64, cdv) * 4);
                 *cdp = *cdp + 1;
-                // Track vreg size from cast_to
-                if ((cdinst.op == d.IR_CAST || cdinst.op == d.IR_LOAD) && cast(i64, cdinst.cast_to) != 0) {
-                    let is *i32 as szp = cast(*i32, cast(i64, cdinst.cast_to) + 28);
-                    let is *i32 as vsp = cast(*i32, cast(i64, vreg_size) + cast(i64, cdv) * 4);
-                    *vsp = *szp;
-                }
-            }
-        }
-        cdinst = cdinst.next;
-    }
-    // Propagate vreg_size through IR_MOV: if src is smaller, dest inherits the smaller size
-    // This catches phi MOVs connecting i32 IR_CAST results to phi vregs
-    cdinst = func.instructions;
-    while (cast(i64, cdinst) != 0) {
-        if (cdinst.is_dead == 0 && cdinst.op == d.IR_MOV && cdinst.dest.op_type == d.OP_VREG && cdinst.src1.op_type == d.OP_VREG) {
-            let is i32 as mdv = cdinst.dest.vreg;
-            let is i32 as msv = cdinst.src1.vreg;
-            if (mdv >= 0 && mdv < vc_ext && msv >= 0 && msv < vc_ext) {
-                let is *i32 as msd = cast(*i32, cast(i64, vreg_size) + cast(i64, mdv) * 4);
-                let is *i32 as mss = cast(*i32, cast(i64, vreg_size) + cast(i64, msv) * 4);
-                if (*mss < *msd) { *msd = *mss; }
             }
         }
         cdinst = cdinst.next;
@@ -120,24 +76,24 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
         else {
             let is i32 as op = inst.op;
 
-            // Resolve src1 copy chain (size-aware)
+            // Resolve src1 copy chain
             if (inst.src1.op_type == d.OP_VREG) {
-                let is i32 as r1 = resolve_sized(copy_of, vreg_size, inst.src1.vreg, vc_ext);
+                let is i32 as r1 = resolve(copy_of, inst.src1.vreg);
                 if (r1 != inst.src1.vreg) { inst.src1.vreg = r1; }
             }
             // Resolve src2 copy chain
             if (inst.src2.op_type == d.OP_VREG) {
-                let is i32 as r2 = resolve_sized(copy_of, vreg_size, inst.src2.vreg, vc_ext);
+                let is i32 as r2 = resolve(copy_of, inst.src2.vreg);
                 if (r2 != inst.src2.vreg) { inst.src2.vreg = r2; }
             }
             // Also resolve dest for STORE (dest is the address vreg)
             if (op == d.IR_STORE && inst.dest.op_type == d.OP_VREG) {
-                let is i32 as rd = resolve_sized(copy_of, vreg_size, inst.dest.vreg, vc_ext);
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
                 if (rd != inst.dest.vreg) { inst.dest.vreg = rd; }
             }
             // Resolve for COPY (dest is address vreg)
             if (op == d.IR_COPY && inst.dest.op_type == d.OP_VREG) {
-                let is i32 as rd = resolve_sized(copy_of, vreg_size, inst.dest.vreg, vc_ext);
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
                 if (rd != inst.dest.vreg) { inst.dest.vreg = rd; }
             }
             // Resolve for JZ/JNZ (src1 is condition)
@@ -159,8 +115,8 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                 }
             }
 
-            // Track IR_MOV as copy — disabled: i32 SSA creates MOVs that cross type widths
-            if (0 == 1 && op == d.IR_MOV && inst.src1.op_type == d.OP_VREG) {
+            // Track IR_MOV: propagate constants through MOVs (no copy_of chain)
+            if (op == d.IR_MOV && inst.src1.op_type == d.OP_VREG) {
                 let is i32 as dv = inst.dest.vreg;
                 let is i32 as sv = inst.src1.vreg;
                 let is i32 as mov_single with mut = 0;
@@ -168,25 +124,15 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                     let is *i32 as cdp = cast(*i32, cast(i64, ccp_defs) + cast(i64, dv) * 4);
                     if (*cdp == 1) { mov_single = 1; }
                 }
-                // Don't propagate across size boundaries (i32 vreg → i64 slot or vice versa)
-                if (mov_single == 1 && dv < vc_ext && sv < vc_ext) {
-                    let is *i32 as sd = cast(*i32, cast(i64, vreg_size) + cast(i64, dv) * 4);
-                    let is *i32 as ss = cast(*i32, cast(i64, vreg_size) + cast(i64, sv) * 4);
-                    if (*sd != *ss) { mov_single = 0; }
-                }
                 if (mov_single == 1) {
-                    let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
-                    *pp = sv;
-                    // Propagate const info
+                    // Only propagate constant info, don't set copy_of (safe)
                     let is *i32 as src_const = cast(*i32, cast(i64, is_const) + cast(i64, sv) * 4);
-                    let is *i32 as dst_const = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
                     if (*src_const == 1) {
+                        let is *i32 as dst_const = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
                         *dst_const = 1;
                         let is *i64 as src_val = cast(*i64, cast(i64, imm_val) + cast(i64, sv) * 8);
                         let is *i64 as dst_val = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
                         *dst_val = *src_val;
-                    } else {
-                        *dst_const = 0;
                     }
                 }
             }
@@ -238,43 +184,27 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                     if ((op == d.IR_ADD || op == d.IR_SUB || op == d.IR_OR ||
                          op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR) && v2 == 0) {
                         let is i32 as dv = inst.dest.vreg;
-                        let is i32 as id_ok with mut = 1;
-                        if (dv < vc_ext && s1v < vc_ext) {
-                            let is *i32 as sd = cast(*i32, cast(i64, vreg_size) + cast(i64, dv) * 4);
-                            let is *i32 as ss = cast(*i32, cast(i64, vreg_size) + cast(i64, s1v) * 4);
-                            if (*sd != *ss) { id_ok = 0; }
-                        }
-                        if (id_ok == 1) {
-                            let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
-                            *pp = s1v;
-                            if (c1 == 1) {
-                                let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
-                                *dcp = 1;
-                                let is *i64 as sv1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
-                                let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
-                                *dvp = *sv1p;
-                            }
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s1v;
+                        if (c1 == 1) {
+                            let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                            *dcp = 1;
+                            let is *i64 as sv1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                            let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                            *dvp = *sv1p;
                         }
                     }
                     // x * 1 → copy x
                     if (op == d.IR_MUL && v2 == 1) {
                         let is i32 as dv = inst.dest.vreg;
-                        let is i32 as id_ok with mut = 1;
-                        if (dv < vc_ext && s1v < vc_ext) {
-                            let is *i32 as sd = cast(*i32, cast(i64, vreg_size) + cast(i64, dv) * 4);
-                            let is *i32 as ss = cast(*i32, cast(i64, vreg_size) + cast(i64, s1v) * 4);
-                            if (*sd != *ss) { id_ok = 0; }
-                        }
-                        if (id_ok == 1) {
-                            let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
-                            *pp = s1v;
-                            if (c1 == 1) {
-                                let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
-                                *dcp = 1;
-                                let is *i64 as sv1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
-                                let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
-                                *dvp = *sv1p;
-                            }
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s1v;
+                        if (c1 == 1) {
+                            let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                            *dcp = 1;
+                            let is *i64 as sv1p = cast(*i64, cast(i64, imm_val) + cast(i64, s1v) * 8);
+                            let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                            *dvp = *sv1p;
                         }
                     }
                     // x * 0, x & 0 → IMM 0
@@ -297,30 +227,14 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                     // 0 + x, 0 | x, 0 ^ x → copy x
                     if ((op == d.IR_ADD || op == d.IR_OR || op == d.IR_XOR) && v1 == 0) {
                         let is i32 as dv = inst.dest.vreg;
-                        let is i32 as id_ok with mut = 1;
-                        if (dv < vc_ext && s2v < vc_ext) {
-                            let is *i32 as sd = cast(*i32, cast(i64, vreg_size) + cast(i64, dv) * 4);
-                            let is *i32 as ss = cast(*i32, cast(i64, vreg_size) + cast(i64, s2v) * 4);
-                            if (*sd != *ss) { id_ok = 0; }
-                        }
-                        if (id_ok == 1) {
-                            let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
-                            *pp = s2v;
-                        }
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s2v;
                     }
                     // 1 * x → copy x
                     if (op == d.IR_MUL && v1 == 1) {
                         let is i32 as dv = inst.dest.vreg;
-                        let is i32 as id_ok with mut = 1;
-                        if (dv < vc_ext && s2v < vc_ext) {
-                            let is *i32 as sd = cast(*i32, cast(i64, vreg_size) + cast(i64, dv) * 4);
-                            let is *i32 as ss = cast(*i32, cast(i64, vreg_size) + cast(i64, s2v) * 4);
-                            if (*sd != *ss) { id_ok = 0; }
-                        }
-                        if (id_ok == 1) {
-                            let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
-                            *pp = s2v;
-                        }
+                        let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
+                        *pp = s2v;
                     }
                     // 0 * x, 0 & x → IMM 0
                     if ((op == d.IR_MUL || op == d.IR_AND) && v1 == 0) {
@@ -463,7 +377,6 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
         }
     }
     mem.gfree(cast(*u8, ccp_defs));
-    mem.gfree(cast(*u8, vreg_size));
 }
 
 // === Pass 1.1: Fuse ADDR+STORE/LOAD into direct stack ops ===
@@ -572,6 +485,7 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
 fn pass_store_load_fwd(func as *d.IRFunction) as void {
     let is [64]i64 as slf_offsets;
     let is [64]i32 as slf_vregs;
+    let is [64]i32 as slf_sizes;
     let is i32 as slf_count with mut = 0;
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
@@ -596,18 +510,19 @@ fn pass_store_load_fwd(func as *d.IRFunction) as void {
                     let is *i32 as stzp = cast(*i32, cast(i64, inst.cast_to) + 28);
                     st_sz = *stzp;
                 }
-                if (st_sz == 8) {
+                if (st_sz == 8 || st_sz == 4 || st_sz == 2 || st_sz == 1) {
                     let is i64 as off = inst.dest.imm;
                     let is i32 as sv = inst.src1.vreg;
                     let is i32 as found with mut = 0;
                     let is i32 as si with mut = 0;
                     while (si < slf_count) {
-                        if (slf_offsets[si] == off) { slf_vregs[si] = sv; found = 1; si = slf_count; }
+                        if (slf_offsets[si] == off) { slf_vregs[si] = sv; slf_sizes[si] = st_sz; found = 1; si = slf_count; }
                         si = si + 1;
                     }
                     if (found == 0 && slf_count < 64) {
                         slf_offsets[slf_count] = off;
                         slf_vregs[slf_count] = sv;
+                        slf_sizes[slf_count] = st_sz;
                         slf_count = slf_count + 1;
                     }
                 } else {
@@ -618,6 +533,7 @@ fn pass_store_load_fwd(func as *d.IRFunction) as void {
                         if (slf_offsets[si] == off) {
                             slf_offsets[si] = slf_offsets[slf_count - 1];
                             slf_vregs[si] = slf_vregs[slf_count - 1];
+                            slf_sizes[si] = slf_sizes[slf_count - 1];
                             slf_count = slf_count - 1;
                             si = slf_count;
                         }
@@ -632,13 +548,13 @@ fn pass_store_load_fwd(func as *d.IRFunction) as void {
                     let is *i32 as ldzp = cast(*i32, cast(i64, inst.cast_to) + 28);
                     ld_sz = *ldzp;
                 }
-                if (ld_sz == 8) {
+                if (ld_sz >= 1) {
                 // Check if we have a forwarded value
                 let is i64 as off = inst.src1.imm;
                 let is i32 as si with mut = 0;
                 let is i32 as fwd with mut = 0;
                 while (si < slf_count) {
-                    if (slf_offsets[si] == off) {
+                    if (slf_offsets[si] == off && slf_sizes[si] == ld_sz) {
                         // Forward: replace load with MOV from tracked vreg
                         inst.op = d.IR_MOV;
                         inst.src1.op_type = d.OP_VREG;
@@ -655,17 +571,18 @@ fn pass_store_load_fwd(func as *d.IRFunction) as void {
                         let is i32 as found2 with mut = 0;
                         si = 0;
                         while (si < slf_count) {
-                            if (slf_offsets[si] == off) { slf_vregs[si] = dv; found2 = 1; si = slf_count; }
+                            if (slf_offsets[si] == off) { slf_vregs[si] = dv; slf_sizes[si] = ld_sz; found2 = 1; si = slf_count; }
                             si = si + 1;
                         }
                         if (found2 == 0) {
                             slf_offsets[slf_count] = off;
                             slf_vregs[slf_count] = dv;
+                            slf_sizes[slf_count] = ld_sz;
                             slf_count = slf_count + 1;
                         }
                     }
                 }
-                } // end ld_sz == 8
+                } // end ld_sz >= 1
             }
         }
         inst = inst.next;
@@ -844,20 +761,20 @@ fn pass_dce(func as *d.IRFunction, vc_alloc as i32, copy_of as *i32) as void {
 
 // === Pass 3: Final resolve (forward) ===
 
-fn pass_final_resolve(func as *d.IRFunction, copy_of as *i32, vreg_size as *i32, vc as i32) as void {
+fn pass_final_resolve(func as *d.IRFunction, copy_of as *i32) as void {
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0) {
             if (inst.src1.op_type == d.OP_VREG) {
-                let is i32 as r1 = resolve_sized(copy_of, vreg_size, inst.src1.vreg, vc);
+                let is i32 as r1 = resolve(copy_of, inst.src1.vreg);
                 inst.src1.vreg = r1;
             }
             if (inst.src2.op_type == d.OP_VREG) {
-                let is i32 as r2 = resolve_sized(copy_of, vreg_size, inst.src2.vreg, vc);
+                let is i32 as r2 = resolve(copy_of, inst.src2.vreg);
                 inst.src2.vreg = r2;
             }
             if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
-                let is i32 as rd = resolve_sized(copy_of, vreg_size, inst.dest.vreg, vc);
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
                 inst.dest.vreg = rd;
             }
         }
@@ -1124,10 +1041,104 @@ fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
 }
 
 // === Loop Strength Reduction ===
-// Converts i*stride inside loops to induction variable (accumulator += stride).
-// Targets: SHL v_i, const_shift inside a loop where v_i is incremented by a constant.
-// Only handles the case where v_i comes from a LOAD of a stack slot that is
-// also STOREd with v_i + step in the same loop body.
+// Converts iv*stride and base+iv*stride inside loops into pointer increments.
+// Handles both stack-based and SSA induction variables, MUL and SHL chains.
+
+// Check if vreg is loop-invariant: defined outside loop, or CAST of outer vreg
+fn is_vreg_loop_inv(v as i32, def_pos as *i32, def_count as *i32, header as i32, backedge as i32, vc as i32, func as *d.IRFunction) as i32 {
+    if (v < 0 || v >= vc) { return 0; }
+    let is i32 as cur with mut = v;
+    let is i32 as depth with mut = 0;
+    while (depth < 4) {
+        if (cur < 0 || cur >= vc) { return 0; }
+        let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, cur) * 4);
+        let is *i32 as dpp = cast(*i32, cast(i64, def_pos) + cast(i64, cur) * 4);
+        // Defined outside loop
+        if (*dcp == 1 && *dpp < header) { return 1; }
+        // Multi-def (outer phi) with all defs outside [header, backedge]
+        if (*dcp > 1 && (*dpp < header || *dpp > backedge)) { return 1; }
+        // Single def inside loop — follow through CAST/MOV
+        if (*dcp == 1 && *dpp >= header && *dpp < backedge) {
+            let is i32 as found with mut = 0;
+            let is *d.IRInst as cs with mut = func.instructions;
+            while (cast(i64, cs) != 0 && found == 0) {
+                if (cs.is_dead == 0 && cs.dest.op_type == d.OP_VREG && cs.dest.vreg == cur) {
+                    if ((cs.op == d.IR_CAST || cs.op == d.IR_MOV) && cs.src1.op_type == d.OP_VREG) {
+                        cur = cs.src1.vreg;
+                        found = 1;
+                    } else {
+                        found = cast(i32, 0 - 1);
+                    }
+                }
+                cs = cs.next;
+            }
+            if (found != 1) { return 0; }
+            if (found == 0) { return 0; }
+        } else {
+            return 0;
+        }
+        depth = depth + 1;
+    }
+    return 0;
+}
+
+// Hoist a vreg's definition before the loop header (in-place move, idempotent).
+// If already before header or after backedge, returns 1 (already available).
+// If inside loop, unlinks and reinserts before header. Recursively hoists operands.
+// Returns 1 on success, 0 on failure.
+// Hoist a vreg's definition before a target instruction (the header label).
+// header_inst is the label instruction pointer (stable across hoists).
+// Returns 1 on success, 0 on failure.
+fn hoist_before_header(v as i32, func as *d.IRFunction, def_pos as *i32, def_count as *i32, header as i32, backedge as i32, vc as i32, header_inst as *d.IRInst, depth as i32) as i32 {
+    if (depth > 3 || v < 0 || v >= vc) { return 0; }
+    let is *i32 as dpp = cast(*i32, cast(i64, def_pos) + cast(i64, v) * 4);
+    if (*dpp < header) { return 1; }
+    if (*dpp > backedge) { return 1; }
+    let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, v) * 4);
+    if (*dcp != 1) { return 0; }
+    // Find defining instruction
+    let is *d.IRInst as inst with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as sc with mut = func.instructions;
+    while (cast(i64, sc) != 0) {
+        if (sc.is_dead == 0 && sc.dest.op_type == d.OP_VREG && sc.dest.vreg == v) { inst = sc; }
+        sc = sc.next;
+    }
+    if (cast(i64, inst) == 0) { return 0; }
+    if (inst.op != d.IR_CAST && inst.op != d.IR_MOV && inst.op != d.IR_MUL && inst.op != d.IR_ADD && inst.op != d.IR_SHL && inst.op != d.IR_SUB && inst.op != d.IR_IMM) {
+        return 0;
+    }
+    // Recursively hoist operands first
+    if (inst.src1.op_type == d.OP_VREG) {
+        if (hoist_before_header(inst.src1.vreg, func, def_pos, def_count, header, backedge, vc, header_inst, depth + 1) == 0) { return 0; }
+    }
+    if (inst.src2.op_type == d.OP_VREG) {
+        if (hoist_before_header(inst.src2.vreg, func, def_pos, def_count, header, backedge, vc, header_inst, depth + 1) == 0) { return 0; }
+    }
+    // Unlink: find predecessor (re-scan since list may have changed)
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as cur with mut = func.instructions;
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur) == cast(i64, inst)) {
+            if (cast(i64, prev) != 0) { prev.next = inst.next; }
+            cur = cast(*d.IRInst, 0);
+        } else {
+            prev = cur;
+            cur = cur.next;
+        }
+    }
+    // Insert before header_inst: find the node whose .next == header_inst
+    let is *d.IRInst as hp with mut = func.instructions;
+    while (cast(i64, hp) != 0) {
+        if (cast(i64, hp.next) == cast(i64, header_inst)) {
+            inst.next = header_inst;
+            hp.next = inst;
+            *dpp = header - 1;
+            return 1;
+        }
+        hp = hp.next;
+    }
+    return 0;
+}
 
 fn pass_strength_reduction(func as *d.IRFunction) as void {
     let is i32 as inst_count with mut = 0;
@@ -1135,32 +1146,67 @@ fn pass_strength_reduction(func as *d.IRFunction) as void {
     while (cast(i64, inst) != 0) { inst_count = inst_count + 1; inst = inst.next; }
     if (inst_count < 6) { return; }
 
+    let is i32 as vc = func.vreg_count;
     let is i32 as lc = func.label_count + 1;
+
+    let is *i32 as def_pos = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    let is *i32 as def_count = cast(*i32, mem.galloc(cast(i64, vc) * 4));
+    let is *i32 as use_count = cast(*i32, mem.galloc(cast(i64, vc) * 4));
     let is *i32 as label_pos = cast(*i32, mem.galloc(cast(i64, lc) * 4));
-    let is i32 as li with mut = 0;
-    while (li < lc) { let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, li) * 4); *lp = cast(i32, 0 - 1); li = li + 1; }
+
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as dp = cast(*i32, cast(i64, def_pos) + cast(i64, i) * 4); *dp = cast(i32, 0 - 1);
+        let is *i32 as dc = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4); *dc = 0;
+        let is *i32 as uc = cast(*i32, cast(i64, use_count) + cast(i64, i) * 4); *uc = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < lc) {
+        let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, i) * 4); *lp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
 
     let is i32 as pos with mut = 0;
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
-        if (inst.op == d.IR_LABEL && inst.dest.label < lc) {
-            let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, inst.dest.label) * 4);
-            *lp = pos;
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_LABEL && inst.dest.label < lc) {
+                let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, inst.dest.label) * 4); *lp = pos;
+            }
+            if (inst.dest.op_type == d.OP_VREG && inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+                let is i32 as dv = inst.dest.vreg;
+                if (dv >= 0 && dv < vc) {
+                    let is *i32 as dp = cast(*i32, cast(i64, def_pos) + cast(i64, dv) * 4); *dp = pos;
+                    let is *i32 as dc = cast(*i32, cast(i64, def_count) + cast(i64, dv) * 4); *dc = *dc + 1;
+                }
+            }
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc) {
+                let is *i32 as uc = cast(*i32, cast(i64, use_count) + cast(i64, inst.src1.vreg) * 4); *uc = *uc + 1;
+            }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc) {
+                let is *i32 as uc = cast(*i32, cast(i64, use_count) + cast(i64, inst.src2.vreg) * 4); *uc = *uc + 1;
+            }
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc) {
+                let is *i32 as uc = cast(*i32, cast(i64, use_count) + cast(i64, inst.dest.vreg) * 4); *uc = *uc + 1;
+            }
         }
         pos = pos + 1;
         inst = inst.next;
     }
 
-    // Find backward jumps (loops)
+    // Phase 1: Find back-edges, sort bottom-to-top
+    let is [32]i32 as loop_headers;
+    let is [32]i32 as loop_backs;
+    let is i32 as num_loops with mut = 0;
+
     pos = 0;
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ) && inst.dest.label < lc) {
             let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, inst.dest.label) * 4);
             let is i32 as header = *lp;
-            if (header >= 0 && header < pos) {
-                // Found loop: [header, pos]
-                // Check no calls in loop (same as LICM)
+            if (header >= 0 && header < pos && num_loops < 32) {
                 let is i32 as has_call with mut = 0;
                 let is *d.IRInst as chk with mut = func.instructions;
                 let is i32 as cp with mut = 0;
@@ -1171,123 +1217,676 @@ fn pass_strength_reduction(func as *d.IRFunction) as void {
                     cp = cp + 1; chk = chk.next;
                 }
                 if (has_call == 0) {
-                    // Scan for SHL v, const inside loop body
-                    let is *d.IRInst as scan with mut = func.instructions;
-                    let is i32 as sp with mut = 0;
-                    while (cast(i64, scan) != 0 && sp <= pos) {
-                        if (sp > header && sp < pos && scan.is_dead == 0) {
-                            if (scan.op == d.IR_SHL && scan.src2.op_type == d.OP_IMM && scan.src1.op_type == d.OP_VREG) {
-                                let is i64 as shift = scan.src2.imm;
-                                if (shift >= 1 && shift <= 3) {
-                                    let is i64 as stride = 1 << shift;
-                                    // Check if src1 is an induction variable:
-                                    // Look for ADD src1_vreg, step_imm → STORE same slot
-                                    // where src1 comes from LOAD of that slot
-                                    let is i32 as iv_vreg = scan.src1.vreg;
-                                    // Find the LOAD that defines iv_vreg
-                                    let is *d.IRInst as lscan with mut = func.instructions;
-                                    let is i32 as lsp with mut = 0;
-                                    while (cast(i64, lscan) != 0 && lsp <= pos) {
-                                        if (lsp > header && lsp < pos && lscan.is_dead == 0) {
-                                            if (lscan.op == d.IR_LOAD && lscan.dest.op_type == d.OP_VREG && lscan.dest.vreg == iv_vreg && lscan.src1.op_type == d.OP_IMM) {
-                                                let is i64 as slot = lscan.src1.imm;
-                                                // Find ADD iv_vreg, step → STORE slot
-                                                let is *d.IRInst as ascan with mut = func.instructions;
-                                                let is i32 as asp with mut = 0;
-                                                let is i64 as step with mut = 0;
-                                                let is i32 as found_inc with mut = 0;
-                                                let is *d.IRInst as add_inst with mut = cast(*d.IRInst, 0);
-                                                while (cast(i64, ascan) != 0 && asp <= pos) {
-                                                    if (asp > header && asp < pos && ascan.is_dead == 0) {
-                                                        if (ascan.op == d.IR_ADD && ascan.src1.op_type == d.OP_VREG && ascan.src1.vreg == iv_vreg && ascan.src2.op_type == d.OP_IMM) {
-                                                            // Check if add result is stored to same slot
-                                                            let is *d.IRInst as sscan with mut = ascan.next;
-                                                            let is i32 as ssp with mut = asp + 1;
-                                                            while (cast(i64, sscan) != 0 && ssp <= pos) {
-                                                                if (sscan.is_dead == 0 && sscan.op == d.IR_STORE && sscan.dest.op_type == d.OP_IMM && sscan.dest.imm == slot && sscan.src1.op_type == d.OP_VREG && sscan.src1.vreg == ascan.dest.vreg) {
-                                                                    step = ascan.src2.imm;
-                                                                    found_inc = 1;
-                                                                    add_inst = ascan;
-                                                                    ssp = pos + 1;
-                                                                }
-                                                                ssp = ssp + 1; sscan = sscan.next;
-                                                            }
-                                                        }
-                                                    }
-                                                    asp = asp + 1; ascan = ascan.next;
-                                                }
-                                                if (found_inc == 1 && step > 0) {
-                                                    // Strength reduce: replace SHL with MUL by stride*step accumulator
-                                                    // Convert: SHL v_i, shift → ADD acc, stride*step (+ init acc before loop)
-                                                    // Create new vregs for accumulator
-                                                    let is i32 as acc_vreg = func.vreg_count;
-                                                    func.vreg_count = func.vreg_count + 1;
-                                                    let is i32 as acc_init_vreg = func.vreg_count;
-                                                    func.vreg_count = func.vreg_count + 1;
-                                                    let is i64 as inc = step * stride;
-
-                                                    // Insert before header: acc_init = iv_vreg << shift (initial value)
-                                                    // Find the instruction just before the header label
-                                                    let is *d.IRInst as hprev with mut = cast(*d.IRInst, 0);
-                                                    let is *d.IRInst as hp with mut = func.instructions;
-                                                    let is i32 as hpp with mut = 0;
-                                                    while (cast(i64, hp) != 0 && hpp < header) {
-                                                        hprev = hp; hp = hp.next; hpp = hpp + 1;
-                                                    }
-                                                    // hp is now the header label instruction
-                                                    // Insert: IMM acc_init = 0 (initial value of i*stride = 0*stride = 0 typically)
-                                                    // Actually, we need the initial value of iv_vreg before the loop.
-                                                    // For simplicity, insert a SHL of the initial LOAD before header
-                                                    // This is complex; let's use a simpler approach:
-                                                    // Just insert acc = SHL(iv_load, shift) before header, then in loop replace
-                                                    // the SHL with ADD acc, inc, and replace uses of SHL result with acc.
-
-                                                    // Simplest: insert LOAD+SHL before header to init, then patch loop body
-                                                    let is *d.IRInst as init_load = d.new_inst(d.IR_LOAD);
-                                                    init_load.dest = d.op_vreg(acc_init_vreg);
-                                                    init_load.src1 = d.op_imm(slot);
-                                                    init_load.cast_to = lscan.cast_to;
-                                                    let is *d.IRInst as init_shl = d.new_inst(d.IR_SHL);
-                                                    init_shl.dest = d.op_vreg(acc_vreg);
-                                                    init_shl.src1 = d.op_vreg(acc_init_vreg);
-                                                    init_shl.src2 = d.op_imm(shift);
-
-                                                    // Insert before header
-                                                    if (cast(i64, hprev) != 0) {
-                                                        init_shl.next = hp;
-                                                        init_load.next = init_shl;
-                                                        hprev.next = init_load;
-                                                    }
-
-                                                    // In loop body: replace the SHL with MOV from acc
-                                                    let is i32 as shl_dest = scan.dest.vreg;
-                                                    scan.op = d.IR_MOV;
-                                                    scan.src1 = d.op_vreg(acc_vreg);
-                                                    scan.src2 = d.op_none();
-
-                                                    // After the ADD that increments iv: add acc, inc
-                                                    let is *d.IRInst as acc_inc = d.new_inst(d.IR_ADD);
-                                                    acc_inc.dest = d.op_vreg(acc_vreg);
-                                                    acc_inc.src1 = d.op_vreg(acc_vreg);
-                                                    acc_inc.src2 = d.op_imm(inc);
-                                                    // Insert after add_inst
-                                                    acc_inc.next = add_inst.next;
-                                                    add_inst.next = acc_inc;
-                                                }
-                                                lsp = pos + 1; // break
-                                            }
-                                        }
-                                        lsp = lsp + 1; lscan = lscan.next;
-                                    }
-                                }
-                            }
-                        }
-                        sp = sp + 1; scan = scan.next;
-                    }
+                    loop_headers[num_loops] = header;
+                    loop_backs[num_loops] = pos;
+                    num_loops = num_loops + 1;
+                } else {
                 }
             }
         }
         pos = pos + 1; inst = inst.next;
     }
+
+    // Sort loops by backedge descending (bottom-to-top)
+    let is i32 as si with mut = 0;
+    while (si < num_loops - 1) {
+        let is i32 as sj with mut = si + 1;
+        while (sj < num_loops) {
+            if (loop_backs[sj] > loop_backs[si]) {
+                let is i32 as th = loop_headers[si]; loop_headers[si] = loop_headers[sj]; loop_headers[sj] = th;
+                let is i32 as tb = loop_backs[si]; loop_backs[si] = loop_backs[sj]; loop_backs[sj] = tb;
+            }
+            sj = sj + 1;
+        }
+        si = si + 1;
+    }
+
+    // Process each loop
+    let is i32 as li with mut = 0;
+    while (li < num_loops) {
+        let is i32 as header = loop_headers[li];
+        let is i32 as backedge = loop_backs[li];
+
+        // === Detect induction variables ===
+        let is [8]i32 as iv_vreg;
+        let is [8]i32 as iv_phi_vreg;
+        let is [8]i64 as iv_step_imm;
+        let is [8]i32 as iv_step_vreg;
+        let is [8]i32 as iv_is_stack;
+        let is [8]i64 as iv_offset;
+        let is [8]i64 as iv_add_inst;
+        let is i32 as num_ivs with mut = 0;
+
+        // Stack-based IV: LOAD [rbp-X] → ADD v, step → STORE [rbp-X]
+        // Only match if the LOAD is not inside an inner loop
+        let is *d.IRInst as scan with mut = func.instructions;
+        let is i32 as sp with mut = 0;
+        while (cast(i64, scan) != 0 && sp <= backedge) {
+            if (sp > header && sp < backedge && scan.is_dead == 0) {
+                let is i32 as in_inner_s with mut = 0;
+                let is i32 as ils with mut = 0;
+                while (ils < num_loops) {
+                    if (loop_headers[ils] > header && loop_backs[ils] < backedge) {
+                        if (sp > loop_headers[ils] && sp < loop_backs[ils]) { in_inner_s = 1; }
+                    }
+                    ils = ils + 1;
+                }
+                if (in_inner_s == 0 && scan.op == d.IR_LOAD && scan.src1.op_type == d.OP_IMM && scan.dest.op_type == d.OP_VREG) {
+                    let is i64 as slot = scan.src1.imm;
+                    let is i32 as load_vreg = scan.dest.vreg;
+                    let is *d.IRInst as ascan with mut = scan.next;
+                    let is i32 as asp with mut = sp + 1;
+                    while (cast(i64, ascan) != 0 && asp <= backedge) {
+                        if (ascan.is_dead == 0 && ascan.op == d.IR_ADD && ascan.src1.op_type == d.OP_VREG && ascan.src1.vreg == load_vreg && ascan.src2.op_type == d.OP_IMM) {
+                            let is i32 as add_dest = ascan.dest.vreg;
+                            let is *d.IRInst as sscan with mut = ascan.next;
+                            let is i32 as ssp with mut = asp + 1;
+                            while (cast(i64, sscan) != 0 && ssp <= backedge) {
+                                if (sscan.is_dead == 0 && sscan.op == d.IR_STORE && sscan.dest.op_type == d.OP_IMM && sscan.dest.imm == slot && sscan.src1.op_type == d.OP_VREG && sscan.src1.vreg == add_dest) {
+                                    if (num_ivs < 8) {
+                                        iv_vreg[num_ivs] = load_vreg;
+                                        iv_phi_vreg[num_ivs] = cast(i32, 0 - 1);
+                                        iv_step_imm[num_ivs] = ascan.src2.imm;
+                                        iv_step_vreg[num_ivs] = cast(i32, 0 - 1);
+                                        iv_is_stack[num_ivs] = 1;
+                                        iv_offset[num_ivs] = slot;
+                                        iv_add_inst[num_ivs] = cast(i64, ascan);
+                                        num_ivs = num_ivs + 1;
+                                    }
+                                    ssp = backedge + 1;
+                                }
+                                ssp = ssp + 1; sscan = sscan.next;
+                            }
+                            asp = backedge + 1;
+                        }
+                        asp = asp + 1; ascan = ascan.next;
+                    }
+                }
+            }
+            sp = sp + 1; scan = scan.next;
+        }
+
+        // SSA IV: ADD v_next = v_i, step
+        // Case A: v_i defined by CAST/MOV of v_phi (def_count > 1)
+        // Case B: v_i IS the phi directly (def_count > 1)
+        scan = func.instructions; sp = 0;
+        while (cast(i64, scan) != 0 && sp <= backedge) {
+            if (sp > header && sp < backedge && scan.is_dead == 0) {
+                if (scan.op == d.IR_ADD && scan.src2.op_type == d.OP_IMM && scan.src1.op_type == d.OP_VREG && scan.dest.op_type == d.OP_VREG) {
+                    // Skip if this ADD is inside an inner loop (not this loop's IV)
+                    let is i32 as in_inner with mut = 0;
+                    let is i32 as il with mut = 0;
+                    while (il < num_loops) {
+                        if (loop_headers[il] > header && loop_backs[il] < backedge) {
+                            if (sp > loop_headers[il] && sp < loop_backs[il]) { in_inner = 1; }
+                        }
+                        il = il + 1;
+                    }
+                    let is i32 as v_i = scan.src1.vreg;
+                    let is i32 as v_next = scan.dest.vreg;
+                    if (v_i >= 0 && v_i < vc && in_inner == 0) {
+                        let is i32 as phi_v with mut = cast(i32, 0 - 1);
+
+                        // Case B: v_i itself has def_count > 1 (it IS the phi)
+                        let is *i32 as vi_dc = cast(*i32, cast(i64, def_count) + cast(i64, v_i) * 4);
+                        if (*vi_dc > 1) {
+                            // Check back-edge: IR_MOV v_i = v_next
+                            let is *d.IRInst as bscan0 with mut = func.instructions;
+                            let is i32 as bsp0 with mut = 0;
+                            while (cast(i64, bscan0) != 0 && bsp0 <= backedge) {
+                                if (bsp0 > header && bscan0.is_dead == 0 && bscan0.op == d.IR_MOV && bscan0.dest.op_type == d.OP_VREG && bscan0.dest.vreg == v_i && bscan0.src1.op_type == d.OP_VREG && bscan0.src1.vreg == v_next) {
+                                    phi_v = v_i;
+                                }
+                                bsp0 = bsp0 + 1; bscan0 = bscan0.next;
+                            }
+                        }
+
+                        // Case A: v_i defined by CAST/MOV of v_phi
+                        if (phi_v < 0) {
+                            let is *d.IRInst as dscan with mut = func.instructions;
+                            let is i32 as dsp with mut = 0;
+                            while (cast(i64, dscan) != 0 && dsp <= backedge) {
+                                if (dscan.is_dead == 0 && dscan.dest.op_type == d.OP_VREG && dscan.dest.vreg == v_i) {
+                                    if ((dscan.op == d.IR_MOV || dscan.op == d.IR_CAST) && dscan.src1.op_type == d.OP_VREG) {
+                                        let is i32 as candidate = dscan.src1.vreg;
+                                        if (candidate >= 0 && candidate < vc) {
+                                            let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, candidate) * 4);
+                                            if (*dcp > 1) { phi_v = candidate; }
+                                        }
+                                    }
+                                }
+                                dsp = dsp + 1; dscan = dscan.next;
+                            }
+                        }
+                        if (phi_v >= 0 && phi_v != v_i) {
+                            // Case A: verify back-edge MOV phi_v = v_next
+                            let is i32 as found_backedge with mut = 0;
+                            let is *d.IRInst as bscan with mut = func.instructions;
+                            let is i32 as bsp with mut = 0;
+                            while (cast(i64, bscan) != 0 && bsp <= backedge) {
+                                if (bsp > header && bscan.is_dead == 0 && bscan.op == d.IR_MOV && bscan.dest.op_type == d.OP_VREG && bscan.dest.vreg == phi_v && bscan.src1.op_type == d.OP_VREG && bscan.src1.vreg == v_next) {
+                                    found_backedge = 1;
+                                }
+                                bsp = bsp + 1; bscan = bscan.next;
+                            }
+                            if (found_backedge == 0) { phi_v = cast(i32, 0 - 1); }
+                        }
+                        if (phi_v >= 0) {
+                            if (num_ivs < 8) {
+                                let is i32 as dup with mut = 0;
+                                let is i32 as di with mut = 0;
+                                while (di < num_ivs) { if (iv_vreg[di] == v_i) { dup = 1; } di = di + 1; }
+                                if (dup == 0) {
+                                    iv_vreg[num_ivs] = v_i;
+                                    iv_phi_vreg[num_ivs] = phi_v;
+                                    iv_step_imm[num_ivs] = scan.src2.imm;
+                                    iv_step_vreg[num_ivs] = cast(i32, 0 - 1);
+                                    iv_is_stack[num_ivs] = 0;
+                                    iv_offset[num_ivs] = 0;
+                                    iv_add_inst[num_ivs] = cast(i64, scan);
+                                    num_ivs = num_ivs + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            sp = sp + 1; scan = scan.next;
+        }
+
+        // Phase 2: Pattern matching — find chains using IVs
+        // chain arrays: max 16 chains per loop
+        let is [16]i32 as ch_iv_idx;        // which IV
+        let is [16]i64 as ch_end_inst;      // last inst in chain (ptr as i64)
+        let is [16]i32 as ch_end_vreg;      // dest vreg of chain_end
+        let is [16]i64 as ch_stride_imm;    // constant stride (1<<shift or MUL const)
+        let is [16]i32 as ch_stride_vreg;   // variable stride vreg (-1 = const)
+        let is [16]i32 as ch_base_vreg;     // base pointer vreg
+        let is [16]i32 as ch_other_vreg;   // invariant offset vreg for full chain (-1 = none)
+        let is [16]i64 as ch_other_shift;  // shift to apply to other_vreg
+        let is [16]i64 as ch_dead1;        // intermediate inst to mark dead (ptr)
+        let is [16]i64 as ch_dead2;         // intermediate inst to mark dead (ptr)
+        let is [16]i64 as ch_dead3;         // intermediate inst to mark dead (ptr)
+        let is i32 as num_chains with mut = 0;
+
+        let is i32 as dbgi with mut = 0;
+        while (dbgi < num_ivs) {
+            dbgi = dbgi + 1;
+        }
+        // For each instruction in loop, try to match chains
+        scan = func.instructions; sp = 0;
+        while (cast(i64, scan) != 0 && sp <= backedge) {
+            if (sp > header && sp < backedge && scan.is_dead == 0 && num_chains < 16) {
+                // Pattern 3: SHL v = iv_vreg, const_shift
+                // Then optionally: ADD addr = base, v
+                if (scan.op == d.IR_SHL && scan.src2.op_type == d.OP_IMM && scan.src1.op_type == d.OP_VREG) {
+                    let is i32 as shl_src with mut = scan.src1.vreg;
+                    if (shl_src >= 0 && shl_src < vc) {
+                        let is *i32 as sdcp = cast(*i32, cast(i64, def_count) + cast(i64, shl_src) * 4);
+                        if (*sdcp == 1) {
+                            let is *i32 as sdpp = cast(*i32, cast(i64, def_pos) + cast(i64, shl_src) * 4);
+                            if (*sdpp >= header && *sdpp < backedge) {
+                                // Check if shl_src is defined by ADD(iv, invariant) or ADD(invariant, iv) — full chain
+                                // Or if shl_src is directly an IV
+                                let is i32 as matched with mut = 0;
+
+                                // Check direct IV match: shl_src == iv_vreg[k]
+                                let is i32 as ik with mut = 0;
+                                while (ik < num_ivs && matched == 0) {
+                                    if (iv_vreg[ik] == shl_src) {
+                                        // SHL iv, shift — check for ADD base, shl_result after
+                                        let is i32 as shl_dest = scan.dest.vreg;
+                                        let is i64 as shift = scan.src2.imm;
+                                        // Check use_count of shl_dest
+                                        let is i32 as shl_uc with mut = 0;
+                                        if (shl_dest >= 0 && shl_dest < vc) {
+                                            let is *i32 as sucp = cast(*i32, cast(i64, use_count) + cast(i64, shl_dest) * 4);
+                                            shl_uc = *sucp;
+                                        }
+                                        if (shl_uc == 1) {
+                                            // Find ADD base, shl_dest or ADD shl_dest, base
+                                            let is *d.IRInst as nscan with mut = func.instructions;
+                                            let is i32 as nsp with mut = 0;
+                                            while (cast(i64, nscan) != 0 && nsp <= backedge) {
+                                                if (nsp > header && nsp < backedge && nscan.is_dead == 0 && nscan.op == d.IR_ADD) {
+                                                    let is i32 as base_v with mut = cast(i32, 0 - 1);
+                                                    if (nscan.src1.op_type == d.OP_VREG && nscan.src1.vreg == shl_dest && nscan.src2.op_type == d.OP_VREG) {
+                                                        base_v = nscan.src2.vreg;
+                                                    }
+                                                    if (nscan.src2.op_type == d.OP_VREG && nscan.src2.vreg == shl_dest && nscan.src1.op_type == d.OP_VREG) {
+                                                        base_v = nscan.src1.vreg;
+                                                    }
+                                                    if (base_v >= 0 && base_v < vc) {
+                                                        if (is_vreg_loop_inv(base_v, def_pos, def_count, header, backedge, vc, func) == 1) {
+                                                            ch_iv_idx[num_chains] = ik;
+                                                            ch_end_inst[num_chains] = cast(i64, nscan);
+                                                            ch_end_vreg[num_chains] = nscan.dest.vreg;
+                                                            ch_stride_imm[num_chains] = 1 << shift;
+                                                            ch_stride_vreg[num_chains] = cast(i32, 0 - 1);
+                                                            ch_base_vreg[num_chains] = base_v;
+                                                            ch_other_vreg[num_chains] = cast(i32, 0 - 1);
+                                                            ch_other_shift[num_chains] = 0;
+                                                            ch_dead1[num_chains] = cast(i64, scan);
+                                                            ch_dead2[num_chains] = 0;
+                                                            ch_dead3[num_chains] = 0;
+                                                            num_chains = num_chains + 1;
+                                                            matched = 1;
+                                                            nsp = backedge + 1;
+                                                        }
+                                                    }
+                                                }
+                                                nsp = nsp + 1; nscan = nscan.next;
+                                            }
+                                        }
+                                    }
+                                    ik = ik + 1;
+                                }
+
+                                // Check ADD(mul/inv, iv) → [CAST] → SHL pattern (full chain)
+                                // shl_src may be ADD result, or CAST of ADD result
+                                if (matched == 0) {
+                                    // Follow shl_src through CAST if needed
+                                    let is i32 as chain_src with mut = shl_src;
+                                    let is *d.IRInst as cast_dead with mut = cast(*d.IRInst, 0);
+                                    let is *d.IRInst as cfs with mut = func.instructions;
+                                    while (cast(i64, cfs) != 0) {
+                                        if (cfs.is_dead == 0 && cfs.dest.op_type == d.OP_VREG && cfs.dest.vreg == chain_src && cfs.op == d.IR_CAST && cfs.src1.op_type == d.OP_VREG) {
+                                            cast_dead = cfs;
+                                            chain_src = cfs.src1.vreg;
+                                        }
+                                        cfs = cfs.next;
+                                    }
+                                    // Find the instruction that defines chain_src (should be ADD)
+                                    let is *d.IRInst as dfscan with mut = func.instructions;
+                                    let is i32 as dfsp with mut = 0;
+                                    while (cast(i64, dfscan) != 0 && dfsp <= backedge) {
+                                        if (dfscan.is_dead == 0 && dfscan.dest.op_type == d.OP_VREG && dfscan.dest.vreg == chain_src) {
+                                            if (dfscan.op == d.IR_ADD && dfscan.src1.op_type == d.OP_VREG && dfscan.src2.op_type == d.OP_VREG) {
+                                                let is i32 as va = dfscan.src1.vreg;
+                                                let is i32 as vb = dfscan.src2.vreg;
+
+                                                // For each IV, check if va or vb is that IV (possibly through CAST)
+                                                let is i32 as ik2 with mut = 0;
+                                                while (ik2 < num_ivs && matched == 0) {
+                                                    let is i32 as this_iv = iv_vreg[ik2];
+                                                    let is i32 as this_phi = iv_phi_vreg[ik2];
+                                                    // Check if vb is this IV (or CAST of IV/phi)
+                                                    let is i32 as vb_is_iv with mut = 0;
+                                                    if (vb == this_iv) { vb_is_iv = 1; }
+                                                    if (vb_is_iv == 0 && vb >= 0 && vb < vc) {
+                                                        let is *d.IRInst as cscan with mut = func.instructions;
+                                                        let is i32 as csp with mut = 0;
+                                                        while (cast(i64, cscan) != 0 && csp <= backedge) {
+                                                            if (cscan.is_dead == 0 && cscan.dest.op_type == d.OP_VREG && cscan.dest.vreg == vb && cscan.op == d.IR_CAST && cscan.src1.op_type == d.OP_VREG) {
+                                                                if (cscan.src1.vreg == this_iv || (this_phi >= 0 && cscan.src1.vreg == this_phi)) {
+                                                                    vb_is_iv = 1;
+                                                                }
+                                                            }
+                                                            csp = csp + 1; cscan = cscan.next;
+                                                        }
+                                                    }
+                                                    // Check if va is this IV (or CAST of IV/phi)
+                                                    let is i32 as va_is_iv with mut = 0;
+                                                    if (va == this_iv) { va_is_iv = 1; }
+                                                    if (va_is_iv == 0 && va >= 0 && va < vc) {
+                                                        let is *d.IRInst as cscan2 with mut = func.instructions;
+                                                        let is i32 as csp2 with mut = 0;
+                                                        while (cast(i64, cscan2) != 0 && csp2 <= backedge) {
+                                                            if (cscan2.is_dead == 0 && cscan2.dest.op_type == d.OP_VREG && cscan2.dest.vreg == va && cscan2.op == d.IR_CAST && cscan2.src1.op_type == d.OP_VREG) {
+                                                                if (cscan2.src1.vreg == this_iv || (this_phi >= 0 && cscan2.src1.vreg == this_phi)) {
+                                                                    va_is_iv = 1;
+                                                                }
+                                                            }
+                                                            csp2 = csp2 + 1; cscan2 = cscan2.next;
+                                                        }
+                                                    }
+
+                                                    // Pattern: ADD(MUL_result, iv) → SHL → ADD base
+                                                    if (vb_is_iv == 1 || va_is_iv == 1) {
+                                                        let is i32 as other_v with mut = va;
+                                                        if (va_is_iv == 1) { other_v = vb; }
+                                                        let is i32 as add_uc with mut = 0;
+                                                        if (shl_src >= 0 && shl_src < vc) {
+                                                            let is *i32 as aucp = cast(*i32, cast(i64, use_count) + cast(i64, shl_src) * 4);
+                                                            add_uc = *aucp;
+                                                        }
+                                                        let is i32 as other_inv with mut = 0;
+                                                        if (other_v >= 0 && other_v < vc) {
+                                                            let is *i32 as odcp = cast(*i32, cast(i64, def_count) + cast(i64, other_v) * 4);
+                                                            let is *i32 as odpp = cast(*i32, cast(i64, def_pos) + cast(i64, other_v) * 4);
+                                                            if (*odcp == 1 && *odpp < header) { other_inv = 1; }
+                                                            // Also check if other_v is defined inside loop but from all-invariant operands
+                                                            // (e.g. MUL of two invariants — LICM should have hoisted it)
+                                                            if (other_inv == 0 && *odcp == 1 && *odpp >= header && *odpp < backedge) {
+                                                                // other_v is defined inside loop — check if from invariant operands
+                                                                // An operand is invariant if:
+                                                                //   - def_count==1 && def_pos < header, OR
+                                                                //   - CAST of a vreg that is NOT an IV of this loop
+                                                                //     (i.e., CAST of outer-loop phi or parameter)
+                                                                let is *d.IRInst as oscan with mut = func.instructions;
+                                                                let is i32 as osp with mut = 0;
+                                                                while (cast(i64, oscan) != 0 && osp <= backedge) {
+                                                                    if (oscan.is_dead == 0 && oscan.dest.op_type == d.OP_VREG && oscan.dest.vreg == other_v) {
+                                                                        let is i32 as all_inv with mut = 1;
+                                                                        if (oscan.src1.op_type == d.OP_VREG && oscan.src1.vreg >= 0 && oscan.src1.vreg < vc) {
+                                                                            let is i32 as s1v = oscan.src1.vreg;
+                                                                            if (is_vreg_loop_inv(s1v, def_pos, def_count, header, backedge, vc, func) == 0) { all_inv = 0; }
+                                                                        }
+                                                                        if (oscan.src2.op_type == d.OP_VREG && oscan.src2.vreg >= 0 && oscan.src2.vreg < vc) {
+                                                                            let is i32 as s2v = oscan.src2.vreg;
+                                                                            if (is_vreg_loop_inv(s2v, def_pos, def_count, header, backedge, vc, func) == 0) { all_inv = 0; }
+                                                                        }
+                                                                        if (all_inv == 1) { other_inv = 1; }
+                                                                    }
+                                                                    osp = osp + 1; oscan = oscan.next;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if (add_uc == 1 && other_inv == 1) {
+                                                            // Full chain: (MUL/other + iv) << shift → check for ADD base
+                                                            let is i32 as shl_dest2 = scan.dest.vreg;
+                                                            let is i64 as shift2 = scan.src2.imm;
+                                                            let is i32 as shl_uc2 with mut = 0;
+                                                            if (shl_dest2 >= 0 && shl_dest2 < vc) {
+                                                                let is *i32 as sucp2 = cast(*i32, cast(i64, use_count) + cast(i64, shl_dest2) * 4);
+                                                                shl_uc2 = *sucp2;
+                                                            }
+                                                            if (shl_uc2 == 1) {
+                                                                // Find ADD base, shl_dest2
+                                                                let is *d.IRInst as nscan2 with mut = func.instructions;
+                                                                let is i32 as nsp2 with mut = 0;
+                                                                while (cast(i64, nscan2) != 0 && nsp2 <= backedge) {
+                                                                    if (nsp2 > header && nsp2 < backedge && nscan2.is_dead == 0 && nscan2.op == d.IR_ADD) {
+                                                                        let is i32 as base_v2 with mut = cast(i32, 0 - 1);
+                                                                        if (nscan2.src1.op_type == d.OP_VREG && nscan2.src1.vreg == shl_dest2 && nscan2.src2.op_type == d.OP_VREG) {
+                                                                            base_v2 = nscan2.src2.vreg;
+                                                                        }
+                                                                        if (nscan2.src2.op_type == d.OP_VREG && nscan2.src2.vreg == shl_dest2 && nscan2.src1.op_type == d.OP_VREG) {
+                                                                            base_v2 = nscan2.src1.vreg;
+                                                                        }
+                                                                        if (base_v2 >= 0 && base_v2 < vc) {
+                                                                            let is i32 as binv = is_vreg_loop_inv(base_v2, def_pos, def_count, header, backedge, vc, func);
+                                                                            if (binv == 1) {
+                                                                                ch_iv_idx[num_chains] = ik2;
+                                                                                ch_end_inst[num_chains] = cast(i64, nscan2);
+                                                                                ch_end_vreg[num_chains] = nscan2.dest.vreg;
+                                                                                ch_stride_imm[num_chains] = 1 << shift2;
+                                                                                ch_stride_vreg[num_chains] = cast(i32, 0 - 1);
+                                                                                ch_base_vreg[num_chains] = base_v2;
+                                                                                ch_other_vreg[num_chains] = other_v;
+                                                                                ch_other_shift[num_chains] = shift2;
+                                                                                ch_dead1[num_chains] = cast(i64, dfscan);
+                                                                                ch_dead2[num_chains] = cast(i64, scan);
+                                                                                ch_dead3[num_chains] = cast(i64, cast_dead);
+                                                                                num_chains = num_chains + 1;
+                                                                                matched = 1;
+                                                                                nsp2 = backedge + 1;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    nsp2 = nsp2 + 1; nscan2 = nscan2.next;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    ik2 = ik2 + 1;
+                                                }
+                                            }
+                                            dfsp = backedge + 1;
+                                        }
+                                        dfsp = dfsp + 1; dfscan = dfscan.next;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Pattern 4: MUL iv, invariant → ADD base, mul_result
+                // Also handles CAST(iv) as MUL operand
+                if (scan.op == d.IR_MUL && scan.src1.op_type == d.OP_VREG && scan.src2.op_type == d.OP_VREG && num_chains < 16) {
+                    let is i32 as ma with mut = scan.src1.vreg;
+                    let is i32 as mb with mut = scan.src2.vreg;
+                    let is i32 as mul_dest = scan.dest.vreg;
+
+                    // Follow through CAST for ma
+                    if (ma >= 0 && ma < vc) {
+                        let is *i32 as madc = cast(*i32, cast(i64, def_count) + cast(i64, ma) * 4);
+                        if (*madc == 1) {
+                            let is *d.IRInst as mcs with mut = func.instructions;
+                            while (cast(i64, mcs) != 0) {
+                                if (mcs.is_dead == 0 && mcs.dest.op_type == d.OP_VREG && mcs.dest.vreg == ma && mcs.op == d.IR_CAST && mcs.src1.op_type == d.OP_VREG) {
+                                    ma = mcs.src1.vreg;
+                                }
+                                mcs = mcs.next;
+                            }
+                        }
+                    }
+                    // Follow through CAST for mb
+                    if (mb >= 0 && mb < vc) {
+                        let is *i32 as mbdc = cast(*i32, cast(i64, def_count) + cast(i64, mb) * 4);
+                        if (*mbdc == 1) {
+                            let is *d.IRInst as mcs2 with mut = func.instructions;
+                            while (cast(i64, mcs2) != 0) {
+                                if (mcs2.is_dead == 0 && mcs2.dest.op_type == d.OP_VREG && mcs2.dest.vreg == mb && mcs2.op == d.IR_CAST && mcs2.src1.op_type == d.OP_VREG) {
+                                    mb = mcs2.src1.vreg;
+                                }
+                                mcs2 = mcs2.next;
+                            }
+                        }
+                    }
+
+                    // Check which operand is IV, which is invariant
+                    let is i32 as mul_iv with mut = cast(i32, 0 - 1);
+                    let is i32 as mul_inv with mut = cast(i32, 0 - 1);
+                    let is i32 as mk with mut = 0;
+                    while (mk < num_ivs) {
+                        if (iv_vreg[mk] == ma || iv_phi_vreg[mk] == ma) {
+                            let is i32 as ob = scan.src2.vreg;
+                            if (ob >= 0 && ob < vc) {
+                                let is *i32 as obdc = cast(*i32, cast(i64, def_count) + cast(i64, ob) * 4);
+                                let is *i32 as obdp = cast(*i32, cast(i64, def_pos) + cast(i64, ob) * 4);
+                                if (*obdc == 1 && *obdp < header) { mul_iv = mk; mul_inv = ob; }
+                            }
+                        }
+                        if (iv_vreg[mk] == mb || iv_phi_vreg[mk] == mb) {
+                            let is i32 as oa = scan.src1.vreg;
+                            if (oa >= 0 && oa < vc) {
+                                let is *i32 as oadc = cast(*i32, cast(i64, def_count) + cast(i64, oa) * 4);
+                                let is *i32 as oadp = cast(*i32, cast(i64, def_pos) + cast(i64, oa) * 4);
+                                if (*oadc == 1 && *oadp < header) { mul_iv = mk; mul_inv = oa; }
+                            }
+                        }
+                        mk = mk + 1;
+                    }
+
+                    if (mul_iv >= 0) {
+                        let is i32 as mul_uc with mut = 0;
+                        if (mul_dest >= 0 && mul_dest < vc) {
+                            let is *i32 as mucp = cast(*i32, cast(i64, use_count) + cast(i64, mul_dest) * 4);
+                            mul_uc = *mucp;
+                        }
+                        if (mul_uc == 1) {
+                            let is *d.IRInst as nscan3 with mut = func.instructions;
+                            let is i32 as nsp3 with mut = 0;
+                            while (cast(i64, nscan3) != 0 && nsp3 <= backedge) {
+                                if (nsp3 > header && nsp3 < backedge && nscan3.is_dead == 0 && nscan3.op == d.IR_ADD) {
+                                    let is i32 as base_v3 with mut = cast(i32, 0 - 1);
+                                    if (nscan3.src1.op_type == d.OP_VREG && nscan3.src1.vreg == mul_dest && nscan3.src2.op_type == d.OP_VREG) {
+                                        base_v3 = nscan3.src2.vreg;
+                                    }
+                                    if (nscan3.src2.op_type == d.OP_VREG && nscan3.src2.vreg == mul_dest && nscan3.src1.op_type == d.OP_VREG) {
+                                        base_v3 = nscan3.src1.vreg;
+                                    }
+                                    if (base_v3 >= 0 && base_v3 < vc) {
+                                        if (is_vreg_loop_inv(base_v3, def_pos, def_count, header, backedge, vc, func) == 1) {
+                                            ch_iv_idx[num_chains] = mul_iv;
+                                            ch_end_inst[num_chains] = cast(i64, nscan3);
+                                            ch_end_vreg[num_chains] = nscan3.dest.vreg;
+                                            ch_stride_imm[num_chains] = 0;
+                                            ch_stride_vreg[num_chains] = mul_inv;
+                                            ch_base_vreg[num_chains] = base_v3;
+                                            ch_other_vreg[num_chains] = cast(i32, 0 - 1);
+                                            ch_other_shift[num_chains] = 0;
+                                            ch_dead1[num_chains] = cast(i64, scan);
+                                            ch_dead2[num_chains] = 0;
+                                            ch_dead3[num_chains] = 0;
+                                            num_chains = num_chains + 1;
+                                            nsp3 = backedge + 1;
+                                        }
+                                    }
+                                }
+                                nsp3 = nsp3 + 1; nscan3 = nscan3.next;
+                            }
+                        }
+                    }
+                }
+            }
+            sp = sp + 1; scan = scan.next;
+        }
+
+        // Phase 3: Transformation — create accumulators for matched chains
+        // Find header label instruction pointer ONCE (stable across hoists/insertions)
+        let is *d.IRInst as h_label with mut = func.instructions;
+        let is i32 as hlp with mut = 0;
+        while (cast(i64, h_label) != 0 && hlp < header) { h_label = h_label.next; hlp = hlp + 1; }
+
+        let is i32 as ci with mut = 0;
+        while (ci < num_chains) {
+            let is i32 as iv_idx = ch_iv_idx[ci];
+            let is i32 as base_v = ch_base_vreg[ci];
+            let is i64 as stride_imm = ch_stride_imm[ci];
+            let is i32 as stride_vreg = ch_stride_vreg[ci];
+            let is i32 as other_v = ch_other_vreg[ci];
+            let is i64 as other_shift = ch_other_shift[ci];
+            let is i64 as step = iv_step_imm[iv_idx];
+            let is *d.IRInst as add_inst = cast(*d.IRInst, iv_add_inst[iv_idx]);
+            let is *d.IRInst as end_inst = cast(*d.IRInst, ch_end_inst[ci]);
+
+            // Hoist other_v and base_v before header so they're available for init
+            let is i32 as use_other with mut = other_v;
+            let is i32 as use_base with mut = base_v;
+            let is i32 as skip_chain with mut = 0;
+
+            if (other_v >= 0 && skip_chain == 0) {
+                if (hoist_before_header(other_v, func, def_pos, def_count, header, backedge, vc, h_label, 0) == 0) { skip_chain = 1; }
+            }
+            if (base_v >= 0 && base_v < vc && skip_chain == 0) {
+                if (hoist_before_header(base_v, func, def_pos, def_count, header, backedge, vc, h_label, 0) == 0) { skip_chain = 1; }
+            }
+
+            if (skip_chain == 0) {
+
+            // Step 2: Create accumulator vreg
+            let is i32 as acc = func.vreg_count;
+            func.vreg_count = func.vreg_count + 1;
+
+            // Step 3: Insert init before header (use h_label pointer, stable across hoists)
+            let is *d.IRInst as hprev with mut = cast(*d.IRInst, 0);
+            let is *d.IRInst as hp with mut = func.instructions;
+            while (cast(i64, hp) != 0) {
+                if (cast(i64, hp) == cast(i64, h_label)) { hp = cast(*d.IRInst, 0); } else { hprev = hp; hp = hp.next; }
+            }
+
+            if (cast(i64, hprev) != 0) {
+                if (other_v < 0) {
+                    // Simple chain (no offset): acc = base
+                    let is *d.IRInst as init_inst = d.new_inst(d.IR_MOV);
+                    init_inst.dest = d.op_vreg(acc);
+                    init_inst.src1 = d.op_vreg(use_base);
+                    init_inst.next = h_label;
+                    hprev.next = init_inst;
+                } else {
+                    // Full chain: acc = base + (use_other << shift)
+                    let is i32 as tmp1 = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as ishl = d.new_inst(d.IR_SHL);
+                    ishl.dest = d.op_vreg(tmp1);
+                    ishl.src1 = d.op_vreg(use_other);
+                    ishl.src2 = d.op_imm(other_shift);
+                    let is *d.IRInst as iadd = d.new_inst(d.IR_ADD);
+                    iadd.dest = d.op_vreg(acc);
+                    iadd.src1 = d.op_vreg(use_base);
+                    iadd.src2 = d.op_vreg(tmp1);
+                    iadd.next = h_label;
+                    ishl.next = iadd;
+                    hprev.next = ishl;
+                }
+            }
+
+            // Step 3: Replace chain end with MOV from acc
+            end_inst.op = d.IR_MOV;
+            end_inst.src1 = d.op_vreg(acc);
+            end_inst.src2 = d.op_none();
+
+            // Mark intermediate instructions as dead
+            if (ch_dead1[ci] != 0) {
+                let is *d.IRInst as d1 = cast(*d.IRInst, ch_dead1[ci]);
+                d1.is_dead = 1;
+            }
+            if (ch_dead2[ci] != 0) {
+                let is *d.IRInst as d2 = cast(*d.IRInst, ch_dead2[ci]);
+                d2.is_dead = 1;
+            }
+            if (ch_dead3[ci] != 0) {
+                let is *d.IRInst as d3 = cast(*d.IRInst, ch_dead3[ci]);
+                d3.is_dead = 1;
+            }
+
+            // Step 4: Insert increment after IV's ADD
+            if (stride_vreg < 0) {
+                // Constant stride: acc += step * stride_imm
+                let is i64 as inc_val = step * stride_imm;
+                let is *d.IRInst as acc_inc = d.new_inst(d.IR_ADD);
+                acc_inc.dest = d.op_vreg(acc);
+                acc_inc.src1 = d.op_vreg(acc);
+                acc_inc.src2 = d.op_imm(inc_val);
+                acc_inc.next = add_inst.next;
+                add_inst.next = acc_inc;
+            } else {
+                if (step == 1) {
+                    // acc += stride_vreg
+                    let is *d.IRInst as acc_inc = d.new_inst(d.IR_ADD);
+                    acc_inc.dest = d.op_vreg(acc);
+                    acc_inc.src1 = d.op_vreg(acc);
+                    acc_inc.src2 = d.op_vreg(stride_vreg);
+                    acc_inc.next = add_inst.next;
+                    add_inst.next = acc_inc;
+                } else {
+                    // acc += step * stride_vreg (materialize step as IMM first)
+                    let is i32 as step_v = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is i32 as tmp_v = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as step_imm = d.new_inst(d.IR_IMM);
+                    step_imm.dest = d.op_vreg(step_v);
+                    step_imm.src1 = d.op_imm(step);
+                    let is *d.IRInst as mul_inst = d.new_inst(d.IR_MUL);
+                    mul_inst.dest = d.op_vreg(tmp_v);
+                    mul_inst.src1 = d.op_vreg(step_v);
+                    mul_inst.src2 = d.op_vreg(stride_vreg);
+                    let is *d.IRInst as acc_inc = d.new_inst(d.IR_ADD);
+                    acc_inc.dest = d.op_vreg(acc);
+                    acc_inc.src1 = d.op_vreg(acc);
+                    acc_inc.src2 = d.op_vreg(tmp_v);
+                    acc_inc.next = add_inst.next;
+                    mul_inst.next = acc_inc;
+                    step_imm.next = mul_inst;
+                    add_inst.next = step_imm;
+                }
+            }
+
+            } // end if (skip_chain == 0)
+
+            ci = ci + 1;
+        }
+
+        li = li + 1;
+    }
+
+    mem.gfree(cast(*u8, def_pos));
+    mem.gfree(cast(*u8, def_count));
+    mem.gfree(cast(*u8, use_count));
     mem.gfree(cast(*u8, label_pos));
 }
