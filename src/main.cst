@@ -197,8 +197,8 @@ fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len
 
 // ── Profiling ──────────────────────────────────────────────────────
 
-let is [8]i64 as prof_times with mut;
-let is [8]i64 as prof_names with mut;
+let is [16]i64 as prof_times with mut;
+let is [16]i64 as prof_names with mut;
 let is i32 as prof_count with mut = 0;
 let is i32 as prof_enabled with mut = 0;
 
@@ -211,7 +211,7 @@ let is i64 as prof_obj_bytes with mut = 0;
 
 fn prof_record(name as *u8, us as i64) as void {
     if (prof_enabled == 0) { return; }
-    if (prof_count >= 8) { return; }
+    if (prof_count >= 16) { return; }
     prof_names[prof_count] = cast(i64, name);
     prof_times[prof_count] = us;
     prof_count = prof_count + 1;
@@ -624,7 +624,9 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     // Optimize
     let is i64 as t_opt = get_time_us();
     if (g_opt_level >= 1) {
+        if (prof_enabled == 1) { iropt.opt_prof_init(); }
         iropt.optimize(cast(*u8, prog));
+        if (prof_enabled == 1) { iropt.opt_prof_print(); }
     }
     prof_record("ir_opt", get_time_us() - t_opt);
 
@@ -735,7 +737,14 @@ fn run_single_file(filename as *u8) as i32 {
         io.write_str(linux.STDERR, "Error: cannot read file\n");
         return 1;
     }
+    let is i64 as t1 = get_time_us();
     let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
+    prof_record("lex", get_time_us() - t1);
+
+    if (prof_enabled == 1) {
+        prof_source_bytes = file_size;
+        prof_token_count = tokens.count;
+    }
     io.write_str(linux.STDOUT, "caustic: ");
     io.write_str(linux.STDOUT, filename);
     io.write_str(linux.STDOUT, " (");
@@ -757,8 +766,10 @@ fn run_single_file(filename as *u8) as i32 {
         io.write_str(linux.STDOUT, "\n");
     }
 
+    let is i64 as t2 = get_time_us();
     ast.types_init();
     let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
+    prof_record("parse", get_time_us() - t2);
 
     // --emit-ast
     if ((g_cache_flags & 4) != 0) {
@@ -772,15 +783,24 @@ fn run_single_file(filename as *u8) as i32 {
         io.write_str(linux.STDOUT, "\n");
     }
 
+    let is i64 as t3 = get_time_us();
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
+    prof_record("semantic", get_time_us() - t3);
     io.write_str(linux.STDOUT, "semantic: ok\n");
+
+    let is i64 as t_ir = get_time_us();
     irg.ir_tl = cast(*u8, &tokens);
     let is *ird.IRProgram as prog = irg.gen_ir(cast(*u8, root), g_no_main);
+    prof_record("ir", get_time_us() - t_ir);
     io.write_str(linux.STDOUT, "ir: ok\n");
 
+    let is i64 as t_opt = get_time_us();
     if (g_opt_level >= 1) {
+        if (prof_enabled == 1) { iropt.opt_prof_init(); }
         iropt.optimize(cast(*u8, prog));
+        if (prof_enabled == 1) { iropt.opt_prof_print(); }
     }
+    prof_record("ir_opt", get_time_us() - t_opt);
 
     // --emit-ir
     if ((g_cache_flags & 8) != 0) {
@@ -805,13 +825,21 @@ fn run_single_file(filename as *u8) as i32 {
         io.write_str(linux.STDERR, "Error: cannot open output file\n");
         return 1;
     }
+    if (prof_enabled == 1) { cg.cg_prof_init(4096); }
+    let is i64 as t4 = get_time_us();
     cg.set_opt_level(g_opt_level);
     cg.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
     linux.close(out_fd);
     if (g_opt_level >= 1) { ph.optimize_asm(asm_path); }
+    prof_record("codegen", get_time_us() - t4);
+    if (prof_enabled == 1) { prof_asm_bytes = read_file_size(asm_path); }
+    if (prof_enabled == 1 && cg.cg_prof_count > 0) {
+        prof_print_top_funcs();
+    }
     io.write_str(linux.STDOUT, "wrote: ");
     io.write_str(linux.STDOUT, asm_path);
     io.write_str(linux.STDOUT, "\n");
+    prof_print();
     return 0;
 }
 
@@ -908,6 +936,7 @@ fn run_multi_file() as i32 {
                 pi = pi + 1;
             }
         }
+        prof_print();
         return 0;
     }
 

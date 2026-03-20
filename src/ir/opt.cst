@@ -1,20 +1,119 @@
 use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "../../std/io.cst" as io;
 use "defs.cst" as d;
 use "ssa.cst" as ssa;
 use "opt_passes.cst" as passes;
 
 let is *u8 as opt_prog_ptr with mut;
 
+// === Per-pass profiling ===
+let is i32 as opt_prof_on with mut = 0;
+let is [16]i64 as opt_prof_times with mut;
+// 0=addr_fusion 1=mem2reg 2=ccp 3=slf 4=fold 5=licm 6=sr 7=dce 8=resolve 9=inline 10=alloc_init
+
+fn opt_prof_time() as i64 {
+    let is [2]i64 as ts;
+    syscall(228, 1, &ts);
+    return ts[0] * 1000000 + ts[1] / 1000;
+}
+
+fn opt_prof_init() as void {
+    opt_prof_on = 1;
+    let is i32 as i with mut = 0;
+    while (i < 16) { opt_prof_times[i] = 0; i = i + 1; }
+}
+
+fn opt_prof_print() as void {
+    if (opt_prof_on == 0) { return; }
+    let is i64 as total with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < 10) { total = total + opt_prof_times[i]; i = i + 1; }
+    if (total == 0) { return; }
+
+    io.write_str(linux.STDOUT, "\n--- optimizer passes ---\n");
+
+    let is [10]i64 as names;
+    names[0] = cast(i64, "addr_fusion");
+    names[1] = cast(i64, "mem2reg");
+    names[2] = cast(i64, "const_copy_prop");
+    names[3] = cast(i64, "store_load_fwd");
+    names[4] = cast(i64, "fold_imm");
+    names[5] = cast(i64, "licm");
+    names[6] = cast(i64, "strength_red");
+    names[7] = cast(i64, "dce");
+    names[8] = cast(i64, "final_resolve");
+    names[9] = cast(i64, "inline");
+
+    i = 0;
+    while (i < 10) {
+        let is i64 as ms = opt_prof_times[i] / 1000;
+        let is i32 as pct with mut = 0;
+        if (total > 0) { pct = cast(i32, opt_prof_times[i] * 100 / total); }
+        io.write_str(linux.STDOUT, "  ");
+
+        // pad name to 18 chars
+        let is *u8 as nm = cast(*u8, names[i]);
+        let is i32 as nl with mut = 0;
+        while (nm[nl] != cast(u8, 0)) { nl = nl + 1; }
+        linux.write(linux.STDOUT, nm, cast(i64, nl));
+        let is i32 as pad with mut = 18 - nl;
+        while (pad > 0) { io.write_str(linux.STDOUT, " "); pad = pad - 1; }
+
+        // pad ms to 6 chars
+        let is i32 as digits with mut = 1;
+        let is i64 as tmp with mut = ms;
+        while (tmp >= 10) { tmp = tmp / 10; digits = digits + 1; }
+        let is i32 as sp with mut = 6 - digits;
+        while (sp > 0) { io.write_str(linux.STDOUT, " "); sp = sp - 1; }
+        io.write_int(linux.STDOUT, ms);
+        io.write_str(linux.STDOUT, "ms ");
+
+        // pad pct
+        if (pct < 10) { io.write_str(linux.STDOUT, " "); }
+        io.write_int(linux.STDOUT, cast(i64, pct));
+        io.write_str(linux.STDOUT, "%");
+
+        // bar
+        let is i32 as blen with mut = cast(i32, opt_prof_times[i] * 20 / total);
+        if (blen == 0 && opt_prof_times[i] > 0) { blen = 1; }
+        io.write_str(linux.STDOUT, " ");
+        let is i32 as bi with mut = 0;
+        while (bi < blen) { io.write_str(linux.STDOUT, "#"); bi = bi + 1; }
+        io.write_str(linux.STDOUT, "\n");
+
+        i = i + 1;
+    }
+    io.write_str(linux.STDOUT, "  ────────────────────────────────────────────\n");
+    io.write_str(linux.STDOUT, "  total             ");
+    let is i64 as tms = total / 1000;
+    let is i32 as td with mut = 1;
+    let is i64 as tt with mut = tms;
+    while (tt >= 10) { tt = tt / 10; td = td + 1; }
+    let is i32 as tsp with mut = 6 - td;
+    while (tsp > 0) { io.write_str(linux.STDOUT, " "); tsp = tsp - 1; }
+    io.write_int(linux.STDOUT, tms);
+    io.write_str(linux.STDOUT, "ms\n");
+}
+
 fn optimize_func(func as *d.IRFunction) as void {
     let is i32 as vc with mut = func.vreg_count;
     if (vc == 0) { return; }
     let is i32 as vc_alloc with mut = vc + 512;
 
+    let is i64 as t0 with mut = 0;
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_addr_fusion(func, vc_alloc);
+    if (opt_prof_on == 1) { opt_prof_times[0] = opt_prof_times[0] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     ssa.mem2reg(func);
+    if (opt_prof_on == 1) { opt_prof_times[1] = opt_prof_times[1] + opt_prof_time() - t0; }
+
     vc = func.vreg_count;
     vc_alloc = vc + 512;
 
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     let is *i32 as is_const = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
     let is *i64 as imm_val = cast(*i64, mem.galloc(cast(i64, vc_alloc) * 8));
     let is *i32 as copy_of = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
@@ -25,15 +124,39 @@ fn optimize_func(func as *d.IRFunction) as void {
         let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, i) * 4); *pp = 0 - 1;
         i = i + 1;
     }
+    if (opt_prof_on == 1) { opt_prof_times[10] = opt_prof_times[10] + opt_prof_time() - t0; }
 
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_const_copy_prop(func, is_const, imm_val, copy_of, vc);
+    if (opt_prof_on == 1) { opt_prof_times[2] = opt_prof_times[2] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_store_load_fwd(func);
+    if (opt_prof_on == 1) { opt_prof_times[3] = opt_prof_times[3] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_fold_immediates(func, is_const, imm_val);
+    if (opt_prof_on == 1) { opt_prof_times[4] = opt_prof_times[4] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_licm(func);
+    if (opt_prof_on == 1) { opt_prof_times[5] = opt_prof_times[5] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_strength_reduction(func);
+    if (opt_prof_on == 1) { opt_prof_times[6] = opt_prof_times[6] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_dce(func, vc_alloc, copy_of);
+    if (opt_prof_on == 1) { opt_prof_times[7] = opt_prof_times[7] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_final_resolve(func, copy_of);
+    if (opt_prof_on == 1) { opt_prof_times[8] = opt_prof_times[8] + opt_prof_time() - t0; }
+
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     passes.pass_inline(func, opt_prog_ptr);
+    if (opt_prof_on == 1) { opt_prof_times[9] = opt_prof_times[9] + opt_prof_time() - t0; }
 
     mem.gfree(cast(*u8, is_const));
     mem.gfree(cast(*u8, imm_val));

@@ -110,6 +110,34 @@ fn slot_index(slots as *SlotInfo, count as i32, off as i64) as i32 {
     return cast(i32, 0 - 1);
 }
 
+// Fast O(1) slot lookup by offset using direct-mapped table
+// off_map[off] = slot_index (or -1). Max offset tracked = 8192.
+let is i32 as OFF_MAP_MAX with imut = 8192;
+
+fn build_off_map(slots as *SlotInfo, count as i32, off_map as *i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < OFF_MAP_MAX) {
+        let is *i32 as p = cast(*i32, cast(i64, off_map) + cast(i64, i) * 4);
+        *p = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < count) {
+        let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, i) * sizeof(SlotInfo));
+        if (s.promotable == 1 && s.offset >= 0 && s.offset < cast(i64, OFF_MAP_MAX)) {
+            let is *i32 as p = cast(*i32, cast(i64, off_map) + cast(i64, s.offset) * 4);
+            *p = i;
+        }
+        i = i + 1;
+    }
+}
+
+fn fast_slot_index(off_map as *i32, off as i64) as i32 {
+    if (off < 0 || off >= cast(i64, OFF_MAP_MAX)) { return cast(i32, 0 - 1); }
+    let is *i32 as p = cast(*i32, cast(i64, off_map) + cast(i64, off) * 4);
+    return *p;
+}
+
 // === Step 4: Insert phi nodes ===
 // Returns count of phis inserted. phi_block[i] = block of phi i, phi_slot[i] = slot index,
 // phi_vreg[i] = dest vreg of phi, phi_args[i * max_preds + j] = arg vreg from pred j
@@ -218,7 +246,47 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
               phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
               phi_args as *i32, max_preds as i32, nphi as i32,
               preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
-    // def_stack[slot][depth] = vreg. Use flat array: def_stack[slot * MAX_DEPTH + depth]
+    // Build fast offset→slot map
+    let is *i32 as off_map = cast(*i32, mem.galloc(cast(i64, OFF_MAP_MAX) * 4));
+    build_off_map(slots, nslots, off_map);
+
+    // Build per-block phi index: phi_by_block_start[b], phi_by_block_count[b], phi_order[i]
+    let is *i32 as pb_count = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
+    let is *i32 as pb_start = cast(*i32, mem.galloc(cast(i64, nblocks) * 4));
+    let is *i32 as phi_order = cast(*i32, mem.galloc(cast(i64, nphi + 1) * 4));
+    let is i32 as pbi with mut = 0;
+    while (pbi < nblocks) {
+        let is *i32 as p = cast(*i32, cast(i64, pb_count) + cast(i64, pbi) * 4); *p = 0;
+        pbi = pbi + 1;
+    }
+    pbi = 0;
+    while (pbi < nphi) {
+        let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, pbi) * 4);
+        let is *i32 as pbc = cast(*i32, cast(i64, pb_count) + cast(i64, *pbp) * 4);
+        *pbc = *pbc + 1;
+        pbi = pbi + 1;
+    }
+    let is i32 as pb_total with mut = 0;
+    pbi = 0;
+    while (pbi < nblocks) {
+        let is *i32 as ps = cast(*i32, cast(i64, pb_start) + cast(i64, pbi) * 4); *ps = pb_total;
+        let is *i32 as pc = cast(*i32, cast(i64, pb_count) + cast(i64, pbi) * 4);
+        pb_total = pb_total + *pc;
+        *pc = 0;
+        pbi = pbi + 1;
+    }
+    pbi = 0;
+    while (pbi < nphi) {
+        let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, pbi) * 4);
+        let is i32 as blk = *pbp;
+        let is *i32 as ps = cast(*i32, cast(i64, pb_start) + cast(i64, blk) * 4);
+        let is *i32 as pc = cast(*i32, cast(i64, pb_count) + cast(i64, blk) * 4);
+        let is *i32 as op = cast(*i32, cast(i64, phi_order) + cast(i64, *ps + *pc) * 4);
+        *op = pbi;
+        *pc = *pc + 1;
+        pbi = pbi + 1;
+    }
+
     let is i32 as MAX_DEPTH = 512;
     let is *i32 as def_stack = cast(*i32, mem.galloc(cast(i64, nslots * MAX_DEPTH) * 4));
     let is *i32 as def_top = cast(*i32, mem.galloc(cast(i64, nslots) * 4));
@@ -302,22 +370,23 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
         if (*rcp == 0) {
             // First visit: process this block
 
-            // Process phis in this block: push phi dest onto def stack
-            let is i32 as pi with mut = 0;
-            while (pi < nphi) {
-                let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, pi) * 4);
-                if (*pbp == b) {
-                    let is *i32 as pslp = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                    let is i32 as slot = *pslp;
-                    let is *i32 as pvp = cast(*i32, cast(i64, phi_vreg) + cast(i64, pi) * 4);
-                    let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
-                    if (*tp < MAX_DEPTH) {
-                        let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp) * 4);
-                        *dsp2 = *pvp;
-                        *tp = *tp + 1;
-                    }
+            // Process phis in this block via per-block index
+            let is *i32 as pbs = cast(*i32, cast(i64, pb_start) + cast(i64, b) * 4);
+            let is *i32 as pbc = cast(*i32, cast(i64, pb_count) + cast(i64, b) * 4);
+            let is i32 as phi_i with mut = 0;
+            while (phi_i < *pbc) {
+                let is *i32 as pop = cast(*i32, cast(i64, phi_order) + cast(i64, *pbs + phi_i) * 4);
+                let is i32 as pi = *pop;
+                let is *i32 as pslp = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
+                let is i32 as slot = *pslp;
+                let is *i32 as pvp = cast(*i32, cast(i64, phi_vreg) + cast(i64, pi) * 4);
+                let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
+                if (*tp < MAX_DEPTH) {
+                    let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp) * 4);
+                    *dsp2 = *pvp;
+                    *tp = *tp + 1;
                 }
-                pi = pi + 1;
+                phi_i = phi_i + 1;
             }
 
             // Process instructions in block
@@ -328,7 +397,7 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
                 if (inst.is_dead == 0) {
                     // Replace LOAD from promotable offset with MOV from current def
                     if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) {
-                        let is i32 as sidx = slot_index(slots, nslots, inst.src1.imm);
+                        let is i32 as sidx = fast_slot_index(off_map, inst.src1.imm);
                         if (sidx >= 0) {
                             let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, sidx) * 4);
                             if (*tp > 0) {
@@ -358,7 +427,7 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
                     }
                     // Replace STORE to promotable offset: mark dead, push value onto def stack
                     if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) {
-                        let is i32 as sidx = slot_index(slots, nslots, inst.dest.imm);
+                        let is i32 as sidx = fast_slot_index(off_map, inst.dest.imm);
                         if (sidx >= 0) {
                             if (inst.src1.op_type == d.OP_VREG) {
                                 let is i32 as val_vreg = inst.src1.vreg;
@@ -377,9 +446,8 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
                 else { inst = inst.next; }
             }
 
-            // Fill phi args in successors
+            // Fill phi args in successors using per-block phi index
             if (bb.succ0 >= 0) {
-                // Find predecessor index of b in succ0's pred list
                 let is i32 as s = bb.succ0;
                 let is *i32 as psp3 = cast(*i32, cast(i64, pred_starts) + cast(i64, s) * 4);
                 let is *i32 as pcp3 = cast(*i32, cast(i64, pred_counts) + cast(i64, s) * 4);
@@ -390,21 +458,21 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
                     if (*pp2 == b) { pred_idx = pii; pii = *pcp3; }
                     pii = pii + 1;
                 }
-                // Set phi args
-                pi = 0;
-                while (pi < nphi) {
-                    let is *i32 as pbp2 = cast(*i32, cast(i64, phi_block) + cast(i64, pi) * 4);
-                    if (*pbp2 == s) {
-                        let is *i32 as pslp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                        let is i32 as slot = *pslp2;
-                        let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
-                        if (*tp > 0) {
-                            let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp - 1) * 4);
-                            let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + pred_idx) * 4);
-                            *pap = *dsp2;
-                        }
+                let is *i32 as spbs = cast(*i32, cast(i64, pb_start) + cast(i64, s) * 4);
+                let is *i32 as spbc = cast(*i32, cast(i64, pb_count) + cast(i64, s) * 4);
+                let is i32 as spi with mut = 0;
+                while (spi < *spbc) {
+                    let is *i32 as sop = cast(*i32, cast(i64, phi_order) + cast(i64, *spbs + spi) * 4);
+                    let is i32 as pi = *sop;
+                    let is *i32 as pslp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
+                    let is i32 as slot = *pslp2;
+                    let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
+                    if (*tp > 0) {
+                        let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp - 1) * 4);
+                        let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + pred_idx) * 4);
+                        *pap = *dsp2;
                     }
-                    pi = pi + 1;
+                    spi = spi + 1;
                 }
             }
             if (bb.succ1 >= 0) {
@@ -418,20 +486,21 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
                     if (*pp2 == b) { pred_idx = pii; pii = *pcp3; }
                     pii = pii + 1;
                 }
-                pi = 0;
-                while (pi < nphi) {
-                    let is *i32 as pbp2 = cast(*i32, cast(i64, phi_block) + cast(i64, pi) * 4);
-                    if (*pbp2 == s) {
-                        let is *i32 as pslp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                        let is i32 as slot = *pslp2;
-                        let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
-                        if (*tp > 0) {
-                            let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp - 1) * 4);
-                            let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + pred_idx) * 4);
-                            *pap = *dsp2;
-                        }
+                let is *i32 as spbs = cast(*i32, cast(i64, pb_start) + cast(i64, s) * 4);
+                let is *i32 as spbc = cast(*i32, cast(i64, pb_count) + cast(i64, s) * 4);
+                let is i32 as spi with mut = 0;
+                while (spi < *spbc) {
+                    let is *i32 as sop = cast(*i32, cast(i64, phi_order) + cast(i64, *spbs + spi) * 4);
+                    let is i32 as pi = *sop;
+                    let is *i32 as pslp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
+                    let is i32 as slot = *pslp2;
+                    let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
+                    if (*tp > 0) {
+                        let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp - 1) * 4);
+                        let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + pred_idx) * 4);
+                        *pap = *dsp2;
                     }
-                    pi = pi + 1;
+                    spi = spi + 1;
                 }
             }
         }
@@ -480,6 +549,10 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
     mem.gfree(cast(*u8, rn_stack));
     mem.gfree(cast(*u8, rn_child_idx));
     mem.gfree(cast(*u8, rn_save_tops));
+    mem.gfree(cast(*u8, off_map));
+    mem.gfree(cast(*u8, pb_count));
+    mem.gfree(cast(*u8, pb_start));
+    mem.gfree(cast(*u8, phi_order));
 }
 
 // === Step 6: SSA Destruction — resolve phis to copies ===
