@@ -1,0 +1,354 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../lexer/tokens.cst" as tok;
+use "defs.cst" as d;
+use "gen.cst" as g;
+use "gen_expr.cst" as ge;
+
+fn gen_stmt(node as *ast.Node) as void {
+    let is *ast.Node as n with mut = node;
+    while (cast(i64, n) != 0) {
+        if (g.ctx_has_returned == 0) {
+            gen_stmt_single(n);
+        }
+        n = n.next;
+    }
+}
+
+fn gen_stmt_single(node as *ast.Node) as void {
+    if (cast(i64, node) == 0) { return; }
+    let is i32 as k = node.kind;
+    let is i32 as line = g.tok_line(node.tok_idx);
+
+    // RETURN
+    if (k == ast.NK_RETURN) {
+        if (cast(i64, node.expr) != 0) {
+            let is i32 as result = ge.gen_expr(node.expr);
+            ge.emit_deferred_calls();
+            if (g.ctx_has_sret == 1) {
+                let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                cp.dest = d.op_vreg(g.ctx_sret_vreg);
+                cp.src1 = d.op_vreg(result);
+                cp.src2 = d.op_imm(cast(i64, node.expr.ty.size));
+                cp.line = line;
+                g.emit(cp);
+                g.emit_return(g.ctx_sret_vreg, line);
+            } else {
+                g.emit_return(result, line);
+            }
+        } else {
+            ge.emit_deferred_calls();
+            g.emit_return(cast(i32, 0 - 1), line);
+        }
+        g.ctx_has_returned = 1;
+        return;
+    }
+
+    // EXPR_STMT
+    if (k == ast.NK_EXPR_STMT) {
+        ge.gen_expr(node.expr);
+        return;
+    }
+
+    // LET (local)
+    if (k == ast.NK_LET) {
+        if (cast(i64, node.init_expr) != 0) {
+            let is i32 as init_kind = node.init_expr.kind;
+            if (init_kind == ast.NK_FNCALL || init_kind == ast.NK_SYSCALL) {
+                let is *d.IRInst as ctx_inst = d.new_inst(d.IR_SET_CTX);
+                ctx_inst.src1 = d.op_imm(0);
+                ctx_inst.line = line;
+                g.emit(ctx_inst);
+            }
+            let is i32 as val = ge.gen_expr(node.init_expr);
+            let is *ast.Type as ty = node.ty;
+            if (ty.size > 8) {
+                let is i32 as dest_addr = g.new_vreg();
+                let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
+                ai.dest = d.op_vreg(dest_addr);
+                ai.src1 = d.op_imm(cast(i64, node.var_offset));
+                ai.line = line;
+                g.emit(ai);
+                let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                cp.dest = d.op_vreg(dest_addr);
+                cp.src1 = d.op_vreg(val);
+                cp.src2 = d.op_imm(cast(i64, ty.size));
+                cp.line = line;
+                g.emit(cp);
+            } else {
+                let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+                si.dest = d.op_imm(cast(i64, node.var_offset));
+                si.src1 = d.op_vreg(val);
+                si.cast_to = cast(*u8, ty);
+                si.line = line;
+                g.emit(si);
+            }
+        }
+        return;
+    }
+
+    // BLOCK
+    if (k == ast.NK_BLOCK) {
+        gen_stmt(node.stmts);
+        return;
+    }
+
+    // IF
+    if (k == ast.NK_IF) {
+        let is i32 as saved_ret = g.ctx_has_returned;
+        let is i32 as saved_defer = g.defer_count;
+        let is i32 as else_l = g.new_label();
+        let is i32 as end_l = g.new_label();
+        let is i32 as cond_reg = ge.gen_expr(node.cond);
+        let is *d.IRInst as jz = d.new_inst(d.IR_JZ);
+        jz.src1 = d.op_vreg(cond_reg); jz.dest = d.op_label(else_l); jz.line = line; g.emit(jz);
+        gen_stmt(node.then_b);
+        let is i32 as then_ret = g.ctx_has_returned;
+        g.ctx_has_returned = saved_ret;
+        g.defer_count = saved_defer;
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(end_l); jmp.line = line; g.emit(jmp);
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(else_l); g.emit(el);
+        let is i32 as else_ret with mut = 0;
+        if (cast(i64, node.else_b) != 0) {
+            gen_stmt(node.else_b);
+            else_ret = g.ctx_has_returned;
+        }
+        let is *d.IRInst as endl = d.new_inst(d.IR_LABEL);
+        endl.dest = d.op_label(end_l); g.emit(endl);
+        if (then_ret == 1 && else_ret == 1) {
+            g.ctx_has_returned = 1;
+        } else {
+            g.ctx_has_returned = saved_ret;
+        }
+        g.defer_count = saved_defer;
+        return;
+    }
+
+    // ASM
+    if (k == ast.NK_ASM) {
+        let is *d.IRInst as i = d.new_inst(d.IR_ASM);
+        i.asm_str_ptr = d.str_dup(node.name_ptr, node.name_len);
+        i.asm_str_len = node.name_len;
+        i.line = line;
+        g.emit(i);
+        g.ctx_has_returned = 1;
+        return;
+    }
+
+    // WHILE
+    if (k == ast.NK_WHILE) {
+        let is i32 as saved_ret = g.ctx_has_returned;
+        let is i32 as saved_defer = g.defer_count;
+        let is i32 as start_l = g.new_label();
+        let is i32 as end_l = g.new_label();
+        g.push_loop(start_l, end_l, start_l);
+        let is *d.IRInst as sl = d.new_inst(d.IR_LABEL);
+        sl.dest = d.op_label(start_l); g.emit(sl);
+        let is i32 as cond_reg = ge.gen_expr(node.cond);
+        let is *d.IRInst as jz = d.new_inst(d.IR_JZ);
+        jz.src1 = d.op_vreg(cond_reg); jz.dest = d.op_label(end_l); jz.line = line; g.emit(jz);
+        gen_stmt_single(node.body);
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(start_l); jmp.line = line; g.emit(jmp);
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(end_l); g.emit(el);
+        g.pop_loop();
+        g.ctx_has_returned = saved_ret;
+        g.defer_count = saved_defer;
+        return;
+    }
+
+    // DO_WHILE
+    if (k == ast.NK_DO_WHILE) {
+        let is i32 as saved_ret = g.ctx_has_returned;
+        let is i32 as saved_defer = g.defer_count;
+        let is i32 as start_l = g.new_label();
+        let is i32 as end_l = g.new_label();
+        let is i32 as cond_l = g.new_label();
+        g.push_loop(start_l, end_l, cond_l);
+        let is *d.IRInst as sl = d.new_inst(d.IR_LABEL);
+        sl.dest = d.op_label(start_l); g.emit(sl);
+        gen_stmt_single(node.body);
+        let is *d.IRInst as cl = d.new_inst(d.IR_LABEL);
+        cl.dest = d.op_label(cond_l); g.emit(cl);
+        let is i32 as cond_reg = ge.gen_expr(node.cond);
+        let is *d.IRInst as jnz = d.new_inst(d.IR_JNZ);
+        jnz.src1 = d.op_vreg(cond_reg); jnz.dest = d.op_label(start_l); jnz.line = line; g.emit(jnz);
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(end_l); g.emit(el);
+        g.pop_loop();
+        g.ctx_has_returned = saved_ret;
+        g.defer_count = saved_defer;
+        return;
+    }
+
+    // FOR
+    if (k == ast.NK_FOR) {
+        let is i32 as saved_defer = g.defer_count;
+        let is i32 as start_l = g.new_label();
+        let is i32 as end_l = g.new_label();
+        let is i32 as step_l = g.new_label();
+        // Init
+        if (cast(i64, node.for_init) != 0) {
+            if (node.for_init.kind == ast.NK_LET) {
+                gen_stmt_single(node.for_init);
+            } else {
+                ge.gen_expr(node.for_init);
+            }
+        }
+        g.push_loop(start_l, end_l, step_l);
+        let is *d.IRInst as sl = d.new_inst(d.IR_LABEL);
+        sl.dest = d.op_label(start_l); g.emit(sl);
+        // Cond
+        if (cast(i64, node.cond) != 0) {
+            let is i32 as cond_reg = ge.gen_expr(node.cond);
+            let is *d.IRInst as jz = d.new_inst(d.IR_JZ);
+            jz.src1 = d.op_vreg(cond_reg); jz.dest = d.op_label(end_l); jz.line = line; g.emit(jz);
+        }
+        gen_stmt_single(node.body);
+        let is *d.IRInst as stl = d.new_inst(d.IR_LABEL);
+        stl.dest = d.op_label(step_l); g.emit(stl);
+        // Step
+        if (cast(i64, node.for_step) != 0) {
+            ge.gen_expr(node.for_step);
+        }
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(start_l); jmp.line = line; g.emit(jmp);
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(end_l); g.emit(el);
+        g.pop_loop();
+        g.defer_count = saved_defer;
+        return;
+    }
+
+    // BREAK
+    if (k == ast.NK_BREAK) {
+        if (g.ctx_loop_depth == 0) { return; }
+        let is i32 as end_l = g.get_loop_end();
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(end_l); jmp.line = line; g.emit(jmp);
+        return;
+    }
+
+    // CONTINUE
+    if (k == ast.NK_CONTINUE) {
+        if (g.ctx_loop_depth == 0) { return; }
+        let is i32 as cont_l = g.get_loop_continue();
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest = d.op_label(cont_l); jmp.line = line; g.emit(jmp);
+        return;
+    }
+
+    // ASSIGN (as statement)
+    if (k == ast.NK_ASSIGN) {
+        ge.gen_expr(node);
+        return;
+    }
+
+    // DEFER
+    if (k == ast.NK_DEFER) {
+        g.push_defer(cast(*u8, node.expr));
+        return;
+    }
+
+    // MATCH
+    if (k == ast.NK_MATCH) {
+        let is i32 as saved_ret = g.ctx_has_returned;
+        let is i32 as saved_defer = g.defer_count;
+        let is i32 as end_l = g.new_label();
+        let is i32 as expr_reg = ge.gen_expr(node.expr);
+        let is *ast.Type as mt = node.match_type;
+        let is i32 as is_tagged with mut = 0;
+        if (mt.payload_offset > 0) { is_tagged = 1; }
+        // Load discriminant
+        let is i32 as disc_reg with mut;
+        if (is_tagged == 1) {
+            disc_reg = g.new_vreg();
+            let is *d.IRInst as ld = d.new_inst(d.IR_LOAD);
+            ld.dest = d.op_vreg(disc_reg); ld.src1 = d.op_vreg(expr_reg);
+            ld.cast_to = cast(*u8, ast.type_i32); ld.line = line; g.emit(ld);
+        } else {
+            disc_reg = expr_reg;
+        }
+        let is i32 as all_returned with mut = 1;
+        let is *ast.Node as c with mut = node.cases;
+        while (cast(i64, c) != 0) {
+            let is i32 as next_l = g.new_label();
+            let is i32 as case_disc = cast(i32, c.val);
+            let is i32 as imm_reg = g.emit_imm(cast(i64, case_disc), line);
+            let is i32 as cmp = g.emit_binary(d.IR_EQ, disc_reg, imm_reg, line);
+            let is *d.IRInst as jz = d.new_inst(d.IR_JZ);
+            jz.src1 = d.op_vreg(cmp); jz.dest = d.op_label(next_l); jz.line = line; g.emit(jz);
+
+            // Payload bindings
+            if (cast(i64, c.params) != 0 && is_tagged == 1) {
+                let is i32 as poff = mt.payload_offset;
+                let is i32 as paddr with mut = expr_reg;
+                if (poff > 0) {
+                    let is i32 as ofreg = g.emit_imm(cast(i64, poff), line);
+                    paddr = g.emit_binary(d.IR_ADD, expr_reg, ofreg, line);
+                }
+                // Bind single or first payload to binding var
+                let is *ast.Node as binding = c.params;
+                if (cast(i64, binding) != 0) {
+                    let is *ast.Type as bty = binding.ty;
+                    let is i32 as val with mut;
+                    if (bty.size > 8) {
+                        val = paddr;
+                    } else {
+                        val = g.new_vreg();
+                        let is *d.IRInst as ld2 = d.new_inst(d.IR_LOAD);
+                        ld2.dest = d.op_vreg(val); ld2.src1 = d.op_vreg(paddr);
+                        ld2.cast_to = cast(*u8, bty); ld2.line = line; g.emit(ld2);
+                    }
+                    if (bty.size > 8) {
+                        let is i32 as da = g.new_vreg();
+                        let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
+                        ai.dest = d.op_vreg(da); ai.src1 = d.op_imm(cast(i64, binding.var_offset));
+                        ai.line = line; g.emit(ai);
+                        let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                        cp.dest = d.op_vreg(da); cp.src1 = d.op_vreg(val);
+                        cp.src2 = d.op_imm(cast(i64, bty.size)); cp.line = line; g.emit(cp);
+                    } else {
+                        let is *d.IRInst as sv = d.new_inst(d.IR_STORE);
+                        sv.dest = d.op_imm(cast(i64, binding.var_offset));
+                        sv.src1 = d.op_vreg(val);
+                        sv.cast_to = cast(*u8, bty); sv.line = line; g.emit(sv);
+                    }
+                }
+            }
+
+            g.ctx_has_returned = saved_ret;
+            g.defer_count = saved_defer;
+            gen_stmt(c.body);
+            if (g.ctx_has_returned == 0) { all_returned = 0; }
+            let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+            jmp.dest = d.op_label(end_l); jmp.line = line; g.emit(jmp);
+            let is *d.IRInst as nl = d.new_inst(d.IR_LABEL);
+            nl.dest = d.op_label(next_l); g.emit(nl);
+            c = c.next;
+        }
+        // Else block
+        if (cast(i64, node.else_b) != 0) {
+            g.ctx_has_returned = saved_ret;
+            gen_stmt(node.else_b);
+            if (g.ctx_has_returned == 0) { all_returned = 0; }
+        } else {
+            all_returned = 0;
+        }
+        let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
+        el.dest = d.op_label(end_l); g.emit(el);
+        if (all_returned == 1) { g.ctx_has_returned = 1; } else { g.ctx_has_returned = saved_ret; }
+        g.defer_count = saved_defer;
+        return;
+    }
+
+    io.write_str(linux.STDERR, "ir: unsupported statement kind: ");
+    io.write_int(linux.STDERR, cast(i64, k));
+    io.write_str(linux.STDERR, "\n");
+    linux.exit(1);
+}
