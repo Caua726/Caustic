@@ -7,6 +7,7 @@ use "alloc_core.cst" as al;
 use "alloc_gc.cst" as gc;
 use "emit_output.cst" as eo;
 use "emit.cst" as e;
+use "emit_inst.cst" as ei;
 use "peephole.cst" as ph;
 
 fn gen_func(func as *d.IRFunction) as void {
@@ -105,7 +106,7 @@ fn gen_func(func as *d.IRFunction) as void {
             last_line = inst.line;
         }
         if (inst.is_dead != 1) {
-            e.gen_inst(inst, ctx);
+            gen_inst(inst, ctx);
         }
         inst = inst.next;
     }
@@ -263,3 +264,44 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     eo.out_flush();
     io.write_str(linux.STDERR, "codegen: done\n");
 }
+
+fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as op = inst.op;
+
+    if (al.al_opt_level >= 1) {
+        // Invalidate dest register — it will be overwritten by this instruction
+        if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
+            let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
+            if (dest_loc >= 0) {
+                eo.rc_invalidate_reg(dest_loc);
+            }
+            // Also invalidate any cached entry for this vreg (it's being redefined)
+            eo.rc_invalidate_vreg(inst.dest.vreg);
+        }
+
+        // Full invalidation on calls (all caller-saved regs clobbered)
+        if (op == d.IR_CALL || op == d.IR_SYSCALL) { eo.ph_invalidate(); }
+
+        // Instruction selection: try fused patterns before standard emission
+        if (op == d.IR_IMM) {
+            if (e.try_fuse_imm_store(inst, ctx) == 1) { return; }
+            if (e.try_fuse_imm_store_stack(inst, ctx) == 1) { return; }
+        }
+        if (op == d.IR_LOAD) {
+            e.try_fuse_inc_stack(inst, ctx);
+            // Note: try_fuse_inc_stack returns 0 always — load still emitted normally
+        }
+    }
+
+    if (op == d.IR_IMM || op == d.IR_MOV) { ei.gen_inst_imm_mov(inst, ctx); return; }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV || op == d.IR_MOD || op == d.IR_NEG) { ei.gen_inst_arith(inst, ctx); return; }
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG) { ei.gen_inst_float(inst, ctx); return; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { ei.gen_inst_compare(inst, ctx); return; }
+    if (op == d.IR_SHL || op == d.IR_SHR || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_NOT) { ei.gen_inst_shift_bitwise(inst, ctx); return; }
+    if (op == d.IR_RET || op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { ei.gen_inst_control(inst, ctx); return; }
+    if (op == d.IR_SET_ARG || op == d.IR_GET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_SYSCALL || op == d.IR_CALL || op == d.IR_VA_START) { ei.gen_inst_calls(inst, ctx); return; }
+    // Memory, load/store, copy, asm, cast, set_ctx
+    ei.gen_inst_memory(inst, ctx);
+}
+
+// === gen_func ===
