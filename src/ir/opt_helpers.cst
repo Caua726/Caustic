@@ -1,0 +1,253 @@
+use "../../std/mem.cst" as mem;
+use "defs.cst" as d;
+
+// === Helpers ===
+
+fn is_power_of_2(v as i64) as i32 {
+    if (v <= 0) { return 0; }
+    if ((v & (v - 1)) == 0) { return 1; }
+    return 0;
+}
+
+fn log2_of(v as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as x with mut = v;
+    while (x > 1) { x = x >> 1; r = r + 1; }
+    return r;
+}
+
+fn resolve(copy_of as *i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as hops with mut = 0;
+    while (hops < 16) {
+        let is *i32 as p = cast(*i32, cast(i64, copy_of) + cast(i64, cur) * 4);
+        let is i32 as next = *p;
+        if (next < 0) { return cur; }
+        cur = next;
+        hops = hops + 1;
+    }
+    return cur;
+}
+
+fn has_side_effects(op as i32) as i32 {
+    if (op == d.IR_STORE) { return 1; }
+    if (op == d.IR_COPY) { return 1; }
+    if (op == d.IR_CALL) { return 1; }
+    if (op == d.IR_SYSCALL) { return 1; }
+    if (op == d.IR_ASM) { return 1; }
+    if (op == d.IR_RET) { return 1; }
+    if (op == d.IR_JMP) { return 1; }
+    if (op == d.IR_JZ) { return 1; }
+    if (op == d.IR_JNZ) { return 1; }
+    if (op == d.IR_LABEL) { return 1; }
+    if (op == d.IR_SET_ARG) { return 1; }
+    if (op == d.IR_SET_SYS_ARG) { return 1; }
+    if (op == d.IR_SET_CTX) { return 1; }
+    if (op == d.IR_VA_START) { return 1; }
+    return 0;
+}
+
+// === Pass 1.5: Fold constants into instruction operands ===
+
+fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64) as void {
+    // Build def count: only fold vregs with exactly one definition
+    let is i32 as fold_vc = func.vreg_count;
+    let is *i32 as fold_defs = cast(*i32, mem.galloc(cast(i64, fold_vc) * 4));
+    let is i32 as fi with mut = 0;
+    while (fi < fold_vc) {
+        let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, fi) * 4);
+        *fdp = 0;
+        fi = fi + 1;
+    }
+    let is *d.IRInst as di with mut = func.instructions;
+    while (cast(i64, di) != 0) {
+        if (di.is_dead == 0 && di.dest.op_type == d.OP_VREG && di.op != d.IR_STORE && di.op != d.IR_COPY) {
+            let is i32 as ddv = di.dest.vreg;
+            if (ddv >= 0 && ddv < fold_vc) {
+                let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, ddv) * 4);
+                *fdp = *fdp + 1;
+            }
+        }
+        di = di.next;
+    }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as fop = inst.op;
+            // Fold src2 constant into immediate for binary ops and comparisons
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as s2v = inst.src2.vreg;
+                if (s2v >= 0 && s2v < fold_vc) {
+                let is *i32 as c2p = cast(*i32, cast(i64, is_const) + cast(i64, s2v) * 4);
+                // Only fold if vreg is const AND has exactly one definition (safe from loop re-def)
+                let is i32 as s2_single_def with mut = 0;
+                    let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, s2v) * 4);
+                    if (*fdp == 1) { s2_single_def = 1; }
+                if (*c2p == 1 && s2_single_def == 1) {
+                    let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                    let is i64 as v2 = *v2p;
+                    if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        if (fop == d.IR_ADD || fop == d.IR_SUB) {
+                            inst.src2.op_type = d.OP_IMM;
+                            inst.src2.imm = v2;
+                        }
+                    }
+                    if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        if (fop == d.IR_LT || fop == d.IR_LE ||
+                            fop == d.IR_GT || fop == d.IR_GE) {
+                            inst.src2.op_type = d.OP_IMM;
+                            inst.src2.imm = v2;
+                        }
+                    }
+                    if ((fop == d.IR_DIV || fop == d.IR_MOD) && v2 != 0 && v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        inst.src2.op_type = d.OP_IMM;
+                        inst.src2.imm = v2;
+                    }
+                    if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        if (fop == d.IR_AND || fop == d.IR_OR || fop == d.IR_XOR ||
+                            fop == d.IR_MUL) {
+                            inst.src2.op_type = d.OP_IMM;
+                            inst.src2.imm = v2;
+                        }
+                    }
+                    if ((fop == d.IR_SHL || fop == d.IR_SHR) && v2 >= 0 && v2 <= 63) {
+                        inst.src2.op_type = d.OP_IMM;
+                        inst.src2.imm = v2;
+                    }
+                    // TODO: EQ/NE fold disabled — causes miscompile in loops where
+                    // const_copy_prop incorrectly marks loop-variant vregs as constant.
+                    // Fix: make const_copy_prop loop-aware (skip phi targets) or run
+                    // fold_immediates only on SSA-form IR where single-def is structural.
+                }
+            }
+            } // end bounds check s2v < fold_vc
+        }
+        inst = inst.next;
+    }
+    mem.gfree(cast(*u8, fold_defs));
+}
+
+// === Pass 2: DCE (backward scan) ===
+
+fn pass_dce(func as *d.IRFunction, vc_alloc as i32, copy_of as *i32) as void {
+    // Count instructions
+    let is i32 as inst_count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        inst_count = inst_count + 1;
+        inst = inst.next;
+    }
+
+    if (inst_count == 0) {
+        return;
+    }
+
+    // Build array of instruction pointers (forward scan)
+    let is *i64 as inst_arr = cast(*i64, mem.galloc(cast(i64, inst_count) * 8));
+    let is i32 as idx with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        let is *i64 as ap = cast(*i64, cast(i64, inst_arr) + cast(i64, idx) * 8);
+        *ap = cast(i64, inst);
+        idx = idx + 1;
+        inst = inst.next;
+    }
+
+    // Allocate used[] array (vc_alloc to cover SSA vregs)
+    let is *i32 as used = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc_alloc) {
+        let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, i) * 4);
+        *up = 0;
+        i = i + 1;
+    }
+
+    // Count defs per vreg — multi-def vregs (phi copies) must not be DCE'd
+    let is *i32 as def_count = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
+    i = 0;
+    while (i < vc_alloc) {
+        let is *i32 as dp = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4);
+        *dp = 0;
+        i = i + 1;
+    }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+            let is i32 as dv = inst.dest.vreg;
+            if (dv >= 0 && dv < vc_alloc) {
+                let is *i32 as dp = cast(*i32, cast(i64, def_count) + cast(i64, dv) * 4);
+                *dp = *dp + 1;
+            }
+        }
+        inst = inst.next;
+    }
+
+    // Backward scan
+    idx = inst_count - 1;
+    while (idx >= 0) {
+        let is *i64 as ap = cast(*i64, cast(i64, inst_arr) + cast(i64, idx) * 8);
+        inst = cast(*d.IRInst, *ap);
+
+        if (inst.is_dead == 0) {
+            // Mark operand vregs as used
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.src1.vreg) * 4);
+                *up = 1;
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.src2.vreg) * 4);
+                *up = 1;
+            }
+            // For STORE/COPY, dest vreg is also a use (address), not a def
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.dest.vreg) * 4);
+                *up = 1;
+            }
+
+            // Check if dest vreg is unused (and no side effects)
+            // Skip multi-def vregs: backward DCE can't see loop back-edge uses
+            if (inst.dest.op_type == d.OP_VREG && has_side_effects(inst.op) == 0) {
+                let is i32 as dv = inst.dest.vreg;
+                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, dv) * 4);
+                if (*up == 0) {
+                    let is i32 as dce_safe with mut = 1;
+                    if (dv >= 0 && dv < vc_alloc) {
+                        let is *i32 as dp = cast(*i32, cast(i64, def_count) + cast(i64, dv) * 4);
+                        if (*dp > 1) { dce_safe = 0; }
+                    }
+                    if (dce_safe == 1) {
+                        inst.is_dead = 1;
+                    }
+                }
+            }
+        }
+        idx = idx - 1;
+    }
+
+    mem.gfree(cast(*u8, inst_arr));
+    mem.gfree(cast(*u8, used));
+    mem.gfree(cast(*u8, def_count));
+}
+
+// === Pass 3: Final resolve (forward) ===
+
+fn pass_final_resolve(func as *d.IRFunction, copy_of as *i32) as void {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is i32 as r1 = resolve(copy_of, inst.src1.vreg);
+                inst.src1.vreg = r1;
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as r2 = resolve(copy_of, inst.src2.vreg);
+                inst.src2.vreg = r2;
+            }
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
+                let is i32 as rd = resolve(copy_of, inst.dest.vreg);
+                inst.dest.vreg = rd;
+            }
+        }
+        inst = inst.next;
+    }
+}
