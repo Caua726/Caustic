@@ -1382,10 +1382,39 @@ fn gen_stmt_single(node as *ast.Node) as void {
     linux.exit(1);
 }
 
+// === f64 bits → f32 bits (integer math, no FPU needed) ===
+
+fn f64_to_f32_bits(bits as i64) as i64 {
+    if (bits == 0) { return 0; }
+    let is i64 as neg_zero = cast(i64, 1) << 63;
+    if (bits == neg_zero) { return cast(i64, 1) << 31; }
+    let is i64 as sign = (bits >> 63) & 1;
+    let is i64 as exp_mask = (cast(i64, 1) << 11) - 1;
+    let is i64 as f64_exp = (bits >> 52) & exp_mask;
+    let is i64 as mant_mask = (cast(i64, 1) << 52) - 1;
+    let is i64 as f64_mant = bits & mant_mask;
+    // infinity / NaN
+    if (f64_exp == 2047) {
+        if (f64_mant == 0) { return (sign << 31) | (255 << 23); }
+        return (sign << 31) | (255 << 23) | 1;
+    }
+    let is i64 as f32_exp = f64_exp - 1023 + 127;
+    if (f32_exp >= 255) { return (sign << 31) | (255 << 23); }
+    if (f32_exp <= 0) { return sign << 31; }
+    let is i64 as f32_mant = f64_mant >> 29;
+    return (sign << 31) | (f32_exp << 23) | f32_mant;
+}
+
 // === eval_const_expr ===
 
 fn eval_const_expr(node as *ast.Node) as i64 {
-    if (node.kind == ast.NK_NUM) { return node.val; }
+    if (node.kind == ast.NK_NUM) {
+        // Float literals: value is in fval, not val
+        if (cast(i64, node.ty) != 0 && (node.ty.kind == ast.TY_F32 || node.ty.kind == ast.TY_F64)) {
+            return ast.f64_to_i64(node.fval);
+        }
+        return node.val;
+    }
     if (node.kind == ast.NK_ADD) { return eval_const_expr(node.lhs) + eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_SUB) { return eval_const_expr(node.lhs) - eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_MUL) { return eval_const_expr(node.lhs) * eval_const_expr(node.rhs); }
@@ -1467,6 +1496,10 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                 glob.size = node.ty.size;
                 if (cast(i64, node.init_expr) != 0) {
                     glob.init_value = eval_const_expr(node.init_expr);
+                    // f32 global: convert f64 bits to f32 bits
+                    if (node.ty.kind == ast.TY_F32) {
+                        glob.init_value = f64_to_f32_bits(glob.init_value);
+                    }
                     glob.is_initialized = 1;
                 }
                 if (cast(i64, glob_tail) == 0) {
