@@ -1,0 +1,232 @@
+use "../std/linux.cst" as linux;
+use "../std/mem.cst" as mem;
+use "../std/io.cst" as io;
+use "lexer/tokens.cst" as tok;
+use "lexer/lexer.cst" as lex;
+use "parser/ast.cst" as ast;
+use "parser/top.cst" as top;
+use "semantic/walk_module.cst" as sem;
+use "ir/defs.cst" as ird;
+use "ir/gen.cst" as irg;
+use "ir/gen_program.cst" as irp;
+use "ir/opt.cst" as iropt;
+use "ir/debug.cst" as irdebug;
+use "codegen/emit.cst" as cg;
+use "codegen/emit_driver.cst" as cgd;
+use "codegen/peephole.cst" as ph;
+use "interface.cst" as iface;
+use "lexer/cache.cst" as tokcache;
+use "parser/cache_write.cst" as astcw;
+use "ir/cache_write.cst" as ircw;
+use "ir/cache_read.cst" as ircr;
+use "codegen/emit_output.cst" as cg;
+use "../caustic-assembler/main.cst" as asmmod;
+
+// ── Profiling ──────────────────────────────────────────────────────
+
+let is [16]i64 as prof_times with mut;
+let is [16]i64 as prof_names with mut;
+let is i32 as prof_count with mut = 0;
+let is i32 as prof_enabled with mut = 0;
+
+let is i64 as prof_source_bytes with mut = 0;
+let is i32 as prof_token_count with mut = 0;
+let is i32 as prof_func_count with mut = 0;
+let is i64 as prof_ir_insts with mut = 0;
+let is i64 as prof_asm_bytes with mut = 0;
+let is i64 as prof_obj_bytes with mut = 0;
+
+fn prof_record(name as *u8, us as i64) as void {
+    if (prof_enabled == 0) { return; }
+    if (prof_count >= 16) { return; }
+    prof_names[prof_count] = cast(i64, name);
+    prof_times[prof_count] = us;
+    prof_count = prof_count + 1;
+}
+
+fn prof_pad_int(val as i64, width as i32) as void {
+    let is i32 as digits with mut = 1;
+    let is i64 as tmp with mut = val;
+    while (tmp >= 10) { tmp = tmp / 10; digits = digits + 1; }
+    let is i32 as p with mut = width - digits;
+    while (p > 0) { io.write_str(linux.STDOUT, " "); p = p - 1; }
+    io.write_int(linux.STDOUT, val);
+}
+
+fn prof_bar(us as i64, max_us as i64, width as i32) as void {
+    let is i32 as blen with mut = 0;
+    if (max_us > 0) { blen = cast(i32, us * cast(i64, width) / max_us); }
+    if (blen == 0 && us > 0) { blen = 1; }
+    let is i32 as bi with mut = 0;
+    while (bi < blen) { io.write_str(linux.STDOUT, "#"); bi = bi + 1; }
+}
+
+fn prof_phase(name as *u8, pad_to as i32, us as i64, total_us as i64, max_us as i64) as void {
+    io.write_str(linux.STDOUT, "  ");
+    let is i32 as nlen = strlen(name);
+    io.write_str(linux.STDOUT, name);
+    let is i32 as pd with mut = pad_to - nlen;
+    while (pd > 0) { io.write_str(linux.STDOUT, " "); pd = pd - 1; }
+    prof_pad_int(us / 1000, 6);
+    io.write_str(linux.STDOUT, "ms ");
+    let is i64 as pct with mut = 0;
+    if (total_us > 0) { pct = us * 100 / total_us; }
+    prof_pad_int(pct, 3);
+    io.write_str(linux.STDOUT, "% ");
+    prof_bar(us, max_us, 30);
+    io.write_str(linux.STDOUT, "\n");
+}
+
+fn prof_print_asm_breakdown() as void {
+    if (asmmod.asm_prof_enabled != 1) { return; }
+    let is i64 as asm_total with mut = 0;
+    let is i64 as asm_max with mut = 0;
+    let is i32 as ai with mut = 0;
+    while (ai < 5) {
+        asm_total = asm_total + asmmod.asm_prof_times[ai];
+        if (asmmod.asm_prof_times[ai] > asm_max) { asm_max = asmmod.asm_prof_times[ai]; }
+        ai = ai + 1;
+    }
+    io.write_str(linux.STDOUT, "\n=== assembler breakdown ===\n");
+    prof_phase("tokenize", 14, asmmod.asm_prof_times[0], asm_total, asm_max);
+    prof_phase("parse", 14, asmmod.asm_prof_times[1], asm_total, asm_max);
+    prof_phase("pass1 (syms)", 14, asmmod.asm_prof_times[2], asm_total, asm_max);
+    prof_phase("pass2 (encode)", 14, asmmod.asm_prof_times[3], asm_total, asm_max);
+    prof_phase("write elf", 14, asmmod.asm_prof_times[4], asm_total, asm_max);
+}
+
+fn prof_print() as void {
+    if (prof_enabled == 0) { return; }
+    if (prof_count == 0) { return; }
+
+    let is i64 as max_us with mut = 0;
+    let is i64 as total_us with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < prof_count) {
+        total_us = total_us + prof_times[i];
+        if (prof_times[i] > max_us) { max_us = prof_times[i]; }
+        i = i + 1;
+    }
+    if (max_us == 0) { max_us = 1; }
+
+    io.write_str(linux.STDOUT, "\n=== stats ===\n");
+    io.write_str(linux.STDOUT, "  source      ");
+    prof_pad_int(prof_source_bytes, 8);
+    io.write_str(linux.STDOUT, " bytes\n");
+    io.write_str(linux.STDOUT, "  tokens      ");
+    prof_pad_int(cast(i64, prof_token_count), 8);
+    io.write_str(linux.STDOUT, "\n");
+    io.write_str(linux.STDOUT, "  functions   ");
+    prof_pad_int(cast(i64, prof_func_count), 8);
+    io.write_str(linux.STDOUT, "\n");
+    io.write_str(linux.STDOUT, "  ir insts    ");
+    prof_pad_int(prof_ir_insts, 8);
+    io.write_str(linux.STDOUT, "\n");
+    io.write_str(linux.STDOUT, "  asm output  ");
+    prof_pad_int(prof_asm_bytes, 8);
+    io.write_str(linux.STDOUT, " bytes\n");
+    io.write_str(linux.STDOUT, "  object      ");
+    prof_pad_int(prof_obj_bytes, 8);
+    io.write_str(linux.STDOUT, " bytes\n");
+
+    io.write_str(linux.STDOUT, "\n=== pipeline ===\n");
+    i = 0;
+    while (i < prof_count) {
+        prof_phase(cast(*u8, prof_names[i]), 14, prof_times[i], total_us, max_us);
+        i = i + 1;
+    }
+    io.write_str(linux.STDOUT, "  ────────────────────────────────────────────\n");
+    io.write_str(linux.STDOUT, "  total       ");
+    prof_pad_int(total_us / 1000, 6);
+    io.write_str(linux.STDOUT, "ms\n");
+
+    prof_print_asm_breakdown();
+}
+
+fn prof_print_top_funcs() as void {
+    if (cg.cg_prof_count == 0) { return; }
+
+    let is i32 as si with mut = 0;
+    while (si < cg.cg_prof_count - 1) {
+        let is i32 as sj with mut = 0;
+        while (sj < cg.cg_prof_count - 1 - si) {
+            let is i64 as t_a = *cast(*i64, cg.cg_prof_buf + cast(i64, sj) * 24 + 16);
+            let is i64 as t_b = *cast(*i64, cg.cg_prof_buf + cast(i64, sj + 1) * 24 + 16);
+            if (t_b > t_a) {
+                let is [24]u8 as tmp;
+                mem.memcpy(&tmp, cast(*u8, cg.cg_prof_buf + cast(i64, sj) * 24), 24);
+                mem.memcpy(cast(*u8, cg.cg_prof_buf + cast(i64, sj) * 24), cast(*u8, cg.cg_prof_buf + cast(i64, sj + 1) * 24), 24);
+                mem.memcpy(cast(*u8, cg.cg_prof_buf + cast(i64, sj + 1) * 24), &tmp, 24);
+            }
+            sj = sj + 1;
+        }
+        si = si + 1;
+    }
+
+    let is i32 as show with mut = 15;
+    if (show > cg.cg_prof_count) { show = cg.cg_prof_count; }
+
+    io.write_str(linux.STDOUT, "\n--- top ");
+    io.write_int(linux.STDOUT, cast(i64, show));
+    io.write_str(linux.STDOUT, " codegen functions ---\n");
+
+    let is i64 as cg_total with mut = 0;
+    let is i32 as ci with mut = 0;
+    while (ci < cg.cg_prof_count) {
+        cg_total = cg_total + *cast(*i64, cg.cg_prof_buf + cast(i64, ci) * 24 + 16);
+        ci = ci + 1;
+    }
+    if (cg_total == 0) { cg_total = 1; }
+
+    let is i64 as func_max = *cast(*i64, cg.cg_prof_buf + 16);
+
+    let is i32 as fi with mut = 0;
+    while (fi < show) {
+        let is i64 as f_off = cast(i64, fi) * 24;
+        let is *u8 as f_name = cast(*u8, *cast(*i64, cg.cg_prof_buf + f_off));
+        let is i32 as f_nlen = *cast(*i32, cg.cg_prof_buf + f_off + 8);
+        let is i32 as f_vregs = *cast(*i32, cg.cg_prof_buf + f_off + 12);
+        let is i64 as f_us = *cast(*i64, cg.cg_prof_buf + f_off + 16);
+        let is i64 as f_ms = f_us / 1000;
+        let is i64 as f_pct = f_us * 100 / cg_total;
+
+        io.write_str(linux.STDOUT, "  ");
+        if (f_ms < 10000) { io.write_str(linux.STDOUT, " "); }
+        if (f_ms < 1000) { io.write_str(linux.STDOUT, " "); }
+        if (f_ms < 100) { io.write_str(linux.STDOUT, " "); }
+        if (f_ms < 10) { io.write_str(linux.STDOUT, " "); }
+        io.write_int(linux.STDOUT, f_ms);
+        io.write_str(linux.STDOUT, "ms ");
+        if (f_pct < 10) { io.write_str(linux.STDOUT, " "); }
+        io.write_int(linux.STDOUT, f_pct);
+        io.write_str(linux.STDOUT, "% ");
+
+        let is i32 as blen with mut = 0;
+        if (func_max > 0) { blen = cast(i32, f_us * 20 / func_max); }
+        if (blen == 0 && f_us > 0) { blen = 1; }
+        let is i32 as bbi with mut = 0;
+        while (bbi < blen) {
+            io.write_str(linux.STDOUT, "#");
+            bbi = bbi + 1;
+        }
+        let is i32 as bpad with mut = 20 - blen;
+        while (bpad > 0) {
+            io.write_str(linux.STDOUT, " ");
+            bpad = bpad - 1;
+        }
+
+        io.write_str(linux.STDOUT, " vregs=");
+        io.write_int(linux.STDOUT, cast(i64, f_vregs));
+        io.write_str(linux.STDOUT, " ");
+        io.write_bytes(linux.STDOUT, f_name, cast(i64, f_nlen));
+        io.write_str(linux.STDOUT, "\n");
+
+        fi = fi + 1;
+    }
+}
+
+fn strlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}

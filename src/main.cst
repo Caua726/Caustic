@@ -11,7 +11,7 @@ use "ir/gen.cst" as irg;
 use "ir/gen_program.cst" as irp;
 use "ir/opt.cst" as iropt;
 use "ir/debug.cst" as irdebug;
-use "codegen/emit.cst" as cg;
+use "codegen/emit_output.cst" as cg;
 use "codegen/emit_driver.cst" as cgd;
 use "codegen/peephole.cst" as ph;
 use "interface.cst" as iface;
@@ -199,208 +199,8 @@ fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len
     return path;
 }
 
-// ── Profiling ──────────────────────────────────────────────────────
+use "profiling.cst" as prof;
 
-let is [16]i64 as prof_times with mut;
-let is [16]i64 as prof_names with mut;
-let is i32 as prof_count with mut = 0;
-let is i32 as prof_enabled with mut = 0;
-
-let is i64 as prof_source_bytes with mut = 0;
-let is i32 as prof_token_count with mut = 0;
-let is i32 as prof_func_count with mut = 0;
-let is i64 as prof_ir_insts with mut = 0;
-let is i64 as prof_asm_bytes with mut = 0;
-let is i64 as prof_obj_bytes with mut = 0;
-
-fn prof_record(name as *u8, us as i64) as void {
-    if (prof_enabled == 0) { return; }
-    if (prof_count >= 16) { return; }
-    prof_names[prof_count] = cast(i64, name);
-    prof_times[prof_count] = us;
-    prof_count = prof_count + 1;
-}
-
-fn prof_pad_int(val as i64, width as i32) as void {
-    let is i32 as digits with mut = 1;
-    let is i64 as tmp with mut = val;
-    while (tmp >= 10) { tmp = tmp / 10; digits = digits + 1; }
-    let is i32 as p with mut = width - digits;
-    while (p > 0) { io.write_str(linux.STDOUT, " "); p = p - 1; }
-    io.write_int(linux.STDOUT, val);
-}
-
-fn prof_bar(us as i64, max_us as i64, width as i32) as void {
-    let is i32 as blen with mut = 0;
-    if (max_us > 0) { blen = cast(i32, us * cast(i64, width) / max_us); }
-    if (blen == 0 && us > 0) { blen = 1; }
-    let is i32 as bi with mut = 0;
-    while (bi < blen) { io.write_str(linux.STDOUT, "#"); bi = bi + 1; }
-}
-
-fn prof_phase(name as *u8, pad_to as i32, us as i64, total_us as i64, max_us as i64) as void {
-    io.write_str(linux.STDOUT, "  ");
-    let is i32 as nlen = strlen(name);
-    io.write_str(linux.STDOUT, name);
-    let is i32 as pd with mut = pad_to - nlen;
-    while (pd > 0) { io.write_str(linux.STDOUT, " "); pd = pd - 1; }
-    prof_pad_int(us / 1000, 6);
-    io.write_str(linux.STDOUT, "ms ");
-    let is i64 as pct with mut = 0;
-    if (total_us > 0) { pct = us * 100 / total_us; }
-    prof_pad_int(pct, 3);
-    io.write_str(linux.STDOUT, "% ");
-    prof_bar(us, max_us, 30);
-    io.write_str(linux.STDOUT, "\n");
-}
-
-fn prof_print_asm_breakdown() as void {
-    if (asmmod.asm_prof_enabled != 1) { return; }
-    let is i64 as asm_total with mut = 0;
-    let is i64 as asm_max with mut = 0;
-    let is i32 as ai with mut = 0;
-    while (ai < 5) {
-        asm_total = asm_total + asmmod.asm_prof_times[ai];
-        if (asmmod.asm_prof_times[ai] > asm_max) { asm_max = asmmod.asm_prof_times[ai]; }
-        ai = ai + 1;
-    }
-    io.write_str(linux.STDOUT, "\n=== assembler breakdown ===\n");
-    prof_phase("tokenize", 14, asmmod.asm_prof_times[0], asm_total, asm_max);
-    prof_phase("parse", 14, asmmod.asm_prof_times[1], asm_total, asm_max);
-    prof_phase("pass1 (syms)", 14, asmmod.asm_prof_times[2], asm_total, asm_max);
-    prof_phase("pass2 (encode)", 14, asmmod.asm_prof_times[3], asm_total, asm_max);
-    prof_phase("write elf", 14, asmmod.asm_prof_times[4], asm_total, asm_max);
-}
-
-fn prof_print() as void {
-    if (prof_enabled == 0) { return; }
-    if (prof_count == 0) { return; }
-
-    let is i64 as max_us with mut = 0;
-    let is i64 as total_us with mut = 0;
-    let is i32 as i with mut = 0;
-    while (i < prof_count) {
-        total_us = total_us + prof_times[i];
-        if (prof_times[i] > max_us) { max_us = prof_times[i]; }
-        i = i + 1;
-    }
-    if (max_us == 0) { max_us = 1; }
-
-    io.write_str(linux.STDOUT, "\n=== stats ===\n");
-    io.write_str(linux.STDOUT, "  source      ");
-    prof_pad_int(prof_source_bytes, 8);
-    io.write_str(linux.STDOUT, " bytes\n");
-    io.write_str(linux.STDOUT, "  tokens      ");
-    prof_pad_int(cast(i64, prof_token_count), 8);
-    io.write_str(linux.STDOUT, "\n");
-    io.write_str(linux.STDOUT, "  functions   ");
-    prof_pad_int(cast(i64, prof_func_count), 8);
-    io.write_str(linux.STDOUT, "\n");
-    io.write_str(linux.STDOUT, "  ir insts    ");
-    prof_pad_int(prof_ir_insts, 8);
-    io.write_str(linux.STDOUT, "\n");
-    io.write_str(linux.STDOUT, "  asm output  ");
-    prof_pad_int(prof_asm_bytes, 8);
-    io.write_str(linux.STDOUT, " bytes\n");
-    io.write_str(linux.STDOUT, "  object      ");
-    prof_pad_int(prof_obj_bytes, 8);
-    io.write_str(linux.STDOUT, " bytes\n");
-
-    io.write_str(linux.STDOUT, "\n=== pipeline ===\n");
-    i = 0;
-    while (i < prof_count) {
-        prof_phase(cast(*u8, prof_names[i]), 14, prof_times[i], total_us, max_us);
-        i = i + 1;
-    }
-    io.write_str(linux.STDOUT, "  ────────────────────────────────────────────\n");
-    io.write_str(linux.STDOUT, "  total       ");
-    prof_pad_int(total_us / 1000, 6);
-    io.write_str(linux.STDOUT, "ms\n");
-
-    prof_print_asm_breakdown();
-}
-
-fn prof_print_top_funcs() as void {
-    if (cg.cg_prof_count == 0) { return; }
-
-    let is i32 as si with mut = 0;
-    while (si < cg.cg_prof_count - 1) {
-        let is i32 as sj with mut = 0;
-        while (sj < cg.cg_prof_count - 1 - si) {
-            let is i64 as t_a = *cast(*i64, cg.cg_prof_buf + cast(i64, sj) * 24 + 16);
-            let is i64 as t_b = *cast(*i64, cg.cg_prof_buf + cast(i64, sj + 1) * 24 + 16);
-            if (t_b > t_a) {
-                let is [24]u8 as tmp;
-                mem.memcpy(&tmp, cast(*u8, cg.cg_prof_buf + cast(i64, sj) * 24), 24);
-                mem.memcpy(cast(*u8, cg.cg_prof_buf + cast(i64, sj) * 24), cast(*u8, cg.cg_prof_buf + cast(i64, sj + 1) * 24), 24);
-                mem.memcpy(cast(*u8, cg.cg_prof_buf + cast(i64, sj + 1) * 24), &tmp, 24);
-            }
-            sj = sj + 1;
-        }
-        si = si + 1;
-    }
-
-    let is i32 as show with mut = 15;
-    if (show > cg.cg_prof_count) { show = cg.cg_prof_count; }
-
-    io.write_str(linux.STDOUT, "\n--- top ");
-    io.write_int(linux.STDOUT, cast(i64, show));
-    io.write_str(linux.STDOUT, " codegen functions ---\n");
-
-    let is i64 as cg_total with mut = 0;
-    let is i32 as ci with mut = 0;
-    while (ci < cg.cg_prof_count) {
-        cg_total = cg_total + *cast(*i64, cg.cg_prof_buf + cast(i64, ci) * 24 + 16);
-        ci = ci + 1;
-    }
-    if (cg_total == 0) { cg_total = 1; }
-
-    let is i64 as func_max = *cast(*i64, cg.cg_prof_buf + 16);
-
-    let is i32 as fi with mut = 0;
-    while (fi < show) {
-        let is i64 as f_off = cast(i64, fi) * 24;
-        let is *u8 as f_name = cast(*u8, *cast(*i64, cg.cg_prof_buf + f_off));
-        let is i32 as f_nlen = *cast(*i32, cg.cg_prof_buf + f_off + 8);
-        let is i32 as f_vregs = *cast(*i32, cg.cg_prof_buf + f_off + 12);
-        let is i64 as f_us = *cast(*i64, cg.cg_prof_buf + f_off + 16);
-        let is i64 as f_ms = f_us / 1000;
-        let is i64 as f_pct = f_us * 100 / cg_total;
-
-        io.write_str(linux.STDOUT, "  ");
-        if (f_ms < 10000) { io.write_str(linux.STDOUT, " "); }
-        if (f_ms < 1000) { io.write_str(linux.STDOUT, " "); }
-        if (f_ms < 100) { io.write_str(linux.STDOUT, " "); }
-        if (f_ms < 10) { io.write_str(linux.STDOUT, " "); }
-        io.write_int(linux.STDOUT, f_ms);
-        io.write_str(linux.STDOUT, "ms ");
-        if (f_pct < 10) { io.write_str(linux.STDOUT, " "); }
-        io.write_int(linux.STDOUT, f_pct);
-        io.write_str(linux.STDOUT, "% ");
-
-        let is i32 as blen with mut = 0;
-        if (func_max > 0) { blen = cast(i32, f_us * 20 / func_max); }
-        if (blen == 0 && f_us > 0) { blen = 1; }
-        let is i32 as bbi with mut = 0;
-        while (bbi < blen) {
-            io.write_str(linux.STDOUT, "#");
-            bbi = bbi + 1;
-        }
-        let is i32 as bpad with mut = 20 - blen;
-        while (bpad > 0) {
-            io.write_str(linux.STDOUT, " ");
-            bpad = bpad - 1;
-        }
-
-        io.write_str(linux.STDOUT, " vregs=");
-        io.write_int(linux.STDOUT, cast(i64, f_vregs));
-        io.write_str(linux.STDOUT, " ");
-        io.write_bytes(linux.STDOUT, f_name, cast(i64, f_nlen));
-        io.write_str(linux.STDOUT, "\n");
-
-        fi = fi + 1;
-    }
-}
 
 // ── CLI argument globals ───────────────────────────────────────────
 
@@ -449,8 +249,8 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         } else if (str_eq(arg, arglen, "--emit-ir", 9) == 1) {
             g_cache_flags = g_cache_flags + 8;
         } else if (str_eq(arg, arglen, "--profile", 9) == 1) {
-            prof_enabled = 1;
-            prof_count = 0;
+            prof.prof_enabled = 1;
+            prof.prof_count = 0;
         } else if (str_eq(arg, arglen, "--cache", 7) == 1) {
             ai = ai + 1;
             if (ai < argc) { g_cache_dir = argv_arr[ai]; }
@@ -540,10 +340,10 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     if (tok_cached == 0) {
         let is i64 as t0 = get_time_us();
         tokens = lex.tokenize(src, file_size, filename);
-        prof_record("lex", get_time_us() - t0);
-        if (prof_enabled == 1) {
-            prof_source_bytes = file_size;
-            prof_token_count = tokens.count;
+        prof.prof_record("lex", get_time_us() - t0);
+        if (prof.prof_enabled == 1) {
+            prof.prof_source_bytes = file_size;
+            prof.prof_token_count = tokens.count;
         }
         io.write_str(linux.STDOUT, "caustic: ");
         io.write_str(linux.STDOUT, filename);
@@ -573,7 +373,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     let is i64 as t1 = get_time_us();
     ast.types_init();
     let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
-    prof_record("parse", get_time_us() - t1);
+    prof.prof_record("parse", get_time_us() - t1);
 
     // Emit AST
     if ((cache_flags & 4) != 0) {
@@ -589,7 +389,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     // Semantic
     let is i64 as t2 = get_time_us();
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
-    prof_record("semantic", get_time_us() - t2);
+    prof.prof_record("semantic", get_time_us() - t2);
     io.write_str(linux.STDOUT, "semantic: ok\n");
 
     // Emit interface and stop
@@ -619,18 +419,18 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     irg.ir_reset();
     irg.ir_tl = cast(*u8, &tokens);
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), no_main);
-    prof_record("ir", get_time_us() - t3);
+    prof.prof_record("ir", get_time_us() - t3);
     io.write_str(linux.STDOUT, "ir: ok\n");
     if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); linux.exit(0); }
     if (g_debug_ir == 1 && g_opt_level >= 1) { irdebug.ir_print_phase(cast(*u8, prog), "before optimization"); }
-    if (prof_enabled == 1) {
+    if (prof.prof_enabled == 1) {
         let is *ird.IRFunction as pf with mut = prog.functions;
         while (cast(i64, pf) != 0) {
             if (pf.is_reachable == 1) {
-                prof_func_count = prof_func_count + 1;
+                prof.prof_func_count = prof.prof_func_count + 1;
                 let is *ird.IRInst as pi with mut = pf.instructions;
                 while (cast(i64, pi) != 0) {
-                    prof_ir_insts = prof_ir_insts + 1;
+                    prof.prof_ir_insts = prof.prof_ir_insts + 1;
                     pi = pi.next;
                 }
             }
@@ -642,11 +442,11 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     // Optimize
     let is i64 as t_opt = get_time_us();
     if (g_opt_level >= 1) {
-        if (prof_enabled == 1) { iropt.opt_prof_init(); }
+        if (prof.prof_enabled == 1) { iropt.opt_prof_init(); }
         iropt.optimize(cast(*u8, prog));
-        if (prof_enabled == 1) { iropt.opt_prof_print(); }
+        if (prof.prof_enabled == 1) { iropt.opt_prof_print(); }
     }
-    prof_record("ir_opt", get_time_us() - t_opt);
+    prof.prof_record("ir_opt", get_time_us() - t_opt);
     if (g_debug_ir == 1 && g_opt_level >= 1) {
         irdebug.dbg_show_dead = 1;
         irdebug.ir_print_phase(cast(*u8, prog), "after optimization");
@@ -676,7 +476,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
 
 fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
                    obj_path_out as *u8) as i32 {
-    if (prof_enabled == 1) { cg.cg_prof_init(4096); }
+    if (prof.prof_enabled == 1) { cg.cg_prof_init(4096); }
     let is i64 as t4 = get_time_us();
     let is i32 as asm_len = fname_len + 2;
     let is *u8 as asm_path = mem.galloc(cast(i64, asm_len) + 1);
@@ -694,11 +494,11 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     cgd.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
     linux.close(out_fd);
     if (g_opt_level >= 1) { ph.optimize_asm(asm_path); }
-    prof_record("codegen", get_time_us() - t4);
-    if (prof_enabled == 1) { prof_asm_bytes = read_file_size(asm_path); }
+    prof.prof_record("codegen", get_time_us() - t4);
+    if (prof.prof_enabled == 1) { prof.prof_asm_bytes = read_file_size(asm_path); }
 
-    if (prof_enabled == 1 && cg.cg_prof_count > 0) {
-        prof_print_top_funcs();
+    if (prof.prof_enabled == 1 && cg.cg_prof_count > 0) {
+        prof.prof_print_top_funcs();
     }
 
     // Build obj path: asm_path + ".o"
@@ -710,15 +510,15 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     obj_path[asm_len + 2] = cast(u8, 0);
 
     // Assemble
-    if (prof_enabled == 1) { asmmod.asm_prof_enabled = 1; }
+    if (prof.prof_enabled == 1) { asmmod.asm_prof_enabled = 1; }
     let is i64 as t5 = get_time_us();
     let is i32 as asm_err = asmmod.assemble_file(asm_path, obj_path);
     if (asm_err != 0) {
         io.write_str(linux.STDERR, "Error: assembly failed\n");
         return 1;
     }
-    prof_record("assembler", get_time_us() - t5);
-    if (prof_enabled == 1) { prof_obj_bytes = read_file_size(obj_path); }
+    prof.prof_record("assembler", get_time_us() - t5);
+    if (prof.prof_enabled == 1) { prof.prof_obj_bytes = read_file_size(obj_path); }
     linux.unlink(asm_path);
 
     // Copy obj_path to stack buffer
@@ -763,11 +563,11 @@ fn run_single_file(filename as *u8) as i32 {
     }
     let is i64 as t1 = get_time_us();
     let is tok.TokenList as tokens = lex.tokenize(src, file_size, filename);
-    prof_record("lex", get_time_us() - t1);
+    prof.prof_record("lex", get_time_us() - t1);
 
-    if (prof_enabled == 1) {
-        prof_source_bytes = file_size;
-        prof_token_count = tokens.count;
+    if (prof.prof_enabled == 1) {
+        prof.prof_source_bytes = file_size;
+        prof.prof_token_count = tokens.count;
     }
     io.write_str(linux.STDOUT, "caustic: ");
     io.write_str(linux.STDOUT, filename);
@@ -793,7 +593,7 @@ fn run_single_file(filename as *u8) as i32 {
     let is i64 as t2 = get_time_us();
     ast.types_init();
     let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
-    prof_record("parse", get_time_us() - t2);
+    prof.prof_record("parse", get_time_us() - t2);
 
     // --emit-ast
     if ((g_cache_flags & 4) != 0) {
@@ -809,24 +609,24 @@ fn run_single_file(filename as *u8) as i32 {
 
     let is i64 as t3 = get_time_us();
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
-    prof_record("semantic", get_time_us() - t3);
+    prof.prof_record("semantic", get_time_us() - t3);
     io.write_str(linux.STDOUT, "semantic: ok\n");
 
     let is i64 as t_ir = get_time_us();
     irg.ir_tl = cast(*u8, &tokens);
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), g_no_main);
-    prof_record("ir", get_time_us() - t_ir);
+    prof.prof_record("ir", get_time_us() - t_ir);
     io.write_str(linux.STDOUT, "ir: ok\n");
     if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); linux.exit(0); }
     if (g_debug_ir == 1 && g_opt_level >= 1) { irdebug.ir_print_phase(cast(*u8, prog), "before optimization"); }
 
     let is i64 as t_opt = get_time_us();
     if (g_opt_level >= 1) {
-        if (prof_enabled == 1) { iropt.opt_prof_init(); }
+        if (prof.prof_enabled == 1) { iropt.opt_prof_init(); }
         iropt.optimize(cast(*u8, prog));
-        if (prof_enabled == 1) { iropt.opt_prof_print(); }
+        if (prof.prof_enabled == 1) { iropt.opt_prof_print(); }
     }
-    prof_record("ir_opt", get_time_us() - t_opt);
+    prof.prof_record("ir_opt", get_time_us() - t_opt);
     if (g_debug_ir == 1 && g_opt_level >= 1) {
         irdebug.dbg_show_dead = 1;
         irdebug.ir_print_phase(cast(*u8, prog), "after optimization");
@@ -856,21 +656,21 @@ fn run_single_file(filename as *u8) as i32 {
         io.write_str(linux.STDERR, "Error: cannot open output file\n");
         return 1;
     }
-    if (prof_enabled == 1) { cg.cg_prof_init(4096); }
+    if (prof.prof_enabled == 1) { cg.cg_prof_init(4096); }
     let is i64 as t4 = get_time_us();
     cgd.set_opt_level(g_opt_level);
     cgd.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
     linux.close(out_fd);
     if (g_opt_level >= 1) { ph.optimize_asm(asm_path); }
-    prof_record("codegen", get_time_us() - t4);
-    if (prof_enabled == 1) { prof_asm_bytes = read_file_size(asm_path); }
-    if (prof_enabled == 1 && cg.cg_prof_count > 0) {
-        prof_print_top_funcs();
+    prof.prof_record("codegen", get_time_us() - t4);
+    if (prof.prof_enabled == 1) { prof.prof_asm_bytes = read_file_size(asm_path); }
+    if (prof.prof_enabled == 1 && cg.cg_prof_count > 0) {
+        prof.prof_print_top_funcs();
     }
     io.write_str(linux.STDOUT, "wrote: ");
     io.write_str(linux.STDOUT, asm_path);
     io.write_str(linux.STDOUT, "\n");
-    prof_print();
+    prof.prof_print();
     return 0;
 }
 
@@ -904,7 +704,7 @@ fn link_objects(obj_paths_buf as *u8, obj_path_offsets as *i32,
         io.write_str(linux.STDERR, "Error: linking failed\n");
         return 1;
     }
-    prof_record("linker", get_time_us() - t6);
+    prof.prof_record("linker", get_time_us() - t6);
 
     // Cleanup .o files
     let is i32 as ci with mut = 0;
@@ -968,7 +768,7 @@ fn run_multi_file() as i32 {
                 pi = pi + 1;
             }
         }
-        prof_print();
+        prof.prof_print();
         return 0;
     }
 
@@ -984,7 +784,7 @@ fn run_multi_file() as i32 {
     io.write_str(linux.STDOUT, cast(*u8, g_output_path));
     io.write_str(linux.STDOUT, "\n");
 
-    prof_print();
+    prof.prof_print();
     return 0;
 }
 
