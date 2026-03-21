@@ -1544,29 +1544,58 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                 let is i32 as param_count with mut = 0;
                 let is *ast.Node as p with mut = node.params;
                 while (cast(i64, p) != 0) { param_count = param_count + 1; p = p.next; }
-                func.num_args = param_count;
 
                 ctx_func = func;
 
                 if (node.body.kind == ast.NK_BLOCK) {
                     let is i32 as arg_idx with mut = 0;
-                    // SRET check
+                    // SRET check — hidden first arg for struct return > 8 bytes
                     if (cast(i64, node.return_type) != 0 && node.return_type.size > 8) {
                         ctx_has_sret = 1;
                         ctx_sret_vreg = emit_get_arg(arg_idx, tok_line(node.tok_idx));
                         arg_idx = arg_idx + 1;
+                        param_count = param_count + 1;
                     }
-                    // Get args and store to local vars
+                func.num_args = param_count;
+                    // Get ALL args first (before any COPY that clobbers regs)
+                    let is [32]i32 as arg_vregs_fn;
+                    let is i32 as arg_vi with mut = 0;
                     p = node.params;
                     while (cast(i64, p) != 0) {
-                        let is i32 as av = emit_get_arg(arg_idx, p.tok_idx);
-                        let is *d.IRInst as si = d.new_inst(d.IR_STORE);
-                        si.dest = d.op_imm(cast(i64, p.var_offset));
-                        si.src1 = d.op_vreg(av);
-                        si.cast_to = cast(*u8, p.ty);
-                        si.line = p.tok_idx;
-                        emit(si);
+                        arg_vregs_fn[arg_vi] = emit_get_arg(arg_idx, p.tok_idx);
+                        arg_vi = arg_vi + 1;
                         arg_idx = arg_idx + 1;
+                        p = p.next;
+                    }
+                    // Now store/copy args to local vars
+                    arg_vi = 0;
+                    p = node.params;
+                    while (cast(i64, p) != 0) {
+                        let is i32 as av = arg_vregs_fn[arg_vi];
+                        let is *ast.Type as pty = p.ty;
+                        if (cast(i64, pty) != 0 && pty.size > 8) {
+                            // Struct param passed by pointer — copy to local stack
+                            let is i32 as da = new_vreg();
+                            let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
+                            ai.dest = d.op_vreg(da);
+                            ai.src1 = d.op_imm(cast(i64, p.var_offset));
+                            ai.line = p.tok_idx;
+                            emit(ai);
+                            let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                            cp.dest = d.op_vreg(da);
+                            cp.src1 = d.op_vreg(av);
+                            cp.src2 = d.op_imm(cast(i64, pty.size));
+                            cp.line = p.tok_idx;
+                            emit(cp);
+                        } else {
+                            let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+                            si.dest = d.op_imm(cast(i64, p.var_offset));
+                            si.src1 = d.op_vreg(av);
+                            si.cast_to = cast(*u8, p.ty);
+                            si.line = p.tok_idx;
+                            emit(si);
+                        }
+                        arg_vi = arg_vi + 1;
                         p = p.next;
                     }
                     gen_stmt(node.body.stmts);
