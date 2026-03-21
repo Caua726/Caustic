@@ -12,7 +12,43 @@ let is *d.Scope as current_scope with mut;
 let is *d.Scope as global_scope with mut;
 let is i32 as stack_offset with mut;
 let is *d.Function as function_table with mut;
+let is i32 as fn_count with mut = 0;
 let is i32 as loop_depth with mut;
+
+// === Function hash table (DJB2 + chaining) ===
+let is i32 as FN_HASH_SIZE with imut = 4096;
+let is *i32 as fn_hash_buckets with mut;
+let is *i32 as fn_hash_next with mut;
+let is *i64 as fn_hash_ptrs with mut;
+
+fn fn_hash(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < prefix_len) {
+        h = h * 33 + cast(i64, prefix_ptr[i]);
+        i = i + 1;
+    }
+    if (prefix_len > 0) { h = h * 33 + 95; }
+    i = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    if (h < 0) { h = 0 - h; }
+    return cast(i32, h % cast(i64, FN_HASH_SIZE));
+}
+
+fn fn_hash_init() as void {
+    fn_hash_buckets = cast(*i32, mem.galloc(cast(i64, FN_HASH_SIZE) * 4));
+    fn_hash_next = cast(*i32, mem.galloc(4096 * 4));
+    fn_hash_ptrs = cast(*i64, mem.galloc(4096 * 8));
+    let is i32 as i with mut = 0;
+    while (i < FN_HASH_SIZE) {
+        fn_hash_buckets[i] = 0 - 1;
+        i = i + 1;
+    }
+    fn_count = 0;
+}
 let is *u8 as current_return_type with mut;
 let is *u8 as current_mod_prefix_ptr with mut;
 let is i32 as current_mod_prefix_len with mut;
@@ -49,6 +85,8 @@ fn symtab_init() as void {
     sem_src_len = 0;
     sem_filename = cast(*u8, 0);
     sem_token_list = cast(*u8, 0);
+
+    fn_hash_init();
 
     global_scope = d.new_scope();
     global_scope.is_global = 1;
@@ -180,11 +218,21 @@ fn declare_fn(name_ptr as *u8, name_len as i32, ret_ty as *u8, param_types as *u
 
     nf.next = function_table;
     function_table = nf;
+
+    // Insert into hash table
+    let is i32 as idx = fn_count;
+    let is i32 as h = fn_hash(nf.name_ptr, nf.name_len, nf.mod_prefix_ptr, nf.mod_prefix_len);
+    fn_hash_ptrs[idx] = cast(i64, nf);
+    fn_hash_next[idx] = fn_hash_buckets[h];
+    fn_hash_buckets[h] = idx;
+    fn_count = fn_count + 1;
 }
 
 fn lookup_fn_qualified(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i32) as *d.Function {
-    let is *d.Function as f with mut = function_table;
-    while (cast(i64, f) != 0) {
+    let is i32 as h = fn_hash(name_ptr, name_len, prefix_ptr, prefix_len);
+    let is i32 as idx with mut = fn_hash_buckets[h];
+    while (idx >= 0) {
+        let is *d.Function as f = cast(*d.Function, fn_hash_ptrs[idx]);
         if (d.str_eq(f.name_ptr, f.name_len, name_ptr, name_len) == 1) {
             if (prefix_len == 0 && f.mod_prefix_len == 0) { return f; }
             if (prefix_len > 0 && f.mod_prefix_len > 0) {
@@ -193,7 +241,7 @@ fn lookup_fn_qualified(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, pref
                 }
             }
         }
-        f = f.next;
+        idx = fn_hash_next[idx];
     }
     return cast(*d.Function, 0);
 }
