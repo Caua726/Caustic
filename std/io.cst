@@ -87,6 +87,90 @@ fn readline(r as *Reader) as string.String {
     return s;
 }
 
+fn peek(r as *Reader) as i32 {
+    if (r.pos >= r.len) {
+        r.pos = 0;
+        let is i64 as n = linux.read(r.fd, r.buf, r.cap);
+        r.len = n;
+        if (n <= 0) {
+            return cast(i32, 0 - 1);
+        }
+    }
+    return cast(i32, r.buf[r.pos]);
+}
+
+fn skip(r as *Reader, count as i64) as void {
+    let is i64 as remaining with mut = count;
+    while (remaining > 0) {
+        let is i32 as b = read(r);
+        if (b == (0 - 1)) { return; }
+        remaining = remaining - 1;
+    }
+}
+
+fn read_until(r as *Reader, delim as u8) as string.String {
+    let is i64 as cap with mut = 64;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = mem.galloc(cap);
+
+    while (1 == 1) {
+        let is i32 as b = read(r);
+        if (b == (0 - 1)) { break; }
+        if (cast(u8, b) == delim) { break; }
+
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = mem.galloc(new_cap);
+            mem.memcpy(new_ptr, ptr, len);
+            mem.gfree(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        ptr[len] = cast(u8, b);
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0);
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+    return s;
+}
+
+fn read_all(r as *Reader) as string.String {
+    let is i64 as cap with mut = 1024;
+    let is i64 as len with mut = 0;
+    let is *u8 as ptr with mut = mem.galloc(cap);
+
+    while (1 == 1) {
+        let is i32 as b = read(r);
+        if (b == (0 - 1)) { break; }
+
+        if (len + 1 >= cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_ptr = mem.galloc(new_cap);
+            mem.memcpy(new_ptr, ptr, len);
+            mem.gfree(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+
+        ptr[len] = cast(u8, b);
+        len = len + 1;
+    }
+
+    ptr[len] = cast(u8, 0);
+
+    let is string.String as s;
+    s.ptr = ptr;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+    return s;
+}
+
 // --- Buffered Writer ---
 
 struct Writer {
@@ -124,7 +208,7 @@ fn put(w as *Writer, b as u8) as void {
 fn write(w as *Writer, s as string.String) as void {
     let is i64 as i with mut = 0;
     let is i64 as slen = cast(i64, s.len);
-    
+
     // Optimization: if string is larger than buffer, flush and write directly
     if (slen > w.cap) {
         flush(w);
@@ -135,6 +219,50 @@ fn write(w as *Writer, s as string.String) as void {
     while (i < slen) {
         put(w, s.ptr[i]);
         i = i + 1;
+    }
+}
+
+fn write_bytes(w as *Writer, ptr as *u8, len as i64) as void {
+    if (len > w.cap) {
+        flush(w);
+        linux.write(w.fd, ptr, len);
+        return;
+    }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        put(w, ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn writeln(w as *Writer, s as string.String) as void {
+    write(w, s);
+    put(w, cast(u8, 10));
+}
+
+fn write_i64(w as *Writer, n as i64) as void {
+    if (n == 0) { put(w, 48); return; }
+
+    if (n == (0 - 9223372036854775807 - 1)) {
+        write_bytes(w, "-9223372036854775808", 20);
+        return;
+    }
+
+    let is [24]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i32 as start with mut = pos + 1;
+    while (start < 24) {
+        put(w, buf[start]);
+        start = start + 1;
     }
 }
 
@@ -328,6 +456,21 @@ fn println(s as string.String) as void {
     linux.write(linux.STDOUT, "\n", 1);
 }
 
+fn eprint(s as string.String) as void {
+    if (s.len > 0) {
+        linux.write(linux.STDERR, s.ptr, cast(i64, s.len));
+    }
+}
+
+fn eprintln(s as string.String) as void {
+    eprint(s);
+    linux.write(linux.STDERR, "\n", 1);
+}
+
+fn eprint_str(s as *u8) as void {
+    linux.write(linux.STDERR, s, strlen(s));
+}
+
 fn print_int(n as i64) as void {
     let is string.String as s = string.int_to_string(n);
     print(s);
@@ -457,4 +600,62 @@ fn open_file(path as string.String) as File {
 
 fn close_file(file as File) as void {
     linux.close(file.fd);
+}
+
+fn copy_file(src as string.String, dst as string.String) as i64 {
+    let is i64 as in_fd = linux.open(src.ptr, linux.O_RDONLY, 0);
+    if (in_fd < 0) { return in_fd; }
+
+    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC;
+    let is i64 as out_fd = linux.open(dst.ptr, flags, 420);
+    if (out_fd < 0) {
+        linux.close(in_fd);
+        return out_fd;
+    }
+
+    let is [4096]u8 as buf;
+    let is i64 as total with mut = 0;
+
+    while (1 == 1) {
+        let is i64 as n = linux.read(in_fd, &buf, 4096);
+        if (n <= 0) { break; }
+        linux.write(out_fd, &buf, n);
+        total = total + n;
+    }
+
+    linux.close(in_fd);
+    linux.close(out_fd);
+    return total;
+}
+
+fn read_file_in(h as *mem.Heap, path as *u8) as string.String {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    let is string.String as s;
+
+    if (fd < 0) {
+        s.ptr = cast(*u8, 0);
+        s.len = 0;
+        s.cap = 0;
+        return s;
+    }
+
+    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
+    linux.lseek(fd, 0, linux.SEEK_SET);
+
+    if (size > 2147483647 || size <= 0) {
+        linux.close(fd);
+        s.ptr = cast(*u8, 0);
+        s.len = 0;
+        s.cap = 0;
+        return s;
+    }
+
+    s.len = cast(i32, size);
+    s.cap = cast(i32, size);
+    s.ptr = cast(*u8, mem.alloc(h, size + 1));
+    read_exact(fd, s.ptr, size);
+    s.ptr[size] = cast(u8, 0);
+
+    linux.close(fd);
+    return s;
 }
