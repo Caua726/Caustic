@@ -619,38 +619,48 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
             // Fold src2 constant into immediate for binary ops and comparisons
             if (inst.src2.op_type == d.OP_VREG) {
                 let is i32 as s2v = inst.src2.vreg;
+                if (s2v >= 0 && s2v < fold_vc) {
                 let is *i32 as c2p = cast(*i32, cast(i64, is_const) + cast(i64, s2v) * 4);
                 // Only fold if vreg is const AND has exactly one definition (safe from loop re-def)
                 let is i32 as s2_single_def with mut = 0;
-                if (s2v >= 0 && s2v < fold_vc) {
                     let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, s2v) * 4);
                     if (*fdp == 1) { s2_single_def = 1; }
-                }
                 if (*c2p == 1 && s2_single_def == 1) {
                     let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
                     let is i64 as v2 = *v2p;
                     if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
-                        if (fop == d.IR_ADD || fop == d.IR_SUB || fop == d.IR_MUL ||
-                            fop == d.IR_AND || fop == d.IR_OR || fop == d.IR_XOR ||
-                            fop == d.IR_EQ || fop == d.IR_NE ||
-                            fop == d.IR_LT || fop == d.IR_LE ||
+                        if (fop == d.IR_ADD || fop == d.IR_SUB) {
+                            inst.src2.op_type = d.OP_IMM;
+                            inst.src2.imm = v2;
+                        }
+                    }
+                    if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        if (fop == d.IR_LT || fop == d.IR_LE ||
                             fop == d.IR_GT || fop == d.IR_GE) {
                             inst.src2.op_type = d.OP_IMM;
                             inst.src2.imm = v2;
                         }
                     }
-                    // DIV/MOD: fold constant divisor so codegen can optimize
-                    if (fop == d.IR_DIV || fop == d.IR_MOD) {
+                    if ((fop == d.IR_DIV || fop == d.IR_MOD) && v2 != 0 && v2 >= (0 - 2147483647) && v2 <= 2147483647) {
                         inst.src2.op_type = d.OP_IMM;
                         inst.src2.imm = v2;
                     }
-                    // SHL/SHR: only fold if shift count fits in 0-63
+                    if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
+                        if (fop == d.IR_AND || fop == d.IR_OR || fop == d.IR_XOR ||
+                            fop == d.IR_MUL) {
+                            inst.src2.op_type = d.OP_IMM;
+                            inst.src2.imm = v2;
+                        }
+                    }
                     if ((fop == d.IR_SHL || fop == d.IR_SHR) && v2 >= 0 && v2 <= 63) {
                         inst.src2.op_type = d.OP_IMM;
                         inst.src2.imm = v2;
                     }
+                    // NOTE: EQ/NE fold disabled — causes miscompile in loops where
+                    // const_copy_prop incorrectly marks loop-variant vregs as constant.
                 }
             }
+            } // end bounds check s2v < fold_vc
         }
         inst = inst.next;
     }
@@ -1358,12 +1368,12 @@ fn sr_process_loop(func as *d.IRFunction, header as i32, backedge as i32,
                                                 if (nscan.src2.op_type == d.OP_VREG && nscan.src2.vreg == shl_dest && nscan.src1.op_type == d.OP_VREG) {
                                                     base_v = nscan.src1.vreg;
                                                 }
-                                                if (base_v >= 0 && base_v < vc) {
+                                                if (base_v >= 0 && base_v < vc && shift >= 0 && shift < 63) {
                                                     if (is_vreg_loop_inv(base_v, def_pos, def_count, header, backedge, vc, def_inst) == 1) {
                                                         ch_iv_idx[num_chains] = ik;
                                                         ch_end_inst[num_chains] = cast(i64, nscan);
                                                         ch_end_vreg[num_chains] = nscan.dest.vreg;
-                                                        ch_stride_imm[num_chains] = 1 << shift;
+                                                        ch_stride_imm[num_chains] = cast(i64, 1) << shift;
                                                         ch_stride_vreg[num_chains] = cast(i32, 0 - 1);
                                                         ch_base_vreg[num_chains] = base_v;
                                                         ch_other_vreg[num_chains] = cast(i32, 0 - 1);
@@ -1472,7 +1482,7 @@ fn sr_process_loop(func as *d.IRFunction, header as i32, backedge as i32,
                                                     }
                                                 }
 
-                                                if (add_uc == 1 && other_inv == 1) {
+                                                if (add_uc == 1 && other_inv == 1 && scan.src2.imm >= 0 && scan.src2.imm < 63) {
                                                     // Full chain: (MUL/other + iv) << shift → check for ADD base
                                                     let is i32 as shl_dest2 = scan.dest.vreg;
                                                     let is i64 as shift2 = scan.src2.imm;
@@ -1501,7 +1511,7 @@ fn sr_process_loop(func as *d.IRFunction, header as i32, backedge as i32,
                                                                         ch_iv_idx[num_chains] = ik2;
                                                                         ch_end_inst[num_chains] = cast(i64, nscan2);
                                                                         ch_end_vreg[num_chains] = nscan2.dest.vreg;
-                                                                        ch_stride_imm[num_chains] = 1 << shift2;
+                                                                        ch_stride_imm[num_chains] = cast(i64, 1) << shift2;
                                                                         ch_stride_vreg[num_chains] = cast(i32, 0 - 1);
                                                                         ch_base_vreg[num_chains] = base_v2;
                                                                         ch_other_vreg[num_chains] = other_v;
