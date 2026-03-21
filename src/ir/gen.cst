@@ -123,13 +123,14 @@ fn emit_cast(src as i32, to_ty as *u8, line as i32) as i32 {
     return emit_cast_from(src, cast(*u8, 0), to_ty, line);
 }
 
-fn emit_call(name_ptr as *u8, name_len as i32, is_variadic as i32, ret_type as *u8, line as i32) as i32 {
+fn emit_call(name_ptr as *u8, name_len as i32, is_variadic as i32, ret_type as *u8, xmm_count as i32, line as i32) as i32 {
     let is i32 as dest = new_vreg();
     let is *d.IRInst as i = d.new_inst(d.IR_CALL);
     i.dest = d.op_vreg(dest);
     i.call_name_ptr = d.str_dup(name_ptr, name_len);
     i.call_name_len = name_len;
     i.is_variadic_call = is_variadic;
+    i.src1 = d.op_imm(cast(i64, xmm_count));
     i.cast_to = ret_type;
     i.line = line;
     emit(i);
@@ -363,45 +364,120 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
 
     // Generate args - max 32 args
     let is [256]u8 as arg_vregs;
+    let is [64]u8 as arg_is_flt;
     let is i32 as ai with mut = 0;
     if (sret_addr != cast(i32, 0 - 1)) {
         let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
         *av = sret_addr;
+        arg_is_flt[ai] = 0;
         ai = ai + 1;
     }
     a = node.args;
     while (cast(i64, a) != 0) {
         let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
         *av = gen_expr(a);
+        if (is_float_kind(a.ty.kind) == 1) { arg_is_flt[ai] = 1; }
+        else { arg_is_flt[ai] = 0; }
         ai = ai + 1;
         a = a.next;
     }
 
-    // Internal Caustic ABI: all args in GPRs
     let is i32 as stack_args with mut = 0;
-    if (arg_count > 6) { stack_args = arg_count - 6; }
     let is i32 as padding with mut = 0;
-    if (stack_args % 2 != 0) { padding = 1; }
-    if (padding == 1) {
-        let is *d.IRInst as al = d.new_inst(d.IR_ASM);
-        al.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
-        al.asm_str_len = 10;
-        al.line = line;
-        emit(al);
-    }
-    // Stack args in reverse
-    let is i32 as j with mut = arg_count - 1;
-    while (j >= 6) {
-        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-        emit_set_arg(j, *av, cast(*u8, 0), line);
-        j = j - 1;
-    }
-    // Register args
-    j = 0;
-    while (j < arg_count && j < 6) {
-        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-        emit_set_arg(j, *av, cast(*u8, 0), line);
-        j = j + 1;
+    let is i32 as j with mut = 0;
+    let is i32 as xmm_total with mut = 0;
+
+    if (node.is_extern == 1) {
+        // System V ABI: floats → xmm0-xmm7, ints → rdi/rsi/rdx/rcx/r8/r9
+        let is i32 as gpr_total with mut = 0;
+        j = 0;
+        while (j < arg_count) {
+            if (arg_is_flt[j] == 1) { xmm_total = xmm_total + 1; }
+            else { gpr_total = gpr_total + 1; }
+            j = j + 1;
+        }
+        let is i32 as stack_gpr with mut = 0;
+        let is i32 as stack_xmm with mut = 0;
+        if (gpr_total > 6) { stack_gpr = gpr_total - 6; }
+        if (xmm_total > 8) { stack_xmm = xmm_total - 8; }
+        stack_args = stack_gpr + stack_xmm;
+        if (stack_args % 2 != 0) { padding = 1; }
+        if (padding == 1) {
+            let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+            pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+            pa.asm_str_len = 10;
+            pa.line = line;
+            emit(pa);
+        }
+        // Classify each arg: on_stack or register
+        let is [64]u8 as arg_on_stk;
+        let is i32 as gi with mut = 0;
+        let is i32 as xi with mut = 0;
+        j = 0;
+        while (j < arg_count) {
+            if (arg_is_flt[j] == 1) {
+                if (xi < 8) { arg_on_stk[j] = 0; } else { arg_on_stk[j] = 1; }
+                xi = xi + 1;
+            } else {
+                if (gi < 6) { arg_on_stk[j] = 0; } else { arg_on_stk[j] = 1; }
+                gi = gi + 1;
+            }
+            j = j + 1;
+        }
+        // Push stack overflow args in reverse
+        j = arg_count - 1;
+        while (j >= 0) {
+            if (arg_on_stk[j] == 1) {
+                let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+                emit_set_arg(6, *av, cast(*u8, 0), line);
+            }
+            j = j - 1;
+        }
+        // Set register args with separate GPR/XMM indices
+        gi = 0;
+        xi = 0;
+        j = 0;
+        while (j < arg_count) {
+            if (arg_on_stk[j] == 0) {
+                let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+                if (arg_is_flt[j] == 1) {
+                    emit_set_arg(xi, *av, cast(*u8, ast.type_f64), line);
+                    xi = xi + 1;
+                } else {
+                    emit_set_arg(gi, *av, cast(*u8, 0), line);
+                    gi = gi + 1;
+                }
+            } else {
+                if (arg_is_flt[j] == 1) { xi = xi + 1; }
+                else { gi = gi + 1; }
+            }
+            j = j + 1;
+        }
+    } else {
+        // Internal Caustic ABI: all args in GPRs
+        if (arg_count > 6) { stack_args = arg_count - 6; }
+        if (stack_args % 2 != 0) { padding = 1; }
+        if (padding == 1) {
+            let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+            pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+            pa.asm_str_len = 10;
+            pa.line = line;
+            emit(pa);
+        }
+        // Stack args in reverse
+        j = arg_count - 1;
+        while (j >= 6) {
+            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j - 1;
+        }
+        // Register args
+        j = 0;
+        while (j < arg_count && j < 6) {
+            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j + 1;
+        }
     }
 
     // Use asm_name if available (for mangled names)
@@ -411,7 +487,7 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         cname = node.asm_name_ptr;
         clen = node.asm_name_len;
     }
-    let is i32 as ret_reg = emit_call(cname, clen, node.is_variadic, cast(*u8, ty), line);
+    let is i32 as ret_reg = emit_call(cname, clen, node.is_variadic, cast(*u8, ty), xmm_total, line);
 
     if (stack_args > 0) {
         let is i32 as pad2 with mut = 0;
