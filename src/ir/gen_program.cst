@@ -1,0 +1,332 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../lexer/tokens.cst" as tok;
+use "defs.cst" as d;
+use "gen.cst" as g;
+use "gen_expr.cst" as ge;
+use "gen_stmt.cst" as gs;
+
+// === f64 bits → f32 bits (integer math, no FPU needed) ===
+
+fn f64_to_f32_bits(bits as i64) as i64 {
+    if (bits == 0) { return 0; }
+    let is i64 as neg_zero = cast(i64, 1) << 63;
+    if (bits == neg_zero) { return cast(i64, 1) << 31; }
+    let is i64 as sign = (bits >> 63) & 1;
+    let is i64 as exp_mask = (cast(i64, 1) << 11) - 1;
+    let is i64 as f64_exp = (bits >> 52) & exp_mask;
+    let is i64 as mant_mask = (cast(i64, 1) << 52) - 1;
+    let is i64 as f64_mant = bits & mant_mask;
+    // infinity / NaN
+    if (f64_exp == 2047) {
+        if (f64_mant == 0) { return (sign << 31) | (255 << 23); }
+        return (sign << 31) | (255 << 23) | 1;
+    }
+    let is i64 as f32_exp = f64_exp - 1023 + 127;
+    if (f32_exp >= 255) { return (sign << 31) | (255 << 23); }
+    if (f32_exp <= 0) { return sign << 31; }
+    let is i64 as f32_mant = f64_mant >> 29;
+    return (sign << 31) | (f32_exp << 23) | f32_mant;
+}
+
+// === eval_const_expr ===
+
+fn eval_const_expr(node as *ast.Node) as i64 {
+    if (node.kind == ast.NK_NUM) {
+        // Float literals: value is in fval, not val
+        if (cast(i64, node.ty) != 0 && (node.ty.kind == ast.TY_F32 || node.ty.kind == ast.TY_F64)) {
+            return ast.f64_to_i64(node.fval);
+        }
+        return node.val;
+    }
+    if (node.kind == ast.NK_ADD) { return eval_const_expr(node.lhs) + eval_const_expr(node.rhs); }
+    if (node.kind == ast.NK_SUB) { return eval_const_expr(node.lhs) - eval_const_expr(node.rhs); }
+    if (node.kind == ast.NK_MUL) { return eval_const_expr(node.lhs) * eval_const_expr(node.rhs); }
+    if (node.kind == ast.NK_DIV) { return eval_const_expr(node.lhs) / eval_const_expr(node.rhs); }
+    io.write_str(linux.STDERR, "ir: non-constant expr in global init\n");
+    linux.exit(1);
+    return 0;
+}
+
+// === mark_reachable ===
+
+fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
+    if (cast(i64, func) == 0) { return; }
+    if (func.is_reachable == 1) { return; }
+    func.is_reachable = 1;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) {
+            let is *d.IRFunction as f with mut = prog.functions;
+            while (cast(i64, f) != 0) {
+                let is *u8 as fname with mut = f.name_ptr;
+                let is i32 as flen with mut = f.name_len;
+                if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
+                if (d.str_eq(fname, flen, inst.call_name_ptr, inst.call_name_len) == 1) {
+                    mark_reachable(prog, f);
+                }
+                f = f.next;
+            }
+        }
+        if (inst.op == d.IR_FN_ADDR && inst.global_name_len > 0) {
+            let is *d.IRFunction as f with mut = prog.functions;
+            while (cast(i64, f) != 0) {
+                let is *u8 as fname with mut = f.name_ptr;
+                let is i32 as flen with mut = f.name_len;
+                if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
+                if (d.str_eq(fname, flen, inst.global_name_ptr, inst.global_name_len) == 1) {
+                    mark_reachable(prog, f);
+                }
+                f = f.next;
+            }
+        }
+        if (inst.op == d.IR_ADDR_GLOBAL && inst.global_name_len > 0) {
+            let is *d.IRGlobal as g with mut = prog.globals;
+            while (cast(i64, g) != 0) {
+                if (d.str_eq(g.name_ptr, g.name_len, inst.global_name_ptr, inst.global_name_len) == 1) {
+                    g.is_reachable = 1;
+                }
+                g = g.next;
+            }
+        }
+        inst = inst.next;
+    }
+}
+
+// === gen_ir entry ===
+
+fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
+    g.ir_depth = g.ir_depth + 1;
+    let is *d.IRProgram as prog = d.new_irprog();
+    let is *d.IRFunction as func_tail with mut = cast(*d.IRFunction, 0);
+    let is *d.IRGlobal as glob_tail with mut = cast(*d.IRGlobal, 0);
+
+    let is *ast.Node as node with mut = cast(*ast.Node, root);
+    while (cast(i64, node) != 0) {
+        let is i32 as nk = node.kind;
+
+        // Global LET
+        if (nk == ast.NK_LET && node.is_global == 1) {
+            if (node.is_extern == 1) { node = node.next; }
+            else {
+                let is *d.IRGlobal as glob = d.new_irglobal();
+                if (node.asm_name_len > 0) {
+                    glob.name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+                    glob.name_len = node.asm_name_len;
+                } else {
+                    glob.name_ptr = d.str_dup(node.name_ptr, node.name_len);
+                    glob.name_len = node.name_len;
+                }
+                glob.size = node.ty.size;
+                if (cast(i64, node.init_expr) != 0) {
+                    glob.init_value = eval_const_expr(node.init_expr);
+                    // f32 global: convert f64 bits to f32 bits
+                    if (node.ty.kind == ast.TY_F32) {
+                        glob.init_value = f64_to_f32_bits(glob.init_value);
+                    }
+                    glob.is_initialized = 1;
+                }
+                if (cast(i64, glob_tail) == 0) {
+                    prog.globals = glob;
+                } else {
+                    glob_tail.next = glob;
+                }
+                glob_tail = glob;
+                node = node.next;
+            }
+        }
+        // NK_FN
+        else if (nk == ast.NK_FN) {
+            // Skip generic templates
+            if (node.generic_param_count > 0) { node = node.next; }
+            // Skip extern / no body
+            else if (cast(i64, node.body) == 0) { node = node.next; }
+            else {
+                // Reset context
+                g.ctx_head = cast(*d.IRInst, 0);
+                g.ctx_tail = cast(*d.IRInst, 0);
+                g.ctx_vreg = 0;
+                g.ctx_loop_depth = 0;
+                g.ctx_has_sret = 0;
+                g.ctx_has_returned = 0;
+                g.defer_count = 0;
+
+                let is *d.IRFunction as func = d.new_irfunc();
+                if (node.asm_name_len > 0) {
+                    func.name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+                    func.name_len = node.asm_name_len;
+                    func.asm_name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+                    func.asm_name_len = node.asm_name_len;
+                } else {
+                    func.name_ptr = d.str_dup(node.name_ptr, node.name_len);
+                    func.name_len = node.name_len;
+                    func.asm_name_ptr = d.str_dup(node.name_ptr, node.name_len);
+                    func.asm_name_len = node.name_len;
+                }
+                func.is_variadic = node.is_variadic;
+
+                let is i32 as param_count with mut = 0;
+                let is *ast.Node as p with mut = node.params;
+                while (cast(i64, p) != 0) { param_count = param_count + 1; p = p.next; }
+
+                g.ctx_func = func;
+
+                if (node.body.kind == ast.NK_BLOCK) {
+                    let is i32 as arg_idx with mut = 0;
+                    // SRET check — hidden first arg for struct return > 8 bytes
+                    if (cast(i64, node.return_type) != 0 && node.return_type.size > 8) {
+                        g.ctx_has_sret = 1;
+                        g.ctx_sret_vreg = g.emit_get_arg(arg_idx, g.tok_line(node.tok_idx));
+                        arg_idx = arg_idx + 1;
+                        param_count = param_count + 1;
+                    }
+                func.num_args = param_count;
+                    // Get ALL args first (before any COPY that clobbers regs)
+                    let is [32]i32 as arg_vregs_fn;
+                    let is i32 as arg_vi with mut = 0;
+                    p = node.params;
+                    while (cast(i64, p) != 0) {
+                        arg_vregs_fn[arg_vi] = g.emit_get_arg(arg_idx, p.tok_idx);
+                        arg_vi = arg_vi + 1;
+                        arg_idx = arg_idx + 1;
+                        p = p.next;
+                    }
+                    // Now store/copy args to local vars
+                    arg_vi = 0;
+                    p = node.params;
+                    while (cast(i64, p) != 0) {
+                        let is i32 as av = arg_vregs_fn[arg_vi];
+                        let is *ast.Type as pty = p.ty;
+                        if (cast(i64, pty) != 0 && pty.size > 8) {
+                            // Struct param passed by pointer — copy to local stack
+                            let is i32 as da = g.new_vreg();
+                            let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
+                            ai.dest = d.op_vreg(da);
+                            ai.src1 = d.op_imm(cast(i64, p.var_offset));
+                            ai.line = p.tok_idx;
+                            g.emit(ai);
+                            let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                            cp.dest = d.op_vreg(da);
+                            cp.src1 = d.op_vreg(av);
+                            cp.src2 = d.op_imm(cast(i64, pty.size));
+                            cp.line = p.tok_idx;
+                            g.emit(cp);
+                        } else {
+                            let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+                            si.dest = d.op_imm(cast(i64, p.var_offset));
+                            si.src1 = d.op_vreg(av);
+                            si.cast_to = cast(*u8, p.ty);
+                            si.line = p.tok_idx;
+                            g.emit(si);
+                        }
+                        arg_vi = arg_vi + 1;
+                        p = p.next;
+                    }
+                    gs.gen_stmt(node.body.stmts);
+                    ge.emit_deferred_calls();
+                    // Implicit return
+                    let is i32 as zero = g.emit_imm(0, 0);
+                    g.emit_return(zero, 0);
+                }
+
+                func.instructions = g.ctx_head;
+                func.vreg_count = g.ctx_vreg;
+                func.label_count = g.ctx_label;
+                func.stack_size = node.stack_size;
+
+                if (cast(i64, func_tail) == 0) {
+                    prog.functions = func;
+                } else {
+                    func_tail.next = func;
+                }
+                func_tail = func;
+
+                // Check if main
+                if (d.str_eq(func.name_ptr, func.name_len, "main", 4) == 1) {
+                    prog.main_func = func;
+                }
+                node = node.next;
+            }
+        }
+        // NK_USE — recurse
+        else if (nk == ast.NK_USE) {
+            if (cast(i64, node.body) != 0) {
+                // Check if this body was already processed
+                let is i64 as body_ptr = cast(i64, node.body);
+                let is i32 as already with mut = 0;
+                let is i32 as di with mut = 0;
+                while (di < g.ir_done_count) {
+                    let is *i64 as dp = cast(*i64, cast(i64, &g.ir_done_bodies) + cast(i64, di) * 8);
+                    if (*dp == body_ptr) { already = 1; }
+                    di = di + 1;
+                }
+                if (already == 0 && g.ir_done_count < 256) {
+                    // Mark as done
+                    let is *i64 as dp2 = cast(*i64, cast(i64, &g.ir_done_bodies) + cast(i64, g.ir_done_count) * 8);
+                    *dp2 = body_ptr;
+                    g.ir_done_count = g.ir_done_count + 1;
+                    let is *d.IRProgram as mod_prog = gen_ir(cast(*u8, node.body), 1);
+                    // Merge functions
+                    if (cast(i64, mod_prog.functions) != 0) {
+                        if (cast(i64, func_tail) == 0) {
+                            prog.functions = mod_prog.functions;
+                        } else {
+                            func_tail.next = mod_prog.functions;
+                        }
+                        // Find new tail
+                        let is *d.IRFunction as ft with mut = mod_prog.functions;
+                        while (cast(i64, ft.next) != 0) { ft = ft.next; }
+                        func_tail = ft;
+                    }
+                    // Merge globals
+                    if (cast(i64, mod_prog.globals) != 0) {
+                        if (cast(i64, glob_tail) == 0) {
+                            prog.globals = mod_prog.globals;
+                        } else {
+                            glob_tail.next = mod_prog.globals;
+                        }
+                        let is *d.IRGlobal as gt with mut = mod_prog.globals;
+                        while (cast(i64, gt.next) != 0) { gt = gt.next; }
+                        glob_tail = gt;
+                    }
+                }
+            }
+            node = node.next;
+        }
+        else {
+            node = node.next;
+        }
+    }
+
+    // Search main after all merges (only at top level)
+    if (g.ir_depth == 1 && cast(i64, prog.main_func) == 0) {
+        let is *d.IRFunction as f with mut = prog.functions;
+        while (cast(i64, f) != 0) {
+            if (d.str_eq(f.name_ptr, f.name_len, "main", 4) == 1) {
+                prog.main_func = f;
+            }
+            f = f.next;
+        }
+    }
+
+    if (g.ir_depth == 1 && cast(i64, prog.main_func) == 0 && no_main == 0) {
+        io.write_str(linux.STDERR, "ir: function main not found\n");
+        linux.exit(1);
+    }
+
+    prog.strings = g.string_head;
+
+    if (cast(i64, prog.main_func) != 0) {
+        mark_reachable(prog, prog.main_func);
+    } else if (no_main == 1) {
+        let is *d.IRFunction as f with mut = prog.functions;
+        while (cast(i64, f) != 0) { f.is_reachable = 1; f = f.next; }
+        let is *d.IRGlobal as g with mut = prog.globals;
+        while (cast(i64, g) != 0) { g.is_reachable = 1; g = g.next; }
+    }
+
+    g.ir_depth = g.ir_depth - 1;
+    return prog;
+}
