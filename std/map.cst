@@ -1,0 +1,398 @@
+// =======================================================
+// std/map.cst
+// Hash maps -- MapI64 (i64->i64) and MapStr (*u8->i64)
+// Open addressing with linear probing, FNV-1a / splitmix64
+// =======================================================
+
+use "linux.cst" as linux;
+use "mem.cst" as mem;
+use "string.cst" as str;
+
+// --- Constants ---
+
+let is i64 as _EMPTY     with imut = 0;
+let is i64 as _OCCUPIED  with imut = 1;
+let is i64 as _TOMBSTONE with imut = 2;
+
+let is i64 as _INITIAL_CAP with imut = 16;
+
+// FNV-1a constants
+let is i64 as _FNV_OFFSET with imut = 2166136261;
+let is i64 as _FNV_PRIME  with imut = 16777619;
+
+// Mask off sign bit for non-negative hash
+let is i64 as _SIGN_MASK with imut = 9223372036854775807;
+
+// --- Hash functions ---
+
+// splitmix64-style hash for i64 keys
+fn _hash_i64(key as i64) as i64 {
+    let is i64 as h with mut = key;
+    h = h ^ (h >> 16);
+    h = h * 2654435761;
+    h = h ^ (h >> 13);
+    h = h & _SIGN_MASK;
+    return h;
+}
+
+// FNV-1a hash for null-terminated strings
+fn _hash_str(key as *u8) as i64 {
+    let is i64 as h with mut = _FNV_OFFSET;
+    let is i64 as i with mut = 0;
+    while (key[i] != 0) {
+        h = h ^ cast(i64, key[i]);
+        h = h * _FNV_PRIME;
+        i = i + 1;
+    }
+    h = h & _SIGN_MASK;
+    return h;
+}
+
+// String equality (null-terminated)
+fn _str_eq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (b[i] != 0) { return 0; }
+    return 1;
+}
+
+// =======================================================
+// MapI64 -- i64 -> i64 hash map
+// =======================================================
+
+struct MapI64 {
+    states as *u8;
+    keys as *i64;
+    values as *i64;
+    cap as i64;
+    count as i64;
+}
+
+fn mapi64_new() as MapI64 {
+    let is MapI64 as m;
+    m.cap = _INITIAL_CAP;
+    m.count = 0;
+    m.states = mem.galloc(m.cap);
+    m.keys = cast(*i64, mem.galloc(m.cap * 8));
+    m.values = cast(*i64, mem.galloc(m.cap * 8));
+    mem.memset(m.states, cast(i32, 0), m.cap);
+    return m;
+}
+
+fn mapi64_free(m as *MapI64) as void {
+    if (cast(i64, m.states) != 0) { mem.gfree(m.states); }
+    if (cast(i64, m.keys) != 0) { mem.gfree(cast(*u8, m.keys)); }
+    if (cast(i64, m.values) != 0) { mem.gfree(cast(*u8, m.values)); }
+    m.states = cast(*u8, 0);
+    m.keys = cast(*i64, 0);
+    m.values = cast(*i64, 0);
+    m.cap = 0;
+    m.count = 0;
+}
+
+// Internal: find slot for key (for get/set/delete)
+fn _mapi64_find(m as *MapI64, key as i64) as i64 {
+    let is i64 as mask = m.cap - 1;
+    let is i64 as idx with mut = (_hash_i64(key)) & mask;
+    let is i64 as first_tomb with mut = 0 - 1;
+
+    let is i64 as probes with mut = 0;
+    while (probes < m.cap) {
+        let is i64 as state = cast(i64, m.states[idx]);
+        if (state == _EMPTY) {
+            if (first_tomb >= 0) { return first_tomb; }
+            return idx;
+        }
+        if (state == _TOMBSTONE) {
+            if (first_tomb < 0) { first_tomb = idx; }
+        }
+        if (state == _OCCUPIED) {
+            if (m.keys[idx] == key) { return idx; }
+        }
+        idx = (idx + 1) & mask;
+        probes = probes + 1;
+    }
+    // Should never happen if load factor is maintained
+    if (first_tomb >= 0) { return first_tomb; }
+    return 0 - 1;
+}
+
+// Internal: grow and rehash
+fn _mapi64_grow(m as *MapI64) as void {
+    let is i64 as old_cap = m.cap;
+    let is *u8 as old_states = m.states;
+    let is *i64 as old_keys = m.keys;
+    let is *i64 as old_values = m.values;
+
+    let is i64 as new_cap = old_cap * 2;
+    m.cap = new_cap;
+    m.count = 0;
+    m.states = mem.galloc(new_cap);
+    m.keys = cast(*i64, mem.galloc(new_cap * 8));
+    m.values = cast(*i64, mem.galloc(new_cap * 8));
+    mem.memset(m.states, cast(i32, 0), new_cap);
+
+    // Reinsert all occupied entries
+    let is i64 as i with mut = 0;
+    while (i < old_cap) {
+        if (cast(i64, old_states[i]) == _OCCUPIED) {
+            mapi64_set(m, old_keys[i], old_values[i]);
+        }
+        i = i + 1;
+    }
+
+    mem.gfree(old_states);
+    mem.gfree(cast(*u8, old_keys));
+    mem.gfree(cast(*u8, old_values));
+}
+
+// Set key->value. Overwrites if key exists.
+fn mapi64_set(m as *MapI64, key as i64, value as i64) as void {
+    // Grow if load > 75%
+    if (m.count * 4 >= m.cap * 3) {
+        _mapi64_grow(m);
+    }
+
+    let is i64 as idx = _mapi64_find(m, key);
+    if (idx < 0) { return; }
+
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        // Update existing
+        m.values[idx] = value;
+    } else {
+        // Insert new
+        m.states[idx] = cast(u8, _OCCUPIED);
+        m.keys[idx] = key;
+        m.values[idx] = value;
+        m.count = m.count + 1;
+    }
+}
+
+// Get value for key. Returns default_val if not found.
+fn mapi64_get(m as *MapI64, key as i64, default_val as i64) as i64 {
+    if (m.count == 0) { return default_val; }
+    let is i64 as idx = _mapi64_find(m, key);
+    if (idx < 0) { return default_val; }
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        if (m.keys[idx] == key) {
+            return m.values[idx];
+        }
+    }
+    return default_val;
+}
+
+// Check if key exists. Returns 1 if found, 0 otherwise.
+fn mapi64_has(m as *MapI64, key as i64) as i64 {
+    if (m.count == 0) { return 0; }
+    let is i64 as idx = _mapi64_find(m, key);
+    if (idx < 0) { return 0; }
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        if (m.keys[idx] == key) { return 1; }
+    }
+    return 0;
+}
+
+// Delete key. Returns 1 if found and deleted, 0 if not found.
+fn mapi64_del(m as *MapI64, key as i64) as i64 {
+    if (m.count == 0) { return 0; }
+    let is i64 as idx = _mapi64_find(m, key);
+    if (idx < 0) { return 0; }
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        if (m.keys[idx] == key) {
+            m.states[idx] = cast(u8, _TOMBSTONE);
+            m.count = m.count - 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Number of entries
+fn mapi64_count(m as *MapI64) as i64 {
+    return m.count;
+}
+
+// Clear all entries (keep capacity)
+fn mapi64_clear(m as *MapI64) as void {
+    mem.memset(m.states, cast(i32, 0), m.cap);
+    m.count = 0;
+}
+
+// =======================================================
+// MapStr -- *u8 (null-terminated string) -> i64 hash map
+// Keys are NOT copied; caller must ensure keys outlive map.
+// =======================================================
+
+struct MapStr {
+    states as *u8;
+    keys as *u8;
+    values as *i64;
+    cap as i64;
+    count as i64;
+}
+
+fn mapstr_new() as MapStr {
+    let is MapStr as m;
+    m.cap = _INITIAL_CAP;
+    m.count = 0;
+    m.states = mem.galloc(m.cap);
+    m.keys = mem.galloc(m.cap * 8);
+    m.values = cast(*i64, mem.galloc(m.cap * 8));
+    mem.memset(m.states, cast(i32, 0), m.cap);
+    return m;
+}
+
+fn mapstr_free(m as *MapStr) as void {
+    if (cast(i64, m.states) != 0) { mem.gfree(m.states); }
+    if (cast(i64, m.keys) != 0) { mem.gfree(m.keys); }
+    if (cast(i64, m.values) != 0) { mem.gfree(cast(*u8, m.values)); }
+    m.states = cast(*u8, 0);
+    m.keys = cast(*u8, 0);
+    m.values = cast(*i64, 0);
+    m.cap = 0;
+    m.count = 0;
+}
+
+// Internal: find slot for key (for get/set/delete)
+fn _mapstr_find(m as *MapStr, key as *u8) as i64 {
+    let is i64 as mask = m.cap - 1;
+    let is i64 as idx with mut = (_hash_str(key)) & mask;
+    let is i64 as first_tomb with mut = 0 - 1;
+    let is *i64 as key_ptrs = cast(*i64, m.keys);
+
+    let is i64 as probes with mut = 0;
+    while (probes < m.cap) {
+        let is i64 as state = cast(i64, m.states[idx]);
+        if (state == _EMPTY) {
+            if (first_tomb >= 0) { return first_tomb; }
+            return idx;
+        }
+        if (state == _TOMBSTONE) {
+            if (first_tomb < 0) { first_tomb = idx; }
+        }
+        if (state == _OCCUPIED) {
+            let is *u8 as stored_key = cast(*u8, key_ptrs[idx]);
+            if (_str_eq(stored_key, key) == 1) { return idx; }
+        }
+        idx = (idx + 1) & mask;
+        probes = probes + 1;
+    }
+    // Should never happen if load factor is maintained
+    if (first_tomb >= 0) { return first_tomb; }
+    return 0 - 1;
+}
+
+// Internal: grow and rehash
+fn _mapstr_grow(m as *MapStr) as void {
+    let is i64 as old_cap = m.cap;
+    let is *u8 as old_states = m.states;
+    let is *u8 as old_keys = m.keys;
+    let is *i64 as old_values = m.values;
+
+    let is i64 as new_cap = old_cap * 2;
+    m.cap = new_cap;
+    m.count = 0;
+    m.states = mem.galloc(new_cap);
+    m.keys = mem.galloc(new_cap * 8);
+    m.values = cast(*i64, mem.galloc(new_cap * 8));
+    mem.memset(m.states, cast(i32, 0), new_cap);
+
+    // Reinsert all occupied entries
+    let is *i64 as old_key_ptrs = cast(*i64, old_keys);
+    let is i64 as i with mut = 0;
+    while (i < old_cap) {
+        if (cast(i64, old_states[i]) == _OCCUPIED) {
+            let is *u8 as k = cast(*u8, old_key_ptrs[i]);
+            mapstr_set(m, k, old_values[i]);
+        }
+        i = i + 1;
+    }
+
+    mem.gfree(old_states);
+    mem.gfree(old_keys);
+    mem.gfree(cast(*u8, old_values));
+}
+
+// Set key->value. Overwrites if key exists.
+// Key pointer is stored directly (NOT copied).
+fn mapstr_set(m as *MapStr, key as *u8, value as i64) as void {
+    // Grow if load > 75%
+    if (m.count * 4 >= m.cap * 3) {
+        _mapstr_grow(m);
+    }
+
+    let is i64 as idx = _mapstr_find(m, key);
+    if (idx < 0) { return; }
+
+    let is *i64 as key_ptrs = cast(*i64, m.keys);
+
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        // Update existing
+        m.values[idx] = value;
+    } else {
+        // Insert new
+        m.states[idx] = cast(u8, _OCCUPIED);
+        key_ptrs[idx] = cast(i64, key);
+        m.values[idx] = value;
+        m.count = m.count + 1;
+    }
+}
+
+// Get value for key. Returns default_val if not found.
+fn mapstr_get(m as *MapStr, key as *u8, default_val as i64) as i64 {
+    if (m.count == 0) { return default_val; }
+    let is i64 as idx = _mapstr_find(m, key);
+    if (idx < 0) { return default_val; }
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        let is *i64 as key_ptrs = cast(*i64, m.keys);
+        let is *u8 as stored_key = cast(*u8, key_ptrs[idx]);
+        if (_str_eq(stored_key, key) == 1) {
+            return m.values[idx];
+        }
+    }
+    return default_val;
+}
+
+// Check if key exists. Returns 1 if found, 0 otherwise.
+fn mapstr_has(m as *MapStr, key as *u8) as i64 {
+    if (m.count == 0) { return 0; }
+    let is i64 as idx = _mapstr_find(m, key);
+    if (idx < 0) { return 0; }
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        let is *i64 as key_ptrs = cast(*i64, m.keys);
+        let is *u8 as stored_key = cast(*u8, key_ptrs[idx]);
+        if (_str_eq(stored_key, key) == 1) { return 1; }
+    }
+    return 0;
+}
+
+// Delete key. Returns 1 if found and deleted, 0 if not found.
+fn mapstr_del(m as *MapStr, key as *u8) as i64 {
+    if (m.count == 0) { return 0; }
+    let is i64 as idx = _mapstr_find(m, key);
+    if (idx < 0) { return 0; }
+    if (cast(i64, m.states[idx]) == _OCCUPIED) {
+        let is *i64 as key_ptrs = cast(*i64, m.keys);
+        let is *u8 as stored_key = cast(*u8, key_ptrs[idx]);
+        if (_str_eq(stored_key, key) == 1) {
+            m.states[idx] = cast(u8, _TOMBSTONE);
+            m.count = m.count - 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Number of entries
+fn mapstr_count(m as *MapStr) as i64 {
+    return m.count;
+}
+
+// Clear all entries (keep capacity)
+fn mapstr_clear(m as *MapStr) as void {
+    mem.memset(m.states, cast(i32, 0), m.cap);
+    m.count = 0;
+}
