@@ -152,6 +152,13 @@ fn write_str(fd as i64, s as *u8) as void {
 
 fn write_int(fd as i64, n as i64) as void {
     if (n == 0) { linux.write(fd, "0", 1); return; }
+
+    // Special case INT64_MIN
+    if (n == (0 - 9223372036854775807 - 1)) {
+        linux.write(fd, "-9223372036854775808", 20);
+        return;
+    }
+
     let is [24]u8 as buf;
     let is i64 as val with mut = n;
     let is i64 as neg with mut = 0;
@@ -193,26 +200,22 @@ fn read_exact(fd as i64, buf as *u8, count as i64) as i64 {
 // --- Formatted Output Helpers ---
 
 fn print_hex(n as i64) as void {
-    let is *u8 as hex = "0123456789ABCDEF";
-    let is *u8 as buf = mem.galloc(19); // 0x + 16 digits + null
-    
-    buf[0] = 48; // '0'
+    let is *u8 as hex = "0123456789abcdef";
+    let is [18]u8 as buf;
+
+    buf[0] = 48;  // '0'
     buf[1] = 120; // 'x'
-    
-    let is i64 as i with mut = 0;
+
     let is i64 as val with mut = n;
-    
-    while (i < 16) {
-        let is i64 as digit = val % 16; // val & 15
-        // 17 - i because we fill backwards from end
-        // buf[2..17]
-        buf[17 - i] = hex[digit];
-        val = val / 16; // val >> 4
-        i = i + 1;
+    let is i32 as i with mut = 15;
+
+    while (i >= 0) {
+        buf[2 + i] = hex[val & 15];
+        val = val >> 4;
+        i = i - 1;
     }
-    
-    linux.write(linux.STDOUT, buf, 18);
-    mem.gfree(buf);
+
+    linux.write(linux.STDOUT, &buf, 18);
 }
 
 fn print_bool(b as i32) as void {
@@ -238,10 +241,24 @@ struct VaList {
     reg_save_area as *u8;
 }
 
+fn print_uint(n as u64) as void {
+    if (n == 0) { linux.write(linux.STDOUT, "0", 1); return; }
+    let is [20]u8 as buf;
+    let is u64 as val with mut = n;
+    let is i32 as pos with mut = 19;
+    while (val > 0) {
+        buf[pos] = cast(u8, cast(i64, val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    let is i64 as start = cast(i64, pos) + 1;
+    linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + start), 20 - start);
+}
+
 fn printf(fmt as *u8, ...) as void {
     let is VaList as va;
     __builtin_va_start(&va);
-    
+
     let is i64 as i with mut = 0;
 
     while (fmt[i] != 0) {
@@ -252,10 +269,10 @@ fn printf(fmt as *u8, ...) as void {
             if (fmt[i] == 37) { // '%%'
                 let is u8 as c = 37;
                 linux.write(linux.STDOUT, &c, 1);
-            } else {
-                // Fetch argument only if not %%
-            let is *i64 as arg_ptr with mut = cast(*i64, 0);
-            if (va.gp_offset < 48) {
+            } else if (fmt[i] == 100 || fmt[i] == 117 || fmt[i] == 115 || fmt[i] == 83 || fmt[i] == 120 || fmt[i] == 99 || fmt[i] == 112) {
+                // Known formats that consume an arg — fetch it
+                let is *i64 as arg_ptr with mut = cast(*i64, 0);
+                if (va.gp_offset < 48) {
                     arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
                     va.gp_offset = va.gp_offset + 8;
                 } else {
@@ -263,32 +280,31 @@ fn printf(fmt as *u8, ...) as void {
                     va.overflow_arg_area = va.overflow_arg_area + 8;
                 }
 
-                if (fmt[i] == 100) { // 'd' (decimal i64)
-                    let is i64 as val = *arg_ptr;
-                    print_int(val);
-                } else if (fmt[i] == 115) { // 's' (string - *u8)
+                if (fmt[i] == 100) { // 'd'
+                    print_int(*arg_ptr);
+                } else if (fmt[i] == 117) { // 'u'
+                    print_uint(cast(u64, *arg_ptr));
+                } else if (fmt[i] == 115) { // 's'
                     let is *u8 as val = cast(*u8, *arg_ptr);
-                    
-                    // Print C-string
-                    let is i64 as len with mut = 0;
-                    while (val[len] != 0) { len = len + 1; }
-                    linux.write(linux.STDOUT, val, len);
-                } else if (fmt[i] == 83) { // 'S' (Caustic String)
-                    let is *string.String as s_ptr = cast(*string.String, *arg_ptr); 
+                    let is i64 as slen with mut = 0;
+                    while (val[slen] != 0) { slen = slen + 1; }
+                    linux.write(linux.STDOUT, val, slen);
+                } else if (fmt[i] == 83) { // 'S'
+                    let is *string.String as s_ptr = cast(*string.String, *arg_ptr);
                     linux.write(linux.STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
-                } else if (fmt[i] == 120) { // 'x' (hex i64)
-                    let is i64 as val = *arg_ptr;
-                    print_hex(val);
-                } else if (fmt[i] == 99) { // 'c' (char)
-                    let is i64 as val = *arg_ptr; 
-                    let is u8 as c = cast(u8, val);
-                    linux.write(linux.STDOUT, &c, 1);
-                } else {
-                    // Unknown format
-                    let is u8 as c = 37;
-                    linux.write(linux.STDOUT, &c, 1);
-                    linux.write(linux.STDOUT, &fmt[i], 1);
+                } else if (fmt[i] == 120) { // 'x'
+                    print_hex(*arg_ptr);
+                } else if (fmt[i] == 99) { // 'c'
+                    let is u8 as ch = cast(u8, *arg_ptr);
+                    linux.write(linux.STDOUT, &ch, 1);
+                } else if (fmt[i] == 112) { // 'p'
+                    print_hex(*arg_ptr);
                 }
+            } else {
+                // Unknown format — print literal, do NOT consume arg
+                let is u8 as pct = 37;
+                linux.write(linux.STDOUT, &pct, 1);
+                linux.write(linux.STDOUT, &fmt[i], 1);
             }
         } else {
             linux.write(linux.STDOUT, &fmt[i], 1);
@@ -362,20 +378,30 @@ fn read_line() as string.String {
 
 fn read_file(path as string.String) as string.String {
     let is i64 as fd = linux.open(path.ptr, linux.O_RDONLY, 0);
-    if (fd < 0) { 
-        return string.String(""); 
+    if (fd < 0) {
+        return string.String("");
     }
 
     let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
     linux.lseek(fd, 0, linux.SEEK_SET);
 
     let is string.String as s;
+
+    // Guard: String.len/cap are i32, max ~2GB
+    if (size > 2147483647) {
+        linux.close(fd);
+        s.ptr = cast(*u8, 0);
+        s.len = 0;
+        s.cap = 0;
+        return s;
+    }
+
     s.len = cast(i32, size);
     s.cap = cast(i32, size);
-    
+
     if (size > 0) {
         s.ptr = cast(*u8, mem.galloc(size + 1));
-        linux.read(fd, s.ptr, size);
+        read_exact(fd, s.ptr, size);
         s.ptr[size] = cast(u8, 0);
     } else {
         s.ptr = cast(*u8, 0);
@@ -386,7 +412,8 @@ fn read_file(path as string.String) as string.String {
 }
 
 fn write_file(path as string.String, content as string.String) as i64 {
-    let is i64 as fd = linux.open(path.ptr, 577, 420);
+    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC;
+    let is i64 as fd = linux.open(path.ptr, flags, 420);
     if (fd < 0) { return fd; }
     let is i64 as res = linux.write(fd, content.ptr, cast(i64, content.len));
     linux.close(fd);
@@ -394,7 +421,8 @@ fn write_file(path as string.String, content as string.String) as i64 {
 }
 
 fn append_file(path as string.String, content as string.String) as i64 {
-    let is i64 as fd = linux.open(path.ptr, 1089, 420);
+    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_APPEND;
+    let is i64 as fd = linux.open(path.ptr, flags, 420);
     if (fd < 0) { return fd; }
     let is i64 as res = linux.write(fd, content.ptr, cast(i64, content.len));
     linux.close(fd);
