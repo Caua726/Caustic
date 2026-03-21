@@ -664,3 +664,132 @@ fn read_file_in(h as *mem.Heap, path as *u8) as string.String {
     linux.close(fd);
     return s;
 }
+
+// --- Directory Operations ---
+
+// dirent64 field offsets (packed linux_dirent64):
+//   d_ino:    offset 0,  size 8 (i64)
+//   d_off:    offset 8,  size 8 (i64)
+//   d_reclen: offset 16, size 2 (u16)
+//   d_type:   offset 18, size 1 (u8)
+//   d_name:   offset 19, variable length (null-terminated)
+
+// File type constants (d_type)
+let is u8 as DT_UNKNOWN with imut = 0;
+let is u8 as DT_FIFO    with imut = 1;
+let is u8 as DT_CHR     with imut = 2;
+let is u8 as DT_DIR     with imut = 4;
+let is u8 as DT_BLK     with imut = 6;
+let is u8 as DT_REG     with imut = 8;
+let is u8 as DT_LNK     with imut = 10;
+let is u8 as DT_SOCK    with imut = 12;
+
+struct DirEntry {
+    name_ptr as *u8;
+    name_len as i64;
+    file_type as i64;
+}
+
+// List directory entries.
+// Fills entries array. Names are copied to heap (caller must free name_ptr).
+// Skips "." and ".." automatically.
+// Returns number of entries found, or -1 on error.
+fn list_dir(path as *u8, entries as *DirEntry, max_entries as i32) as i32 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
+    if (fd < 0) { return cast(i32, 0 - 1); }
+
+    let is [4096]u8 as buf;
+    let is i32 as count with mut = 0;
+
+    while (1 == 1) {
+        let is i64 as nread = linux.getdents64(fd, &buf, 4096);
+        if (nread <= 0) { break; }
+
+        let is i64 as pos with mut = 0;
+        while (pos < nread) {
+            let is *u8 as entry_ptr = cast(*u8, cast(i64, &buf) + pos);
+
+            // d_reclen at offset 16 (2 bytes, little-endian)
+            let is *u8 as reclen_ptr = cast(*u8, cast(i64, entry_ptr) + 16);
+            let is i64 as reclen = cast(i64, reclen_ptr[0]) + cast(i64, reclen_ptr[1]) * 256;
+
+            // d_type at offset 18
+            let is u8 as dtype = entry_ptr[18];
+
+            // d_name at offset 19
+            let is *u8 as name = cast(*u8, cast(i64, entry_ptr) + 19);
+
+            // Skip "." and ".."
+            let is i64 as skip with mut = 0;
+            if (name[0] == 46 && name[1] == 0) { skip = 1; }
+            if (name[0] == 46 && name[1] == 46 && name[2] == 0) { skip = 1; }
+
+            if (skip == 0 && count < max_entries) {
+                let is i32 as nlen with mut = 0;
+                while (name[nlen] != 0) {
+                    nlen = nlen + 1;
+                }
+
+                // Copy name to heap so it survives buffer reuse
+                let is *u8 as name_copy = mem.galloc(cast(i64, nlen) + 1);
+                mem.memcpy(name_copy, name, cast(i64, nlen));
+                name_copy[nlen] = 0;
+
+                entries[count].name_ptr = name_copy;
+                entries[count].name_len = cast(i64, nlen);
+                entries[count].file_type = cast(i64, dtype);
+                count = count + 1;
+            }
+
+            pos = pos + reclen;
+        }
+    }
+
+    linux.close(fd);
+    return count;
+}
+
+// Count entries in a directory (excluding . and ..)
+fn count_dir_entries(path as *u8) as i32 {
+    let is [4096]u8 as buf;
+    let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
+    if (fd < 0) { return cast(i32, 0 - 1); }
+
+    let is i32 as count with mut = 0;
+
+    while (1 == 1) {
+        let is i64 as nread = linux.getdents64(fd, &buf, 4096);
+        if (nread <= 0) { break; }
+
+        let is i64 as pos with mut = 0;
+        while (pos < nread) {
+            let is *u8 as entry_ptr = cast(*u8, cast(i64, &buf) + pos);
+            let is *u8 as reclen_ptr = cast(*u8, cast(i64, entry_ptr) + 16);
+            let is i64 as reclen = cast(i64, reclen_ptr[0]) + cast(i64, reclen_ptr[1]) * 256;
+
+            let is *u8 as name = cast(*u8, cast(i64, entry_ptr) + 19);
+            let is i64 as skip with mut = 0;
+            if (name[0] == 46 && name[1] == 0) { skip = 1; }
+            if (name[0] == 46 && name[1] == 46 && name[2] == 0) { skip = 1; }
+            if (skip == 0) { count = count + 1; }
+
+            pos = pos + reclen;
+        }
+    }
+
+    linux.close(fd);
+    return count;
+}
+
+// Check if path is a directory
+fn is_dir(path as *u8) as i32 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
+    if (fd < 0) { return 0; }
+    linux.close(fd);
+    return 1;
+}
+
+// Get current working directory
+fn get_cwd(buf as *u8, size as i64) as i64 {
+    return linux.getcwd(buf, size);
+}
