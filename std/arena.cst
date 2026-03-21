@@ -1,0 +1,129 @@
+// =======================================================
+// std/arena.cst
+// Bump allocator — fast O(1) alloc, free all at once
+// No individual free. Reset or destroy to reclaim memory.
+// =======================================================
+
+use "linux.cst" as linux;
+
+struct Arena {
+    base as *u8;
+    top as *u8;
+    limit as *u8;
+    size as i64;
+}
+
+// Create a new arena with the given size (bytes)
+fn create(size as i64) as Arena {
+    let is i64 as minus_one = 0 - 1;
+    let is i64 as prot = linux.PROT_READ + linux.PROT_WRITE;
+    let is i64 as flags = linux.MAP_PRIVATE + linux.MAP_ANONYMOUS;
+    let is *u8 as ptr = linux.mmap(cast(*u8, 0), size, prot, flags, minus_one, 0);
+
+    let is Arena as a;
+    if (cast(i64, ptr) == linux.MAP_FAILED) {
+        a.base = cast(*u8, 0);
+        a.top = cast(*u8, 0);
+        a.limit = cast(*u8, 0);
+        a.size = 0;
+        return a;
+    }
+
+    a.base = ptr;
+    a.top = ptr;
+    a.limit = cast(*u8, cast(i64, ptr) + size);
+    a.size = size;
+    return a;
+}
+
+// Destroy the arena, munmap all memory
+fn destroy(a as *Arena) as void {
+    if (cast(i64, a.base) != 0) {
+        linux.munmap(a.base, a.size);
+        a.base = cast(*u8, 0);
+        a.top = cast(*u8, 0);
+        a.limit = cast(*u8, 0);
+        a.size = 0;
+    }
+}
+
+// Reset the arena — all previous allocations become invalid
+fn reset(a as *Arena) as void {
+    a.top = a.base;
+}
+
+// Allocate n bytes (8-byte aligned). Returns null if arena is full.
+fn alloc(a as *Arena, n as i64) as *u8 {
+    // Align to 8 bytes
+    let is i64 as aligned = (n + 7) & (0 - 8);
+    if (aligned < 8) { aligned = 8; }
+
+    let is i64 as current = cast(i64, a.top);
+    let is i64 as end = current + aligned;
+
+    if (end > cast(i64, a.limit)) {
+        return cast(*u8, 0);
+    }
+
+    a.top = cast(*u8, end);
+    return cast(*u8, current);
+}
+
+// How many bytes are currently allocated
+fn used(a as *Arena) as i64 {
+    return cast(i64, a.top) - cast(i64, a.base);
+}
+
+// How many bytes are still available
+fn remaining(a as *Arena) as i64 {
+    return cast(i64, a.limit) - cast(i64, a.top);
+}
+
+// Total capacity
+fn capacity(a as *Arena) as i64 {
+    return a.size;
+}
+
+// Allocate and copy a null-terminated string into the arena
+fn alloc_str(a as *Arena, s as *u8) as *u8 {
+    let is i64 as len with mut = 0;
+    while (s[len] != 0) { len = len + 1; }
+
+    let is *u8 as ptr = alloc(a, len + 1);
+    if (cast(i64, ptr) == 0) { return cast(*u8, 0); }
+
+    let is i64 as i with mut = 0;
+    while (i <= len) {
+        ptr[i] = s[i];
+        i = i + 1;
+    }
+    return ptr;
+}
+
+// Allocate n bytes and zero them
+fn alloc_zero(a as *Arena, n as i64) as *u8 {
+    let is *u8 as ptr = alloc(a, n);
+    if (cast(i64, ptr) == 0) { return cast(*u8, 0); }
+
+    let is i64 as i with mut = 0;
+    let is i64 as aligned = (n + 7) & (0 - 8);
+    if (aligned < 8) { aligned = 8; }
+    while (i < aligned) {
+        ptr[i] = 0;
+        i = i + 1;
+    }
+    return ptr;
+}
+
+// Save current position for later restore
+fn save(a as *Arena) as *u8 {
+    return a.top;
+}
+
+// Restore to a previously saved position (partial reset)
+fn restore(a as *Arena, pos as *u8) as void {
+    // Only restore if pos is within the arena
+    if (cast(i64, pos) >= cast(i64, a.base) && cast(i64, pos) <= cast(i64, a.limit)) {
+        a.top = pos;
+    }
+}
