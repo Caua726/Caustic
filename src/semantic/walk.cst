@@ -522,7 +522,30 @@ fn walk_fncall(node as *ast.Node) as void {
     else if (node.lhs.kind == ast.NK_MEMBER) {
         let is *ast.Node as lhs_expr = node.lhs.lhs;
 
-        if (lhs_expr.kind == ast.NK_IDENT) {
+        // Chained module access: mod.submod.func()
+        if (lhs_expr.kind == ast.NK_MEMBER && lhs_expr.lhs.kind == ast.NK_IDENT) {
+            let is *d.Variable as pvar = sc.lookup_var(lhs_expr.lhs.name_ptr, lhs_expr.lhs.name_len);
+            if (cast(i64, pvar) != 0 && pvar.is_module == 1) {
+                let is *d.Module as pmod = cast(*d.Module, pvar.module_ref);
+                let is i32 as found_sub with mut = 0;
+                let is *d.SubModule as sm with mut = cast(*d.SubModule, pmod.submodules);
+                while (cast(i64, sm) != 0 && found_sub == 0) {
+                    if (d.str_eq(sm.alias_ptr, sm.alias_len, lhs_expr.member_ptr, lhs_expr.member_len) == 1) {
+                        found_sub = 1;
+                        let is *d.Module as sub_mod = cast(*d.Module, sm.module_ref);
+                        func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, sub_mod.prefix_ptr, sub_mod.prefix_len);
+                        if (cast(i64, func) == 0) {
+                            sc.sem_error_at(node, "funcao nao encontrada no submodulo");
+                        }
+                    }
+                    sm = cast(*d.SubModule, sm.next);
+                }
+                if (found_sub == 0) {
+                    sc.sem_error_at(node, "submodulo nao encontrado");
+                }
+            }
+        }
+        else if (lhs_expr.kind == ast.NK_IDENT) {
             let is *d.Variable as var = sc.lookup_var(lhs_expr.name_ptr, lhs_expr.name_len);
 
             if (cast(i64, var) != 0 && var.is_module == 1) {
@@ -824,6 +847,50 @@ fn walk_member(node as *ast.Node) as void {
         }
     }
 
+    // Chained module variable access: mod.submod.VAR
+    if (node.lhs.kind == ast.NK_MEMBER && node.lhs.lhs.kind == ast.NK_IDENT) {
+        let is *d.Variable as pvar = sc.lookup_var(node.lhs.lhs.name_ptr, node.lhs.lhs.name_len);
+        if (cast(i64, pvar) != 0 && pvar.is_module == 1) {
+            let is *d.Module as pmod = cast(*d.Module, pvar.module_ref);
+            let is i32 as found_sub with mut = 0;
+            let is *d.SubModule as sm with mut = cast(*d.SubModule, pmod.submodules);
+            while (cast(i64, sm) != 0 && found_sub == 0) {
+                if (d.str_eq(sm.alias_ptr, sm.alias_len, node.lhs.member_ptr, node.lhs.member_len) == 1) {
+                    found_sub = 1;
+                    let is *d.Module as sub_mod = cast(*d.Module, sm.module_ref);
+                    // Try variable in submodule scope
+                    let is *d.Variable as sv with mut = sub_mod.scope.vars;
+                    while (cast(i64, sv) != 0) {
+                        if (d.str_eq(sv.name_ptr, sv.name_len, node.member_ptr, node.member_len) == 1) {
+                            node.kind = ast.NK_IDENT;
+                            node.name_ptr = sv.asm_name_ptr;
+                            node.name_len = sv.asm_name_len;
+                            node.ty = cast(*ast.Type, sv.ty);
+                            node.var_offset = sv.offset;
+                            node.is_global = sv.is_global;
+                            return;
+                        }
+                        sv = sv.next;
+                    }
+                    // Try function ref in submodule
+                    let is *d.Function as sfn = sc.lookup_fn_qualified(node.member_ptr, node.member_len, sub_mod.prefix_ptr, sub_mod.prefix_len);
+                    if (cast(i64, sfn) != 0) {
+                        node.kind = ast.NK_IDENT;
+                        node.name_ptr = sfn.asm_name_ptr;
+                        node.name_len = sfn.asm_name_len;
+                        node.ty = cast(*ast.Type, sfn.return_type);
+                        return;
+                    }
+                    sc.sem_error_at(node, "membro nao encontrado no submodulo");
+                }
+                sm = cast(*d.SubModule, sm.next);
+            }
+            if (found_sub == 0) {
+                sc.sem_error_at(node, "submodulo nao encontrado");
+            }
+        }
+    }
+
     // Check if LHS is a module
     if (node.lhs.kind == ast.NK_IDENT) {
         let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
@@ -936,6 +1003,22 @@ fn walk_fn_ptr_node(node as *ast.Node) as void {
 // Pass IDs: 1=register_structs, 2=register_aliases, 3=resolve_fields,
 //           4=register_vars, 5=register_fns, 6=analyze_bodies
 
+// Only-filter state for submodule building
+let is *u8 as current_only_names with mut;
+let is i32 as current_only_count with mut = 0;
+
+fn is_in_only_list(name_ptr as *u8, name_len as i32, only_names as *u8, only_count as i32) as i32 {
+    if (only_count == 0) { return 1; }
+    let is i32 as i with mut = 0;
+    while (i < only_count) {
+        let is *i64 as pp = cast(*i64, cast(i64, only_names) + cast(i64, i) * 12);
+        let is *i32 as lp = cast(*i32, cast(i64, only_names) + cast(i64, i) * 12 + 8);
+        if (d.str_eq(name_ptr, name_len, cast(*u8, *pp), *lp) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
     let is i32 as raw_len with mut = 0;
     let is *u8 as raw_path with mut = cast(*u8, 0);
@@ -982,6 +1065,40 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
                 mod.module_list = mm;
             }
             register_structs(body);
+            // Build submodule list from nested use statements
+            let is *d.Module as parent_mm = mod.find_module(prefix, plen);
+            if (cast(i64, parent_mm) != 0) {
+                let is *u8 as prev_only = current_only_names;
+                let is i32 as prev_oc = current_only_count;
+                current_only_names = n.only_names;
+                current_only_count = n.only_count;
+                let is *ast.Node as child with mut = cast(*ast.Node, body);
+                while (cast(i64, child) != 0) {
+                    if (child.kind == ast.NK_USE && child.member_len > 0) {
+                        if (is_in_only_list(child.member_ptr, child.member_len, current_only_names, current_only_count) == 1) {
+                            let is i32 as crl with mut = 0;
+                            let is *u8 as crp = mod.strip_quotes(child.name_ptr, child.name_len, &crl);
+                            let is i32 as cnl with mut = 0;
+                            let is *u8 as cn = sc.resolve_module_path(crp, crl, &cnl);
+                            let is *u8 as cp = sc.get_mod_prefix(cn, cnl);
+                            let is i32 as cpl = sc.get_mod_prefix_len(cn, cnl);
+                            let is *d.Module as cm = mod.find_module(cp, cpl);
+                            if (cast(i64, cm) != 0) {
+                                let is *d.SubModule as sm = d.new_submodule();
+                                sm.alias_ptr = d.str_dup(child.member_ptr, child.member_len);
+                                sm.alias_len = child.member_len;
+                                sm.module_ref = cast(*u8, cm);
+                                sm.next = parent_mm.submodules;
+                                parent_mm.submodules = cast(*u8, sm);
+                                parent_mm.submodule_count = parent_mm.submodule_count + 1;
+                            }
+                        }
+                    }
+                    child = child.next;
+                }
+                current_only_names = prev_only;
+                current_only_count = prev_oc;
+            }
         } else {
             n.body = cast(*ast.Node, cached.body);
             sc.current_source_dir_ptr = cached.source_dir_ptr;
