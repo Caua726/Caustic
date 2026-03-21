@@ -5,290 +5,8 @@ use "../parser/ast.cst" as ast;
 use "../ir/defs.cst" as d;
 use "alloc_core.cst" as al;
 use "alloc_gc.cst" as gc;
+use "emit_output.cst" as eo;
 
-// === Output buffer ===
-let is *u8 as out_buf with mut;
-let is i64 as out_len with mut;
-let is i64 as out_cap with mut;
-let is i32 as out_fd with mut;
-
-// === Debug info ===
-let is *u8 as cg_filename with mut;
-let is i32 as cg_filename_len with mut;
-
-// === Simple peephole for -O0: skip redundant reload after store ===
-let is i32 as ph_vreg with mut = 99999;
-let is i32 as ph_ridx with mut = 99999;
-
-// === Register cache: track which phys reg holds which spilled vreg ===
-// rc_vreg[reg_idx] = vreg currently cached in that register (99999 = empty)
-// Only tracks SPILLED vregs (register-allocated vregs don't need caching).
-let is [16]i32 as rc_vreg with mut;
-
-fn rc_init() as void {
-    let is i32 as i with mut = 0;
-    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
-}
-
-fn ph_invalidate() as void {
-    let is i32 as i with mut = 0;
-    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
-}
-
-// Invalidate a specific register (e.g., when it's overwritten)
-fn rc_invalidate_reg(idx as i32) as void {
-    if (idx >= 0 && idx < 16) { rc_vreg[idx] = 99999; }
-}
-
-// Record that phys reg idx now holds spilled vreg
-fn rc_set(idx as i32, vreg as i32) as void {
-    if (idx >= 0 && idx < 16) { rc_vreg[idx] = vreg; }
-}
-
-// Find which register holds a given vreg. Returns reg idx or -1.
-fn rc_find(vreg as i32) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < 16) {
-        if (rc_vreg[i] == vreg) { return i; }
-        i = i + 1;
-    }
-    return cast(i32, 0 - 1);
-}
-
-// Invalidate all entries for a vreg (when it's redefined)
-fn rc_invalidate_vreg(vreg as i32) as void {
-    let is i32 as i with mut = 0;
-    while (i < 16) {
-        if (rc_vreg[i] == vreg) { rc_vreg[i] = 99999; }
-        i = i + 1;
-    }
-}
-
-fn reg_name_to_idx(name as *u8) as i32 {
-    if (name[0] == 114) {
-        // r...
-        if (name[1] == 97) { return 0; } // rax
-        if (name[1] == 99) { return 1; } // rcx
-        if (name[1] == 100 && name[2] == 105) { return 5; } // rdi (check before rdx!)
-        if (name[1] == 100) { return 2; } // rdx
-        if (name[1] == 98) { return 3; } // rbx
-        if (name[1] == 115) { return 4; } // rsi
-        if (name[1] == 49 && name[2] == 53) { return 15; } // r15
-        if (name[1] == 49 && name[2] == 52) { return 12; } // r14 → idx 12
-        if (name[1] == 49 && name[2] == 51) { return 11; } // r13 → idx 11
-        if (name[1] == 49 && name[2] == 50) { return 10; } // r12 → idx 10
-        if (name[1] == 49 && name[2] == 49) { return 9; } // r11 → idx 9
-        if (name[1] == 49 && name[2] == 48) { return 8; } // r10 → idx 8
-        if (name[1] == 56) { return 6; }  // r8 → idx 6
-        if (name[1] == 57) { return 7; }  // r9 → idx 7
-    }
-    return 99999;
-}
-
-// === Per-function profiling ===
-// Each entry: name_ptr(8) + name_len(4) + vregs(4) + time_us(8) = 24 bytes
-let is i64 as cg_prof_buf with mut = 0;   // ptr to buffer
-let is i32 as cg_prof_count with mut = 0;
-let is i32 as cg_prof_max with mut = 0;
-let is i32 as cg_prof_enabled with mut = 0;
-
-fn cg_prof_init(max_entries as i32) as void {
-    cg_prof_buf = cast(i64, mem.galloc(cast(i64, max_entries) * 24));
-    cg_prof_count = 0;
-    cg_prof_max = max_entries;
-    cg_prof_enabled = 1;
-}
-
-fn cg_prof_get_time_us() as i64 {
-    let is [2]i64 as ts;
-    syscall(228, 1, &ts);
-    return ts[0] * 1000000 + ts[1] / 1000;
-}
-
-fn cg_prof_record(name_ptr as *u8, name_len as i32, vregs as i32, time_us as i64) as void {
-    if (cg_prof_count >= cg_prof_max) { return; }
-    let is i64 as off = cast(i64, cg_prof_count) * 24;
-    let is *i64 as p0 = cast(*i64, cg_prof_buf + off);
-    *p0 = cast(i64, name_ptr);
-    let is *i32 as p1 = cast(*i32, cg_prof_buf + off + 8);
-    *p1 = name_len;
-    let is *i32 as p2 = cast(*i32, cg_prof_buf + off + 12);
-    *p2 = vregs;
-    let is *i64 as p3 = cast(*i64, cg_prof_buf + off + 16);
-    *p3 = time_us;
-    cg_prof_count = cg_prof_count + 1;
-}
-
-fn out_init(fd as i32) as void {
-    out_cap = 4194304; // 4MB
-    out_buf = mem.galloc(out_cap);
-    out_len = 0;
-    out_fd = fd;
-}
-
-fn out_flush() as void {
-    if (out_len > 0) {
-        linux.write(cast(i64, out_fd), out_buf, out_len);
-        out_len = 0;
-    }
-}
-
-fn out_ensure(n as i64) as void {
-    if (out_len + n >= out_cap) {
-        out_flush();
-    }
-}
-
-fn out_char(c as u8) as void {
-    out_ensure(1);
-    out_buf[out_len] = c;
-    out_len = out_len + 1;
-}
-
-fn out_str(s as *u8, n as i32) as void {
-    out_ensure(cast(i64, n));
-    mem.memcpy(cast(*u8, cast(i64, out_buf) + out_len), s, cast(i64, n));
-    out_len = out_len + cast(i64, n);
-}
-
-fn out_cstr(s as *u8) as void {
-    let is i32 as i with mut = 0;
-    while (s[i] != 0) { i = i + 1; }
-    out_str(s, i);
-}
-
-fn out_int(n as i64) as void {
-    if (n == 0) { out_char(48); return; }
-    let is i64 as val with mut = n;
-    let is i32 as neg with mut = 0;
-    if (val < 0) { neg = 1; val = 0 - val; }
-    let is [24]u8 as buf;
-    let is i32 as pos with mut = 23;
-    while (val > 0) {
-        buf[pos] = cast(u8, (val % 10) + 48);
-        val = val / 10;
-        pos = pos - 1;
-    }
-    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
-    out_str(cast(*u8, cast(i64, &buf) + cast(i64, pos) + 1), 23 - pos);
-}
-
-fn out_line(s as *u8) as void {
-    out_cstr("  ");
-    out_cstr(s);
-    out_char(10);
-}
-
-fn out_line2(a as *u8, b as *u8) as void {
-    out_cstr("  ");
-    out_cstr(a);
-    out_cstr(b);
-    out_char(10);
-}
-
-fn out_line3(a as *u8, b as *u8, c as *u8) as void {
-    out_cstr("  ");
-    out_cstr(a);
-    out_cstr(b);
-    out_cstr(c);
-    out_char(10);
-}
-
-// === Register name tables ===
-// regs[0..11] = rax,rcx,rdx,rbx,rsi,rdi,r8,r9,r10,r11,r12,r13
-
-fn reg64(idx as i32) as *u8 {
-    if (idx == 0) { return "rax"; }
-    if (idx == 1) { return "rcx"; }
-    if (idx == 2) { return "rdx"; }
-    if (idx == 3) { return "rbx"; }
-    if (idx == 4) { return "rsi"; }
-    if (idx == 5) { return "rdi"; }
-    if (idx == 6) { return "r8"; }
-    if (idx == 7) { return "r9"; }
-    if (idx == 8) { return "r10"; }
-    if (idx == 9) { return "r11"; }
-    if (idx == 10) { return "r12"; }
-    if (idx == 11) { return "r13"; }
-    if (idx == 12) { return "r14"; }
-    if (idx == 15) { return "r15"; }
-    return "rax";
-}
-
-fn reg32(idx as i32) as *u8 {
-    if (idx == 0) { return "eax"; }
-    if (idx == 1) { return "ecx"; }
-    if (idx == 2) { return "edx"; }
-    if (idx == 3) { return "ebx"; }
-    if (idx == 4) { return "esi"; }
-    if (idx == 5) { return "edi"; }
-    if (idx == 6) { return "r8d"; }
-    if (idx == 7) { return "r9d"; }
-    if (idx == 8) { return "r10d"; }
-    if (idx == 9) { return "r11d"; }
-    if (idx == 10) { return "r12d"; }
-    if (idx == 11) { return "r13d"; }
-    if (idx == 12) { return "r14d"; }
-    if (idx == 15) { return "r15d"; }
-    return "eax";
-}
-
-fn reg16(idx as i32) as *u8 {
-    if (idx == 0) { return "ax"; }
-    if (idx == 1) { return "cx"; }
-    if (idx == 2) { return "dx"; }
-    if (idx == 3) { return "bx"; }
-    if (idx == 4) { return "si"; }
-    if (idx == 5) { return "di"; }
-    if (idx == 6) { return "r8w"; }
-    if (idx == 7) { return "r9w"; }
-    if (idx == 8) { return "r10w"; }
-    if (idx == 9) { return "r11w"; }
-    if (idx == 10) { return "r12w"; }
-    if (idx == 11) { return "r13w"; }
-    if (idx == 12) { return "r14w"; }
-    if (idx == 15) { return "r15w"; }
-    return "ax";
-}
-
-fn reg8(idx as i32) as *u8 {
-    if (idx == 0) { return "al"; }
-    if (idx == 1) { return "cl"; }
-    if (idx == 2) { return "dl"; }
-    if (idx == 3) { return "bl"; }
-    if (idx == 4) { return "sil"; }
-    if (idx == 5) { return "dil"; }
-    if (idx == 6) { return "r8b"; }
-    if (idx == 7) { return "r9b"; }
-    if (idx == 8) { return "r10b"; }
-    if (idx == 9) { return "r11b"; }
-    if (idx == 10) { return "r12b"; }
-    if (idx == 11) { return "r13b"; }
-    if (idx == 12) { return "r14b"; }
-    if (idx == 15) { return "r15b"; }
-    return "al";
-}
-
-fn arg_reg64(idx as i32) as *u8 {
-    if (idx == 0) { return "rdi"; }
-    if (idx == 1) { return "rsi"; }
-    if (idx == 2) { return "rdx"; }
-    if (idx == 3) { return "rcx"; }
-    if (idx == 4) { return "r8"; }
-    if (idx == 5) { return "r9"; }
-    return "rax";
-}
-
-fn syscall_reg(idx as i32) as *u8 {
-    if (idx == 0) { return "rax"; }
-    if (idx == 1) { return "rdi"; }
-    if (idx == 2) { return "rsi"; }
-    if (idx == 3) { return "rdx"; }
-    if (idx == 4) { return "r10"; }
-    if (idx == 5) { return "r8"; }
-    if (idx == 6) { return "r9"; }
-    return "rax";
-}
 
 // === Operand helpers ===
 
@@ -296,7 +14,7 @@ fn syscall_reg(idx as i32) as *u8 {
 // If dest is spilled, return "rax" as scratch (caller must store_op after).
 fn get_scratch(vreg as i32, ctx as *al.AllocCtx) as *u8 {
     let is i32 as loc = al.get_loc(vreg, ctx);
-    if (loc >= 0) { return reg64(loc); }
+    if (loc >= 0) { return eo.reg64(loc); }
     return "rax";
 }
 
@@ -312,46 +30,46 @@ fn get_scratch_idx(vreg as i32, ctx as *al.AllocCtx) as i32 {
 fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     if (loc >= 0) {
-        let is *u8 as rn = reg64(loc);
+        let is *u8 as rn = eo.reg64(loc);
         if (cast(i64, rn) != cast(i64, target)) {
-            out_cstr("  mov ");
-            out_cstr(target);
-            out_cstr(", ");
-            out_cstr(rn);
-            out_char(10);
+            eo.out_cstr("  mov ");
+            eo.out_cstr(target);
+            eo.out_cstr(", ");
+            eo.out_cstr(rn);
+            eo.out_char(10);
         }
         if (al.al_opt_level >= 1) {
-            rc_invalidate_reg(reg_name_to_idx(target));
+            eo.rc_invalidate_reg(eo.reg_name_to_idx(target));
         }
     } else {
         if (al.al_opt_level >= 1) {
             // Spilled vreg: check register cache
-            let is i32 as tidx = reg_name_to_idx(target);
-            let is i32 as cached = rc_find(vreg);
+            let is i32 as tidx = eo.reg_name_to_idx(target);
+            let is i32 as cached = eo.rc_find(vreg);
             if (cached >= 0) {
                 if (cached == tidx) { return; }
-                out_cstr("  mov ");
-                out_cstr(target);
-                out_cstr(", ");
-                out_cstr(reg64(cached));
-                out_char(10);
-                rc_set(tidx, vreg);
+                eo.out_cstr("  mov ");
+                eo.out_cstr(target);
+                eo.out_cstr(", ");
+                eo.out_cstr(eo.reg64(cached));
+                eo.out_char(10);
+                eo.rc_set(tidx, vreg);
                 return;
             }
             let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-            out_cstr("  mov ");
-            out_cstr(target);
-            out_cstr(", QWORD PTR [rbp-");
-            out_int(off);
-            out_cstr("]\n");
-            rc_set(tidx, vreg);
+            eo.out_cstr("  mov ");
+            eo.out_cstr(target);
+            eo.out_cstr(", QWORD PTR [rbp-");
+            eo.out_int(off);
+            eo.out_cstr("]\n");
+            eo.rc_set(tidx, vreg);
         } else {
             let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-            out_cstr("  mov ");
-            out_cstr(target);
-            out_cstr(", QWORD PTR [rbp-");
-            out_int(off);
-            out_cstr("]\n");
+            eo.out_cstr("  mov ");
+            eo.out_cstr(target);
+            eo.out_cstr(", QWORD PTR [rbp-");
+            eo.out_int(off);
+            eo.out_cstr("]\n");
         }
     }
 }
@@ -359,29 +77,29 @@ fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
 fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     if (loc >= 0) {
-        let is *u8 as rn = reg64(loc);
+        let is *u8 as rn = eo.reg64(loc);
         if (cast(i64, rn) != cast(i64, source)) {
-            out_cstr("  mov ");
-            out_cstr(rn);
-            out_cstr(", ");
-            out_cstr(source);
-            out_char(10);
+            eo.out_cstr("  mov ");
+            eo.out_cstr(rn);
+            eo.out_cstr(", ");
+            eo.out_cstr(source);
+            eo.out_char(10);
         }
         if (al.al_opt_level >= 1) {
-            let is i32 as sidx = reg_name_to_idx(source);
-            rc_invalidate_reg(sidx);
-            rc_invalidate_reg(loc);
+            let is i32 as sidx = eo.reg_name_to_idx(source);
+            eo.rc_invalidate_reg(sidx);
+            eo.rc_invalidate_reg(loc);
         }
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-        out_cstr("  mov QWORD PTR [rbp-");
-        out_int(off);
-        out_cstr("], ");
-        out_cstr(source);
-        out_char(10);
+        eo.out_cstr("  mov QWORD PTR [rbp-");
+        eo.out_int(off);
+        eo.out_cstr("], ");
+        eo.out_cstr(source);
+        eo.out_char(10);
         if (al.al_opt_level >= 1) {
-            rc_invalidate_vreg(vreg);
-            rc_set(reg_name_to_idx(source), vreg);
+            eo.rc_invalidate_vreg(vreg);
+            eo.rc_set(eo.reg_name_to_idx(source), vreg);
         }
     }
 }
@@ -390,19 +108,19 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
 fn emit_op(vreg as i32, ctx as *al.AllocCtx) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     if (loc >= 0) {
-        out_cstr(reg64(loc));
+        eo.out_cstr(eo.reg64(loc));
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-        out_cstr("QWORD PTR [rbp-");
-        out_int(off);
-        out_cstr("]");
+        eo.out_cstr("QWORD PTR [rbp-");
+        eo.out_int(off);
+        eo.out_cstr("]");
     }
 }
 
 // Emit src2 operand: either immediate or register/memory
 fn emit_src2(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (inst.src2.op_type == d.OP_IMM) {
-        out_int(inst.src2.imm);
+        eo.out_int(inst.src2.imm);
     } else {
         emit_op(inst.src2.vreg, ctx);
     }
@@ -415,34 +133,34 @@ fn emit_mov_imm(vreg as i32, ctx as *al.AllocCtx, val as i64) as void {
     if (val > 2147483647 || val < 0 - 2147483647) { is_large = 1; }
     if (loc >= 0) {
         if (is_large == 1) {
-            out_cstr("  mov ");
-            out_cstr(reg64(loc));
-            out_cstr(", ");
-            out_int(val);
-            out_char(10);
+            eo.out_cstr("  mov ");
+            eo.out_cstr(eo.reg64(loc));
+            eo.out_cstr(", ");
+            eo.out_int(val);
+            eo.out_char(10);
         } else {
-            out_cstr("  mov ");
-            out_cstr(reg64(loc));
-            out_cstr(", ");
-            out_int(val);
-            out_char(10);
+            eo.out_cstr("  mov ");
+            eo.out_cstr(eo.reg64(loc));
+            eo.out_cstr(", ");
+            eo.out_int(val);
+            eo.out_char(10);
         }
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         if (is_large == 1) {
-            out_cstr("  mov rax, ");
-            out_int(val);
-            out_char(10);
-            out_cstr("  mov QWORD PTR [rbp-");
-            out_int(off);
-            out_cstr("], rax\n");
-            if (al.al_opt_level >= 1) { rc_invalidate_reg(0); }
+            eo.out_cstr("  mov rax, ");
+            eo.out_int(val);
+            eo.out_char(10);
+            eo.out_cstr("  mov QWORD PTR [rbp-");
+            eo.out_int(off);
+            eo.out_cstr("], rax\n");
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
         } else {
-            out_cstr("  mov QWORD PTR [rbp-");
-            out_int(off);
-            out_cstr("], ");
-            out_int(val);
-            out_char(10);
+            eo.out_cstr("  mov QWORD PTR [rbp-");
+            eo.out_int(off);
+            eo.out_cstr("], ");
+            eo.out_int(val);
+            eo.out_char(10);
         }
     }
 }
@@ -478,37 +196,37 @@ fn gen_binop(inst as *d.IRInst, ctx as *al.AllocCtx, op_name as *u8) as void {
             if (al.get_loc(inst.src2.vreg, ctx) == dest_loc) { conflict = 1; }
         }
         if (conflict == 0) {
-            let is *u8 as dr = reg64(dest_loc);
+            let is *u8 as dr = eo.reg64(dest_loc);
             load_op(inst.src1.vreg, ctx, dr);
-            out_cstr("  ");
-            out_cstr(op_name);
-            out_cstr(" ");
-            out_cstr(dr);
-            out_cstr(", ");
+            eo.out_cstr("  ");
+            eo.out_cstr(op_name);
+            eo.out_cstr(" ");
+            eo.out_cstr(dr);
+            eo.out_cstr(", ");
             emit_src2(inst, ctx);
-            out_char(10);
+            eo.out_char(10);
             // The op just clobbered dr — clear any stale cache entry
-            // (load_op may have set rc_set(dest_loc, src1.vreg) above)
-            if (al.al_opt_level >= 1) { rc_invalidate_reg(dest_loc); }
+            // (load_op may have set eo.rc_set(dest_loc, src1.vreg) above)
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(dest_loc); }
         } else {
             load_op(inst.src1.vreg, ctx, "rax");
-            out_cstr("  ");
-            out_cstr(op_name);
-            out_cstr(" rax, ");
-            out_cstr(reg64(dest_loc));
-            out_char(10);
+            eo.out_cstr("  ");
+            eo.out_cstr(op_name);
+            eo.out_cstr(" rax, ");
+            eo.out_cstr(eo.reg64(dest_loc));
+            eo.out_char(10);
             store_op(inst.dest.vreg, ctx, "rax");
         }
     } else {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
         load_op(inst.src1.vreg, ctx, scr);
-        out_cstr("  ");
-        out_cstr(op_name);
-        out_cstr(" ");
-        out_cstr(scr);
-        out_cstr(", ");
+        eo.out_cstr("  ");
+        eo.out_cstr(op_name);
+        eo.out_cstr(" ");
+        eo.out_cstr(scr);
+        eo.out_cstr(", ");
         emit_src2(inst, ctx);
-        out_char(10);
+        eo.out_char(10);
         store_op(inst.dest.vreg, ctx, scr);
     }
 }
@@ -524,11 +242,11 @@ fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // IR_MOV
     let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
     if (dloc >= 0) {
-        load_op(inst.src1.vreg, ctx, reg64(dloc));
+        load_op(inst.src1.vreg, ctx, eo.reg64(dloc));
     } else {
         let is i32 as sloc = al.get_loc(inst.src1.vreg, ctx);
         if (sloc >= 0) {
-            store_op(inst.dest.vreg, ctx, reg64(sloc));
+            store_op(inst.dest.vreg, ctx, eo.reg64(sloc));
         } else {
             load_op(inst.src1.vreg, ctx, "rax");
             store_op(inst.dest.vreg, ctx, "rax");
@@ -546,20 +264,20 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
         if (inst.src2.op_type == d.OP_IMM) {
             load_op(inst.src1.vreg, ctx, scr);
-            if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
-            out_cstr("  mov rcx, ");
-            out_int(inst.src2.imm);
-            out_char(10);
-            out_cstr("  imul "); out_cstr(scr); out_cstr(", rcx\n");
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+            eo.out_cstr("  mov rcx, ");
+            eo.out_int(inst.src2.imm);
+            eo.out_char(10);
+            eo.out_cstr("  imul "); eo.out_cstr(scr); eo.out_cstr(", rcx\n");
         } else if (al.is_mem(inst.src2.vreg, ctx) == 1) {
             load_op(inst.src1.vreg, ctx, scr);
             load_op(inst.src2.vreg, ctx, "rcx");
-            out_cstr("  imul "); out_cstr(scr); out_cstr(", rcx\n");
+            eo.out_cstr("  imul "); eo.out_cstr(scr); eo.out_cstr(", rcx\n");
         } else {
             load_op(inst.src1.vreg, ctx, scr);
-            out_cstr("  imul "); out_cstr(scr); out_cstr(", ");
+            eo.out_cstr("  imul "); eo.out_cstr(scr); eo.out_cstr(", ");
             emit_op(inst.src2.vreg, ctx);
-            out_char(10);
+            eo.out_char(10);
         }
         store_op(inst.dest.vreg, ctx, scr);
         return;
@@ -573,41 +291,41 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             let is i64 as tmp with mut = inst.src2.imm;
             while (tmp > 1) { tmp = tmp >> 1; shift = shift + 1; }
             if (is_signed_type(inst.cast_to) == 1) {
-                if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
+                if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
                 if (shift == 1) {
-                    out_cstr("  mov rcx, "); out_cstr(scr); out_char(10);
-                    out_line("shr rcx, 63");
-                    out_cstr("  add "); out_cstr(scr); out_cstr(", rcx\n");
-                    out_cstr("  sar "); out_cstr(scr); out_cstr(", 1\n");
+                    eo.out_cstr("  mov rcx, "); eo.out_cstr(scr); eo.out_char(10);
+                    eo.out_line("shr rcx, 63");
+                    eo.out_cstr("  add "); eo.out_cstr(scr); eo.out_cstr(", rcx\n");
+                    eo.out_cstr("  sar "); eo.out_cstr(scr); eo.out_cstr(", 1\n");
                 } else {
-                    out_cstr("  mov rcx, "); out_cstr(scr); out_char(10);
-                    out_line("sar rcx, 63");
-                    out_cstr("  shr rcx, "); out_int(64 - shift); out_char(10);
-                    out_cstr("  add "); out_cstr(scr); out_cstr(", rcx\n");
-                    out_cstr("  sar "); out_cstr(scr); out_cstr(", "); out_int(shift); out_char(10);
+                    eo.out_cstr("  mov rcx, "); eo.out_cstr(scr); eo.out_char(10);
+                    eo.out_line("sar rcx, 63");
+                    eo.out_cstr("  shr rcx, "); eo.out_int(64 - shift); eo.out_char(10);
+                    eo.out_cstr("  add "); eo.out_cstr(scr); eo.out_cstr(", rcx\n");
+                    eo.out_cstr("  sar "); eo.out_cstr(scr); eo.out_cstr(", "); eo.out_int(shift); eo.out_char(10);
                 }
             } else {
-                out_cstr("  shr "); out_cstr(scr); out_cstr(", "); out_int(shift); out_char(10);
+                eo.out_cstr("  shr "); eo.out_cstr(scr); eo.out_cstr(", "); eo.out_int(shift); eo.out_char(10);
             }
             store_op(inst.dest.vreg, ctx, scr);
             return;
         }
         load_op(inst.src1.vreg, ctx, "rax");
         if (inst.src2.op_type == d.OP_IMM) {
-            if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
-            out_cstr("  mov rcx, "); out_int(inst.src2.imm); out_char(10);
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+            eo.out_cstr("  mov rcx, "); eo.out_int(inst.src2.imm); eo.out_char(10);
         } else {
             load_op(inst.src2.vreg, ctx, "rcx");
         }
-        out_line("push rdx");
+        eo.out_line("push rdx");
         if (is_signed_type(inst.cast_to) == 1) {
-            out_line("cqo");
-            out_line("idiv rcx");
+            eo.out_line("cqo");
+            eo.out_line("idiv rcx");
         } else {
-            out_line("xor rdx, rdx");
-            out_line("div rcx");
+            eo.out_line("xor rdx, rdx");
+            eo.out_line("div rcx");
         }
-        out_line("pop rdx");
+        eo.out_line("pop rdx");
         store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
@@ -618,44 +336,44 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             load_op(inst.src1.vreg, ctx, scr);
             let is i64 as mask = inst.src2.imm - 1;
             if (is_signed_type(inst.cast_to) == 1) {
-                if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
-                out_cstr("  mov rcx, "); out_cstr(scr); out_char(10);
-                out_cstr("  sar "); out_cstr(scr); out_cstr(", 63\n");
-                out_cstr("  and "); out_cstr(scr); out_cstr(", "); out_int(mask); out_char(10);
-                out_cstr("  add rcx, "); out_cstr(scr); out_char(10);
-                out_cstr("  and rcx, "); out_int(mask); out_char(10);
-                out_cstr("  sub rcx, "); out_cstr(scr); out_char(10);
-                out_cstr("  mov "); out_cstr(scr); out_cstr(", rcx\n");
+                if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+                eo.out_cstr("  mov rcx, "); eo.out_cstr(scr); eo.out_char(10);
+                eo.out_cstr("  sar "); eo.out_cstr(scr); eo.out_cstr(", 63\n");
+                eo.out_cstr("  and "); eo.out_cstr(scr); eo.out_cstr(", "); eo.out_int(mask); eo.out_char(10);
+                eo.out_cstr("  add rcx, "); eo.out_cstr(scr); eo.out_char(10);
+                eo.out_cstr("  and rcx, "); eo.out_int(mask); eo.out_char(10);
+                eo.out_cstr("  sub rcx, "); eo.out_cstr(scr); eo.out_char(10);
+                eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", rcx\n");
             } else {
-                out_cstr("  and "); out_cstr(scr); out_cstr(", "); out_int(mask); out_char(10);
+                eo.out_cstr("  and "); eo.out_cstr(scr); eo.out_cstr(", "); eo.out_int(mask); eo.out_char(10);
             }
             store_op(inst.dest.vreg, ctx, scr);
             return;
         }
         load_op(inst.src1.vreg, ctx, "rax");
         if (inst.src2.op_type == d.OP_IMM) {
-            if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
-            out_cstr("  mov rcx, "); out_int(inst.src2.imm); out_char(10);
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+            eo.out_cstr("  mov rcx, "); eo.out_int(inst.src2.imm); eo.out_char(10);
         } else {
             load_op(inst.src2.vreg, ctx, "rcx");
         }
-        out_line("push rdx");
+        eo.out_line("push rdx");
         if (is_signed_type(inst.cast_to) == 1) {
-            out_line("cqo");
-            out_line("idiv rcx");
+            eo.out_line("cqo");
+            eo.out_line("idiv rcx");
         } else {
-            out_line("xor rdx, rdx");
-            out_line("div rcx");
+            eo.out_line("xor rdx, rdx");
+            eo.out_line("div rcx");
         }
-        out_line("mov rax, rdx");
-        out_line("pop rdx");
+        eo.out_line("mov rax, rdx");
+        eo.out_line("pop rdx");
         store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
     // IR_NEG
     let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
     load_op(inst.src1.vreg, ctx, scr);
-    out_cstr("  neg "); out_cstr(scr); out_char(10);
+    eo.out_cstr("  neg "); eo.out_cstr(scr); eo.out_char(10);
     store_op(inst.dest.vreg, ctx, scr);
 }
 
@@ -665,25 +383,25 @@ fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     if (op == d.IR_FNEG) {
         load_op(inst.src1.vreg, ctx, "rax");
-        out_line("movq xmm0, rax");
-        if (al.al_opt_level >= 1) { rc_invalidate_reg(1); }
-        out_line("mov rcx, 0x8000000000000000");
-        out_line("movq xmm1, rcx");
-        out_line("xorpd xmm0, xmm1");
-        out_line("movq rax, xmm0");
+        eo.out_line("movq xmm0, rax");
+        if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+        eo.out_line("mov rcx, 0x8000000000000000");
+        eo.out_line("movq xmm1, rcx");
+        eo.out_line("xorpd xmm0, xmm1");
+        eo.out_line("movq rax, xmm0");
         store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
     // FADD, FSUB, FMUL, FDIV
     load_op(inst.src1.vreg, ctx, "rax");
     load_op(inst.src2.vreg, ctx, "rcx");
-    out_line("movq xmm0, rax");
-    out_line("movq xmm1, rcx");
-    if (op == d.IR_FADD) { out_line("addsd xmm0, xmm1"); }
-    if (op == d.IR_FSUB) { out_line("subsd xmm0, xmm1"); }
-    if (op == d.IR_FMUL) { out_line("mulsd xmm0, xmm1"); }
-    if (op == d.IR_FDIV) { out_line("divsd xmm0, xmm1"); }
-    out_line("movq rax, xmm0");
+    eo.out_line("movq xmm0, rax");
+    eo.out_line("movq xmm1, rcx");
+    if (op == d.IR_FADD) { eo.out_line("addsd xmm0, xmm1"); }
+    if (op == d.IR_FSUB) { eo.out_line("subsd xmm0, xmm1"); }
+    if (op == d.IR_FMUL) { eo.out_line("mulsd xmm0, xmm1"); }
+    if (op == d.IR_FDIV) { eo.out_line("divsd xmm0, xmm1"); }
+    eo.out_line("movq rax, xmm0");
     store_op(inst.dest.vreg, ctx, "rax");
 }
 
@@ -698,51 +416,51 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         if ((nx_op == d.IR_JZ || nx_op == d.IR_JNZ) && nx.src1.vreg == inst.dest.vreg) {
             load_op(inst.src1.vreg, ctx, "rax");
             if (inst.src2.op_type == d.OP_IMM && inst.src2.imm == 0) {
-                out_cstr("  test rax, rax\n");
+                eo.out_cstr("  test rax, rax\n");
             } else {
-                out_cstr("  cmp rax, ");
+                eo.out_cstr("  cmp rax, ");
                 emit_src2(inst, ctx);
-                out_char(10);
+                eo.out_char(10);
             }
             let is i32 as sgn = is_signed_type(inst.cast_to);
             if (nx_op == d.IR_JZ) {
-                if (op == d.IR_EQ) { out_cstr("  jne .L"); }
-                else if (op == d.IR_NE) { out_cstr("  je .L"); }
-                else if (op == d.IR_LT) { if (sgn == 1) { out_cstr("  jge .L"); } else { out_cstr("  jae .L"); } }
-                else if (op == d.IR_LE) { if (sgn == 1) { out_cstr("  jg .L"); } else { out_cstr("  ja .L"); } }
-                else if (op == d.IR_GT) { if (sgn == 1) { out_cstr("  jle .L"); } else { out_cstr("  jbe .L"); } }
-                else if (op == d.IR_GE) { if (sgn == 1) { out_cstr("  jl .L"); } else { out_cstr("  jb .L"); } }
+                if (op == d.IR_EQ) { eo.out_cstr("  jne .L"); }
+                else if (op == d.IR_NE) { eo.out_cstr("  je .L"); }
+                else if (op == d.IR_LT) { if (sgn == 1) { eo.out_cstr("  jge .L"); } else { eo.out_cstr("  jae .L"); } }
+                else if (op == d.IR_LE) { if (sgn == 1) { eo.out_cstr("  jg .L"); } else { eo.out_cstr("  ja .L"); } }
+                else if (op == d.IR_GT) { if (sgn == 1) { eo.out_cstr("  jle .L"); } else { eo.out_cstr("  jbe .L"); } }
+                else if (op == d.IR_GE) { if (sgn == 1) { eo.out_cstr("  jl .L"); } else { eo.out_cstr("  jb .L"); } }
             } else {
-                if (op == d.IR_EQ) { out_cstr("  je .L"); }
-                else if (op == d.IR_NE) { out_cstr("  jne .L"); }
-                else if (op == d.IR_LT) { if (sgn == 1) { out_cstr("  jl .L"); } else { out_cstr("  jb .L"); } }
-                else if (op == d.IR_LE) { if (sgn == 1) { out_cstr("  jle .L"); } else { out_cstr("  jbe .L"); } }
-                else if (op == d.IR_GT) { if (sgn == 1) { out_cstr("  jg .L"); } else { out_cstr("  ja .L"); } }
-                else if (op == d.IR_GE) { if (sgn == 1) { out_cstr("  jge .L"); } else { out_cstr("  jae .L"); } }
+                if (op == d.IR_EQ) { eo.out_cstr("  je .L"); }
+                else if (op == d.IR_NE) { eo.out_cstr("  jne .L"); }
+                else if (op == d.IR_LT) { if (sgn == 1) { eo.out_cstr("  jl .L"); } else { eo.out_cstr("  jb .L"); } }
+                else if (op == d.IR_LE) { if (sgn == 1) { eo.out_cstr("  jle .L"); } else { eo.out_cstr("  jbe .L"); } }
+                else if (op == d.IR_GT) { if (sgn == 1) { eo.out_cstr("  jg .L"); } else { eo.out_cstr("  ja .L"); } }
+                else if (op == d.IR_GE) { if (sgn == 1) { eo.out_cstr("  jge .L"); } else { eo.out_cstr("  jae .L"); } }
             }
-            out_int(cast(i64, nx.dest.label));
-            out_char(10);
+            eo.out_int(cast(i64, nx.dest.label));
+            eo.out_char(10);
             nx.is_dead = 1;
             fused = 1;
         }
     }
     if (fused == 0) {
         load_op(inst.src1.vreg, ctx, "rcx");
-        out_line("xor eax, eax");
+        eo.out_line("xor eax, eax");
         if (inst.src2.op_type == d.OP_IMM && inst.src2.imm == 0) {
-            out_cstr("  test rcx, rcx\n");
+            eo.out_cstr("  test rcx, rcx\n");
         } else {
-            out_cstr("  cmp rcx, ");
+            eo.out_cstr("  cmp rcx, ");
             emit_src2(inst, ctx);
-            out_char(10);
+            eo.out_char(10);
         }
-        if (op == d.IR_EQ) { out_line("sete al"); }
-        if (op == d.IR_NE) { out_line("setne al"); }
+        if (op == d.IR_EQ) { eo.out_line("sete al"); }
+        if (op == d.IR_NE) { eo.out_line("setne al"); }
         let is i32 as sgn2 = is_signed_type(inst.cast_to);
-        if (op == d.IR_LT) { if (sgn2 == 1) { out_line("setl al"); } else { out_line("setb al"); } }
-        if (op == d.IR_LE) { if (sgn2 == 1) { out_line("setle al"); } else { out_line("setbe al"); } }
-        if (op == d.IR_GT) { if (sgn2 == 1) { out_line("setg al"); } else { out_line("seta al"); } }
-        if (op == d.IR_GE) { if (sgn2 == 1) { out_line("setge al"); } else { out_line("setae al"); } }
+        if (op == d.IR_LT) { if (sgn2 == 1) { eo.out_line("setl al"); } else { eo.out_line("setb al"); } }
+        if (op == d.IR_LE) { if (sgn2 == 1) { eo.out_line("setle al"); } else { eo.out_line("setbe al"); } }
+        if (op == d.IR_GT) { if (sgn2 == 1) { eo.out_line("setg al"); } else { eo.out_line("seta al"); } }
+        if (op == d.IR_GE) { if (sgn2 == 1) { eo.out_line("setge al"); } else { eo.out_line("setae al"); } }
         store_op(inst.dest.vreg, ctx, "rax");
     }
 }
@@ -755,16 +473,16 @@ fn gen_inst_shift_bitwise(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
         load_op(inst.src1.vreg, ctx, scr);
         if (inst.src2.op_type == d.OP_IMM) {
-            out_cstr("  shl ");
-            out_cstr(scr);
-            out_cstr(", ");
-            out_int(inst.src2.imm);
-            out_char(10);
+            eo.out_cstr("  shl ");
+            eo.out_cstr(scr);
+            eo.out_cstr(", ");
+            eo.out_int(inst.src2.imm);
+            eo.out_char(10);
         } else {
             load_op(inst.src2.vreg, ctx, "rcx");
-            out_cstr("  shl ");
-            out_cstr(scr);
-            out_cstr(", cl\n");
+            eo.out_cstr("  shl ");
+            eo.out_cstr(scr);
+            eo.out_cstr(", cl\n");
         }
         store_op(inst.dest.vreg, ctx, scr);
         return;
@@ -774,23 +492,23 @@ fn gen_inst_shift_bitwise(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         load_op(inst.src1.vreg, ctx, scr);
         if (inst.src2.op_type == d.OP_IMM) {
             if (is_signed_type(inst.cast_to) == 1) {
-                out_cstr("  sar ");
+                eo.out_cstr("  sar ");
             } else {
-                out_cstr("  shr ");
+                eo.out_cstr("  shr ");
             }
-            out_cstr(scr);
-            out_cstr(", ");
-            out_int(inst.src2.imm);
-            out_char(10);
+            eo.out_cstr(scr);
+            eo.out_cstr(", ");
+            eo.out_int(inst.src2.imm);
+            eo.out_char(10);
         } else {
             load_op(inst.src2.vreg, ctx, "rcx");
             if (is_signed_type(inst.cast_to) == 1) {
-                out_cstr("  sar ");
+                eo.out_cstr("  sar ");
             } else {
-                out_cstr("  shr ");
+                eo.out_cstr("  shr ");
             }
-            out_cstr(scr);
-            out_cstr(", cl\n");
+            eo.out_cstr(scr);
+            eo.out_cstr(", cl\n");
         }
         store_op(inst.dest.vreg, ctx, scr);
         return;
@@ -801,9 +519,9 @@ fn gen_inst_shift_bitwise(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // IR_NOT
     let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
     load_op(inst.src1.vreg, ctx, scr);
-    out_cstr("  not ");
-    out_cstr(scr);
-    out_char(10);
+    eo.out_cstr("  not ");
+    eo.out_cstr(scr);
+    eo.out_char(10);
     store_op(inst.dest.vreg, ctx, scr);
 }
 
@@ -816,47 +534,47 @@ fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             load_op(inst.src1.vreg, ctx, "rax");
         }
         if (ctx.aligned_stack_size > 0) {
-            out_cstr("  add rsp, ");
-            out_int(cast(i64, ctx.aligned_stack_size));
-            out_char(10);
+            eo.out_cstr("  add rsp, ");
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
         }
-        if (ctx.used_callee_mask & 16) { out_line("pop r15"); }
-        if (ctx.used_callee_mask & 8) { out_line("pop r14"); }
-        if (ctx.used_callee_mask & 4) { out_line("pop r13"); }
-        if (ctx.used_callee_mask & 2) { out_line("pop r12"); }
-        if (ctx.used_callee_mask & 1) { out_line("pop rbx"); }
-        out_line("pop rbp");
-        out_line("ret");
+        if (ctx.used_callee_mask & 16) { eo.out_line("pop r15"); }
+        if (ctx.used_callee_mask & 8) { eo.out_line("pop r14"); }
+        if (ctx.used_callee_mask & 4) { eo.out_line("pop r13"); }
+        if (ctx.used_callee_mask & 2) { eo.out_line("pop r12"); }
+        if (ctx.used_callee_mask & 1) { eo.out_line("pop rbx"); }
+        eo.out_line("pop rbp");
+        eo.out_line("ret");
         return;
     }
     if (op == d.IR_LABEL) {
-        if (al.al_opt_level >= 1) { ph_invalidate(); }
-        out_cstr(".L");
-        out_int(cast(i64, inst.dest.label));
-        out_cstr(":\n");
+        if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
+        eo.out_cstr(".L");
+        eo.out_int(cast(i64, inst.dest.label));
+        eo.out_cstr(":\n");
         return;
     }
     if (op == d.IR_JMP) {
-        if (al.al_opt_level >= 1) { ph_invalidate(); }
-        out_cstr("  jmp .L");
-        out_int(cast(i64, inst.dest.label));
-        out_char(10);
+        if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
+        eo.out_cstr("  jmp .L");
+        eo.out_int(cast(i64, inst.dest.label));
+        eo.out_char(10);
         return;
     }
     if (op == d.IR_JZ) {
         load_op(inst.src1.vreg, ctx, "rax");
-        out_line("test rax, rax");
-        out_cstr("  jz .L");
-        out_int(cast(i64, inst.dest.label));
-        out_char(10);
+        eo.out_line("test rax, rax");
+        eo.out_cstr("  jz .L");
+        eo.out_int(cast(i64, inst.dest.label));
+        eo.out_char(10);
         return;
     }
     // IR_JNZ
     load_op(inst.src1.vreg, ctx, "rax");
-    out_line("test rax, rax");
-    out_cstr("  jnz .L");
-    out_int(cast(i64, inst.dest.label));
-    out_char(10);
+    eo.out_line("test rax, rax");
+    eo.out_cstr("  jnz .L");
+    eo.out_int(cast(i64, inst.dest.label));
+    eo.out_char(10);
 }
 
 // === gen_inst: ADDR, ADDR_GLOBAL, FN_ADDR, GET_ALLOC_ADDR, LOAD, STORE, COPY, ASM, CAST ===
@@ -865,57 +583,57 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     if (op == d.IR_ADDR) {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
-        out_cstr("  lea ");
-        out_cstr(scr);
-        out_cstr(", [rbp-");
-        out_int(inst.src1.imm);
-        out_cstr("]\n");
+        eo.out_cstr("  lea ");
+        eo.out_cstr(scr);
+        eo.out_cstr(", [rbp-");
+        eo.out_int(inst.src1.imm);
+        eo.out_cstr("]\n");
         store_op(inst.dest.vreg, ctx, scr);
         return;
     }
     if (op == d.IR_ADDR_GLOBAL) {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
         if (inst.is_extern_global == 1) {
-            out_cstr("  mov ");
-            out_cstr(scr);
-            out_cstr(", QWORD PTR [rip+");
-            out_str(inst.global_name_ptr, inst.global_name_len);
-            out_cstr("]\n");
+            eo.out_cstr("  mov ");
+            eo.out_cstr(scr);
+            eo.out_cstr(", QWORD PTR [rip+");
+            eo.out_str(inst.global_name_ptr, inst.global_name_len);
+            eo.out_cstr("]\n");
         } else {
-            out_cstr("  lea ");
-            out_cstr(scr);
-            out_cstr(", [rip+");
-            out_str(inst.global_name_ptr, inst.global_name_len);
-            out_cstr("]\n");
+            eo.out_cstr("  lea ");
+            eo.out_cstr(scr);
+            eo.out_cstr(", [rip+");
+            eo.out_str(inst.global_name_ptr, inst.global_name_len);
+            eo.out_cstr("]\n");
         }
         store_op(inst.dest.vreg, ctx, scr);
         return;
     }
     if (op == d.IR_FN_ADDR) {
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
-        out_cstr("  lea ");
-        out_cstr(scr);
-        out_cstr(", [rip+");
-        out_str(inst.global_name_ptr, inst.global_name_len);
-        out_cstr("]\n");
+        eo.out_cstr("  lea ");
+        eo.out_cstr(scr);
+        eo.out_cstr(", [rip+");
+        eo.out_str(inst.global_name_ptr, inst.global_name_len);
+        eo.out_cstr("]\n");
         store_op(inst.dest.vreg, ctx, scr);
         return;
     }
     if (op == d.IR_GET_ALLOC_ADDR) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, ctx.stack_slots) * 8 + inst.src1.imm;
         let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
-        out_cstr("  lea ");
-        out_cstr(scr);
-        out_cstr(", [rbp-");
-        out_int(off);
-        out_cstr("]\n");
+        eo.out_cstr("  lea ");
+        eo.out_cstr(scr);
+        eo.out_cstr(", [rbp-");
+        eo.out_int(off);
+        eo.out_cstr("]\n");
         store_op(inst.dest.vreg, ctx, scr);
         return;
     }
     if (op == d.IR_SET_CTX) {
         if (inst.src1.op_type == d.OP_IMM) {
-            out_line("xor r10, r10");
-            if (al.al_opt_level >= 1) { rc_invalidate_reg(8); }
+            eo.out_line("xor r10, r10");
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(8); }
         } else {
             load_op(inst.src1.vreg, ctx, "r10");
         }
@@ -925,8 +643,8 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is i32 as sz = get_type_size(inst.cast_to);
         let is i32 as sgn = is_signed_type(inst.cast_to);
         let is i32 as si = get_scratch_idx(inst.dest.vreg, ctx);
-        let is *u8 as scr = reg64(si);
-        let is *u8 as scr32 = reg32(si);
+        let is *u8 as scr = eo.reg64(si);
+        let is *u8 as scr32 = eo.reg32(si);
         if (inst.src1.op_type == d.OP_VREG) {
             let is AddrMode as am with mut;
             am.matched = 0;
@@ -937,64 +655,64 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 load_op(am.base_vreg, ctx, "rax");
                 load_op(am.index_vreg, ctx, "rcx");
                 if (sz == 8) {
-                    out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                    eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR [rax + rcx * "); eo.out_int(cast(i64, am.scale)); eo.out_cstr("]\n");
                 } else if (sz == 4) {
-                    if (sgn == 1) { out_cstr("  movsxd "); out_cstr(scr); } else { out_cstr("  mov "); out_cstr(scr32); }
-                    out_cstr(", DWORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                    if (sgn == 1) { eo.out_cstr("  movsxd "); eo.out_cstr(scr); } else { eo.out_cstr("  mov "); eo.out_cstr(scr32); }
+                    eo.out_cstr(", DWORD PTR [rax + rcx * "); eo.out_int(cast(i64, am.scale)); eo.out_cstr("]\n");
                 } else if (sz == 2) {
-                    if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-                    out_cstr(scr); out_cstr(", WORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                    if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+                    eo.out_cstr(scr); eo.out_cstr(", WORD PTR [rax + rcx * "); eo.out_int(cast(i64, am.scale)); eo.out_cstr("]\n");
                 } else if (sz == 1) {
-                    if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-                    out_cstr(scr); out_cstr(", BYTE PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                    if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+                    eo.out_cstr(scr); eo.out_cstr(", BYTE PTR [rax + rcx * "); eo.out_int(cast(i64, am.scale)); eo.out_cstr("]\n");
                 } else {
-                    out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rax + rcx * "); out_int(cast(i64, am.scale)); out_cstr("]\n");
+                    eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR [rax + rcx * "); eo.out_int(cast(i64, am.scale)); eo.out_cstr("]\n");
                 }
             } else {
             load_op(inst.src1.vreg, ctx, scr);
             if (sz == 8) {
-                out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR ["); out_cstr(scr); out_cstr("]\n");
+                eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR ["); eo.out_cstr(scr); eo.out_cstr("]\n");
             } else if (sz == 4) {
-                if (sgn == 1) { out_cstr("  movsxd "); out_cstr(scr); out_cstr(", DWORD PTR ["); out_cstr(scr); out_cstr("]\n"); }
-                else { out_cstr("  mov "); out_cstr(scr32); out_cstr(", DWORD PTR ["); out_cstr(scr); out_cstr("]\n"); }
+                if (sgn == 1) { eo.out_cstr("  movsxd "); eo.out_cstr(scr); eo.out_cstr(", DWORD PTR ["); eo.out_cstr(scr); eo.out_cstr("]\n"); }
+                else { eo.out_cstr("  mov "); eo.out_cstr(scr32); eo.out_cstr(", DWORD PTR ["); eo.out_cstr(scr); eo.out_cstr("]\n"); }
             } else if (sz == 2) {
-                if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-                out_cstr(scr); out_cstr(", WORD PTR ["); out_cstr(scr); out_cstr("]\n");
+                if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+                eo.out_cstr(scr); eo.out_cstr(", WORD PTR ["); eo.out_cstr(scr); eo.out_cstr("]\n");
             } else if (sz == 1) {
-                if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-                out_cstr(scr); out_cstr(", BYTE PTR ["); out_cstr(scr); out_cstr("]\n");
+                if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+                eo.out_cstr(scr); eo.out_cstr(", BYTE PTR ["); eo.out_cstr(scr); eo.out_cstr("]\n");
             } else {
-                out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR ["); out_cstr(scr); out_cstr("]\n");
+                eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR ["); eo.out_cstr(scr); eo.out_cstr("]\n");
             }
             }
         } else {
             // Stack offset (IMM)
             if (sz == 8) {
-                out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rbp-");
-                out_int(inst.src1.imm); out_cstr("]\n");
+                eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR [rbp-");
+                eo.out_int(inst.src1.imm); eo.out_cstr("]\n");
             } else if (sz == 4) {
                 if (sgn == 1) {
-                    out_cstr("  movsxd "); out_cstr(scr);
+                    eo.out_cstr("  movsxd "); eo.out_cstr(scr);
                 } else {
-                    out_cstr("  mov "); out_cstr(scr32);
+                    eo.out_cstr("  mov "); eo.out_cstr(scr32);
                 }
-                out_cstr(", DWORD PTR [rbp-"); out_int(inst.src1.imm); out_cstr("]\n");
+                eo.out_cstr(", DWORD PTR [rbp-"); eo.out_int(inst.src1.imm); eo.out_cstr("]\n");
             } else if (sz == 2) {
-                if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-                out_cstr(scr); out_cstr(", WORD PTR [rbp-"); out_int(inst.src1.imm); out_cstr("]\n");
+                if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+                eo.out_cstr(scr); eo.out_cstr(", WORD PTR [rbp-"); eo.out_int(inst.src1.imm); eo.out_cstr("]\n");
             } else if (sz == 1) {
-                if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-                out_cstr(scr); out_cstr(", BYTE PTR [rbp-"); out_int(inst.src1.imm); out_cstr("]\n");
+                if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+                eo.out_cstr(scr); eo.out_cstr(", BYTE PTR [rbp-"); eo.out_int(inst.src1.imm); eo.out_cstr("]\n");
             } else {
-                out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rbp-");
-                out_int(inst.src1.imm); out_cstr("]\n");
+                eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR [rbp-");
+                eo.out_int(inst.src1.imm); eo.out_cstr("]\n");
             }
         }
         // f32 load: widen f32 bitpattern to f64 for internal representation
         if (sz == 4 && is_float_type(inst.cast_to) == 1) {
-            out_cstr("  movd xmm0, "); out_cstr(scr32); out_char(10);
-            out_line("cvtss2sd xmm0, xmm0");
-            out_cstr("  movq "); out_cstr(scr); out_cstr(", xmm0\n");
+            eo.out_cstr("  movd xmm0, "); eo.out_cstr(scr32); eo.out_char(10);
+            eo.out_line("cvtss2sd xmm0, xmm0");
+            eo.out_cstr("  movq "); eo.out_cstr(scr); eo.out_cstr(", xmm0\n");
         }
         store_op(inst.dest.vreg, ctx, scr);
         return;
@@ -1004,75 +722,75 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         load_op(inst.src1.vreg, ctx, "rax");
         // f32 store: value in rax is f64 bitpattern, convert to f32 bitpattern
         if (sz == 4 && is_float_type(inst.cast_to) == 1) {
-            out_line("movq xmm0, rax");
-            out_line("cvtsd2ss xmm0, xmm0");
-            out_line("movd eax, xmm0");
+            eo.out_line("movq xmm0, rax");
+            eo.out_line("cvtsd2ss xmm0, xmm0");
+            eo.out_line("movd eax, xmm0");
         }
         if (inst.dest.op_type == d.OP_VREG) {
             load_op(inst.dest.vreg, ctx, "rcx");
-            if (sz == 8) { out_line("mov QWORD PTR [rcx], rax"); }
-            else if (sz == 4) { out_line("mov DWORD PTR [rcx], eax"); }
-            else if (sz == 2) { out_line("mov WORD PTR [rcx], ax"); }
-            else if (sz == 1) { out_line("mov BYTE PTR [rcx], al"); }
-            else { out_line("mov QWORD PTR [rcx], rax"); }
+            if (sz == 8) { eo.out_line("mov QWORD PTR [rcx], rax"); }
+            else if (sz == 4) { eo.out_line("mov DWORD PTR [rcx], eax"); }
+            else if (sz == 2) { eo.out_line("mov WORD PTR [rcx], ax"); }
+            else if (sz == 1) { eo.out_line("mov BYTE PTR [rcx], al"); }
+            else { eo.out_line("mov QWORD PTR [rcx], rax"); }
         } else {
             // Stack offset (IMM)
             if (sz == 8) {
-                out_cstr("  mov QWORD PTR [rbp-");
-                out_int(inst.dest.imm);
-                out_cstr("], rax\n");
+                eo.out_cstr("  mov QWORD PTR [rbp-");
+                eo.out_int(inst.dest.imm);
+                eo.out_cstr("], rax\n");
             } else if (sz == 4) {
-                out_cstr("  mov DWORD PTR [rbp-");
-                out_int(inst.dest.imm);
-                out_cstr("], eax\n");
+                eo.out_cstr("  mov DWORD PTR [rbp-");
+                eo.out_int(inst.dest.imm);
+                eo.out_cstr("], eax\n");
             } else if (sz == 2) {
-                out_cstr("  mov WORD PTR [rbp-");
-                out_int(inst.dest.imm);
-                out_cstr("], ax\n");
+                eo.out_cstr("  mov WORD PTR [rbp-");
+                eo.out_int(inst.dest.imm);
+                eo.out_cstr("], ax\n");
             } else if (sz == 1) {
-                out_cstr("  mov BYTE PTR [rbp-");
-                out_int(inst.dest.imm);
-                out_cstr("], al\n");
+                eo.out_cstr("  mov BYTE PTR [rbp-");
+                eo.out_int(inst.dest.imm);
+                eo.out_cstr("], al\n");
             } else {
                 // Struct > 8 bytes: rax is a pointer to the struct data.
                 // Copy from [rax] to [rbp-dest] using rcx as scratch.
-                if (al.al_opt_level >= 1) { rc_invalidate_reg(0); rc_invalidate_reg(1); }
-                out_line("mov rcx, rax");
+                if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); eo.rc_invalidate_reg(1); }
+                eo.out_line("mov rcx, rax");
                 let is i32 as soff with mut = 0;
                 while (soff + 8 <= sz) {
-                    out_cstr("  mov rax, QWORD PTR [rcx+");
-                    out_int(cast(i64, soff));
-                    out_cstr("]\n");
-                    out_cstr("  mov QWORD PTR [rbp-");
-                    out_int(inst.dest.imm - cast(i64, soff));
-                    out_cstr("], rax\n");
+                    eo.out_cstr("  mov rax, QWORD PTR [rcx+");
+                    eo.out_int(cast(i64, soff));
+                    eo.out_cstr("]\n");
+                    eo.out_cstr("  mov QWORD PTR [rbp-");
+                    eo.out_int(inst.dest.imm - cast(i64, soff));
+                    eo.out_cstr("], rax\n");
                     soff = soff + 8;
                 }
                 if (soff + 4 <= sz) {
-                    out_cstr("  mov eax, DWORD PTR [rcx+");
-                    out_int(cast(i64, soff));
-                    out_cstr("]\n");
-                    out_cstr("  mov DWORD PTR [rbp-");
-                    out_int(inst.dest.imm - cast(i64, soff));
-                    out_cstr("], eax\n");
+                    eo.out_cstr("  mov eax, DWORD PTR [rcx+");
+                    eo.out_int(cast(i64, soff));
+                    eo.out_cstr("]\n");
+                    eo.out_cstr("  mov DWORD PTR [rbp-");
+                    eo.out_int(inst.dest.imm - cast(i64, soff));
+                    eo.out_cstr("], eax\n");
                     soff = soff + 4;
                 }
                 if (soff + 2 <= sz) {
-                    out_cstr("  movzx eax, WORD PTR [rcx+");
-                    out_int(cast(i64, soff));
-                    out_cstr("]\n");
-                    out_cstr("  mov WORD PTR [rbp-");
-                    out_int(inst.dest.imm - cast(i64, soff));
-                    out_cstr("], ax\n");
+                    eo.out_cstr("  movzx eax, WORD PTR [rcx+");
+                    eo.out_int(cast(i64, soff));
+                    eo.out_cstr("]\n");
+                    eo.out_cstr("  mov WORD PTR [rbp-");
+                    eo.out_int(inst.dest.imm - cast(i64, soff));
+                    eo.out_cstr("], ax\n");
                     soff = soff + 2;
                 }
                 if (soff < sz) {
-                    out_cstr("  movzx eax, BYTE PTR [rcx+");
-                    out_int(cast(i64, soff));
-                    out_cstr("]\n");
-                    out_cstr("  mov BYTE PTR [rbp-");
-                    out_int(inst.dest.imm - cast(i64, soff));
-                    out_cstr("], al\n");
+                    eo.out_cstr("  movzx eax, BYTE PTR [rcx+");
+                    eo.out_int(cast(i64, soff));
+                    eo.out_cstr("]\n");
+                    eo.out_cstr("  mov BYTE PTR [rbp-");
+                    eo.out_int(inst.dest.imm - cast(i64, soff));
+                    eo.out_cstr("], al\n");
                 }
             }
         }
@@ -1081,55 +799,55 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_COPY) {
         load_op(inst.dest.vreg, ctx, "rdi");
         load_op(inst.src1.vreg, ctx, "rsi");
-        out_cstr("  mov rcx, ");
-        out_int(inst.src2.imm);
-        out_char(10);
-        out_line("cld");
-        out_line("rep movsb");
+        eo.out_cstr("  mov rcx, ");
+        eo.out_int(inst.src2.imm);
+        eo.out_char(10);
+        eo.out_line("cld");
+        eo.out_line("rep movsb");
         // rep movsb clobbers rdi, rsi, rcx
         if (al.al_opt_level >= 1) {
-            rc_invalidate_reg(5);
-            rc_invalidate_reg(4);
-            rc_invalidate_reg(1);
+            eo.rc_invalidate_reg(5);
+            eo.rc_invalidate_reg(4);
+            eo.rc_invalidate_reg(1);
         }
         return;
     }
     if (op == d.IR_ASM) {
-        out_cstr("  ");
-        out_str(inst.asm_str_ptr, inst.asm_str_len);
-        out_char(10);
-        if (al.al_opt_level >= 1) { ph_invalidate(); }
+        eo.out_cstr("  ");
+        eo.out_str(inst.asm_str_ptr, inst.asm_str_len);
+        eo.out_char(10);
+        if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
         return;
     }
     // IR_CAST
     let is i32 as to_flt = is_float_type(inst.cast_to);
     let is i32 as from_flt = is_float_type(inst.cast_from);
     let is i32 as si = get_scratch_idx(inst.dest.vreg, ctx);
-    let is *u8 as scr = reg64(si);
+    let is *u8 as scr = eo.reg64(si);
     load_op(inst.src1.vreg, ctx, scr);
     if (from_flt == 1 && to_flt == 0) {
-        out_cstr("  movq xmm0, "); out_cstr(scr); out_char(10);
-        out_cstr("  cvttsd2si "); out_cstr(scr); out_cstr(", xmm0\n");
+        eo.out_cstr("  movq xmm0, "); eo.out_cstr(scr); eo.out_char(10);
+        eo.out_cstr("  cvttsd2si "); eo.out_cstr(scr); eo.out_cstr(", xmm0\n");
         store_op(inst.dest.vreg, ctx, scr);
         return;
     }
     if (from_flt == 0 && to_flt == 1) {
-        out_cstr("  cvtsi2sd xmm0, "); out_cstr(scr); out_char(10);
-        out_cstr("  movq "); out_cstr(scr); out_cstr(", xmm0\n");
+        eo.out_cstr("  cvtsi2sd xmm0, "); eo.out_cstr(scr); eo.out_char(10);
+        eo.out_cstr("  movq "); eo.out_cstr(scr); eo.out_cstr(", xmm0\n");
         store_op(inst.dest.vreg, ctx, scr);
         return;
     }
     let is i32 as to_sz = get_type_size(inst.cast_to);
     let is i32 as sgn = is_signed_type(inst.cast_to);
     if (to_sz == 4) {
-        if (sgn == 1) { out_cstr("  movsxd "); out_cstr(scr); out_cstr(", "); out_cstr(reg32(si)); out_char(10); }
-        else { out_cstr("  mov "); out_cstr(reg32(si)); out_cstr(", "); out_cstr(reg32(si)); out_char(10); }
+        if (sgn == 1) { eo.out_cstr("  movsxd "); eo.out_cstr(scr); eo.out_cstr(", "); eo.out_cstr(eo.reg32(si)); eo.out_char(10); }
+        else { eo.out_cstr("  mov "); eo.out_cstr(eo.reg32(si)); eo.out_cstr(", "); eo.out_cstr(eo.reg32(si)); eo.out_char(10); }
     } else if (to_sz == 2) {
-        if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-        out_cstr(scr); out_cstr(", "); out_cstr(reg16(si)); out_char(10);
+        if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+        eo.out_cstr(scr); eo.out_cstr(", "); eo.out_cstr(eo.reg16(si)); eo.out_char(10);
     } else if (to_sz == 1) {
-        if (sgn == 1) { out_cstr("  movsx "); } else { out_cstr("  movzx "); }
-        out_cstr(scr); out_cstr(", "); out_cstr(reg8(si)); out_char(10);
+        if (sgn == 1) { eo.out_cstr("  movsx "); } else { eo.out_cstr("  movzx "); }
+        eo.out_cstr(scr); eo.out_cstr(", "); eo.out_cstr(eo.reg8(si)); eo.out_char(10);
     }
     store_op(inst.dest.vreg, ctx, scr);
 }
@@ -1146,49 +864,49 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             let is i32 as fsz = get_type_size(inst.cast_to);
             if (fsz == 4) {
                 // f32: load as f64, convert to f32 for C ABI
-                out_cstr("  movq xmm");
-                out_int(cast(i64, idx));
-                out_cstr(", rax\n");
-                out_cstr("  cvtsd2ss xmm");
-                out_int(cast(i64, idx));
-                out_cstr(", xmm");
-                out_int(cast(i64, idx));
-                out_char(10);
+                eo.out_cstr("  movq xmm");
+                eo.out_int(cast(i64, idx));
+                eo.out_cstr(", rax\n");
+                eo.out_cstr("  cvtsd2ss xmm");
+                eo.out_int(cast(i64, idx));
+                eo.out_cstr(", xmm");
+                eo.out_int(cast(i64, idx));
+                eo.out_char(10);
             } else {
                 // f64: movq xmmN, rax
-                out_cstr("  movq xmm");
-                out_int(cast(i64, idx));
-                out_cstr(", rax\n");
+                eo.out_cstr("  movq xmm");
+                eo.out_int(cast(i64, idx));
+                eo.out_cstr(", rax\n");
             }
         } else if (idx < 6) {
-            load_op(inst.src1.vreg, ctx, arg_reg64(idx));
+            load_op(inst.src1.vreg, ctx, eo.arg_reg64(idx));
         } else {
             load_op(inst.src1.vreg, ctx, "rax");
-            out_line("push rax");
+            eo.out_line("push rax");
         }
         return;
     }
     if (op == d.IR_GET_ARG) {
         let is i32 as idx = cast(i32, inst.src1.imm);
         if (idx < 6) {
-            store_op(inst.dest.vreg, ctx, arg_reg64(idx));
+            store_op(inst.dest.vreg, ctx, eo.arg_reg64(idx));
         } else {
             let is i64 as off = 16 + cast(i64, idx - 6) * 8;
             let is *u8 as scr = get_scratch(inst.dest.vreg, ctx);
-            out_cstr("  mov "); out_cstr(scr); out_cstr(", QWORD PTR [rbp+");
-            out_int(off);
-            out_cstr("]\n");
+            eo.out_cstr("  mov "); eo.out_cstr(scr); eo.out_cstr(", QWORD PTR [rbp+");
+            eo.out_int(off);
+            eo.out_cstr("]\n");
             store_op(inst.dest.vreg, ctx, scr);
         }
         return;
     }
     if (op == d.IR_SET_SYS_ARG) {
         let is i32 as idx = cast(i32, inst.dest.imm);
-        load_op(inst.src1.vreg, ctx, syscall_reg(idx));
+        load_op(inst.src1.vreg, ctx, eo.syscall_reg(idx));
         return;
     }
     if (op == d.IR_SYSCALL) {
-        out_line("syscall");
+        eo.out_line("syscall");
         store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
@@ -1196,31 +914,31 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         if (inst.is_variadic_call == 1) {
             let is i32 as xmm_n = cast(i32, inst.src1.imm);
             if (xmm_n > 0) {
-                out_cstr("  mov eax, ");
-                out_int(cast(i64, xmm_n));
-                out_char(10);
+                eo.out_cstr("  mov eax, ");
+                eo.out_int(cast(i64, xmm_n));
+                eo.out_char(10);
             } else {
-                out_line("xor eax, eax");
+                eo.out_line("xor eax, eax");
             }
         }
-        out_cstr("  call ");
-        out_str(inst.call_name_ptr, inst.call_name_len);
-        out_char(10);
+        eo.out_cstr("  call ");
+        eo.out_str(inst.call_name_ptr, inst.call_name_len);
+        eo.out_char(10);
         // Handle return type ABI (only for extern calls — internal calls return in rax)
         if (cast(i64, inst.cast_to) != 0 && inst.is_extern_call == 1) {
             let is i32 as ret_sz = get_type_size(inst.cast_to);
             if (is_float_type(inst.cast_to) == 1) {
                 if (ret_sz == 4) {
-                    out_line("cvtss2sd xmm0, xmm0");
+                    eo.out_line("cvtss2sd xmm0, xmm0");
                 }
                 // extern fn returns float in xmm0 — move to rax for internal ABI
-                out_line("movq rax, xmm0");
+                eo.out_line("movq rax, xmm0");
             } else if (ret_sz == 1) {
-                if (is_signed_type(inst.cast_to) == 1) { out_line("movsx rax, al"); }
-                else { out_line("movzx eax, al"); }
+                if (is_signed_type(inst.cast_to) == 1) { eo.out_line("movsx rax, al"); }
+                else { eo.out_line("movzx eax, al"); }
             } else if (ret_sz == 2) {
-                if (is_signed_type(inst.cast_to) == 1) { out_line("movsx rax, ax"); }
-                else { out_line("movzx eax, ax"); }
+                if (is_signed_type(inst.cast_to) == 1) { eo.out_line("movsx rax, ax"); }
+                else { eo.out_line("movzx eax, ax"); }
             }
         }
         store_op(inst.dest.vreg, ctx, "rax");
@@ -1229,23 +947,23 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // IR_VA_START
     let is i32 as num_args = cast(i32, inst.src2.imm);
     load_op(inst.src1.vreg, ctx, "rcx");
-    out_cstr("  mov DWORD PTR [rcx], ");
-    out_int(cast(i64, num_args) * 8);
-    out_char(10);
-    out_line("mov DWORD PTR [rcx+4], 48");
+    eo.out_cstr("  mov DWORD PTR [rcx], ");
+    eo.out_int(cast(i64, num_args) * 8);
+    eo.out_char(10);
+    eo.out_line("mov DWORD PTR [rcx+4], 48");
     let is i64 as overflow_off with mut = 16;
     if (num_args > 6) {
         overflow_off = 16 + cast(i64, num_args - 6) * 8;
     }
-    out_cstr("  lea rax, [rbp+");
-    out_int(overflow_off);
-    out_cstr("]\n");
-    out_line("mov QWORD PTR [rcx+8], rax");
-    out_cstr("  lea rax, [rbp-");
-    out_int(cast(i64, ctx.va_save_offset));
-    out_cstr("]\n");
-    out_line("mov QWORD PTR [rcx+16], rax");
-    if (al.al_opt_level >= 1) { rc_invalidate_reg(0); }
+    eo.out_cstr("  lea rax, [rbp+");
+    eo.out_int(overflow_off);
+    eo.out_cstr("]\n");
+    eo.out_line("mov QWORD PTR [rcx+8], rax");
+    eo.out_cstr("  lea rax, [rbp-");
+    eo.out_int(cast(i64, ctx.va_save_offset));
+    eo.out_cstr("]\n");
+    eo.out_line("mov QWORD PTR [rcx+16], rax");
+    if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
 }
 
 // === Instruction selection: use counts + pattern matching on IR ===
@@ -1373,11 +1091,11 @@ fn size_name(sz as i32) as *u8 {
 }
 
 fn size_reg(idx as i32, sz as i32) as *u8 {
-    if (sz == 8) { return reg64(idx); }
-    if (sz == 4) { return reg32(idx); }
-    if (sz == 2) { return reg16(idx); }
-    if (sz == 1) { return reg8(idx); }
-    return reg64(idx);
+    if (sz == 8) { return eo.reg64(idx); }
+    if (sz == 4) { return eo.reg32(idx); }
+    if (sz == 2) { return eo.reg16(idx); }
+    if (sz == 1) { return eo.reg8(idx); }
+    return eo.reg64(idx);
 }
 
 // Pattern: IR_IMM v=const + IR_STORE [addr]=v → mov PTR [addr], const
@@ -1396,11 +1114,11 @@ fn try_fuse_imm_store(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     if (sz > 8) { return 0; }
     // Emit: mov SIZE PTR [addr_reg], imm
     load_op(nx.dest.vreg, ctx, "rcx");
-    out_cstr("  mov ");
-    out_cstr(size_name(sz));
-    out_cstr(" [rcx], ");
-    out_int(val);
-    out_char(10);
+    eo.out_cstr("  mov ");
+    eo.out_cstr(size_name(sz));
+    eo.out_cstr(" [rcx], ");
+    eo.out_int(val);
+    eo.out_char(10);
     nx.is_dead = 1;
     return 1;
 }
@@ -1419,13 +1137,13 @@ fn try_fuse_imm_store_stack(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     let is i32 as sz = get_type_size(nx.cast_to);
     if (sz > 8) { return 0; }
     // Emit: mov SIZE PTR [rbp-off], imm
-    out_cstr("  mov ");
-    out_cstr(size_name(sz));
-    out_cstr(" [rbp-");
-    out_int(nx.dest.imm);
-    out_cstr("], ");
-    out_int(val);
-    out_char(10);
+    eo.out_cstr("  mov ");
+    eo.out_cstr(size_name(sz));
+    eo.out_cstr(" [rbp-");
+    eo.out_int(nx.dest.imm);
+    eo.out_cstr("], ");
+    eo.out_int(val);
+    eo.out_char(10);
     nx.is_dead = 1;
     return 1;
 }
@@ -1450,14 +1168,14 @@ fn try_fuse_inc_stack(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     let is i32 as sz = get_type_size(inst.cast_to);
     if (sz > 8) { return 0; }
     // Emit: add/sub SIZE PTR [rbp-X], imm
-    if (nx.op == d.IR_ADD) { out_cstr("  add "); }
-    else { out_cstr("  sub "); }
-    out_cstr(size_name(sz));
-    out_cstr(" [rbp-");
-    out_int(inst.src1.imm);
-    out_cstr("], ");
-    out_int(addval);
-    out_char(10);
+    if (nx.op == d.IR_ADD) { eo.out_cstr("  add "); }
+    else { eo.out_cstr("  sub "); }
+    eo.out_cstr(size_name(sz));
+    eo.out_cstr(" [rbp-");
+    eo.out_int(inst.src1.imm);
+    eo.out_cstr("], ");
+    eo.out_int(addval);
+    eo.out_char(10);
     // Mark consumed instructions dead but keep them for vreg tracking
     nx.is_dead = 1;
     nx2.is_dead = 1;
@@ -1476,14 +1194,14 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY) {
             let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
             if (dest_loc >= 0) {
-                rc_invalidate_reg(dest_loc);
+                eo.rc_invalidate_reg(dest_loc);
             }
             // Also invalidate any cached entry for this vreg (it's being redefined)
-            rc_invalidate_vreg(inst.dest.vreg);
+            eo.rc_invalidate_vreg(inst.dest.vreg);
         }
 
         // Full invalidation on calls (all caller-saved regs clobbered)
-        if (op == d.IR_CALL || op == d.IR_SYSCALL) { ph_invalidate(); }
+        if (op == d.IR_CALL || op == d.IR_SYSCALL) { eo.ph_invalidate(); }
 
         // Instruction selection: try fused patterns before standard emission
         if (op == d.IR_IMM) {

@@ -1,0 +1,298 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../ir/defs.cst" as d;
+use "alloc_core.cst" as al;
+use "alloc_gc.cst" as gc;
+
+// === Output buffer ===
+let is *u8 as out_buf with mut;
+let is i64 as out_len with mut;
+let is i64 as out_cap with mut;
+let is i32 as out_fd with mut;
+
+// === Debug info ===
+let is *u8 as cg_filename with mut;
+let is i32 as cg_filename_len with mut;
+
+// === Simple peephole for -O0: skip redundant reload after store ===
+let is i32 as ph_vreg with mut = 99999;
+let is i32 as ph_ridx with mut = 99999;
+
+// === Register cache: track which phys reg holds which spilled vreg ===
+// rc_vreg[reg_idx] = vreg currently cached in that register (99999 = empty)
+// Only tracks SPILLED vregs (register-allocated vregs don't need caching).
+let is [16]i32 as rc_vreg with mut;
+
+fn rc_init() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
+}
+
+fn ph_invalidate() as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { rc_vreg[i] = 99999; i = i + 1; }
+}
+
+// Invalidate a specific register (e.g., when it's overwritten)
+fn rc_invalidate_reg(idx as i32) as void {
+    if (idx >= 0 && idx < 16) { rc_vreg[idx] = 99999; }
+}
+
+// Record that phys reg idx now holds spilled vreg
+fn rc_set(idx as i32, vreg as i32) as void {
+    if (idx >= 0 && idx < 16) { rc_vreg[idx] = vreg; }
+}
+
+// Find which register holds a given vreg. Returns reg idx or -1.
+fn rc_find(vreg as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 16) {
+        if (rc_vreg[i] == vreg) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Invalidate all entries for a vreg (when it's redefined)
+fn rc_invalidate_vreg(vreg as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) {
+        if (rc_vreg[i] == vreg) { rc_vreg[i] = 99999; }
+        i = i + 1;
+    }
+}
+
+fn reg_name_to_idx(name as *u8) as i32 {
+    if (name[0] == 114) {
+        // r...
+        if (name[1] == 97) { return 0; } // rax
+        if (name[1] == 99) { return 1; } // rcx
+        if (name[1] == 100 && name[2] == 105) { return 5; } // rdi (check before rdx!)
+        if (name[1] == 100) { return 2; } // rdx
+        if (name[1] == 98) { return 3; } // rbx
+        if (name[1] == 115) { return 4; } // rsi
+        if (name[1] == 49 && name[2] == 53) { return 15; } // r15
+        if (name[1] == 49 && name[2] == 52) { return 12; } // r14 → idx 12
+        if (name[1] == 49 && name[2] == 51) { return 11; } // r13 → idx 11
+        if (name[1] == 49 && name[2] == 50) { return 10; } // r12 → idx 10
+        if (name[1] == 49 && name[2] == 49) { return 9; } // r11 → idx 9
+        if (name[1] == 49 && name[2] == 48) { return 8; } // r10 → idx 8
+        if (name[1] == 56) { return 6; }  // r8 → idx 6
+        if (name[1] == 57) { return 7; }  // r9 → idx 7
+    }
+    return 99999;
+}
+
+// === Per-function profiling ===
+// Each entry: name_ptr(8) + name_len(4) + vregs(4) + time_us(8) = 24 bytes
+let is i64 as cg_prof_buf with mut = 0;   // ptr to buffer
+let is i32 as cg_prof_count with mut = 0;
+let is i32 as cg_prof_max with mut = 0;
+let is i32 as cg_prof_enabled with mut = 0;
+
+fn cg_prof_init(max_entries as i32) as void {
+    cg_prof_buf = cast(i64, mem.galloc(cast(i64, max_entries) * 24));
+    cg_prof_count = 0;
+    cg_prof_max = max_entries;
+    cg_prof_enabled = 1;
+}
+
+fn cg_prof_get_time_us() as i64 {
+    let is [2]i64 as ts;
+    syscall(228, 1, &ts);
+    return ts[0] * 1000000 + ts[1] / 1000;
+}
+
+fn cg_prof_record(name_ptr as *u8, name_len as i32, vregs as i32, time_us as i64) as void {
+    if (cg_prof_count >= cg_prof_max) { return; }
+    let is i64 as off = cast(i64, cg_prof_count) * 24;
+    let is *i64 as p0 = cast(*i64, cg_prof_buf + off);
+    *p0 = cast(i64, name_ptr);
+    let is *i32 as p1 = cast(*i32, cg_prof_buf + off + 8);
+    *p1 = name_len;
+    let is *i32 as p2 = cast(*i32, cg_prof_buf + off + 12);
+    *p2 = vregs;
+    let is *i64 as p3 = cast(*i64, cg_prof_buf + off + 16);
+    *p3 = time_us;
+    cg_prof_count = cg_prof_count + 1;
+}
+
+fn out_init(fd as i32) as void {
+    out_cap = 4194304; // 4MB
+    out_buf = mem.galloc(out_cap);
+    out_len = 0;
+    out_fd = fd;
+}
+
+fn out_flush() as void {
+    if (out_len > 0) {
+        linux.write(cast(i64, out_fd), out_buf, out_len);
+        out_len = 0;
+    }
+}
+
+fn out_ensure(n as i64) as void {
+    if (out_len + n >= out_cap) {
+        out_flush();
+    }
+}
+
+fn out_char(c as u8) as void {
+    out_ensure(1);
+    out_buf[out_len] = c;
+    out_len = out_len + 1;
+}
+
+fn out_str(s as *u8, n as i32) as void {
+    out_ensure(cast(i64, n));
+    mem.memcpy(cast(*u8, cast(i64, out_buf) + out_len), s, cast(i64, n));
+    out_len = out_len + cast(i64, n);
+}
+
+fn out_cstr(s as *u8) as void {
+    let is i32 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    out_str(s, i);
+}
+
+fn out_int(n as i64) as void {
+    if (n == 0) { out_char(48); return; }
+    let is i64 as val with mut = n;
+    let is i32 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    let is [24]u8 as buf;
+    let is i32 as pos with mut = 23;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    out_str(cast(*u8, cast(i64, &buf) + cast(i64, pos) + 1), 23 - pos);
+}
+
+fn out_line(s as *u8) as void {
+    out_cstr("  ");
+    out_cstr(s);
+    out_char(10);
+}
+
+fn out_line2(a as *u8, b as *u8) as void {
+    out_cstr("  ");
+    out_cstr(a);
+    out_cstr(b);
+    out_char(10);
+}
+
+fn out_line3(a as *u8, b as *u8, c as *u8) as void {
+    out_cstr("  ");
+    out_cstr(a);
+    out_cstr(b);
+    out_cstr(c);
+    out_char(10);
+}
+
+// === Register name tables ===
+// regs[0..11] = rax,rcx,rdx,rbx,rsi,rdi,r8,r9,r10,r11,r12,r13
+
+fn reg64(idx as i32) as *u8 {
+    if (idx == 0) { return "rax"; }
+    if (idx == 1) { return "rcx"; }
+    if (idx == 2) { return "rdx"; }
+    if (idx == 3) { return "rbx"; }
+    if (idx == 4) { return "rsi"; }
+    if (idx == 5) { return "rdi"; }
+    if (idx == 6) { return "r8"; }
+    if (idx == 7) { return "r9"; }
+    if (idx == 8) { return "r10"; }
+    if (idx == 9) { return "r11"; }
+    if (idx == 10) { return "r12"; }
+    if (idx == 11) { return "r13"; }
+    if (idx == 12) { return "r14"; }
+    if (idx == 15) { return "r15"; }
+    return "rax";
+}
+
+fn reg32(idx as i32) as *u8 {
+    if (idx == 0) { return "eax"; }
+    if (idx == 1) { return "ecx"; }
+    if (idx == 2) { return "edx"; }
+    if (idx == 3) { return "ebx"; }
+    if (idx == 4) { return "esi"; }
+    if (idx == 5) { return "edi"; }
+    if (idx == 6) { return "r8d"; }
+    if (idx == 7) { return "r9d"; }
+    if (idx == 8) { return "r10d"; }
+    if (idx == 9) { return "r11d"; }
+    if (idx == 10) { return "r12d"; }
+    if (idx == 11) { return "r13d"; }
+    if (idx == 12) { return "r14d"; }
+    if (idx == 15) { return "r15d"; }
+    return "eax";
+}
+
+fn reg16(idx as i32) as *u8 {
+    if (idx == 0) { return "ax"; }
+    if (idx == 1) { return "cx"; }
+    if (idx == 2) { return "dx"; }
+    if (idx == 3) { return "bx"; }
+    if (idx == 4) { return "si"; }
+    if (idx == 5) { return "di"; }
+    if (idx == 6) { return "r8w"; }
+    if (idx == 7) { return "r9w"; }
+    if (idx == 8) { return "r10w"; }
+    if (idx == 9) { return "r11w"; }
+    if (idx == 10) { return "r12w"; }
+    if (idx == 11) { return "r13w"; }
+    if (idx == 12) { return "r14w"; }
+    if (idx == 15) { return "r15w"; }
+    return "ax";
+}
+
+fn reg8(idx as i32) as *u8 {
+    if (idx == 0) { return "al"; }
+    if (idx == 1) { return "cl"; }
+    if (idx == 2) { return "dl"; }
+    if (idx == 3) { return "bl"; }
+    if (idx == 4) { return "sil"; }
+    if (idx == 5) { return "dil"; }
+    if (idx == 6) { return "r8b"; }
+    if (idx == 7) { return "r9b"; }
+    if (idx == 8) { return "r10b"; }
+    if (idx == 9) { return "r11b"; }
+    if (idx == 10) { return "r12b"; }
+    if (idx == 11) { return "r13b"; }
+    if (idx == 12) { return "r14b"; }
+    if (idx == 15) { return "r15b"; }
+    return "al";
+}
+
+fn arg_reg64(idx as i32) as *u8 {
+    if (idx == 0) { return "rdi"; }
+    if (idx == 1) { return "rsi"; }
+    if (idx == 2) { return "rdx"; }
+    if (idx == 3) { return "rcx"; }
+    if (idx == 4) { return "r8"; }
+    if (idx == 5) { return "r9"; }
+    return "rax";
+}
+
+fn syscall_reg(idx as i32) as *u8 {
+    if (idx == 0) { return "rax"; }
+    if (idx == 1) { return "rdi"; }
+    if (idx == 2) { return "rsi"; }
+    if (idx == 3) { return "rdx"; }
+    if (idx == 4) { return "r10"; }
+    if (idx == 5) { return "r8"; }
+    if (idx == 6) { return "r9"; }
+    return "rax";
+}
+
+struct AddrMode {
+    base_vreg as i32;
+    index_vreg as i32;
+    scale as i32;
+    matched as i32;
+}
