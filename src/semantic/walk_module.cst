@@ -1,0 +1,448 @@
+use "../../std/mem.cst" as mem;
+use "../../std/linux.cst" as linux;
+use "defs.cst" as d;
+use "scope.cst" as sc;
+use "types.cst" as ty;
+use "generics.cst" as gn;
+use "modules.cst" as mod;
+use "../../std/io.cst" as io;
+use "../parser/ast.cst" as ast;
+use "../lexer/tokens.cst" as tok;
+use "../lexer/lexer.cst" as lex;
+use "../parser/top.cst" as top;
+use "walk.cst" as w;
+
+// Only-filter state for submodule building
+let is *u8 as current_only_names with mut;
+let is i32 as current_only_count with mut = 0;
+
+fn is_in_only_list(name_ptr as *u8, name_len as i32, only_names as *u8, only_count as i32) as i32 {
+    if (only_count == 0) { return 1; }
+    let is i32 as i with mut = 0;
+    while (i < only_count) {
+        let is *i64 as pp = cast(*i64, cast(i64, only_names) + cast(i64, i) * 12);
+        let is *i32 as lp = cast(*i32, cast(i64, only_names) + cast(i64, i) * 12 + 8);
+        if (d.str_eq(name_ptr, name_len, cast(*u8, *pp), *lp) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
+    let is i32 as raw_len with mut = 0;
+    let is *u8 as raw_path with mut = cast(*u8, 0);
+    if (n.member_len > 0) {
+        raw_path = mod.strip_quotes(n.name_ptr, n.name_len, &raw_len);
+    }
+    if (raw_len == 0) { return; }
+
+    let is i32 as norm_len with mut = 0;
+    let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
+    let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
+    let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
+
+    // Save state
+    let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
+    let is i32 as old_plen = sc.current_mod_prefix_len;
+    let is *u8 as old_dir = sc.current_source_dir_ptr;
+    let is i32 as old_dir_len = sc.current_source_dir_len;
+    sc.current_mod_prefix_ptr = prefix;
+    sc.current_mod_prefix_len = plen;
+
+    // Pass 1: register_structs — load module if not cached
+    if (pass_id == 1) {
+        let is *d.Module as cached = mod.find_module(prefix, plen);
+        if (cast(i64, cached) == 0) {
+            let is *u8 as body = w.load_module(raw_path, raw_len);
+            n.body = cast(*ast.Node, body);
+            if (n.member_len > 0) {
+                let is *d.Module as mm = d.new_module();
+                mm.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+                mm.name_len = n.member_len;
+                mm.prefix_ptr = d.str_dup(prefix, plen);
+                mm.prefix_len = plen;
+                mm.body = body;
+                mm.src_ptr = mod.last_loaded_src;
+                mm.src_size = mod.last_loaded_src_len;
+                mm.token_list = mod.last_loaded_tl;
+                let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
+                if (sd_len > 0) {
+                    mm.source_dir_ptr = d.str_dup(norm, sd_len);
+                    mm.source_dir_len = sd_len;
+                }
+                mm.next = mod.module_list;
+                mod.module_list = mm;
+            }
+            register_structs(body);
+            // Build submodule list from nested use statements
+            let is *d.Module as parent_mm = mod.find_module(prefix, plen);
+            if (cast(i64, parent_mm) != 0) {
+                let is *u8 as prev_only = current_only_names;
+                let is i32 as prev_oc = current_only_count;
+                current_only_names = n.only_names;
+                current_only_count = n.only_count;
+                let is *ast.Node as child with mut = cast(*ast.Node, body);
+                while (cast(i64, child) != 0) {
+                    if (child.kind == ast.NK_USE && child.member_len > 0) {
+                        if (is_in_only_list(child.member_ptr, child.member_len, current_only_names, current_only_count) == 1) {
+                            let is i32 as crl with mut = 0;
+                            let is *u8 as crp = mod.strip_quotes(child.name_ptr, child.name_len, &crl);
+                            let is i32 as cnl with mut = 0;
+                            let is *u8 as cn = sc.resolve_module_path(crp, crl, &cnl);
+                            let is *u8 as cp = sc.get_mod_prefix(cn, cnl);
+                            let is i32 as cpl = sc.get_mod_prefix_len(cn, cnl);
+                            let is *d.Module as cm = mod.find_module(cp, cpl);
+                            if (cast(i64, cm) != 0) {
+                                let is *d.SubModule as sm = d.new_submodule();
+                                sm.alias_ptr = d.str_dup(child.member_ptr, child.member_len);
+                                sm.alias_len = child.member_len;
+                                sm.module_ref = cast(*u8, cm);
+                                sm.next = parent_mm.submodules;
+                                parent_mm.submodules = cast(*u8, sm);
+                                parent_mm.submodule_count = parent_mm.submodule_count + 1;
+                            }
+                        }
+                    }
+                    child = child.next;
+                }
+                current_only_names = prev_only;
+                current_only_count = prev_oc;
+            }
+        } else {
+            n.body = cast(*ast.Node, cached.body);
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+        }
+        sc.current_mod_prefix_ptr = old_prefix;
+        sc.current_mod_prefix_len = old_plen;
+        sc.current_source_dir_ptr = old_dir;
+        sc.current_source_dir_len = old_dir_len;
+        return;
+    }
+
+    // Pass 2: register_aliases — create scope, register module var
+    if (pass_id == 2) {
+        let is *d.Scope as outer_scope = sc.current_scope;
+        let is *d.Scope as mod_scope with mut = outer_scope;
+        let is *d.Module as existing with mut = cast(*d.Module, 0);
+
+        if (n.member_len > 0) {
+            existing = mod.find_module(prefix, plen);
+            if (cast(i64, existing) != 0 && cast(i64, existing.scope) != 0) {
+                mod_scope = existing.scope;
+            } else {
+                mod_scope = d.new_scope();
+                mod_scope.next_all = sc.all_scopes;
+                sc.all_scopes = mod_scope;
+                mod_scope.parent = sc.global_scope;
+                mod_scope.is_global = 1;
+                if (cast(i64, existing) != 0) {
+                    existing.scope = mod_scope;
+                }
+            }
+            sc.current_scope = mod_scope;
+        }
+
+        let is *d.Module as cached = mod.find_module(prefix, plen);
+        let is *u8 as mod_body with mut = cast(*u8, 0);
+        if (cast(i64, cached) != 0 && cast(i64, cached.body) != 0) {
+            mod_body = cached.body;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+        } else {
+            mod_body = w.load_module(raw_path, raw_len);
+        }
+        if (n.member_len > 0 && cast(i64, existing) == 0) {
+            let is *d.Module as modd = d.new_module();
+            modd.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+            modd.name_len = n.member_len;
+            modd.prefix_ptr = d.str_dup(prefix, plen);
+            modd.prefix_len = plen;
+            modd.scope = mod_scope;
+            modd.body = mod_body;
+            modd.src_ptr = mod.last_loaded_src;
+            modd.src_size = mod.last_loaded_src_len;
+            modd.token_list = mod.last_loaded_tl;
+            let is i32 as sd_len = sc.get_dir_len(norm, norm_len);
+            if (sd_len > 0) {
+                modd.source_dir_ptr = d.str_dup(norm, sd_len);
+                modd.source_dir_len = sd_len;
+            }
+            modd.next = mod.module_list;
+            mod.module_list = modd;
+            existing = modd;
+        }
+        register_aliases(mod_body);
+        sc.current_scope = outer_scope;
+        if (n.member_len > 0) {
+            let is *d.Variable as var = sc.declare_var(n.member_ptr, n.member_len, cast(*u8, ast.type_void), ast.VF_NONE);
+            var.is_module = 1;
+            var.module_ref = cast(*u8, existing);
+        }
+        sc.current_mod_prefix_ptr = old_prefix;
+        sc.current_mod_prefix_len = old_plen;
+        sc.current_source_dir_ptr = old_dir;
+        sc.current_source_dir_len = old_dir_len;
+        return;
+    }
+
+    // Passes 3-6: switch to module scope, recurse into cached body
+    let is *d.Scope as outer = sc.current_scope;
+    if (n.member_len > 0) {
+        let is *d.Variable as var = sc.lookup_var(n.member_ptr, n.member_len);
+        if (cast(i64, var) != 0 && var.is_module == 1) {
+            let is *d.Module as _mr = cast(*d.Module, var.module_ref);
+            sc.current_scope = _mr.scope;
+        }
+    }
+
+    let is *d.Module as cached = mod.find_module(prefix, plen);
+
+    if (pass_id == 3) {
+        if (cast(i64, cached) != 0) {
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            resolve_fields(cached.body);
+        }
+    }
+    if (pass_id == 4) {
+        if (cast(i64, cached) != 0 && cached.vars_done == 0) {
+            cached.vars_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            register_vars(cached.body);
+        }
+    }
+    if (pass_id == 5) {
+        if (cast(i64, cached) != 0) {
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            register_fns(cached.body);
+        }
+    }
+    if (pass_id == 6) {
+        let is *u8 as old_sem_src = sc.sem_src;
+        let is i64 as old_sem_src_len = sc.sem_src_len;
+        let is *u8 as old_sem_fn = sc.sem_filename;
+        let is *u8 as old_sem_tl = sc.sem_token_list;
+        if (cast(i64, cached) != 0 && cached.bodies_done == 0) {
+            cached.bodies_done = 1;
+            sc.current_source_dir_ptr = cached.source_dir_ptr;
+            sc.current_source_dir_len = cached.source_dir_len;
+            if (cast(i64, cached.src_ptr) != 0) {
+                sc.sem_src = cached.src_ptr;
+                sc.sem_src_len = cached.src_size;
+                sc.sem_token_list = cached.token_list;
+            }
+            sc.sem_filename = cached.name_ptr;
+            analyze_bodies(cached.body);
+        }
+        sc.sem_src = old_sem_src;
+        sc.sem_src_len = old_sem_src_len;
+        sc.sem_filename = old_sem_fn;
+        sc.sem_token_list = old_sem_tl;
+    }
+
+    sc.current_scope = outer;
+    sc.current_mod_prefix_ptr = old_prefix;
+    sc.current_mod_prefix_len = old_plen;
+    sc.current_source_dir_ptr = old_dir;
+    sc.current_source_dir_len = old_dir_len;
+}
+
+fn register_structs(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 1);
+        } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0) {
+            if (n.ty.kind == ast.TY_STRUCT) {
+                if (n.generic_param_count > 0) {
+                    n.ty.gen_params = n.generic_params;
+                    n.ty.gen_param_count = n.generic_param_count;
+                    n.ty.fields = cast(*u8, n.stmts);
+                    gn.store_template(n.ty.name_ptr, n.ty.name_len, n.generic_params, n.generic_param_count, cast(*u8, 0), cast(*u8, n.ty), 0);
+                } else {
+                    n.ty.fields = cast(*u8, n.stmts);
+                    if (sc.current_mod_prefix_len > 0) {
+                        let is i32 as mlen with mut = 0;
+                        let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.ty.name_ptr, n.ty.name_len, &mlen);
+                        ty.declare_struct(mangled, mlen, cast(*u8, n.ty));
+                    } else {
+                        ty.declare_struct(n.ty.name_ptr, n.ty.name_len, cast(*u8, n.ty));
+                    }
+                }
+            } else if (n.ty.kind == ast.TY_ENUM) {
+                n.ty.fields = cast(*u8, n.stmts);
+                if (n.generic_param_count > 0) {
+                    n.ty.gen_params = n.generic_params;
+                    n.ty.gen_param_count = n.generic_param_count;
+                    gn.store_template(n.ty.name_ptr, n.ty.name_len, n.generic_params, n.generic_param_count, cast(*u8, 0), cast(*u8, n.ty), 0);
+                } else {
+                    if (sc.current_mod_prefix_len > 0) {
+                        let is i32 as mlen with mut = 0;
+                        let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.ty.name_ptr, n.ty.name_len, &mlen);
+                        ty.declare_enum(mangled, mlen, cast(*u8, n.ty));
+                    } else {
+                        ty.declare_enum(n.ty.name_ptr, n.ty.name_len, cast(*u8, n.ty));
+                    }
+                }
+            }
+        }
+        n = n.next;
+    }
+}
+
+fn register_aliases(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 2);
+        } else if (n.kind == ast.NK_TYPE_ALIAS) {
+            w.resolve_type(cast(*u8, n.ty));
+            if (sc.current_mod_prefix_len > 0) {
+                let is i32 as mlen with mut = 0;
+                let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.name_ptr, n.name_len, &mlen);
+                ty.declare_type_alias(mangled, mlen, cast(*u8, n.ty));
+            } else {
+                ty.declare_type_alias(n.name_ptr, n.name_len, cast(*u8, n.ty));
+            }
+        }
+        n = n.next;
+    }
+}
+
+fn resolve_fields(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 3);
+        } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_STRUCT) {
+            if (n.generic_param_count == 0) {
+                let is i32 as offset with mut = 0;
+                let is *ast.Node as f with mut = cast(*ast.Node, n.ty.fields);
+                while (cast(i64, f) != 0) {
+                    w.resolve_type(cast(*u8, f.ty));
+                    f.var_offset = offset;
+                    offset = offset + f.ty.size;
+                    f = f.next;
+                }
+                n.ty.size = offset;
+            }
+        } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_ENUM) {
+            // Enum layout computed in declare_enum
+        }
+        n = n.next;
+    }
+}
+
+fn register_vars(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 4);
+        } else if (n.kind == ast.NK_LET) {
+            w.walk(n);
+        }
+        n = n.next;
+    }
+}
+
+fn register_fns(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 5);
+        } else if (n.kind == ast.NK_FN) {
+            if (n.generic_param_count == 0) {
+                let is *ast.Node as p with mut = n.params;
+                while (cast(i64, p) != 0) {
+                    w.resolve_type(cast(*u8, p.ty));
+                    p = p.next;
+                }
+                w.resolve_type(cast(*u8, n.return_type));
+                let is i32 as pc with mut = 0;
+                p = n.params;
+                while (cast(i64, p) != 0) { pc = pc + 1; p = p.next; }
+                let is *u8 as pt = d.pt_alloc(pc);
+                let is i32 as i with mut = 0;
+                p = n.params;
+                while (cast(i64, p) != 0) {
+                    d.pt_set(pt, i, cast(*u8, p.ty));
+                    i = i + 1;
+                    p = p.next;
+                }
+                sc.declare_fn(n.name_ptr, n.name_len, cast(*u8, n.return_type), pt, pc, n.is_variadic, n.is_extern);
+            } else {
+                gn.store_template(n.name_ptr, n.name_len, n.generic_params, n.generic_param_count, cast(*u8, n), cast(*u8, 0), 1);
+            }
+        }
+        n = n.next;
+    }
+}
+
+fn analyze_bodies(node as *u8) as void {
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE) {
+            visit_use_module(n, 6);
+        } else if (n.kind == ast.NK_FN) {
+            if (n.generic_param_count == 0 && n.is_extern == 0) {
+                w.walk(n);
+            }
+        }
+        n = n.next;
+    }
+}
+
+// === Entry point ===
+
+fn set_stdlib_dir(ptr as *u8, slen as i32) as void {
+    sc.stdlib_dir_ptr = ptr;
+    sc.stdlib_dir_len = slen;
+}
+
+fn set_extra_paths(paths as *i64, count as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < count && i < 16) {
+        sc.extra_search_paths[i] = paths[i];
+        i = i + 1;
+    }
+    sc.extra_search_path_count = count;
+}
+
+fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, src_len as i64, tl as *u8) as void {
+    sc.symtab_init();
+    ty.types_init();
+    gn.generics_init();
+    mod.modules_init();
+
+    // Set error reporting context
+    sc.sem_src = src;
+    sc.sem_src_len = src_len;
+    sc.sem_filename = filename_ptr;
+    sc.sem_token_list = tl;
+
+    // Set initial source directory from filename
+    let is i32 as dir_len = sc.get_dir_len(filename_ptr, filename_len);
+    if (dir_len > 0) {
+        sc.current_source_dir_ptr = d.str_dup(filename_ptr, dir_len);
+        sc.current_source_dir_len = dir_len;
+    }
+
+    // Find ast_tail
+    gn.ast_tail = cast(*ast.Node, root);
+    if (cast(i64, gn.ast_tail) != 0) {
+        while (cast(i64, gn.ast_tail.next) != 0) {
+            gn.ast_tail = gn.ast_tail.next;
+        }
+    }
+
+    // 6 passes
+    register_structs(root);
+    register_aliases(root);
+    resolve_fields(root);
+    register_vars(root);
+    register_fns(root);
+    analyze_bodies(root);
+}
