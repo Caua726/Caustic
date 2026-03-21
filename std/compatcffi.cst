@@ -6,6 +6,8 @@
 
 use "mem.cst" as mem;
 use "string.cst" as string;
+use "linux.cst" as linux;
+use "io.cst" as io;
 
 // --- Section 1: C Type Size Constants (x86_64 Linux) ---
 
@@ -61,6 +63,38 @@ fn align_up(val as i64, align as i64) as i64 {
     }
     return val;
 }
+
+// --- Byte Order ---
+
+fn bswap16(val as i64) as i64 {
+    return ((val & 255) << 8) + ((val >> 8) & 255);
+}
+
+fn bswap32(val as i64) as i64 {
+    let is i64 as b0 = (val & 255) << 24;
+    let is i64 as b1 = ((val >> 8) & 255) << 16;
+    let is i64 as b2 = ((val >> 16) & 255) << 8;
+    let is i64 as b3 = (val >> 24) & 255;
+    return b0 + b1 + b2 + b3;
+}
+
+fn bswap64(val as i64) as i64 {
+    let is i64 as b0 = (val & 255) << 56;
+    let is i64 as b1 = ((val >> 8) & 255) << 48;
+    let is i64 as b2 = ((val >> 16) & 255) << 40;
+    let is i64 as b3 = ((val >> 24) & 255) << 32;
+    let is i64 as b4 = ((val >> 32) & 255) << 24;
+    let is i64 as b5 = ((val >> 40) & 255) << 16;
+    let is i64 as b6 = ((val >> 48) & 255) << 8;
+    let is i64 as b7 = (val >> 56) & 255;
+    return b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7;
+}
+
+// x86_64 is little-endian, network is big-endian
+fn htons(val as i64) as i64 { return bswap16(val); }
+fn htonl(val as i64) as i64 { return bswap32(val); }
+fn ntohs(val as i64) as i64 { return bswap16(val); }
+fn ntohl(val as i64) as i64 { return bswap32(val); }
 
 fn field_get(cs as *CStruct, idx as i64) as *CField {
     return cast(*CField, cast(i64, cs.fields) + idx * sizeof(CField));
@@ -140,6 +174,10 @@ fn add_bytes(cs as *CStruct, fsize as i64, falign as i64) as void {
     add_field(cs, fsize, falign, 1);
 }
 
+fn add_union(cs as *CStruct, u as *CUnion) as void {
+    add_field(cs, u.total_size, u.max_align, 1);
+}
+
 // Finalize: apply tail padding
 fn finish(cs as *CStruct) as void {
     if (cs.field_count == 0) {
@@ -149,6 +187,20 @@ fn finish(cs as *CStruct) as void {
     let is *CField as last = field_get(cs, cast(i64, cs.field_count) - 1);
     let is i64 as raw_end = last.offset + last.size * last.count;
     cs.total_size = align_up(raw_end, cs.max_align);
+}
+
+fn clone_struct(src as *CStruct) as CStruct {
+    let is CStruct as dst;
+    dst.field_count = src.field_count;
+    dst.field_cap = src.field_cap;
+    dst.total_size = src.total_size;
+    dst.max_align = src.max_align;
+
+    let is i64 as data_size = cast(i64, src.field_cap) * sizeof(CField);
+    dst.fields = mem.galloc(data_size);
+    mem.memcpy(dst.fields, src.fields, cast(i64, src.field_count) * sizeof(CField));
+
+    return dst;
 }
 
 // --- Section 5: CStruct — Instances ---
@@ -345,6 +397,50 @@ fn get_array_ptr(buf as *u8, cs as *CStruct, field_idx as i64, arr_idx as i64) a
     let is *CField as f = field_get(cs, field_idx);
     let is *i64 as p = cast(*i64, cast(i64, buf) + f.offset + arr_idx * 8);
     return cast(*u8, *p);
+}
+
+// --- String <-> Field ---
+
+fn strncpy_to_field(buf as *u8, cs as *CStruct, field_idx as i64, src as *u8, max_len as i64) as void {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *u8 as dst = cast(*u8, cast(i64, buf) + f.offset);
+    let is i64 as limit = f.size * f.count;
+    if (max_len < limit) { limit = max_len; }
+
+    let is i64 as i with mut = 0;
+    while (i < limit && src[i] != 0) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    // Null-fill remainder
+    while (i < f.size * f.count) {
+        dst[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn field_to_string(buf as *u8, cs as *CStruct, field_idx as i64) as string.String {
+    let is *CField as f = field_get(cs, field_idx);
+    let is *u8 as src = cast(*u8, cast(i64, buf) + f.offset);
+    let is i64 as max_len = f.size * f.count;
+
+    // Find null terminator or end
+    let is i64 as len with mut = 0;
+    while (len < max_len && src[len] != 0) {
+        len = len + 1;
+    }
+
+    let is string.String as s;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, len);
+    if (len > 0) {
+        s.ptr = mem.galloc(len + 1);
+        mem.memcpy(s.ptr, src, len);
+        s.ptr[len] = cast(u8, 0);
+    } else {
+        s.ptr = cast(*u8, 0);
+    }
+    return s;
 }
 
 // --- Section 8: CUnion ---
@@ -596,4 +692,82 @@ fn ptr_get_ptr(ptr as *u8, index as i64) as *u8 {
 fn ptr_set_ptr(ptr as *u8, index as i64, val as *u8) as void {
     let is *i64 as p = cast(*i64, cast(i64, ptr) + index * 8);
     *p = cast(i64, val);
+}
+
+// --- Debug ---
+
+fn dump_layout(cs as *CStruct) as void {
+    io.write_str(linux.STDOUT, "CStruct layout:\n");
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, cs.field_count)) {
+        let is *CField as f = field_get(cs, i);
+        io.write_str(linux.STDOUT, "  field ");
+        io.write_int(linux.STDOUT, i);
+        io.write_str(linux.STDOUT, ": offset=");
+        io.write_int(linux.STDOUT, f.offset);
+        io.write_str(linux.STDOUT, " size=");
+        io.write_int(linux.STDOUT, f.size);
+        io.write_str(linux.STDOUT, " align=");
+        io.write_int(linux.STDOUT, f.align);
+        io.write_str(linux.STDOUT, " count=");
+        io.write_int(linux.STDOUT, f.count);
+        linux.write(linux.STDOUT, "\n", 1);
+        i = i + 1;
+    }
+    io.write_str(linux.STDOUT, "  total_size=");
+    io.write_int(linux.STDOUT, cs.total_size);
+    io.write_str(linux.STDOUT, " max_align=");
+    io.write_int(linux.STDOUT, cs.max_align);
+    linux.write(linux.STDOUT, "\n", 1);
+}
+
+fn dump_bytes(buf as *u8, len as i64) as void {
+    let is *u8 as hex = "0123456789abcdef";
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (i > 0 && (i % 16) == 0) {
+            linux.write(linux.STDOUT, "\n", 1);
+        } else if (i > 0) {
+            linux.write(linux.STDOUT, " ", 1);
+        }
+        let is u8 as b = buf[i];
+        let is [2]u8 as hx;
+        hx[0] = hex[(cast(i64, b) >> 4) & 15];
+        hx[1] = hex[cast(i64, b) & 15];
+        linux.write(linux.STDOUT, &hx, 2);
+        i = i + 1;
+    }
+    linux.write(linux.STDOUT, "\n", 1);
+}
+
+// --- Errno ---
+
+fn errno_to_string(code as i64) as *u8 {
+    // Errno values are negative syscall returns, negate to get positive
+    let is i64 as e with mut = code;
+    if (e < 0) { e = 0 - e; }
+
+    if (e == 1)  { return "EPERM: Operation not permitted"; }
+    if (e == 2)  { return "ENOENT: No such file or directory"; }
+    if (e == 3)  { return "ESRCH: No such process"; }
+    if (e == 4)  { return "EINTR: Interrupted system call"; }
+    if (e == 5)  { return "EIO: I/O error"; }
+    if (e == 9)  { return "EBADF: Bad file descriptor"; }
+    if (e == 11) { return "EAGAIN: Resource temporarily unavailable"; }
+    if (e == 12) { return "ENOMEM: Cannot allocate memory"; }
+    if (e == 13) { return "EACCES: Permission denied"; }
+    if (e == 14) { return "EFAULT: Bad address"; }
+    if (e == 17) { return "EEXIST: File exists"; }
+    if (e == 19) { return "ENODEV: No such device"; }
+    if (e == 20) { return "ENOTDIR: Not a directory"; }
+    if (e == 21) { return "EISDIR: Is a directory"; }
+    if (e == 22) { return "EINVAL: Invalid argument"; }
+    if (e == 23) { return "ENFILE: Too many open files in system"; }
+    if (e == 24) { return "EMFILE: Too many open files"; }
+    if (e == 28) { return "ENOSPC: No space left on device"; }
+    if (e == 36) { return "ENAMETOOLONG: File name too long"; }
+    if (e == 39) { return "ENOTEMPTY: Directory not empty"; }
+    if (e == 110) { return "ETIMEDOUT: Connection timed out"; }
+    if (e == 111) { return "ECONNREFUSED: Connection refused"; }
+    return "Unknown error";
 }
