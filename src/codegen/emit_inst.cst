@@ -181,6 +181,22 @@ fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
 // === gen_inst: EQ, NE, LT, LE, GT, GE (with branch fusion) ===
 
+fn cmp_try_inline_imm(inst as *d.IRInst) as i64 {
+    // Check if src2 is a vreg defined by a single-use IMM — inline the constant
+    if (inst.src2.op_type == d.OP_IMM) { return inst.src2.imm; }
+    if (inst.src2.op_type != d.OP_VREG) { return cast(i64, 0) - cast(i64, 9999999999); }
+    if (al.al_opt_level < 1) { return cast(i64, 0) - cast(i64, 9999999999); }
+    let is i32 as s2v = inst.src2.vreg;
+    if (e.isel_get_uses(s2v) != 1) { return cast(i64, 0) - cast(i64, 9999999999); }
+    let is *d.IRInst as def = e.isel_get_def(s2v);
+    if (cast(i64, def) == 0) { return cast(i64, 0) - cast(i64, 9999999999); }
+    if (def.op != d.IR_IMM) { return cast(i64, 0) - cast(i64, 9999999999); }
+    let is i64 as v = def.src1.imm;
+    if (v < (0 - 2147483647) || v > 2147483647) { return cast(i64, 0) - cast(i64, 9999999999); }
+    def.is_dead = 1;
+    return v;
+}
+
 fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     let is i32 as fused with mut = 0;
@@ -188,9 +204,17 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (cast(i64, nx) != 0 && nx.is_dead != 1) {
         let is i32 as nx_op = nx.op;
         if ((nx_op == d.IR_JZ || nx_op == d.IR_JNZ) && nx.src1.vreg == inst.dest.vreg) {
+            // Try inline constant for src2 (done in codegen, not fold, to preserve register barriers)
+            let is i64 as imm_val = cmp_try_inline_imm(inst);
+            let is i32 as has_imm with mut = 0;
+            if (imm_val != cast(i64, 0) - cast(i64, 9999999999)) { has_imm = 1; }
             e.load_op(inst.src1.vreg, ctx, "rax");
-            if (inst.src2.op_type == d.OP_IMM && inst.src2.imm == 0) {
+            if (has_imm == 1 && imm_val == 0) {
                 eo.out_cstr("  test rax, rax\n");
+            } else if (has_imm == 1) {
+                eo.out_cstr("  cmp rax, ");
+                eo.out_int(imm_val);
+                eo.out_char(10);
             } else {
                 eo.out_cstr("  cmp rax, ");
                 e.emit_src2(inst, ctx);
