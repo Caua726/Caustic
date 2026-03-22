@@ -52,11 +52,16 @@ fn has_side_effects(op as i32) as i32 {
 fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64) as void {
     // Build def count: only fold vregs with exactly one definition
     let is i32 as fold_vc = func.vreg_count;
+    // Build per-vreg: def count, is_imm flag, imm value (self-contained, ignores const_copy_prop)
     let is *i32 as fold_defs = cast(*i32, mem.galloc(cast(i64, fold_vc) * 4));
+    let is *i32 as fold_is_imm = cast(*i32, mem.galloc(cast(i64, fold_vc) * 4));
+    let is *i64 as fold_val = cast(*i64, mem.galloc(cast(i64, fold_vc) * 8));
     let is i32 as fi with mut = 0;
     while (fi < fold_vc) {
         let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, fi) * 4);
         *fdp = 0;
+        let is *i32 as fip = cast(*i32, cast(i64, fold_is_imm) + cast(i64, fi) * 4);
+        *fip = 0;
         fi = fi + 1;
     }
     let is *d.IRInst as di with mut = func.instructions;
@@ -66,6 +71,12 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
             if (ddv >= 0 && ddv < fold_vc) {
                 let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, ddv) * 4);
                 *fdp = *fdp + 1;
+                if (di.op == d.IR_IMM) {
+                    let is *i32 as fip = cast(*i32, cast(i64, fold_is_imm) + cast(i64, ddv) * 4);
+                    *fip = 1;
+                    let is *i64 as fvp = cast(*i64, cast(i64, fold_val) + cast(i64, ddv) * 8);
+                    *fvp = di.src1.imm;
+                }
             }
         }
         di = di.next;
@@ -83,8 +94,11 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                 let is i32 as s2_single_def with mut = 0;
                     let is *i32 as fdp = cast(*i32, cast(i64, fold_defs) + cast(i64, s2v) * 4);
                     if (*fdp == 1) { s2_single_def = 1; }
-                if (*c2p == 1 && s2_single_def == 1) {
-                    let is *i64 as v2p = cast(*i64, cast(i64, imm_val) + cast(i64, s2v) * 8);
+                let is i32 as s2_is_imm with mut = 0;
+                    let is *i32 as fip2 = cast(*i32, cast(i64, fold_is_imm) + cast(i64, s2v) * 4);
+                    if (*fip2 == 1) { s2_is_imm = 1; }
+                if (s2_single_def == 1 && s2_is_imm == 1) {
+                    let is *i64 as v2p = cast(*i64, cast(i64, fold_val) + cast(i64, s2v) * 8);
                     let is i64 as v2 = *v2p;
                     if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
                         if (fop == d.IR_ADD || fop == d.IR_SUB) {
@@ -104,8 +118,8 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                         inst.src2.imm = v2;
                     }
                     if (v2 >= (0 - 2147483647) && v2 <= 2147483647) {
-                        if (fop == d.IR_AND || fop == d.IR_OR || fop == d.IR_XOR ||
-                            fop == d.IR_MUL) {
+                        if (fop == d.IR_MUL ||
+                            fop == d.IR_AND || fop == d.IR_OR || fop == d.IR_XOR) {
                             inst.src2.op_type = d.OP_IMM;
                             inst.src2.imm = v2;
                         }
@@ -114,10 +128,6 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                         inst.src2.op_type = d.OP_IMM;
                         inst.src2.imm = v2;
                     }
-                    // TODO: EQ/NE fold disabled — causes miscompile in loops where
-                    // const_copy_prop incorrectly marks loop-variant vregs as constant.
-                    // Fix: make const_copy_prop loop-aware (skip phi targets) or run
-                    // fold_immediates only on SSA-form IR where single-def is structural.
                 }
             }
             } // end bounds check s2v < fold_vc
@@ -125,6 +135,8 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
         inst = inst.next;
     }
     mem.gfree(cast(*u8, fold_defs));
+    mem.gfree(cast(*u8, fold_is_imm));
+    mem.gfree(cast(*u8, fold_val));
 }
 
 // === Pass 2: DCE (backward scan) ===
