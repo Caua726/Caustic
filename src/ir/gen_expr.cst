@@ -132,11 +132,10 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
     let is i32 as sret_addr with mut = cast(i32, 0 - 1);
     if (use_sret == 1) {
         g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + ty.size;
-        let is i32 as offset = g.ctx_func.alloc_stack_size;
-        // align 16
         if (g.ctx_func.alloc_stack_size % 16 != 0) {
             g.ctx_func.alloc_stack_size = g.ctx_func.alloc_stack_size + 16 - (g.ctx_func.alloc_stack_size % 16);
         }
+        let is i32 as offset = g.ctx_func.alloc_stack_size;
         sret_addr = g.new_vreg();
         let is *d.IRInst as ga = d.new_inst(d.IR_GET_ALLOC_ADDR);
         ga.dest = d.op_vreg(sret_addr);
@@ -159,7 +158,7 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         ai = ai + 1;
     }
     a = node.args;
-    while (cast(i64, a) != 0) {
+    while (cast(i64, a) != 0 && ai < 64) {
         let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
         *av = gen_expr(a);
         if (g.is_float_kind(a.ty.kind) == 1) { arg_is_flt[ai] = 1; }
@@ -736,7 +735,7 @@ fn gen_expr(node as *ast.Node) as i32 {
         return dest;
     }
 
-    // Logical AND
+    // Logical AND (multi-def dest — blocks const prop but is correct)
     if (k == ast.NK_LAND) {
         let is i32 as false_l = g.new_label();
         let is i32 as end_l = g.new_label();
@@ -747,23 +746,20 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is i32 as rhs = gen_expr(node.rhs);
         let is *d.IRInst as jz2 = d.new_inst(d.IR_JZ);
         jz2.src1 = d.op_vreg(rhs); jz2.dest = d.op_label(false_l); jz2.line = line; g.emit(jz2);
-        // true
         let is *d.IRInst as mt = d.new_inst(d.IR_IMM);
         mt.dest = d.op_vreg(dest); mt.src1 = d.op_imm(1); g.emit(mt);
         let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
         jmp.dest = d.op_label(end_l); g.emit(jmp);
-        // false
         let is *d.IRInst as fl = d.new_inst(d.IR_LABEL);
         fl.dest = d.op_label(false_l); g.emit(fl);
         let is *d.IRInst as mf = d.new_inst(d.IR_IMM);
         mf.dest = d.op_vreg(dest); mf.src1 = d.op_imm(0); g.emit(mf);
-        // end
         let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
         el.dest = d.op_label(end_l); g.emit(el);
         return dest;
     }
 
-    // Logical OR
+    // Logical OR (multi-def dest — blocks const prop but is correct)
     if (k == ast.NK_LOR) {
         let is i32 as true_l = g.new_label();
         let is i32 as end_l = g.new_label();
@@ -774,17 +770,14 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is i32 as rhs = gen_expr(node.rhs);
         let is *d.IRInst as jnz2 = d.new_inst(d.IR_JNZ);
         jnz2.src1 = d.op_vreg(rhs); jnz2.dest = d.op_label(true_l); jnz2.line = line; g.emit(jnz2);
-        // false
         let is *d.IRInst as mf = d.new_inst(d.IR_IMM);
         mf.dest = d.op_vreg(dest); mf.src1 = d.op_imm(0); g.emit(mf);
         let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
         jmp.dest = d.op_label(end_l); g.emit(jmp);
-        // true
         let is *d.IRInst as tl = d.new_inst(d.IR_LABEL);
         tl.dest = d.op_label(true_l); g.emit(tl);
         let is *d.IRInst as mt = d.new_inst(d.IR_IMM);
         mt.dest = d.op_vreg(dest); mt.src1 = d.op_imm(1); g.emit(mt);
-        // end
         let is *d.IRInst as el = d.new_inst(d.IR_LABEL);
         el.dest = d.op_label(end_l); g.emit(el);
         return dest;
@@ -792,6 +785,83 @@ fn gen_expr(node as *ast.Node) as i32 {
 
     // NK_FNCALL
     if (k == ast.NK_FNCALL) { return gen_fncall(node, ty, line); }
+
+    // NK_CALL_INDIRECT: call(fn_ptr, args...)
+    if (k == ast.NK_CALL_INDIRECT) {
+        let is i32 as fn_ptr_vreg = gen_expr(node.expr);
+        let is i32 as arg_count with mut = 0;
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { arg_count = arg_count + 1; a = a.next; }
+
+        let is [256]u8 as arg_vregs;
+        let is i32 as ai with mut = 0;
+        a = node.args;
+        while (cast(i64, a) != 0 && ai < 64) {
+            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
+            *av = gen_expr(a);
+            ai = ai + 1;
+            a = a.next;
+        }
+
+        // Stack args in reverse (internal ABI: all GPR)
+        let is i32 as stack_args with mut = 0;
+        let is i32 as padding with mut = 0;
+        if (arg_count > 6) { stack_args = arg_count - 6; }
+        if (stack_args % 2 != 0) { padding = 1; }
+        if (padding == 1) {
+            let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+            pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+            pa.asm_str_len = 10;
+            pa.line = line;
+            g.emit(pa);
+        }
+        let is i32 as j with mut = arg_count - 1;
+        while (j >= 6) {
+            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            g.emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j - 1;
+        }
+        j = 0;
+        while (j < arg_count && j < 6) {
+            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            g.emit_set_arg(j, *av, cast(*u8, 0), line);
+            j = j + 1;
+        }
+
+        let is i32 as ret_reg = g.emit_call_indirect(fn_ptr_vreg, line);
+        // Attach return type for float handling in codegen
+        if (cast(i64, ty) != 0) { g.ctx_tail.cast_to = cast(*u8, ty); }
+
+        if (stack_args > 0) {
+            let is i32 as pad2 with mut = 0;
+            if (stack_args % 2 != 0) { pad2 = 1; }
+            let is i32 as cleanup_bytes = (stack_args + pad2) * 8;
+            let is [32]u8 as cbuf;
+            mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
+            let is i32 as cpos with mut = 9;
+            let is i32 as cv with mut = cleanup_bytes;
+            let is [10]u8 as nbuf;
+            let is i32 as ni with mut = 0;
+            while (cv > 0) {
+                nbuf[ni] = cast(u8, (cv % 10) + 48);
+                cv = cv / 10;
+                ni = ni + 1;
+            }
+            let is i32 as nj with mut = ni - 1;
+            while (nj >= 0) {
+                cbuf[cpos] = nbuf[nj];
+                cpos = cpos + 1;
+                nj = nj - 1;
+            }
+            let is *d.IRInst as cl = d.new_inst(d.IR_ASM);
+            cl.asm_str_ptr = d.str_dup(cast(*u8, &cbuf), cpos);
+            cl.asm_str_len = cpos;
+            cl.line = line;
+            g.emit(cl);
+        }
+
+        return ret_reg;
+    }
 
     // NK_SYSCALL
     if (k == ast.NK_SYSCALL) { return gen_syscall(node, line); }
