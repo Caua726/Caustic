@@ -1,0 +1,351 @@
+// =======================================================
+// std/mem/bins.cst
+// Bin allocator — O(1) alloc/free via size classes
+// Sem header por bloco (tamanho determinado pela região)
+// Lazy mmap: cada bin aloca página do kernel no primeiro uso
+// =======================================================
+
+use "../linux.cst" as linux;
+
+// --- Size Classes ---
+
+// Default: 16 bins com espaçamento gradual
+let is i64 as NUM_DEFAULT_BINS with imut = 16;
+
+// --- Structs ---
+
+struct Bin {
+    slot_size as i64;
+    region as *u8;
+    region_size as i64;
+    free_head as *u8;
+    total_slots as i64;
+    used_slots as i64;
+}
+
+struct Bins {
+    bin_data as *u8;
+    bin_count as i64;
+    page_size as i64;
+}
+
+// --- Internal helpers ---
+
+fn _bin_at(b as *Bins, idx as i64) as *Bin {
+    return cast(*Bin, cast(i64, b.bin_data) + idx * sizeof(Bin));
+}
+
+fn _find_bin(b as *Bins, size as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        if (bin.slot_size >= size) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _find_bin_by_ptr(b as *Bins, ptr as *u8) as i64 {
+    let is i64 as p = cast(i64, ptr);
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        if (cast(i64, bin.region) != 0) {
+            let is i64 as start = cast(i64, bin.region);
+            let is i64 as end = start + bin.region_size;
+            if (p >= start && p < end) {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _init_bin_region(bin as *Bin, page_size as i64) as i64 {
+    let is i64 as minus_one = 0 - 1;
+    let is i64 as prot = linux.PROT_READ + linux.PROT_WRITE;
+    let is i64 as flags = linux.MAP_PRIVATE + linux.MAP_ANONYMOUS;
+    let is *u8 as region = linux.mmap(cast(*u8, 0), page_size, prot, flags, minus_one, 0);
+
+    if (cast(i64, region) == linux.MAP_FAILED) {
+        return 0;
+    }
+
+    bin.region = region;
+    bin.region_size = page_size;
+    bin.total_slots = page_size / bin.slot_size;
+    bin.used_slots = 0;
+
+    // Build freelist: each slot points to next
+    let is i64 as i with mut = 0;
+    while (i < bin.total_slots - 1) {
+        let is *u8 as slot = cast(*u8, cast(i64, region) + i * bin.slot_size);
+        let is *i64 as next_ptr = cast(*i64, slot);
+        *next_ptr = cast(i64, region) + (i + 1) * bin.slot_size;
+        i = i + 1;
+    }
+    // Last slot points to null
+    let is *u8 as last = cast(*u8, cast(i64, region) + (bin.total_slots - 1) * bin.slot_size);
+    let is *i64 as last_next = cast(*i64, last);
+    *last_next = 0;
+
+    bin.free_head = region;
+    return 1;
+}
+
+fn _setup_default_sizes(b as *Bins) as void {
+    let is [16]i64 as sizes;
+    sizes[0] = 8;     sizes[1] = 16;    sizes[2] = 24;    sizes[3] = 32;
+    sizes[4] = 48;    sizes[5] = 64;    sizes[6] = 96;    sizes[7] = 128;
+    sizes[8] = 192;   sizes[9] = 256;   sizes[10] = 384;  sizes[11] = 512;
+    sizes[12] = 768;  sizes[13] = 1024; sizes[14] = 2048; sizes[15] = 4096;
+
+    let is i64 as i with mut = 0;
+    while (i < 16) {
+        let is *Bin as bin = _bin_at(b, i);
+        bin.slot_size = sizes[i];
+        bin.region = cast(*u8, 0);
+        bin.region_size = 0;
+        bin.free_head = cast(*u8, 0);
+        bin.total_slots = 0;
+        bin.used_slots = 0;
+        i = i + 1;
+    }
+}
+
+// --- Public API ---
+
+fn bins_new(page_size as i64) as Bins {
+    let is Bins as b;
+    b.bin_count = NUM_DEFAULT_BINS;
+    b.page_size = page_size;
+
+    // Alloc bin metadata array via mmap (standalone, no dependency on mem.cst)
+    let is i64 as meta_size = NUM_DEFAULT_BINS * sizeof(Bin);
+    let is i64 as minus_one = 0 - 1;
+    let is i64 as prot = linux.PROT_READ + linux.PROT_WRITE;
+    let is i64 as flags = linux.MAP_PRIVATE + linux.MAP_ANONYMOUS;
+    b.bin_data = linux.mmap(cast(*u8, 0), meta_size, prot, flags, minus_one, 0);
+
+    if (cast(i64, b.bin_data) != linux.MAP_FAILED) {
+        _setup_default_sizes(&b);
+    } else {
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+    }
+
+    return b;
+}
+
+fn bins_custom(page_size as i64, sizes as *i64, count as i64) as Bins {
+    let is Bins as b;
+    b.bin_count = count;
+    b.page_size = page_size;
+
+    let is i64 as meta_size = count * sizeof(Bin);
+    let is i64 as minus_one = 0 - 1;
+    let is i64 as prot = linux.PROT_READ + linux.PROT_WRITE;
+    let is i64 as flags = linux.MAP_PRIVATE + linux.MAP_ANONYMOUS;
+    b.bin_data = linux.mmap(cast(*u8, 0), meta_size, prot, flags, minus_one, 0);
+
+    if (cast(i64, b.bin_data) == linux.MAP_FAILED) {
+        b.bin_data = cast(*u8, 0);
+        b.bin_count = 0;
+        return b;
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is *Bin as bin = _bin_at(&b, i);
+        bin.slot_size = sizes[i];
+        bin.region = cast(*u8, 0);
+        bin.region_size = 0;
+        bin.free_head = cast(*u8, 0);
+        bin.total_slots = 0;
+        bin.used_slots = 0;
+        i = i + 1;
+    }
+
+    return b;
+}
+
+// Alloc — O(1)
+fn bins_alloc(b as *Bins, size as i64) as *u8 {
+    if (size <= 0) { return cast(*u8, 0); }
+
+    let is i64 as idx = _find_bin(b, size);
+    if (idx < 0) { return cast(*u8, 0); }
+
+    let is *Bin as bin = _bin_at(b, idx);
+
+    // Lazy init: first alloc in this bin triggers mmap
+    if (cast(i64, bin.region) == 0) {
+        if (_init_bin_region(bin, b.page_size) == 0) {
+            return cast(*u8, 0);
+        }
+    }
+
+    // No free slots
+    if (cast(i64, bin.free_head) == 0) {
+        return cast(*u8, 0);
+    }
+
+    // Pop from freelist — O(1)
+    let is *u8 as slot = bin.free_head;
+    let is *i64 as next_ptr = cast(*i64, slot);
+    bin.free_head = cast(*u8, *next_ptr);
+    bin.used_slots = bin.used_slots + 1;
+
+    return slot;
+}
+
+// Free — O(1)
+fn bins_free(b as *Bins, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+
+    let is i64 as idx = _find_bin_by_ptr(b, ptr);
+    if (idx < 0) { return; }
+
+    let is *Bin as bin = _bin_at(b, idx);
+
+    // Push onto freelist — O(1)
+    let is *i64 as next_ptr = cast(*i64, ptr);
+    *next_ptr = cast(i64, bin.free_head);
+    bin.free_head = ptr;
+    bin.used_slots = bin.used_slots - 1;
+}
+
+// Destroy — munmap all regions + metadata
+fn bins_destroy(b as *Bins) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        if (cast(i64, bin.region) != 0) {
+            linux.munmap(bin.region, bin.region_size);
+        }
+        i = i + 1;
+    }
+    if (cast(i64, b.bin_data) != 0) {
+        linux.munmap(b.bin_data, b.bin_count * sizeof(Bin));
+        b.bin_data = cast(*u8, 0);
+    }
+    b.bin_count = 0;
+}
+
+// --- Introspection ---
+
+// Which size class for this size?
+fn bins_which(b as *Bins, size as i64) as i64 {
+    let is i64 as idx = _find_bin(b, size);
+    if (idx < 0) { return 0; }
+    let is *Bin as bin = _bin_at(b, idx);
+    return bin.slot_size;
+}
+
+// How many bytes wasted for this size?
+fn bins_overhead(b as *Bins, size as i64) as i64 {
+    let is i64 as sc = bins_which(b, size);
+    if (sc == 0) { return 0; }
+    return sc - size;
+}
+
+// Total bytes in use (slot_size * used_slots across all bins)
+fn bins_used(b as *Bins) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        total = total + bin.slot_size * bin.used_slots;
+        i = i + 1;
+    }
+    return total;
+}
+
+// Total bytes reserved from kernel
+fn bins_total(b as *Bins) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        total = total + bin.region_size;
+        i = i + 1;
+    }
+    return total;
+}
+
+// Free slots in bin N
+fn bins_free_count(b as *Bins, bin_idx as i64) as i64 {
+    if (bin_idx < 0 || bin_idx >= b.bin_count) { return 0; }
+    let is *Bin as bin = _bin_at(b, bin_idx);
+    return bin.total_slots - bin.used_slots;
+}
+
+// Used slots in bin N
+fn bins_alloc_count(b as *Bins, bin_idx as i64) as i64 {
+    if (bin_idx < 0 || bin_idx >= b.bin_count) { return 0; }
+    let is *Bin as bin = _bin_at(b, bin_idx);
+    return bin.used_slots;
+}
+
+// Number of bins
+fn bins_bin_count(b as *Bins) as i64 {
+    return b.bin_count;
+}
+
+// Size class of bin N
+fn bins_bin_size(b as *Bins, bin_idx as i64) as i64 {
+    if (bin_idx < 0 || bin_idx >= b.bin_count) { return 0; }
+    let is *Bin as bin = _bin_at(b, bin_idx);
+    return bin.slot_size;
+}
+
+// Fragmentation: total overhead as percentage (0-100)
+fn bins_fragmentation(b as *Bins) as i64 {
+    let is i64 as total_reserved = bins_total(b);
+    let is i64 as total_used = bins_used(b);
+    if (total_reserved == 0) { return 0; }
+    return ((total_reserved - total_used) * 100) / total_reserved;
+}
+
+// Print stats to stdout
+fn bins_stats(b as *Bins) as void {
+    let is i64 as i with mut = 0;
+    let is [24]u8 as nbuf;
+
+    while (i < b.bin_count) {
+        let is *Bin as bin = _bin_at(b, i);
+        if (bin.total_slots > 0) {
+            linux.write(linux.STDOUT, "  bin ", 6);
+            _write_num(bin.slot_size);
+            linux.write(linux.STDOUT, ": ", 2);
+            _write_num(bin.used_slots);
+            linux.write(linux.STDOUT, "/", 1);
+            _write_num(bin.total_slots);
+            linux.write(linux.STDOUT, " used\n", 6);
+        }
+        i = i + 1;
+    }
+    linux.write(linux.STDOUT, "  total used: ", 14);
+    _write_num(bins_used(b));
+    linux.write(linux.STDOUT, " bytes, kernel: ", 16);
+    _write_num(bins_total(b));
+    linux.write(linux.STDOUT, " bytes\n", 7);
+}
+
+// Internal: write i64 to stdout (no io.cst dependency)
+fn _write_num(n as i64) as void {
+    if (n == 0) { linux.write(linux.STDOUT, "0", 1); return; }
+    let is [20]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i32 as pos with mut = 19;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    let is i64 as start = cast(i64, pos) + 1;
+    linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + start), 20 - start);
+}
