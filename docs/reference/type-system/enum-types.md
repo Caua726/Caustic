@@ -100,20 +100,20 @@ let is Color as c = Color.Red;
 Pattern matching is used to inspect enum values and extract payload data:
 
 ```cst
-match s {
-    Circle(r) => {
+match Shape (s) {
+    case Circle(r) {
         // r is f64, bound to the radius
     }
-    Rect(w, h) => {
+    case Rect(w, h) {
         // w and h are f64
     }
-    Point => {
+    case Point {
         // no payload to bind
     }
 }
 ```
 
-The `match` expression checks the tag to determine which variant is active, then binds payload fields to local variables in the matched arm.
+The `match` statement takes the enum type name followed by the expression in parentheses. Each arm uses `case VariantName` or `case VariantName(bindings)`. An optional `else` clause handles unmatched variants. The compiler checks the tag to determine which variant is active, then binds payload fields to local variables.
 
 ## Discriminant Values
 
