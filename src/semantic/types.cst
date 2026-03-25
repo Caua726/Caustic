@@ -144,6 +144,22 @@ fn resolve_alias(ty_ptr as *u8) as *u8 {
             alias = lookup_type_alias(amangled, amlen);
             if (cast(i64, alias) == 0) { mem.gfree(amangled); }
         }
+        // Try dot-split for module.Type references
+        if (cast(i64, alias) == 0) {
+            let is i32 as dp = find_dot(ty.name_ptr, ty.name_len);
+            if (dp >= 0) {
+                let is *u8 as tname_ptr = cast(*u8, cast(i64, ty.name_ptr) + cast(i64, dp) + 1);
+                let is i32 as tname_len = ty.name_len - dp - 1;
+                let is *d.Variable as var = sc.lookup_var(ty.name_ptr, dp);
+                if (cast(i64, var) != 0 && var.is_module == 1 && cast(i64, var.module_ref) != 0) {
+                    let is *d.Module as modd = cast(*d.Module, var.module_ref);
+                    let is i32 as dmlen with mut = 0;
+                    let is *u8 as dmangled = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tname_ptr, tname_len, &dmlen);
+                    alias = lookup_type_alias(dmangled, dmlen);
+                    if (cast(i64, alias) == 0) { mem.gfree(dmangled); }
+                }
+            }
+        }
         if (cast(i64, alias) != 0) { return alias; }
     }
     return ty_ptr;
@@ -274,6 +290,20 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
 
     // Resolve struct/enum name references
     if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
+        // Pre-compute dot-mangled name for module.Type references
+        let is *u8 as dot_mangled_ptr with mut = cast(*u8, 0);
+        let is i32 as dot_mangled_len with mut = 0;
+        let is i32 as dot_pos with mut = find_dot(ty.name_ptr, ty.name_len);
+        if (dot_pos >= 0) {
+            let is *u8 as tname_ptr = cast(*u8, cast(i64, ty.name_ptr) + cast(i64, dot_pos) + 1);
+            let is i32 as tname_len = ty.name_len - dot_pos - 1;
+            let is *d.Variable as var = sc.lookup_var(ty.name_ptr, dot_pos);
+            if (cast(i64, var) != 0 && var.is_module == 1 && cast(i64, var.module_ref) != 0) {
+                let is *d.Module as modd = cast(*d.Module, var.module_ref);
+                dot_mangled_ptr = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tname_ptr, tname_len, &dot_mangled_len);
+            }
+        }
+
         let is *u8 as def with mut = lookup_struct(ty.name_ptr, ty.name_len);
 
         // 1. Try mangled name (internal reference)
@@ -286,25 +316,9 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
             }
         }
 
-        // 2. Try alias.Type (external reference with dot)
-        if (cast(i64, def) == 0) {
-            let is i32 as dot_pos with mut = find_dot(ty.name_ptr, ty.name_len);
-            if (dot_pos >= 0) {
-                let is *u8 as alias_ptr = ty.name_ptr;
-                let is i32 as alias_len = dot_pos;
-                let is *u8 as tname_ptr = cast(*u8, cast(i64, ty.name_ptr) + cast(i64, dot_pos) + 1);
-                let is i32 as tname_len = ty.name_len - dot_pos - 1;
-                let is *d.Variable as var = sc.lookup_var(alias_ptr, alias_len);
-                if (cast(i64, var) != 0 && var.is_module == 1 && cast(i64, var.module_ref) != 0) {
-                    let is *d.Module as modd = cast(*d.Module, var.module_ref);
-                    let is i32 as mlen with mut = 0;
-                    let is *u8 as mangled = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tname_ptr, tname_len, &mlen);
-                    def = lookup_struct(mangled, mlen);
-                    if (cast(i64, def) == 0) {
-                        mem.gfree(mangled);
-                    }
-                }
-            }
+        // 2. Try dot-mangled (external reference with dot)
+        if (cast(i64, def) == 0 && cast(i64, dot_mangled_ptr) != 0) {
+            def = lookup_struct(dot_mangled_ptr, dot_mangled_len);
         }
 
         // 3. Try generic instantiation
@@ -321,6 +335,10 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
                 let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &mlen);
                 edef = lookup_enum(mangled, mlen);
                 if (cast(i64, edef) == 0) { mem.gfree(mangled); }
+            }
+            // Try dot-mangled for enum
+            if (cast(i64, edef) == 0 && cast(i64, dot_mangled_ptr) != 0) {
+                edef = lookup_enum(dot_mangled_ptr, dot_mangled_len);
             }
             if (cast(i64, edef) != 0) {
                 let is *ast.Type as et = cast(*ast.Type, edef);
@@ -339,6 +357,10 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
                     alias_ty = lookup_type_alias(amangled, amlen);
                     if (cast(i64, alias_ty) == 0) { mem.gfree(amangled); }
                 }
+                // Try dot-mangled for alias
+                if (cast(i64, alias_ty) == 0 && cast(i64, dot_mangled_ptr) != 0) {
+                    alias_ty = lookup_type_alias(dot_mangled_ptr, dot_mangled_len);
+                }
                 if (cast(i64, alias_ty) != 0) {
                     let is *ast.Type as at = cast(*ast.Type, alias_ty);
                     mem.memcpy(cast(*u8, ty), cast(*u8, at), sizeof(ast.Type));
@@ -354,6 +376,10 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
             let is *ast.Type as dt = cast(*ast.Type, def);
             ty.fields = dt.fields;
             ty.size = dt.size;
+        }
+
+        if (cast(i64, dot_mangled_ptr) != 0) {
+            mem.gfree(dot_mangled_ptr);
         }
     }
 
