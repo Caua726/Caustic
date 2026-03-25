@@ -6,9 +6,11 @@ Migrate compiler allocations from `mem.galloc` (freelist) to bins/pool via `only
 
 ## Part 1: Optimizer temp arrays → Bins
 
-**Files:** `opt.cst`, `opt_loop.cst`, `opt_prop.cst`, `opt_helpers.cst`, `opt_sr.cst`, `cfg.cst`, `dom.cst`, `ssa.cst`
+**Files:** `opt.cst`, `opt_loop.cst`, `opt_prop.cst`, `opt_helpers.cst`, `opt_sr.cst`, `cfg.cst`, `dom.cst`
 
-**Not in scope:** `alloc_core.cst` and `alloc_gc.cst` (register allocator in `src/codegen/`, separate subsystem — future migration).
+**Not in scope:**
+- `ssa.cst` — allocates arrays up to 500KB+ (blocks, phi_args, def_stack, df_out). All exceed bins max slot of 4096. Stays on freelist.
+- `alloc_core.cst` and `alloc_gc.cst` — register allocator in `src/codegen/`, separate subsystem. Future migration.
 
 **Import change per file:**
 ```cst
@@ -25,7 +27,7 @@ use "../../std/mem.cst" only bins, freelist as mem;
 
 **Global instance:** One `mem.Bins` in `opt.cst`, initialized in `optimize()`, shared by all passes.
 
-**Large allocations (>4096 bytes):** `ssa.cst` allocates arrays up to hundreds of KB (e.g. `nslots * MAX_DEPTH * 4`). Bins max slot is 4096. For allocations >4096, keep using `mem.galloc` from freelist, or add a mmap fallback in the bins wrapper. Decision: use `only bins, freelist as mem;` for `ssa.cst` and call `mem.galloc` for large arrays, `mem.bins_alloc` for small ones. Threshold: `size > 4096 → galloc, else → bins_alloc`.
+**Note on large allocations:** All Part 1 files allocate arrays proportional to vreg_count or label_count (typically <4096 bytes). Files with allocations that may exceed 4096 bytes (ssa.cst, alloc_gc.cst) are excluded from this migration.
 
 ## Part 2: IR defs → Pool + Bins
 
