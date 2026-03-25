@@ -1,153 +1,120 @@
 # Register Allocation
 
-Caustic uses a linear scan register allocator to map unlimited virtual registers (vregs) down to
-a small set of physical registers. The allocator is implemented in `src/codegen/alloc.cst`.
+Caustic provides two register allocators, selected by the optimization level:
 
-## Algorithm Overview
+- **-O0**: Linear scan (fast compilation, decent code)
+- **-O1**: Graph coloring with Iterative Register Coalescing (slow compilation, better code)
 
-The linear scan algorithm processes vregs in order of their first use (start position) and
-assigns each one a physical register. When all registers are occupied, the allocator spills the
-vreg whose interval extends furthest into the future, freeing a register for the current vreg.
+Both allocators use the same 10 allocatable registers (see [available-registers.md](available-registers.md)) and produce a `vreg_to_loc` mapping: `>= 0` means a physical register index, `< 0` means a spill slot (offset = `arg_spill_base + (-loc) * 8`), `-1000` means unallocated/dead.
 
-Steps:
+## Data Structures
 
-1. **Build live intervals**: Scan the instruction list to determine each vreg's start and end
-   positions.
-2. **Sort intervals**: Insertion sort by start position; ties broken by end position (shorter
-   intervals first).
-3. **Allocate**: Walk sorted intervals, assign registers or spill.
-
-## LiveInterval Struct
+### LiveInterval
 
 ```cst
 struct LiveInterval {
-    vreg      as i32;   -- virtual register index
-    start     as i32;   -- first instruction position where vreg appears
-    end_pos   as i32;   -- last instruction position where vreg appears
-    reg       as i32;   -- assigned physical register index (-1 if unassigned)
-    spill_loc as i32;   -- spill slot index (-1 if not spilled)
-    use_count as i32;   -- number of times vreg is referenced as a source operand
-    spill_cost as i32;  -- heuristic cost of spilling (higher = more expensive)
+    vreg       as i32;   // virtual register index
+    start      as i32;   // first instruction position
+    end_pos    as i32;   // last instruction position
+    reg        as i32;   // assigned register (-1 if unassigned)
+    spill_loc  as i32;   // spill slot (-1 if not spilled)
+    use_count  as i32;   // source operand references
+    spill_cost as i32;   // cost heuristic (higher = more expensive to spill)
 }
 ```
 
-## AllocCtx Struct
+### AllocCtx
 
 ```cst
 struct AllocCtx {
-    intervals        as *LiveInterval;  -- array of intervals (one per vreg)
-    count            as i32;            -- total number of intervals
-    vreg_to_loc      as *i32;          -- vreg index -> physical register or spill slot
-    stack_slots      as i32;            -- number of spill slots consumed
-    next_spill       as i32;            -- next available spill slot index
-    is_leaf          as i32;            -- reserved
-    arg_spill_base   as i32;            -- stack offset where spill slots begin
-    aligned_stack_size as i32;          -- total aligned stack frame size in bytes
-    func             as *u8;            -- pointer to the IRFunction
+    intervals          as *LiveInterval;
+    count              as i32;
+    vreg_to_loc        as *i32;      // vreg -> register or spill slot
+    stack_slots        as i32;
+    next_spill         as i32;
+    is_leaf            as i32;
+    arg_spill_base     as i32;       // stack offset where spill slots begin
+    aligned_stack_size as i32;       // total aligned stack frame
+    func               as *u8;       // -> IRFunction
+    va_save_offset     as i32;       // variadic save area offset
+    call_positions     as *i32;      // sorted array of call/SET_ARG positions
+    call_count         as i32;       // size of call_positions
+    active_idx         as *i32;      // 10-slot active set (one per allocatable register)
+    used_callee_mask   as i32;       // bitmask of callee-saved regs actually used
 }
 ```
 
 ## Building Live Intervals
 
-`build_intervals(func, ctx)` performs two passes over the instruction list.
+`build_intervals(func, ctx)` scans the instruction list:
 
-### Pass 1: Map Labels to Positions
+1. **Label mapping**: record position of each `IR_LABEL`
+2. **Call position collection**: record positions of `IR_CALL`, `IR_CALL_INDIRECT`, `IR_SYSCALL`, `IR_SET_ARG`, `IR_SET_SYS_ARG` — these are points where caller-saved registers are clobbered
+3. **Vreg usage scan**: for each instruction at position `pos`:
+   - `src1`/`src2` as OP_VREG: update start (min), end_pos (max), use_count++, spill_cost += 10
+   - `dest` as OP_VREG: update start, end_pos, spill_cost += 1
+4. **Backward jump extension**: for `IR_JMP`/`IR_JZ`/`IR_JNZ` jumping backward (loops), extend intervals of vregs defined at/before the loop header and alive at the header to span the full loop
+5. **Spill cost normalization**: `cost = cost * 100 / (end_pos - start + 1)` — frequently-used short-lived vregs are expensive to spill
+6. **Sort**: merge sort by start position (ties broken by shorter end first)
 
-Walk all instructions and record the instruction index (position) of each `IR_LABEL`. Used in
-pass 2 to detect backward jumps.
+## -O0: Linear Scan
 
-### Pass 2: Scan for Vreg Usage
+### Algorithm
 
-For each instruction, at position `pos`:
+1. Initialize `vreg_to_loc[v] = -1000` for all vregs
+2. Build MOV coalescing hints: `mov_partner[v]` tracks MOV-connected vregs
+3. Initialize 10-slot active set (one per allocatable register, all empty)
+4. Walk sorted intervals:
+   - **Expire**: clear active entries whose interval ended before current start
+   - **Compute hint**: if vreg has a MOV partner already allocated, prefer that register
+   - **find_free_reg**: try hint first, then callee-saved (rbx, r12, r13, r14, r15), then caller-saved (r8, r9, r10, rsi, rdi) — but only if interval does not span a call (checked via `spans_call()` binary search)
+   - **Spill if full**: `spill_register()` evicts the interval with lowest spill cost (tie-break: longest remaining range)
+   - **Track callee usage**: set `used_callee_mask` bits for assigned callee-saved registers
+5. Set `stack_slots = next_spill - 1`
 
-- If `src1` or `src2` is `OP_VREG`, update that vreg's `start` (min) and `end_pos` (max).
-  Increment `use_count` and add 10 to `spill_cost`.
-- If `dest` is `OP_VREG`, update `start` and `end_pos`. Add 1 to `spill_cost` (definitions are
-  cheaper to spill than uses).
-- For `IR_JMP`, `IR_JZ`, `IR_JNZ` that jump backward (loop back edges): extend the live
-  intervals of all vregs that overlap with the loop range `[target_pos, current_pos]`.
+### spans_call (Binary Search)
 
-### Spill Cost Heuristic
+Given an interval `[start, end]`, binary search the sorted `call_positions` array to check if any call position falls within the range. O(log n) per query.
 
-After the scan, the raw cost is normalized by interval span:
+If the interval crosses a call, caller-saved registers are excluded from the candidate set for that interval.
 
-```
-spill_cost = spill_cost * 100 / (end_pos - start + 1)
-```
+## -O1: Graph Coloring (Iterative Register Coalescing)
 
-Frequently-used vregs with short live ranges become expensive to spill. Infrequently-used vregs
-with long live ranges become cheap to spill.
+Implemented in `src/codegen/alloc_gc.cst`. Based on George & Appel 1996.
 
-## Linear Scan Allocation
+### Steps
 
-`linear_scan_alloc(func, ctx)` walks the sorted intervals and assigns each one a location.
+1. **Build interference graph**: bit matrix `n x n` where `n` = vreg count. Two vregs interfere if their live intervals overlap.
+2. **Collect MOV instructions**: tracked as `GCMove(src, dst)` for coalescing.
+3. **Compute degrees and classify**: each vreg gets a degree (number of interfering neighbors). Classify into worklists:
+   - `simplify_wl`: degree < k (trivially colorable)
+   - `freeze_wl`: degree < k but has MOV-related edges
+   - `spill_wl`: degree >= k
+   - Where k = 10 (or 5 if interval crosses a call)
+4. **Main loop** (repeat until all worklists empty):
+   - **Simplify**: pop from simplify_wl, push onto stack, decrement neighbor degrees
+   - **Coalesce**: try George criterion — merge MOV-related vregs if safe
+   - **Freeze**: give up coalescing for a freeze_wl vreg, move to simplify
+   - **Spill**: select lowest-cost vreg from spill_wl, push onto stack
+5. **Select (pop stack)**: assign colors (physical registers) in LIFO order. Exclude colors used by already-colored neighbors. Exclude caller-saved if interval crosses a call. Try coalesce hint first, then first-fit.
+6. **Propagate**: copy colors to coalesced aliases.
+7. **Verify**: safety net — fix any remaining conflicts (call-crossing + interference).
 
-### Available Registers
+### Spill Cost
 
-Only three callee-saved registers are available for allocation:
+Loop-depth-weighted: `cost = base_cost * pow10[loop_depth]` where pow10 = [1, 100, 10000, 100000]. Inner loop vregs are extremely expensive to spill.
 
-| Register | Index |
-|----------|-------|
-| rbx | 3 |
-| r12 | 10 |
-| r13 | 11 |
+### GET_ARG ABI Exclusion
 
-The caller-saved registers (rax, rcx, rdx, rsi, rdi, r8-r11) are not allocated because they
-would be clobbered by any `call` instruction. `r14` and `r15` are reserved as scratch registers
-by the instruction emitter.
+For vregs that receive function arguments (IR_GET_ARG), the allocator excludes other parameters' ABI registers to prevent sequential GET_ARG emission from clobbering later params.
 
-### Register Assignment
+## Register Cache (-O1 only)
 
-For each interval (in start-position order):
+The instruction emitter maintains a 16-entry cache tracking which physical register currently holds which spilled vreg value. When a spilled vreg needs to be loaded, the cache is checked first — if the value is already in a register, the load is skipped.
 
-1. Call `find_free_reg`: scan rbx, r12, r13 in order and return the first whose live intervals
-   do not overlap with the current position.
-2. If no register is free, call `spill_register`: find the interval assigned to rbx/r12/r13
-   with the latest `end_pos` and spill it (assign a stack slot, clear its `reg` field).
-3. If a register was freed by spilling, assign it to the current interval.
-4. If spilling also failed, spill the current interval itself.
+Targeted invalidation:
+- At labels, calls, and jumps: full cache clear
+- At each instruction: invalidate scratch registers used
+- At SET_ARG: invalidate the argument register
 
-### Location Encoding
-
-`vreg_to_loc[vreg]` encodes the location as follows:
-
-- `>= 0`: physical register index (3=rbx, 10=r12, 11=r13).
-- `< 0`: spill slot. Stack offset is `arg_spill_base + (-loc) * 8`.
-- `-1000`: initial sentinel meaning "unallocated" (vreg is dead / never used).
-
-## Accessing Vreg Values in the Emitter
-
-Two helpers abstract the register-vs-memory distinction:
-
-### `load_op(vreg, ctx, target)`
-
-Loads the value of `vreg` into the named register:
-
-```asm
-; vreg in rbx:
-  mov r15, rbx
-
-; vreg spilled at offset 24:
-  mov r15, QWORD PTR [rbp-24]
-```
-
-### `store_op(vreg, ctx, source)`
-
-Stores the named register into `vreg`'s location:
-
-```asm
-; vreg in r12:
-  mov r12, r15
-
-; vreg spilled at offset 32:
-  mov QWORD PTR [rbp-32], r15
-```
-
-## Limitations
-
-- Only 3 physical registers are available for allocation. Functions with many simultaneously
-  live vregs will spill heavily to the stack.
-- No register coalescing, copy propagation, or interval splitting.
-- Every instruction uses scratch registers (r14/r15) for operand loading, adding `mov`
-  instructions even for vregs that are already in registers.
-- The spill heuristic does not account for loop nesting depth.
+Eliminates ~21% of redundant memory loads.
