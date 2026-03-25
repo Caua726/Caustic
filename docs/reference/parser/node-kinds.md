@@ -1,6 +1,6 @@
 # Node Kinds
 
-The Caustic parser produces an AST where each node has a `kind` field identifying its type. There are 51 node kinds, numbered from `NK_NUM=0` through `NK_TYPE_ALIAS=50`.
+The Caustic parser produces an AST where each node has a `kind` field identifying its type. There are 53 node kinds, numbered from `NK_NUM=0` through `NK_CALL_INDIRECT=52`.
 
 ## Complete Node Kind Table
 
@@ -139,11 +139,13 @@ The Caustic parser produces an AST where each node has a `kind` field identifyin
 | `NK_DEFER` | 48 | Deferred function call | `lhs` (the function call node) |
 | `NK_FN_PTR` | 49 | Function pointer expression | `name`, `module_name`, `generic_args` |
 
-### Type Alias (50)
+### VA Start, Type Alias, and Indirect Call (50-52)
 
 | Kind | Value | Description | Key Fields |
 |------|-------|-------------|------------|
-| `NK_TYPE_ALIAS` | 50 | Type alias declaration (`type Name = Type`) | `name`, `let_type` (the aliased type) |
+| `NK_VA_START` | 50 | Variadic argument list init (`__builtin_va_start`) | `lhs` (VaList pointer) |
+| `NK_TYPE_ALIAS` | 51 | Type alias declaration (`type Name = Type`) | `name`, `let_type` (the aliased type) |
+| `NK_CALL_INDIRECT` | 52 | Indirect function call (`call(fn_ptr, args)`) | `lhs` (fn_ptr expression), `args` (argument list) |
 
 ## Node Kind Categories Summary
 
@@ -155,11 +157,11 @@ The Caustic parser produces an AST where each node has a `kind` field identifyin
 | Statements | 14-16 | 3 |
 | Declarations / Blocks | 17-20 | 4 |
 | Control flow | 21, 23, 32-33, 40-41, 47 | 7 |
-| Special expressions | 22, 24, 28, 38, 49 | 5 |
+| Special expressions | 22, 24, 28, 38, 49, 50, 52 | 7 |
 | Memory operations | 25-27, 29 | 4 |
 | Logical operators | 30-31, 44 | 3 |
 | Bitwise operators | 34-37, 42-43 | 6 |
-| Other | 39, 45, 46, 48, 50 | 5 |
+| Other | 39, 45, 46, 48, 51 | 5 |
 
 ## Notes
 

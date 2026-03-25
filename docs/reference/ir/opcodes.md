@@ -1,6 +1,6 @@
 # IR Opcodes
 
-Caustic's IR defines 46 opcodes numbered 0 through 45. Each opcode is stored as an `i32` constant. This document describes every opcode, its operand usage, and its semantics.
+Caustic's IR defines 48 opcodes numbered 0 through 47. Each opcode is stored as an `i32` constant. This document describes every opcode, its operand usage, and its semantics.
 
 ## Notation
 
@@ -343,3 +343,23 @@ Codegen uses `divsd`.
 `dest = -src1` (f64)
 
 Codegen XORs the sign bit: loads `0x8000000000000000` into xmm1, then `xorpd xmm0, xmm1`.
+
+---
+
+## Variadic and Indirect Calls
+
+### IR_VA_START (46) -- Initialize Variadic Argument List
+Initializes a `VaList` struct for accessing variadic arguments.
+
+- `dest`: unused
+- `src1`: V(s) -- pointer to the VaList struct
+
+Codegen stores the current `gp_offset`, `fp_offset`, `overflow_arg_area`, and `reg_save_area` into the VaList struct following the System V AMD64 ABI va_list layout.
+
+### IR_CALL_INDIRECT (47) -- Indirect Function Call
+Calls a function through a pointer (used by `call()` syntax).
+
+- `dest`: V(d) -- receives the return value
+- `src2`: V(target) -- vreg holding the function pointer
+
+Arguments must be set up beforehand via IR_SET_ARG. Codegen emits `call r` where `r` is the register holding the function pointer.
