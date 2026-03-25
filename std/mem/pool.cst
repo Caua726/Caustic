@@ -1,0 +1,116 @@
+// =======================================================
+// std/mem/pool.cst
+// Pool allocator — fixed-size slots, O(1) alloc/free
+// Zero fragmentation, zero header overhead
+// =======================================================
+
+use "../linux.cst" as linux;
+
+struct Pool {
+    region as *u8;
+    region_size as i64;
+    freelist as *u8;
+    slot_size as i64;
+    total_slots as i64;
+    used_slots as i64;
+}
+
+// Create a pool with N slots of fixed size
+fn create(slot_size as i64, count as i64) as Pool {
+    let is Pool as p;
+
+    let is i64 as aligned_size with mut = (slot_size + 7) & (0 - 8);
+    if (aligned_size < 8) { aligned_size = 8; }
+
+    let is i64 as total = aligned_size * count;
+    let is i64 as minus_one = 0 - 1;
+    let is *u8 as region = linux.mmap(cast(*u8, 0), total, 3, 34, minus_one, 0);
+
+    if (cast(i64, region) < 0) {
+        p.region = cast(*u8, 0);
+        p.region_size = 0;
+        p.freelist = cast(*u8, 0);
+        p.slot_size = 0;
+        p.total_slots = 0;
+        p.used_slots = 0;
+        return p;
+    }
+
+    p.region = region;
+    p.region_size = total;
+    p.slot_size = aligned_size;
+    p.total_slots = count;
+    p.used_slots = 0;
+
+    // Build freelist: each slot's first 8 bytes hold next pointer
+    let is i64 as i with mut = 0;
+    while (i < count - 1) {
+        let is *i64 as np = cast(*i64, cast(i64, region) + i * aligned_size);
+        *np = cast(i64, region) + (i + 1) * aligned_size;
+        i = i + 1;
+    }
+    // Last slot points to null
+    let is *i64 as last = cast(*i64, cast(i64, region) + (count - 1) * aligned_size);
+    *last = 0;
+
+    p.freelist = region;
+    return p;
+}
+
+// Alloc — O(1) pop from freelist
+fn alloc(p as *Pool) as *u8 {
+    if (cast(i64, p.freelist) == 0) { return cast(*u8, 0); }
+
+    let is *u8 as slot = p.freelist;
+    let is *i64 as np = cast(*i64, slot);
+    p.freelist = cast(*u8, *np);
+    p.used_slots = p.used_slots + 1;
+    return slot;
+}
+
+// Free — O(1) push to freelist
+fn free(p as *Pool, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+
+    // Validate: ptr must be within region and aligned
+    let is i64 as offset = cast(i64, ptr) - cast(i64, p.region);
+    if (offset < 0 || offset >= p.region_size) { return; }
+    if ((offset % p.slot_size) != 0) { return; }
+
+    let is *i64 as np = cast(*i64, ptr);
+    *np = cast(i64, p.freelist);
+    p.freelist = ptr;
+    p.used_slots = p.used_slots - 1;
+}
+
+// Destroy — munmap the region
+fn destroy(p as *Pool) as void {
+    if (cast(i64, p.region) != 0) {
+        linux.munmap(p.region, p.region_size);
+        p.region = cast(*u8, 0);
+        p.freelist = cast(*u8, 0);
+        p.total_slots = 0;
+        p.used_slots = 0;
+    }
+}
+
+// Reset — free all slots without munmap
+fn reset(p as *Pool) as void {
+    let is i64 as i with mut = 0;
+    while (i < p.total_slots - 1) {
+        let is *i64 as np = cast(*i64, cast(i64, p.region) + i * p.slot_size);
+        *np = cast(i64, p.region) + (i + 1) * p.slot_size;
+        i = i + 1;
+    }
+    let is *i64 as last = cast(*i64, cast(i64, p.region) + (p.total_slots - 1) * p.slot_size);
+    *last = 0;
+    p.freelist = p.region;
+    p.used_slots = 0;
+}
+
+// --- Introspection ---
+
+fn used(p as *Pool) as i64 { return p.used_slots; }
+fn available(p as *Pool) as i64 { return p.total_slots - p.used_slots; }
+fn capacity(p as *Pool) as i64 { return p.total_slots; }
+fn slot_size(p as *Pool) as i64 { return p.slot_size; }

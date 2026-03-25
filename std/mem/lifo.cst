@@ -1,0 +1,118 @@
+// =======================================================
+// std/mem/lifo.cst
+// LIFO/Stack allocator — O(1) alloc, O(1) free (reverse order)
+// Like arena but supports free in LIFO order
+// =======================================================
+
+use "../linux.cst" as linux;
+
+struct Lifo {
+    base as *u8;
+    top as *u8;
+    limit as *u8;
+    size as i64;
+}
+
+// Create a LIFO allocator with given capacity
+fn create(size as i64) as Lifo {
+    let is i64 as minus_one = 0 - 1;
+    let is *u8 as ptr = linux.mmap(cast(*u8, 0), size, 3, 34, minus_one, 0);
+
+    let is Lifo as s;
+    if (cast(i64, ptr) < 0) {
+        s.base = cast(*u8, 0);
+        s.top = cast(*u8, 0);
+        s.limit = cast(*u8, 0);
+        s.size = 0;
+        return s;
+    }
+
+    s.base = ptr;
+    s.top = ptr;
+    s.limit = cast(*u8, cast(i64, ptr) + size);
+    s.size = size;
+    return s;
+}
+
+// Destroy — munmap all memory
+fn destroy(s as *Lifo) as void {
+    if (cast(i64, s.base) != 0) {
+        linux.munmap(s.base, s.size);
+        s.base = cast(*u8, 0);
+        s.top = cast(*u8, 0);
+        s.limit = cast(*u8, 0);
+        s.size = 0;
+    }
+}
+
+// Reset — free everything
+fn reset(s as *Lifo) as void {
+    s.top = s.base;
+}
+
+// Alloc — O(1) bump with 8-byte header storing alloc size
+// Layout: [size: 8 bytes] [user data: N bytes aligned to 8]
+fn alloc(s as *Lifo, n as i64) as *u8 {
+    let is i64 as aligned with mut = (n + 7) & (0 - 8);
+    if (aligned < 8) { aligned = 8; }
+
+    let is i64 as needed = 8 + aligned; // 8 byte header + data
+    let is i64 as current = cast(i64, s.top);
+
+    if (current + needed > cast(i64, s.limit)) {
+        return cast(*u8, 0);
+    }
+
+    // Write size header
+    let is *i64 as header = cast(*i64, s.top);
+    *header = aligned;
+
+    s.top = cast(*u8, current + needed);
+    return cast(*u8, current + 8);
+}
+
+// Free — O(1) but MUST be the last allocation
+// Reads the size header to know how much to pop
+fn free(s as *Lifo, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+
+    // Read size from header (8 bytes before ptr)
+    let is *i64 as header = cast(*i64, cast(i64, ptr) - 8);
+    let is i64 as alloc_size = *header;
+    let is i64 as block_start = cast(i64, ptr) - 8;
+    let is i64 as block_end = cast(i64, ptr) + alloc_size;
+
+    // Validate: block_end must equal current top (LIFO order)
+    if (block_end != cast(i64, s.top)) { return; }
+
+    // Validate: block_start within region
+    if (block_start < cast(i64, s.base)) { return; }
+
+    s.top = cast(*u8, block_start);
+}
+
+// Save current position for later restore
+fn save(s as *Lifo) as *u8 {
+    return s.top;
+}
+
+// Restore to a saved position (bulk free)
+fn restore(s as *Lifo, pos as *u8) as void {
+    if (cast(i64, pos) >= cast(i64, s.base) && cast(i64, pos) <= cast(i64, s.limit)) {
+        s.top = pos;
+    }
+}
+
+// --- Introspection ---
+
+fn used(s as *Lifo) as i64 {
+    return cast(i64, s.top) - cast(i64, s.base);
+}
+
+fn remaining(s as *Lifo) as i64 {
+    return cast(i64, s.limit) - cast(i64, s.top);
+}
+
+fn capacity(s as *Lifo) as i64 {
+    return s.size;
+}

@@ -1,0 +1,171 @@
+// =======================================================
+// std/mem/freelist.cst
+// Free-list allocator with address-ordered coalescing
+// O(n) alloc/free, 16 bytes header per block
+// =======================================================
+
+use "../linux.cst" as linux;
+
+struct Header {
+    size as i64;
+    next as *u8;
+}
+
+struct Heap {
+    freelist as *Header;
+    start    as *u8;
+    top      as *u8;
+    limit    as *u8;
+}
+
+fn reserve(req_size as i64) as *Heap {
+    let is i64 as size with mut = req_size;
+    let is i64 as total with mut = size + sizeof(Heap);
+
+    let is i64 as minus_one = 0 - 1;
+    let is i64 as prot = linux.PROT_READ + linux.PROT_WRITE;
+    let is i64 as flags = linux.MAP_PRIVATE + linux.MAP_ANONYMOUS;
+    let is *u8 as ptr = linux.mmap(cast(*u8, 0), total, prot, flags, minus_one, 0);
+
+    if (cast(i64, ptr) < 0) {
+        linux.write(linux.STDERR, "mmap failed\n", 12);
+        return cast(*Heap, 0);
+    }
+
+    let is *Heap as h = cast(*Heap, ptr);
+    let is i64 as base = cast(i64, ptr);
+    let is i64 as data_start = base + sizeof(Heap);
+
+    h.start = cast(*u8, data_start);
+    h.top   = cast(*u8, data_start);
+    h.limit = cast(*u8, base + total);
+    h.freelist = cast(*Header, 0);
+
+    return h;
+}
+
+fn release(h as *Heap) as void {
+    if (cast(i64, h) == 0) { return; }
+    let is i64 as total = cast(i64, h.limit) - cast(i64, h);
+    linux.munmap(cast(*u8, h), total);
+}
+
+fn alloc(h as *Heap, req_size as i64) as *u8 {
+    if (req_size <= 0) { return cast(*u8, 0); }
+    let is i64 as size with mut = (req_size + 7) & (0 - 8);
+    if (size < 8) { size = 8; }
+
+    let is *Header as curr with mut = h.freelist;
+    let is *Header as prev with mut = cast(*Header, 0);
+
+    while (cast(i64, curr) != 0) {
+        if (curr.size >= size) {
+            let is i64 as remaining = curr.size - size;
+
+            if (remaining >= sizeof(Header) + 8) {
+                let is i64 as split_addr = cast(i64, curr) + sizeof(Header) + size;
+                let is *Header as split = cast(*Header, split_addr);
+                split.size = remaining - sizeof(Header);
+                split.next = curr.next;
+                if (cast(i64, prev) == 0) { h.freelist = split; }
+                else { prev.next = split; }
+                curr.size = size;
+            } else {
+                if (cast(i64, prev) == 0) { h.freelist = curr.next; }
+                else { prev.next = curr.next; }
+            }
+
+            return cast(*u8, cast(i64, curr) + sizeof(Header));
+        }
+
+        prev = curr;
+        curr = curr.next;
+    }
+
+    let is *u8 as _current_top_ptr = h.top;
+    let is i64 as current_top with mut = cast(i64, h.top);
+    let is i64 as limit = cast(i64, h.limit);
+    let is i64 as needed = sizeof(Header) + size;
+
+    if (current_top + needed > limit) {
+        return cast(*u8, 0);
+    }
+
+    let is *Header as new_head = cast(*Header, h.top);
+    new_head.size = size;
+    h.top = cast(*u8, current_top + needed);
+
+    return cast(*u8, current_top + sizeof(Header));
+}
+
+fn free(h as *Heap, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+    if (cast(i64, h) == 0) { return; }
+
+    let is i64 as p = cast(i64, ptr);
+    if (p < cast(i64, h.start) || p >= cast(i64, h.top)) { return; }
+
+    let is i64 as header_addr = cast(i64, ptr) - sizeof(Header);
+    let is *Header as block = cast(*Header, header_addr);
+
+    let is *Header as curr with mut = h.freelist;
+    let is *Header as prev with mut = cast(*Header, 0);
+
+    while (cast(i64, curr) != 0 && cast(i64, curr) < header_addr) {
+        prev = curr;
+        curr = cast(*Header, curr.next);
+    }
+    if (cast(i64, curr) != 0 && cast(i64, curr) == header_addr) { return; }
+
+    block.next = cast(*u8, curr);
+    if (cast(i64, prev) == 0) {
+        h.freelist = block;
+    } else {
+        prev.next = cast(*u8, block);
+    }
+
+    if (cast(i64, curr) != 0) {
+        let is i64 as block_end = header_addr + sizeof(Header) + block.size;
+        if (block_end == cast(i64, curr)) {
+            block.size = block.size + sizeof(Header) + curr.size;
+            block.next = curr.next;
+        }
+    }
+
+    if (cast(i64, prev) != 0) {
+        let is i64 as prev_end = cast(i64, prev) + sizeof(Header) + prev.size;
+        if (prev_end == header_addr) {
+            prev.size = prev.size + sizeof(Header) + block.size;
+            prev.next = block.next;
+        }
+    }
+}
+
+fn memcpy(dst as *u8, src as *u8, n as i64) as *u8 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn memset(dst as *u8, c as i32, n as i64) as *u8 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        dst[i] = cast(u8, c);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn memcmp(mem1 as *u8, mem2 as *u8, data_size as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < data_size) {
+        if (mem1[i] != mem2[i]) {
+            return cast(i32, mem1[i]) - cast(i32, mem2[i]);
+        }
+        i = i + 1;
+    }
+    return cast(i32, 0);
+}
