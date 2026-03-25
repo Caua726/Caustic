@@ -42,7 +42,7 @@ The compiler (`caustic`) transforms `.cst` source through six sequential phases:
 
 | File | Responsibility |
 |------|----------------|
-| `tokens.cst` | Defines the `Token` struct (32 bytes: kind, ptr, len, line, col, int_val), `TokenList` container, and all 77 token kind constants (TK_EOF through TK_XOR_EQ). Also contains `keyword_lookup()` which dispatches by string length. |
+| `tokens.cst` | Defines the `Token` struct (32 bytes: kind, ptr, len, line, col, int_val), `TokenList` container, and all 80 token kind constants (TK_EOF through TK_CALL). Also contains `keyword_lookup()` which dispatches by string length. |
 | `lexer.cst` | Character-by-character scanner. Reads raw `*u8` source, produces a `TokenList`. Handles string/char literals with escape sequences, integer and float literals, single and multi-character operators, and comments. |
 | `util.cst` | Character classification helpers (is_digit, is_alpha, is_alnum, etc.) and character constants. |
 
@@ -50,7 +50,7 @@ The compiler (`caustic`) transforms `.cst` source through six sequential phases:
 
 | File | Responsibility |
 |------|----------------|
-| `ast.cst` | Defines the `Node` struct (50 node kinds: NK_NUM through NK_FN_PTR), the `Type` struct (18 type kinds: TY_VOID through TY_ENUM), singleton type pointers (type_i32, type_i64, etc.), and constructors (`new_node`, `new_type`). |
+| `ast.cst` | Defines the `Node` struct (53 node kinds: NK_NUM through NK_CALL_INDIRECT), the `Type` struct (19 type kinds: TY_VOID through TY_FN), singleton type pointers (type_i32, type_i64, etc.), and constructors (`new_node`, `new_type`). |
 | `top.cst` | Top-level parsing entry point. Parses `fn`, `struct`, `enum`, `use`, `impl`, `extern fn`, and global `let` declarations. Entry function: `parse_file()`. |
 | `stmt.cst` | Statement parsing: `let`, `return`, `if`/`else`, `while`, `for`, `do`/`while`, `match`, `break`, `continue`, `defer`, `asm`, expression statements. |
 | `expr.cst` | Expression parsing with precedence climbing for binary operators. Handles unary operators, function calls, member access, indexing, `cast`, `sizeof`, `syscall`, `fn_ptr`, and literals. |
@@ -73,31 +73,38 @@ The compiler (`caustic`) transforms `.cst` source through six sequential phases:
 
 | File | Responsibility |
 |------|----------------|
-| `defs.cst` | IR data structures: `IRProgram`, `IRFunction`, `IRInst`, `IRGlobal`, `StringEntry`, `Operand`. Defines 46 IR opcodes (IR_IMM through IR_FNEG) and operand types (OP_NONE, OP_VREG, OP_IMM, OP_LABEL). |
-| `gen.cst` | IR generation. Walks the typed AST and emits IR instructions into `IRFunction` chains. Each expression evaluates to a virtual register number. Handles control flow (labels + conditional jumps), function calls (System V ABI argument setup), struct operations, defer expansion, and float operations. Entry function: `gen_ir()`. |
+| `defs.cst` | IR data structures: `IRProgram`, `IRFunction`, `IRInst`, `IRGlobal`, `StringEntry`, `Operand`. Defines 48 IR opcodes (IR_IMM through IR_CALL_INDIRECT) and operand types (OP_NONE, OP_VREG, OP_IMM, OP_LABEL). |
+| `gen.cst` | IR generation context, emit helpers (emit_imm, emit_binary, emit_call, etc.), loop/defer stacks, string registry. |
+| `gen_expr.cst` | Expression IR generation: address computation, function calls (System V ABI), load/store, struct operations, float operations. |
+| `gen_stmt.cst` | Statement IR generation: control flow, defer expansion, match/case. |
+| `gen_program.cst` | Program-level IR generation: function iteration, global variables, reachability. Entry: `gen_ir()`. |
+| `opt.cst` | Optimization pipeline orchestration (-O1): addr_fusion, mem2reg, const prop, store-load fwd, fold imm, LICM, strength reduction, DCE, inlining. |
+| `ssa.cst` | SSA construction: mem2reg pass with phi nodes, dominance frontiers, vreg renaming. |
+| `cfg.cst` | Control flow graph: basic blocks, successors, predecessors. |
+| `dom.cst` | Dominator tree computation and dominance frontiers. |
+| `debug.cst` | IR debug printer (activated with `-debugir`). |
 
 ### Phase 5: Code Generation (`src/codegen/`)
 
 | File | Responsibility |
 |------|----------------|
-| `alloc.cst` | Linear scan register allocator. Builds `LiveInterval` for each virtual register, sorts by start position, then assigns physical registers (rbx, r12, r13 as callee-saved) or spills to stack. Uses `AllocCtx` to track allocation state per function. |
-| `emit.cst` | x86_64 assembly emitter. Iterates each `IRInst` and emits corresponding Intel-syntax assembly. Manages a buffered output writer (4MB buffer). Generates `.text`, `.data`, and `.rodata` sections. Handles the System V AMD64 calling convention (rdi, rsi, rdx, rcx, r8, r9 for integer args; xmm0-xmm7 for floats). Entry function: `codegen()`. |
+| `alloc_core.cst` | Register allocator core. At -O0: linear scan with 10 allocatable registers, merge sort, MOV coalescing hints, active set tracking. At -O1: graph coloring (Iterative Register Coalescing, George & Appel 1996). Uses `AllocCtx` to track allocation state per function. |
+| `alloc_gc.cst` | Graph coloring register allocator for -O1. Bit matrix interference graph, George coalescing criterion, optimistic Briggs coloring, loop-depth-weighted spill costs. |
+| `emit.cst` | x86_64 instruction selection. Load/store with register cache (16-entry, targeted invalidation). IMM+STORE fusion, stack increment fusion, addressing mode matching ([base + index*scale]). |
+| `emit_inst.cst` | x86_64 instruction emission for each IR opcode. |
+| `emit_driver.cst` | Codegen orchestration: build intervals, allocate registers, compute stack layout, emit prologue/epilogue, iterate instructions. Entry function: `codegen()`. |
+| `emit_output.cst` | Buffered assembly output writer (4MB buffer). Register name tables (64/32/16/8-bit). |
+| `peephole.cst` | Post-emission peephole optimizer: MOV+movsxd fusion, MOV chain bypass, dead MOV elimination. |
 
 ### Entry Point (`src/main.cst`)
 
 Orchestrates the full pipeline:
 
-1. Parses CLI arguments (source filename, `-c` flag for library compilation)
-2. Initializes a 64MB heap via `mem.gheapinit()`
-3. Reads the source file
-4. Calls `lex.tokenize()` to produce tokens
-5. Calls `ast.types_init()` to create singleton type objects
-6. Calls `top.parse_file()` to produce the AST
-7. Calls `sem.analyze()` for semantic analysis
-8. Calls `irg.gen_ir()` to produce IR
-9. Opens the output `.s` file
-10. Calls `cg.codegen()` to emit assembly
-11. Writes and closes the output file
+1. Parses CLI arguments (16 flags: `-c`, `-o`, `-O0`/`-O1`, `--profile`, `--cache`, `--max-ram`, `--path`, `-l<lib>`, `--emit-*`, `-debug*`)
+2. Estimates heap size from source + imports, initializes heap via `mem.gheapinit()`
+3. For each input file: lex → parse → semantic → IR → optimize (-O1) → codegen → assemble (in-process via caustic-as)
+4. If `-o` specified: link all objects into final executable (in-process via caustic-ld)
+5. Supports caching (token/AST/IR) via `--cache` for fast rebuilds
 
 ## Assembler (`caustic-as`)
 
@@ -125,12 +132,21 @@ Located in `caustic-linker/`. Combines one or more `.o` files into a final ELF e
 
 | File | Description |
 |------|-------------|
-| `linux.cst` | Raw Linux syscall wrappers: `read`, `write`, `open`, `close`, `mmap`, `munmap`, `exit`, `lseek`, and constants (O_RDONLY, STDOUT, STDERR, SEEK_END, etc.). |
-| `mem.cst` | Heap allocator. Uses `mmap` for initial allocation. Free-list with coalescing. Functions: `gheapinit()`, `galloc()`, `gfree()`, `memcpy()`, `memcmp()`, `memset()`. |
-| `string.cst` | Dynamic string type (`String` struct with ptr/len/cap). Operations: create, append, append_char, substring, compare, to_cstr. |
-| `io.cst` | Buffered I/O. Functions: `write_str()`, `write_int()`, `write_n()`, `printf()`-style formatting, line reading. |
-| `types.cst` | Type conversion utilities. |
-| `compatcffi.cst` | C FFI compatibility helpers for extern function interop. |
+| `linux.cst` | Raw Linux syscall wrappers (40+): read, write, open, close, mmap, exit, socket, bind, listen, etc. |
+| `mem.cst` | Memory management hub. Delegates to submodules: freelist (O(n), coalescing), bins (O(1), slab-based), arena (O(1), bump), pool (O(1), fixed-size), lifo (O(1), stack). Global API: `gheapinit()`, `galloc()`, `gfree()`, `memcpy()`, `memset()`, `memcmp()`. |
+| `string.cst` | Dynamic string type (`String` with ptr/len/cap). Operations: concat, find, substring, eq, starts_with, ends_with, contains, char_at, parse_int, trim, split, replace, repeat. |
+| `io.cst` | Buffered Reader/Writer, `printf()` with VaList, file ops (read_file, write_file, copy_file), directory ops (list_dir, is_dir). |
+| `slice.cst` | Generic dynamic array (`Slice gen T`). Methods: push, get, set, pop, free, clear, reverse, insert, remove_at, swap, clone, reserve, truncate. |
+| `types.cst` | `Option gen T { Some; None; }` and `Result gen T, E { Ok; Err; }`. |
+| `map.cst` | Hash maps: MapI64 (i64->i64, splitmix64) and MapStr (*u8->i64, FNV-1a). Open addressing, linear probing, iterator API. |
+| `math.cst` | Integer math: abs, min, max, clamp, pow, gcd, lcm, sign, div_ceil, is_power_of_two, align_up/down. |
+| `sort.cst` | Sorting: quicksort, heapsort, mergesort, insertion, bubble. All with fn_ptr comparators, i32/i64 variants, asc/desc. |
+| `random.cst` | xoshiro256** PRNG. Rng struct, rejection sampling range, shuffle, fill. Global convenience functions. |
+| `net.cst` | TCP/UDP networking: socket creation, bind/listen/accept/connect, send/recv, poll, socket options. |
+| `time.cst` | Monotonic/wall clock, sleep (s/ms/us/ns), elapsed measurement. |
+| `env.cst` | Command-line arguments (argc/argv) and environment variables (getenv). |
+| `arena.cst` | Bump allocator: O(1) alloc, bulk free via reset/destroy. Save/restore checkpoints. |
+| `compatcffi.cst` | C FFI compatibility helpers for struct passing and extern function interop. |
 
 ## Data Flow Summary
 
