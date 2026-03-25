@@ -29,12 +29,12 @@ let is Result gen i32, i32 as err = Result gen i32, i32 .Err(1);
 ## Matching
 
 ```cst
-match some_val {
-    Some(val) => {
+match Option gen i32 (some_val) {
+    case Some(val) {
         // val is i32
         syscall(60, val);
     }
-    None => {
+    case None {
         syscall(60, 1);
     }
 }

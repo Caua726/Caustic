@@ -45,15 +45,17 @@ Simple enums are stored as `i32` (4 bytes). The value is the variant's index.
 
 ## Using with Match
 
+The `match` statement requires the **enum type name** followed by the expression in parentheses. Each arm uses `case VariantName`. An optional `else` clause handles any unmatched variants.
+
 ```cst
-match (c) {
-    Color.Red => {
+match Color (c) {
+    case Red {
         syscall(1, 1, "red\n", 4);
     }
-    Color.Green => {
+    case Green {
         syscall(1, 1, "green\n", 6);
     }
-    Color.Blue => {
+    case Blue {
         syscall(1, 1, "blue\n", 5);
     }
 }
@@ -63,12 +65,23 @@ match (c) {
 
 ```cst
 fn color_code(c as Color) as i32 {
-    match (c) {
-        Color.Red => { return 1; }
-        Color.Green => { return 2; }
-        Color.Blue => { return 3; }
+    match Color (c) {
+        case Red { return 1; }
+        case Green { return 2; }
+        case Blue { return 3; }
     }
     return 0;
+}
+```
+
+## Using else (Default)
+
+The `else` clause matches any variant not covered by a `case`:
+
+```cst
+match Color (c) {
+    case Red { return 1; }
+    else { return 0; }
 }
 ```
 

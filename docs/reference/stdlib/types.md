@@ -61,12 +61,12 @@ let is types.Result gen i64, i32 as err_val = types.Result.Err gen i64, i32 (cas
 Use `match` to destructure and extract the inner values:
 
 ```cst
-fn process_option(opt as types.Option gen i64) as i64 {
-    match (opt) {
-        types.Option.Some gen i64 (val) => {
+fn process_option(opt as Option gen i64) as i64 {
+    match Option gen i64 (opt) {
+        case Some(val) {
             return val;
         }
-        types.Option.None gen i64 => {
+        case None {
             return 0 - 1;
         }
     }
@@ -75,12 +75,12 @@ fn process_option(opt as types.Option gen i64) as i64 {
 ```
 
 ```cst
-fn process_result(res as types.Result gen i64, i32) as i64 {
-    match (res) {
-        types.Result.Ok gen i64, i32 (val) => {
+fn process_result(res as Result gen i64, i32) as i64 {
+    match Result gen i64, i32 (res) {
+        case Ok(val) {
             return val;
         }
-        types.Result.Err gen i64, i32 (code) => {
+        case Err(code) {
             io.printf("error: %d\n", cast(i64, code));
             return 0;
         }
@@ -137,11 +137,11 @@ fn main() as i32 {
 
     let is types.Result gen i64, i32 as res = divide(10, 3);
 
-    match (res) {
-        types.Result.Ok gen i64, i32 (val) => {
+    match Result gen i64, i32 (res) {
+        case Ok(val) {
             io.printf("result: %d\n", val);
         }
-        types.Result.Err gen i64, i32 (code) => {
+        case Err(code) {
             io.printf("error code: %d\n", cast(i64, code));
         }
     }

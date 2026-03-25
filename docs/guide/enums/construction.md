@@ -76,9 +76,9 @@ Construct directly in a function call:
 
 ```cst
 fn process(r as Result) as i32 {
-    match (r) {
-        Result.Ok(val) => { return val; }
-        Result.Err(msg) => { return 1; }
+    match Result (r) {
+        case Ok(val) { return val; }
+        case Err(msg) { return 1; }
     }
     return 0;
 }

@@ -30,18 +30,18 @@ let is Shape as s3 = Shape.None;
 
 ## Extracting Data with Match
 
-Use `match` to destructure variants and bind their data:
+Use `match` with the **enum type name** to destructure variants and bind their data. Each arm uses `case VariantName` or `case VariantName(bindings)`:
 
 ```cst
 fn area(s as Shape) as i32 {
-    match (s) {
-        Shape.Circle(r) => {
+    match Shape (s) {
+        case Circle(r) {
             return r * r * 3;  // approximate
         }
-        Shape.Rect(w, h) => {
+        case Rect(w, h) {
             return w * h;
         }
-        Shape.None => {
+        case None {
             return 0;
         }
     }
@@ -50,6 +50,17 @@ fn area(s as Shape) as i32 {
 ```
 
 The variable names in the match arm (`r`, `w`, `h`) bind to the variant's payload fields.
+
+## Using else (Default)
+
+The `else` clause matches any variant not covered by a `case`:
+
+```cst
+match Shape (s) {
+    case Rect(w, h) { return w * h; }
+    else { return 0; }
+}
+```
 
 ## Memory Layout
 
@@ -80,12 +91,12 @@ enum Value {
 
 let is Value as v = Value.Int(42);
 
-match (v) {
-    Value.Int(n) => { /* use n as i64 */ }
-    Value.Float(f) => { /* use f as f64 */ }
-    Value.Str(s) => { /* use s as *u8 */ }
-    Value.Bool(b) => { /* use b as bool */ }
-    Value.Nil => { /* no data */ }
+match Value (v) {
+    case Int(n) { /* use n as i64 */ }
+    case Float(f) { /* use f as f64 */ }
+    case Str(s) { /* use s as *u8 */ }
+    case Bool(b) { /* use b as bool */ }
+    case Nil { /* no data */ }
 }
 ```
 
@@ -100,13 +111,13 @@ enum Token {
 }
 
 fn describe(tok as Token) as i32 {
-    match (tok) {
-        Token.Number(val) => {
+    match Token (tok) {
+        case Number(val) {
             return cast(i32, val);
         }
-        Token.Plus => { return 43; }   // '+'
-        Token.Minus => { return 45; }  // '-'
-        Token.End => { return 0; }
+        case Plus { return 43; }   // '+'
+        case Minus { return 45; }  // '-'
+        case End { return 0; }
     }
     return 0;
 }

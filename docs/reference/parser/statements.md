@@ -197,31 +197,39 @@ Creates `NK_DO_WHILE` with `body` and `cond`.
 
 ## Match Statement
 
-Syntax: `match (expr) { case value: { body } ... }`
+Syntax: `match TypeName (expr) { case VariantName { body } ... else { body } }`
 
 ```cst
-match (code) {
-    case 0: {
-        return "zero";
-    }
-    case 1: {
-        return "one";
-    }
+match Color (c) {
+    case Red { return 1; }
+    case Green { return 2; }
+    case Blue { return 3; }
+}
+```
+
+With destructuring and else:
+```cst
+match Shape (s) {
+    case Circle(r) { return r * r; }
+    case Rect(w, h) { return w * h; }
+    else { return 0; }
 }
 ```
 
 Parsing:
 1. Consume `TK_MATCH`.
-2. Consume `TK_LPAREN`.
-3. Parse the match target expression, set as `cond`.
-4. Consume `TK_RPAREN`.
-5. Consume `TK_LBRACE`.
-6. Parse case arms in a loop:
+2. Parse the match type (enum type name).
+3. Consume `TK_LPAREN`.
+4. Parse the match target expression, set as `cond`.
+5. Consume `TK_RPAREN`.
+6. Consume `TK_LBRACE`.
+7. Parse case arms in a loop:
    a. Consume `TK_CASE`.
-   b. Parse the case value expression.
-   c. Consume `TK_COLON`.
+   b. Parse the variant name identifier.
+   c. Optionally parse destructuring bindings `(name1, name2)`.
    d. Parse the case body block.
    e. Link case nodes together.
+8. Optionally parse `else { body }` as default arm.
 7. Consume `TK_RBRACE`.
 
 Creates `NK_MATCH` with `cond` and `cases` (linked list of case arm nodes).
