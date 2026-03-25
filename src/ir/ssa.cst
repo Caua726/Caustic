@@ -658,6 +658,63 @@ fn mem2reg(func as *d.IRFunction) as void {
     let is i32 as nblocks with mut = 0;
     cfg.build_cfg(func, blocks, &nblocks, label_to_bb);
     if (nblocks <= 1) {
+        // Fast path: single basic block — no phis needed, simple linear forwarding
+        let is *i32 as sb_off_map = cast(*i32, mem.galloc(cast(i64, OFF_MAP_MAX) * 4));
+        let is i32 as oi with mut = 0;
+        while (oi < OFF_MAP_MAX) { let is *i32 as op = cast(*i32, cast(i64, sb_off_map) + cast(i64, oi) * 4); *op = cast(i32, 0 - 1); oi = oi + 1; }
+        oi = 0;
+        while (oi < nslots) {
+            let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, oi) * sizeof(SlotInfo));
+            if (s.promotable == 1 && s.offset >= 0 && s.offset < cast(i64, OFF_MAP_MAX)) {
+                let is *i32 as op = cast(*i32, cast(i64, sb_off_map) + cast(i64, s.offset) * 4); *op = oi;
+            }
+            oi = oi + 1;
+        }
+        // cur_def[slot] tracks current vreg holding the slot's value
+        let is *i32 as cur_def = cast(*i32, mem.galloc(cast(i64, nslots) * 4));
+        oi = 0;
+        while (oi < nslots) { let is *i32 as cd = cast(*i32, cast(i64, cur_def) + cast(i64, oi) * 4); *cd = cast(i32, 0 - 1); oi = oi + 1; }
+        let is *d.IRInst as sb_inst with mut = func.instructions;
+        while (cast(i64, sb_inst) != 0) {
+            if (sb_inst.is_dead == 0) {
+                if (sb_inst.op == d.IR_LOAD && sb_inst.src1.op_type == d.OP_IMM) {
+                    let is i32 as sb_sidx = fast_slot_index(sb_off_map, sb_inst.src1.imm);
+                    if (sb_sidx >= 0) {
+                        let is *i32 as cd = cast(*i32, cast(i64, cur_def) + cast(i64, sb_sidx) * 4);
+                        if (*cd >= 0) {
+                            let is i32 as need_cast with mut = 0;
+                            if (cast(i64, sb_inst.cast_to) != 0) {
+                                let is *i32 as szp = cast(*i32, cast(i64, sb_inst.cast_to) + 28);
+                                if (*szp < 8) { need_cast = 1; }
+                            }
+                            if (need_cast == 1) {
+                                sb_inst.op = d.IR_CAST;
+                                sb_inst.src1.op_type = d.OP_VREG;
+                                sb_inst.src1.vreg = *cd;
+                                sb_inst.cast_from = sb_inst.cast_to;
+                            } else {
+                                sb_inst.op = d.IR_MOV;
+                                sb_inst.src1.op_type = d.OP_VREG;
+                                sb_inst.src1.vreg = *cd;
+                            }
+                        }
+                    }
+                }
+                if (sb_inst.op == d.IR_STORE && sb_inst.dest.op_type == d.OP_IMM) {
+                    let is i32 as sb_sidx = fast_slot_index(sb_off_map, sb_inst.dest.imm);
+                    if (sb_sidx >= 0) {
+                        if (sb_inst.src1.op_type == d.OP_VREG) {
+                            let is *i32 as cd = cast(*i32, cast(i64, cur_def) + cast(i64, sb_sidx) * 4);
+                            *cd = sb_inst.src1.vreg;
+                        }
+                        sb_inst.is_dead = 1;
+                    }
+                }
+            }
+            sb_inst = sb_inst.next;
+        }
+        mem.gfree(cast(*u8, cur_def));
+        mem.gfree(cast(*u8, sb_off_map));
         mem.gfree(cast(*u8, slots));
         mem.gfree(cast(*u8, blocks));
         mem.gfree(cast(*u8, label_to_bb));

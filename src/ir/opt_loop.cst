@@ -105,6 +105,23 @@ fn pass_licm(func as *d.IRFunction) as void {
 
 // === Function Inlining (-O1) ===
 
+// Check if callee has stack ops that survived mem2reg.
+// After mem2reg, only address-taken vars, arrays, and large structs keep stack references.
+// Inlining such functions would corrupt stack offsets (callee offsets clash with caller frame).
+fn inline_has_stack_ops(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) { return 1; }
+            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) { return 1; }
+            if (inst.op == d.IR_ADDR && inst.src1.op_type == d.OP_IMM) { return 1; }
+            if (inst.op == d.IR_GET_ALLOC_ADDR) { return 1; }
+        }
+        inst = inst.next;
+    }
+    return 0;
+}
+
 fn inline_count_insts(func as *d.IRFunction) as i32 {
     let is i32 as count with mut = 0;
     let is *d.IRInst as inst with mut = func.instructions;
@@ -139,9 +156,9 @@ fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
                     callee = cast(*d.IRFunction, 0);
                 } else { callee = callee.next; }
             }
-            if (cast(i64, found) != 0 && cast(i64, found) != cast(i64, func) && found.is_variadic == 0 && found.alloc_stack_size == 0 && found.stack_size == 0) {
+            if (cast(i64, found) != 0 && cast(i64, found) != cast(i64, func) && found.is_variadic == 0 && found.alloc_stack_size == 0 && found.num_args <= 6 && inline_has_stack_ops(found) == 0) {
                 let is i32 as callee_size = inline_count_insts(found);
-                if (callee_size > 0 && callee_size <= 20) {
+                if (callee_size > 0 && callee_size <= 60) {
                     // Check non-recursive
                     let is i32 as is_recursive with mut = 0;
                     let is *d.IRInst as rc with mut = found.instructions;
@@ -149,7 +166,7 @@ fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
                         if (rc.op == d.IR_CALL && inline_name_eq(rc.call_name_ptr, rc.call_name_len, found.asm_name_ptr, found.asm_name_len) == 1) { is_recursive = 1; }
                         rc = rc.next;
                     }
-                    if (is_recursive == 0) {
+                    if (is_recursive == 0 && func.vreg_count + found.vreg_count <= 512) {
                         let is i32 as vreg_off = func.vreg_count;
                         let is i32 as label_off = func.label_count;
                         let is i32 as after_lbl = func.label_count;
@@ -203,6 +220,12 @@ fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
                                         mr.src1 = d.op_vreg(ci.src1.vreg + vreg_off);
                                         mr.line = ci.line;
                                         if (cast(i64, ch) == 0) { ch = mr; ct = mr; } else { ct.next = mr; ct = mr; }
+                                    } else if (ci.src1.op_type == d.OP_IMM) {
+                                        let is *d.IRInst as mi = d.new_inst(d.IR_IMM);
+                                        mi.dest = d.op_vreg(inst.dest.vreg);
+                                        mi.src1 = d.op_imm(ci.src1.imm);
+                                        mi.line = ci.line;
+                                        if (cast(i64, ch) == 0) { ch = mi; ct = mi; } else { ct.next = mi; ct = mi; }
                                     }
                                     let is *d.IRInst as ja = d.new_inst(d.IR_JMP);
                                     ja.dest = d.op_label(after_lbl);
@@ -216,6 +239,7 @@ fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
                                     cl.call_name_ptr = ci.call_name_ptr;
                                     cl.call_name_len = ci.call_name_len;
                                     cl.is_variadic_call = ci.is_variadic_call;
+                                    cl.is_extern_call = ci.is_extern_call;
                                     cl.global_name_ptr = ci.global_name_ptr;
                                     cl.global_name_len = ci.global_name_len;
                                     cl.is_extern_global = ci.is_extern_global;
