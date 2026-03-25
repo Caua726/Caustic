@@ -1,6 +1,6 @@
 # Keywords
 
-Caustic has 28 reserved keywords. These words cannot be used as variable names, function names, struct names, module aliases, or any other user-defined identifier. Each keyword has a dedicated token kind, so the parser never sees them as `TK_IDENT`.
+Caustic has 31 reserved keywords. These words cannot be used as variable names, function names, struct names, module aliases, or any other user-defined identifier. Each keyword has a dedicated token kind, so the parser never sees them as `TK_IDENT`.
 
 ## Keyword Table
 
@@ -34,6 +34,8 @@ Caustic has 28 reserved keywords. These words cannot be used as variable names, 
 | `syscall` | `TK_SYSCALL` | 65 | 7 | Direct Linux syscall invocation |
 | `continue` | `TK_CONTINUE` | 66 | 8 | Continue to next loop iteration |
 | `type` | `TK_TYPE` | 77 | 4 | Type alias declaration |
+| `only` | `TK_ONLY` | 78 | 4 | Selective import filter (`use "path" only name1, name2`) |
+| `call` | `TK_CALL` | 79 | 4 | Indirect function call through pointer (`call(fn_ptr, args)`) |
 
 ## Keyword Lookup Strategy
 
