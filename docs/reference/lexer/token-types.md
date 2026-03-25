@@ -1,6 +1,6 @@
 # Token Types
 
-The Caustic lexer recognizes 77 distinct token kinds, numbered from `TK_EOF=0` through `TK_XOR_EQ=76`. Each token kind is represented as an `i32` constant in the `Token.kind` field.
+The Caustic lexer recognizes 80 distinct token kinds, numbered from `TK_EOF=0` through `TK_CALL=79`. Each token kind is represented as an `i32` constant in the `Token.kind` field.
 
 ## Complete Token Kind Table
 
