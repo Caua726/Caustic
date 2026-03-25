@@ -1,81 +1,156 @@
 // =======================================================
 // std/mem/pool.cst
 // Pool allocator — fixed-size slots, O(1) alloc/free
-// Zero fragmentation, zero header overhead
+// create() — fast, no safety checks
+// create_debug() — with bitmap for O(1) double-free detection
 // =======================================================
 
 use "../linux.cst" as linux;
 
 struct Pool {
     region as *u8;
+    bitmap as *u8;
     region_size as i64;
+    bitmap_size as i64;
     freelist as *u8;
     slot_size as i64;
     total_slots as i64;
     used_slots as i64;
+    debug as i64;
 }
 
-// Create a pool with N slots of fixed size
-fn create(slot_size as i64, count as i64) as Pool {
+// --- Internal ---
+
+fn _mmap(size as i64) as *u8 {
+    let is i64 as minus_one = 0 - 1;
+    return linux.mmap(cast(*u8, 0), size, 3, 34, minus_one, 0);
+}
+
+fn _bit_test(bitmap as *u8, idx as i64) as i64 {
+    let is i64 as bi = idx >> 3;
+    let is i64 as bit = idx & 7;
+    if (((cast(i64, bitmap[bi]) >> bit) & 1) == 1) { return 1; }
+    return 0;
+}
+
+fn _bit_set(bitmap as *u8, idx as i64) as void {
+    let is i64 as bi = idx >> 3;
+    let is i64 as bit = idx & 7;
+    bitmap[bi] = cast(u8, cast(i64, bitmap[bi]) | (1 << bit));
+}
+
+fn _bit_clear(bitmap as *u8, idx as i64) as void {
+    let is i64 as bi = idx >> 3;
+    let is i64 as bit = idx & 7;
+    bitmap[bi] = cast(u8, cast(i64, bitmap[bi]) & (255 ^ (1 << bit)));
+}
+
+fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
     let is Pool as p;
 
-    let is i64 as aligned_size with mut = (slot_size + 7) & (0 - 8);
-    if (aligned_size < 8) { aligned_size = 8; }
+    if (slot_size <= 0 || count <= 0) {
+        p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+        p.region_size = 0; p.bitmap_size = 0;
+        p.freelist = cast(*u8, 0); p.slot_size = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0;
+        return p;
+    }
 
-    let is i64 as total = aligned_size * count;
-    let is i64 as minus_one = 0 - 1;
-    let is *u8 as region = linux.mmap(cast(*u8, 0), total, 3, 34, minus_one, 0);
+    let is i64 as aligned with mut = (slot_size + 7) & (0 - 8);
+    if (aligned < 8) { aligned = 8; }
 
+    let is i64 as total = aligned * count;
+    let is *u8 as region = _mmap(total);
     if (cast(i64, region) < 0) {
-        p.region = cast(*u8, 0);
-        p.region_size = 0;
-        p.freelist = cast(*u8, 0);
-        p.slot_size = 0;
-        p.total_slots = 0;
-        p.used_slots = 0;
+        p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+        p.region_size = 0; p.bitmap_size = 0;
+        p.freelist = cast(*u8, 0); p.slot_size = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0;
         return p;
     }
 
     p.region = region;
     p.region_size = total;
-    p.slot_size = aligned_size;
+    p.slot_size = aligned;
     p.total_slots = count;
     p.used_slots = 0;
+    p.debug = with_debug;
 
-    // Build freelist: each slot's first 8 bytes hold next pointer
+    // Bitmap (only if debug)
+    if (with_debug == 1) {
+        let is i64 as bm_size = (count + 7) >> 3;
+        let is *u8 as bm = _mmap(bm_size);
+        if (cast(i64, bm) < 0) {
+            linux.munmap(region, total);
+            p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+            p.region_size = 0; p.bitmap_size = 0;
+            p.freelist = cast(*u8, 0); p.slot_size = 0;
+            p.total_slots = 0; p.used_slots = 0; p.debug = 0;
+            return p;
+        }
+        p.bitmap = bm;
+        p.bitmap_size = bm_size;
+        let is i64 as bi with mut = 0;
+        while (bi < bm_size) { bm[bi] = 255; bi = bi + 1; }
+        let is i64 as extra = bm_size * 8 - count;
+        if (extra > 0) { bm[bm_size - 1] = cast(u8, (1 << (8 - extra)) - 1); }
+    } else {
+        p.bitmap = cast(*u8, 0);
+        p.bitmap_size = 0;
+    }
+
+    // Build freelist
     let is i64 as i with mut = 0;
     while (i < count - 1) {
-        let is *i64 as np = cast(*i64, cast(i64, region) + i * aligned_size);
-        *np = cast(i64, region) + (i + 1) * aligned_size;
+        let is *i64 as np = cast(*i64, cast(i64, region) + i * aligned);
+        *np = cast(i64, region) + (i + 1) * aligned;
         i = i + 1;
     }
-    // Last slot points to null
-    let is *i64 as last = cast(*i64, cast(i64, region) + (count - 1) * aligned_size);
+    let is *i64 as last = cast(*i64, cast(i64, region) + (count - 1) * aligned);
     *last = 0;
-
     p.freelist = region;
+
     return p;
 }
 
-// Alloc — O(1) pop from freelist
+// --- Public API ---
+
+// debug=0: fast, no double-free detection
+// debug=1: with bitmap for O(1) double-free detection
+fn create(slot_size as i64, count as i64, debug as i64) as Pool {
+    return _init_pool(slot_size, count, debug);
+}
+
+// Alloc — O(1)
 fn alloc(p as *Pool) as *u8 {
     if (cast(i64, p.freelist) == 0) { return cast(*u8, 0); }
 
     let is *u8 as slot = p.freelist;
     let is *i64 as np = cast(*i64, slot);
     p.freelist = cast(*u8, *np);
+
+    if (p.debug == 1) {
+        let is i64 as si = (cast(i64, slot) - cast(i64, p.region)) / p.slot_size;
+        _bit_clear(p.bitmap, si);
+    }
+
     p.used_slots = p.used_slots + 1;
     return slot;
 }
 
-// Free — O(1) push to freelist
+// Free — O(1)
 fn free(p as *Pool, ptr as *u8) as void {
     if (cast(i64, ptr) == 0) { return; }
 
-    // Validate: ptr must be within region and aligned
     let is i64 as offset = cast(i64, ptr) - cast(i64, p.region);
     if (offset < 0 || offset >= p.region_size) { return; }
     if ((offset % p.slot_size) != 0) { return; }
+
+    if (p.debug == 1) {
+        let is i64 as si = offset / p.slot_size;
+        if (_bit_test(p.bitmap, si) == 1) { return; }
+        _bit_set(p.bitmap, si);
+    }
 
     let is *i64 as np = cast(*i64, ptr);
     *np = cast(i64, p.freelist);
@@ -83,19 +158,21 @@ fn free(p as *Pool, ptr as *u8) as void {
     p.used_slots = p.used_slots - 1;
 }
 
-// Destroy — munmap the region
+// Destroy
 fn destroy(p as *Pool) as void {
-    if (cast(i64, p.region) != 0) {
-        linux.munmap(p.region, p.region_size);
-        p.region = cast(*u8, 0);
-        p.freelist = cast(*u8, 0);
-        p.total_slots = 0;
-        p.used_slots = 0;
-    }
+    if (cast(i64, p.region) != 0) { linux.munmap(p.region, p.region_size); }
+    if (cast(i64, p.bitmap) != 0) { linux.munmap(p.bitmap, p.bitmap_size); }
+    p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+    p.freelist = cast(*u8, 0);
+    p.region_size = 0; p.bitmap_size = 0;
+    p.slot_size = 0; p.total_slots = 0;
+    p.used_slots = 0; p.debug = 0;
 }
 
-// Reset — free all slots without munmap
+// Reset
 fn reset(p as *Pool) as void {
+    if (cast(i64, p.region) == 0 || p.total_slots == 0) { return; }
+
     let is i64 as i with mut = 0;
     while (i < p.total_slots - 1) {
         let is *i64 as np = cast(*i64, cast(i64, p.region) + i * p.slot_size);
@@ -105,6 +182,14 @@ fn reset(p as *Pool) as void {
     let is *i64 as last = cast(*i64, cast(i64, p.region) + (p.total_slots - 1) * p.slot_size);
     *last = 0;
     p.freelist = p.region;
+
+    if (p.debug == 1) {
+        i = 0;
+        while (i < p.bitmap_size) { p.bitmap[i] = 255; i = i + 1; }
+        let is i64 as extra = p.bitmap_size * 8 - p.total_slots;
+        if (extra > 0) { p.bitmap[p.bitmap_size - 1] = cast(u8, (1 << (8 - extra)) - 1); }
+    }
+
     p.used_slots = 0;
 }
 
