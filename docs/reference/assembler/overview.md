@@ -78,5 +78,5 @@ The heap is initialized via `mem.gheapinit()` using Linux `mmap` syscalls -- the
 ## Build
 
 ```bash
-make assembler    # compiles caustic-assembler/*.cst, then assembles + links to ./caustic-as
+./caustic-mk build caustic-as
 ```

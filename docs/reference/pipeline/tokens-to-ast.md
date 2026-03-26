@@ -96,7 +96,7 @@ Nodes are allocated on the heap via `new_node(kind)`, which zeroes all fields an
 
 ## Node Kinds
 
-There are 50 node kinds (NK_NUM through NK_FN_PTR):
+There are 53 node kinds (NK_NUM through NK_CALL_INDIRECT):
 
 ### Literals and Names
 
