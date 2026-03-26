@@ -2,9 +2,112 @@
 
 Self-hosted x86_64 Linux compiler — no LLVM, no libc, no runtime.
 
-The entire toolchain (compiler, assembler, linker, build system) is written in Caustic itself.
+The entire toolchain — compiler, assembler, linker, and build system — is written in Caustic itself. Programs execute via direct Linux syscalls with zero external dependencies.
 
-## Build
+## Overview
+
+- **Self-hosted**: the compiler compiles itself (stable bootstrap since v0.0.1)
+- **Zero dependencies**: no LLVM, no libc, no runtime — only Linux syscalls
+- **Full toolchain**: compiler (`caustic`), assembler (`caustic-as`), linker (`caustic-ld`), build system (`caustic-mk`)
+- **Optimizing**: `-O1` with SSA, constant propagation, strength reduction, LICM, DCE, graph coloring register allocation
+- **~18K lines** of self-hosted Caustic code + 6.6K lines of standard library
+
+```cst
+fn main() as i32 {
+    syscall(1, 1, "Hello, World!\n", 14);
+    return 0;
+}
+```
+
+```sh
+./caustic hello.cst -o hello && ./hello
+```
+
+## Features
+
+### Language
+- **Types**: i8-i64, u8-u64, f32, f64, bool, char, string, void, pointers, arrays
+- **Generics**: monomorphization (`fn max gen T`, `struct Pair gen T, U`, `enum Option gen T`)
+- **Enums**: simple enums and tagged unions with pattern matching (`match`/`case`/`else`)
+- **Impl blocks**: methods and associated functions (`impl Point { fn sum(self) ... }`)
+- **Defer**: LIFO cleanup before return (`defer free(ptr);`)
+- **FFI**: `extern fn` for C interop, System V ABI struct passing
+- **Indirect calls**: `call(fn_ptr, args)` with compile-time type checking
+- **Modules**: `use "path" as alias`, `only` selective imports, submodule dot-notation
+- **Type aliases**: `type Size = i64;`
+
+### Standard Library
+
+| Module | Description |
+|--------|-------------|
+| `linux.cst` | 40+ syscall wrappers (file, process, memory, network, time) |
+| `mem.cst` | 5 allocators: freelist, bins (O(1)), arena, pool, lifo |
+| `string.cst` | Dynamic strings (concat, find, substring, split, trim, replace) |
+| `io.cst` | Buffered I/O, printf, file/directory operations |
+| `slice.cst` | Generic dynamic array (`Slice gen T` with push/pop/get/set) |
+| `types.cst` | `Option gen T` and `Result gen T, E` |
+| `map.cst` | Hash maps (MapI64, MapStr) with open addressing |
+| `math.cst` | abs, min, max, pow, gcd, lcm, align |
+| `sort.cst` | quicksort, heapsort, mergesort with fn_ptr comparators |
+| `random.cst` | xoshiro256** PRNG with rejection sampling |
+| `net.cst` | TCP/UDP sockets, bind/listen/accept, poll |
+| `time.cst` | Monotonic/wall clock, sleep, elapsed |
+| `env.cst` | argc/argv, getenv |
+| `arena.cst` | Standalone bump allocator |
+| `compatcffi.cst` | C FFI struct passing helpers |
+
+### Toolchain
+- **Compiler** (`caustic`): 6-phase pipeline (lex → parse → semantic → IR → optimize → codegen)
+- **Assembler** (`caustic-as`): two-pass x86_64 assembler, 65 instructions, ELF .o output
+- **Linker** (`caustic-ld`): static and dynamic linking, PLT/GOT, multi-object
+- **Build system** (`caustic-mk`): Causticfile-based, git dependencies, system libraries
+
+### Optimization (-O1)
+SSA mem2reg, constant propagation, store-load forwarding, LICM, strength reduction, DCE, function inlining, graph coloring register allocation (George & Appel 1996), peephole optimizer. **3.4x faster** than -O0.
+
+## Performance
+
+Benchmark totals (v0.0.13, same machine, CPU-pinned):
+
+| Compiler | fib(38) | sieve(10M) | sort(1M) | matmul(64) | collatz(1M) | **Total** |
+|----------|---------|------------|----------|------------|-------------|-----------|
+| GCC -O2 | — | — | — | — | — | **242ms** |
+| GCC -O0 | — | — | — | — | — | **709ms** |
+| **Caustic -O1** | 175ms | 61ms | 261ms | 70ms | 185ms | **757ms** |
+| LuaJIT | — | — | — | — | — | **1081ms** |
+
+## Quick Start
+
+### Install
+
+```sh
+tar xzf caustic-x86_64-linux.tar.gz
+sudo cp caustic-x86_64-linux/bin/* /usr/local/bin/
+sudo mkdir -p /usr/local/lib/caustic/std
+sudo cp caustic-x86_64-linux/lib/caustic/std/*.cst /usr/local/lib/caustic/std/
+```
+
+### Using caustic-mk
+
+```sh
+./caustic-mk build hello    # compile examples/hello.cst
+./build/hello                # run it
+./caustic-mk test            # run test suite
+```
+
+### Manual pipeline
+
+```sh
+./caustic program.cst -o program    # compile + assemble + link
+./program                            # run
+
+# Or step by step:
+./caustic program.cst                # -> program.cst.s
+./caustic-as program.cst.s           # -> program.cst.s.o
+./caustic-ld program.cst.s.o -o program
+```
+
+## Build from Source
 
 Bootstrap the build system:
 
@@ -14,29 +117,13 @@ Bootstrap the build system:
 ./caustic-ld caustic-maker/main.cst.s.o -o caustic-mk
 ```
 
-Then use `caustic-mk` for everything:
+Then build everything:
 
 ```sh
 ./caustic-mk build caustic       # compiler
 ./caustic-mk build caustic-as    # assembler
 ./caustic-mk build caustic-ld    # linker
 ./caustic-mk build caustic-mk    # build system itself
-```
-
-Compile and run a program:
-
-```sh
-./caustic-mk build hello
-./build/hello
-```
-
-Other commands:
-
-```sh
-./caustic-mk run <name>          # run a script or target binary
-./caustic-mk test                # run the "test" script
-./caustic-mk clean               # remove .caustic/ and build/
-./caustic-mk init                # create a new Causticfile
 ```
 
 ### Causticfile
@@ -58,184 +145,30 @@ script "test" {
 }
 ```
 
-## Capabilities
+## Syntax
 
-### Core
-
-- [x] **Native Code Generation**
-- [x] **Direct Syscalls**
-- [x] **Pointers, Arrays, Structs**
-- [x] **Global Variables**
-- [x] **String Literals**
-- [x] **Module System**
-- [x] **Functions**
-- [x] **Floats** (f32, f64 via SSE)
-- [x] **Standard Library**
-  - [x] **Memory Management**
-  - [x] **Dynamic Strings**
-  - [x] **String Operations** (eq, starts_with, ends_with, contains, char_at, parse_int)
-  - [x] **Option & Result Types**
-  - [x] **IO Library**
-- [-] **Language Extensions**
-  - [x] **Generics**
-  - [x] **Enums & Pattern Matching**
-  - [x] **Defer**
-  - [x] **FFI / C Interop**
-  - [x] **Impl Blocks** (methods & associated functions)
-- [-] **Compiler Evolution**
-  - [x] **Self-Hosted Compiler**
-  - [x] **Assembler** (caustic-as)
-  - [x] **Linker** (caustic-ld, static & dynamic)
-  - [x] **Build System** (caustic-mk)
-  - [ ] **Optimization**
-
-### Syntax Dump
-
-#### Entry Point
 ```cst
-fn main() as i32 {
-    return 0;
-}
-```
+use "std/mem.cst" as mem;
+use "std/io.cst" as io;
 
-#### Variables & Globals
-```cst
-// Stack (Local)
-let is i32 as x = 10;
-let is *u8 as ptr;
-let is [64]u8 as buffer;
-
-// Data Section (Global)
-let is i32 as global_count with mut = 0;
-```
-
-#### Structs & Layout
-```cst
-struct Vec3 {
-    x as i32;
-    y as i32;
-    z as i32;
-}
-
-let is Vec3 as v;
-v.x = 10;
-let is i32 as size = sizeof(Vec3); // 12
-```
-
-#### Enums & Pattern Matching
-```cst
-// Simple enum
-enum Color { Red; Green; Blue; }
-
-// Tagged union (with data)
-enum Shape { Circle as i32; Rect as i32, i32; None; }
-
-// Generic enum
-enum Option gen T { Some as T; None; }
-
-// Construction
-let is Color as c = Color.Blue;
-let is Shape as s = Shape.Rect(10, 20);
-let is Option gen i32 as x = Option gen i32 .Some(42);
-
-// Pattern matching
-match Color (c) {
-    case Red { return 1; }
-    case Green { return 2; }
-    case Blue { return 3; }
-}
-
-// Destructuring
-match Shape (s) {
-    case Rect(w, h) { return w + h; }
-    case Circle(r) { return r; }
-    else { return 0; }
-}
-```
-
-#### Flow Control
-```cst
-if (1 == 1) {
-    // ...
-}
-
-while (1) {
-    if (x > 10) { break; }
-    continue;
-}
-
-// Short-circuit logic
-if (ptr != 0 && *ptr == 10) { ... }
-```
-
-#### FFI / C Interop
-```cst
-extern fn printf(fmt as *u8, ...) as i32;
-extern fn malloc(size as u64) as *u8;
-extern fn free(ptr as *u8) as void;
-
-fn main() as i32 {
-    let is *u8 as buf = malloc(256);
-    printf("Hello %s, %d\n", "world", 42);
-    free(buf);
-    return 0;
-}
-```
-
-#### Defer
-```cst
-fn work() as void {
-    let is *u8 as ptr = alloc(1024);
-    defer free(ptr);
-    // ... use ptr ...
-    // free(ptr) is called automatically on return
-}
-```
-
-#### Impl Blocks
-```cst
 struct Point { x as i32; y as i32; }
 
 impl Point {
-    // Associated function (no self)
     fn new(x as i32, y as i32) as Point {
         let is Point as p;
         p.x = x; p.y = y;
         return p;
     }
 
-    // Method (takes self pointer)
     fn sum(self as *Point) as i32 {
         return self.x + self.y;
     }
 }
 
-let is Point as p = Point.new(3, 4); // associated function
-let is i32 as s = p.sum();           // method call
-```
-
-#### Low Level / Unsafe
-```cst
-// Syscall 1 (Write) to FD 1 (Stdout)
-syscall(1, 1, "Hello World\n", 12);
-
-// Direct Assembly
-asm("mov rax, 1\n");
-
-// Bitwise & Casting
-let is i32 as align = (size + 15) & ~15;
-let is *u8 as raw_ptr = cast(*u8, 0x7fffffff);
-let is i32 as shifted = 1 << 4;
-```
-
-#### Modules
-```cst
-use "std/mem.cst" as mem;
-
 fn main() as i32 {
     mem.gheapinit(1048576);
-    let is *u8 as ptr = mem.galloc(1024);
-    defer mem.gfree(ptr);
+    let is Point as p = Point.new(3, 4);
+    io.printf("sum = %d\n", cast(i64, p.sum()));
     return 0;
 }
 ```
