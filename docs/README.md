@@ -1,132 +1,26 @@
 # Caustic Documentation
 
-Caustic is a self-hosted native x86_64 Linux compiler. The entire toolchain — compiler, assembler, linker — is written in Caustic itself. No LLVM, no libc, no runtime dependencies.
+Caustic is a self-hosted native x86_64 Linux compiler. The entire toolchain — compiler, assembler, linker, build system — is written in Caustic itself. No LLVM, no libc, no runtime dependencies.
 
 ## Guide
 
-Learn the language from scratch.
+Learn the language from scratch. Each page covers a topic with examples.
 
 - [Getting Started](guide/getting-started.md) — install, hello world, pipeline
-- [Hello World](guide/hello-world.md) — first program, compile, run
-- [Compiler Flags](guide/compiler-flags.md) — `-c`, `-debuglexer`, `-debugparser`, `-debugir`
-- [Error Messages](guide/error-messages.md) — common errors and how to fix them
-
-### Variables
-
-- [Declaration](guide/variables/declaration.md) — `let is TYPE as name`
-- [Mutability](guide/variables/mutability.md) — `with mut`, `with imut`
-- [Globals](guide/variables/globals.md) — global variables, data section
-- [Shadowing](guide/variables/shadowing.md) — shadowing rules
-- [Initialization](guide/variables/initialization.md) — default values, required initialization
-
-### Types
-
-- [Integers](guide/types/integers.md) — `i8`, `i16`, `i32`, `i64`
-- [Unsigned](guide/types/unsigned.md) — `u8`, `u16`, `u32`, `u64`
-- [Floats](guide/types/floats.md) — `f32`, `f64`, SSE
-- [Bool](guide/types/bool.md) — `bool`, `true`/`false`
-- [Char](guide/types/char.md) — `char`, `'A'`
-- [Void](guide/types/void.md) — `void`
-- [String Type](guide/types/string-type.md) — `string`, `"..."`
-- [Type Coercion](guide/types/type-coercion.md) — narrowing, widening
-- [Negative Literals](guide/types/negative-literals.md) — workarounds for `imut` globals
-- [Type Aliases](guide/types/type-aliases.md) — `type Name = ExistingType`
-
-### Functions
-
-- [Declaration](guide/functions/declaration.md) — `fn name(params) as RetType`
-- [Parameters](guide/functions/parameters.md) — by value, by pointer
-- [Return Values](guide/functions/return-values.md) — `return`, struct return (SRET)
-- [Recursion](guide/functions/recursion.md) — recursive functions
-- [Variadic](guide/functions/variadic.md) — variadic functions, `...`
-
-### Operators
-
-- [Arithmetic](guide/operators/arithmetic.md) — `+`, `-`, `*`, `/`, `%`
-- [Comparison](guide/operators/comparison.md) — `==`, `!=`, `<`, `<=`, `>`, `>=`
-- [Logical](guide/operators/logical.md) — `&&`, `||`, `!`
-- [Bitwise](guide/operators/bitwise.md) — `&`, `|`, `^`, `~`, `<<`, `>>`
-- [Compound Assignment](guide/operators/compound-assignment.md) — `+=`, `-=`, `*=`, `/=`, etc
-- [Short-Circuit](guide/operators/short-circuit.md) — `&&` and `||` evaluation
-- [Operator Precedence](guide/operators/operator-precedence.md) — precedence table
-
-### Control Flow
-
-- [If/Else](guide/control-flow/if-else.md) — `if`, `else`, `else if`
-- [While](guide/control-flow/while.md) — `while` loop
-- [For](guide/control-flow/for.md) — `for` loop
-- [Do-While](guide/control-flow/do-while.md) — `do { } while ()`
-- [Break/Continue](guide/control-flow/break-continue.md) — loop control
-- [Match](guide/control-flow/match.md) — pattern matching
-- [Destructuring](guide/control-flow/destructuring.md) — enum data extraction
-
-### Structs
-
-- [Declaration](guide/structs/declaration.md) — `struct Name { fields }`
-- [Field Access](guide/structs/field-access.md) — `s.field`, pointer access
-- [Packed Layout](guide/structs/packed-layout.md) — no padding, `sizeof`
-- [Nested Structs](guide/structs/nested-structs.md) — structs inside structs
-- [Struct Pointers](guide/structs/struct-pointers.md) — `*Struct`, heap allocation
-- [Struct Return](guide/structs/struct-return.md) — SRET, large structs
-
-### Enums
-
-- [Simple Enums](guide/enums/simple-enums.md) — enums without data
-- [Tagged Unions](guide/enums/tagged-unions.md) — variants with data
-- [Construction](guide/enums/construction.md) — `Enum.Variant`, `Enum.Variant(data)`
-- [Enum Layout](guide/enums/enum-layout.md) — tag + max size, memory layout
-
-### Generics
-
-- [Syntax](guide/generics/syntax.md) — `gen T`, `gen T, U`
-- [Functions](guide/generics/functions.md) — `fn name gen T (...)`
-- [Structs](guide/generics/structs.md) — `struct Name gen T { ... }`
-- [Enums](guide/generics/enums.md) — `enum Name gen T { ... }`
-- [Monomorphization](guide/generics/monomorphization.md) — code generation, name mangling
-- [Constraints](guide/generics/constraints.md) — current limitations
-
-### Impl Blocks
-
-- [Methods](guide/impl/methods.md) — `fn method(self as *Type)`
-- [Associated Functions](guide/impl/associated-functions.md) — `fn new(...)`, no `self`
-- [Desugaring](guide/impl/desugaring.md) — how methods become top-level functions
-- [Generic Impl](guide/impl/generic-impl.md) — `impl Name gen T { ... }`
-- [Method Call Syntax](guide/impl/method-call-syntax.md) — `p.method()` → `Type_method(&p)`
-
-### Memory
-
-- [Pointers](guide/memory/pointers.md) — `*T`, null
-- [Address-Of](guide/memory/address-of.md) — `&x`
-- [Dereferencing](guide/memory/dereferencing.md) — `*ptr`
-- [Pointer Arithmetic](guide/memory/pointer-arithmetic.md) — `ptr + offset`
-- [Arrays](guide/memory/arrays.md) — `[N]T`, indexing
-- [Array of Structs](guide/memory/array-of-structs.md) — struct arrays
-- [Heap Allocation](guide/memory/heap-allocation.md) — `galloc`, `gfree`
-- [Stack vs Heap](guide/memory/stack-vs-heap.md) — when to use each
-
-### Modules
-
-- [Use Statement](guide/modules/use-statement.md) — `use "path.cst" as alias`
-- [Aliases](guide/modules/aliases.md) — `alias.func()`, `alias.CONST`
-- [Relative Paths](guide/modules/relative-paths.md) — path resolution
-- [Circular Imports](guide/modules/circular-imports.md) — limitations
-- [Multi-File Projects](guide/modules/multi-file-projects.md) — `-c`, linking
-- [Extern Fn](guide/modules/extern-fn.md) — cross-object declarations
-
-### Advanced
-
-- [Cast](guide/advanced/cast.md) — `cast(Type, expr)`
-- [Sizeof](guide/advanced/sizeof.md) — `sizeof(Type)`
-- [Inline Assembly](guide/advanced/inline-asm.md) — `asm("...")`
-- [Syscalls](guide/advanced/syscalls.md) — `syscall(nr, ...)`
-- [Defer](guide/advanced/defer.md) — syntax, LIFO, scope
-- [Defer Patterns](guide/advanced/defer-patterns.md) — alloc/free, open/close
-- [Function Pointers](guide/advanced/function-pointers.md) — `fn_ptr(name)`
-- [FFI](guide/advanced/ffi.md) — `extern fn`, linking with libc
-- [FFI Struct Passing](guide/advanced/ffi-struct-passing.md) — System V ABI
-- [C Interop Types](guide/advanced/compatcffi.md) — CStruct, CUnion
-- [String Escapes](guide/advanced/string-escapes.md) — `\n`, `\t`, `\\`, `\0`
-- [Char Literals](guide/advanced/char-literals.md) — `'A'`, encoding
+- [Variables](guide/variables.md) — declaration, mutability, globals, shadowing
+- [Types](guide/types.md) — integers, unsigned, floats, bool, char, void, string, type aliases, hex/binary/octal literals
+- [Functions](guide/functions.md) — declaration, parameters, return values, recursion, variadic
+- [Control Flow](guide/control-flow.md) — if/else, while, for, do-while, break/continue, match, destructuring
+- [Operators](guide/operators.md) — arithmetic, comparison, logical, bitwise, compound assignment, precedence
+- [Structs](guide/structs.md) — declaration, field access, packed layout, pointers, return
+- [Enums](guide/enums.md) — simple enums, tagged unions, construction, match/case/else, layout
+- [Generics](guide/generics.md) — syntax, functions, structs, enums, monomorphization
+- [Memory](guide/memory.md) — pointers, address-of, dereferencing, arrays, heap, stack vs heap
+- [Modules](guide/modules.md) — use, aliases, only imports, submodules, extern fn, multi-file
+- [Impl Blocks](guide/impl.md) — methods, associated functions, desugaring, generic impl
+- [Advanced](guide/advanced.md) — cast, sizeof, asm, syscalls, defer, function pointers, call(), FFI, string escapes
+- [Compiler Flags](guide/compiler-flags.md) — -c, -o, -O0/-O1, --profile, --cache, --max-ram, all 16 flags
+- [Build System](guide/build-system.md) — caustic-mk, Causticfile, targets, scripts, dependencies
 
 ## Reference
 
@@ -148,15 +42,15 @@ Deep dive into the compiler internals.
 ### Lexer
 
 - [Overview](reference/lexer/overview.md) — input/output
-- [Token Types](reference/lexer/token-types.md) — all 77 token types
-- [Keywords](reference/lexer/keywords.md) — reserved words
+- [Token Types](reference/lexer/token-types.md) — all 80 token types
+- [Keywords](reference/lexer/keywords.md) — 31 reserved words
 - [Literals](reference/lexer/literals.md) — integer, float, string, char
 - [Operators & Punctuation](reference/lexer/operators-and-punctuation.md)
 
 ### Parser
 
 - [Overview](reference/parser/overview.md) — recursive descent
-- [Node Kinds](reference/parser/node-kinds.md) — all 50 node kinds
+- [Node Kinds](reference/parser/node-kinds.md) — all 53 node kinds
 - [Expressions](reference/parser/expressions.md) — precedence climbing
 - [Statements](reference/parser/statements.md)
 - [Declarations](reference/parser/declarations.md) — fn, struct, enum, let, use, impl
@@ -180,13 +74,14 @@ Deep dive into the compiler internals.
 - [Array Types](reference/type-system/array-types.md)
 - [Struct Types](reference/type-system/struct-types.md)
 - [Enum Types](reference/type-system/enum-types.md)
+- [Function Types](reference/type-system/function-types.md) — TY_FN, typed fn_ptr
 - [Type Sizes](reference/type-system/type-sizes.md)
 - [Type Compatibility](reference/type-system/type-compatibility.md)
 
 ### IR
 
 - [Overview](reference/ir/overview.md) — design, vregs, operands
-- [Opcodes](reference/ir/opcodes.md) — all 46 operations
+- [Opcodes](reference/ir/opcodes.md) — all 48 operations
 - [Operand Types](reference/ir/operand-types.md)
 - [Data Structures](reference/ir/data-structures.md)
 - [Control Flow IR](reference/ir/control-flow-ir.md)
@@ -197,8 +92,9 @@ Deep dive into the compiler internals.
 ### Codegen
 
 - [Overview](reference/codegen/overview.md)
-- [Register Allocation](reference/codegen/register-allocation.md)
-- [Available Registers](reference/codegen/available-registers.md)
+- [Register Allocation](reference/codegen/register-allocation.md) — linear scan (-O0) + graph coloring (-O1)
+- [Available Registers](reference/codegen/available-registers.md) — 10 allocatable registers
+- [Optimizations](reference/codegen/optimizations.md) — -O1 pipeline (10 passes)
 - [Instruction Emission](reference/codegen/instruction-emission.md)
 - [Function Prologue](reference/codegen/function-prologue.md)
 - [Function Epilogue](reference/codegen/function-epilogue.md)
@@ -231,12 +127,25 @@ Deep dive into the compiler internals.
 - [ELF Executable Format](reference/linker/elf-executable-format.md)
 - [Multi-Object](reference/linker/multi-object.md)
 
+### Build System (caustic-mk)
+
+- [Causticfile Format](reference/build-system/causticfile.md) — targets, scripts, dependencies
+- [Commands](reference/build-system/commands.md) — build, run, test, clean, init
+
 ### Standard Library
 
-- [mem.cst](reference/stdlib/mem.md) — heap allocator
-- [io.cst](reference/stdlib/io.md) — buffered I/O, printf
+- [mem.cst](reference/stdlib/mem.md) — memory management (5 allocators)
+- [io.cst](reference/stdlib/io.md) — buffered I/O, printf, file ops
 - [string.cst](reference/stdlib/string.md) — dynamic strings
 - [linux.cst](reference/stdlib/linux.md) — syscall wrappers
 - [types.cst](reference/stdlib/types.md) — Option, Result
 - [slice.cst](reference/stdlib/slice.md) — generic dynamic array
+- [map.cst](reference/stdlib/map.md) — hash maps (MapI64, MapStr)
+- [math.cst](reference/stdlib/math.md) — integer math
+- [sort.cst](reference/stdlib/sort.md) — sorting algorithms
+- [random.cst](reference/stdlib/random.md) — xoshiro256** PRNG
+- [net.cst](reference/stdlib/net.md) — TCP/UDP networking
+- [time.cst](reference/stdlib/time.md) — clock, sleep, elapsed
+- [env.cst](reference/stdlib/env.md) — argc/argv, getenv
+- [arena.cst](reference/stdlib/arena.md) — bump allocator
 - [compatcffi.cst](reference/stdlib/compatcffi.md) — C interop types
