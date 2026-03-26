@@ -1,119 +1,112 @@
 # Getting Started
 
-## Prerequisites
+## Install
 
-- Linux x86_64 (kernel 3.2+)
-- git
-- make
+Download the latest release tarball and copy the binaries:
 
-No other dependencies are needed. Caustic does not use LLVM, GCC, libc, or any runtime. The compiler, assembler, and linker are all self-contained.
-
-## Build from Source
-
-```bash
-git clone https://github.com/your-repo/Caustic.git
-cd Caustic
-
-make              # Build the compiler (./caustic)
-make assembler    # Build the assembler (./caustic-as)
-make linker       # Build the linker (./caustic-ld)
+```sh
+tar xzf caustic-x86_64-linux.tar.gz
+sudo cp caustic-x86_64-linux/bin/* /usr/local/bin/
+sudo mkdir -p /usr/local/lib/caustic/std
+sudo cp caustic-x86_64-linux/lib/caustic/std/*.cst /usr/local/lib/caustic/std/
 ```
 
-After building, you should have three binaries in the project root: `caustic`, `caustic-as`, and `caustic-ld`.
+## Hello World
 
-## The Compilation Pipeline
-
-Caustic uses a three-stage pipeline to go from source code to a native executable:
-
-```
-source.cst  -->  caustic  -->  .s  -->  caustic-as  -->  .o  -->  caustic-ld  -->  executable
-              (compiler)        (assembler)                (linker)
-```
-
-1. **caustic** compiles `.cst` source into x86_64 assembly (`.s`)
-2. **caustic-as** assembles the `.s` file into an ELF object (`.o`)
-3. **caustic-ld** links one or more `.o` files into a final executable
-
-The full command for a single file:
-
-```bash
-./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program
-./program
-```
-
-## Quick Test
-
-Create a file called `hello.cst`:
+Create a file `hello.cst`:
 
 ```cst
 fn main() as i32 {
-    syscall(1, 1, "Hello, Caustic!\n", 16);
+    syscall(1, 1, "Hello, World!\n", 14);
     return 0;
 }
 ```
 
 Compile and run:
 
-```bash
-./caustic hello.cst && ./caustic-as hello.cst.s && ./caustic-ld hello.cst.s.o -o hello
+```sh
+./caustic hello.cst -o hello
 ./hello
 ```
 
-You should see `Hello, Caustic!` printed to stdout.
+Output: `Hello, World!`
 
-## No libc
+The `-o` flag runs the full pipeline: compile to assembly, assemble to object file, link into executable.
 
-Caustic programs do not link against libc. All system interaction happens through raw Linux syscalls. The `syscall()` builtin maps directly to the `syscall` instruction with x86_64 Linux syscall numbers (e.g., write=1, read=0, exit=60, mmap=9).
+## Using caustic-mk
 
-## Program Entry Point
+For projects with multiple files, use the build system. Create a `Causticfile`:
 
-Every Caustic program needs a `main` function that returns `i32`:
+```
+name "myproject"
+version "0.1.0"
 
-```cst
-fn main() as i32 {
-    return 0;
+target "hello" {
+    src "hello.cst"
+    out "build/hello"
 }
 ```
 
-The return value becomes the process exit code (0-255). Use the `-c` flag when compiling library files that do not have a main function.
+Then build and run:
 
-## Standard Library
+```sh
+./caustic-mk build hello
+./build/hello
+```
 
-Caustic ships with a small standard library in the `std/` directory:
+Other commands:
 
-| Module | Purpose |
-|--------|---------|
-| `std/linux.cst` | Syscall wrappers (read, write, open, close, mmap, exit, etc.) |
-| `std/mem.cst` | Heap allocator with free-list coalescing (`galloc`, `gfree`) |
-| `std/string.cst` | Dynamic strings (`String` struct with ptr/len/cap) |
-| `std/io.cst` | Buffered I/O, line reading, `printf` |
+```sh
+./caustic-mk run hello       # build and run
+./caustic-mk test            # run the "test" script
+./caustic-mk clean           # remove build artifacts
+./caustic-mk init            # create a new Causticfile interactively
+```
 
-Import modules with `use`:
+## Using the Standard Library
+
+Most programs need the heap allocator and I/O:
 
 ```cst
 use "std/mem.cst" as mem;
 use "std/io.cst" as io;
 
 fn main() as i32 {
-    mem.gheapinit(1048576);
-    io.printf("Hello from io!\n");
+    mem.gheapinit(1048576);  // 1MB heap
+
+    io.printf("Hello %s! %d + %d = %d\n", "World", 2, 3, 5);
+
     return 0;
 }
 ```
 
-The heap must be initialized with `mem.gheapinit(size)` before any allocation functions are called.
+The stdlib is resolved automatically from `<binary_dir>/../lib/caustic/` or `/usr/local/lib/caustic/`.
 
-## Examples
+## Manual Pipeline
 
-The [examples/](../../examples/) directory contains runnable programs covering common patterns:
+Without `-o`, you can run each stage separately:
 
-- **hello.cst** — Hello world with syscall and linux.write
-- **fibonacci.cst** — Recursive and iterative fibonacci
-- **strings.cst** — String operations (concat, find, compare)
-- **structs.cst** — Structs, impl blocks, methods, constructors
-- **files.cst** — File I/O with raw syscalls
-- **calculator.cst** — Interactive calculator reading from stdin
-- **linked_list.cst** — Heap-allocated linked list
-- **enums.cst** — Enums, tagged unions, pattern matching
+```sh
+./caustic program.cst          # compile -> program.cst.s
+./caustic-as program.cst.s     # assemble -> program.cst.s.o
+./caustic-ld program.cst.s.o -o program  # link -> executable
+./program
+```
 
-See [examples/README.md](../../examples/README.md) for build instructions.
+## Optimization
+
+Use `-O1` for optimized builds (3.4x faster code, slower compilation):
+
+```sh
+./caustic -O1 program.cst -o program
+```
+
+## Next Steps
+
+- [Variables](variables.md) — declaration, mutability, globals
+- [Types](types.md) — integers, floats, pointers, arrays
+- [Functions](functions.md) — parameters, return values
+- [Control Flow](control-flow.md) — if, while, for, match
+- [Structs](structs.md) — composite types
+- [Modules](modules.md) — imports, multi-file projects
+- [Compiler Flags](compiler-flags.md) — all 16 flags
