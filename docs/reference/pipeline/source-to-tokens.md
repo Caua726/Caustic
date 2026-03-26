@@ -55,7 +55,7 @@ For integer literals, the lexer pre-computes the numeric value and stores it in 
 
 ## Token Kinds
 
-There are 77 token kinds, numbered 0 through 76:
+There are 80 token kinds, numbered 0 through 79:
 
 ### Literals (0-5)
 

@@ -4,7 +4,7 @@ Types appear in variable declarations (`let is Type as name`), function paramete
 
 ## Type Kind Table
 
-The `Type` struct uses a `kind` field to identify the type category. There are 18 type kinds:
+The `Type` struct uses a `kind` field to identify the type category. There are 19 type kinds:
 
 | Kind | Value | Description | Key Fields |
 |------|-------|-------------|------------|

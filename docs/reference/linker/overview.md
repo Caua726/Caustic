@@ -70,13 +70,13 @@ caustic-linker/
 ## Build and Usage
 
 ```bash
-make linker          # builds ./caustic-ld
+./caustic-mk build caustic-ld
 
 ./caustic-ld input.o -o output
 ./caustic-ld a.o b.o c.o -o output
 ./caustic-ld main.o -lc -o output    # dynamic, links libc
 
-make test-linker     # run the full test suite (54 tests)
+./caustic-mk test
 ```
 
 ## Full Toolchain Pipeline

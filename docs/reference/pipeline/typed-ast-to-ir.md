@@ -129,7 +129,7 @@ struct Operand {
 
 ## IR Opcodes
 
-There are 46 IR opcodes (IR_IMM through IR_FNEG):
+There are 48 IR opcodes (IR_IMM through IR_CALL_INDIRECT):
 
 ### Data Movement
 
