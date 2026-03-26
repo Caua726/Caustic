@@ -5,22 +5,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-make              # Build the compiler (creates ./caustic binary)
-make assembler    # Build the assembler (creates ./caustic-as binary)
-make linker       # Build the linker (creates ./caustic-ld binary)
-make test-linker  # Run full linker test suite
-make clean        # Remove build artifacts
+./caustic-mk build caustic       # Build the compiler
+./caustic-mk build caustic-as    # Build the assembler
+./caustic-mk build caustic-ld    # Build the linker
+./caustic-mk build caustic-mk    # Build the build system itself
+./caustic-mk test                # Run test suite
+./caustic-mk clean               # Remove .caustic/ and build/
 ```
 
 **Compiler usage:**
 ```bash
 ./caustic <source.cst>           # Generates <source.cst>.s assembly
+./caustic <source.cst> -o prog   # Full pipeline: compile + assemble + link
 ./caustic -c <source.cst>        # Compile only (no main required, for libraries)
+./caustic -O1 <source.cst> -o p  # Optimized build
 ./caustic -debuglexer <file>     # Debug tokenization
 ./caustic -debugparser <file>    # Debug AST
 ./caustic -debugir <file>        # Debug IR generation
+./caustic --profile <file> -o p  # Show per-phase timing
 
-# Full pipeline:
+# Full manual pipeline:
 ./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program && ./program
 
 # Multi-object linking:
@@ -29,7 +33,7 @@ make clean        # Remove build artifacts
 ./caustic-ld lib.cst.s.o main.cst.s.o -o program
 
 # Quick one-liner test (prints exit code):
-./caustic test.cst && ./caustic-as test.cst.s && ./caustic-ld test.cst.s.o -o /tmp/t && /tmp/t; echo "Exit: $?"
+./caustic test.cst -o /tmp/t && /tmp/t; echo "Exit: $?"
 ```
 
 ## Architecture
@@ -46,25 +50,26 @@ Source (.cst) → Lexer → Parser → Semantic → IR → Codegen → Assembly 
 
 | Phase | Files | Purpose |
 |-------|-------|---------|
-| Lexer | `src/lexer/` | Tokenization (60+ token types) |
-| Parser | `src/parser/` | Recursive descent → AST (30+ node kinds) |
-| Semantic | `src/semantic/` | Type checking, symbol tables, module resolution |
-| IR | `src/ir/` | Virtual register IR (45+ operations, unlimited vregs) |
-| Codegen | `src/codegen/` | Register allocation + x86_64 assembly output |
+| Lexer | `src/lexer/` | Tokenization (80 token types) |
+| Parser | `src/parser/` | Recursive descent → AST (53 node kinds) |
+| Semantic | `src/semantic/` | Type checking, symbol tables, module resolution, generic instantiation |
+| IR | `src/ir/` | Virtual register IR (48 opcodes, unlimited vregs), optimization passes |
+| Codegen | `src/codegen/` | Register allocation (linear scan -O0, graph coloring -O1) + x86_64 assembly output |
 
 ### Type System
 
 - **Primitives**: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `char`, `string`, `void`
-- **Composite**: Pointers (`*T`), Arrays (`[N]T`), Structs
+- **Composite**: Pointers (`*T`), Arrays (`[N]T`), Structs, Enums (tagged unions)
 - **Type Aliases**: `type Name = ExistingType;`
-- **Floats**: Use SSE instructions (addsd, subsd, mulsd, divsd)
+- **Function Types**: `TY_FN` — typed function pointers via `fn_ptr()`
+- **Floats**: Use SSE instructions (addsd, subsd, mulsd, divsd), f32 literal narrowing
 
 ### Key Conventions
 
 - System V AMD64 ABI for function calls (args: rdi, rsi, rdx, rcx, r8, r9)
-- Linear scan register allocation with 12 GPRs
+- 10 allocatable registers: rbx, r12, r13, r14, r15 (callee-saved) + rsi, rdi, r8, r9, r10 (caller-saved between calls)
 - Module caching to avoid re-parsing imports
-- Manual memory management via `std/mem.cst` heap allocator
+- Manual memory management via `std/mem.cst` heap allocator (5 submodule allocators)
 
 ## Language Syntax
 
@@ -89,17 +94,20 @@ type Size = i64;
 
 // Modules
 use "std/mem.cst" as mem;
+use "std/mem.cst" only freelist, bins as mem;  // selective import
 mem.galloc(1024);
+mem.bins.bins_new(4096);  // submodule access
 
-// Defer — executa chamada antes de cada return (LIFO)
+// Defer — executes call before each return (LIFO)
 defer free(ptr);
 defer close(fd);
 
-// Function pointers
+// Function pointers + indirect calls
 let is *u8 as cb = fn_ptr(my_func);          // local function
 let is *u8 as cb = fn_ptr(mod.func);         // module function
 let is *u8 as cb = fn_ptr(max gen i32);      // generic function
 let is *u8 as cb = fn_ptr(Point_sum);        // impl method
+let is i64 as result = call(cb, arg1, arg2); // indirect call (type-checked)
 
 // Low-level
 syscall(1, 1, "hello", 5);  // direct syscall
@@ -109,11 +117,26 @@ cast(*u8, address);         // type cast
 
 ## Standard Library (`std/`)
 
-- `linux.cst` - Syscall wrappers (read, write, mmap, exit, etc.)
-- `mem.cst` - Heap allocator with free-list coalescing
-- `string.cst` - Dynamic strings (String struct with ptr/len/cap)
-- `io.cst` - Buffered I/O, line reading, printf
-- `slice.cst` - Generic dynamic array (`Slice gen T` with push/get/set/pop/free)
+- `linux.cst` — 40+ syscall wrappers (file, process, memory, network, time)
+- `mem.cst` — Memory management hub with 5 allocators:
+  - `mem/freelist.cst` — O(n) alloc/free, address-ordered coalescing
+  - `mem/bins.cst` — O(1) alloc/free, slab-based, bitmap double-free detection
+  - `mem/arena.cst` — O(1) bump allocator, bulk free
+  - `mem/pool.cst` — O(1) fixed-size slots, optional debug
+  - `mem/lifo.cst` — O(1) stack-like allocator
+- `string.cst` — Dynamic strings (concat, find, substring, split, trim, replace)
+- `io.cst` — Buffered I/O, printf, file/directory operations
+- `slice.cst` — Generic dynamic array (`Slice gen T`)
+- `types.cst` — `Option gen T` and `Result gen T, E`
+- `map.cst` — Hash maps (MapI64 splitmix64, MapStr FNV-1a)
+- `math.cst` — abs, min, max, pow, gcd, lcm, align_up/down
+- `sort.cst` — quicksort, heapsort, mergesort with fn_ptr comparators
+- `random.cst` — xoshiro256** PRNG, rejection sampling range
+- `net.cst` — TCP/UDP sockets, bind/listen/accept, poll
+- `time.cst` — Monotonic/wall clock, sleep, elapsed
+- `env.cst` — argc/argv, getenv
+- `arena.cst` — Standalone bump allocator (same as mem/arena.cst)
+- `compatcffi.cst` — C FFI struct passing helpers
 
 ## Adding New Operators/Features
 
@@ -149,8 +172,9 @@ fn work() as i32 {
 - **Stdlib resolution**: The compiler tries paths relative to the source file first, then falls back to `<binary_dir>/../lib/caustic/`, then `/usr/local/lib/caustic/`
 - **No libc**: Programs use raw Linux syscalls, not C library functions
 - **Syscall numbers**: x86_64 Linux (e.g., write=1, exit=60, mmap=9)
-- **Float literals**: Must match variable type (`10.0` for f64, not `10`)
+- **Float literals**: Must match variable type (`10.0` for f64, not `10`). f32 literal narrowing is automatic.
 - **Char literals**: Now properly typed, no cast needed for `let is char as c = 'A'`
 - **Return via exit code**: `return N` from main becomes process exit code (0-255)
 - **Unused variable warnings**: Variables declared but never used produce a warning (prefix with `_` to suppress)
 - **Debug info**: Generated assembly includes `.file` and `.loc` DWARF directives for source-level debugging with GDB
+- **Packed structs**: No alignment padding between fields. `sizeof({i64,i32,i64})` = 20, not 24.
