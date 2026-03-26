@@ -4,13 +4,14 @@ Caustic is a self-hosted native x86_64 Linux compiler. The entire toolchain -- c
 
 ## Toolchain Components
 
-The full toolchain consists of three separate binaries:
+The full toolchain consists of four binaries:
 
 | Tool | Binary | Input | Output | Description |
 |------|--------|-------|--------|-------------|
-| Compiler | `caustic` | `.cst` source | `.s` assembly | Compiles Caustic source to x86_64 assembly |
+| Compiler | `caustic` | `.cst` source | `.s` assembly | Compiles Caustic source to x86_64 assembly (with `-o`: full pipeline to executable) |
 | Assembler | `caustic-as` | `.s` assembly | `.o` ELF object | Assembles x86_64 into relocatable ELF objects |
 | Linker | `caustic-ld` | `.o` object(s) | ELF executable | Links objects into a static or dynamic executable |
+| Build System | `caustic-mk` | `Causticfile` | executables | Orchestrates compilation via declarative project files |
 
 A typical build invocation:
 
