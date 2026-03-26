@@ -186,7 +186,7 @@ fn str_dup(src as *u8, len as i32) as *u8 {
     let is *u8 as dst = mem.bins_alloc(&_ir_bins, cast(i64, len) + 1);
 ```
 
-The memcpy inside str_dup uses the inline `memzero`-style loop or `fl.memcpy`. Check and use `fl.memcpy` if needed.
+`str_dup` also calls `mem.memcpy`. With `only bins, pool as mem`, `mem.memcpy` resolves to `mem.cst`'s top-level `memcpy` wrapper (which delegates to `freelist.memcpy`). This works because the `only` filter exposes submodule functions but the parent's top-level functions are still accessible as fallback. Verified by testing.
 
 - [ ] **Step 3: Verify compilation**
 
@@ -256,31 +256,29 @@ git commit -m "ir: pool+bins allocation for IR structs, bootstrap verified"
 **Files:**
 - Modify: `src/main.cst`
 
-- [ ] **Step 1: Find codegen call sites**
+- [ ] **Step 1: Add destroy call in compile_backend**
 
-```bash
-grep -n "codegen(" src/main.cst
+`main.cst` imports `defs.cst` as `ird` (line 9: `use "ir/defs.cst" as ird;`).
+
+`codegen` is called in two places:
+- `compile_backend()` line 495 — used by both single-file and multi-file paths
+- `run_single_file()` line 663 — direct single-file path
+
+Add `ird.ir_alloc_destroy();` after each `codegen()` call. Since `compile_backend` covers both paths, adding it there handles multi-file automatically:
+
+In `compile_backend()`, after line 495 (`cgd.codegen(...)`):
+```cst
+ird.ir_alloc_destroy();
 ```
 
-There are multiple call sites (single-file, multi-file paths). After each `codegen()` returns, add `d.ir_alloc_destroy();` (where `d` is the import alias for `defs.cst` — check what main.cst uses).
-
-Note: `main.cst` imports `gen_program.cst` as `gen` or similar, which imports `defs.cst` as `d`. Check the import chain:
-```bash
-grep "defs\|gen_program" src/main.cst | head -5
+In `run_single_file()`, after line 663 (`cgd.codegen(...)`):
+```cst
+ird.ir_alloc_destroy();
 ```
 
-If `defs.cst` is not directly imported, `ir_alloc_destroy` must be accessible through the existing import chain, or add a wrapper in `gen_program.cst`.
+- [ ] **Step 2: Multi-file mode is already handled**
 
-- [ ] **Step 2: Add cleanup call**
-
-After each `codegen()` return in `main.cst`, add the destroy call. This frees all pool and bins memory.
-
-- [ ] **Step 3: Handle multi-file mode**
-
-In `run_multi_file()`, `gheapreset` is called between files. After migration, `ir_alloc_destroy()` should be called before `gheapreset`, and `ir_alloc_init()` should be called again for the next file. Check the flow:
-```bash
-grep -n "gheapreset\|compile_one\|codegen" src/main.cst | head -10
-```
+In `run_multi_file()`, each file calls `compile_one()` → `compile_backend()` → `codegen()` → `ir_alloc_destroy()`. Then `gheapreset` runs. Next iteration, `gen_ir()` calls `ir_alloc_init()` which re-creates pool+bins (guarded by `_ir_alloc_ready == 0`). The order is correct: destroy before reset, init before use.
 
 - [ ] **Step 4: Bootstrap O1 4th gen + test all examples**
 
