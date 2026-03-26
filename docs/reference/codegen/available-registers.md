@@ -32,7 +32,7 @@ Only assigned to intervals that **do not span any call or SET_ARG instruction**.
 
 ### Allocation Priority
 
-The allocator tries registers in this order: callee-saved first (rbx, r12, r13, r14, r8, r9, r10, rsi, rdi, r15). Callee-saved are preferred because they work across calls. A hint register (from MOV coalescing) is tried before the priority list.
+The allocator tries registers in this order: rbx, r12, r13, r14, r8, r9, r10, rsi, rdi, r15. Callee-saved registers are tried first (slots 0-3), then caller-saved (slots 4-8), then r15 (slot 9, callee-saved but last priority). A hint register (from MOV coalescing) is tried before the priority list.
 
 ## Reserved Registers (5)
 
