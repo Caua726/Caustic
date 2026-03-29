@@ -12,12 +12,13 @@
 // =======================================================
 
 use "../linux.cst" as linux;
+use "core.cst" as core;
 
 // --- Constants ---
 
 let is i64 as HEADER_SIZE with imut = 8;
-let is i64 as NUM_DEFAULT_BINS with imut = 16;
-let is i64 as LOOKUP_SIZE with imut = 513;
+let is i64 as NUM_DEFAULT_BINS with imut = 20;
+let is i64 as LOOKUP_SIZE with imut = 8193;
 
 // --- Structs ---
 
@@ -46,38 +47,6 @@ struct Bins {
     lookup_entries as i64;
 }
 
-// --- Internal: mmap ---
-
-fn _mmap(size as i64) as *u8 {
-    let is i64 as minus_one = 0 - 1;
-    return linux.mmap(cast(*u8, 0), size, 3, 34, minus_one, 0);
-}
-
-fn _munmap(ptr as *u8, size as i64) as void {
-    linux.munmap(ptr, size);
-}
-
-// --- Internal: bitmap ---
-
-fn _bit_test(bitmap as *u8, idx as i64) as i64 {
-    let is i64 as byte_idx = idx >> 3;
-    let is i64 as bit_idx = idx & 7;
-    if (((cast(i64, bitmap[byte_idx]) >> bit_idx) & 1) == 1) { return 1; }
-    return 0;
-}
-
-fn _bit_set(bitmap as *u8, idx as i64) as void {
-    let is i64 as byte_idx = idx >> 3;
-    let is i64 as bit_idx = idx & 7;
-    bitmap[byte_idx] = cast(u8, cast(i64, bitmap[byte_idx]) | (1 << bit_idx));
-}
-
-fn _bit_clear(bitmap as *u8, idx as i64) as void {
-    let is i64 as byte_idx = idx >> 3;
-    let is i64 as bit_idx = idx & 7;
-    let is i64 as clear_mask = 255 ^ (1 << bit_idx);
-    bitmap[byte_idx] = cast(u8, cast(i64, bitmap[byte_idx]) & clear_mask);
-}
 
 // --- Internal: slab ---
 
@@ -90,12 +59,12 @@ fn _slab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
     let is i64 as bitmap_bytes = (total_slots + 7) >> 3;
     let is i64 as meta_size = sizeof(Slab) + bitmap_bytes;
 
-    let is *u8 as meta = _mmap(meta_size);
+    let is *u8 as meta = core.mmap_anon(meta_size);
     if (cast(i64, meta) < 0) { return cast(*Slab, 0); }
 
-    let is *u8 as region = _mmap(page_size);
+    let is *u8 as region = core.mmap_anon(page_size);
     if (cast(i64, region) < 0) {
-        _munmap(meta, meta_size);
+        core.munmap(meta, meta_size);
         return cast(*Slab, 0);
     }
 
@@ -137,8 +106,8 @@ fn _slab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
 
 fn _slab_destroy(slab as *Slab) as void {
     let is i64 as bitmap_bytes = (slab.total_slots + 7) >> 3;
-    _munmap(slab.region, slab.region_size);
-    _munmap(cast(*u8, slab), sizeof(Slab) + bitmap_bytes);
+    core.munmap(slab.region, slab.region_size);
+    core.munmap(cast(*u8, slab), sizeof(Slab) + bitmap_bytes);
 }
 
 // --- Internal: bin helpers ---
@@ -184,14 +153,15 @@ fn _lookup_bin(b as *Bins, size as i64) as i64 {
 }
 
 fn _setup_default(b as *Bins) as void {
-    let is [16]i64 as sizes;
+    let is [20]i64 as sizes;
     sizes[0] = 8;     sizes[1] = 16;    sizes[2] = 24;    sizes[3] = 32;
     sizes[4] = 48;    sizes[5] = 64;    sizes[6] = 96;    sizes[7] = 128;
     sizes[8] = 192;   sizes[9] = 256;   sizes[10] = 384;  sizes[11] = 512;
     sizes[12] = 768;  sizes[13] = 1024; sizes[14] = 2048; sizes[15] = 4096;
+    sizes[16] = 8192; sizes[17] = 16384; sizes[18] = 32768; sizes[19] = 65536;
 
     let is i64 as i with mut = 0;
-    while (i < 16) {
+    while (i < 20) {
         let is *Bin as bin = _bin_at(b, i);
         bin.slot_size = sizes[i];
         bin.alloc_size = sizes[i] + HEADER_SIZE;
@@ -209,7 +179,7 @@ fn bins_new(page_size as i64) as Bins {
     b.page_size = page_size;
 
     let is i64 as meta_size = NUM_DEFAULT_BINS * sizeof(Bin);
-    b.bin_data = _mmap(meta_size);
+    b.bin_data = core.mmap_anon(meta_size);
     if (cast(i64, b.bin_data) < 0) {
         b.bin_data = cast(*u8, 0);
         b.bin_count = 0;
@@ -217,9 +187,9 @@ fn bins_new(page_size as i64) as Bins {
     }
 
     b.lookup_entries = LOOKUP_SIZE;
-    b.lookup = _mmap(LOOKUP_SIZE * 2);
+    b.lookup = core.mmap_anon(LOOKUP_SIZE * 2);
     if (cast(i64, b.lookup) < 0) {
-        _munmap(b.bin_data, meta_size);
+        core.munmap(b.bin_data, meta_size);
         b.bin_data = cast(*u8, 0);
         b.bin_count = 0;
         return b;
@@ -258,7 +228,7 @@ fn bins_custom(page_size as i64, sizes as *i64, count as i64) as Bins {
     b.bin_count = count;
     b.page_size = page_size;
     let is i64 as meta_size = count * sizeof(Bin);
-    b.bin_data = _mmap(meta_size);
+    b.bin_data = core.mmap_anon(meta_size);
     if (cast(i64, b.bin_data) < 0) {
         b.bin_data = cast(*u8, 0);
         b.bin_count = 0;
@@ -267,9 +237,9 @@ fn bins_custom(page_size as i64, sizes as *i64, count as i64) as Bins {
 
     let is i64 as max_size = sizes[count - 1];
     b.lookup_entries = (max_size >> 3) + 2;
-    b.lookup = _mmap(b.lookup_entries * 2);
+    b.lookup = core.mmap_anon(b.lookup_entries * 2);
     if (cast(i64, b.lookup) < 0) {
-        _munmap(b.bin_data, meta_size);
+        core.munmap(b.bin_data, meta_size);
         b.bin_data = cast(*u8, 0);
         b.bin_count = 0;
         return b;
@@ -294,7 +264,12 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
     if (size <= 0) { return cast(*u8, 0); }
 
     let is i64 as idx = _lookup_bin(b, size);
-    if (idx < 0) { return cast(*u8, 0); }
+    if (idx < 0) {
+        core.write_str(2, "bins_alloc: size ");
+        core.write_int(2, size);
+        core.write_str(2, " exceeds max bin 65536\n");
+        return cast(*u8, 0);
+    }
 
     let is *Bin as bin = _bin_at(b, idx);
 
@@ -315,7 +290,7 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
             hdr[1] = cast(u8, si & 255);
             hdr[2] = cast(u8, (si >> 8) & 255);
             hdr[3] = cast(u8, (si >> 16) & 255);
-            _bit_clear(slab.bitmap, si);
+            core.bit_clear(slab.bitmap, si);
             slab.used_slots = slab.used_slots + 1;
             return cast(*u8, cast(i64, slot) + HEADER_SIZE);
         }
@@ -337,7 +312,7 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
     hdr[1] = 0;
     hdr[2] = 0;
     hdr[3] = 0;
-    _bit_clear(new_slab.bitmap, 0);
+    core.bit_clear(new_slab.bitmap, 0);
     new_slab.used_slots = 1;
     return cast(*u8, cast(i64, slot) + HEADER_SIZE);
 }
@@ -364,8 +339,8 @@ fn bins_free(b as *Bins, ptr as *u8) as void {
         let is i64 as end = start + slab.region_size;
         if (cast(i64, slot) >= start && cast(i64, slot) < end) {
             // Double-free detection — O(1) bit test
-            if (_bit_test(slab.bitmap, si) == 1) { return; }
-            _bit_set(slab.bitmap, si);
+            if (core.bit_test(slab.bitmap, si) == 1) { return; }
+            core.bit_set(slab.bitmap, si);
             slab.used_slots = slab.used_slots - 1;
             // Push onto freelist
             let is *i64 as np = cast(*i64, slot);
@@ -390,8 +365,8 @@ fn bins_destroy(b as *Bins) as void {
         }
         i = i + 1;
     }
-    if (cast(i64, b.lookup) != 0) { _munmap(b.lookup, b.lookup_entries * 2); }
-    if (cast(i64, b.bin_data) != 0) { _munmap(b.bin_data, b.bin_count * sizeof(Bin)); }
+    if (cast(i64, b.lookup) != 0) { core.munmap(b.lookup, b.lookup_entries * 2); }
+    if (cast(i64, b.bin_data) != 0) { core.munmap(b.bin_data, b.bin_count * sizeof(Bin)); }
     b.bin_data = cast(*u8, 0);
     b.bin_count = 0;
 }

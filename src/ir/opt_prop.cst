@@ -1,4 +1,3 @@
-use "../../std/mem.cst" as mem;
 use "defs.cst" as d;
 use "opt_helpers.cst" as oh;
 
@@ -7,7 +6,7 @@ use "opt_helpers.cst" as oh;
 fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64, copy_of as *i32, vc as i32) as void {
     let is i32 as vc_ext = vc + 512;
     // Pre-compute def counts: vregs with multiple defs cannot be safely marked const
-    let is *i32 as ccp_defs = cast(*i32, mem.galloc(cast(i64, vc_ext) * 4));
+    let is *i32 as ccp_defs = cast(*i32, d.opt_alloc(cast(i64, vc_ext) * 4));
     let is i32 as cdi with mut = 0;
     while (cdi < vc_ext) {
         let is *i32 as cdp = cast(*i32, cast(i64, ccp_defs) + cast(i64, cdi) * 4);
@@ -315,12 +314,9 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
             // Invalidate const/copy tracking when dest is redefined by non-IMM/non-MOV
             if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG) {
                 let is i32 as dv = inst.dest.vreg;
-                if (op != d.IR_IMM && op != d.IR_MOV) {
-                    // Check if we already folded this to IMM above
+                if (op != d.IR_IMM && op != d.IR_MOV && dv >= 0 && dv < vc + 512) {
                     let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
                     if (inst.op != d.IR_IMM) {
-                        // Only invalidate if NOT already set by folding
-                        // (folding changes inst.op to IR_IMM, so if it's still not IR_IMM, invalidate)
                         *dcp = 0;
                         let is *i32 as pp = cast(*i32, cast(i64, copy_of) + cast(i64, dv) * 4);
                         *pp = 0 - 1;
@@ -331,14 +327,14 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
             inst = inst.next;
         }
     }
-    mem.gfree(cast(*u8, ccp_defs));
+    d.opt_free(cast(*u8, ccp_defs));
 }
 
 // === Pass 1.1: Fuse ADDR+STORE/LOAD into direct stack ops ===
 
 fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     // Count uses of each vreg (as src1, src2, or dest-of-STORE/COPY)
-    let is *i32 as use_count = cast(*i32, mem.galloc(cast(i64, vc_alloc) * 4));
+    let is *i32 as use_count = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
     let is i32 as i with mut = 0;
     while (i < vc_alloc) {
         let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, i) * 4);
@@ -348,16 +344,16 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0) {
-            if (inst.src1.op_type == d.OP_VREG) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc_alloc) {
                 let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, inst.src1.vreg) * 4);
                 *ucp = *ucp + 1;
             }
-            if (inst.src2.op_type == d.OP_VREG) {
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc_alloc) {
                 let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, inst.src2.vreg) * 4);
                 *ucp = *ucp + 1;
             }
             // STORE/COPY dest is a use (address), not a def
-            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG) {
+            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc_alloc) {
                 let is *i32 as ucp = cast(*i32, cast(i64, use_count) + cast(i64, inst.dest.vreg) * 4);
                 *ucp = *ucp + 1;
             }
@@ -366,7 +362,7 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     }
     // Track which vregs come from IR_ADDR with IMM (local var address)
     // addr_offset[v] = stack offset if v was defined by IR_ADDR(IMM), else -1
-    let is *i64 as addr_offset = cast(*i64, mem.galloc(cast(i64, vc_alloc) * 8));
+    let is *i64 as addr_offset = cast(*i64, d.opt_alloc(cast(i64, vc_alloc) * 8));
     i = 0;
     while (i < vc_alloc) {
         let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, i) * 8);
@@ -377,8 +373,10 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && inst.op == d.IR_ADDR && inst.src1.op_type == d.OP_IMM) {
             let is i32 as dv = inst.dest.vreg;
+            if (dv >= 0 && dv < vc_alloc) {
             let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, dv) * 8);
             *aop = inst.src1.imm;
+            }
         }
         inst = inst.next;
     }
@@ -387,7 +385,7 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0) {
             // Fuse ADDR+STORE: IR_STORE dest=vA(addr), src1=vB(value)
-            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_VREG) {
+            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc_alloc) {
                 let is i32 as av = inst.dest.vreg;
                 let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, av) * 8);
                 let is i64 as off = *aop;
@@ -409,7 +407,7 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
                 }
             }
             // Fuse ADDR+LOAD: IR_LOAD dest=vB, src1=vA(addr vreg)
-            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_VREG) {
+            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc_alloc) {
                 let is i32 as av = inst.src1.vreg;
                 let is *i64 as aop = cast(*i64, cast(i64, addr_offset) + cast(i64, av) * 8);
                 let is i64 as off = *aop;
@@ -431,8 +429,8 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
         }
         inst = inst.next;
     }
-    mem.gfree(cast(*u8, use_count));
-    mem.gfree(cast(*u8, addr_offset));
+    d.opt_free(cast(*u8, use_count));
+    d.opt_free(cast(*u8, addr_offset));
 }
 
 // === Pass 1.2: Store-Load Forwarding ===
