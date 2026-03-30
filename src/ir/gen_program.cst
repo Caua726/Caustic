@@ -6,6 +6,7 @@ use "defs.cst" as d;
 use "gen.cst" as g;
 use "gen_expr.cst" as ge;
 use "gen_stmt.cst" as gs;
+use "opt.cst" as opt;
 
 // === f64 bits → f32 bits (integer math, no FPU needed) ===
 
@@ -51,43 +52,87 @@ fn eval_const_expr(node as *ast.Node) as i64 {
 
 // === mark_reachable ===
 
+// Cache call/fn_addr target names before freeing instructions
+fn cache_call_targets(func as *d.IRFunction) as void {
+    let is i32 as count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) { count = count + 1; }
+        if (inst.op == d.IR_FN_ADDR && inst.global_name_len > 0) { count = count + 1; }
+        inst = inst.next;
+    }
+    if (count == 0) { func.call_target_count = 0; return; }
+    // Each entry: 8 bytes ptr + 4 bytes len = 12 bytes
+    let is *u8 as buf = d.opt_alloc(cast(i64, count) * 12);
+    let is i32 as idx with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) {
+            let is *i64 as pp = cast(*i64, cast(i64, buf) + cast(i64, idx) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, buf) + cast(i64, idx) * 12 + 8);
+            *pp = cast(i64, inst.call_name_ptr);
+            *pl = inst.call_name_len;
+            idx = idx + 1;
+        }
+        if (inst.op == d.IR_FN_ADDR && inst.global_name_len > 0) {
+            let is *i64 as pp = cast(*i64, cast(i64, buf) + cast(i64, idx) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, buf) + cast(i64, idx) * 12 + 8);
+            *pp = cast(i64, inst.global_name_ptr);
+            *pl = inst.global_name_len;
+            idx = idx + 1;
+        }
+        inst = inst.next;
+    }
+    func.call_targets = buf;
+    func.call_target_count = count;
+}
+
+fn _reach_by_name(prog as *d.IRProgram, tname as *u8, tlen as i32) as void {
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        let is *u8 as fname with mut = f.name_ptr;
+        let is i32 as flen with mut = f.name_len;
+        if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
+        if (d.str_eq(fname, flen, tname, tlen) == 1) {
+            mark_reachable(prog, f);
+        }
+        f = f.next;
+    }
+}
+
 fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
     if (cast(i64, func) == 0) { return; }
     if (func.is_reachable == 1) { return; }
     func.is_reachable = 1;
+
+    // Use cached call targets if instructions were freed
+    if (func.call_target_count > 0 && cast(i64, func.call_targets) != 0) {
+        let is i32 as ci with mut = 0;
+        while (ci < func.call_target_count) {
+            let is *i64 as pp = cast(*i64, cast(i64, func.call_targets) + cast(i64, ci) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, func.call_targets) + cast(i64, ci) * 12 + 8);
+            _reach_by_name(prog, cast(*u8, *pp), *pl);
+            ci = ci + 1;
+        }
+        return;
+    }
+
+    // Scan instructions directly
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.op == d.IR_CALL && inst.call_name_len > 0) {
-            let is *d.IRFunction as f with mut = prog.functions;
-            while (cast(i64, f) != 0) {
-                let is *u8 as fname with mut = f.name_ptr;
-                let is i32 as flen with mut = f.name_len;
-                if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
-                if (d.str_eq(fname, flen, inst.call_name_ptr, inst.call_name_len) == 1) {
-                    mark_reachable(prog, f);
-                }
-                f = f.next;
-            }
+            _reach_by_name(prog, inst.call_name_ptr, inst.call_name_len);
         }
         if (inst.op == d.IR_FN_ADDR && inst.global_name_len > 0) {
-            let is *d.IRFunction as f with mut = prog.functions;
-            while (cast(i64, f) != 0) {
-                let is *u8 as fname with mut = f.name_ptr;
-                let is i32 as flen with mut = f.name_len;
-                if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
-                if (d.str_eq(fname, flen, inst.global_name_ptr, inst.global_name_len) == 1) {
-                    mark_reachable(prog, f);
-                }
-                f = f.next;
-            }
+            _reach_by_name(prog, inst.global_name_ptr, inst.global_name_len);
         }
         if (inst.op == d.IR_ADDR_GLOBAL && inst.global_name_len > 0) {
-            let is *d.IRGlobal as g with mut = prog.globals;
-            while (cast(i64, g) != 0) {
-                if (d.str_eq(g.name_ptr, g.name_len, inst.global_name_ptr, inst.global_name_len) == 1) {
-                    g.is_reachable = 1;
+            let is *d.IRGlobal as gg with mut = prog.globals;
+            while (cast(i64, gg) != 0) {
+                if (d.str_eq(gg.name_ptr, gg.name_len, inst.global_name_ptr, inst.global_name_len) == 1) {
+                    gg.is_reachable = 1;
                 }
-                g = g.next;
+                gg = gg.next;
             }
         }
         inst = inst.next;
@@ -330,6 +375,16 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                 if (d.str_eq(func.name_ptr, func.name_len, "main", 4) == 1) {
                     prog.main_func = func;
                 }
+
+                // Per-function Phase 1: optimize + cache call targets + free
+                if (d.ir_opt_level >= 1 && cast(i64, func.instructions) != 0) {
+                    opt.optimize_func(func);
+                    cache_call_targets(func);
+                    if (d.is_inline_candidate(func) == 0) {
+                        d.free_func_insts(func);
+                    }
+                }
+
                 node = node.next;
             }
         }
@@ -407,6 +462,9 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
 
     if (cast(i64, prog.main_func) != 0) {
         mark_reachable(prog, prog.main_func);
+        // Mark all globals reachable — freed functions can't propagate IR_ADDR_GLOBAL
+        let is *d.IRGlobal as rg with mut = prog.globals;
+        while (cast(i64, rg) != 0) { rg.is_reachable = 1; rg = rg.next; }
     } else if (no_main == 1) {
         let is *d.IRFunction as f with mut = prog.functions;
         while (cast(i64, f) != 0) { f.is_reachable = 1; f = f.next; }
