@@ -56,12 +56,34 @@ fn gc2_resolve(alias as *i32, v as i32) as i32 {
     return root;
 }
 
-// --- Worklist helpers (swap-with-last removal) ---
+// --- Worklist helpers with O(1) membership ---
+// Tags: 0=none, 1=simplify, 2=freeze, 3=spill
+let is *u8 as _wl_tag with mut;
+let is i32 as _wl_n with mut = 0;
+let is *i32 as _wl_simp with mut;
+let is *i32 as _wl_freeze with mut;
+let is *i32 as _wl_spill with mut;
+
+fn wl_init_tags(n as i32, sw as *i32, fw as *i32, pw as *i32) as void {
+    _wl_n = n;
+    _wl_tag = cast(*u8, d.opt_alloc(cast(i64, n)));
+    core.memzero(_wl_tag, cast(i64, n));
+    _wl_simp = sw; _wl_freeze = fw; _wl_spill = pw;
+}
+
+fn _wl_tag_for(wl as *i32) as u8 {
+    if (cast(i64, wl) == cast(i64, _wl_simp)) { return cast(u8, 1); }
+    if (cast(i64, wl) == cast(i64, _wl_freeze)) { return cast(u8, 2); }
+    if (cast(i64, wl) == cast(i64, _wl_spill)) { return cast(u8, 3); }
+    return cast(u8, 0);
+}
+
 fn wl_add(wl as *i32, cnt as *i32, v as i32) as void {
     let is i32 as c = *cnt;
     let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, c) * 4);
     *wp = v;
     *cnt = c + 1;
+    if (v >= 0 && v < _wl_n) { _wl_tag[v] = _wl_tag_for(wl); }
 }
 
 fn wl_remove(wl as *i32, cnt as *i32, v as i32) as void {
@@ -73,6 +95,7 @@ fn wl_remove(wl as *i32, cnt as *i32, v as i32) as void {
             let is *i32 as last = cast(*i32, cast(i64, wl) + cast(i64, c - 1) * 4);
             *wp = *last;
             *cnt = c - 1;
+            if (v >= 0 && v < _wl_n) { _wl_tag[v] = 0; }
             return;
         }
         i = i + 1;
@@ -80,12 +103,13 @@ fn wl_remove(wl as *i32, cnt as *i32, v as i32) as void {
 }
 
 fn wl_contains(wl as *i32, cnt as i32, v as i32) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < cnt) {
-        let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, i) * 4);
-        if (*wp == v) { return 1; }
-        i = i + 1;
-    }
+    // O(1) tag check — wl/cnt unused but kept for API compat
+    if (v >= 0 && v < _wl_n && _wl_tag[v] != 0) { return 1; }
+    return 0;
+}
+
+fn wl_in(v as i32, tag as u8) as i32 {
+    if (v >= 0 && v < _wl_n && _wl_tag[v] == tag) { return 1; }
     return 0;
 }
 
@@ -370,6 +394,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     let is *i32 as freeze_wl = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
     let is i32 as freeze_cnt with mut = 0;
     let is *i32 as spill_wl = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    wl_init_tags(n, simplify_wl, freeze_wl, spill_wl);
     let is i32 as spill_cnt with mut = 0;
     let is *i32 as stack = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
     let is i32 as stack_top with mut = 0;
@@ -538,7 +563,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                         let is *i32 as cc_t3 = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
                                         let is i32 as k_t3 with mut = 10;
                                         if (*cc_t3 == 1) { k_t3 = 5; }
-                                        if (*dt3 < k_t3 && wl_contains(spill_wl, spill_cnt, t) == 1) {
+                                        if (*dt3 < k_t3 && wl_in(t, 3) == 1) {
                                             wl_remove(spill_wl, &spill_cnt, t);
                                             let is *i32 as mr_t3 = cast(*i32, cast(i64, is_mr) + cast(i64, t) * 4);
                                             if (*mr_t3 == 1) {
@@ -593,7 +618,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                     let is *i32 as mr_p = cast(*i32, cast(i64, is_mr) + cast(i64, p) * 4);
                                     *mr_p = 0;
                                     let is *i32 as st_p = cast(*i32, cast(i64, status) + cast(i64, p) * 4);
-                                    if (*st_p == 0 && wl_contains(freeze_wl, freeze_cnt, p) == 1) {
+                                    if (*st_p == 0 && wl_in(p, 2) == 1) {
                                         wl_remove(freeze_wl, &freeze_cnt, p);
                                         wl_add(simplify_wl, &simplify_cnt, p);
                                     }
@@ -808,13 +833,14 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         *loc_vi = 0 - sp2;
                         ctx.stack_slots = ctx.next_spill - 1;
                     }
-                    // Check interference conflicts
+                    // Check interference conflicts (skip spilled vregs early)
+                    let is i32 as my_loc = *loc_vi;
                     let is i32 as vj with mut = vi + 1;
                     while (vj < n) {
-                        let is *i32 as vj_p = cast(*i32, cast(i64, v2iv) + cast(i64, vj) * 4);
-                        if (*vj_p >= 0 && bm_test(matrix, n, vi, vj) == 1) {
-                            let is *i32 as loc_vj = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, vj) * 4);
-                            if (*loc_vj >= 0 && *loc_vj == *loc_vi) {
+                        let is *i32 as loc_vj = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, vj) * 4);
+                        if (*loc_vj >= 0 && *loc_vj == my_loc) {
+                            let is *i32 as vj_p = cast(*i32, cast(i64, v2iv) + cast(i64, vj) * 4);
+                            if (*vj_p >= 0 && bm_test(matrix, n, vi, vj) == 1) {
                                 let is i32 as sp3 = ctx.next_spill;
                                 ctx.next_spill = ctx.next_spill + 1;
                                 *loc_vj = 0 - sp3;
