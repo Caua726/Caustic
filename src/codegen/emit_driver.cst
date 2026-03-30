@@ -4,6 +4,7 @@ use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../ir/defs.cst" as d;
 use "../ir/opt.cst" as opt;
+use "../ir/gen_program.cst" as irp;
 use "alloc_core.cst" as al;
 use "alloc_gc.cst" as gc;
 use "emit_output.cst" as eo;
@@ -119,6 +120,18 @@ fn emit_rodata(prog as *d.IRProgram) as void {
     eo.out_cstr(".section .rodata\n");
     let is *d.StringEntry as s with mut = prog.strings;
     while (cast(i64, s) != 0) {
+        // Emit global name label for string-initialized globals
+        let is *d.IRGlobal as sg with mut = prog.globals;
+        while (cast(i64, sg) != 0) {
+            if (sg.is_string_init == 1 && sg.is_reachable == 1 && sg.init_value == cast(i64, s.id)) {
+                eo.out_cstr(".globl ");
+                eo.out_str(sg.name_ptr, sg.name_len);
+                eo.out_char(10);
+                eo.out_str(sg.name_ptr, sg.name_len);
+                eo.out_cstr(":\n");
+            }
+            sg = sg.next;
+        }
         eo.out_cstr(".LC");
         eo.out_int(cast(i64, s.id));
         eo.out_cstr(":\n  .string \"");
@@ -128,9 +141,17 @@ fn emit_rodata(prog as *d.IRProgram) as void {
             let is u8 as c = s.ptr[i];
             if (c == 10) { eo.out_cstr("\\n"); }
             else if (c == 9) { eo.out_cstr("\\t"); }
+            else if (c == 13) { eo.out_cstr("\\r"); }
             else if (c == 0) { eo.out_cstr("\\0"); }
             else if (c == 34) { eo.out_cstr("\\\""); }
             else if (c == 92) { eo.out_cstr("\\\\"); }
+            else if (c < 32 || c > 126) {
+                let is i32 as cv = cast(i32, c);
+                eo.out_char(92);
+                eo.out_char(cast(u8, 48 + ((cv >> 6) & 7)));
+                eo.out_char(cast(u8, 48 + ((cv >> 3) & 7)));
+                eo.out_char(cast(u8, 48 + (cv & 7)));
+            }
             else { eo.out_char(c); }
             i = i + 1;
         }
@@ -145,7 +166,7 @@ fn emit_data(prog as *d.IRProgram) as void {
     // .data section (initialized)
     let is *d.IRGlobal as g with mut = prog.globals;
     while (cast(i64, g) != 0) {
-        if (g.is_reachable == 1 && g.is_initialized == 1) {
+        if (g.is_reachable == 1 && g.is_initialized == 1 && g.is_string_init == 0) {
             if (has_data == 0) {
                 eo.out_cstr(".data\n");
                 has_data = 1;
@@ -155,7 +176,11 @@ fn emit_data(prog as *d.IRProgram) as void {
             eo.out_char(10);
             eo.out_str(g.name_ptr, g.name_len);
             eo.out_cstr(":\n");
-            if (g.size == 8) {
+            if (g.is_string_init == 1) {
+                eo.out_cstr("  .quad .LC");
+                eo.out_int(g.init_value);
+                eo.out_char(10);
+            } else if (g.size == 8) {
                 eo.out_cstr("  .quad ");
                 eo.out_int(g.init_value);
                 eo.out_char(10);
@@ -254,11 +279,18 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
         }
     }
 
-    // Codegen per-function → free instructions after each
+    // Codegen per-function: regen freed functions, then codegen + free
     io.write_str(linux.STDERR, "codegen: funcs\n");
     f = p.functions;
     while (cast(i64, f) != 0) {
         if (f.is_reachable == 1) {
+            // Regen IR + re-optimize for functions freed after Phase 1
+            if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+                irp.regen_func_ir(f);
+                if (al.al_opt_level >= 1) {
+                    opt.optimize_func(f);
+                }
+            }
             io.write_str(linux.STDERR, "  gen: ");
             io.write_bytes(linux.STDERR, f.asm_name_ptr, cast(i64, f.asm_name_len));
             io.write_str(linux.STDERR, "\n");

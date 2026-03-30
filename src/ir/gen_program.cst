@@ -94,6 +94,78 @@ fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
     }
 }
 
+// === Regenerate IR for a single function from its AST node ===
+
+fn regen_func_ir(func as *d.IRFunction) as void {
+    let is *ast.Node as node = cast(*ast.Node, func.ast_node);
+    if (cast(i64, node) == 0 || cast(i64, node.body) == 0) { return; }
+
+    // Save/nullify ir_tl: regen'd functions may be from imported modules
+    // whose tok_idx are relative to a different token list
+    let is *u8 as saved_tl = g.ir_tl;
+    g.ir_tl = cast(*u8, 0);
+    g.ctx_head = cast(*d.IRInst, 0);
+    g.ctx_tail = cast(*d.IRInst, 0);
+    g.ctx_vreg = 0;
+    g.ctx_label = 0;
+    g.ctx_loop_depth = 0;
+    g.ctx_has_sret = 0;
+    g.ctx_has_returned = 0;
+    g.defer_count = 0;
+    g.ctx_func = func;
+
+    if (node.body.kind == ast.NK_BLOCK) {
+        let is i32 as param_count with mut = 0;
+        let is *ast.Node as p with mut = node.params;
+        while (cast(i64, p) != 0) { param_count = param_count + 1; p = p.next; }
+        let is i32 as arg_idx with mut = 0;
+        if (cast(i64, node.return_type) != 0 && node.return_type.size > 8) {
+            g.ctx_has_sret = 1;
+            g.ctx_sret_vreg = g.emit_get_arg(arg_idx, g.tok_line(node.tok_idx));
+            arg_idx = arg_idx + 1;
+            param_count = param_count + 1;
+        }
+        func.num_args = param_count;
+        let is [32]i32 as arg_vregs;
+        let is i32 as avi with mut = 0;
+        p = node.params;
+        while (cast(i64, p) != 0) {
+            arg_vregs[avi] = g.emit_get_arg(arg_idx, g.tok_line(p.tok_idx));
+            avi = avi + 1; arg_idx = arg_idx + 1; p = p.next;
+        }
+        avi = 0; p = node.params;
+        while (cast(i64, p) != 0) {
+            let is i32 as av = arg_vregs[avi];
+            let is *ast.Type as pty = p.ty;
+            if (cast(i64, pty) != 0 && pty.size > 8) {
+                let is i32 as da = g.new_vreg();
+                let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
+                ai.dest = d.op_vreg(da); ai.src1 = d.op_imm(cast(i64, p.var_offset));
+                ai.line = g.tok_line(p.tok_idx); g.emit(ai);
+                let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                cp.dest = d.op_vreg(da); cp.src1 = d.op_vreg(av);
+                cp.src2 = d.op_imm(cast(i64, pty.size));
+                cp.line = g.tok_line(p.tok_idx); g.emit(cp);
+            } else {
+                let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+                si.dest = d.op_imm(cast(i64, p.var_offset));
+                si.src1 = d.op_vreg(av); si.cast_to = cast(*u8, p.ty);
+                si.line = g.tok_line(p.tok_idx); g.emit(si);
+            }
+            avi = avi + 1; p = p.next;
+        }
+        gs.gen_stmt(node.body.stmts);
+        ge.emit_deferred_calls();
+        let is i32 as zero = g.emit_imm(0, 0);
+        g.emit_return(zero, 0);
+    }
+
+    func.instructions = g.ctx_head;
+    func.vreg_count = g.ctx_vreg;
+    func.label_count = g.ctx_label;
+    g.ir_tl = saved_tl;
+}
+
 // === gen_ir entry ===
 
 fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
@@ -121,10 +193,17 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                 }
                 glob.size = node.ty.size;
                 if (cast(i64, node.init_expr) != 0) {
-                    glob.init_value = eval_const_expr(node.init_expr);
-                    // f32 global: convert f64 bits to f32 bits
-                    if (node.ty.kind == ast.TY_F32) {
-                        glob.init_value = f64_to_f32_bits(glob.init_value);
+                    if (node.init_expr.kind == ast.NK_STRING) {
+                        // String literal: register string, store ID
+                        let is i32 as sid = g.register_string(node.init_expr.name_ptr, node.init_expr.name_len);
+                        glob.init_value = cast(i64, sid);
+                        glob.is_string_init = 1;
+                    } else {
+                        glob.init_value = eval_const_expr(node.init_expr);
+                        // f32 global: convert f64 bits to f32 bits
+                        if (node.ty.kind == ast.TY_F32) {
+                            glob.init_value = f64_to_f32_bits(glob.init_value);
+                        }
                     }
                     glob.is_initialized = 1;
                 }
@@ -235,6 +314,7 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                 func.vreg_count = g.ctx_vreg;
                 func.label_count = g.ctx_label;
                 func.stack_size = node.stack_size;
+                func.ast_node = cast(*u8, node);
 
                 if (cast(i64, func_tail) == 0) {
                     prog.functions = func;

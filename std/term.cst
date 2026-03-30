@@ -1,0 +1,183 @@
+// =======================================================
+// std/term.cst
+// Terminal: raw mode, ANSI escapes, keyboard input
+// =======================================================
+
+use "linux.cst" as linux;
+use "io.cst" as io;
+use "mem.cst" as mem;
+
+// --- termios ---
+// Linux struct termios: 60 bytes
+//   c_iflag (4) + c_oflag (4) + c_cflag (4) + c_lflag (4)
+//   + c_line (1) + c_cc[32] (32) + pad(3) + c_ispeed (4) + c_ospeed (4)
+// Total: 56 bytes (packed: 4+4+4+4+1+32+3+4+4 = 60, but kernel uses 60)
+// We store as raw 60-byte buffer.
+
+let is i64 as TERMIOS_SIZE with imut = 60;
+
+// ioctl requests
+let is i64 as TCGETS  with imut = 21505;  // 0x5401
+let is i64 as TCSETS  with imut = 21506;  // 0x5402
+let is i64 as TIOCGWINSZ with imut = 21523; // 0x5413
+
+// c_lflag bits to clear for raw mode
+let is i32 as ECHO   with imut = 8;     // 0x0008
+let is i32 as ICANON with imut = 2;     // 0x0002
+let is i32 as ISIG   with imut = 1;     // 0x0001
+let is i32 as IEXTEN with imut = 32768; // 0x8000
+
+// c_iflag bits to clear
+let is i32 as ICRNL  with imut = 256;   // 0x0100
+let is i32 as IXON   with imut = 1024;  // 0x0400
+
+// Saved original termios
+let is [60]u8 as _orig_termios with mut;
+let is i32 as _raw_active with mut = 0;
+
+fn enter_raw() as void {
+    if (_raw_active == 1) { return; }
+    // Save current
+    linux.ioctl(linux.STDIN, TCGETS, cast(*u8, &_orig_termios));
+    // Copy and modify
+    let is [60]u8 as raw;
+    mem.memcpy(cast(*u8, &raw), cast(*u8, &_orig_termios), 60);
+    // c_iflag at offset 0: clear ICRNL | IXON
+    let is *i32 as iflag = cast(*i32, &raw);
+    *iflag = *iflag & (cast(i32, 0 - 1) - ICRNL - IXON);
+    // c_lflag at offset 12: clear ECHO | ICANON | ISIG | IEXTEN
+    let is *i32 as lflag = cast(*i32, cast(i64, &raw) + 12);
+    *lflag = *lflag & (cast(i32, 0 - 1) - ECHO - ICANON - ISIG - IEXTEN);
+    // c_cc[VMIN] at offset 4+4+4+4+1+6 = 23: set to 0
+    // c_cc[VTIME] at offset 24: set to 1 (100ms timeout)
+    let is *u8 as cc = cast(*u8, cast(i64, &raw) + 17); // c_cc starts at offset 17
+    cc[6] = 0;  // VMIN
+    cc[5] = 1;  // VTIME
+    linux.ioctl(linux.STDIN, TCSETS, cast(*u8, &raw));
+    _raw_active = 1;
+}
+
+fn leave_raw() as void {
+    if (_raw_active == 0) { return; }
+    linux.ioctl(linux.STDIN, TCSETS, cast(*u8, &_orig_termios));
+    _raw_active = 0;
+}
+
+// --- Terminal size ---
+
+fn get_size(rows as *i32, cols as *i32) as void {
+    // struct winsize: rows(u16) cols(u16) xpixel(u16) ypixel(u16) = 8 bytes
+    let is [8]u8 as ws;
+    linux.ioctl(linux.STDIN, TIOCGWINSZ, cast(*u8, &ws));
+    let is *u16 as vals = cast(*u16, &ws);
+    *rows = cast(i32, vals[0]);
+    *cols = cast(i32, vals[1]);
+}
+
+// --- ANSI output ---
+
+fn esc_byte() as void {
+    let is u8 as e = 27;
+    linux.write(linux.STDOUT, &e, 1);
+}
+
+fn clear_screen() as void {
+    linux.write(linux.STDOUT, "\x1b[2J\x1b[H", 10);
+}
+
+fn move_to(row as i32, col as i32) as void {
+    let is [32]u8 as buf;
+    let is i64 as n = io.sprintf(cast(*u8, &buf), 32, "\x1b[%d;%dH", cast(i64, row), cast(i64, col));
+    linux.write(linux.STDOUT, cast(*u8, &buf), n);
+}
+
+fn hide_cursor() as void {
+    linux.write(linux.STDOUT, "\x1b[?25l", 6);
+}
+
+fn show_cursor() as void {
+    linux.write(linux.STDOUT, "\x1b[?25h", 6);
+}
+
+fn clear_line() as void {
+    linux.write(linux.STDOUT, "\x1b[2K", 4);
+}
+
+fn set_color(fg as i32) as void {
+    let is [16]u8 as buf;
+    let is i64 as n = io.sprintf(cast(*u8, &buf), 16, "\x1b[%dm", cast(i64, fg));
+    linux.write(linux.STDOUT, cast(*u8, &buf), n);
+}
+
+fn set_bold() as void {
+    linux.write(linux.STDOUT, "\x1b[1m", 4);
+}
+
+fn reset_style() as void {
+    linux.write(linux.STDOUT, "\x1b[0m", 4);
+}
+
+// --- Color constants ---
+let is i32 as BLACK   with imut = 30;
+let is i32 as RED     with imut = 31;
+let is i32 as GREEN   with imut = 32;
+let is i32 as YELLOW  with imut = 33;
+let is i32 as BLUE    with imut = 34;
+let is i32 as MAGENTA with imut = 35;
+let is i32 as CYAN    with imut = 36;
+let is i32 as WHITE   with imut = 37;
+
+// --- Key constants ---
+let is i32 as KEY_NONE  with imut = 0;
+let is i32 as KEY_UP    with imut = 1000;
+let is i32 as KEY_DOWN  with imut = 1001;
+let is i32 as KEY_RIGHT with imut = 1002;
+let is i32 as KEY_LEFT  with imut = 1003;
+let is i32 as KEY_HOME  with imut = 1004;
+let is i32 as KEY_END   with imut = 1005;
+let is i32 as KEY_DEL   with imut = 1006;
+let is i32 as KEY_PGUP  with imut = 1007;
+let is i32 as KEY_PGDN  with imut = 1008;
+let is i32 as KEY_ESC   with imut = 27;
+let is i32 as KEY_ENTER with imut = 13;
+let is i32 as KEY_TAB   with imut = 9;
+let is i32 as KEY_BKSP  with imut = 127;
+
+// Read a key from stdin. Returns KEY_* constants or ASCII char.
+fn read_key() as i32 {
+    let is [6]u8 as seq;
+    let is i64 as n = linux.read(linux.STDIN, cast(*u8, &seq), 1);
+    if (n <= 0) { return KEY_NONE; }
+
+    // Not an escape sequence
+    if (seq[0] != 27) { return cast(i32, seq[0]); }
+
+    // Try to read more
+    let is i64 as n2 = linux.read(linux.STDIN, cast(*u8, cast(i64, &seq) + 1), 1);
+    if (n2 <= 0) { return KEY_ESC; }
+
+    if (seq[1] == 91) { // '['
+        let is i64 as n3 = linux.read(linux.STDIN, cast(*u8, cast(i64, &seq) + 2), 1);
+        if (n3 <= 0) { return KEY_ESC; }
+        if (seq[2] == 65) { return KEY_UP; }
+        if (seq[2] == 66) { return KEY_DOWN; }
+        if (seq[2] == 67) { return KEY_RIGHT; }
+        if (seq[2] == 68) { return KEY_LEFT; }
+        if (seq[2] == 72) { return KEY_HOME; }
+        if (seq[2] == 70) { return KEY_END; }
+        if (seq[2] == 51) { // '3' — could be Delete (3~)
+            let is i64 as n4 = linux.read(linux.STDIN, cast(*u8, cast(i64, &seq) + 3), 1);
+            if (n4 > 0 && seq[3] == 126) { return KEY_DEL; }
+        }
+        if (seq[2] == 53) { // '5~' = PgUp
+            let is i64 as n4 = linux.read(linux.STDIN, cast(*u8, cast(i64, &seq) + 3), 1);
+            if (n4 > 0 && seq[3] == 126) { return KEY_PGUP; }
+        }
+        if (seq[2] == 54) { // '6~' = PgDn
+            let is i64 as n4 = linux.read(linux.STDIN, cast(*u8, cast(i64, &seq) + 3), 1);
+            if (n4 > 0 && seq[3] == 126) { return KEY_PGDN; }
+        }
+    }
+
+    return KEY_ESC;
+}
