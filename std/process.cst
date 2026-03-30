@@ -1,0 +1,100 @@
+// =======================================================
+// std/process.cst
+// Process management (fork, execve, wait, capture)
+// =======================================================
+
+use "linux.cst" as linux;
+use "env.cst" as env;
+use "mem.cst" only bins, core as mem;
+use "string.cst" as str;
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(16384); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn _free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
+// Execute a program via execve, replacing current process.
+fn run(path as *u8, argv as *u8) as void {
+    linux.execve(path, argv, env.envp());
+}
+
+// Fork and execve, return child PID.
+fn spawn(path as *u8, argv as *u8) as i64 {
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        linux.execve(path, argv, env.envp());
+        linux.exit(127);
+    }
+    return pid;
+}
+
+// Fork and execvp (PATH search), return child PID.
+fn spawnp(file as *u8, argv as *u8) as i64 {
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        env.execvp(file, argv);
+        linux.exit(127);
+    }
+    return pid;
+}
+
+// Wait for a specific PID, return exit code (0-255).
+fn wait_pid(pid as i64) as i32 {
+    let is i32 as status with mut = 0;
+    let is i64 as rc = linux.wait4(pid, &status, 0, cast(*u8, 0));
+    if (rc < 0) { return cast(i32, 0 - 1); }
+    return (status >> 8) & 255;
+}
+
+// Run a command and capture its stdout as a String.
+fn capture(path as *u8, argv as *u8) as str.String {
+    let is [2]i32 as pipefd;
+    linux.pipe(cast(*i32, &pipefd));
+
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        linux.close(cast(i64, pipefd[0]));
+        linux.dup2(cast(i64, pipefd[1]), linux.STDOUT);
+        linux.close(cast(i64, pipefd[1]));
+        linux.execve(path, argv, env.envp());
+        linux.exit(127);
+    }
+
+    linux.close(cast(i64, pipefd[1]));
+
+    let is i64 as cap with mut = 4096;
+    let is i64 as len with mut = 0;
+    let is *u8 as buf with mut = _alloc(cap);
+
+    while (1 == 1) {
+        if (len + 1024 > cap) {
+            let is i64 as new_cap = cap * 2;
+            let is *u8 as new_buf = _alloc(new_cap);
+            mem.core.memcpy(new_buf, buf, len);
+            _free(buf);
+            buf = new_buf;
+            cap = new_cap;
+        }
+        let is i64 as n = linux.read(cast(i64, pipefd[0]), cast(*u8, cast(i64, buf) + len), 1024);
+        if (n <= 0) { break; }
+        len = len + n;
+    }
+    linux.close(cast(i64, pipefd[0]));
+
+    let is i32 as _status with mut = 0;
+    linux.wait4(pid, &_status, 0, cast(*u8, 0));
+
+    buf[len] = 0;
+    let is str.String as s;
+    s.ptr = buf;
+    s.len = cast(i32, len);
+    s.cap = cast(i32, cap);
+    return s;
+}

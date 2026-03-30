@@ -1,6 +1,18 @@
 use "linux.cst" as linux;
 use "string.cst" as string;
-use "mem.cst" as mem;
+use "mem.cst" only bins, core as mem;
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn _free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
 
 // --- Buffered Reader ---
 
@@ -51,7 +63,7 @@ fn readline(r as *Reader) as string.String {
     // Initial guess for line length
     let is i64 as cap with mut = 64;
     let is i64 as len with mut = 0;
-    let is *u8 as ptr with mut = mem.galloc(cap);
+    let is *u8 as ptr with mut = _alloc(cap);
     if (cast(i64, ptr) == 0) {
         let is string.String as empty;
         empty.ptr = cast(*u8, 0);
@@ -73,9 +85,9 @@ fn readline(r as *Reader) as string.String {
 
         if (len + 1 >= cap) {
             let is i64 as new_cap = cap * 2;
-            let is *u8 as new_ptr = mem.galloc(new_cap);
-            mem.memcpy(new_ptr, ptr, len);
-            mem.gfree(ptr);
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
             ptr = new_ptr;
             cap = new_cap;
         }
@@ -118,7 +130,7 @@ fn skip(r as *Reader, count as i64) as void {
 fn read_until(r as *Reader, delim as u8) as string.String {
     let is i64 as cap with mut = 64;
     let is i64 as len with mut = 0;
-    let is *u8 as ptr with mut = mem.galloc(cap);
+    let is *u8 as ptr with mut = _alloc(cap);
     if (cast(i64, ptr) == 0) {
         let is string.String as empty;
         empty.ptr = cast(*u8, 0);
@@ -134,9 +146,9 @@ fn read_until(r as *Reader, delim as u8) as string.String {
 
         if (len + 1 >= cap) {
             let is i64 as new_cap = cap * 2;
-            let is *u8 as new_ptr = mem.galloc(new_cap);
-            mem.memcpy(new_ptr, ptr, len);
-            mem.gfree(ptr);
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
             ptr = new_ptr;
             cap = new_cap;
         }
@@ -157,7 +169,7 @@ fn read_until(r as *Reader, delim as u8) as string.String {
 fn read_all(r as *Reader) as string.String {
     let is i64 as cap with mut = 1024;
     let is i64 as len with mut = 0;
-    let is *u8 as ptr with mut = mem.galloc(cap);
+    let is *u8 as ptr with mut = _alloc(cap);
     if (cast(i64, ptr) == 0) {
         let is string.String as empty;
         empty.ptr = cast(*u8, 0);
@@ -172,9 +184,9 @@ fn read_all(r as *Reader) as string.String {
 
         if (len + 1 >= cap) {
             let is i64 as new_cap = cap * 2;
-            let is *u8 as new_ptr = mem.galloc(new_cap);
-            mem.memcpy(new_ptr, ptr, len);
-            mem.gfree(ptr);
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
             ptr = new_ptr;
             cap = new_cap;
         }
@@ -404,62 +416,211 @@ fn print_uint(n as u64) as void {
     linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + start), 20 - start);
 }
 
+fn _pad(count as i64, ch as u8) as void {
+    let is u8 as c = ch;
+    let is i64 as k with mut = 0;
+    while (k < count) { linux.write(linux.STDOUT, &c, 1); k = k + 1; }
+}
+
 fn printf(fmt as *u8, ...) as void {
     let is VaList as va;
     __builtin_va_start(&va);
-
     let is i64 as i with mut = 0;
 
     while (fmt[i] != 0) {
-        if (fmt[i] == 37) { // '%'
+        if (fmt[i] != 37) {
+            linux.write(linux.STDOUT, &fmt[i], 1);
             i = i + 1;
+        } else {
+            i = i + 1; // skip '%'
             if (fmt[i] == 0) { break; }
 
             if (fmt[i] == 37) { // '%%'
-                let is u8 as c = 37;
-                linux.write(linux.STDOUT, &c, 1);
-            } else if (fmt[i] == 100 || fmt[i] == 117 || fmt[i] == 115 || fmt[i] == 83 || fmt[i] == 120 || fmt[i] == 99 || fmt[i] == 112) {
-                // Known formats that consume an arg — fetch it
-                let is *i64 as arg_ptr with mut = cast(*i64, 0);
-                if (va.gp_offset < 48) {
-                    arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
-                    va.gp_offset = va.gp_offset + 8;
-                } else {
-                    arg_ptr = cast(*i64, va.overflow_arg_area);
-                    va.overflow_arg_area = va.overflow_arg_area + 8;
-                }
-
-                if (fmt[i] == 100) { // 'd'
-                    print_int(*arg_ptr);
-                } else if (fmt[i] == 117) { // 'u'
-                    print_uint(cast(u64, *arg_ptr));
-                } else if (fmt[i] == 115) { // 's'
-                    let is *u8 as val = cast(*u8, *arg_ptr);
-                    let is i64 as slen with mut = 0;
-                    while (val[slen] != 0) { slen = slen + 1; }
-                    linux.write(linux.STDOUT, val, slen);
-                } else if (fmt[i] == 83) { // 'S'
-                    let is *string.String as s_ptr = cast(*string.String, *arg_ptr);
-                    linux.write(linux.STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
-                } else if (fmt[i] == 120) { // 'x'
-                    print_hex(*arg_ptr);
-                } else if (fmt[i] == 99) { // 'c'
-                    let is u8 as ch = cast(u8, *arg_ptr);
-                    linux.write(linux.STDOUT, &ch, 1);
-                } else if (fmt[i] == 112) { // 'p'
-                    print_hex(*arg_ptr);
-                }
-            } else {
-                // Unknown format — print literal, do NOT consume arg
                 let is u8 as pct = 37;
                 linux.write(linux.STDOUT, &pct, 1);
-                linux.write(linux.STDOUT, &fmt[i], 1);
+                i = i + 1;
+            } else {
+                // Parse flags
+                let is i32 as left with mut = 0;
+                if (fmt[i] == 45) { left = 1; i = i + 1; } // '-'
+
+                // Parse width
+                let is i32 as width with mut = 0;
+                while (fmt[i] >= 48 && fmt[i] <= 57) {
+                    width = width * 10 + (cast(i32, fmt[i]) - 48);
+                    i = i + 1;
+                }
+
+                // Skip optional 'l' length modifier
+                if (fmt[i] == 108) { i = i + 1; }
+                if (fmt[i] == 0) { break; }
+
+                // Known specifiers that consume an arg
+                if (fmt[i] == 100 || fmt[i] == 117 || fmt[i] == 115 || fmt[i] == 83 || fmt[i] == 120 || fmt[i] == 99 || fmt[i] == 112) {
+                    let is *i64 as arg_ptr with mut = cast(*i64, 0);
+                    if (va.gp_offset < 48) {
+                        arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
+                        va.gp_offset = va.gp_offset + 8;
+                    } else {
+                        arg_ptr = cast(*i64, va.overflow_arg_area);
+                        va.overflow_arg_area = va.overflow_arg_area + 8;
+                    }
+
+                    if (fmt[i] == 100) { // %d
+                        let is [21]u8 as dbuf;
+                        let is i32 as dpos with mut = 20;
+                        let is i64 as dval with mut = *arg_ptr;
+                        let is i32 as neg with mut = 0;
+                        if (dval < 0) { neg = 1; dval = 0 - dval; }
+                        if (dval == 0) { dbuf[dpos] = 48; dpos = dpos - 1; }
+                        else { while (dval > 0) { dbuf[dpos] = cast(u8, 48 + cast(i32, dval % 10)); dval = dval / 10; dpos = dpos - 1; } }
+                        if (neg == 1) { dbuf[dpos] = 45; dpos = dpos - 1; }
+                        let is i32 as dstart = dpos + 1;
+                        let is i64 as dlen = 21 - cast(i64, dstart);
+                        let is i64 as pad = cast(i64, width) - dlen;
+                        if (left == 0 && pad > 0) { _pad(pad, 32); }
+                        linux.write(linux.STDOUT, cast(*u8, cast(i64, &dbuf) + cast(i64, dstart)), dlen);
+                        if (left == 1 && pad > 0) { _pad(pad, 32); }
+                    } else if (fmt[i] == 117) { // %u
+                        let is [21]u8 as ubuf;
+                        let is i32 as upos with mut = 20;
+                        let is u64 as uval with mut = cast(u64, *arg_ptr);
+                        if (uval == 0) { ubuf[upos] = 48; upos = upos - 1; }
+                        else { while (uval > 0) { ubuf[upos] = cast(u8, 48 + cast(i32, uval % 10)); uval = uval / 10; upos = upos - 1; } }
+                        let is i32 as ustart = upos + 1;
+                        let is i64 as ulen = 21 - cast(i64, ustart);
+                        let is i64 as pad = cast(i64, width) - ulen;
+                        if (left == 0 && pad > 0) { _pad(pad, 32); }
+                        linux.write(linux.STDOUT, cast(*u8, cast(i64, &ubuf) + cast(i64, ustart)), ulen);
+                        if (left == 1 && pad > 0) { _pad(pad, 32); }
+                    } else if (fmt[i] == 115) { // %s
+                        let is *u8 as val = cast(*u8, *arg_ptr);
+                        let is i64 as slen with mut = 0;
+                        while (val[slen] != 0) { slen = slen + 1; }
+                        let is i64 as pad = cast(i64, width) - slen;
+                        if (left == 0 && pad > 0) { _pad(pad, 32); }
+                        linux.write(linux.STDOUT, val, slen);
+                        if (left == 1 && pad > 0) { _pad(pad, 32); }
+                    } else if (fmt[i] == 83) { // %S
+                        let is *string.String as s_ptr = cast(*string.String, *arg_ptr);
+                        let is i64 as pad = cast(i64, width) - cast(i64, s_ptr.len);
+                        if (left == 0 && pad > 0) { _pad(pad, 32); }
+                        linux.write(linux.STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
+                        if (left == 1 && pad > 0) { _pad(pad, 32); }
+                    } else if (fmt[i] == 120) { // %x
+                        print_hex(*arg_ptr);
+                    } else if (fmt[i] == 99) { // %c
+                        let is u8 as ch = cast(u8, *arg_ptr);
+                        linux.write(linux.STDOUT, &ch, 1);
+                    } else if (fmt[i] == 112) { // %p
+                        print_hex(*arg_ptr);
+                    }
+                } else {
+                    // Unknown specifier — print literal, do NOT consume arg
+                    let is u8 as pct = 37;
+                    linux.write(linux.STDOUT, &pct, 1);
+                    linux.write(linux.STDOUT, &fmt[i], 1);
+                }
+                i = i + 1;
             }
-        } else {
-            linux.write(linux.STDOUT, &fmt[i], 1);
         }
-        i = i + 1;
     }
+}
+
+fn sprintf(buf as *u8, cap as i64, fmt as *u8, ...) as i64 {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    let is i64 as i with mut = 0;
+    let is i64 as pos with mut = 0;
+    let is i64 as lim = cap - 1;
+
+    while (fmt[i] != 0 && pos < lim) {
+        if (fmt[i] != 37) {
+            buf[pos] = fmt[i]; pos = pos + 1;
+            i = i + 1;
+        } else {
+            i = i + 1;
+            if (fmt[i] == 0) { break; }
+
+            if (fmt[i] == 37) {
+                buf[pos] = 37; pos = pos + 1;
+                i = i + 1;
+            } else {
+                // Parse flags
+                let is i32 as left with mut = 0;
+                if (fmt[i] == 45) { left = 1; i = i + 1; }
+
+                // Parse width
+                let is i32 as width with mut = 0;
+                while (fmt[i] >= 48 && fmt[i] <= 57) {
+                    width = width * 10 + (cast(i32, fmt[i]) - 48);
+                    i = i + 1;
+                }
+
+                if (fmt[i] == 108) { i = i + 1; }
+                if (fmt[i] == 0) { break; }
+
+                if (fmt[i] == 100 || fmt[i] == 117 || fmt[i] == 115 || fmt[i] == 99) {
+                    let is *i64 as arg_ptr with mut = cast(*i64, 0);
+                    if (va.gp_offset < 48) {
+                        arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
+                        va.gp_offset = va.gp_offset + 8;
+                    } else {
+                        arg_ptr = cast(*i64, va.overflow_arg_area);
+                        va.overflow_arg_area = va.overflow_arg_area + 8;
+                    }
+
+                    if (fmt[i] == 100) { // %d
+                        let is [21]u8 as dbuf;
+                        let is i32 as dpos with mut = 20;
+                        let is i64 as dval with mut = *arg_ptr;
+                        let is i32 as neg with mut = 0;
+                        if (dval < 0) { neg = 1; dval = 0 - dval; }
+                        if (dval == 0) { dbuf[dpos] = 48; dpos = dpos - 1; }
+                        else { while (dval > 0) { dbuf[dpos] = cast(u8, 48 + cast(i32, dval % 10)); dval = dval / 10; dpos = dpos - 1; } }
+                        if (neg == 1) { dbuf[dpos] = 45; dpos = dpos - 1; }
+                        let is i32 as dstart = dpos + 1;
+                        let is i64 as dlen = 21 - cast(i64, dstart);
+                        let is i64 as pad = cast(i64, width) - dlen;
+                        if (left == 0 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
+                        let is i64 as di with mut = cast(i64, dstart);
+                        while (di < 21 && pos < lim) { buf[pos] = dbuf[di]; pos = pos + 1; di = di + 1; }
+                        if (left == 1 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
+                    } else if (fmt[i] == 117) { // %u
+                        let is [21]u8 as ubuf;
+                        let is i32 as upos with mut = 20;
+                        let is u64 as uval with mut = cast(u64, *arg_ptr);
+                        if (uval == 0) { ubuf[upos] = 48; upos = upos - 1; }
+                        else { while (uval > 0) { ubuf[upos] = cast(u8, 48 + cast(i32, uval % 10)); uval = uval / 10; upos = upos - 1; } }
+                        let is i32 as ustart = upos + 1;
+                        let is i64 as ulen = 21 - cast(i64, ustart);
+                        let is i64 as pad = cast(i64, width) - ulen;
+                        if (left == 0 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
+                        let is i64 as ui with mut = cast(i64, ustart);
+                        while (ui < 21 && pos < lim) { buf[pos] = ubuf[ui]; pos = pos + 1; ui = ui + 1; }
+                        if (left == 1 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
+                    } else if (fmt[i] == 115) { // %s
+                        let is *u8 as val = cast(*u8, *arg_ptr);
+                        let is i64 as slen with mut = 0;
+                        while (val[slen] != 0) { slen = slen + 1; }
+                        let is i64 as pad = cast(i64, width) - slen;
+                        if (left == 0 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
+                        let is i64 as si with mut = 0;
+                        while (si < slen && pos < lim) { buf[pos] = val[si]; pos = pos + 1; si = si + 1; }
+                        if (left == 1 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
+                    } else if (fmt[i] == 99) { // %c
+                        buf[pos] = cast(u8, *arg_ptr); pos = pos + 1;
+                    }
+                } else {
+                    buf[pos] = 37; pos = pos + 1;
+                    if (pos < lim) { buf[pos] = fmt[i]; pos = pos + 1; }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    buf[pos] = 0;
+    return pos;
 }
 
 struct File {
@@ -493,9 +654,16 @@ fn eprint_str(s as *u8) as void {
 }
 
 fn print_int(n as i64) as void {
-    let is string.String as s = string.int_to_string(n);
-    print(s);
-    string.string_free(s);
+    let is [21]u8 as buf;
+    let is i32 as pos with mut = 20;
+    let is i64 as val with mut = n;
+    let is i32 as neg with mut = 0;
+    if (val < 0) { neg = 1; val = 0 - val; }
+    if (val == 0) { buf[pos] = 48; pos = pos - 1; }
+    else { while (val > 0) { buf[pos] = cast(u8, 48 + cast(i32, val % 10)); val = val / 10; pos = pos - 1; } }
+    if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
+    let is i32 as start = pos + 1;
+    linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + cast(i64, start)), 21 - cast(i64, start));
 }
 
 // Legacy read_line (slow, unbuffered) - kept for compatibility
@@ -504,14 +672,14 @@ fn read_line() as string.String {
     // Implementation using small stack buffer for basic buffering
     let is i64 as cap with mut = 128;
     let is i64 as len with mut = 0;
-    let is *u8 as ptr with mut = mem.galloc(cap);
+    let is *u8 as ptr with mut = _alloc(cap);
 
     while (1 == 1) {
         if (len + 1 >= cap) {
             let is i64 as new_cap = cap * 2;
-            let is *u8 as new_ptr = mem.galloc(new_cap);
-            mem.memcpy(new_ptr, ptr, len);
-            mem.gfree(ptr);
+            let is *u8 as new_ptr = _alloc(new_cap);
+            mem.core.memcpy(new_ptr, ptr, len);
+            _free(ptr);
             ptr = new_ptr;
             cap = new_cap;
         }
@@ -568,7 +736,7 @@ fn read_file(path as string.String) as string.String {
     s.cap = cast(i32, size);
 
     if (size > 0) {
-        s.ptr = cast(*u8, mem.galloc(size + 1));
+        s.ptr = cast(*u8, _alloc(size + 1));
         read_exact(fd, s.ptr, size);
         s.ptr[size] = cast(u8, 0);
     } else {
@@ -658,7 +826,7 @@ fn copy_file(src as string.String, dst as string.String) as i64 {
     return total;
 }
 
-fn read_file_in(h as *mem.Heap, path as *u8) as string.String {
+fn read_file_in(h as *u8, path as *u8) as string.String {
     let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
     let is string.String as s;
 
@@ -682,7 +850,7 @@ fn read_file_in(h as *mem.Heap, path as *u8) as string.String {
 
     s.len = cast(i32, size);
     s.cap = cast(i32, size);
-    s.ptr = cast(*u8, mem.alloc(h, size + 1));
+    s.ptr = cast(*u8, _alloc(size + 1));
     read_exact(fd, s.ptr, size);
     s.ptr[size] = cast(u8, 0);
 
@@ -756,8 +924,8 @@ fn list_dir(path as *u8, entries as *DirEntry, max_entries as i32) as i32 {
                 }
 
                 // Copy name to heap so it survives buffer reuse
-                let is *u8 as name_copy = mem.galloc(cast(i64, nlen) + 1);
-                mem.memcpy(name_copy, name, cast(i64, nlen));
+                let is *u8 as name_copy = _alloc(cast(i64, nlen) + 1);
+                mem.core.memcpy(name_copy, name, cast(i64, nlen));
                 name_copy[nlen] = 0;
 
                 entries[count].name_ptr = name_copy;
