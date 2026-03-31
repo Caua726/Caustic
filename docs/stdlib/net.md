@@ -1,3 +1,19 @@
+## _module
+std/net.cst — Networking
+
+TCP/UDP socket operations over Linux syscalls.
+
+  tcp_listen(port)    — create server socket
+  tcp_connect(ip,port)— connect to server
+  accept(fd)          — accept incoming connection
+  send(fd, buf, len)  — send data
+  recv(fd, buf, len)  — receive data
+  poll(fds, n, ms)    — wait for events on multiple fds
+
+Usage:
+  use "std/net.cst" as net;
+  let is i64 as server = net.tcp_listen(8080);
+---
 ## tcp_listen
 fn tcp_listen(port as i32) as i64
 

@@ -1,3 +1,17 @@
+## _module
+std/random.cst — Pseudo-random number generator
+
+xoshiro256** PRNG with rejection sampling for ranges.
+
+  seed(s)      — initialize PRNG state
+  next()       — next random i64
+  range(lo,hi) — random integer in [lo, hi)
+
+Usage:
+  use "std/random.cst" as random;
+  random.seed(time.now_ns());
+  let is i64 as dice = random.range(1, 7);
+---
 ## seed
 fn seed(s as i64) as void
 

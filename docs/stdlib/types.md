@@ -1,3 +1,16 @@
+## _module
+std/types.cst — Option and Result types
+
+Generic types for nullable values and error handling.
+
+  Option gen T      — value that may be absent (Some/None)
+  Result gen T, E   — value or error (Ok/Err)
+
+Usage:
+  use "std/types.cst" as types;
+  let is types.Option gen i32 as maybe = types.Some gen i32 (42);
+  if (maybe.has == 1) { /* use maybe.val */ }
+---
 ## Option
 struct Option gen T { has as i32; val as T; }
 

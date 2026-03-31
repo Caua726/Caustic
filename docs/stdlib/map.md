@@ -1,3 +1,18 @@
+## _module
+std/map.cst — Hash maps
+
+Two hash map implementations:
+  MapI64 — i64 keys, i64 values (splitmix64 hash)
+  MapStr — string keys (*u8), i64 values (FNV-1a hash)
+
+Both use open addressing with linear probing. Auto-grow at 75% load.
+
+Usage:
+  use "std/map.cst" as map;
+  let is map.MapI64 as m = map.mapi64_new();
+  map.mapi64_set(&m, 42, 100);
+  let is i64 as v = map.mapi64_get(&m, 42, 0);
+---
 ## MapI64
 struct MapI64 { ... }
 

@@ -346,31 +346,96 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         }
     }
 
-    // Fall back to local symbol lookup — use the same signature extraction
-    // as module hover, but on the document's own source
+    // Fall back to local symbol lookup
     let is *u8 as name with mut = cast(*u8, 0);
     let is i32 as nlen with mut = 0;
     syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
     if (nlen == 0) { send_null_result(id); return; }
 
+    // Check if the name is a module — show _module doc
+    let is i32 as mod_idx = syms.find_by_name(name, nlen);
+    if (mod_idx >= 0 && syms.sym_kinds[mod_idx] == syms.SK_MODULE) {
+        let is i32 as imp_len = syms.sym_type_lens[mod_idx];
+        let is *u8 as imp_path = cast(*u8, syms.sym_types[mod_idx]);
+        // Extract bare module name from path
+        let is i32 as bs with mut = imp_len - 1;
+        while (bs > 0 && imp_path[bs] != 47) { bs = bs - 1; }
+        if (imp_path[bs] == 47) { bs = bs + 1; }
+        let is i32 as be with mut = imp_len;
+        if (be > 4 && imp_path[be - 4] == 46) { be = be - 4; }
+        let is [2048]u8 as hover_buf;
+        let is i32 as hover_len with mut = 0;
+        if (syms.lookup_in_docs(cast(*u8, cast(i64, imp_path) + cast(i64, bs)), be - bs,
+                                "_module", 7, &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
+            _send_hover(id, &hover_buf, hover_len);
+            return;
+        }
+    }
+
+    // Check if identifier is in a "use ... only X, Y" context
+    // If so, look it up as a submodule of the module on that line
+    if (mod_idx < 0) {
+        // Find what's on this line — check if it's a "use" line
+        let is i32 as line_offset with mut = 0;
+        let is i32 as cur_line with mut = 1;
+        while (line_offset < d.text_len && cur_line < line) {
+            if (d.text_ptr[line_offset] == 10) { cur_line = cur_line + 1; }
+            line_offset = line_offset + 1;
+        }
+        // Check if line starts with "use" (skip whitespace)
+        let is i32 as lp with mut = line_offset;
+        while (lp < d.text_len && (d.text_ptr[lp] == 32 || d.text_ptr[lp] == 9)) { lp = lp + 1; }
+        if (lp + 3 < d.text_len && d.text_ptr[lp] == 117 && d.text_ptr[lp + 1] == 115 && d.text_ptr[lp + 2] == 101 && d.text_ptr[lp + 3] == 32) {
+            // It's a use line. Find the module alias (last ident before ';')
+            // Scan for "as MODULE" at end of line
+            let is i32 as le with mut = lp;
+            while (le < d.text_len && d.text_ptr[le] != 10 && d.text_ptr[le] != 59) { le = le + 1; }
+            // Walk back from end to find the alias
+            let is i32 as ae with mut = le - 1;
+            while (ae > lp && (d.text_ptr[ae] == 32 || d.text_ptr[ae] == 9 || d.text_ptr[ae] == 59)) { ae = ae - 1; }
+            let is i32 as alias_end = ae + 1;
+            while (ae > lp && syms._is_alnum(d.text_ptr[ae - 1]) == 1) { ae = ae - 1; }
+            let is i32 as alias_start = ae;
+            let is i32 as alias_len = alias_end - alias_start;
+            if (alias_len > 0) {
+                let is i32 as alias_idx = syms.find_by_name(cast(*u8, cast(i64, d.text_ptr) + cast(i64, alias_start)), alias_len);
+                if (alias_idx >= 0 && syms.sym_kinds[alias_idx] == syms.SK_MODULE) {
+                    // Look up the hovered name as a member of this module's docs
+                    let is i32 as aimp_len = syms.sym_type_lens[alias_idx];
+                    let is *u8 as aimp = cast(*u8, syms.sym_types[alias_idx]);
+                    let is i32 as abs with mut = aimp_len - 1;
+                    while (abs > 0 && aimp[abs] != 47) { abs = abs - 1; }
+                    if (aimp[abs] == 47) { abs = abs + 1; }
+                    let is i32 as abe with mut = aimp_len;
+                    if (abe > 4 && aimp[abe - 4] == 46) { abe = abe - 4; }
+                    let is [2048]u8 as obuf;
+                    let is i32 as olen with mut = 0;
+                    if (syms.lookup_in_docs(cast(*u8, cast(i64, aimp) + cast(i64, abs)), abe - abs,
+                                            name, nlen, &obuf, 2000, &olen) == 1 && olen > 0) {
+                        _send_hover(id, &obuf, olen);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Try to find full signature + doc comments in the document source
-    let is [2048]u8 as hover_buf;
-    let is i32 as hover_len with mut = 0;
+    let is [2048]u8 as hover_buf2;
+    let is i32 as hover_len2 with mut = 0;
     if (syms.lookup_in_file(d.text_ptr, d.text_len, name, nlen,
-                            &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
-        _send_hover(id, &hover_buf, hover_len);
+                            &hover_buf2, 2000, &hover_len2) == 1 && hover_len2 > 0) {
+        _send_hover(id, &hover_buf2, hover_len2);
         return;
     }
 
     // If not found as a definition, it might be a reference — look up the symbol
-    let is i32 as idx = syms.find_by_name(name, nlen);
-    if (idx >= 0) {
-        // Use lookup_in_file with the symbol's original name
-        let is *u8 as sname = cast(*u8, syms.sym_names[idx]);
-        let is i32 as snlen = syms.sym_name_lens[idx];
+    if (mod_idx >= 0) {
+        let is *u8 as sname = cast(*u8, syms.sym_names[mod_idx]);
+        let is i32 as snlen = syms.sym_name_lens[mod_idx];
         if (syms.lookup_in_file(d.text_ptr, d.text_len, sname, snlen,
-                                &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
-            _send_hover(id, &hover_buf, hover_len);
+                                &hover_buf2, 2000, &hover_len2) == 1 && hover_len2 > 0) {
+            _send_hover(id, &hover_buf2, hover_len2);
             return;
         }
     }
