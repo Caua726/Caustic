@@ -1,3 +1,18 @@
+## _module
+std/time.cst — Time measurement
+
+Monotonic clock for performance measurement and sleep.
+
+  now_ns()          — current time in nanoseconds
+  now_us()          — current time in microseconds
+  now_ms()          — current time in milliseconds
+  sleep_ms(ms)      — sleep for milliseconds
+  elapsed_ms(start) — elapsed ms since timestamp
+
+Usage:
+  use "std/time.cst" as time;
+  let is i64 as t0 = time.now_ns();
+---
 ## now_ns
 fn now_ns() as i64
 

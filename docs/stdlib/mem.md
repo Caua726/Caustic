@@ -1,3 +1,19 @@
+## _module
+std/mem.cst — Memory management
+
+Central memory module with 5 allocator submodules:
+  bins     — O(1) slab allocator (best general-purpose)
+  arena    — O(1) bump allocator (bulk free)
+  pool     — O(1) fixed-size slots
+  freelist — O(n) general allocator with coalescing
+  lifo     — O(1) stack-like allocator
+
+Also provides memcpy, memset, memcmp, memzero.
+
+Usage:
+  use "std/mem.cst" as mem;
+  use "std/mem.cst" only bins, core as mem;
+---
 ## memcpy
 fn memcpy(dst as *u8, src as *u8, n as i64) as *u8
 
@@ -54,6 +70,17 @@ Usage:
   let is *u8 as p = mem.bins.bins_alloc(&b, 64);     // allocate 64 bytes
   mem.bins.bins_free(&b, p);                          // free
   mem.bins.bins_destroy(&b);                          // release all memory
+---
+## core
+Submodule: mem/core.cst — Low-level memory operations
+
+Provides the fundamental memory primitives:
+  memcpy(dst, src, n)  — copy bytes
+  memset(dst, c, n)    — fill bytes
+  memcmp(a, b, n)      — compare bytes
+  memzero(dst, n)      — zero bytes
+
+These are used by all other allocators and most stdlib modules.
 ---
 ## arena
 Submodule: mem/arena.cst — O(1) bump allocator

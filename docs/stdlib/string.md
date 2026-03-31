@@ -1,3 +1,25 @@
+## _module
+std/string.cst — Dynamic strings
+
+Heap-allocated, growable strings with length tracking.
+
+Key functions:
+  String(text)          — create from C string
+  from_parts(ptr, len)  — create from pointer + length
+  concat(a, b)          — concatenate two strings
+  strlen(s)             — length of C string
+  streq(a, b)           — compare strings
+  find(s, needle)       — search substring
+  substring(s, a, b)    — extract range
+  split(s, delim, ...)  — split by delimiter
+  trim(s)               — remove whitespace
+  replace(s, old, new)  — replace all occurrences
+  int_to_string(n)      — integer to string
+
+Usage:
+  use "std/string.cst" as string;
+  let is string.String as s = string.String("hello");
+---
 ## String
 struct String { ptr as *u8; len as i32; cap as i32; }
 

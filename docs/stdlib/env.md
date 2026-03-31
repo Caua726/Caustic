@@ -1,3 +1,16 @@
+## _module
+std/env.cst — Environment
+
+Access command-line arguments and environment variables.
+
+  argc()      — number of arguments
+  argv(idx)   — get argument by index
+  getenv(name)— get environment variable
+
+Usage:
+  use "std/env.cst" as env;
+  let is *u8 as file = env.argv(1);
+---
 ## argc
 fn argc() as i64
 

@@ -1,3 +1,26 @@
+## _module
+std/linux.cst — Linux syscall wrappers
+
+Direct wrappers around x86_64 Linux system calls. No libc dependency.
+
+Provides:
+  File I/O   — open, close, read, write, lseek, stat, rename, unlink
+  Memory     — mmap, munmap, mprotect, brk
+  Process    — fork, execve, wait4, exit, getpid
+  Pipes      — pipe, pipe2, dup2, dup3
+  Filesystem — mkdir, rmdir, getcwd, chdir, access, chmod
+  Network    — socket, connect, accept, bind, listen, poll
+  Time       — clock_gettime, nanosleep
+  Other      — getrandom, ioctl, fcntl
+
+Constants:
+  STDIN/STDOUT/STDERR, O_RDONLY/O_WRONLY/O_CREAT/O_TRUNC,
+  SEEK_SET/SEEK_CUR/SEEK_END, PROT_READ/PROT_WRITE, MAP_PRIVATE/MAP_ANONYMOUS
+
+Usage:
+  use "std/linux.cst" as linux;
+  linux.write(linux.STDOUT, "hello\n", 6);
+---
 ## STDIN
 let is i64 as STDIN with imut = 0
 

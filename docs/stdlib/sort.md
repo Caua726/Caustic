@@ -1,3 +1,15 @@
+## _module
+std/sort.cst — Sorting algorithms
+
+Three sorting algorithms with function pointer comparators:
+  quicksort  — average O(n log n), in-place
+  heapsort   — guaranteed O(n log n), in-place
+  mergesort  — O(n log n), stable, uses extra memory
+
+Usage:
+  use "std/sort.cst" as sort;
+  sort.quicksort(&arr, n, fn_ptr(my_cmp));
+---
 ## quicksort
 fn quicksort(arr as *i64, n as i32, cmp as *u8) as void
 

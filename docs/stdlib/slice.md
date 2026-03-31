@@ -1,3 +1,23 @@
+## _module
+std/slice.cst — Generic dynamic array
+
+Growable array (vector) with generic element type.
+Automatically resizes when full. O(1) amortized push.
+
+Key functions:
+  new gen T ()        — create empty slice
+  push gen T (s, val) — append element
+  get gen T (s, idx)  — read element at index
+  set gen T (s,i,val) — write element at index
+  pop gen T (s)       — remove and return last
+  len gen T (s)       — element count
+  clear gen T (s)     — remove all elements
+
+Usage:
+  use "std/slice.cst" as slice;
+  let is slice.Slice gen i32 as nums = slice.new gen i32 ();
+  slice.push gen i32 (&nums, 42);
+---
 ## Slice
 struct Slice gen T { data as *T; len as i32; cap as i32; }
 

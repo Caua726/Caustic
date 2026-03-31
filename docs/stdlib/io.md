@@ -1,3 +1,24 @@
+## _module
+std/io.cst — Input/Output
+
+Buffered and unbuffered I/O for files and stdio.
+
+Key functions:
+  write_str(fd, s)     — write string to fd
+  write_int(fd, n)     — write integer as text
+  write_bytes(fd, b,n) — write raw bytes
+  printf(fmt, ...)     — formatted output
+  read_file(path)      — read entire file into memory
+  file_exists(path)    — check if file exists
+
+Buffered I/O:
+  Reader(fd, buf, cap) — buffered byte reader
+  Writer(fd, buf, cap) — buffered writer
+
+Usage:
+  use "std/io.cst" as io;
+  io.write_str(linux.STDOUT, "hello\n");
+---
 ## Reader
 struct Reader { fd as i64; buf as *u8; cap as i64; len as i64; pos as i64; }
 

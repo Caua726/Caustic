@@ -1,3 +1,12 @@
+## _module
+std/math.cst — Math utilities
+
+Integer math functions: abs, min, max, pow, gcd, lcm, align_up, align_down.
+
+Usage:
+  use "std/math.cst" as math;
+  let is i64 as x = math.max(a, b);
+---
 ## abs
 fn abs(x as i64) as i64
 
