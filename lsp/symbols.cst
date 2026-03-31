@@ -656,3 +656,145 @@ fn _extract_signature(src as *u8, src_len as i32, def_line_start as i32,
     *out_len = olen;
     return 1;
 }
+
+// === Module export scanning ===
+// Scan a module file and collect all top-level fn/struct/enum/type/let names.
+// Stores into mod_export_* arrays. Returns count.
+
+let is i32 as MAX_EXPORTS with imut = 256;
+let is [256]i64 as mod_export_names with mut;
+let is [256]i32 as mod_export_name_lens with mut;
+let is [256]i32 as mod_export_kinds with mut;
+let is [256]i64 as mod_export_details with mut;  // *u8 detail string (return type / field type)
+let is [256]i32 as mod_export_detail_lens with mut;
+let is i32 as mod_export_count with mut;
+
+fn scan_module_exports(file_src as *u8, file_len as i32) as i32 {
+    mod_export_count = 0;
+    let is i32 as pos with mut = 0;
+
+    while (pos < file_len && mod_export_count < MAX_EXPORTS) {
+        let is u8 as c = file_src[pos];
+        // Skip newlines
+        if (c == 10) { pos = pos + 1; }
+        // Skip strings
+        else if (c == 34) {
+            pos = pos + 1;
+            while (pos < file_len && file_src[pos] != 34) {
+                if (file_src[pos] == 92) { pos = pos + 1; }
+                pos = pos + 1;
+            }
+            if (pos < file_len) { pos = pos + 1; }
+        }
+        // Skip comments
+        else if (c == 47 && pos + 1 < file_len && file_src[pos + 1] == 47) {
+            while (pos < file_len && file_src[pos] != 10) { pos = pos + 1; }
+        }
+        // "fn " at start of line (not indented = top-level)
+        else if (_match_word(file_src, pos, file_len, "fn", 2) == 1) {
+            let is i32 as p with mut = pos + 2;
+            _skip_ws_inline(file_src, &p, file_len);
+            let is i32 as nstart = p;
+            while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
+            let is i32 as nlen = p - nstart;
+            if (nlen > 0) {
+                // Get return type: scan for ") as TYPE"
+                let is *u8 as ret with mut = "void";
+                let is i32 as ret_len with mut = 4;
+                let is i32 as sp with mut = p;
+                while (sp < file_len - 4 && sp < p + 500) {
+                    if (file_src[sp] == 41 && file_src[sp + 1] == 32
+                        && file_src[sp + 2] == 97 && file_src[sp + 3] == 115
+                        && file_src[sp + 4] == 32) {
+                        sp = sp + 5;
+                        ret = cast(*u8, cast(i64, file_src) + cast(i64, sp));
+                        ret_len = 0;
+                        while (sp + ret_len < file_len && _is_alnum(file_src[sp + ret_len]) == 1) {
+                            ret_len = ret_len + 1;
+                        }
+                        // Include pointer prefix
+                        if (ret_len > 0 && sp > 0 && file_src[sp - 1] == 42) {
+                            ret = cast(*u8, cast(i64, file_src) + cast(i64, sp) - 1);
+                            ret_len = ret_len + 1;
+                        }
+                        break;
+                    }
+                    if (file_src[sp] == 123 || file_src[sp] == 10) { break; }
+                    sp = sp + 1;
+                }
+                _add_export(cast(*u8, cast(i64, file_src) + cast(i64, nstart)), nlen,
+                           SK_FUNCTION, ret, ret_len);
+            }
+            pos = p;
+        }
+        // "struct "
+        else if (_match_word(file_src, pos, file_len, "struct", 6) == 1) {
+            let is i32 as p with mut = pos + 6;
+            _skip_ws_inline(file_src, &p, file_len);
+            let is i32 as nstart = p;
+            while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
+            let is i32 as nlen = p - nstart;
+            if (nlen > 0) {
+                _add_export(cast(*u8, cast(i64, file_src) + cast(i64, nstart)), nlen,
+                           SK_STRUCT, "struct", 6);
+            }
+            // Skip to closing }
+            while (pos < file_len && file_src[pos] != 125) { pos = pos + 1; }
+            if (pos < file_len) { pos = pos + 1; }
+        }
+        // "enum "
+        else if (_match_word(file_src, pos, file_len, "enum", 4) == 1) {
+            let is i32 as p with mut = pos + 4;
+            _skip_ws_inline(file_src, &p, file_len);
+            let is i32 as nstart = p;
+            while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
+            let is i32 as nlen = p - nstart;
+            if (nlen > 0) {
+                _add_export(cast(*u8, cast(i64, file_src) + cast(i64, nstart)), nlen,
+                           SK_ENUM, "enum", 4);
+            }
+            while (pos < file_len && file_src[pos] != 125) { pos = pos + 1; }
+            if (pos < file_len) { pos = pos + 1; }
+        }
+        // "let " (top-level globals)
+        else if (_match_word(file_src, pos, file_len, "let", 3) == 1) {
+            let is i32 as p with mut = pos + 3;
+            _skip_ws_inline(file_src, &p, file_len);
+            if (_match_word(file_src, p, file_len, "is", 2) == 1) {
+                p = p + 2;
+                _skip_ws_inline(file_src, &p, file_len);
+                // Read type
+                let is i32 as ty_start = p;
+                let is i32 as ty_len with mut = 0;
+                _read_type(file_src, &p, file_len, &ty_len);
+                _skip_ws_inline(file_src, &p, file_len);
+                if (_match_word(file_src, p, file_len, "as", 2) == 1) {
+                    p = p + 2;
+                    _skip_ws_inline(file_src, &p, file_len);
+                    let is i32 as nstart = p;
+                    while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
+                    let is i32 as nlen = p - nstart;
+                    if (nlen > 0) {
+                        _add_export(cast(*u8, cast(i64, file_src) + cast(i64, nstart)), nlen,
+                                   SK_VARIABLE, cast(*u8, cast(i64, file_src) + cast(i64, ty_start)), ty_len);
+                    }
+                }
+            }
+            // Skip to end of line
+            while (pos < file_len && file_src[pos] != 10) { pos = pos + 1; }
+        }
+        else { pos = pos + 1; }
+    }
+    return mod_export_count;
+}
+
+fn _add_export(name as *u8, name_len as i32, kind as i32, detail as *u8, detail_len as i32) as void {
+    if (mod_export_count >= MAX_EXPORTS) { return; }
+    let is i32 as i = mod_export_count;
+    mod_export_names[i] = cast(i64, name);
+    mod_export_name_lens[i] = name_len;
+    mod_export_kinds[i] = kind;
+    mod_export_details[i] = cast(i64, detail);
+    mod_export_detail_lens[i] = detail_len;
+    mod_export_count = mod_export_count + 1;
+}
