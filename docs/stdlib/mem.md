@@ -1,18 +1,38 @@
 ## _module
-std/mem.cst — Memory management
+mem — Manual Memory Allocation
 
-Central memory module with 5 allocator submodules:
-  bins     — O(1) slab allocator (best general-purpose)
-  arena    — O(1) bump allocator (bulk free)
-  pool     — O(1) fixed-size slots
-  freelist — O(n) general allocator with coalescing
-  lifo     — O(1) stack-like allocator
+Caustic has no garbage collector. You manage memory yourself.
+mem gives you 5 different allocators — pick the right one for your use case:
 
-Also provides memcpy, memset, memcmp, memzero.
+  mem.bins     — Use this by default. Fast O(1) slab allocator for mixed sizes.
+  mem.arena    — Fastest. Allocates linearly, frees everything at once. Great for
+                 temporary work like parsing or building a response.
+  mem.pool     — Fixed-size slots. Use when you need many objects of the same size
+                 (linked list nodes, tree nodes, etc.)
+  mem.freelist — Traditional allocator. Handles any size, coalesces adjacent frees.
+                 Slower but most flexible.
+  mem.lifo     — Stack allocator. Must free in reverse order. Extremely fast.
 
-Usage:
+Also provides low-level primitives via mem.core:
+  memcpy(dst, src, n)  — copy bytes (regions must not overlap)
+  memset(dst, c, n)    — fill memory with a byte value
+  memcmp(a, b, n)      — compare memory (0 if equal)
+  memzero(dst, n)      — zero out memory
+
+How to use:
   use "std/mem.cst" as mem;
+  // or selectively:
   use "std/mem.cst" only bins, core as mem;
+
+  // Allocate with bins (most common):
+  let is mem.Bins as heap = mem.bins.bins_new(131072);
+  let is *u8 as ptr = mem.bins.bins_alloc(&heap, 64);
+  mem.bins.bins_free(&heap, ptr);
+
+  // Allocate with arena (fastest for batch work):
+  let is mem.Arena as a = mem.arena.create(65536);
+  let is *u8 as p = mem.arena.alloc(&a, 128);
+  mem.arena.destroy(&a);  // frees everything at once
 ---
 ## memcpy
 fn memcpy(dst as *u8, src as *u8, n as i64) as *u8

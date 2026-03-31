@@ -1,23 +1,32 @@
 ## _module
-std/io.cst — Input/Output
+io — Reading and Writing Data
 
-Buffered and unbuffered I/O for files and stdio.
+Everything you need to print output, read input, and work with files.
 
-Key functions:
-  write_str(fd, s)     — write string to fd
-  write_int(fd, n)     — write integer as text
-  write_bytes(fd, b,n) — write raw bytes
-  printf(fmt, ...)     — formatted output
-  read_file(path)      — read entire file into memory
-  file_exists(path)    — check if file exists
+Quick output (unbuffered — each call is a syscall):
+  io.write_str(fd, "text")     — print a string
+  io.write_int(fd, 42)         — print a number
+  io.write_float(fd, 3.14)     — print a float
+  io.write_hex(fd, 0xff)       — print hex
+  io.write_bytes(fd, buf, len) — print raw bytes
+  io.printf("x=%d\n", x)      — formatted output (%s, %d, %x)
 
-Buffered I/O:
-  Reader(fd, buf, cap) — buffered byte reader
-  Writer(fd, buf, cap) — buffered writer
+The fd parameter is a file descriptor: linux.STDOUT (screen),
+linux.STDERR (errors), or a file opened with linux.open().
 
-Usage:
+Reading files:
+  io.read_file("path")     — returns entire file as *u8 (heap-allocated)
+  io.file_exists("path")   — returns 1 if file exists
+
+Buffered I/O (for performance — batches small reads/writes):
+  io.Reader(fd, buf, cap)  — read bytes one at a time efficiently
+  io.Writer(fd, buf, cap)  — buffer writes, flush when full
+
+Example:
   use "std/io.cst" as io;
-  io.write_str(linux.STDOUT, "hello\n");
+  use "std/linux.cst" as linux;
+  io.write_str(linux.STDOUT, "hello world\n");
+  io.write_int(linux.STDERR, 42);
 ---
 ## Reader
 struct Reader { fd as i64; buf as *u8; cap as i64; len as i64; pos as i64; }

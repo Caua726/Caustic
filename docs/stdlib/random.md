@@ -1,16 +1,21 @@
 ## _module
-std/random.cst — Pseudo-random number generator
+random — Random Number Generation
 
-xoshiro256** PRNG with rejection sampling for ranges.
+Fast pseudo-random numbers using xoshiro256** algorithm.
+NOT cryptographically secure — use linux.getrandom() for crypto.
 
-  seed(s)      — initialize PRNG state
-  next()       — next random i64
-  range(lo,hi) — random integer in [lo, hi)
+You MUST call seed() before generating numbers:
+  random.seed(time.now_ns());  // seed from clock
+  // or: seed from system entropy
+  let is [8]u8 as e; linux.getrandom(&e, 8, 0);
+  random.seed(cast(*i64, &e)[0]);
 
-Usage:
-  use "std/random.cst" as random;
-  random.seed(time.now_ns());
-  let is i64 as dice = random.range(1, 7);
+Generating numbers:
+  random.next()         — full-range i64
+  random.range(1, 7)    — integer in [1, 7) — i.e. 1 through 6
+  random.range(0, 100)  — integer in [0, 100)
+
+range() uses rejection sampling for uniform distribution.
 ---
 ## seed
 fn seed(s as i64) as void

@@ -1,15 +1,25 @@
 ## _module
-std/env.cst — Environment
+env — Command Line and Environment
 
-Access command-line arguments and environment variables.
+Access program arguments and environment variables.
 
-  argc()      — number of arguments
-  argv(idx)   — get argument by index
-  getenv(name)— get environment variable
+Arguments:
+  env.argc()   — how many args (including program name)
+  env.argv(0)  — program name
+  env.argv(1)  — first argument
+  env.argv(N)  — Nth argument
 
-Usage:
+Environment variables:
+  env.getenv("HOME")  — returns value or null if not set
+  env.getenv("PATH")
+
+Typical usage pattern:
   use "std/env.cst" as env;
-  let is *u8 as file = env.argv(1);
+  if (env.argc() < 2) {
+      io.write_str(linux.STDERR, "usage: prog <file>\n");
+      return 1;
+  }
+  let is *u8 as filename = env.argv(1);
 ---
 ## argc
 fn argc() as i64

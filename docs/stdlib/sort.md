@@ -1,14 +1,24 @@
 ## _module
-std/sort.cst — Sorting algorithms
+sort — Sorting Algorithms
 
-Three sorting algorithms with function pointer comparators:
-  quicksort  — average O(n log n), in-place
-  heapsort   — guaranteed O(n log n), in-place
-  mergesort  — O(n log n), stable, uses extra memory
+Sort arrays of i64 using function pointer comparators.
 
-Usage:
-  use "std/sort.cst" as sort;
-  sort.quicksort(&arr, n, fn_ptr(my_cmp));
+Three algorithms — pick based on your needs:
+  sort.quicksort — fastest on average, O(n log n), but O(n^2) worst case
+  sort.heapsort  — guaranteed O(n log n), never worse. Use when worst case matters.
+  sort.mergesort — stable sort (equal elements keep order). Uses extra memory.
+
+All take the same interface:
+  sort.quicksort(&arr, count, fn_ptr(my_cmp));
+
+The comparator is fn(a as i64, b as i64) as i32:
+  return negative if a < b
+  return 0 if a == b
+  return positive if a > b
+
+Example:
+  fn cmp_asc(a as i64, b as i64) as i32 { return cast(i32, a - b); }
+  sort.quicksort(&arr, n, fn_ptr(cmp_asc));
 ---
 ## quicksort
 fn quicksort(arr as *i64, n as i32, cmp as *u8) as void
