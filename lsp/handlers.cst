@@ -251,6 +251,29 @@ fn handle_definition(id as i64, params as *json.JsonValue) as void {
     rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
 
+fn _send_hover(id as i64, text as *u8, text_len as i32) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.key_c(&w, "contents");
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "kind", "plaintext");
+    jw.kv_str(&w, "value", text, text_len);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn _cstrlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}
+
 fn handle_hover(id as i64, params as *json.JsonValue) as void {
     let is i32 as line with mut = 0;
     let is i32 as col with mut = 0;
@@ -262,6 +285,41 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         return;
     }
 
+    // Check if cursor is on "mod.member" pattern
+    let is *u8 as mod_name with mut = cast(*u8, 0);
+    let is i32 as mod_len with mut = 0;
+    let is *u8 as member_name with mut = cast(*u8, 0);
+    let is i32 as member_len with mut = 0;
+    if (syms.find_member_at(d.text_ptr, d.text_len, line, col, &mod_name, &mod_len, &member_name, &member_len) == 1) {
+        // Look up the module in our symbol index
+        let is i32 as mod_idx = syms.find_by_name(mod_name, mod_len);
+        if (mod_idx >= 0 && syms.sym_kinds[mod_idx] == syms.SK_MODULE) {
+            // Resolve the module file path
+            let is i32 as import_path_len = syms.sym_type_lens[mod_idx];
+            let is *u8 as import_path = cast(*u8, syms.sym_types[mod_idx]);
+            let is i32 as resolved_len with mut = 0;
+            let is *u8 as resolved = syms.resolve_module_path(d.path_ptr, d.path_len,
+                                                               import_path, import_path_len, &resolved_len);
+            // Read the module file
+            let is i32 as file_len with mut = 0;
+            let is *u8 as file_src = syms._read_file(resolved, &file_len);
+            if (cast(i64, file_src) != 0 && file_len > 0) {
+                let is [2048]u8 as hover_buf;
+                let is i32 as hover_len with mut = 0;
+                if (syms.lookup_in_file(file_src, file_len, member_name, member_len,
+                                        &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
+                    _send_hover(id, &hover_buf, hover_len);
+                    return;
+                }
+                // Not found directly — maybe it's in a submodule.
+                // Scan the module file for "use" imports and search each.
+                // For now, try checking submodule pattern: mod.sub.func
+                // TODO: recursive submodule resolution
+            }
+        }
+    }
+
+    // Fall back to local symbol lookup
     let is *u8 as name with mut = cast(*u8, 0);
     let is i32 as nlen with mut = 0;
     syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
@@ -270,33 +328,29 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
     let is i32 as idx = syms.find_by_name(name, nlen);
     if (idx < 0) { send_null_result(id); return; }
 
-    // Build hover text
+    // Build hover text for local symbol
     let is [512]u8 as hover;
     let is i32 as hlen with mut = 0;
     let is i32 as kind = syms.sym_kinds[idx];
 
     if (kind == syms.SK_FUNCTION) {
-        // "fn NAME as TYPE"
         hover[0] = 102; hover[1] = 110; hover[2] = 32; hlen = 3;
     }
     else if (kind == syms.SK_VARIABLE) {
-        // "let is TYPE as NAME"
         hover[0] = 108; hover[1] = 101; hover[2] = 116; hover[3] = 32;
         hover[4] = 105; hover[5] = 115; hover[6] = 32; hlen = 7;
-        // append type
         let is i32 as ti with mut = 0;
         while (ti < syms.sym_type_lens[idx] && hlen < 490) {
             hover[hlen] = cast(*u8, syms.sym_types[idx])[ti];
             hlen = hlen + 1;
             ti = ti + 1;
         }
-        hover[hlen] = 32; hlen = hlen + 1; // space
-        hover[hlen] = 97; hlen = hlen + 1; // a
-        hover[hlen] = 115; hlen = hlen + 1; // s
-        hover[hlen] = 32; hlen = hlen + 1; // space
+        hover[hlen] = 32; hlen = hlen + 1;
+        hover[hlen] = 97; hlen = hlen + 1;
+        hover[hlen] = 115; hlen = hlen + 1;
+        hover[hlen] = 32; hlen = hlen + 1;
     }
     else if (kind == syms.SK_STRUCT) {
-        // "struct NAME"
         hover[0] = 115; hover[1] = 116; hover[2] = 114; hover[3] = 117;
         hover[4] = 99; hover[5] = 116; hover[6] = 32; hlen = 7;
     }
@@ -305,14 +359,10 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         hover[4] = 32; hlen = 5;
     }
     else if (kind == syms.SK_TYPE_ALIAS) {
-        // "type NAME = TYPE"
         hover[0] = 116; hover[1] = 121; hover[2] = 112; hover[3] = 101;
         hover[4] = 32; hlen = 5;
     }
-    else if (kind == syms.SK_FIELD) {
-        // "field: TYPE"
-        hlen = 0;
-    }
+    else if (kind == syms.SK_FIELD) { hlen = 0; }
     else { hlen = 0; }
 
     // Append name
@@ -323,7 +373,6 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         ni = ni + 1;
     }
 
-    // For functions: append " as RET_TYPE"
     if (kind == syms.SK_FUNCTION) {
         hover[hlen] = 32; hlen = hlen + 1;
         hover[hlen] = 97; hlen = hlen + 1;
@@ -336,7 +385,6 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
             ri = ri + 1;
         }
     }
-    // For type alias: append " = TYPE"
     else if (kind == syms.SK_TYPE_ALIAS) {
         hover[hlen] = 32; hlen = hlen + 1;
         hover[hlen] = 61; hlen = hlen + 1;
@@ -348,7 +396,6 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
             ri = ri + 1;
         }
     }
-    // For fields: append ": TYPE"
     else if (kind == syms.SK_FIELD) {
         hover[hlen] = 58; hlen = hlen + 1;
         hover[hlen] = 32; hlen = hlen + 1;
@@ -360,20 +407,7 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         }
     }
 
-    let is jw.Writer as w = jw.writer_new();
-    jw.obj_start(&w);
-    jw.kv_str_c(&w, "jsonrpc", "2.0");
-    jw.kv_int(&w, "id", id);
-    jw.key_c(&w, "result");
-    jw.obj_start(&w);
-    jw.key_c(&w, "contents");
-    jw.obj_start(&w);
-    jw.kv_str_c(&w, "kind", "plaintext");
-    jw.kv_str(&w, "value", &hover, hlen);
-    jw.obj_end(&w);
-    jw.obj_end(&w);
-    jw.obj_end(&w);
-    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+    _send_hover(id, &hover, hlen);
 }
 
 fn handle_completion(id as i64, params as *json.JsonValue) as void {
