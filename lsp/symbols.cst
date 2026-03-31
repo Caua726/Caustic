@@ -1,0 +1,407 @@
+use "../std/mem.cst" only bins, core as mem;
+use "json.cst" as json;
+
+// Symbol kinds (match LSP CompletionItemKind)
+let is i32 as SK_FUNCTION with imut = 3;
+let is i32 as SK_VARIABLE with imut = 6;
+let is i32 as SK_STRUCT with imut = 22;
+let is i32 as SK_ENUM with imut = 13;
+let is i32 as SK_FIELD with imut = 5;
+let is i32 as SK_TYPE_ALIAS with imut = 25;
+let is i32 as SK_MODULE with imut = 9;
+
+let is i32 as MAX_SYMS with imut = 1024;
+
+// Symbol storage (flat arrays for speed)
+let is [1024]i64 as sym_names with mut;      // *u8
+let is [1024]i32 as sym_name_lens with mut;
+let is [1024]i32 as sym_kinds with mut;
+let is [1024]i32 as sym_lines with mut;       // 1-based
+let is [1024]i32 as sym_cols with mut;        // 1-based
+let is [1024]i64 as sym_types with mut;       // *u8 type string
+let is [1024]i32 as sym_type_lens with mut;
+let is i32 as sym_count with mut = 0;
+
+fn reset() as void {
+    sym_count = 0;
+}
+
+fn _add_sym(name as *u8, name_len as i32, kind as i32, line as i32, col as i32,
+            ty_str as *u8, ty_len as i32) as void {
+    if (sym_count >= MAX_SYMS) { return; }
+    let is i32 as i = sym_count;
+    sym_names[i] = cast(i64, name);
+    sym_name_lens[i] = name_len;
+    sym_kinds[i] = kind;
+    sym_lines[i] = line;
+    sym_cols[i] = col;
+    sym_types[i] = cast(i64, ty_str);
+    sym_type_lens[i] = ty_len;
+    sym_count = sym_count + 1;
+}
+
+// === Source scanner ===
+// Scan source text for definitions. Populates symbol arrays.
+
+fn _is_alpha(c as u8) as i32 {
+    if (c >= 65 && c <= 90) { return 1; }   // A-Z
+    if (c >= 97 && c <= 122) { return 1; }  // a-z
+    if (c == 95) { return 1; }              // _
+    return 0;
+}
+
+fn _is_alnum(c as u8) as i32 {
+    if (_is_alpha(c) == 1) { return 1; }
+    if (c >= 48 && c <= 57) { return 1; }   // 0-9
+    return 0;
+}
+
+fn _match_word(src as *u8, pos as i32, src_len as i32, word as *u8, wlen as i32) as i32 {
+    if (pos + wlen > src_len) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < wlen) {
+        if (src[pos + i] != word[i]) { return 0; }
+        i = i + 1;
+    }
+    // Must not be followed by alnum (word boundary)
+    if (pos + wlen < src_len && _is_alnum(src[pos + wlen]) == 1) { return 0; }
+    return 1;
+}
+
+fn _skip_ws_inline(src as *u8, pos as *i32, src_len as i32) as void {
+    while (*pos < src_len && (src[*pos] == 32 || src[*pos] == 9)) {
+        *pos = *pos + 1;
+    }
+}
+
+// Read an identifier at pos. Returns pointer into src, sets out_len.
+fn _read_ident(src as *u8, pos as *i32, src_len as i32, out_len as *i32) as *u8 {
+    let is i32 as start = *pos;
+    while (*pos < src_len && _is_alnum(src[*pos]) == 1) {
+        *pos = *pos + 1;
+    }
+    *out_len = *pos - start;
+    return cast(*u8, cast(i64, src) + cast(i64, start));
+}
+
+// Read a type expression (simplified: just reads tokens until 'as' or '=' or '{' or ';' or ')')
+fn _read_type(src as *u8, pos as *i32, src_len as i32, out_len as *i32) as *u8 {
+    _skip_ws_inline(src, pos, src_len);
+    let is i32 as start = *pos;
+    // Handle pointer prefix
+    while (*pos < src_len && src[*pos] == 42) { *pos = *pos + 1; } // *
+    // Handle array prefix [N]
+    if (*pos < src_len && src[*pos] == 91) {
+        while (*pos < src_len && src[*pos] != 93) { *pos = *pos + 1; }
+        if (*pos < src_len) { *pos = *pos + 1; } // skip ]
+    }
+    // Read the type name
+    while (*pos < src_len && (_is_alnum(src[*pos]) == 1 || src[*pos] == 46)) {
+        *pos = *pos + 1;
+    }
+    // Handle gen args (e.g. "Slice gen i32")
+    _skip_ws_inline(src, pos, src_len);
+    if (_match_word(src, *pos, src_len, "gen", 3) == 1) {
+        *pos = *pos + 3;
+        _skip_ws_inline(src, pos, src_len);
+        while (*pos < src_len && (_is_alnum(src[*pos]) == 1 || src[*pos] == 44 || src[*pos] == 32)) {
+            *pos = *pos + 1;
+        }
+    }
+    *out_len = *pos - start;
+    return cast(*u8, cast(i64, src) + cast(i64, start));
+}
+
+fn scan(src as *u8, src_len as i32) as void {
+    reset();
+    let is i32 as pos with mut = 0;
+    let is i32 as line with mut = 1;
+    let is i32 as line_start with mut = 0;
+
+    while (pos < src_len) {
+        let is u8 as c = src[pos];
+
+        // Track line numbers
+        if (c == 10) {
+            line = line + 1;
+            line_start = pos + 1;
+            pos = pos + 1;
+        }
+        // Skip line comments
+        else if (c == 47 && pos + 1 < src_len && src[pos + 1] == 47) {
+            while (pos < src_len && src[pos] != 10) { pos = pos + 1; }
+        }
+        // Skip strings
+        else if (c == 34) {
+            pos = pos + 1;
+            while (pos < src_len && src[pos] != 34) {
+                if (src[pos] == 92) { pos = pos + 1; } // skip escape
+                pos = pos + 1;
+            }
+            if (pos < src_len) { pos = pos + 1; }
+        }
+        // "fn " — function definition
+        else if (_match_word(src, pos, src_len, "fn", 2) == 1) {
+            let is i32 as fn_col = pos - line_start + 1;
+            pos = pos + 2;
+            _skip_ws_inline(src, &pos, src_len);
+            let is i32 as nlen with mut = 0;
+            let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+            if (nlen > 0) {
+                // Skip to return type: find "as TYPE" after params
+                let is *u8 as ret_type with mut = cast(*u8, 0);
+                let is i32 as ret_len with mut = 0;
+                // Scan forward for ") as "
+                let is i32 as scan_pos with mut = pos;
+                while (scan_pos < src_len - 4 && scan_pos < pos + 500) {
+                    if (src[scan_pos] == 41 && src[scan_pos + 1] == 32
+                        && src[scan_pos + 2] == 97 && src[scan_pos + 3] == 115
+                        && src[scan_pos + 4] == 32) {
+                        scan_pos = scan_pos + 5;
+                        ret_type = _read_type(src, &scan_pos, src_len, &ret_len);
+                        break;
+                    }
+                    scan_pos = scan_pos + 1;
+                }
+                if (ret_len == 0) { ret_type = "void"; ret_len = 4; }
+                _add_sym(name, nlen, SK_FUNCTION, line, fn_col, ret_type, ret_len);
+            }
+        }
+        // "let is " — variable
+        else if (_match_word(src, pos, src_len, "let", 3) == 1) {
+            let is i32 as let_col = pos - line_start + 1;
+            pos = pos + 3;
+            _skip_ws_inline(src, &pos, src_len);
+            if (_match_word(src, pos, src_len, "is", 2) == 1) {
+                pos = pos + 2;
+                _skip_ws_inline(src, &pos, src_len);
+                let is i32 as ty_len with mut = 0;
+                let is *u8 as ty_str = _read_type(src, &pos, src_len, &ty_len);
+                _skip_ws_inline(src, &pos, src_len);
+                if (_match_word(src, pos, src_len, "as", 2) == 1) {
+                    pos = pos + 2;
+                    _skip_ws_inline(src, &pos, src_len);
+                    let is i32 as nlen with mut = 0;
+                    let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+                    if (nlen > 0) {
+                        _add_sym(name, nlen, SK_VARIABLE, line, let_col, ty_str, ty_len);
+                    }
+                }
+            }
+        }
+        // "struct " — struct definition
+        else if (_match_word(src, pos, src_len, "struct", 6) == 1) {
+            let is i32 as st_col = pos - line_start + 1;
+            pos = pos + 6;
+            _skip_ws_inline(src, &pos, src_len);
+            let is i32 as nlen with mut = 0;
+            let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+            if (nlen > 0) {
+                _add_sym(name, nlen, SK_STRUCT, line, st_col, "struct", 6);
+                // Scan fields inside { ... }
+                _skip_ws_inline(src, &pos, src_len);
+                // Skip gen params
+                if (_match_word(src, pos, src_len, "gen", 3) == 1) {
+                    while (pos < src_len && src[pos] != 123) { pos = pos + 1; }
+                }
+                if (pos < src_len && src[pos] == 123) {
+                    pos = pos + 1;
+                    // Parse fields: "name as type;"
+                    while (pos < src_len && src[pos] != 125) {
+                        if (src[pos] == 10) { line = line + 1; line_start = pos + 1; pos = pos + 1; }
+                        else if (src[pos] == 32 || src[pos] == 9 || src[pos] == 13) { pos = pos + 1; }
+                        else if (_is_alpha(src[pos]) == 1) {
+                            let is i32 as fld_col = pos - line_start + 1;
+                            let is i32 as flen with mut = 0;
+                            let is *u8 as fname = _read_ident(src, &pos, src_len, &flen);
+                            _skip_ws_inline(src, &pos, src_len);
+                            if (_match_word(src, pos, src_len, "as", 2) == 1) {
+                                pos = pos + 2;
+                                let is i32 as fty_len with mut = 0;
+                                let is *u8 as fty = _read_type(src, &pos, src_len, &fty_len);
+                                _add_sym(fname, flen, SK_FIELD, line, fld_col, fty, fty_len);
+                            }
+                            // Skip to next ; or }
+                            while (pos < src_len && src[pos] != 59 && src[pos] != 125) {
+                                if (src[pos] == 10) { line = line + 1; line_start = pos + 1; }
+                                pos = pos + 1;
+                            }
+                            if (pos < src_len && src[pos] == 59) { pos = pos + 1; }
+                        }
+                        else { pos = pos + 1; }
+                    }
+                    if (pos < src_len) { pos = pos + 1; } // skip }
+                }
+            }
+        }
+        // "enum " — enum definition
+        else if (_match_word(src, pos, src_len, "enum", 4) == 1) {
+            let is i32 as en_col = pos - line_start + 1;
+            pos = pos + 4;
+            _skip_ws_inline(src, &pos, src_len);
+            let is i32 as nlen with mut = 0;
+            let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+            if (nlen > 0) {
+                _add_sym(name, nlen, SK_ENUM, line, en_col, "enum", 4);
+            }
+            // Skip to closing }
+            while (pos < src_len && src[pos] != 125) {
+                if (src[pos] == 10) { line = line + 1; line_start = pos + 1; }
+                pos = pos + 1;
+            }
+            if (pos < src_len) { pos = pos + 1; }
+        }
+        // "type " — type alias
+        else if (_match_word(src, pos, src_len, "type", 4) == 1) {
+            let is i32 as ta_col = pos - line_start + 1;
+            pos = pos + 4;
+            _skip_ws_inline(src, &pos, src_len);
+            let is i32 as nlen with mut = 0;
+            let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+            if (nlen > 0) {
+                _skip_ws_inline(src, &pos, src_len);
+                if (pos < src_len && src[pos] == 61) { // =
+                    pos = pos + 1;
+                    let is i32 as ty_len with mut = 0;
+                    let is *u8 as ty_str = _read_type(src, &pos, src_len, &ty_len);
+                    _add_sym(name, nlen, SK_TYPE_ALIAS, line, ta_col, ty_str, ty_len);
+                }
+            }
+        }
+        // "use " — module import
+        else if (_match_word(src, pos, src_len, "use", 3) == 1) {
+            let is i32 as use_col = pos - line_start + 1;
+            pos = pos + 3;
+            _skip_ws_inline(src, &pos, src_len);
+            // Skip the path string
+            if (pos < src_len && src[pos] == 34) {
+                pos = pos + 1;
+                let is i32 as path_start = pos;
+                while (pos < src_len && src[pos] != 34) { pos = pos + 1; }
+                let is i32 as path_len = pos - path_start;
+                if (pos < src_len) { pos = pos + 1; } // skip "
+                // Find "as NAME"
+                _skip_ws_inline(src, &pos, src_len);
+                // Skip "only ..." if present
+                if (_match_word(src, pos, src_len, "only", 4) == 1) {
+                    while (pos < src_len && src[pos] != 59 && !(_match_word(src, pos, src_len, "as", 2) == 1)) {
+                        pos = pos + 1;
+                    }
+                }
+                if (_match_word(src, pos, src_len, "as", 2) == 1) {
+                    pos = pos + 2;
+                    _skip_ws_inline(src, &pos, src_len);
+                    let is i32 as nlen with mut = 0;
+                    let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+                    if (nlen > 0) {
+                        _add_sym(name, nlen, SK_MODULE, line, use_col,
+                                 cast(*u8, cast(i64, src) + cast(i64, path_start)), path_len);
+                    }
+                }
+            }
+        }
+        else {
+            pos = pos + 1;
+        }
+    }
+}
+
+// === Lookup ===
+
+fn _streq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
+    if (alen != blen) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Find symbol by name. Returns index or -1.
+fn find_by_name(name as *u8, name_len as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < sym_count) {
+        if (_streq(cast(*u8, sym_names[i]), sym_name_lens[i], name, name_len) == 1) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Find the identifier at a given cursor position (line, col are 1-based).
+// Scans source text to find the word under the cursor.
+fn find_ident_at(src as *u8, src_len as i32, target_line as i32, target_col as i32,
+                 out_name as **u8, out_len as *i32) as void {
+    let is i32 as pos with mut = 0;
+    let is i32 as line with mut = 1;
+    let is i32 as line_start with mut = 0;
+
+    // Find the target line
+    while (pos < src_len && line < target_line) {
+        if (src[pos] == 10) { line = line + 1; line_start = pos + 1; }
+        pos = pos + 1;
+    }
+
+    // Move to target col (1-based)
+    pos = line_start + target_col - 1;
+    if (pos < 0 || pos >= src_len) { *out_name = cast(*u8, 0); *out_len = 0; return; }
+
+    // Expand to find the full identifier
+    let is i32 as start with mut = pos;
+    while (start > line_start && _is_alnum(src[start - 1]) == 1) { start = start - 1; }
+    let is i32 as end with mut = pos;
+    while (end < src_len && _is_alnum(src[end]) == 1) { end = end + 1; }
+
+    if (end <= start) { *out_name = cast(*u8, 0); *out_len = 0; return; }
+
+    *out_name = cast(*u8, cast(i64, src) + cast(i64, start));
+    *out_len = end - start;
+}
+
+// Find all occurrences of a name in source. Returns count.
+// Fills out_lines[] and out_cols[] (1-based).
+fn find_all_refs(src as *u8, src_len as i32, name as *u8, name_len as i32,
+                 out_lines as *i32, out_cols as *i32, max_refs as i32) as i32 {
+    let is i32 as count with mut = 0;
+    let is i32 as pos with mut = 0;
+    let is i32 as line with mut = 1;
+    let is i32 as line_start with mut = 0;
+
+    while (pos < src_len && count < max_refs) {
+        if (src[pos] == 10) {
+            line = line + 1;
+            line_start = pos + 1;
+            pos = pos + 1;
+        }
+        // Skip strings
+        else if (src[pos] == 34) {
+            pos = pos + 1;
+            while (pos < src_len && src[pos] != 34) {
+                if (src[pos] == 92) { pos = pos + 1; }
+                pos = pos + 1;
+            }
+            if (pos < src_len) { pos = pos + 1; }
+        }
+        // Skip comments
+        else if (src[pos] == 47 && pos + 1 < src_len && src[pos + 1] == 47) {
+            while (pos < src_len && src[pos] != 10) { pos = pos + 1; }
+        }
+        // Check for identifier match
+        else if (_is_alpha(src[pos]) == 1) {
+            let is i32 as id_start = pos;
+            while (pos < src_len && _is_alnum(src[pos]) == 1) { pos = pos + 1; }
+            let is i32 as id_len = pos - id_start;
+            if (_streq(cast(*u8, cast(i64, src) + cast(i64, id_start)), id_len, name, name_len) == 1) {
+                out_lines[count] = line;
+                out_cols[count] = id_start - line_start + 1;
+                count = count + 1;
+            }
+        }
+        else {
+            pos = pos + 1;
+        }
+    }
+    return count;
+}
