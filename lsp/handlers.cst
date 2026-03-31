@@ -7,6 +7,7 @@ use "rpc.cst" as rpc;
 use "documents.cst" as docs;
 use "uri.cst" as uri;
 use "analysis.cst" as analysis;
+use "symbols.cst" as syms;
 
 // Path to the caustic compiler binary (resolved at startup)
 let is *u8 as compiler_path with mut;
@@ -136,6 +137,9 @@ fn handle_did_close(params as *json.JsonValue) as void {
 fn _publish_diagnostics(d as *docs.Document) as void {
     if (cast(i64, d.path_ptr) == 0) { return; }
 
+    // Scan symbols from source
+    syms.scan(d.text_ptr, d.text_len);
+
     // Run compiler on the document
     let is i32 as count = analysis.analyze_file(d.path_ptr, d.text_ptr, d.text_len, compiler_path);
 
@@ -190,24 +194,303 @@ fn _publish_empty_diagnostics(uri_str as *u8, uri_len as i32) as void {
     rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
 
-// === Navigation (stubs for now) ===
+// === Navigation ===
+
+fn _get_position(params as *json.JsonValue, out_line as *i32, out_col as *i32) as i32 {
+    let is *json.JsonValue as pos = json.obj_get(params, "position", 8);
+    if (cast(i64, pos) == 0) { return 0; }
+    // LSP is 0-based, we use 1-based
+    *out_line = cast(i32, json.obj_get_int(pos, "line", 4, 0)) + 1;
+    *out_col = cast(i32, json.obj_get_int(pos, "character", 9, 0)) + 1;
+    return 1;
+}
+
+fn _get_doc(params as *json.JsonValue, out_uri as **u8, out_uri_len as *i32) as *docs.Document {
+    let is *json.JsonValue as td = json.obj_get(params, "textDocument", 12);
+    if (cast(i64, td) == 0) { return cast(*docs.Document, 0); }
+    let is i32 as uri_len with mut = 0;
+    let is *u8 as uri_str = json.obj_get_str(td, "uri", 3, &uri_len);
+    *out_uri = uri_str;
+    *out_uri_len = uri_len;
+    return docs.find(uri_str, uri_len);
+}
 
 fn handle_definition(id as i64, params as *json.JsonValue) as void {
-    send_null_result(id);
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0 || _get_position(params, &line, &col) == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    // Find the identifier at cursor
+    let is *u8 as name with mut = cast(*u8, 0);
+    let is i32 as nlen with mut = 0;
+    syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
+    if (nlen == 0) { send_null_result(id); return; }
+
+    // Look up the symbol definition
+    let is i32 as idx = syms.find_by_name(name, nlen);
+    if (idx < 0) { send_null_result(id); return; }
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.kv_str(&w, "uri", d.uri_ptr, d.uri_len);
+    jw.key_c(&w, "range");
+    _write_range(&w, syms.sym_lines[idx] - 1, syms.sym_cols[idx] - 1,
+                 syms.sym_lines[idx] - 1, syms.sym_cols[idx] - 1 + syms.sym_name_lens[idx]);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
 
 fn handle_hover(id as i64, params as *json.JsonValue) as void {
-    send_null_result(id);
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0 || _get_position(params, &line, &col) == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    let is *u8 as name with mut = cast(*u8, 0);
+    let is i32 as nlen with mut = 0;
+    syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
+    if (nlen == 0) { send_null_result(id); return; }
+
+    let is i32 as idx = syms.find_by_name(name, nlen);
+    if (idx < 0) { send_null_result(id); return; }
+
+    // Build hover text
+    let is [512]u8 as hover;
+    let is i32 as hlen with mut = 0;
+    let is i32 as kind = syms.sym_kinds[idx];
+
+    if (kind == syms.SK_FUNCTION) {
+        // "fn NAME as TYPE"
+        hover[0] = 102; hover[1] = 110; hover[2] = 32; hlen = 3;
+    }
+    else if (kind == syms.SK_VARIABLE) {
+        // "let is TYPE as NAME"
+        hover[0] = 108; hover[1] = 101; hover[2] = 116; hover[3] = 32;
+        hover[4] = 105; hover[5] = 115; hover[6] = 32; hlen = 7;
+        // append type
+        let is i32 as ti with mut = 0;
+        while (ti < syms.sym_type_lens[idx] && hlen < 490) {
+            hover[hlen] = cast(*u8, syms.sym_types[idx])[ti];
+            hlen = hlen + 1;
+            ti = ti + 1;
+        }
+        hover[hlen] = 32; hlen = hlen + 1; // space
+        hover[hlen] = 97; hlen = hlen + 1; // a
+        hover[hlen] = 115; hlen = hlen + 1; // s
+        hover[hlen] = 32; hlen = hlen + 1; // space
+    }
+    else if (kind == syms.SK_STRUCT) {
+        // "struct NAME"
+        hover[0] = 115; hover[1] = 116; hover[2] = 114; hover[3] = 117;
+        hover[4] = 99; hover[5] = 116; hover[6] = 32; hlen = 7;
+    }
+    else if (kind == syms.SK_ENUM) {
+        hover[0] = 101; hover[1] = 110; hover[2] = 117; hover[3] = 109;
+        hover[4] = 32; hlen = 5;
+    }
+    else if (kind == syms.SK_TYPE_ALIAS) {
+        // "type NAME = TYPE"
+        hover[0] = 116; hover[1] = 121; hover[2] = 112; hover[3] = 101;
+        hover[4] = 32; hlen = 5;
+    }
+    else if (kind == syms.SK_FIELD) {
+        // "field: TYPE"
+        hlen = 0;
+    }
+    else { hlen = 0; }
+
+    // Append name
+    let is i32 as ni with mut = 0;
+    while (ni < syms.sym_name_lens[idx] && hlen < 500) {
+        hover[hlen] = cast(*u8, syms.sym_names[idx])[ni];
+        hlen = hlen + 1;
+        ni = ni + 1;
+    }
+
+    // For functions: append " as RET_TYPE"
+    if (kind == syms.SK_FUNCTION) {
+        hover[hlen] = 32; hlen = hlen + 1;
+        hover[hlen] = 97; hlen = hlen + 1;
+        hover[hlen] = 115; hlen = hlen + 1;
+        hover[hlen] = 32; hlen = hlen + 1;
+        let is i32 as ri with mut = 0;
+        while (ri < syms.sym_type_lens[idx] && hlen < 510) {
+            hover[hlen] = cast(*u8, syms.sym_types[idx])[ri];
+            hlen = hlen + 1;
+            ri = ri + 1;
+        }
+    }
+    // For type alias: append " = TYPE"
+    else if (kind == syms.SK_TYPE_ALIAS) {
+        hover[hlen] = 32; hlen = hlen + 1;
+        hover[hlen] = 61; hlen = hlen + 1;
+        hover[hlen] = 32; hlen = hlen + 1;
+        let is i32 as ri with mut = 0;
+        while (ri < syms.sym_type_lens[idx] && hlen < 510) {
+            hover[hlen] = cast(*u8, syms.sym_types[idx])[ri];
+            hlen = hlen + 1;
+            ri = ri + 1;
+        }
+    }
+    // For fields: append ": TYPE"
+    else if (kind == syms.SK_FIELD) {
+        hover[hlen] = 58; hlen = hlen + 1;
+        hover[hlen] = 32; hlen = hlen + 1;
+        let is i32 as ri with mut = 0;
+        while (ri < syms.sym_type_lens[idx] && hlen < 510) {
+            hover[hlen] = cast(*u8, syms.sym_types[idx])[ri];
+            hlen = hlen + 1;
+            ri = ri + 1;
+        }
+    }
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.key_c(&w, "contents");
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "kind", "plaintext");
+    jw.kv_str(&w, "value", &hover, hlen);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
 
 fn handle_completion(id as i64, params as *json.JsonValue) as void {
-    send_empty_array(id);
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+
+    let is i32 as i with mut = 0;
+    while (i < syms.sym_count) {
+        jw.obj_start(&w);
+        jw.kv_str(&w, "label", cast(*u8, syms.sym_names[i]), syms.sym_name_lens[i]);
+        jw.kv_int(&w, "kind", cast(i64, syms.sym_kinds[i]));
+        if (syms.sym_type_lens[i] > 0) {
+            jw.kv_str(&w, "detail", cast(*u8, syms.sym_types[i]), syms.sym_type_lens[i]);
+        }
+        jw.obj_end(&w);
+        i = i + 1;
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
 
 fn handle_references(id as i64, params as *json.JsonValue) as void {
-    send_empty_array(id);
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0 || _get_position(params, &line, &col) == 0) {
+        send_empty_array(id);
+        return;
+    }
+
+    let is *u8 as name with mut = cast(*u8, 0);
+    let is i32 as nlen with mut = 0;
+    syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
+    if (nlen == 0) { send_empty_array(id); return; }
+
+    let is [256]i32 as ref_lines;
+    let is [256]i32 as ref_cols;
+    let is i32 as count = syms.find_all_refs(d.text_ptr, d.text_len, name, nlen, &ref_lines, &ref_cols, 256);
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        jw.obj_start(&w);
+        jw.kv_str(&w, "uri", d.uri_ptr, d.uri_len);
+        jw.key_c(&w, "range");
+        _write_range(&w, ref_lines[i] - 1, ref_cols[i] - 1, ref_lines[i] - 1, ref_cols[i] - 1 + nlen);
+        jw.obj_end(&w);
+        i = i + 1;
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
 
 fn handle_rename(id as i64, params as *json.JsonValue) as void {
-    send_null_result(id);
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0 || _get_position(params, &line, &col) == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    let is i32 as new_name_len with mut = 0;
+    let is *u8 as new_name = json.obj_get_str(params, "newName", 7, &new_name_len);
+    if (cast(i64, new_name) == 0) { send_null_result(id); return; }
+
+    let is *u8 as name with mut = cast(*u8, 0);
+    let is i32 as nlen with mut = 0;
+    syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
+    if (nlen == 0) { send_null_result(id); return; }
+
+    let is [256]i32 as ref_lines;
+    let is [256]i32 as ref_cols;
+    let is i32 as count = syms.find_all_refs(d.text_ptr, d.text_len, name, nlen, &ref_lines, &ref_cols, 256);
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.key_c(&w, "changes");
+    jw.obj_start(&w);
+    jw.key(&w, d.uri_ptr, d.uri_len);
+    jw.arr_start(&w);
+
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        jw.obj_start(&w);
+        jw.key_c(&w, "range");
+        _write_range(&w, ref_lines[i] - 1, ref_cols[i] - 1, ref_lines[i] - 1, ref_cols[i] - 1 + nlen);
+        jw.kv_str(&w, "newText", new_name, new_name_len);
+        jw.obj_end(&w);
+        i = i + 1;
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
 }
