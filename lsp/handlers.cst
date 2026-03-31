@@ -1,0 +1,213 @@
+use "../std/linux.cst" as linux;
+use "../std/io.cst" as io;
+use "../std/mem.cst" only bins, core as mem;
+use "json.cst" as json;
+use "json_write.cst" as jw;
+use "rpc.cst" as rpc;
+use "documents.cst" as docs;
+use "uri.cst" as uri;
+use "analysis.cst" as analysis;
+
+// Path to the caustic compiler binary (resolved at startup)
+let is *u8 as compiler_path with mut;
+
+// === Helpers ===
+
+fn _write_range(w as *jw.Writer, sl as i32, sc as i32, el as i32, ec as i32) as void {
+    jw.obj_start(w);
+    jw.key_c(w, "start");
+    jw.obj_start(w);
+    jw.kv_int(w, "line", cast(i64, sl));
+    jw.kv_int(w, "character", cast(i64, sc));
+    jw.obj_end(w);
+    jw.key_c(w, "end");
+    jw.obj_start(w);
+    jw.kv_int(w, "line", cast(i64, el));
+    jw.kv_int(w, "character", cast(i64, ec));
+    jw.obj_end(w);
+    jw.obj_end(w);
+}
+
+fn send_null_result(id as i64) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.kv_null(&w, "result");
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn send_empty_array(id as i64) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Initialize ===
+
+fn handle_initialize(id as i64) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.key_c(&w, "capabilities");
+    jw.obj_start(&w);
+    jw.kv_int(&w, "textDocumentSync", 1);
+    jw.kv_bool(&w, "hoverProvider", 1);
+    jw.kv_bool(&w, "definitionProvider", 1);
+    jw.key_c(&w, "completionProvider");
+    jw.obj_start(&w);
+    jw.key_c(&w, "triggerCharacters");
+    jw.arr_start(&w);
+    jw.str_c(&w, ".");
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    jw.kv_bool(&w, "referencesProvider", 1);
+    jw.kv_bool(&w, "renameProvider", 1);
+    jw.obj_end(&w);
+    jw.key_c(&w, "serverInfo");
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "name", "caustic-lsp");
+    jw.kv_str_c(&w, "version", "0.1.0");
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn handle_shutdown(id as i64) as void {
+    send_null_result(id);
+}
+
+// === Document sync ===
+
+fn handle_did_open(params as *json.JsonValue) as void {
+    let is *json.JsonValue as td = json.obj_get(params, "textDocument", 12);
+    if (cast(i64, td) == 0) { return; }
+    let is i32 as uri_len with mut = 0;
+    let is *u8 as uri_str = json.obj_get_str(td, "uri", 3, &uri_len);
+    let is i32 as text_len with mut = 0;
+    let is *u8 as text = json.obj_get_str(td, "text", 4, &text_len);
+    let is i64 as version = json.obj_get_int(td, "version", 7, 0);
+    let is *docs.Document as d = docs.doc_open(uri_str, uri_len, text, text_len, cast(i32, version));
+    let is i32 as path_len with mut = 0;
+    d.path_ptr = uri.uri_to_path(uri_str, uri_len, &path_len);
+    d.path_len = path_len;
+    _publish_diagnostics(d);
+}
+
+fn handle_did_change(params as *json.JsonValue) as void {
+    let is *json.JsonValue as td = json.obj_get(params, "textDocument", 12);
+    if (cast(i64, td) == 0) { return; }
+    let is i32 as uri_len with mut = 0;
+    let is *u8 as uri_str = json.obj_get_str(td, "uri", 3, &uri_len);
+    let is i64 as version = json.obj_get_int(td, "version", 7, 0);
+    let is *docs.Document as d = docs.find(uri_str, uri_len);
+    if (cast(i64, d) == 0) { return; }
+    let is *json.JsonValue as changes = json.obj_get(params, "contentChanges", 14);
+    if (cast(i64, changes) == 0 || changes.kind != json.JSON_ARRAY) { return; }
+    let is *json.JsonValue as first = json.arr_get(changes, 0);
+    if (cast(i64, first) == 0) { return; }
+    let is i32 as text_len with mut = 0;
+    let is *u8 as text = json.obj_get_str(first, "text", 4, &text_len);
+    if (cast(i64, text) == 0) { return; }
+    docs.update(d, text, text_len, cast(i32, version));
+    _publish_diagnostics(d);
+}
+
+fn handle_did_close(params as *json.JsonValue) as void {
+    let is *json.JsonValue as td = json.obj_get(params, "textDocument", 12);
+    if (cast(i64, td) == 0) { return; }
+    let is i32 as uri_len with mut = 0;
+    let is *u8 as uri_str = json.obj_get_str(td, "uri", 3, &uri_len);
+    docs.doc_close(uri_str, uri_len);
+    _publish_empty_diagnostics(uri_str, uri_len);
+}
+
+fn _publish_diagnostics(d as *docs.Document) as void {
+    if (cast(i64, d.path_ptr) == 0) { return; }
+
+    // Run compiler on the document
+    let is i32 as count = analysis.analyze_file(d.path_ptr, d.text_ptr, d.text_len, compiler_path);
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.key_c(&w, "method");
+    jw.str_c(&w, "textDocument/publishDiagnostics");
+    jw.key_c(&w, "params");
+    jw.obj_start(&w);
+    jw.kv_str(&w, "uri", d.uri_ptr, d.uri_len);
+    jw.key_c(&w, "diagnostics");
+    jw.arr_start(&w);
+
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        jw.obj_start(&w);
+        jw.key_c(&w, "range");
+        // LSP is 0-based, compiler is 1-based
+        let is i32 as ln with mut = analysis.err_lines[i];
+        let is i32 as cl with mut = analysis.err_cols[i];
+        if (ln > 0) { ln = ln - 1; }
+        if (cl > 0) { cl = cl - 1; }
+        _write_range(&w, ln, cl, ln, cl + 1);
+        jw.kv_int(&w, "severity", cast(i64, analysis.err_severities[i]));
+        jw.kv_str_c(&w, "source", "caustic");
+        jw.kv_str(&w, "message", cast(*u8, analysis.err_msgs[i]), analysis.err_msg_lens[i]);
+        jw.obj_end(&w);
+        i = i + 1;
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn _publish_empty_diagnostics(uri_str as *u8, uri_len as i32) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.key_c(&w, "method");
+    jw.str_c(&w, "textDocument/publishDiagnostics");
+    jw.key_c(&w, "params");
+    jw.obj_start(&w);
+    jw.kv_str(&w, "uri", uri_str, uri_len);
+    jw.key_c(&w, "diagnostics");
+    jw.arr_start(&w);
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Navigation (stubs for now) ===
+
+fn handle_definition(id as i64, params as *json.JsonValue) as void {
+    send_null_result(id);
+}
+
+fn handle_hover(id as i64, params as *json.JsonValue) as void {
+    send_null_result(id);
+}
+
+fn handle_completion(id as i64, params as *json.JsonValue) as void {
+    send_empty_array(id);
+}
+
+fn handle_references(id as i64, params as *json.JsonValue) as void {
+    send_empty_array(id);
+}
+
+fn handle_rename(id as i64, params as *json.JsonValue) as void {
+    send_null_result(id);
+}

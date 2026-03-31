@@ -1,0 +1,206 @@
+use "../std/linux.cst" as linux;
+use "../std/io.cst" as io;
+use "../std/mem.cst" only bins, core as mem;
+use "json.cst" as json;
+
+// Run the compiler as a subprocess, capture stderr for errors.
+// Returns error count. Fills err_lines[], err_cols[], err_msgs[], err_msg_lens[].
+
+let is i32 as MAX_ERRORS with imut = 64;
+
+struct AnalysisResult {
+    error_count as i32;
+    warn_count as i32;
+}
+
+// Parse a single error line from compiler stderr.
+// Format: "Error in filename:LINE:COL: message"
+// Or:     "Erro semantico: message"
+// Or:     "Aviso em filename:LINE:COL: message"
+// Fills out_line, out_col, out_msg, out_msg_len, out_severity.
+fn _parse_error_line(line as *u8, line_len as i32,
+                     out_line as *i32, out_col as *i32,
+                     out_msg as **u8, out_msg_len as *i32,
+                     out_severity as *i32) as i32 {
+    // Check for "Error in " (9 chars)
+    if (line_len > 9 && line[0] == 69 && line[1] == 114 && line[2] == 114
+        && line[3] == 111 && line[4] == 114 && line[5] == 32
+        && line[6] == 105 && line[7] == 110 && line[8] == 32) {
+        *out_severity = 1;
+        // Find filename:line:col: — skip past "Error in ", find first ':'
+        let is i32 as i with mut = 9;
+        // Skip filename (find first colon followed by digit)
+        while (i < line_len - 1) {
+            if (line[i] == 58 && line[i + 1] >= 48 && line[i + 1] <= 57) {
+                break;
+            }
+            i = i + 1;
+        }
+        if (i >= line_len - 1) { return 0; }
+        i = i + 1; // skip ':'
+        // Parse line number
+        let is i32 as ln with mut = 0;
+        while (i < line_len && line[i] >= 48 && line[i] <= 57) {
+            ln = ln * 10 + cast(i32, line[i]) - 48;
+            i = i + 1;
+        }
+        *out_line = ln;
+        if (i < line_len && line[i] == 58) { i = i + 1; } // skip ':'
+        // Parse col number
+        let is i32 as cl with mut = 0;
+        while (i < line_len && line[i] >= 48 && line[i] <= 57) {
+            cl = cl * 10 + cast(i32, line[i]) - 48;
+            i = i + 1;
+        }
+        *out_col = cl;
+        if (i < line_len && line[i] == 58) { i = i + 1; } // skip ':'
+        if (i < line_len && line[i] == 32) { i = i + 1; } // skip ' '
+        *out_msg = cast(*u8, cast(i64, line) + cast(i64, i));
+        *out_msg_len = line_len - i;
+        return 1;
+    }
+    // Check for "Aviso em " (9 chars): A(65) v(118) i(105) s(115) o(111) (32) e(101) m(109) (32)
+    if (line_len > 9 && line[0] == 65 && line[1] == 118 && line[2] == 105
+        && line[3] == 115 && line[4] == 111 && line[5] == 32
+        && line[6] == 101 && line[7] == 109 && line[8] == 32) {
+        *out_severity = 2;
+        let is i32 as i with mut = 9;
+        while (i < line_len - 1) {
+            if (line[i] == 58 && line[i + 1] >= 48 && line[i + 1] <= 57) { break; }
+            i = i + 1;
+        }
+        if (i >= line_len - 1) { return 0; }
+        i = i + 1;
+        let is i32 as ln with mut = 0;
+        while (i < line_len && line[i] >= 48 && line[i] <= 57) {
+            ln = ln * 10 + cast(i32, line[i]) - 48;
+            i = i + 1;
+        }
+        *out_line = ln;
+        if (i < line_len && line[i] == 58) { i = i + 1; }
+        let is i32 as cl with mut = 0;
+        while (i < line_len && line[i] >= 48 && line[i] <= 57) {
+            cl = cl * 10 + cast(i32, line[i]) - 48;
+            i = i + 1;
+        }
+        *out_col = cl;
+        if (i < line_len && line[i] == 58) { i = i + 1; }
+        if (i < line_len && line[i] == 32) { i = i + 1; }
+        *out_msg = cast(*u8, cast(i64, line) + cast(i64, i));
+        *out_msg_len = line_len - i;
+        return 1;
+    }
+    // Check for "Erro semantico: " (17 chars)
+    if (line_len > 17 && line[0] == 69 && line[1] == 114 && line[2] == 114
+        && line[3] == 111 && line[4] == 32 && line[5] == 115) {
+        *out_severity = 1;
+        *out_line = 0;
+        *out_col = 0;
+        *out_msg = cast(*u8, cast(i64, line) + 17);
+        *out_msg_len = line_len - 17;
+        return 1;
+    }
+    return 0;
+}
+
+// Error storage
+let is [64]i32 as err_lines with mut;
+let is [64]i32 as err_cols with mut;
+let is [64]i64 as err_msgs with mut;
+let is [64]i32 as err_msg_lens with mut;
+let is [64]i32 as err_severities with mut;
+let is i32 as err_count with mut;
+
+fn _cstrlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}
+
+// Analyze a document by running the compiler as a subprocess.
+// Writes text to a temp file, runs `caustic -c tmpfile 2>&1`, parses output.
+fn analyze_file(path as *u8, text as *u8, text_len as i32, compiler_path as *u8) as i32 {
+    // Write text to a temp file (overwrite the actual file path)
+    let is i64 as fd = linux.open(path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+    if (fd < 0) { return 0; }
+    linux.write(fd, text, cast(i64, text_len));
+    linux.close(fd);
+
+    // Create pipe for capturing stderr
+    let is [2]i32 as pipe_fds;
+    linux.pipe(&pipe_fds);
+
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        // Child: redirect stderr to pipe write end
+        linux.close(cast(i64, pipe_fds[0]));
+        linux.dup2(cast(i64, pipe_fds[1]), linux.STDERR);
+        linux.close(cast(i64, pipe_fds[1]));
+        // Also redirect stdout to /dev/null
+        let is i64 as devnull = linux.open("/dev/null", linux.O_WRONLY, 0);
+        linux.dup2(devnull, linux.STDOUT);
+        linux.close(devnull);
+        // exec: caustic -c path
+        let is [4]i64 as argv;
+        argv[0] = cast(i64, compiler_path);
+        argv[1] = cast(i64, "-c");
+        argv[2] = cast(i64, path);
+        argv[3] = 0;
+        let is [1]i64 as envp;
+        envp[0] = 0;
+        linux.execve(compiler_path, cast(*u8, &argv), cast(*u8, &envp));
+        linux.exit(127);
+    }
+
+    // Parent: read from pipe
+    linux.close(cast(i64, pipe_fds[1]));
+    let is [8192]u8 as buf;
+    let is i32 as buf_len with mut = 0;
+    while (1 == 1) {
+        let is i64 as n = linux.read(cast(i64, pipe_fds[0]), cast(*u8, cast(i64, &buf) + cast(i64, buf_len)), cast(i64, 8192 - buf_len));
+        if (n <= 0) { break; }
+        buf_len = buf_len + cast(i32, n);
+        if (buf_len >= 8000) { break; }
+    }
+    linux.close(cast(i64, pipe_fds[0]));
+
+    // Wait for child
+    let is [4]i64 as status;
+    linux.wait4(pid, cast(*u8, &status), 0, cast(*u8, 0));
+
+    // Parse stderr output line by line
+    err_count = 0;
+    let is i32 as line_start with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i <= buf_len) {
+        if (i == buf_len || buf[i] == 10) {
+            let is i32 as line_len = i - line_start;
+            if (line_len > 0 && err_count < MAX_ERRORS) {
+                let is i32 as eln with mut = 0;
+                let is i32 as ecl with mut = 0;
+                let is *u8 as emsg with mut = cast(*u8, 0);
+                let is i32 as emsg_len with mut = 0;
+                let is i32 as esev with mut = 1;
+                let is i32 as ok = _parse_error_line(
+                    cast(*u8, cast(i64, &buf) + cast(i64, line_start)), line_len,
+                    &eln, &ecl, &emsg, &emsg_len, &esev);
+                if (ok == 1) {
+                    err_lines[err_count] = eln;
+                    err_cols[err_count] = ecl;
+                    // Copy message
+                    let is *u8 as mcopy = json.alloc(cast(i64, emsg_len) + 1);
+                    mem.core.memcpy(mcopy, emsg, cast(i64, emsg_len));
+                    mcopy[emsg_len] = cast(u8, 0);
+                    err_msgs[err_count] = cast(i64, mcopy);
+                    err_msg_lens[err_count] = emsg_len;
+                    err_severities[err_count] = esev;
+                    err_count = err_count + 1;
+                }
+            }
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    return err_count;
+}

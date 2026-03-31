@@ -70,6 +70,48 @@ let is i64 as sem_src_len with mut;
 let is *u8 as sem_filename with mut;
 let is *u8 as sem_token_list with mut;
 
+// === LSP error accumulation ===
+let is i32 as lsp_mode with mut = 0;
+let is *u8 as lsp_errors with mut;
+let is i32 as lsp_error_count with mut = 0;
+let is i32 as lsp_had_error with mut = 0;
+
+struct LspError {
+    line as i32;
+    col as i32;
+    msg_ptr as *u8;
+    msg_len as i32;
+    severity as i32;
+    next as *u8;
+}
+
+fn _strlen(s as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) { i = i + 1; }
+    return i;
+}
+
+fn lsp_reset_errors() as void {
+    lsp_errors = cast(*u8, 0);
+    lsp_error_count = 0;
+    lsp_had_error = 0;
+}
+
+fn lsp_add_error(line as i32, col as i32, msg as *u8, msg_len as i32, severity as i32) as void {
+    let is *LspError as err = cast(*LspError, d.sem_alloc(48));
+    err.line = line;
+    err.col = col;
+    err.msg_ptr = d.sem_alloc(cast(i64, msg_len) + 1);
+    mem.memcpy(err.msg_ptr, msg, cast(i64, msg_len));
+    err.msg_ptr[msg_len] = cast(u8, 0);
+    err.msg_len = msg_len;
+    err.severity = severity;
+    err.next = lsp_errors;
+    lsp_errors = cast(*u8, err);
+    lsp_error_count = lsp_error_count + 1;
+    if (severity == 1) { lsp_had_error = 1; }
+}
+
 // === Scope management ===
 
 fn symtab_init() as void {
@@ -247,6 +289,10 @@ fn lookup_fn(name_ptr as *u8, name_len as i32) as *d.Function {
 // === Error helpers ===
 
 fn sem_error(msg as *u8) as void {
+    if (lsp_mode == 1) {
+        lsp_add_error(0, 0, msg, _strlen(msg), 1);
+        return;
+    }
     io.write_str(linux.STDERR, "Erro semantico: ");
     io.write_str(linux.STDERR, msg);
     io.write_str(linux.STDERR, "\n");
@@ -254,6 +300,19 @@ fn sem_error(msg as *u8) as void {
 }
 
 fn sem_error2(msg as *u8, name as *u8, nlen as i32) as void {
+    if (lsp_mode == 1) {
+        let is i32 as ml = _strlen(msg);
+        let is i32 as total = ml + 3 + nlen;
+        let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+        mem.memcpy(buf, msg, cast(i64, ml));
+        buf[ml] = cast(u8, 32);
+        buf[ml + 1] = cast(u8, 39);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), name, cast(i64, nlen));
+        buf[ml + 2 + nlen] = cast(u8, 39);
+        buf[total] = cast(u8, 0);
+        lsp_add_error(0, 0, buf, total, 1);
+        return;
+    }
     io.write_str(linux.STDERR, "Erro semantico: ");
     io.write_str(linux.STDERR, msg);
     io.write_str(linux.STDERR, " '");
@@ -263,6 +322,21 @@ fn sem_error2(msg as *u8, name as *u8, nlen as i32) as void {
 }
 
 fn sem_error3(msg as *u8, a as *u8, alen as i32, b as *u8, blen as i32) as void {
+    if (lsp_mode == 1) {
+        let is i32 as ml = _strlen(msg);
+        let is i32 as total = ml + 3 + alen + 1 + blen;
+        let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+        mem.memcpy(buf, msg, cast(i64, ml));
+        buf[ml] = cast(u8, 32);
+        buf[ml + 1] = cast(u8, 39);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), a, cast(i64, alen));
+        buf[ml + 2 + alen] = cast(u8, 46);
+        mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 3 + cast(i64, alen)), b, cast(i64, blen));
+        buf[ml + 3 + alen + blen] = cast(u8, 39);
+        buf[total] = cast(u8, 0);
+        lsp_add_error(0, 0, buf, total, 1);
+        return;
+    }
     io.write_str(linux.STDERR, "Erro semantico: ");
     io.write_str(linux.STDERR, msg);
     io.write_str(linux.STDERR, " '");
@@ -274,6 +348,14 @@ fn sem_error3(msg as *u8, a as *u8, alen as i32, b as *u8, blen as i32) as void 
 }
 
 fn sem_error_at(node as *ast.Node, msg as *u8) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            lsp_add_error(t.line, t.col, msg, _strlen(msg), 1);
+        }
+        return;
+    }
     if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
         let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
         let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
@@ -287,20 +369,36 @@ fn sem_error_at(node as *ast.Node, msg as *u8) as void {
 }
 
 fn sem_error_at2(node as *ast.Node, msg as *u8, name as *u8, nlen as i32) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            let is i32 as ml = _strlen(msg);
+            let is i32 as total = ml + 3 + nlen;
+            let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+            mem.memcpy(buf, msg, cast(i64, ml));
+            buf[ml] = cast(u8, 32);
+            buf[ml + 1] = cast(u8, 39);
+            mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), name, cast(i64, nlen));
+            buf[ml + 2 + nlen] = cast(u8, 39);
+            buf[total] = cast(u8, 0);
+            lsp_add_error(t.line, t.col, buf, total, 1);
+        }
+        return;
+    }
     if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
         let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
         let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
-        // Build combined message: msg + " '" + name + "'"
         let is i32 as msg_len with mut = 0;
         let is *u8 as mp = msg;
         while (mp[msg_len] != cast(u8, 0)) { msg_len = msg_len + 1; }
         let is i32 as total = msg_len + 3 + nlen;
         let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
         mem.memcpy(buf, msg, cast(i64, msg_len));
-        buf[msg_len] = cast(u8, 32);     // ' '
-        buf[msg_len + 1] = cast(u8, 39); // '
+        buf[msg_len] = cast(u8, 32);
+        buf[msg_len + 1] = cast(u8, 39);
         mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, msg_len) + 2), name, cast(i64, nlen));
-        buf[msg_len + 2 + nlen] = cast(u8, 39); // '
+        buf[msg_len + 2 + nlen] = cast(u8, 39);
         buf[total] = cast(u8, 0);
         lex.error_at_report(sem_src, sem_src_len, sem_filename, t.line, t.col, buf);
     } else {
@@ -314,6 +412,14 @@ fn sem_error_at2(node as *ast.Node, msg as *u8, name as *u8, nlen as i32) as voi
 }
 
 fn sem_warn_at(node as *ast.Node, msg as *u8) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            lsp_add_error(t.line, t.col, msg, _strlen(msg), 2);
+        }
+        return;
+    }
     if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
         let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
         let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
@@ -334,6 +440,23 @@ fn sem_warn_at(node as *ast.Node, msg as *u8) as void {
 }
 
 fn sem_warn_at2(node as *ast.Node, msg as *u8, name as *u8, nlen as i32) as void {
+    if (lsp_mode == 1) {
+        if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
+            let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
+            let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
+            let is i32 as ml = _strlen(msg);
+            let is i32 as total = ml + 3 + nlen;
+            let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+            mem.memcpy(buf, msg, cast(i64, ml));
+            buf[ml] = cast(u8, 32);
+            buf[ml + 1] = cast(u8, 39);
+            mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, ml) + 2), name, cast(i64, nlen));
+            buf[ml + 2 + nlen] = cast(u8, 39);
+            buf[total] = cast(u8, 0);
+            lsp_add_error(t.line, t.col, buf, total, 2);
+        }
+        return;
+    }
     if (cast(i64, sem_src) != 0 && cast(i64, sem_token_list) != 0) {
         let is *tok.TokenList as tl = cast(*tok.TokenList, sem_token_list);
         let is *tok.Token as t = tok.tl_get(tl, node.tok_idx);
