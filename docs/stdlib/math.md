@@ -1,11 +1,19 @@
 ## _module
-std/math.cst — Math utilities
+math — Integer Math Utilities
 
-Integer math functions: abs, min, max, pow, gcd, lcm, align_up, align_down.
+Common math operations on i64 integers.
 
-Usage:
-  use "std/math.cst" as math;
-  let is i64 as x = math.max(a, b);
+  math.abs(x)          — absolute value
+  math.min(a, b)       — smaller of two
+  math.max(a, b)       — larger of two
+  math.pow(base, exp)  — base^exp (no overflow check)
+  math.gcd(a, b)       — greatest common divisor
+  math.lcm(a, b)       — least common multiple
+  math.align_up(n, a)  — round up to multiple of a (power of 2)
+  math.align_down(n,a) — round down to multiple of a
+
+Note: Caustic has no float math library yet. For f64 operations
+use inline asm or syscall-based approaches.
 ---
 ## abs
 fn abs(x as i64) as i64

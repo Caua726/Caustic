@@ -1,17 +1,25 @@
 ## _module
-std/map.cst — Hash maps
+map — Key-Value Hash Maps
 
-Two hash map implementations:
-  MapI64 — i64 keys, i64 values (splitmix64 hash)
-  MapStr — string keys (*u8), i64 values (FNV-1a hash)
+When you need to associate keys with values. Two variants:
 
-Both use open addressing with linear probing. Auto-grow at 75% load.
-
-Usage:
-  use "std/map.cst" as map;
+MapI64 — for integer keys (e.g. mapping IDs to pointers):
   let is map.MapI64 as m = map.mapi64_new();
-  map.mapi64_set(&m, 42, 100);
-  let is i64 as v = map.mapi64_get(&m, 42, 0);
+  map.mapi64_set(&m, key, value);
+  let is i64 as v = map.mapi64_get(&m, key, default);
+  map.mapi64_has(&m, key)    — returns 1 if exists
+  map.mapi64_del(&m, key)    — delete entry
+
+MapStr — for string keys (e.g. symbol tables, configs):
+  let is map.MapStr as m = map.mapstr_new();
+  map.mapstr_set(&m, "name", value);
+  let is i64 as v = map.mapstr_get(&m, "name", default);
+
+Both auto-grow when 75% full. Values are i64 — store pointers
+via cast(i64, ptr) and retrieve with cast(*MyType, value).
+
+Hashing: MapI64 uses splitmix64, MapStr uses FNV-1a.
+Warning: MapStr stores key pointers, NOT copies. Keys must outlive the map.
 ---
 ## MapI64
 struct MapI64 { ... }

@@ -1,24 +1,35 @@
 ## _module
-std/string.cst — Dynamic strings
+string — Dynamic Strings
 
-Heap-allocated, growable strings with length tracking.
+Caustic string literals ("hello") are just *u8 pointers to static data —
+you can't modify or grow them. string.cst gives you heap-allocated
+strings that you can build, search, split, and manipulate.
 
-Key functions:
-  String(text)          — create from C string
-  from_parts(ptr, len)  — create from pointer + length
-  concat(a, b)          — concatenate two strings
-  strlen(s)             — length of C string
-  streq(a, b)           — compare strings
-  find(s, needle)       — search substring
-  substring(s, a, b)    — extract range
-  split(s, delim, ...)  — split by delimiter
-  trim(s)               — remove whitespace
-  replace(s, old, new)  — replace all occurrences
-  int_to_string(n)      — integer to string
+A string.String has { ptr, len, cap } — the pointer is always null-terminated
+for compatibility with functions that expect *u8.
 
-Usage:
+Creating strings:
+  string.String("hello")          — copy a literal into a String
+  string.from_parts(ptr, len)     — create from a buffer + length
+  string.int_to_string(42)        — number to string
+
+Operations:
+  string.concat(a, b)             — join two strings
+  string.find(s, "needle")        — find substring (-1 if not found)
+  string.substring(s, start, end) — extract a range
+  string.split(s, ',', ...)       — split by delimiter
+  string.trim(s)                  — remove leading/trailing whitespace
+  string.replace(s, "old", "new") — replace all occurrences
+  string.to_upper(s) / to_lower(s)
+
+Comparison:
+  string.streq(a, b)              — compare two *u8 strings
+  string.streq_n(a, alen, b, blen) — compare with explicit lengths
+
+Example:
   use "std/string.cst" as string;
-  let is string.String as s = string.String("hello");
+  let is string.String as name = string.String("world");
+  let is string.String as msg = string.concat(string.String("hello "), name);
 ---
 ## String
 struct String { ptr as *u8; len as i32; cap as i32; }

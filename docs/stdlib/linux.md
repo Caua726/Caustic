@@ -1,25 +1,38 @@
 ## _module
-std/linux.cst — Linux syscall wrappers
+linux — Direct Linux System Calls
 
-Direct wrappers around x86_64 Linux system calls. No libc dependency.
+Caustic programs run without libc. linux.cst provides typed wrappers
+around raw x86_64 Linux syscalls so you don't have to use syscall() directly.
 
-Provides:
-  File I/O   — open, close, read, write, lseek, stat, rename, unlink
-  Memory     — mmap, munmap, mprotect, brk
-  Process    — fork, execve, wait4, exit, getpid
-  Pipes      — pipe, pipe2, dup2, dup3
-  Filesystem — mkdir, rmdir, getcwd, chdir, access, chmod
-  Network    — socket, connect, accept, bind, listen, poll
-  Time       — clock_gettime, nanosleep
-  Other      — getrandom, ioctl, fcntl
+This is the lowest level of the stdlib. Most programs use io.cst for
+output and mem.cst for allocation, which internally call linux functions.
+
+File I/O:
+  linux.open(path, flags, mode) — open/create a file, returns fd
+  linux.read(fd, buf, count)    — read bytes from fd
+  linux.write(fd, buf, count)   — write bytes to fd
+  linux.close(fd)               — close a file descriptor
+  linux.lseek(fd, offset, whence) — seek in file
+
+Process control:
+  linux.fork()                  — create child process
+  linux.execve(path, argv, env) — replace process with new program
+  linux.exit(code)              — terminate immediately (no cleanup)
+  linux.wait4(pid, ...)         — wait for child process
+
+Memory:
+  linux.mmap(...)               — map memory pages (low-level allocation)
+  linux.munmap(addr, len)       — unmap memory pages
 
 Constants:
-  STDIN/STDOUT/STDERR, O_RDONLY/O_WRONLY/O_CREAT/O_TRUNC,
-  SEEK_SET/SEEK_CUR/SEEK_END, PROT_READ/PROT_WRITE, MAP_PRIVATE/MAP_ANONYMOUS
+  linux.STDIN (0), linux.STDOUT (1), linux.STDERR (2)
+  linux.O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND
+  linux.SEEK_SET, SEEK_CUR, SEEK_END
 
-Usage:
+Example:
   use "std/linux.cst" as linux;
   linux.write(linux.STDOUT, "hello\n", 6);
+  let is i64 as fd = linux.open("file.txt", linux.O_RDONLY, 0);
 ---
 ## STDIN
 let is i64 as STDIN with imut = 0

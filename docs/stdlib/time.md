@@ -1,17 +1,25 @@
 ## _module
-std/time.cst — Time measurement
+time — Timing and Sleep
 
-Monotonic clock for performance measurement and sleep.
+Measure elapsed time and pause execution.
 
-  now_ns()          — current time in nanoseconds
-  now_us()          — current time in microseconds
-  now_ms()          — current time in milliseconds
-  sleep_ms(ms)      — sleep for milliseconds
-  elapsed_ms(start) — elapsed ms since timestamp
+Uses CLOCK_MONOTONIC — not affected by system clock changes,
+so it's safe for benchmarking and timeouts.
 
-Usage:
-  use "std/time.cst" as time;
-  let is i64 as t0 = time.now_ns();
+Measuring time:
+  let is i64 as start = time.now_ns();
+  // ... do work ...
+  let is i64 as elapsed = time.elapsed_ms(start);
+  io.write_int(linux.STDOUT, elapsed);  // milliseconds
+
+Available precisions:
+  time.now_ns() — nanoseconds  (most precise)
+  time.now_us() — microseconds
+  time.now_ms() — milliseconds
+
+Sleeping:
+  time.sleep_ms(500);  // pause for 500ms
+  time.sleep_us(100);  // pause for 100 microseconds
 ---
 ## now_ns
 fn now_ns() as i64
