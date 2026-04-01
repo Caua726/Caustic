@@ -216,6 +216,36 @@ fn _get_doc(params as *json.JsonValue, out_uri as **u8, out_uri_len as *i32) as 
     return docs.find(uri_str, uri_len);
 }
 
+fn _send_location(id as i64, file_uri as *u8, file_uri_len as i32, def_line as i32, def_col as i32, name_len as i32) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.kv_str(&w, "uri", file_uri, file_uri_len);
+    jw.key_c(&w, "range");
+    _write_range(&w, def_line, def_col, def_line, def_col + name_len);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn _resolve_module_file(d as *docs.Document, mod_idx as i32,
+                        out_path as **u8, out_path_len as *i32,
+                        out_uri as **u8, out_uri_len as *i32) as i32 {
+    let is i32 as imp_len = syms.sym_type_lens[mod_idx];
+    let is *u8 as imp = cast(*u8, syms.sym_types[mod_idx]);
+    let is i32 as rlen with mut = 0;
+    let is *u8 as resolved = syms.resolve_module_path(d.path_ptr, d.path_len, imp, imp_len, &rlen);
+    *out_path = resolved;
+    *out_path_len = rlen;
+    let is i32 as ulen with mut = 0;
+    *out_uri = uri.path_to_uri(resolved, rlen, &ulen);
+    *out_uri_len = ulen;
+    return 1;
+}
+
 fn handle_definition(id as i64, params as *json.JsonValue) as void {
     let is i32 as line with mut = 0;
     let is i32 as col with mut = 0;
@@ -227,29 +257,101 @@ fn handle_definition(id as i64, params as *json.JsonValue) as void {
         return;
     }
 
-    // Find the identifier at cursor
+    // Check for mod.member pattern — go to definition in module file
+    let is *u8 as mod_name with mut = cast(*u8, 0);
+    let is i32 as mod_len with mut = 0;
+    let is *u8 as member_name with mut = cast(*u8, 0);
+    let is i32 as member_len with mut = 0;
+    if (syms.find_member_at(d.text_ptr, d.text_len, line, col, &mod_name, &mod_len, &member_name, &member_len) == 1) {
+        let is i32 as midx = syms.find_by_name(mod_name, mod_len);
+        if (midx >= 0 && syms.sym_kinds[midx] == syms.SK_MODULE) {
+            // Get ident under cursor to decide: module part or member part?
+            let is *u8 as cur_ident with mut = cast(*u8, 0);
+            let is i32 as cur_ident_len with mut = 0;
+            syms.find_ident_at(d.text_ptr, d.text_len, line, col, &cur_ident, &cur_ident_len);
+
+            // If cursor is on the module name itself, go to module file line 1
+            if (cur_ident_len == mod_len && syms._streq(cur_ident, cur_ident_len, mod_name, mod_len) == 1) {
+                let is *u8 as mpath with mut = cast(*u8, 0);
+                let is i32 as mpath_len with mut = 0;
+                let is *u8 as muri with mut = cast(*u8, 0);
+                let is i32 as muri_len with mut = 0;
+                _resolve_module_file(d, midx, &mpath, &mpath_len, &muri, &muri_len);
+                _send_location(id, muri, muri_len, 0, 0, 0);
+                return;
+            }
+
+            // Cursor is on the member — find its line in the module source
+            let is *u8 as mpath with mut = cast(*u8, 0);
+            let is i32 as mpath_len with mut = 0;
+            let is *u8 as muri with mut = cast(*u8, 0);
+            let is i32 as muri_len with mut = 0;
+            _resolve_module_file(d, midx, &mpath, &mpath_len, &muri, &muri_len);
+
+            let is i32 as flen with mut = 0;
+            let is *u8 as fsrc = syms._read_file(mpath, &flen);
+            if (cast(i64, fsrc) != 0 && flen > 0) {
+                let is i32 as def_line = syms.find_def_line(fsrc, flen, member_name, member_len);
+                if (def_line > 0) {
+                    _send_location(id, muri, muri_len, def_line - 1, 0, member_len);
+                    return;
+                }
+            }
+
+            // Try submodule file for 3-level access
+            if (syms.last_submod_len > 0) {
+                let is i32 as imp_len = syms.sym_type_lens[midx];
+                let is *u8 as imp = cast(*u8, syms.sym_types[midx]);
+                let is i32 as base_len with mut = imp_len;
+                if (base_len > 4) { base_len = base_len - 4; }
+                let is i32 as sp_len = base_len + 1 + syms.last_submod_len + 4;
+                let is *u8 as sp = json.alloc(cast(i64, sp_len) + 1);
+                mem.core.memcpy(sp, imp, cast(i64, base_len));
+                sp[base_len] = 47;
+                mem.core.memcpy(cast(*u8, cast(i64, sp) + cast(i64, base_len) + 1),
+                               syms.last_submod_ptr, cast(i64, syms.last_submod_len));
+                let is i32 as co = base_len + 1 + syms.last_submod_len;
+                sp[co] = 46; sp[co + 1] = 99; sp[co + 2] = 115; sp[co + 3] = 116;
+                sp[co + 4] = cast(u8, 0);
+                let is i32 as srlen with mut = 0;
+                let is *u8 as sresolved = syms.resolve_module_path(d.path_ptr, d.path_len, sp, sp_len, &srlen);
+                let is i32 as sflen with mut = 0;
+                let is *u8 as sfsrc = syms._read_file(sresolved, &sflen);
+                if (cast(i64, sfsrc) != 0 && sflen > 0) {
+                    let is i32 as sdef_line = syms.find_def_line(sfsrc, sflen, member_name, member_len);
+                    if (sdef_line > 0) {
+                        let is i32 as sulen with mut = 0;
+                        let is *u8 as suri = uri.path_to_uri(sresolved, srlen, &sulen);
+                        _send_location(id, suri, sulen, sdef_line - 1, 0, member_len);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Local symbol lookup
     let is *u8 as name with mut = cast(*u8, 0);
     let is i32 as nlen with mut = 0;
     syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
     if (nlen == 0) { send_null_result(id); return; }
 
-    // Look up the symbol definition
+    // If it's a module alias, go to the module file
     let is i32 as idx = syms.find_by_name(name, nlen);
-    if (idx < 0) { send_null_result(id); return; }
+    if (idx >= 0 && syms.sym_kinds[idx] == syms.SK_MODULE) {
+        let is *u8 as mpath with mut = cast(*u8, 0);
+        let is i32 as mpath_len with mut = 0;
+        let is *u8 as muri with mut = cast(*u8, 0);
+        let is i32 as muri_len with mut = 0;
+        _resolve_module_file(d, idx, &mpath, &mpath_len, &muri, &muri_len);
+        _send_location(id, muri, muri_len, 0, 0, 0);
+        return;
+    }
 
-    let is jw.Writer as w = jw.writer_new();
-    jw.obj_start(&w);
-    jw.kv_str_c(&w, "jsonrpc", "2.0");
-    jw.kv_int(&w, "id", id);
-    jw.key_c(&w, "result");
-    jw.obj_start(&w);
-    jw.kv_str(&w, "uri", d.uri_ptr, d.uri_len);
-    jw.key_c(&w, "range");
-    _write_range(&w, syms.sym_lines[idx] - 1, syms.sym_cols[idx] - 1,
-                 syms.sym_lines[idx] - 1, syms.sym_cols[idx] - 1 + syms.sym_name_lens[idx]);
-    jw.obj_end(&w);
-    jw.obj_end(&w);
-    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+    // Local definition
+    if (idx < 0) { send_null_result(id); return; }
+    _send_location(id, d.uri_ptr, d.uri_len,
+                   syms.sym_lines[idx] - 1, syms.sym_cols[idx] - 1, syms.sym_name_lens[idx]);
 }
 
 fn _send_hover(id as i64, text as *u8, text_len as i32) as void {
