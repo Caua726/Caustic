@@ -432,13 +432,27 @@ fn find_member_at(src as *u8, src_len as i32, target_line as i32, target_col as 
     while (end < src_len && _is_alnum(src[end]) == 1) { end = end + 1; }
     if (end <= start) { return 0; }
 
-    // Check for dot before: "mod.member" — cursor is on "member"
+    // Check for dot before: "mod.member" or "mod.sub.member" — cursor is on rightmost part
     if (start > 1 && src[start - 1] == 46) {
-        // Find the module name before the dot
         let is i32 as mod_end = start - 1;
         let is i32 as mod_start with mut = mod_end - 1;
         while (mod_start > 0 && _is_alnum(src[mod_start - 1]) == 1) { mod_start = mod_start - 1; }
         if (mod_start < mod_end) {
+            // Check for another dot before (X.Y.Z pattern — mod_start points to Y)
+            if (mod_start > 1 && src[mod_start - 1] == 46) {
+                let is i32 as root_end = mod_start - 1;
+                let is i32 as root_start with mut = root_end - 1;
+                while (root_start > 0 && _is_alnum(src[root_start - 1]) == 1) { root_start = root_start - 1; }
+                if (root_start < root_end) {
+                    // Return root module (X) and the member name (Z)
+                    // The submodule (Y) is part of the member context
+                    *out_mod = cast(*u8, cast(i64, src) + cast(i64, root_start));
+                    *out_mod_len = root_end - root_start;
+                    *out_member = cast(*u8, cast(i64, src) + cast(i64, start));
+                    *out_member_len = end - start;
+                    return 1;
+                }
+            }
             *out_mod = cast(*u8, cast(i64, src) + cast(i64, mod_start));
             *out_mod_len = mod_end - mod_start;
             *out_member = cast(*u8, cast(i64, src) + cast(i64, start));
@@ -584,18 +598,66 @@ fn lookup_in_file(file_src as *u8, file_len as i32, member_name as *u8, member_l
             }
             if (pos < file_len) { pos = pos + 1; }
         }
-        // Check "fn NAME"
+        // Check "fn NAME" — also check params inside (...)
         else if (_match_word(file_src, pos, file_len, "fn", 2) == 1) {
             let is i32 as fn_start = line_start;
             let is i32 as p with mut = pos + 2;
             _skip_ws_inline(file_src, &p, file_len);
-            // Read name
+            // Read function name
             let is i32 as nstart = p;
             while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
             let is i32 as nlen = p - nstart;
             if (_streq(cast(*u8, cast(i64, file_src) + cast(i64, nstart)), nlen, member_name, member_len) == 1) {
-                // Found! Extract the full line from fn_start to end of line or '{'
                 return _extract_signature(file_src, file_len, fn_start, out_buf, out_max, out_len);
+            }
+            // Check params: scan inside (...) for "NAME as TYPE"
+            _skip_ws_inline(file_src, &p, file_len);
+            // Skip gen params
+            if (_match_word(file_src, p, file_len, "gen", 3) == 1) {
+                p = p + 3;
+                while (p < file_len && file_src[p] != 40) { p = p + 1; } // skip to (
+            }
+            if (p < file_len && file_src[p] == 40) {
+                p = p + 1; // skip (
+                while (p < file_len && file_src[p] != 41) {
+                    _skip_ws_inline(file_src, &p, file_len);
+                    if (_is_alpha(file_src[p]) == 1) {
+                        let is i32 as pname_start = p;
+                        while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
+                        let is i32 as pname_len = p - pname_start;
+                        _skip_ws_inline(file_src, &p, file_len);
+                        if (_match_word(file_src, p, file_len, "as", 2) == 1) {
+                            // This is a parameter: "name as type"
+                            if (_streq(cast(*u8, cast(i64, file_src) + cast(i64, pname_start)), pname_len, member_name, member_len) == 1) {
+                                // Found param! Extract "name as type" as hover
+                                let is i32 as param_start = pname_start;
+                                let is i32 as param_end with mut = p + 2;
+                                _skip_ws_inline(file_src, &param_end, file_len);
+                                // Read the type
+                                while (param_end < file_len && file_src[param_end] != 44 && file_src[param_end] != 41) {
+                                    param_end = param_end + 1;
+                                }
+                                // Trim
+                                while (param_end > param_start && file_src[param_end - 1] == 32) { param_end = param_end - 1; }
+                                let is i32 as pclen with mut = param_end - param_start;
+                                if (pclen > out_max - 1) { pclen = out_max - 1; }
+                                // Prefix with "parameter: "
+                                let is *u8 as prefix = "parameter: ";
+                                let is i32 as pfx_len = 11;
+                                let is i32 as total with mut = pfx_len + pclen;
+                                if (total > out_max - 1) { total = out_max - 1; }
+                                mem.core.memcpy(out_buf, prefix, cast(i64, pfx_len));
+                                mem.core.memcpy(cast(*u8, cast(i64, out_buf) + cast(i64, pfx_len)),
+                                               cast(*u8, cast(i64, file_src) + cast(i64, param_start)), cast(i64, pclen));
+                                *out_len = total;
+                                return 1;
+                            }
+                        }
+                    }
+                    // Advance past this param
+                    while (p < file_len && file_src[p] != 44 && file_src[p] != 41) { p = p + 1; }
+                    if (p < file_len && file_src[p] == 44) { p = p + 1; }
+                }
             }
             pos = p;
         }
@@ -638,24 +700,7 @@ fn lookup_in_file(file_src as *u8, file_len as i32, member_name as *u8, member_l
             }
             pos = p;
         }
-        // Check enum variants: "VariantName;" inside enum block
-        // If member_name matches an identifier followed by ; inside { }
-        else if (_is_alpha(file_src[pos]) == 1) {
-            let is i32 as id_start = pos;
-            let is i32 as p with mut = pos;
-            while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
-            let is i32 as id_len = p - id_start;
-            if (_streq(cast(*u8, cast(i64, file_src) + cast(i64, id_start)), id_len, member_name, member_len) == 1) {
-                // Check if this looks like an enum variant (preceded by { or ;)
-                let is i32 as bp with mut = id_start - 1;
-                while (bp > 0 && (file_src[bp] == 32 || file_src[bp] == 9 || file_src[bp] == 10 || file_src[bp] == 13)) { bp = bp - 1; }
-                if (bp >= 0 && (file_src[bp] == 123 || file_src[bp] == 59)) {
-                    return _extract_signature(file_src, file_len, id_start, out_buf, out_max, out_len);
-                }
-            }
-            pos = p;
-        }
-        // Check "let is ... as NAME" (globals)
+        // Check "let is ... as NAME"
         else if (_match_word(file_src, pos, file_len, "let", 3) == 1) {
             let is i32 as let_start = line_start;
             // Scan forward for "as NAME"
@@ -677,6 +722,21 @@ fn lookup_in_file(file_src as *u8, file_len as i32, member_name as *u8, member_l
             }
             if (found_name == 1) {
                 return _extract_signature(file_src, file_len, let_start, out_buf, out_max, out_len);
+            }
+            pos = p;
+        }
+        // Check enum variants and skip other identifiers
+        else if (_is_alpha(file_src[pos]) == 1) {
+            let is i32 as id_start = pos;
+            let is i32 as p with mut = pos;
+            while (p < file_len && _is_alnum(file_src[p]) == 1) { p = p + 1; }
+            let is i32 as id_len = p - id_start;
+            if (_streq(cast(*u8, cast(i64, file_src) + cast(i64, id_start)), id_len, member_name, member_len) == 1) {
+                let is i32 as bp with mut = id_start - 1;
+                while (bp > 0 && (file_src[bp] == 32 || file_src[bp] == 9 || file_src[bp] == 10 || file_src[bp] == 13)) { bp = bp - 1; }
+                if (bp >= 0 && (file_src[bp] == 123 || file_src[bp] == 59)) {
+                    return _extract_signature(file_src, file_len, id_start, out_buf, out_max, out_len);
+                }
             }
             pos = p;
         }

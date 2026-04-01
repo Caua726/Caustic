@@ -275,6 +275,17 @@ fn _cstrlen(s as *u8) as i32 {
     return i;
 }
 
+fn _find_module_name_from_path(path as *u8, path_len as i32, out_name as **u8, out_len as *i32) as void {
+    // Extract bare name: "../std/io.cst" -> "io"
+    let is i32 as bs with mut = path_len - 1;
+    while (bs > 0 && path[bs] != 47) { bs = bs - 1; }
+    if (path[bs] == 47) { bs = bs + 1; }
+    let is i32 as be with mut = path_len;
+    if (be > 4 && path[be - 4] == 46) { be = be - 4; } // remove .cst
+    *out_name = cast(*u8, cast(i64, path) + cast(i64, bs));
+    *out_len = be - bs;
+}
+
 fn handle_hover(id as i64, params as *json.JsonValue) as void {
     let is i32 as line with mut = 0;
     let is i32 as col with mut = 0;
@@ -284,6 +295,45 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
     if (cast(i64, d) == 0 || _get_position(params, &line, &col) == 0) {
         send_null_result(id);
         return;
+    }
+
+    // Check if cursor is inside a string on a use line — show module docs
+    let is i32 as cpos with mut = 0;
+    let is i32 as cln with mut = 1;
+    let is i32 as cln_start with mut = 0;
+    while (cpos < d.text_len && cln < line) {
+        if (d.text_ptr[cpos] == 10) { cln = cln + 1; cln_start = cpos + 1; }
+        cpos = cpos + 1;
+    }
+    let is i32 as cursor_off = cln_start + col - 1;
+    // Check if we're inside quotes on a use line
+    if (cursor_off > 0 && cursor_off < d.text_len) {
+        // Find if this line starts with "use"
+        let is i32 as lp with mut = cln_start;
+        while (lp < d.text_len && (d.text_ptr[lp] == 32 || d.text_ptr[lp] == 9)) { lp = lp + 1; }
+        if (lp + 3 < d.text_len && d.text_ptr[lp] == 117 && d.text_ptr[lp + 1] == 115 && d.text_ptr[lp + 2] == 101 && d.text_ptr[lp + 3] == 32) {
+            // It's a use line. Find the string
+            let is i32 as qstart with mut = lp + 4;
+            while (qstart < d.text_len && d.text_ptr[qstart] != 34) { qstart = qstart + 1; }
+            if (qstart < d.text_len) {
+                let is i32 as qend with mut = qstart + 1;
+                while (qend < d.text_len && d.text_ptr[qend] != 34) { qend = qend + 1; }
+                // Check if cursor is between quotes
+                if (cursor_off > qstart && cursor_off <= qend) {
+                    let is *u8 as ipath = cast(*u8, cast(i64, d.text_ptr) + cast(i64, qstart) + 1);
+                    let is i32 as ipath_len = qend - qstart - 1;
+                    let is *u8 as bare_name with mut = cast(*u8, 0);
+                    let is i32 as bare_len with mut = 0;
+                    _find_module_name_from_path(ipath, ipath_len, &bare_name, &bare_len);
+                    let is [2048]u8 as ibuf;
+                    let is i32 as ilen with mut = 0;
+                    if (syms.lookup_in_docs(bare_name, bare_len, "_module", 7, &ibuf, 2000, &ilen) == 1 && ilen > 0) {
+                        _send_hover(id, &ibuf, ilen);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     // Get the identifier at cursor
