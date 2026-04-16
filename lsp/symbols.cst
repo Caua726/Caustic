@@ -1038,3 +1038,126 @@ fn _add_export(name as *u8, name_len as i32, kind as i32, detail as *u8, detail_
     mod_export_detail_lens[i] = detail_len;
     mod_export_count = mod_export_count + 1;
 }
+
+// Generate a full documentation page from source file
+// Scans all top-level fn/struct/enum/type, extracts signatures + comments
+// Returns length written to out_buf
+fn generate_docs(src as *u8, src_len as i32, module_name as *u8, module_len as i32,
+                 out_buf as *u8, out_max as i32) as i32 {
+    let is i32 as olen with mut = 0;
+    // Header: ## _module\n<module_name> module\n---\n
+    let is *u8 as hdr1 = "## _module\n";
+    let is i32 as hi with mut = 0;
+    while (hdr1[hi] != cast(u8, 0) && olen < out_max) { out_buf[olen] = hdr1[hi]; olen = olen + 1; hi = hi + 1; }
+    hi = 0;
+    while (hi < module_len && olen < out_max) { out_buf[olen] = module_name[hi]; olen = olen + 1; hi = hi + 1; }
+    let is *u8 as hdr2 = " module\n---\n";
+    hi = 0;
+    while (hdr2[hi] != cast(u8, 0) && olen < out_max) { out_buf[olen] = hdr2[hi]; olen = olen + 1; hi = hi + 1; }
+
+    // Scan source for top-level definitions
+    let is i32 as pos with mut = 0;
+    let is i32 as line_start with mut = 0;
+    let is i32 as depth with mut = 0;
+
+    while (pos < src_len && olen < out_max - 200) {
+        let is u8 as c = src[pos];
+        if (c == 10) { line_start = pos + 1; pos = pos + 1; }
+        else if (c == 123) { depth = depth + 1; pos = pos + 1; }
+        else if (c == 125) { if (depth > 0) { depth = depth - 1; } pos = pos + 1; }
+        else if (c == 34) { pos = pos + 1; while (pos < src_len && src[pos] != 34) { if (src[pos] == 92) { pos = pos + 1; } pos = pos + 1; } if (pos < src_len) { pos = pos + 1; } }
+        else if (c == 47 && pos + 1 < src_len && src[pos + 1] == 47) { while (pos < src_len && src[pos] != 10) { pos = pos + 1; } }
+        else if (depth == 0 && (_match_word(src, pos, src_len, "fn", 2) == 1 ||
+                                _match_word(src, pos, src_len, "struct", 6) == 1 ||
+                                _match_word(src, pos, src_len, "enum", 4) == 1 ||
+                                _match_word(src, pos, src_len, "type", 4) == 1)) {
+            // Extract name
+            let is i32 as kw_len with mut = 2;
+            if (src[pos] == 115) { kw_len = 6; } // struct
+            if (src[pos] == 101) { kw_len = 4; } // enum
+            if (src[pos] == 116) { kw_len = 4; } // type
+            let is i32 as npos with mut = pos + kw_len;
+            _skip_ws_inline(src, &npos, src_len);
+            let is i32 as nlen with mut = 0;
+            let is *u8 as name = _read_ident(src, &npos, src_len, &nlen);
+            if (nlen > 0 && name[0] != 95) { // skip _private names
+                // ## name\n
+                let is *u8 as shdr = "## ";
+                hi = 0;
+                while (shdr[hi] != cast(u8, 0) && olen < out_max) { out_buf[olen] = shdr[hi]; olen = olen + 1; hi = hi + 1; }
+                hi = 0;
+                while (hi < nlen && olen < out_max) { out_buf[olen] = name[hi]; olen = olen + 1; hi = hi + 1; }
+                out_buf[olen] = 10; olen = olen + 1;
+
+                // Extract signature + comments
+                let is [1024]u8 as sig_buf;
+                let is i32 as sig_len with mut = 0;
+                _extract_signature(src, src_len, line_start, &sig_buf, 1000, &sig_len);
+                hi = 0;
+                while (hi < sig_len && olen < out_max) { out_buf[olen] = sig_buf[hi]; olen = olen + 1; hi = hi + 1; }
+                out_buf[olen] = 10; olen = olen + 1;
+
+                // ---\n
+                let is *u8 as sep = "---\n";
+                hi = 0;
+                while (sep[hi] != cast(u8, 0) && olen < out_max) { out_buf[olen] = sep[hi]; olen = olen + 1; hi = hi + 1; }
+            }
+            // Skip past the definition
+            pos = npos;
+        }
+        else { pos = pos + 1; }
+    }
+    return olen;
+}
+
+// Find field info for a struct type in source
+fn lookup_struct_field(src as *u8, src_len as i32, struct_name as *u8, struct_len as i32,
+                       field_name as *u8, field_len as i32,
+                       out_buf as *u8, out_max as i32, out_len as *i32) as i32 {
+    let is i32 as pos with mut = 0;
+    while (pos < src_len) {
+        if (_match_word(src, pos, src_len, "struct", 6) == 1) {
+            pos = pos + 6;
+            _skip_ws_inline(src, &pos, src_len);
+            let is i32 as nlen with mut = 0;
+            let is *u8 as name = _read_ident(src, &pos, src_len, &nlen);
+            if (nlen == struct_len && _streq(name, nlen, struct_name, struct_len) == 1) {
+                while (pos < src_len && src[pos] != 123) { pos = pos + 1; }
+                if (pos >= src_len) { return 0; }
+                pos = pos + 1;
+                while (pos < src_len && src[pos] != 125) {
+                    if (src[pos] == 32 || src[pos] == 9 || src[pos] == 10 || src[pos] == 13) { pos = pos + 1; }
+                    else if (_is_alpha(src[pos]) == 1) {
+                        let is i32 as flen with mut = 0;
+                        let is *u8 as fname = _read_ident(src, &pos, src_len, &flen);
+                        _skip_ws_inline(src, &pos, src_len);
+                        if (_match_word(src, pos, src_len, "as", 2) == 1) {
+                            pos = pos + 2;
+                            _skip_ws_inline(src, &pos, src_len);
+                            let is i32 as fty_len with mut = 0;
+                            let is *u8 as fty = _read_type(src, &pos, src_len, &fty_len);
+                            if (flen == field_len && _streq(fname, flen, field_name, field_len) == 1) {
+                                let is i32 as wlen with mut = 0;
+                                let is i32 as ci with mut = 0;
+                                while (ci < flen && wlen < out_max) { out_buf[wlen] = fname[ci]; wlen = wlen + 1; ci = ci + 1; }
+                                let is *u8 as sep = " as ";
+                                ci = 0;
+                                while (sep[ci] != cast(u8, 0) && wlen < out_max) { out_buf[wlen] = sep[ci]; wlen = wlen + 1; ci = ci + 1; }
+                                ci = 0;
+                                while (ci < fty_len && wlen < out_max) { out_buf[wlen] = fty[ci]; wlen = wlen + 1; ci = ci + 1; }
+                                *out_len = wlen;
+                                return 1;
+                            }
+                        }
+                        while (pos < src_len && src[pos] != 59 && src[pos] != 125) { pos = pos + 1; }
+                        if (pos < src_len && src[pos] == 59) { pos = pos + 1; }
+                    }
+                    else { pos = pos + 1; }
+                }
+                return 0;
+            }
+        }
+        else { pos = pos + 1; }
+    }
+    return 0;
+}

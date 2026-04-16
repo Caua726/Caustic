@@ -75,6 +75,16 @@ fn handle_initialize(id as i64) as void {
     jw.obj_end(&w);
     jw.kv_bool(&w, "referencesProvider", 1);
     jw.kv_bool(&w, "renameProvider", 1);
+    jw.kv_bool(&w, "documentSymbolProvider", 1);
+    jw.key_c(&w, "signatureHelpProvider");
+    jw.obj_start(&w);
+    jw.key_c(&w, "triggerCharacters");
+    jw.arr_start(&w);
+    jw.str_c(&w, "(");
+    jw.str_c(&w, ",");
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    jw.kv_bool(&w, "foldingRangeProvider", 1);
     jw.obj_end(&w);
     jw.key_c(&w, "serverInfo");
     jw.obj_start(&w);
@@ -257,6 +267,38 @@ fn handle_definition(id as i64, params as *json.JsonValue) as void {
         return;
     }
 
+    // Check if cursor is inside a string on a "use" line -> go to that file
+    let is i32 as def_cpos with mut = 0;
+    let is i32 as def_cln with mut = 1;
+    let is i32 as def_cln_start with mut = 0;
+    while (def_cpos < d.text_len && def_cln < line) {
+        if (d.text_ptr[def_cpos] == 10) { def_cln = def_cln + 1; def_cln_start = def_cpos + 1; }
+        def_cpos = def_cpos + 1;
+    }
+    let is i32 as def_cursor_off = def_cln_start + col - 1;
+    if (def_cursor_off > 0 && def_cursor_off < d.text_len) {
+        let is i32 as dlp with mut = def_cln_start;
+        while (dlp < d.text_len && (d.text_ptr[dlp] == 32 || d.text_ptr[dlp] == 9)) { dlp = dlp + 1; }
+        if (dlp + 3 < d.text_len && d.text_ptr[dlp] == 117 && d.text_ptr[dlp + 1] == 115 && d.text_ptr[dlp + 2] == 101 && d.text_ptr[dlp + 3] == 32) {
+            let is i32 as dqs with mut = dlp + 4;
+            while (dqs < d.text_len && d.text_ptr[dqs] != 34) { dqs = dqs + 1; }
+            if (dqs < d.text_len) {
+                let is i32 as dqe with mut = dqs + 1;
+                while (dqe < d.text_len && d.text_ptr[dqe] != 34) { dqe = dqe + 1; }
+                if (def_cursor_off > dqs && def_cursor_off <= dqe) {
+                    let is *u8 as dipath = cast(*u8, cast(i64, d.text_ptr) + cast(i64, dqs) + 1);
+                    let is i32 as dipath_len = dqe - dqs - 1;
+                    let is i32 as drlen with mut = 0;
+                    let is *u8 as dresolved = syms.resolve_module_path(d.path_ptr, d.path_len, dipath, dipath_len, &drlen);
+                    let is i32 as dulen with mut = 0;
+                    let is *u8 as druri = uri.path_to_uri(dresolved, drlen, &dulen);
+                    _send_location(id, druri, dulen, 0, 0, 0);
+                    return;
+                }
+            }
+        }
+    }
+
     // Check for mod.member pattern — go to definition in module file
     let is *u8 as mod_name with mut = cast(*u8, 0);
     let is i32 as mod_len with mut = 0;
@@ -363,7 +405,7 @@ fn _send_hover(id as i64, text as *u8, text_len as i32) as void {
     jw.obj_start(&w);
     jw.key_c(&w, "contents");
     jw.obj_start(&w);
-    jw.kv_str_c(&w, "kind", "plaintext");
+    jw.kv_str_c(&w, "kind", "markdown");
     jw.kv_str(&w, "value", text, text_len);
     jw.obj_end(&w);
     jw.obj_end(&w);
@@ -430,7 +472,7 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
                     let is [2048]u8 as ibuf;
                     let is i32 as ilen with mut = 0;
                     if (syms.lookup_in_docs(bare_name, bare_len, "_module", 7, &ibuf, 2000, &ilen) == 1 && ilen > 0) {
-                        _send_hover(id, &ibuf, ilen);
+                        _send_hover_with_docs_link(id, &ibuf, ilen, bare_name, bare_len, "_module", 7);
                         return;
                     }
                 }
@@ -452,7 +494,7 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
             let is *u8 as kw_doc with mut = cast(*u8, 0);
             let is i32 as kw_doc_len with mut = 0;
             if (kw.lookup(kw_ident, kw_ident_len, &kw_doc, &kw_doc_len) == 1) {
-                _send_hover(id, kw_doc, kw_doc_len);
+                _send_hover_with_docs_link(id, kw_doc, kw_doc_len, "_lang", 5, kw_ident, kw_ident_len);
                 return;
             }
         }
@@ -477,9 +519,11 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
                 if (mbe > 4 && mimp[mbe - 4] == 46) { mbe = mbe - 4; }
                 let is [2048]u8 as mbuf;
                 let is i32 as mhlen with mut = 0;
-                if (syms.lookup_in_docs(cast(*u8, cast(i64, mimp) + cast(i64, mbs)), mbe - mbs,
+                let is *u8 as mbare = cast(*u8, cast(i64, mimp) + cast(i64, mbs));
+                let is i32 as mbare_len = mbe - mbs;
+                if (syms.lookup_in_docs(mbare, mbare_len,
                                         "_module", 7, &mbuf, 2000, &mhlen) == 1 && mhlen > 0) {
-                    _send_hover(id, &mbuf, mhlen);
+                    _send_hover_with_docs_link(id, &mbuf, mhlen, mbare, mbare_len, "_module", 7);
                     return;
                 }
             }
@@ -505,7 +549,7 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
 
             if (syms.lookup_in_docs(bare_name, bare_len, member_name, member_len,
                                     &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
-                _send_hover(id, &hover_buf, hover_len);
+                _send_hover_with_docs_link(id, &hover_buf, hover_len, bare_name, bare_len, member_name, member_len);
                 return;
             }
 
@@ -518,7 +562,7 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
             if (cast(i64, file_src) != 0 && file_len > 0) {
                 if (syms.lookup_in_file(file_src, file_len, member_name, member_len,
                                         &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
-                    _send_hover(id, &hover_buf, hover_len);
+                    _send_hover_with_docs_link(id, &hover_buf, hover_len, bare_name, bare_len, member_name, member_len);
                     return;
                 }
             }
@@ -558,20 +602,39 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         }
     }
 
+    // Check struct field access: var.field (only if mod.member didn't match a module)
+    if (member_len > 0) {
+        let is i32 as var_idx = syms.find_by_name(mod_name, mod_len);
+        if (var_idx >= 0 && syms.sym_kinds[var_idx] != syms.SK_MODULE) {
+            let is *u8 as var_type = cast(*u8, syms.sym_types[var_idx]);
+            let is i32 as var_type_len = syms.sym_type_lens[var_idx];
+            let is *u8 as sn with mut = var_type;
+            let is i32 as snl with mut = var_type_len;
+            if (snl > 0 && sn[0] == 42) { sn = cast(*u8, cast(i64, sn) + 1); snl = snl - 1; }
+            let is [1024]u8 as fbuf;
+            let is i32 as fblen with mut = 0;
+            if (syms.lookup_struct_field(d.text_ptr, d.text_len, sn, snl,
+                                          member_name, member_len, &fbuf, 1000, &fblen) == 1 && fblen > 0) {
+                _send_hover(id, &fbuf, fblen);
+                return;
+            }
+        }
+    }
+
     // Fall back to local symbol lookup
     let is *u8 as name with mut = cast(*u8, 0);
     let is i32 as nlen with mut = 0;
     syms.find_ident_at(d.text_ptr, d.text_len, line, col, &name, &nlen);
     // Check if it's a number literal (find_ident_at treats digits as alnum)
     if (nlen > 0 && name[0] >= 48 && name[0] <= 57) {
-        _send_hover(id, "integer literal (i64)", 21);
+        _send_hover(id, "`i64` **integer literal**", 25);
         return;
     }
     // Check if cursor is inside a string literal (char before ident is " or after ident is ")
     if (nlen > 0) {
         let is i32 as ident_off = cast(i32, cast(i64, name) - cast(i64, d.text_ptr));
         if (ident_off > 0 && d.text_ptr[ident_off - 1] == 34) {
-            _send_hover(id, "string literal (*u8, null-terminated)", 37);
+            _send_hover(id, "`*u8` **string literal** (null-terminated)", 41);
             return;
         }
     }
@@ -579,21 +642,21 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         // Not an identifier — check for number, string, or operator
         if (cursor_off >= 0 && cursor_off < d.text_len) {
             let is u8 as ch = d.text_ptr[cursor_off];
-            if (ch >= 48 && ch <= 57) { _send_hover(id, "integer literal (i64)", 21); return; }
-            if (ch == 34) { _send_hover(id, "string literal (*u8, null-terminated)", 37); return; }
-            if (ch == 61) { _send_hover(id, "= assignment\n\nAssigns value on the right to the variable on the left.\nFor equality comparison, use ==", 100); return; }
-            if (ch == 43) { _send_hover(id, "+ addition\n\nWorks on all integer and float types.", 48); return; }
-            if (ch == 45) { _send_hover(id, "- subtraction or negation", 25); return; }
-            if (ch == 42) { _send_hover(id, "* multiply or pointer\n\nBinary: multiplication.\nPrefix: pointer type (*u8) or dereference (*ptr).", 95); return; }
-            if (ch == 47) { _send_hover(id, "/ division\n\nInteger division truncates toward zero.", 50); return; }
-            if (ch == 37) { _send_hover(id, "% modulo (remainder after division)", 35); return; }
-            if (ch == 62) { _send_hover(id, "> greater than (returns 1 or 0)", 31); return; }
-            if (ch == 60) { _send_hover(id, "< less than (returns 1 or 0)", 28); return; }
-            if (ch == 33) { _send_hover(id, "! logical NOT (!0 = 1, !1 = 0)", 30); return; }
-            if (ch == 38) { _send_hover(id, "& address-of (prefix) or bitwise AND (binary)", 46); return; }
-            if (ch == 124) { _send_hover(id, "| bitwise OR", 12); return; }
-            if (ch == 94) { _send_hover(id, "^ bitwise XOR", 13); return; }
-            if (ch == 126) { _send_hover(id, "~ bitwise NOT (inverts all bits)", 31); return; }
+            if (ch >= 48 && ch <= 57) { _send_hover(id, "`i64` **integer literal**", 25); return; }
+            if (ch == 34) { _send_hover(id, "`*u8` **string literal** (null-terminated)", 41); return; }
+            if (ch == 61) { _send_hover(id, "**`=` assignment**\n\nAssigns value on the right to the variable on the left.\n\nFor equality comparison, use `==`", 109); return; }
+            if (ch == 43) { _send_hover(id, "**`+` addition**\n\nWorks on all integer and float types.", 54); return; }
+            if (ch == 45) { _send_hover(id, "**`-` subtraction or negation**", 31); return; }
+            if (ch == 42) { _send_hover(id, "**`*` multiply or pointer**\n\nBinary: multiplication.\n\nPrefix: pointer type (`*u8`) or dereference (`*ptr`).", 107); return; }
+            if (ch == 47) { _send_hover(id, "**`/` division**\n\nInteger division truncates toward zero.", 56); return; }
+            if (ch == 37) { _send_hover(id, "**`%` modulo** (remainder after division)", 41); return; }
+            if (ch == 62) { _send_hover(id, "**`>` greater than** (returns 1 or 0)", 37); return; }
+            if (ch == 60) { _send_hover(id, "**`<` less than** (returns 1 or 0)", 34); return; }
+            if (ch == 33) { _send_hover(id, "**`!` logical NOT** (`!0` = 1, `!1` = 0)", 41); return; }
+            if (ch == 38) { _send_hover(id, "**`&` address-of** (prefix) or **bitwise AND** (binary)", 55); return; }
+            if (ch == 124) { _send_hover(id, "**`|` bitwise OR**", 18); return; }
+            if (ch == 94) { _send_hover(id, "**`^` bitwise XOR**", 19); return; }
+            if (ch == 126) { _send_hover(id, "**`~` bitwise NOT** (inverts all bits)", 37); return; }
         }
         send_null_result(id);
         return;
@@ -612,9 +675,11 @@ fn handle_hover(id as i64, params as *json.JsonValue) as void {
         if (be > 4 && imp_path[be - 4] == 46) { be = be - 4; }
         let is [2048]u8 as hover_buf;
         let is i32 as hover_len with mut = 0;
-        if (syms.lookup_in_docs(cast(*u8, cast(i64, imp_path) + cast(i64, bs)), be - bs,
+        let is *u8 as mod_bare = cast(*u8, cast(i64, imp_path) + cast(i64, bs));
+        let is i32 as mod_bare_len = be - bs;
+        if (syms.lookup_in_docs(mod_bare, mod_bare_len,
                                 "_module", 7, &hover_buf, 2000, &hover_len) == 1 && hover_len > 0) {
-            _send_hover(id, &hover_buf, hover_len);
+            _send_hover_with_docs_link(id, &hover_buf, hover_len, mod_bare, mod_bare_len, "_module", 7);
             return;
         }
     }
@@ -746,6 +811,42 @@ fn handle_completion(id as i64, params as *json.JsonValue) as void {
         }
     }
 
+    // Context-aware: check if we're in a type position (after "is " or "as " or "gen ")
+    if (cast(i64, d) != 0 && col > 3) {
+        let is i32 as tpos with mut = 0;
+        let is i32 as tline with mut = 1;
+        let is i32 as tline_start with mut = 0;
+        while (tpos < d.text_len && tline < line) {
+            if (d.text_ptr[tpos] == 10) { tline = tline + 1; tline_start = tpos + 1; }
+            tpos = tpos + 1;
+        }
+        let is i32 as tcoff = tline_start + col - 1;
+        // Skip back over partial ident being typed
+        let is i32 as tback with mut = tcoff - 1;
+        while (tback > 0 && syms._is_alnum(d.text_ptr[tback]) == 1) { tback = tback - 1; }
+        // Skip whitespace
+        while (tback > 0 && (d.text_ptr[tback] == 32 || d.text_ptr[tback] == 9)) { tback = tback - 1; }
+        // Check if previous word ends with "is" or "as" or "gen" (check last 2-3 chars)
+        let is i32 as is_type_ctx with mut = 0;
+        if (tback >= 1 && d.text_ptr[tback - 1] == 105 && d.text_ptr[tback] == 115) { is_type_ctx = 1; } // "is"
+        if (tback >= 1 && d.text_ptr[tback - 1] == 97 && d.text_ptr[tback] == 115) { is_type_ctx = 1; }  // "as"
+        if (tback >= 2 && d.text_ptr[tback - 2] == 103 && d.text_ptr[tback - 1] == 101 && d.text_ptr[tback] == 110) { is_type_ctx = 1; } // "gen"
+
+        if (is_type_ctx == 1) {
+            let is jw.Writer as tw = jw.writer_new();
+            jw.obj_start(&tw);
+            jw.kv_str_c(&tw, "jsonrpc", "2.0");
+            jw.kv_int(&tw, "id", id);
+            jw.key_c(&tw, "result");
+            jw.arr_start(&tw);
+            _add_type_completions(&tw);
+            jw.arr_end(&tw);
+            jw.obj_end(&tw);
+            rpc.write_message(jw.finish(&tw), jw.finish_len(&tw));
+            return;
+        }
+    }
+
     // Default: return all local symbols
     let is jw.Writer as w = jw.writer_new();
     jw.obj_start(&w);
@@ -798,22 +899,66 @@ fn _send_module_completions(id as i64) as void {
 }
 
 fn _add_keyword_completions(w as *jw.Writer) as void {
-    // Add Caustic keywords as completion items (kind=14 = Keyword)
-    _kw_item(w, "fn", 2); _kw_item(w, "let", 3); _kw_item(w, "return", 6);
-    _kw_item(w, "if", 2); _kw_item(w, "else", 4); _kw_item(w, "while", 5);
-    _kw_item(w, "for", 3); _kw_item(w, "break", 5); _kw_item(w, "continue", 8);
-    _kw_item(w, "struct", 6); _kw_item(w, "enum", 4); _kw_item(w, "match", 5);
-    _kw_item(w, "case", 4); _kw_item(w, "use", 3); _kw_item(w, "impl", 4);
-    _kw_item(w, "defer", 5); _kw_item(w, "cast", 4); _kw_item(w, "sizeof", 6);
-    _kw_item(w, "syscall", 7); _kw_item(w, "asm", 3); _kw_item(w, "extern", 6);
-    _kw_item(w, "type", 4); _kw_item(w, "gen", 3);
+    _kw_item(w, "fn", 2, "Declare a function", 18);
+    _kw_item(w, "let", 3, "Declare a variable", 18);
+    _kw_item(w, "return", 6, "Return from function", 20);
+    _kw_item(w, "if", 2, "Conditional branch", 18);
+    _kw_item(w, "else", 4, "Else branch", 11);
+    _kw_item(w, "while", 5, "While loop", 10);
+    _kw_item(w, "for", 3, "For loop", 8);
+    _kw_item(w, "break", 5, "Break out of loop", 17);
+    _kw_item(w, "continue", 8, "Skip to next iteration", 22);
+    _kw_item(w, "struct", 6, "Define a struct", 15);
+    _kw_item(w, "enum", 4, "Define a tagged union", 21);
+    _kw_item(w, "match", 5, "Pattern match on enum", 21);
+    _kw_item(w, "case", 4, "Match case branch", 17);
+    _kw_item(w, "use", 3, "Import a module", 15);
+    _kw_item(w, "impl", 4, "Implement methods", 17);
+    _kw_item(w, "defer", 5, "Defer call until return", 23);
+    _kw_item(w, "cast", 4, "Type cast", 9);
+    _kw_item(w, "sizeof", 6, "Size of type in bytes", 21);
+    _kw_item(w, "syscall", 7, "Direct Linux syscall", 20);
+    _kw_item(w, "asm", 3, "Inline assembly", 15);
+    _kw_item(w, "extern", 6, "External function", 17);
+    _kw_item(w, "type", 4, "Type alias", 10);
+    _kw_item(w, "gen", 3, "Generic type parameter", 22);
 }
 
-fn _kw_item(w as *jw.Writer, label as *u8, label_len as i32) as void {
+fn _kw_item(w as *jw.Writer, label as *u8, label_len as i32, doc as *u8, doc_len as i32) as void {
     jw.obj_start(w);
     jw.kv_str(w, "label", label, label_len);
     jw.kv_int(w, "kind", 14);
+    if (doc_len > 0) {
+        jw.kv_str(w, "detail", doc, doc_len);
+    }
     jw.obj_end(w);
+}
+
+// === Context-aware Completions ===
+
+fn _type_item(w as *jw.Writer, label as *u8, label_len as i32) as void {
+    jw.obj_start(w);
+    jw.kv_str(w, "label", label, label_len);
+    jw.kv_int(w, "kind", 25);
+    jw.obj_end(w);
+}
+
+fn _add_type_completions(w as *jw.Writer) as void {
+    _type_item(w, "i8", 2); _type_item(w, "i16", 3); _type_item(w, "i32", 3); _type_item(w, "i64", 3);
+    _type_item(w, "u8", 2); _type_item(w, "u16", 3); _type_item(w, "u32", 3); _type_item(w, "u64", 3);
+    _type_item(w, "f32", 3); _type_item(w, "f64", 3);
+    _type_item(w, "bool", 4); _type_item(w, "char", 4); _type_item(w, "void", 4);
+    _type_item(w, "*u8", 3);
+    let is i32 as i with mut = 0;
+    while (i < syms.sym_count) {
+        if (syms.sym_kinds[i] == syms.SK_STRUCT || syms.sym_kinds[i] == syms.SK_ENUM || syms.sym_kinds[i] == syms.SK_TYPE_ALIAS) {
+            jw.obj_start(w);
+            jw.kv_str(w, "label", cast(*u8, syms.sym_names[i]), syms.sym_name_lens[i]);
+            jw.kv_int(w, "kind", 25);
+            jw.obj_end(w);
+        }
+        i = i + 1;
+    }
 }
 
 fn handle_references(id as i64, params as *json.JsonValue) as void {
@@ -905,6 +1050,586 @@ fn handle_rename(id as i64, params as *json.JsonValue) as void {
 
     jw.arr_end(&w);
     jw.obj_end(&w);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Document Symbols (outline) ===
+
+fn _sym_kind_to_lsp(kind as i32) as i32 {
+    // LSP SymbolKind: Function=12, Variable=13, Struct=23, Enum=10, Field=8, TypeParameter=26, Module=2
+    if (kind == syms.SK_FUNCTION) { return 12; }
+    if (kind == syms.SK_VARIABLE) { return 13; }
+    if (kind == syms.SK_STRUCT) { return 23; }
+    if (kind == syms.SK_ENUM) { return 10; }
+    if (kind == syms.SK_FIELD) { return 8; }
+    if (kind == syms.SK_TYPE_ALIAS) { return 26; }
+    if (kind == syms.SK_MODULE) { return 2; }
+    return 13;
+}
+
+fn handle_document_symbol(id as i64, params as *json.JsonValue) as void {
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0) { send_empty_array(id); return; }
+
+    // Ensure symbols are scanned
+    syms.scan(d.text_ptr, d.text_len);
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+
+    let is i32 as i with mut = 0;
+    while (i < syms.sym_count) {
+        // Skip fields — they are children of structs, not top-level
+        if (syms.sym_kinds[i] != syms.SK_FIELD) {
+            let is i32 as ln = syms.sym_lines[i] - 1;
+            let is i32 as cl = syms.sym_cols[i] - 1;
+            let is i32 as nlen = syms.sym_name_lens[i];
+            jw.obj_start(&w);
+            jw.kv_str(&w, "name", cast(*u8, syms.sym_names[i]), nlen);
+            if (syms.sym_type_lens[i] > 0) {
+                jw.kv_str(&w, "detail", cast(*u8, syms.sym_types[i]), syms.sym_type_lens[i]);
+            }
+            jw.kv_int(&w, "kind", cast(i64, _sym_kind_to_lsp(syms.sym_kinds[i])));
+            jw.key_c(&w, "range");
+            _write_range(&w, ln, cl, ln, cl + nlen);
+            jw.key_c(&w, "selectionRange");
+            _write_range(&w, ln, cl, ln, cl + nlen);
+            jw.obj_end(&w);
+        }
+        i = i + 1;
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Signature Help ===
+
+fn handle_signature_help(id as i64, params as *json.JsonValue) as void {
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0 || _get_position(params, &line, &col) == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    // Find the function call context: walk back from cursor to find opening ( and function name
+    let is i32 as cpos with mut = 0;
+    let is i32 as cln with mut = 1;
+    let is i32 as cln_start with mut = 0;
+    while (cpos < d.text_len && cln < line) {
+        if (d.text_ptr[cpos] == 10) { cln = cln + 1; cln_start = cpos + 1; }
+        cpos = cpos + 1;
+    }
+    let is i32 as cursor_off = cln_start + col - 1;
+
+    // Walk back to find unmatched '('
+    let is i32 as depth with mut = 0;
+    let is i32 as paren_off with mut = cursor_off - 1;
+    let is i32 as active_param with mut = 0;
+    while (paren_off >= 0) {
+        let is u8 as ch = d.text_ptr[paren_off];
+        if (ch == 41) { depth = depth + 1; }
+        else if (ch == 40) {
+            if (depth == 0) { break; }
+            depth = depth - 1;
+        }
+        else if (ch == 44 && depth == 0) { active_param = active_param + 1; }
+        paren_off = paren_off - 1;
+    }
+
+    if (paren_off < 0) { send_null_result(id); return; }
+
+    // Get function name before the '('
+    let is i32 as name_end with mut = paren_off;
+    while (name_end > 0 && (d.text_ptr[name_end - 1] == 32 || d.text_ptr[name_end - 1] == 9)) {
+        name_end = name_end - 1;
+    }
+    let is i32 as name_start with mut = name_end;
+    while (name_start > 0 && (syms._is_alnum(d.text_ptr[name_start - 1]) == 1 || d.text_ptr[name_start - 1] == 46)) {
+        name_start = name_start - 1;
+    }
+    if (name_start >= name_end) { send_null_result(id); return; }
+
+    let is *u8 as fn_name = cast(*u8, cast(i64, d.text_ptr) + cast(i64, name_start));
+    let is i32 as fn_name_len = name_end - name_start;
+
+    // Check if it contains a dot (module.func)
+    let is i32 as dot_pos with mut = 0;
+    let is i32 as has_dot with mut = 0;
+    while (dot_pos < fn_name_len) {
+        if (fn_name[dot_pos] == 46) { has_dot = 1; break; }
+        dot_pos = dot_pos + 1;
+    }
+
+    // Find the signature
+    let is [2048]u8 as sig_buf;
+    let is i32 as sig_len with mut = 0;
+    let is i32 as found with mut = 0;
+
+    if (has_dot == 1) {
+        // Module function: look up in module source or docs
+        let is *u8 as mod_name = fn_name;
+        let is i32 as mod_nlen = dot_pos;
+        let is *u8 as mem_name = cast(*u8, cast(i64, fn_name) + cast(i64, dot_pos) + 1);
+        let is i32 as mem_nlen = fn_name_len - dot_pos - 1;
+        let is i32 as midx = syms.find_by_name(mod_name, mod_nlen);
+        if (midx >= 0 && syms.sym_kinds[midx] == syms.SK_MODULE) {
+            // Try docs first
+            let is i32 as imp_len = syms.sym_type_lens[midx];
+            let is *u8 as imp = cast(*u8, syms.sym_types[midx]);
+            let is i32 as bs with mut = imp_len - 1;
+            while (bs > 0 && imp[bs] != 47) { bs = bs - 1; }
+            if (imp[bs] == 47) { bs = bs + 1; }
+            let is i32 as be with mut = imp_len;
+            if (be > 4 && imp[be - 4] == 46) { be = be - 4; }
+            if (syms.lookup_in_docs(cast(*u8, cast(i64, imp) + cast(i64, bs)), be - bs,
+                                    mem_name, mem_nlen, &sig_buf, 2000, &sig_len) == 1 && sig_len > 0) {
+                found = 1;
+            }
+            // Fallback: module source
+            if (found == 0) {
+                let is i32 as rlen with mut = 0;
+                let is *u8 as resolved = syms.resolve_module_path(d.path_ptr, d.path_len, imp, imp_len, &rlen);
+                let is i32 as flen with mut = 0;
+                let is *u8 as fsrc = syms._read_file(resolved, &flen);
+                if (cast(i64, fsrc) != 0 && flen > 0) {
+                    if (syms.lookup_in_file(fsrc, flen, mem_name, mem_nlen, &sig_buf, 2000, &sig_len) == 1 && sig_len > 0) {
+                        found = 1;
+                    }
+                }
+            }
+        }
+    } else {
+        // Local function
+        if (syms.lookup_in_file(d.text_ptr, d.text_len, fn_name, fn_name_len, &sig_buf, 2000, &sig_len) == 1 && sig_len > 0) {
+            found = 1;
+        }
+    }
+
+    if (found == 0) { send_null_result(id); return; }
+
+    // Extract just the first line (the signature line)
+    let is i32 as first_line_len with mut = 0;
+    while (first_line_len < sig_len && sig_buf[first_line_len] != 10) {
+        first_line_len = first_line_len + 1;
+    }
+
+    // Count parameters from signature — find '(' and count commas inside
+    let is i32 as param_count with mut = 0;
+    let is i32 as sp with mut = 0;
+    let is i32 as paren_start with mut = 0;
+    while (sp < first_line_len && sig_buf[sp] != 40) { sp = sp + 1; }
+    if (sp < first_line_len) {
+        paren_start = sp;
+        sp = sp + 1;
+        // Check for empty params
+        while (sp < first_line_len && (sig_buf[sp] == 32 || sig_buf[sp] == 9)) { sp = sp + 1; }
+        if (sp < first_line_len && sig_buf[sp] != 41) {
+            param_count = 1;
+            let is i32 as pdepth with mut = 0;
+            while (sp < first_line_len) {
+                if (sig_buf[sp] == 40) { pdepth = pdepth + 1; }
+                else if (sig_buf[sp] == 41) {
+                    if (pdepth == 0) { break; }
+                    pdepth = pdepth - 1;
+                }
+                else if (sig_buf[sp] == 44 && pdepth == 0) { param_count = param_count + 1; }
+                sp = sp + 1;
+            }
+        }
+    }
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.key_c(&w, "signatures");
+    jw.arr_start(&w);
+    jw.obj_start(&w);
+    jw.kv_str(&w, "label", &sig_buf, first_line_len);
+    jw.key_c(&w, "documentation");
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "kind", "markdown");
+    jw.kv_str(&w, "value", &sig_buf, sig_len);
+    jw.obj_end(&w);
+
+    // Parameters: extract each param from the signature
+    if (param_count > 0) {
+        jw.key_c(&w, "parameters");
+        jw.arr_start(&w);
+        let is i32 as pp with mut = paren_start + 1;
+        let is i32 as pi with mut = 0;
+        while (pi < param_count && pp < first_line_len) {
+            // Find start of this param (skip whitespace)
+            while (pp < first_line_len && (sig_buf[pp] == 32 || sig_buf[pp] == 9)) { pp = pp + 1; }
+            let is i32 as param_start = pp;
+            // Find end: next comma or closing paren
+            let is i32 as pd with mut = 0;
+            while (pp < first_line_len) {
+                if (sig_buf[pp] == 40) { pd = pd + 1; }
+                else if (sig_buf[pp] == 41) {
+                    if (pd == 0) { break; }
+                    pd = pd - 1;
+                }
+                else if (sig_buf[pp] == 44 && pd == 0) { break; }
+                pp = pp + 1;
+            }
+            let is i32 as param_end with mut = pp;
+            // Trim trailing whitespace
+            while (param_end > param_start && (sig_buf[param_end - 1] == 32 || sig_buf[param_end - 1] == 9)) {
+                param_end = param_end - 1;
+            }
+            jw.obj_start(&w);
+            jw.kv_str(&w, "label", cast(*u8, cast(i64, &sig_buf) + cast(i64, param_start)), param_end - param_start);
+            jw.obj_end(&w);
+            if (pp < first_line_len && sig_buf[pp] == 44) { pp = pp + 1; }
+            pi = pi + 1;
+        }
+        jw.arr_end(&w);
+    }
+
+    jw.obj_end(&w);
+    jw.arr_end(&w);
+    if (active_param < param_count) {
+        jw.kv_int(&w, "activeParameter", cast(i64, active_param));
+    }
+    jw.kv_int(&w, "activeSignature", 0);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Folding Ranges ===
+
+fn handle_folding_range(id as i64, params as *json.JsonValue) as void {
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = _get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0) { send_empty_array(id); return; }
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+
+    let is i32 as pos with mut = 0;
+    let is i32 as fline with mut = 0;
+    // Stack of opening brace lines (max depth 64)
+    let is [64]i32 as brace_stack;
+    let is i32 as sp with mut = 0;
+    // Track comment blocks
+    let is i32 as comment_start with mut = cast(i32, 0 - 1);
+    let is i32 as comment_line with mut = 0;
+
+    while (pos < d.text_len) {
+        let is u8 as c = d.text_ptr[pos];
+
+        if (c == 10) {
+            fline = fline + 1;
+            pos = pos + 1;
+        }
+        // Skip strings
+        else if (c == 34) {
+            comment_start = cast(i32, 0 - 1);
+            pos = pos + 1;
+            while (pos < d.text_len && d.text_ptr[pos] != 34) {
+                if (d.text_ptr[pos] == 92) { pos = pos + 1; }
+                pos = pos + 1;
+            }
+            if (pos < d.text_len) { pos = pos + 1; }
+        }
+        // Line comment
+        else if (c == 47 && pos + 1 < d.text_len && d.text_ptr[pos + 1] == 47) {
+            if (comment_start < 0) { comment_start = fline; }
+            comment_line = fline;
+            while (pos < d.text_len && d.text_ptr[pos] != 10) { pos = pos + 1; }
+            // Check if next line is also a comment
+            let is i32 as peek with mut = pos + 1;
+            while (peek < d.text_len && (d.text_ptr[peek] == 32 || d.text_ptr[peek] == 9)) { peek = peek + 1; }
+            if (peek + 1 >= d.text_len || d.text_ptr[peek] != 47 || d.text_ptr[peek + 1] != 47) {
+                if (comment_line > comment_start) {
+                    jw.obj_start(&w);
+                    jw.kv_int(&w, "startLine", cast(i64, comment_start));
+                    jw.kv_int(&w, "endLine", cast(i64, comment_line));
+                    jw.kv_str_c(&w, "kind", "comment");
+                    jw.obj_end(&w);
+                }
+                comment_start = cast(i32, 0 - 1);
+            }
+        }
+        // Opening brace
+        else if (c == 123) {
+            comment_start = cast(i32, 0 - 1);
+            if (sp < 64) {
+                brace_stack[sp] = fline;
+                sp = sp + 1;
+            }
+            pos = pos + 1;
+        }
+        // Closing brace
+        else if (c == 125) {
+            comment_start = cast(i32, 0 - 1);
+            if (sp > 0) {
+                sp = sp - 1;
+                let is i32 as start_line = brace_stack[sp];
+                if (fline > start_line) {
+                    jw.obj_start(&w);
+                    jw.kv_int(&w, "startLine", cast(i64, start_line));
+                    jw.kv_int(&w, "endLine", cast(i64, fline));
+                    jw.kv_str_c(&w, "kind", "region");
+                    jw.obj_end(&w);
+                }
+            }
+            pos = pos + 1;
+        }
+        else {
+            if (c != 32 && c != 9 && c != 13) { comment_start = cast(i32, 0 - 1); }
+            pos = pos + 1;
+        }
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Custom: Full Documentation ===
+
+fn _send_hover_with_docs_link(id as i64, text as *u8, text_len as i32,
+                               mname as *u8, mname_len as i32,
+                               sname as *u8, sname_len as i32) as void {
+    let is [4096]u8 as buf;
+    let is i32 as blen with mut = 0;
+    let is i32 as ci with mut = 0;
+    while (ci < text_len && blen < 3900) { buf[blen] = text[ci]; blen = blen + 1; ci = ci + 1; }
+    let is *u8 as link_pre = "\n\n---\n[Open Documentation](command:caustic.openDocs?";
+    ci = 0;
+    while (link_pre[ci] != cast(u8, 0)) { buf[blen] = link_pre[ci]; blen = blen + 1; ci = ci + 1; }
+    ci = 0;
+    while (ci < mname_len && blen < 4050) { buf[blen] = mname[ci]; blen = blen + 1; ci = ci + 1; }
+    buf[blen] = 44; blen = blen + 1;
+    ci = 0;
+    while (ci < sname_len && blen < 4080) { buf[blen] = sname[ci]; blen = blen + 1; ci = ci + 1; }
+    buf[blen] = 41; blen = blen + 1;
+    _send_hover(id, &buf, blen);
+}
+
+fn handle_docs(id as i64, params as *json.JsonValue) as void {
+    let is i32 as mod_len with mut = 0;
+    let is *u8 as dmod_name = json.obj_get_str(params, "module", 6, &mod_len);
+    let is i32 as sym_len with mut = 0;
+    let is *u8 as dsym_name = json.obj_get_str(params, "symbol", 6, &sym_len);
+    let is i32 as src_path_len with mut = 0;
+    let is *u8 as src_path = json.obj_get_str(params, "path", 4, &src_path_len);
+    if (cast(i64, dmod_name) == 0 || mod_len == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    // Check for language reference: module="_lang", symbol=keyword name
+    if (syms._streq(dmod_name, mod_len, "_lang", 5) == 1) {
+        // Read docs/language.md (docs_dir is like ".../docs/stdlib/", go up one level)
+        // Build path: docs_dir - "stdlib/" + "language.md"
+        let is i32 as lang_base with mut = syms.docs_dir_len - 7; // remove "stdlib/"
+        if (lang_base < 0) { lang_base = 0; }
+        let is i32 as lang_path_len = lang_base + 11; // "language.md"
+        let is *u8 as lang_path = json.alloc(cast(i64, lang_path_len) + 1);
+        mem.core.memcpy(lang_path, syms.docs_dir, cast(i64, lang_base));
+        let is *u8 as lang_sfx = "language.md";
+        let is i32 as lsi with mut = 0;
+        while (lang_sfx[lsi] != cast(u8, 0)) { lang_path[lang_base + lsi] = lang_sfx[lsi]; lsi = lsi + 1; }
+        lang_path[lang_base + lsi] = cast(u8, 0);
+
+        let is i32 as lang_flen with mut = 0;
+        let is *u8 as lang_content = syms._read_file(lang_path, &lang_flen);
+        if (cast(i64, lang_content) != 0 && lang_flen > 0) {
+            // If symbol specified, return full file (extension scrolls to it)
+            let is jw.Writer as w = jw.writer_new();
+            jw.obj_start(&w);
+            jw.kv_str_c(&w, "jsonrpc", "2.0");
+            jw.kv_int(&w, "id", id);
+            jw.key_c(&w, "result");
+            jw.obj_start(&w);
+            jw.kv_str(&w, "markdown", lang_content, lang_flen);
+            jw.kv_str_c(&w, "module", "Language");
+            if (cast(i64, dsym_name) != 0 && sym_len > 0) {
+                jw.kv_str(&w, "symbol", dsym_name, sym_len);
+            }
+            jw.kv_bool(&w, "isStdlib", 1);
+            jw.obj_end(&w);
+            jw.obj_end(&w);
+            rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+            return;
+        }
+    }
+
+    // Try stdlib docs first: docs_dir + module + ".md"
+    let is i32 as dpath_len = syms.docs_dir_len + mod_len + 3;
+    let is *u8 as dpath = json.alloc(cast(i64, dpath_len) + 1);
+    mem.core.memcpy(dpath, syms.docs_dir, cast(i64, syms.docs_dir_len));
+    mem.core.memcpy(cast(*u8, cast(i64, dpath) + cast(i64, syms.docs_dir_len)),
+                    dmod_name, cast(i64, mod_len));
+    let is i32 as ext_off = syms.docs_dir_len + mod_len;
+    dpath[ext_off] = 46; dpath[ext_off + 1] = 109; dpath[ext_off + 2] = 100;
+    dpath[ext_off + 3] = cast(u8, 0);
+
+    let is i32 as flen with mut = 0;
+    let is *u8 as content = syms._read_file(dpath, &flen);
+
+    if (cast(i64, content) != 0 && flen > 0) {
+        // Serve stdlib docs
+        let is jw.Writer as w = jw.writer_new();
+        jw.obj_start(&w);
+        jw.kv_str_c(&w, "jsonrpc", "2.0");
+        jw.kv_int(&w, "id", id);
+        jw.key_c(&w, "result");
+        jw.obj_start(&w);
+        jw.kv_str(&w, "markdown", content, flen);
+        jw.kv_str(&w, "module", dmod_name, mod_len);
+        if (cast(i64, dsym_name) != 0 && sym_len > 0) {
+            jw.kv_str(&w, "symbol", dsym_name, sym_len);
+        }
+        jw.kv_bool(&w, "isStdlib", 1);
+        jw.obj_end(&w);
+        jw.obj_end(&w);
+        rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+        return;
+    }
+
+    // Fallback: generate docs from source file
+    // If path was provided, use it. Otherwise try to resolve from current open docs.
+    let is *u8 as resolve_path with mut = src_path;
+    let is i32 as resolve_len with mut = src_path_len;
+
+    if (cast(i64, resolve_path) == 0 || resolve_len == 0) {
+        // Try to find from open document's imports
+        let is *docs.Document as doc = docs.first_doc();
+        if (cast(i64, doc) != 0) {
+            syms.scan(doc.text_ptr, doc.text_len);
+            let is i32 as midx = syms.find_by_name(dmod_name, mod_len);
+            if (midx >= 0 && syms.sym_kinds[midx] == syms.SK_MODULE) {
+                let is i32 as rlen with mut = 0;
+                resolve_path = syms.resolve_module_path(doc.path_ptr, doc.path_len,
+                    cast(*u8, syms.sym_types[midx]), syms.sym_type_lens[midx], &rlen);
+                resolve_len = rlen;
+            }
+        }
+    }
+
+    if (cast(i64, resolve_path) == 0 || resolve_len == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    // Read and generate docs from source
+    let is i32 as sflen with mut = 0;
+    let is *u8 as ssrc = syms._read_file(resolve_path, &sflen);
+    if (cast(i64, ssrc) == 0 || sflen == 0) {
+        send_null_result(id);
+        return;
+    }
+
+    let is [32768]u8 as gen_buf;
+    let is i32 as gen_len = syms.generate_docs(ssrc, sflen, dmod_name, mod_len, &gen_buf, 32000);
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.kv_str(&w, "markdown", &gen_buf, gen_len);
+    jw.kv_str(&w, "module", dmod_name, mod_len);
+    if (cast(i64, dsym_name) != 0 && sym_len > 0) {
+        jw.kv_str(&w, "symbol", dsym_name, sym_len);
+    }
+    jw.kv_bool(&w, "isStdlib", 0);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+// === Custom: List modules from current document ===
+
+fn handle_modules(id as i64, params as *json.JsonValue) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+
+    // Language reference topics
+    jw.key_c(&w, "language");
+    jw.arr_start(&w);
+    jw.str_c(&w, "let"); jw.str_c(&w, "fn"); jw.str_c(&w, "struct");
+    jw.str_c(&w, "enum"); jw.str_c(&w, "match"); jw.str_c(&w, "use");
+    jw.str_c(&w, "impl"); jw.str_c(&w, "if"); jw.str_c(&w, "while");
+    jw.str_c(&w, "for"); jw.str_c(&w, "return"); jw.str_c(&w, "break");
+    jw.str_c(&w, "continue"); jw.str_c(&w, "cast"); jw.str_c(&w, "sizeof");
+    jw.str_c(&w, "defer"); jw.str_c(&w, "type"); jw.str_c(&w, "gen");
+    jw.str_c(&w, "extern"); jw.str_c(&w, "syscall"); jw.str_c(&w, "asm");
+    jw.str_c(&w, "fn_ptr"); jw.str_c(&w, "call"); jw.str_c(&w, "section");
+    jw.str_c(&w, "Types"); jw.str_c(&w, "Operators");
+    jw.arr_end(&w);
+
+    // Stdlib modules
+    jw.key_c(&w, "stdlib");
+    jw.arr_start(&w);
+    jw.str_c(&w, "env"); jw.str_c(&w, "io"); jw.str_c(&w, "linux");
+    jw.str_c(&w, "map"); jw.str_c(&w, "math"); jw.str_c(&w, "mem");
+    jw.str_c(&w, "net"); jw.str_c(&w, "random"); jw.str_c(&w, "slice");
+    jw.str_c(&w, "sort"); jw.str_c(&w, "string"); jw.str_c(&w, "time");
+    jw.str_c(&w, "types");
+    jw.arr_end(&w);
+
+    // Project modules from current open document
+    jw.key_c(&w, "project");
+    jw.arr_start(&w);
+    let is *docs.Document as doc = docs.first_doc();
+    if (cast(i64, doc) != 0) {
+        syms.scan(doc.text_ptr, doc.text_len);
+        let is i32 as i with mut = 0;
+        while (i < syms.sym_count) {
+            if (syms.sym_kinds[i] == syms.SK_MODULE) {
+                // Check if it's NOT a stdlib module (import path doesn't contain "/std/")
+                let is *u8 as imp = cast(*u8, syms.sym_types[i]);
+                let is i32 as imp_len = syms.sym_type_lens[i];
+                let is i32 as is_std with mut = 0;
+                let is i32 as j with mut = 0;
+                while (j < imp_len - 4) {
+                    if (imp[j] == 47 && imp[j + 1] == 115 && imp[j + 2] == 116 && imp[j + 3] == 100 && imp[j + 4] == 47) {
+                        is_std = 1;
+                        break;
+                    }
+                    j = j + 1;
+                }
+                if (is_std == 0) {
+                    jw.str_val(&w, cast(*u8, syms.sym_names[i]), syms.sym_name_lens[i]);
+                }
+            }
+            i = i + 1;
+        }
+    }
+    jw.arr_end(&w);
+
     jw.obj_end(&w);
     jw.obj_end(&w);
     rpc.write_message(jw.finish(&w), jw.finish_len(&w));

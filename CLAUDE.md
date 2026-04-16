@@ -79,11 +79,14 @@ let is i64 as x = 10;
 let is *u8 as ptr;
 let is [64]u8 as buffer;
 let is i64 as global with mut = 0;  // mutable global
+let is i64 as entry with section(".drivers_init") = 99;  // custom ELF section
+let is i64 as x with mut with section(".mydata") = 0;    // mut + section
 
 // Functions
 fn name(a as i64, b as *u8) as i32 {
     return 0;
 }
+fn init() as void with section(".init") { }  // function in custom section
 
 // Structs
 struct Point { x as i32; y as i32; }
@@ -178,3 +181,4 @@ fn work() as i32 {
 - **Unused variable warnings**: Variables declared but never used produce a warning (prefix with `_` to suppress)
 - **Debug info**: Generated assembly includes `.file` and `.loc` DWARF directives for source-level debugging with GDB
 - **Packed structs**: No alignment padding between fields. `sizeof({i64,i32,i64})` = 20, not 24.
+- **Custom sections**: `with section(".name")` places globals/functions in named ELF sections. Linker merges by name across .o files. Only works on top-level declarations.
