@@ -162,6 +162,74 @@ fn emit_rodata(prog as *d.IRProgram) as void {
     }
 }
 
+// Find a literal entry for the given struct field name. Returns null if
+// the caller omitted this field (it will be zero-filled).
+fn _find_lit_entry(lit as *ast.Node, name as *u8, name_len as i32) as *ast.Node {
+    let is *ast.Node as e with mut = lit.args;
+    while (cast(i64, e) != 0) {
+        if (e.name_len == name_len && d.str_eq(e.name_ptr, e.name_len, name, name_len) == 1) {
+            return e;
+        }
+        e = e.next;
+    }
+    return cast(*ast.Node, 0);
+}
+
+fn _emit_sized_int(size as i32, val as i64) as void {
+    if (size == 8) { eo.out_cstr("  .quad "); }
+    else if (size == 4) { eo.out_cstr("  .long "); }
+    else if (size == 2) { eo.out_cstr("  .short "); }
+    else { eo.out_cstr("  .byte "); }
+    eo.out_int(val);
+    eo.out_char(10);
+}
+
+// Emit a struct literal value field-by-field. Assumes the preceding
+// ".globl X\nX:\n" header was already written.
+fn _emit_struct_lit(g as *d.IRGlobal) as void {
+    let is *ast.Node as lit = cast(*ast.Node, g.struct_lit_ast);
+    let is *ast.Type as st = lit.ty;
+    if (cast(i64, st) == 0) { return; }
+    let is i32 as cur_off with mut = 0;
+    let is *ast.Node as f with mut = cast(*ast.Node, st.fields);
+    while (cast(i64, f) != 0) {
+        // Padding before this field (alignment or skipped fields).
+        if (f.var_offset > cur_off) {
+            eo.out_cstr("  .zero ");
+            eo.out_int(cast(i64, f.var_offset - cur_off));
+            eo.out_char(10);
+            cur_off = f.var_offset;
+        }
+        let is *ast.Node as entry = _find_lit_entry(lit, f.name_ptr, f.name_len);
+        let is i32 as fsize = f.ty.size;
+        if (cast(i64, entry) == 0) {
+            // Omitted field — zero-fill.
+            eo.out_cstr("  .zero ");
+            eo.out_int(cast(i64, fsize));
+            eo.out_char(10);
+        } else if (cast(i64, entry.expr) != 0 && entry.expr.kind == ast.NK_FN_PTR) {
+            eo.out_cstr("  .quad ");
+            eo.out_str(entry.expr.name_ptr, entry.expr.name_len);
+            eo.out_char(10);
+        } else if (cast(i64, entry.expr) != 0 && entry.expr.kind == ast.NK_NUM) {
+            _emit_sized_int(fsize, entry.expr.val);
+        } else {
+            // Unsupported expression kind in struct literal init — emit zeros
+            // so alignment is preserved; semantic walk should have flagged this.
+            eo.out_cstr("  .zero ");
+            eo.out_int(cast(i64, fsize));
+            eo.out_char(10);
+        }
+        cur_off = cur_off + fsize;
+        f = f.next;
+    }
+    if (cur_off < st.size) {
+        eo.out_cstr("  .zero ");
+        eo.out_int(cast(i64, st.size - cur_off));
+        eo.out_char(10);
+    }
+}
+
 fn _emit_global_value(g as *d.IRGlobal) as void {
     eo.out_cstr(".globl ");
     eo.out_str(g.name_ptr, g.name_len);
@@ -176,6 +244,8 @@ fn _emit_global_value(g as *d.IRGlobal) as void {
         eo.out_cstr("  .quad ");
         eo.out_str(g.init_fn_name_ptr, g.init_fn_name_len);
         eo.out_char(10);
+    } else if (g.is_struct_lit_init == 1) {
+        _emit_struct_lit(g);
     } else if (g.size == 8) {
         eo.out_cstr("  .quad ");
         eo.out_int(g.init_value);
