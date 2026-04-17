@@ -84,7 +84,40 @@ string.free(&s);
 ### Limitations
 
 - You cannot import individual symbols; the alias is always required.
-- Struct fields from another module cannot be used as field types directly in your own structs. Use `*u8` pointers and accessor functions as a workaround.
+
+### Cross-Module Struct Fields
+
+A struct defined in another module can be used directly as a field type. The inner struct is embedded inline, same as a same-file nested struct.
+
+```cst
+// base.cst
+struct Base {
+    a as i64;
+    b as i64;
+}
+```
+
+```cst
+// main.cst
+use "base.cst" as base;
+
+struct Derived {
+    parent as base.Base;   // embedded inline — sizeof(Derived) = 24
+    c as i64;
+}
+
+let is Derived as d;
+d.parent.a = 10;           // nested field access works through the module-qualified type
+d.c = 30;
+```
+
+Since the embedded base lives at offset 0, a pointer to the extended type can be cast directly to a pointer to the base type:
+
+```cst
+let is *base.Base as bp = cast(*base.Base, &d);
+```
+
+This enables inheritance-style patterns (driver frameworks, device trees, polymorphic containers) across module boundaries.
 
 ## Relative Paths
 

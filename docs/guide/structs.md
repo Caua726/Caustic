@@ -303,19 +303,20 @@ fn get_width(r as *Rect) as i32 {
 }
 ```
 
-### Limitation
+### Cross-Module Nesting
 
-You cannot use a struct from another module directly as a field type. Use a pointer instead:
+A struct from another module can be used directly as a field type. The inner struct is embedded inline, same as with same-file nesting:
 
 ```cst
-// This may fail:
-// struct Wrapper { s as mod.SomeStruct; }
+use "shapes.cst" as sh;
 
-// Use a pointer:
 struct Wrapper {
-    s as *u8;  // cast to/from *mod.SomeStruct
+    origin as sh.Point;   // embedded inline, no pointer indirection
+    tag as i32;
 }
 ```
+
+Because the embedded field lives at offset 0 when it is the first field, a pointer to the outer struct can be cast directly to a pointer to the inner struct — useful for inheritance-style patterns.
 
 ## Struct Pointers
 
