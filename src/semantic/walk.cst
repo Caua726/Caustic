@@ -126,6 +126,15 @@ fn walk_let(node as *ast.Node) as void {
         node.asm_name_ptr = var.asm_name_ptr;
         node.asm_name_len = var.asm_name_len;
     }
+    // Locals without an init expression start uninitialized. Globals are
+    // BSS-zeroed; aggregates (array/struct) are used as buffers (filled via
+    // address-of, which marks them initialized in walk_addr).
+    if (cast(i64, node.init_expr) == 0 && var.is_global == 0) {
+        let is i32 as tk = node.ty.kind;
+        if (tk != ast.TY_ARRAY && tk != ast.TY_STRUCT) {
+            var.is_init = 0;
+        }
+    }
 }
 
 fn walk_binop(node as *ast.Node) as void {
@@ -173,17 +182,31 @@ fn walk_cmp(node as *ast.Node) as void {
 }
 
 fn walk_assign(node as *ast.Node) as void {
-    walk(node.lhs);
     walk(node.rhs);
     let is i32 as lk = node.lhs.kind;
     if (lk != ast.NK_IDENT && lk != ast.NK_DEREF && lk != ast.NK_INDEX && lk != ast.NK_MEMBER) {
         sc.sem_error_at(node, "alvo de atribuicao invalido");
     }
     if (lk == ast.NK_IDENT) {
+        // Handle the target variable directly so the uninit read check
+        // doesn't fire on the very variable being assigned.
         let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
-        if (cast(i64, var) != 0 && var.flags != ast.VF_MUT) {
-            sc.sem_error_at2(node, "nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
+        if (cast(i64, var) == 0) {
+            sc.sem_error_at2(node.lhs, "variavel nao declarada", node.lhs.name_ptr, node.lhs.name_len);
+        } else {
+            if (var.flags != ast.VF_MUT) {
+                sc.sem_error_at2(node, "nao pode atribuir a variavel imutavel", node.lhs.name_ptr, node.lhs.name_len);
+            }
+            var.is_init = 1;
+            var.is_used = 1;
+            node.lhs.ty = cast(*ast.Type, var.ty);
+            node.lhs.var_offset = var.offset;
+            node.lhs.is_global = var.is_global;
+            node.lhs.is_string_const = var.is_string_const;
+            if (var.asm_name_len > 0) { node.lhs.asm_name_ptr = var.asm_name_ptr; node.lhs.asm_name_len = var.asm_name_len; }
         }
+    } else {
+        walk(node.lhs);
     }
     if (node.rhs.kind == ast.NK_NUM) {
         ty.can_narrow_literal_to(node.rhs, cast(*u8, node.lhs.ty));
@@ -220,6 +243,9 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_IDENT) {
         let is *d.Variable as var = sc.lookup_var(node.name_ptr, node.name_len);
         if (cast(i64, var) == 0) { sc.sem_error_at2(node, "variavel nao declarada", node.name_ptr, node.name_len); }
+        if (var.is_init == 0) {
+            sc.sem_error_at2(node, "uso de variavel nao inicializada", node.name_ptr, node.name_len);
+        }
         var.is_used = 1;
         node.ty = cast(*ast.Type, var.ty);
         node.var_offset = var.offset;
@@ -251,9 +277,25 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_DO_WHILE) { sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; walk(node.cond); return; }
     if (k == ast.NK_FOR) { walk_for(node); return; }
     if (k == ast.NK_ADDR) {
-        walk(node.expr);
+        let is *ast.Node as inner = node.expr;
+        if (inner.kind == ast.NK_IDENT) {
+            // Taking address of a variable marks it as initialized — the
+            // callee receiving the pointer may write through it. Skip the
+            // uninit read check by resolving fields directly.
+            let is *d.Variable as v = sc.lookup_var(inner.name_ptr, inner.name_len);
+            if (cast(i64, v) == 0) { sc.sem_error_at2(inner, "variavel nao declarada", inner.name_ptr, inner.name_len); }
+            v.is_init = 1;
+            v.is_used = 1;
+            inner.ty = cast(*ast.Type, v.ty);
+            inner.var_offset = v.offset;
+            inner.is_global = v.is_global;
+            inner.is_string_const = v.is_string_const;
+            if (v.asm_name_len > 0) { inner.asm_name_ptr = v.asm_name_ptr; inner.asm_name_len = v.asm_name_len; }
+        } else {
+            walk(inner);
+        }
         let is *ast.Type as p = ast.new_type(ast.TY_PTR);
-        p.base = node.expr.ty; p.size = 8; node.ty = p; return;
+        p.base = inner.ty; p.size = 8; node.ty = p; return;
     }
     if (k == ast.NK_DEREF) {
         walk(node.expr);
