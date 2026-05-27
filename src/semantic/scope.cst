@@ -5,6 +5,7 @@ use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../lexer/tokens.cst" as tok;
 use "../lexer/lexer.cst" as lex;
+use "../codegen/target.cst" as tgt;
 
 // === Global state ===
 let is *d.Scope as all_scopes with mut;
@@ -549,15 +550,58 @@ fn normalize_path(path_ptr as *u8, path_len as i32, out_len as *i32) as *u8 {
     return buf;
 }
 
+// Expand <TARGET> placeholder in a module path string. Returns a new
+// allocated string with <TARGET> replaced by the active target's OS name
+// (e.g. "linux" or "windows"), or duplicates the input if no <TARGET>
+// substring is present. Used by `use "std/io/<TARGET>.cst"` style paths
+// to dispatch to per-OS implementations without comptime.
+fn expand_target_placeholder(in_ptr as *u8, in_len as i32, out_len as *i32) as *u8 {
+    // Scan for "<TARGET>" (9 chars)
+    let is i32 as found_at with mut = cast(i32, 0 - 1);
+    let is i32 as si with mut = 0;
+    while (si + 8 <= in_len) {
+        if (in_ptr[si] == 60 && in_ptr[si+1] == 84 && in_ptr[si+2] == 65 && in_ptr[si+3] == 82
+            && in_ptr[si+4] == 71 && in_ptr[si+5] == 69 && in_ptr[si+6] == 84 && in_ptr[si+7] == 62) {
+            // "<TARGET>" = '<','T','A','R','G','E','T','>'
+            found_at = si;
+            si = in_len;  // break
+        } else {
+            si = si + 1;
+        }
+    }
+    if (found_at < 0) {
+        *out_len = in_len;
+        return d.str_dup(in_ptr, in_len);
+    }
+    let is i32 as os_len with mut = 0;
+    let is *u8 as os_name = tgt.target_os_name(&os_len);
+    let is i32 as total = in_len - 8 + os_len;
+    let is *u8 as buf = d.sem_alloc(cast(i64, total) + 1);
+    let is i32 as wi with mut = 0;
+    let is i32 as ri with mut = 0;
+    while (ri < found_at) { buf[wi] = in_ptr[ri]; wi = wi + 1; ri = ri + 1; }
+    let is i32 as oi with mut = 0;
+    while (oi < os_len) { buf[wi] = os_name[oi]; wi = wi + 1; oi = oi + 1; }
+    ri = found_at + 8;
+    while (ri < in_len) { buf[wi] = in_ptr[ri]; wi = wi + 1; ri = ri + 1; }
+    buf[wi] = cast(u8, 0);
+    *out_len = wi;
+    return buf;
+}
+
 // Resolve raw module path relative to current dir, then normalize
 // Falls back to stdlib system directory if file not found
-fn resolve_module_path(raw_ptr as *u8, raw_len as i32, out_len as *i32) as *u8 {
+fn resolve_module_path(raw_ptr as *u8, raw_len_in as i32, out_len as *i32) as *u8 {
+    // Expand <TARGET> placeholder if present (e.g. "std/io/<TARGET>.cst")
+    let is i32 as raw_len with mut = 0;
+    let is *u8 as raw_expanded = expand_target_placeholder(raw_ptr, raw_len_in, &raw_len);
+    let is *u8 as raw_ptr2 = raw_expanded;
     let is *u8 as resolved with mut = cast(*u8, 0);
     let is i32 as resolved_len with mut = 0;
     if (current_source_dir_len > 0) {
-        resolved = resolve_path(current_source_dir_ptr, current_source_dir_len, raw_ptr, raw_len, &resolved_len);
+        resolved = resolve_path(current_source_dir_ptr, current_source_dir_len, raw_ptr2, raw_len, &resolved_len);
     } else {
-        resolved = d.str_dup(raw_ptr, raw_len);
+        resolved = d.str_dup(raw_ptr2, raw_len);
         resolved_len = raw_len;
     }
     let is *u8 as norm = normalize_path(resolved, resolved_len, out_len);
@@ -576,7 +620,7 @@ fn resolve_module_path(raw_ptr as *u8, raw_len as i32, out_len as *i32) as *u8 {
         let is i32 as ep_len with mut = 0;
         while (ep[ep_len] != cast(u8, 0)) { ep_len = ep_len + 1; }
         let is i32 as ep_rlen with mut = 0;
-        let is *u8 as ep_resolved = resolve_path(ep, ep_len, raw_ptr, raw_len, &ep_rlen);
+        let is *u8 as ep_resolved = resolve_path(ep, ep_len, raw_ptr2, raw_len, &ep_rlen);
         let is *u8 as ep_norm = normalize_path(ep_resolved, ep_rlen, out_len);
         let is i64 as ep_fd = linux.open(ep_norm, linux.O_RDONLY, 0);
         if (ep_fd >= 0) {
@@ -590,7 +634,7 @@ fn resolve_module_path(raw_ptr as *u8, raw_len as i32, out_len as *i32) as *u8 {
     if (stdlib_dir_len > 0) {
         let is i32 as saved_len = *out_len;
         let is i32 as fb_len with mut = 0;
-        let is *u8 as fb = resolve_path(stdlib_dir_ptr, stdlib_dir_len, raw_ptr, raw_len, &fb_len);
+        let is *u8 as fb = resolve_path(stdlib_dir_ptr, stdlib_dir_len, raw_ptr2, raw_len, &fb_len);
         let is *u8 as fb_norm = normalize_path(fb, fb_len, out_len);
         let is i64 as fd2 = linux.open(fb_norm, linux.O_RDONLY, 0);
         if (fd2 >= 0) {
