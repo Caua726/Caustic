@@ -780,6 +780,68 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
+    if (op == d.IR_FFI_CALL) {
+        // FFI call: targets a Windows DLL function via the IAT.
+        //
+        // At entry, args 0..N-1 are in System V regs (rdi, rsi, rdx, rcx,
+        // r8, r9) because the rest of the codegen pipeline uses SysV.
+        // Reorder to MS x64: arg0→rcx, arg1→rdx, arg2→r8, arg3→r9.
+        // Use r10/r11 as scratch for arg2/arg3 since their targets (r8/r9)
+        // and one source (rdx/rcx) overlap.
+        //
+        // Emit `.cstimport "<dll>" <name>` directive so the assembler can
+        // record the import. The assembler will emit a `__imp_<name>`
+        // external symbol; the linker resolves it to an IAT slot and the
+        // call lands as `call qword ptr [rip+disp32]` (FF 15 form).
+        let is i32 as arg_n = cast(i32, inst.src2.imm);
+
+        // Reorder integer args System V → MS x64
+        if (arg_n >= 3) { eo.out_line("mov r10, rdx"); }   // save arg2 before clobbering rdx
+        if (arg_n >= 4) { eo.out_line("mov r11, rcx"); }   // save arg3 before clobbering rcx
+        if (arg_n >= 1) { eo.out_line("mov rcx, rdi"); }   // arg0
+        if (arg_n >= 2) { eo.out_line("mov rdx, rsi"); }   // arg1
+        if (arg_n >= 3) { eo.out_line("mov r8, r10"); }    // arg2
+        if (arg_n >= 4) { eo.out_line("mov r9, r11"); }    // arg3
+        // Args 5+ not yet supported in Fase 2 (need stack juggle).
+
+        // 32-byte shadow space (caller-allocated, callee-owned, never used
+        // by caller across the call) + 8 bytes to keep rsp 16-aligned at
+        // the call instruction.
+        eo.out_line("sub rsp, 40");
+
+        // Indirect call through IAT slot named __imp_<callee>
+        eo.out_cstr("  call qword ptr [rip+__imp_");
+        eo.out_str(inst.call_name_ptr, inst.call_name_len);
+        eo.out_cstr("]\n");
+
+        eo.out_line("add rsp, 40");
+
+        // Emit the .cstimport directive so the assembler records the
+        // DLL→symbol mapping for the linker's import table builder.
+        eo.out_cstr("  .cstimport \"");
+        eo.out_str(inst.asm_str_ptr, inst.asm_str_len);
+        eo.out_cstr("\" ");
+        eo.out_str(inst.call_name_ptr, inst.call_name_len);
+        eo.out_char(10);
+
+        // Handle return type — MS x64 returns in rax (int) or xmm0 (float),
+        // same as SysV for the cases we care about.
+        if (cast(i64, inst.cast_to) != 0) {
+            let is i32 as ret_sz = e.get_type_size(inst.cast_to);
+            if (e.is_float_type(inst.cast_to) == 1) {
+                if (ret_sz == 4) { eo.out_line("cvtss2sd xmm0, xmm0"); }
+                eo.out_line("movq rax, xmm0");
+            } else if (ret_sz == 1) {
+                if (e.is_signed_type(inst.cast_to) == 1) { eo.out_line("movsx rax, al"); }
+                else { eo.out_line("movzx eax, al"); }
+            } else if (ret_sz == 2) {
+                if (e.is_signed_type(inst.cast_to) == 1) { eo.out_line("movsx rax, ax"); }
+                else { eo.out_line("movzx eax, ax"); }
+            }
+        }
+        e.store_op(inst.dest.vreg, ctx, "rax");
+        return;
+    }
     if (op == d.IR_CALL_INDIRECT) {
         e.load_op(inst.src2.vreg, ctx, "rax");
         if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
