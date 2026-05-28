@@ -154,15 +154,97 @@ fn exit_scope() as void {
 }
 
 // === Variable declaration / lookup ===
+// Per-scope hash table for global/module scopes (lazy alloc). DJB2 + chaining.
+// 128 buckets handles ~150 vars/scope with low collision rate; initial cap 64
+// grows by doubling on overflow.
+let is i32 as VAR_HASH_BUCKETS with imut = 128;
+let is i32 as VAR_HASH_CAP_INIT with imut = 64;
 
-fn declare_var(name_ptr as *u8, name_len as i32, ty as *u8, flags as i32) as *d.Variable {
-    // Check duplicate in current scope
-    let is *d.Variable as v with mut = current_scope.vars;
-    while (cast(i64, v) != 0) {
+fn var_hash(name_ptr as *u8, name_len as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    h = h & 9223372036854775807;
+    return cast(i32, h & cast(i64, VAR_HASH_BUCKETS - 1));
+}
+
+fn vh_init(s as *d.Scope) as void {
+    s.vh_buckets = cast(*i32, d.sem_alloc(cast(i64, VAR_HASH_BUCKETS) * 4));
+    s.vh_cap = VAR_HASH_CAP_INIT;
+    s.vh_ptrs = cast(*i64, d.sem_alloc(cast(i64, s.vh_cap) * 8));
+    s.vh_next = cast(*i32, d.sem_alloc(cast(i64, s.vh_cap) * 4));
+    let is i32 as i with mut = 0;
+    while (i < VAR_HASH_BUCKETS) {
+        s.vh_buckets[i] = 0 - 1;
+        i = i + 1;
+    }
+    s.vh_count = 0;
+}
+
+fn vh_grow(s as *d.Scope) as void {
+    let is i32 as new_cap = s.vh_cap * 2;
+    let is *i64 as new_ptrs = cast(*i64, d.sem_alloc(cast(i64, new_cap) * 8));
+    let is *i32 as new_next = cast(*i32, d.sem_alloc(cast(i64, new_cap) * 4));
+    let is i32 as i with mut = 0;
+    while (i < s.vh_count) {
+        let is *i64 as src_pp = cast(*i64, cast(i64, s.vh_ptrs) + cast(i64, i) * 8);
+        let is *i32 as src_np = cast(*i32, cast(i64, s.vh_next) + cast(i64, i) * 4);
+        let is *i64 as dst_pp = cast(*i64, cast(i64, new_ptrs) + cast(i64, i) * 8);
+        let is *i32 as dst_np = cast(*i32, cast(i64, new_next) + cast(i64, i) * 4);
+        *dst_pp = *src_pp;
+        *dst_np = *src_np;
+        i = i + 1;
+    }
+    s.vh_ptrs = new_ptrs;
+    s.vh_next = new_next;
+    s.vh_cap = new_cap;
+}
+
+fn vh_insert(s as *d.Scope, v as *d.Variable) as void {
+    if (cast(i64, s.vh_buckets) == 0) { vh_init(s); }
+    if (s.vh_count >= s.vh_cap) { vh_grow(s); }
+    let is i32 as h = var_hash(v.name_ptr, v.name_len);
+    let is i32 as idx = s.vh_count;
+    let is *i64 as pp = cast(*i64, cast(i64, s.vh_ptrs) + cast(i64, idx) * 8);
+    let is *i32 as np = cast(*i32, cast(i64, s.vh_next) + cast(i64, idx) * 4);
+    *pp = cast(i64, v);
+    *np = s.vh_buckets[h];
+    s.vh_buckets[h] = idx;
+    s.vh_count = s.vh_count + 1;
+}
+
+fn vh_lookup(s as *d.Scope, name_ptr as *u8, name_len as i32) as *d.Variable {
+    if (cast(i64, s.vh_buckets) == 0) { return cast(*d.Variable, 0); }
+    let is i32 as h = var_hash(name_ptr, name_len);
+    let is i32 as idx with mut = s.vh_buckets[h];
+    while (idx >= 0) {
+        let is *i64 as pp = cast(*i64, cast(i64, s.vh_ptrs) + cast(i64, idx) * 8);
+        let is *d.Variable as v = cast(*d.Variable, *pp);
         if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
             return v;
         }
-        v = v.next;
+        let is *i32 as np = cast(*i32, cast(i64, s.vh_next) + cast(i64, idx) * 4);
+        idx = *np;
+    }
+    return cast(*d.Variable, 0);
+}
+
+fn declare_var(name_ptr as *u8, name_len as i32, ty as *u8, flags as i32) as *d.Variable {
+    // Check duplicate in current scope
+    if (current_scope.is_global == 1) {
+        let is *d.Variable as existing = vh_lookup(current_scope, name_ptr, name_len);
+        if (cast(i64, existing) != 0) { return existing; }
+    } else {
+        let is *d.Variable as v with mut = current_scope.vars;
+        while (cast(i64, v) != 0) {
+            if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
+                return v;
+            }
+            v = v.next;
+        }
     }
 
     let is *d.Variable as nv = d.new_variable();
@@ -194,18 +276,26 @@ fn declare_var(name_ptr as *u8, name_len as i32, ty as *u8, flags as i32) as *d.
 
     nv.next = current_scope.vars;
     current_scope.vars = nv;
+    if (current_scope.is_global == 1) {
+        vh_insert(current_scope, nv);
+    }
     return nv;
 }
 
 fn lookup_var(name_ptr as *u8, name_len as i32) as *d.Variable {
     let is *d.Scope as s with mut = current_scope;
     while (cast(i64, s) != 0) {
-        let is *d.Variable as v with mut = s.vars;
-        while (cast(i64, v) != 0) {
-            if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
-                return v;
+        if (s.is_global == 1) {
+            let is *d.Variable as hit = vh_lookup(s, name_ptr, name_len);
+            if (cast(i64, hit) != 0) { return hit; }
+        } else {
+            let is *d.Variable as v with mut = s.vars;
+            while (cast(i64, v) != 0) {
+                if (d.str_eq(v.name_ptr, v.name_len, name_ptr, name_len) == 1) {
+                    return v;
+                }
+                v = v.next;
             }
-            v = v.next;
         }
         s = s.parent;
     }
