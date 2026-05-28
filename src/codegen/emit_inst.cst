@@ -9,6 +9,87 @@ use "target.cst" as tgt;
 
 let is i32 as label_base with mut = 0;
 
+// Granlund-Montgomery signed 64-bit magic for divide-by-constant.
+// Pre: d != 0, |d| != 1, |d| not a power of 2.
+// Writes magic M to *out_M and post-shift count to *out_s.
+// Returns 1 if "add-back" (high += n) is needed after the imul, 0 otherwise.
+fn _magic_s64(d as i64, out_M as *i64, out_s as *i32) as i32 {
+    let is u64 as two63 = cast(u64, 1) << cast(u64, 63);
+    let is u64 as ad with mut = cast(u64, d);
+    if (d < 0) { ad = cast(u64, 0 - d); }
+
+    let is u64 as t with mut = two63;
+    if (d < 0) { t = t + cast(u64, 1); }
+
+    let is u64 as anc = (t - cast(u64, 1)) - (t % ad);
+
+    let is i32 as p with mut = 63;
+    let is u64 as q1 with mut = two63 / anc;
+    let is u64 as r1 with mut = two63 - q1 * anc;
+    let is u64 as q2 with mut = two63 / ad;
+    let is u64 as r2 with mut = two63 - q2 * ad;
+    let is u64 as delta with mut = cast(u64, 0);
+
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        p = p + 1;
+        q1 = q1 + q1;
+        r1 = r1 + r1;
+        if (r1 >= anc) { q1 = q1 + cast(u64, 1); r1 = r1 - anc; }
+        q2 = q2 + q2;
+        r2 = r2 + r2;
+        if (r2 >= ad) { q2 = q2 + cast(u64, 1); r2 = r2 - ad; }
+        delta = ad - r2;
+        if (q1 < delta) { more = 1; }
+        else {
+            if (q1 == delta) {
+                if (r1 == cast(u64, 0)) { more = 1; } else { more = 0; }
+            } else { more = 0; }
+        }
+    }
+
+    let is i64 as M with mut = cast(i64, q2 + cast(u64, 1));
+    if (d < 0) { M = 0 - M; }
+
+    *out_M = M;
+    *out_s = p - 64;
+
+    if (d > 0) { if (M < 0) { return 1; } }
+    if (d < 0) { if (M > 0) { return 1; } }
+    return 0;
+}
+
+// True when imm is a non-zero constant that is not |1| and not a power of 2.
+// Power-of-2 (including 1) is already handled by the existing fast path.
+fn _is_magic_const(imm as i64) as i32 {
+    if (imm == 0) { return 0; }
+    let is i64 as a with mut = imm;
+    if (a < 0) { a = 0 - a; }
+    if (a == 1) { return 0; }
+    if ((a & (a - 1)) == 0) { return 0; }   // power of 2
+    return 1;
+}
+
+// Emit the magic-multiply sequence for signed div-by-constant.
+// Pre-conditions: dividend has been loaded into rax. rdx will be clobbered
+// (caller must push/pop it). Leaves the quotient in rdx and the saved
+// dividend in rcx so callers computing mod can reuse them.
+fn _emit_magic_div_s64(d_imm as i64) as void {
+    let is i64 as M with mut = 0;
+    let is i32 as sh with mut = 0;
+    let is i32 as addback = _magic_s64(d_imm, &M, &sh);
+    eo.out_line("mov rcx, rax");
+    eo.out_str("  mov rdx, ", 11); eo.out_int(M); eo.out_char(10);
+    eo.out_line("imul rdx");
+    if (addback == 1) { eo.out_line("add rdx, rcx"); }
+    if (sh > 0) {
+        eo.out_str("  sar rdx, ", 11); eo.out_int(cast(i64, sh)); eo.out_char(10);
+    }
+    eo.out_line("mov rax, rcx");
+    eo.out_line("sar rax, 63");
+    eo.out_line("sub rdx, rax");
+}
+
 fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     if (op == d.IR_IMM) {
@@ -42,17 +123,35 @@ fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
 fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
+    // Algebraic identity: x +/- 0 == x. Skip the op, just move src1 to dest.
+    if ((op == d.IR_ADD || op == d.IR_SUB)
+        && inst.src2.op_type == d.OP_IMM && inst.src2.imm == 0) {
+        e.emit_vreg_copy(inst.dest.vreg, inst.src1.vreg, ctx, inst.cast_to);
+        return;
+    }
     if (op == d.IR_ADD) { e.gen_binop(inst, ctx, "add"); return; }
     if (op == d.IR_SUB) { e.gen_binop(inst, ctx, "sub"); return; }
     if (op == d.IR_MUL) {
         let is *u8 as scr = e.get_scratch(inst.dest.vreg, ctx);
         if (inst.src2.op_type == d.OP_IMM) {
+            let is i64 as imm = inst.src2.imm;
             e.load_op(inst.src1.vreg, ctx, scr);
-            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
-            eo.out_str("  mov rcx, ", 11);
-            eo.out_int(inst.src2.imm);
-            eo.out_char(10);
-            eo.out_str("  imul ", 7); eo.out_cstr(scr); eo.out_str(", rcx\n", 6);
+            if (imm == 0) {
+                eo.out_str("  xor ", 6); eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_cstr(scr); eo.out_char(10);
+            } else if (imm == 1) {
+                // identity
+            } else if (imm > 0 && (imm & (imm - 1)) == 0) {
+                let is i64 as shift with mut = 0;
+                let is i64 as tmp with mut = imm;
+                while (tmp > 1) { tmp = tmp >> 1; shift = shift + 1; }
+                eo.out_str("  shl ", 6); eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_int(shift); eo.out_char(10);
+            } else if (imm >= 0 - 2147483648 && imm <= 2147483647) {
+                eo.out_str("  imul ", 7); eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_int(imm); eo.out_char(10);
+            } else {
+                if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+                eo.out_str("  mov rcx, ", 11); eo.out_int(imm); eo.out_char(10);
+                eo.out_str("  imul ", 7); eo.out_cstr(scr); eo.out_str(", rcx\n", 6);
+            }
         } else if (al.is_mem(inst.src2.vreg, ctx) == 1) {
             e.load_op(inst.src1.vreg, ctx, scr);
             e.load_op(inst.src2.vreg, ctx, "rcx");
@@ -96,6 +195,23 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             e.store_op(inst.dest.vreg, ctx, scr);
             return;
         }
+        // Granlund-Montgomery magic-multiplication for signed div by constant.
+        if (inst.src2.op_type == d.OP_IMM
+            && e.is_signed_type(inst.cast_to) == 1
+            && _is_magic_const(inst.src2.imm) == 1) {
+            if (al.al_opt_level >= 1) {
+                eo.rc_invalidate_reg(1);
+                eo.rc_invalidate_reg(2);
+            }
+            e.load_op(inst.src1.vreg, ctx, "rax");
+            eo.out_line("push rdx");
+            _emit_magic_div_s64(inst.src2.imm);
+            eo.out_line("mov rax, rdx");
+            eo.out_line("pop rdx");
+            e.emit_narrow_truncate(0, inst.cast_to);
+            e.store_op(inst.dest.vreg, ctx, "rax");
+            return;
+        }
         e.load_op(inst.src1.vreg, ctx, "rax");
         if (inst.src2.op_type == d.OP_IMM) {
             if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
@@ -136,6 +252,27 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             }
             e.emit_narrow_truncate(eo.reg_name_to_idx(scr), inst.cast_to);
             e.store_op(inst.dest.vreg, ctx, scr);
+            return;
+        }
+        // Granlund-Montgomery magic for signed mod by constant.
+        // After _emit_magic_div_s64: rdx = quotient, rcx = original dividend.
+        // mod = n - q * d  →  imul rdx, d; sub rcx, rdx; rax = rcx.
+        if (inst.src2.op_type == d.OP_IMM
+            && e.is_signed_type(inst.cast_to) == 1
+            && _is_magic_const(inst.src2.imm) == 1) {
+            if (al.al_opt_level >= 1) {
+                eo.rc_invalidate_reg(1);
+                eo.rc_invalidate_reg(2);
+            }
+            e.load_op(inst.src1.vreg, ctx, "rax");
+            eo.out_line("push rdx");
+            _emit_magic_div_s64(inst.src2.imm);
+            eo.out_str("  imul rdx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
+            eo.out_line("sub rcx, rdx");
+            eo.out_line("mov rax, rcx");
+            eo.out_line("pop rdx");
+            e.emit_narrow_truncate(0, inst.cast_to);
+            e.store_op(inst.dest.vreg, ctx, "rax");
             return;
         }
         e.load_op(inst.src1.vreg, ctx, "rax");
