@@ -1,5 +1,4 @@
 use "../../std/mem.cst" as mem;
-use "../../std/linux.cst" as linux;
 use "defs.cst" as d;
 use "scope.cst" as sc;
 use "types.cst" as ty;
@@ -8,6 +7,7 @@ use "modules.cst" as mod;
 use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../parser/top.cst" as top;
+use "../codegen/target.cst" as tgt;
 use "walk_types.cst" as wt;
 
 fn walk_return(node as *ast.Node) as void {
@@ -96,6 +96,261 @@ fn walk_block(node as *ast.Node) as void {
     sc.exit_scope();
 }
 
+// Try to evaluate an init expression to an integer literal at semantic time.
+// === Layer 2 comptime: AST interpreter for `with imut` functions ===
+//
+// Each call to an imut fn opens a fresh frame (params + locals). The walker
+// uses a single 32-slot bump-allocated frame stack; nested imut calls share
+// the same array, each one tracking its own `frame_base` so locals don't
+// collide. Bounded at 32 nesting levels so a buggy recursion can't blow up
+// the compiler. Slot layout per fn: params first (in declaration order),
+// then locals in the order they appear via `let`.
+let is [256]i64 as imut_slot_val;          // 8 frames × 32 slots = 256
+let is [256]i64 as imut_slot_name_ptr;     // i64 stash of *u8 name
+let is [256]i32 as imut_slot_name_len;
+let is i32 as imut_sp with mut = 0;        // slot stack pointer
+let is i32 as imut_depth with mut = 0;     // current recursion depth
+
+// Returns 1 if a local with the given name exists in the current frame
+// (between imut_frame_base and imut_sp). Writes its value into *out.
+fn imut_lookup(frame_base as i32, name_ptr as *u8, name_len as i32, out as *i64) as i32 {
+    let is i32 as i with mut = imut_sp - 1;
+    while (i >= frame_base) {
+        let is i64 as np = imut_slot_name_ptr[i];
+        let is i32 as nl = imut_slot_name_len[i];
+        if (nl == name_len && d.str_eq(cast(*u8, np), nl, name_ptr, name_len) == 1) {
+            *out = imut_slot_val[i];
+            return 1;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn imut_bind(name_ptr as *u8, name_len as i32, val as i64) as i32 {
+    if (imut_sp >= 256) { return 0; }
+    imut_slot_name_ptr[imut_sp] = cast(i64, name_ptr);
+    imut_slot_name_len[imut_sp] = name_len;
+    imut_slot_val[imut_sp] = val;
+    imut_sp = imut_sp + 1;
+    return 1;
+}
+
+// Evaluate an expression node in the current imut frame. Returns 1 on
+// success (value in *out), 0 on any non-foldable construct.
+fn imut_eval_expr(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) { *out = n.val; return 1; }
+    if (k == ast.NK_IDENT) {
+        if (imut_lookup(frame_base, n.name_ptr, n.name_len, out) == 1) { return 1; }
+        // Fall back to const-folded imut globals.
+        let is *d.Variable as v = sc.lookup_var(n.name_ptr, n.name_len);
+        if (cast(i64, v) != 0 && v.has_folded_init == 1) {
+            *out = v.folded_init_val;
+            return 1;
+        }
+        return 0;
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL
+        || k == ast.NK_DIV || k == ast.NK_MOD
+        || k == ast.NK_EQ  || k == ast.NK_NE
+        || k == ast.NK_LT  || k == ast.NK_LE
+        || k == ast.NK_GT  || k == ast.NK_GE) {
+        let is i64 as l with mut = 0;
+        let is i64 as r with mut = 0;
+        if (imut_eval_expr(n.lhs, frame_base, &l) == 0) { return 0; }
+        if (imut_eval_expr(n.rhs, frame_base, &r) == 0) { return 0; }
+        if (k == ast.NK_ADD) { *out = l + r; return 1; }
+        if (k == ast.NK_SUB) { *out = l - r; return 1; }
+        if (k == ast.NK_MUL) { *out = l * r; return 1; }
+        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
+        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
+        if (k == ast.NK_EQ)  { *out = 0; if (l == r) { *out = 1; } return 1; }
+        if (k == ast.NK_NE)  { *out = 0; if (l != r) { *out = 1; } return 1; }
+        if (k == ast.NK_LT)  { *out = 0; if (l <  r) { *out = 1; } return 1; }
+        if (k == ast.NK_LE)  { *out = 0; if (l <= r) { *out = 1; } return 1; }
+        if (k == ast.NK_GT)  { *out = 0; if (l >  r) { *out = 1; } return 1; }
+        if (k == ast.NK_GE)  { *out = 0; if (l >= r) { *out = 1; } return 1; }
+    }
+    if (k == ast.NK_FNCALL) {
+        // Recursive imut call: fold by re-entering the interpreter.
+        return try_fold_imut_call(n, out);
+    }
+    return 0;
+}
+
+// Control-flow sentinel for imut_exec_stmt:
+//   returns 0 = continue with next stmt
+//   returns 1 = explicit return executed (value in *out)
+//   returns 2 = non-foldable, abort interpretation
+fn imut_exec_stmt(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    // Parser wraps standalone expressions/assignments in NK_EXPR_STMT.
+    // Unwrap so the inner NK_ASSIGN / NK_FNCALL is handled below.
+    if (k == ast.NK_EXPR_STMT) {
+        if (cast(i64, n.expr) == 0) { return 0; }
+        return imut_exec_stmt(n.expr, frame_base, out);
+    }
+    if (k == ast.NK_BLOCK) {
+        let is *ast.Node as s with mut = n.stmts;
+        while (cast(i64, s) != 0) {
+            let is i32 as r = imut_exec_stmt(s, frame_base, out);
+            if (r != 0) { return r; }
+            s = s.next;
+        }
+        return 0;
+    }
+    if (k == ast.NK_RETURN) {
+        if (cast(i64, n.expr) == 0) { *out = 0; return 1; }
+        if (imut_eval_expr(n.expr, frame_base, out) == 0) { return 2; }
+        return 1;
+    }
+    if (k == ast.NK_LET) {
+        let is i64 as v with mut = 0;
+        if (cast(i64, n.init_expr) != 0) {
+            if (imut_eval_expr(n.init_expr, frame_base, &v) == 0) { return 2; }
+        }
+        if (imut_bind(n.name_ptr, n.name_len, v) == 0) { return 2; }
+        return 0;
+    }
+    if (k == ast.NK_IF) {
+        let is i64 as cv with mut = 0;
+        if (imut_eval_expr(n.cond, frame_base, &cv) == 0) { return 2; }
+        if (cv != 0) { return imut_exec_stmt(n.then_b, frame_base, out); }
+        if (cast(i64, n.else_b) != 0) { return imut_exec_stmt(n.else_b, frame_base, out); }
+        return 0;
+    }
+    if (k == ast.NK_WHILE) {
+        // Cap iterations to prevent compiler-time DoS on unbounded loops.
+        let is i32 as iter with mut = 0;
+        while (iter < 65536) {
+            let is i64 as cv with mut = 0;
+            if (imut_eval_expr(n.cond, frame_base, &cv) == 0) { return 2; }
+            if (cv == 0) { return 0; }
+            let is i32 as r = imut_exec_stmt(n.body, frame_base, out);
+            if (r != 0) { return r; }
+            iter = iter + 1;
+        }
+        return 2;
+    }
+    if (k == ast.NK_ASSIGN) {
+        // Only LHS = NK_IDENT to a local in this frame is supported.
+        if (cast(i64, n.lhs) == 0 || n.lhs.kind != ast.NK_IDENT) { return 2; }
+        let is i64 as rv with mut = 0;
+        if (imut_eval_expr(n.rhs, frame_base, &rv) == 0) { return 2; }
+        let is i32 as i with mut = imut_sp - 1;
+        while (i >= frame_base) {
+            let is i64 as np = imut_slot_name_ptr[i];
+            let is i32 as nl = imut_slot_name_len[i];
+            if (nl == n.lhs.name_len && d.str_eq(cast(*u8, np), nl, n.lhs.name_ptr, n.lhs.name_len) == 1) {
+                imut_slot_val[i] = rv;
+                return 0;
+            }
+            i = i - 1;
+        }
+        return 2;
+    }
+    return 2;
+}
+
+// Attempt to fold a NK_FNCALL into a literal by interpreting the callee's
+// body. Returns 1 on success (with the result in *out), 0 if the call site
+// is not foldable (callee not imut, args not all literal, body uses an
+// unsupported construct, recursion too deep, etc).
+fn try_fold_imut_call(cn as *ast.Node, out as *i64) as i32 {
+    if (imut_depth >= 8) { return 0; }
+    if (cast(i64, cn.name_ptr) == 0 || cn.name_len <= 0) { return 0; }
+    let is *d.Function as f = sc.lookup_fn(cn.name_ptr, cn.name_len);
+    if (cast(i64, f) == 0) { return 0; }
+    if (f.is_imut == 0 || cast(i64, f.ast_node) == 0) { return 0; }
+    let is *ast.Node as fn_node = cast(*ast.Node, f.ast_node);
+
+    // Evaluate all args first (in caller's frame). All must be foldable.
+    // arg count must match param count (no variadic).
+    let is [16]i64 as arg_vals;
+    let is i32 as arg_n with mut = 0;
+    let is *ast.Node as a with mut = cn.args;
+    while (cast(i64, a) != 0) {
+        if (arg_n >= 16) { return 0; }
+        let is i64 as v with mut = 0;
+        if (imut_eval_expr(a, imut_sp, &v) == 0) { return 0; }
+        arg_vals[arg_n] = v;
+        arg_n = arg_n + 1;
+        a = a.next;
+    }
+    if (arg_n != f.param_count) { return 0; }
+
+    // Open frame: bind params, then run body, then pop.
+    let is i32 as saved_sp = imut_sp;
+    let is *ast.Node as p with mut = fn_node.params;
+    let is i32 as pi with mut = 0;
+    while (cast(i64, p) != 0) {
+        if (imut_bind(p.name_ptr, p.name_len, arg_vals[pi]) == 0) {
+            imut_sp = saved_sp;
+            return 0;
+        }
+        pi = pi + 1;
+        p = p.next;
+    }
+    let is i64 as rv with mut = 0;
+    imut_depth = imut_depth + 1;
+    let is i32 as r = imut_exec_stmt(fn_node.body, saved_sp, &rv);
+    imut_depth = imut_depth - 1;
+    imut_sp = saved_sp;
+    if (r == 1) { *out = rv; return 1; }
+    return 0;
+}
+
+// Returns 1 on success and writes the value to *out; returns 0 if the node
+// references something non-foldable (mut global, runtime call, etc).
+// Supports: NK_NUM, references to imut globals with folded inits, the same
+// arithmetic and comparison ops that gen_expr's const-fold handles, and
+// calls to `with imut` functions when all args fold. Bounded to avoid
+// infinite recursion on cyclic references (which would be a user bug, but
+// defending here keeps the compiler well-behaved).
+fn try_fold_const(n as *ast.Node, out as *i64, depth as i32) as i32 {
+    if (depth > 32) { return 0; }
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) { *out = n.val; return 1; }
+    if (k == ast.NK_IDENT) {
+        let is *d.Variable as v = sc.lookup_var(n.name_ptr, n.name_len);
+        if (cast(i64, v) != 0 && v.has_folded_init == 1) {
+            *out = v.folded_init_val;
+            return 1;
+        }
+        return 0;
+    }
+    if (k == ast.NK_FNCALL) {
+        // Try Layer 2 comptime evaluation if callee is `with imut`.
+        return try_fold_imut_call(n, out);
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL
+        || k == ast.NK_DIV || k == ast.NK_MOD
+        || k == ast.NK_EQ  || k == ast.NK_NE
+        || k == ast.NK_LT  || k == ast.NK_LE
+        || k == ast.NK_GT  || k == ast.NK_GE) {
+        let is i64 as l with mut = 0;
+        let is i64 as r with mut = 0;
+        if (try_fold_const(n.lhs, &l, depth + 1) == 0) { return 0; }
+        if (try_fold_const(n.rhs, &r, depth + 1) == 0) { return 0; }
+        if (k == ast.NK_ADD) { *out = l + r; return 1; }
+        if (k == ast.NK_SUB) { *out = l - r; return 1; }
+        if (k == ast.NK_MUL) { *out = l * r; return 1; }
+        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
+        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
+        if (k == ast.NK_EQ)  { *out = 0; if (l == r) { *out = 1; } return 1; }
+        if (k == ast.NK_NE)  { *out = 0; if (l != r) { *out = 1; } return 1; }
+        if (k == ast.NK_LT)  { *out = 0; if (l <  r) { *out = 1; } return 1; }
+        if (k == ast.NK_LE)  { *out = 0; if (l <= r) { *out = 1; } return 1; }
+        if (k == ast.NK_GT)  { *out = 0; if (l >  r) { *out = 1; } return 1; }
+        if (k == ast.NK_GE)  { *out = 0; if (l >= r) { *out = 1; } return 1; }
+    }
+    return 0;
+}
+
 fn walk_let(node as *ast.Node) as void {
     node.ty = wt.resolve_type_ptr(cast(*u8, node.ty));
     if (node.ty.kind == ast.TY_VOID) {
@@ -122,6 +377,16 @@ fn walk_let(node as *ast.Node) as void {
         var.is_string_const = 1;
         node.is_string_const = 1;
     }
+    // Eager const-prop: if this is an imut global whose init expression
+    // evaluates to a literal at semantic time, record the value so gen_expr
+    // can substitute literal at every use site.
+    if (var.is_global == 1 && node.flags == ast.VF_IMUT && cast(i64, node.init_expr) != 0) {
+        let is i64 as fv with mut = 0;
+        if (try_fold_const(node.init_expr, &fv, 0) == 1) {
+            var.has_folded_init = 1;
+            var.folded_init_val = fv;
+        }
+    }
     if (var.asm_name_len > 0) {
         node.asm_name_ptr = var.asm_name_ptr;
         node.asm_name_len = var.asm_name_len;
@@ -147,6 +412,19 @@ fn walk_binop(node as *ast.Node) as void {
     if (node.lhs.kind == ast.NK_NUM && node.rhs.kind != ast.NK_NUM) {
         ty.can_narrow_literal_to(node.lhs, cast(*u8, node.rhs.ty));
     }
+    // When both sides are literals (typical after imut-global const-prop
+    // rewrites IDENT → NK_NUM), narrow the wider one to the narrower one
+    // if it fits — keeps the result type at the originally-declared size
+    // and avoids spurious "narrowing required" errors at the use site.
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM
+        && cast(i64, node.lhs.ty) != 0 && cast(i64, node.rhs.ty) != 0
+        && node.lhs.ty.size != node.rhs.ty.size) {
+        if (node.lhs.ty.size > node.rhs.ty.size) {
+            ty.can_narrow_literal_to(node.lhs, cast(*u8, node.rhs.ty));
+        } else {
+            ty.can_narrow_literal_to(node.rhs, cast(*u8, node.lhs.ty));
+        }
+    }
     if (k == ast.NK_ADD || k == ast.NK_SUB) {
         if (node.lhs.ty.kind == ast.TY_PTR && ty.is_integer_type(cast(*u8, node.rhs.ty)) == 1) {
             node.ty = node.lhs.ty;
@@ -167,6 +445,11 @@ fn walk_binop(node as *ast.Node) as void {
     } else {
         node.ty = node.rhs.ty;
     }
+    // NOTE: we intentionally do NOT fold this op to a NK_NUM literal at the
+    // AST level even when both sides are NK_NUM — that would lose the
+    // narrowing path in walk_let (which narrows a literal NK_NUM to a
+    // smaller declared type). Const-fold of arithmetic happens later in
+    // gen_expr where types are settled.
 }
 
 fn walk_cmp(node as *ast.Node) as void {
@@ -179,6 +462,39 @@ fn walk_cmp(node as *ast.Node) as void {
         ty.can_narrow_literal_to(node.lhs, cast(*u8, node.rhs.ty));
     }
     node.ty = ast.type_bool;
+    // If both sides folded to literals, collapse the comparison itself to
+    // a 0/1 literal — lets `if (x == y)` with x,y imut-folded reach the
+    // NK_IF dead-branch elim.
+    if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM) {
+        let is i64 as a = node.lhs.val;
+        let is i64 as b = node.rhs.val;
+        let is i32 as k = node.kind;
+        let is i64 as r with mut = 0;
+        if (k == ast.NK_EQ) { if (a == b) { r = 1; } }
+        else if (k == ast.NK_NE) { if (a != b) { r = 1; } }
+        else if (k == ast.NK_LT) { if (a <  b) { r = 1; } }
+        else if (k == ast.NK_LE) { if (a <= b) { r = 1; } }
+        else if (k == ast.NK_GT) { if (a >  b) { r = 1; } }
+        else if (k == ast.NK_GE) { if (a >= b) { r = 1; } }
+        node.kind = ast.NK_NUM;
+        node.val = r;
+    }
+}
+
+// Same trick for arithmetic ops: collapse to a literal when both sides
+// are NK_NUM (after const-prop substitution). Mirrors the IR-gen folds in
+// gen_expr but at the AST level so downstream walks see a literal value.
+fn fold_binop_if_const(node as *ast.Node) as void {
+    if (node.lhs.kind != ast.NK_NUM) { return; }
+    if (node.rhs.kind != ast.NK_NUM) { return; }
+    let is i32 as k = node.kind;
+    let is i64 as a = node.lhs.val;
+    let is i64 as b = node.rhs.val;
+    if (k == ast.NK_ADD) { node.kind = ast.NK_NUM; node.val = a + b; return; }
+    if (k == ast.NK_SUB) { node.kind = ast.NK_NUM; node.val = a - b; return; }
+    if (k == ast.NK_MUL) { node.kind = ast.NK_NUM; node.val = a * b; return; }
+    if (k == ast.NK_DIV) { if (b == 0) { return; } node.kind = ast.NK_NUM; node.val = a / b; return; }
+    if (k == ast.NK_MOD) { if (b == 0) { return; } node.kind = ast.NK_NUM; node.val = a % b; return; }
 }
 
 fn walk_assign(node as *ast.Node) as void {
@@ -252,6 +568,15 @@ fn walk(node as *ast.Node) as void {
         node.is_global = var.is_global;
         node.is_string_const = var.is_string_const;
         if (var.asm_name_len > 0) { node.asm_name_ptr = var.asm_name_ptr; node.asm_name_len = var.asm_name_len; }
+        // Const-prop at the AST level: if this references an imut global
+        // whose init folded to a literal in walk_let, rewrite the node
+        // in-place to NK_NUM so downstream arithmetic + comparison folds
+        // in gen_expr fire transitively (`A + B`, `A == 1`, etc. all see
+        // both sides as literals).
+        if (var.has_folded_init == 1) {
+            node.kind = ast.NK_NUM;
+            node.val = var.folded_init_val;
+        }
         return;
     }
     if (k == ast.NK_RETURN) { walk_return(node); return; }
@@ -272,7 +597,25 @@ fn walk(node as *ast.Node) as void {
     }
     if (k == ast.NK_BREAK) { if (sc.loop_depth == 0) { sc.sem_error_at(node, "break fora de loop"); } return; }
     if (k == ast.NK_CONTINUE) { if (sc.loop_depth == 0) { sc.sem_error_at(node, "continue fora de loop"); } return; }
-    if (k == ast.NK_IF) { walk(node.cond); walk(node.then_b); if (cast(i64, node.else_b) != 0) { walk(node.else_b); } return; }
+    if (k == ast.NK_IF) {
+        walk(node.cond);
+        // Semantic dead-branch elim: when the condition has already been
+        // rewritten to a literal during walk(cond) (NK_IDENT→NK_NUM for
+        // imut globals, NK_EQ of two literals → NK_NUM), skip semantic-
+        // walking the dead arm. Cheap path — no extra fold attempt, we
+        // just look at what `walk` left in node.cond. The IR generator
+        // does the same trim later; doing it here also stops references
+        // in the dead arm from being resolved against modules that a
+        // top-level `if (__target_is_X) use` intentionally didn't load.
+        if (node.cond.kind == ast.NK_NUM) {
+            if (node.cond.val != 0) { walk(node.then_b); }
+            else if (cast(i64, node.else_b) != 0) { walk(node.else_b); }
+            return;
+        }
+        walk(node.then_b);
+        if (cast(i64, node.else_b) != 0) { walk(node.else_b); }
+        return;
+    }
     if (k == ast.NK_WHILE) { walk(node.cond); sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; return; }
     if (k == ast.NK_DO_WHILE) { sc.loop_depth = sc.loop_depth + 1; walk(node.body); sc.loop_depth = sc.loop_depth - 1; walk(node.cond); return; }
     if (k == ast.NK_FOR) { walk_for(node); return; }
@@ -365,6 +708,11 @@ fn walk(node as *ast.Node) as void {
         return;
     }
     if (k == ast.NK_SYSCALL) {
+        // The "syscall() not supported on this target" gate lives in codegen
+        // (emit_inst.cst, IR_SYSCALL case), not here — semantic walks every
+        // imported file's body, so a Windows build transitively importing
+        // linux.cst would otherwise flag its syscall-wrapping functions even
+        // though DCE drops them before codegen.
         node.ty = ast.type_i64;
         let is *ast.Node as a with mut = node.args;
         while (cast(i64, a) != 0) { walk(a); a = a.next; }
@@ -711,6 +1059,36 @@ fn walk_fncall(node as *ast.Node) as void {
         walk(arg);
         arg = arg.next;
     }
+
+    // Layer 2 comptime: if callee is `with imut` and every arg already
+    // folded to NK_NUM (via NK_IDENT→NK_NUM rewrite or recursive imut
+    // fold), evaluate the body now and rewrite this NK_FNCALL node into
+    // the resulting NK_NUM literal. Codegen will then see a constant
+    // instead of a runtime call.
+    if (func.is_imut == 1 && cast(i64, func.ast_node) != 0) {
+        let is i32 as all_lit with mut = 1;
+        let is *ast.Node as ck with mut = node.args;
+        while (cast(i64, ck) != 0) {
+            if (ck.kind != ast.NK_NUM) { all_lit = 0; ck = cast(*ast.Node, 0); }
+            else { ck = ck.next; }
+        }
+        if (all_lit == 1) {
+            let is i64 as folded with mut = 0;
+            // Pass the call name through so try_fold_imut_call sees a
+            // ready-made identifier — walk_fncall doesn't always populate
+            // name_ptr (some call shapes route through node.lhs.name).
+            if (cast(i64, node.name_ptr) == 0 && cast(i64, node.lhs) != 0
+                && node.lhs.kind == ast.NK_IDENT) {
+                node.name_ptr = node.lhs.name_ptr;
+                node.name_len = node.lhs.name_len;
+            }
+            if (try_fold_imut_call(node, &folded) == 1) {
+                node.kind = ast.NK_NUM;
+                node.val = folded;
+                node.ty = cast(*ast.Type, func.return_type);
+            }
+        }
+    }
 }
 
 // === Enum constructor ===
@@ -862,6 +1240,12 @@ fn walk_member(node as *ast.Node) as void {
                     let is *d.Variable as sv with mut = sub_mod.scope.vars;
                     while (cast(i64, sv) != 0) {
                         if (d.str_eq(sv.name_ptr, sv.name_len, node.member_ptr, node.member_len) == 1) {
+                            if (sv.has_folded_init == 1) {
+                                node.kind = ast.NK_NUM;
+                                node.val = sv.folded_init_val;
+                                node.ty = cast(*ast.Type, sv.ty);
+                                return;
+                            }
                             node.kind = ast.NK_IDENT;
                             node.name_ptr = sv.asm_name_ptr;
                             node.name_len = sv.asm_name_len;
@@ -908,6 +1292,18 @@ fn walk_member(node as *ast.Node) as void {
             let is *d.Variable as mv with mut = modd.scope.vars;
             while (cast(i64, mv) != 0) {
                 if (d.str_eq(mv.name_ptr, mv.name_len, node.member_ptr, node.member_len) == 1) {
+                    // Const-prop through module access: `os.current` where
+                    // `current` is an imut global folded to a literal in
+                    // walk_let should collapse to that literal here too —
+                    // otherwise dead-branch elim in if-statements that use
+                    // `os.X == os.Y` patterns wouldn't fire for module-
+                    // qualified references.
+                    if (mv.has_folded_init == 1) {
+                        node.kind = ast.NK_NUM;
+                        node.val = mv.folded_init_val;
+                        node.ty = cast(*ast.Type, mv.ty);
+                        return;
+                    }
                     node.kind = ast.NK_IDENT;
                     node.name_ptr = mv.asm_name_ptr;
                     node.name_len = mv.asm_name_len;

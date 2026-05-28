@@ -1,7 +1,8 @@
 use "../../std/mem.cst" as mem;
-use "../../std/linux.cst" as linux;
 use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
+use "../semantic/scope.cst" as sc;
+use "../semantic/defs.cst" as sd;
 use "defs.cst" as d;
 use "gen.cst" as g;
 use "gen_expr.cst" as ge;
@@ -41,12 +42,21 @@ fn eval_const_expr(node as *ast.Node) as i64 {
         }
         return node.val;
     }
+    // Reference to another `with imut` global whose init was folded in
+    // semantic — pick up the value so `let X with imut = A + B;` works
+    // when A and B are imut globals themselves.
+    if (node.kind == ast.NK_IDENT) {
+        let is *sd.Variable as v = sc.lookup_var(node.name_ptr, node.name_len);
+        if (cast(i64, v) != 0 && v.has_folded_init == 1) {
+            return v.folded_init_val;
+        }
+    }
     if (node.kind == ast.NK_ADD) { return eval_const_expr(node.lhs) + eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_SUB) { return eval_const_expr(node.lhs) - eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_MUL) { return eval_const_expr(node.lhs) * eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_DIV) { return eval_const_expr(node.lhs) / eval_const_expr(node.rhs); }
-    io.write_str(linux.STDERR, "ir: non-constant expr in global init\n");
-    linux.exit(1);
+    io.write_str(io.STDERR, "ir: non-constant expr in global init\n");
+    io.exit(1);
     return 0;
 }
 
@@ -59,10 +69,12 @@ fn cache_call_targets(func as *d.IRFunction) as void {
     while (cast(i64, inst) != 0) {
         if (inst.op == d.IR_CALL && inst.call_name_len > 0) { count = count + 1; }
         if (inst.op == d.IR_FN_ADDR && inst.global_name_len > 0) { count = count + 1; }
+        if (inst.op == d.IR_ADDR_GLOBAL && inst.global_name_len > 0) { count = count + 1; }
         inst = inst.next;
     }
     if (count == 0) { func.call_target_count = 0; return; }
-    // Each entry: 8 bytes ptr + 4 bytes len = 12 bytes
+    // Each entry: 8 bytes ptr + 4 bytes len = 12 bytes. Names refer to either
+    // functions or globals; mark_reachable resolves both kinds by lookup.
     let is *u8 as buf = d.opt_alloc(cast(i64, count) * 12);
     let is i32 as idx with mut = 0;
     inst = func.instructions;
@@ -75,6 +87,13 @@ fn cache_call_targets(func as *d.IRFunction) as void {
             idx = idx + 1;
         }
         if (inst.op == d.IR_FN_ADDR && inst.global_name_len > 0) {
+            let is *i64 as pp = cast(*i64, cast(i64, buf) + cast(i64, idx) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, buf) + cast(i64, idx) * 12 + 8);
+            *pp = cast(i64, inst.global_name_ptr);
+            *pl = inst.global_name_len;
+            idx = idx + 1;
+        }
+        if (inst.op == d.IR_ADDR_GLOBAL && inst.global_name_len > 0) {
             let is *i64 as pp = cast(*i64, cast(i64, buf) + cast(i64, idx) * 12);
             let is *i32 as pl = cast(*i32, cast(i64, buf) + cast(i64, idx) * 12 + 8);
             *pp = cast(i64, inst.global_name_ptr);
@@ -97,6 +116,15 @@ fn _reach_by_name(prog as *d.IRProgram, tname as *u8, tlen as i32) as void {
             mark_reachable(prog, f);
         }
         f = f.next;
+    }
+    // A name in the cached-targets buffer can refer to either a function
+    // (IR_CALL/IR_FN_ADDR) or a global (IR_ADDR_GLOBAL). Try both kinds.
+    let is *d.IRGlobal as gg with mut = prog.globals;
+    while (cast(i64, gg) != 0) {
+        if (d.str_eq(gg.name_ptr, gg.name_len, tname, tlen) == 1) {
+            gg.is_reachable = 1;
+        }
+        gg = gg.next;
     }
 }
 
@@ -470,17 +498,22 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
     }
 
     if (g.ir_depth == 1 && cast(i64, prog.main_func) == 0 && no_main == 0) {
-        io.write_str(linux.STDERR, "ir: function main not found\n");
-        linux.exit(1);
+        io.write_str(io.STDERR, "ir: function main not found\n");
+        io.exit(1);
     }
 
     prog.strings = g.string_head;
 
     if (cast(i64, prog.main_func) != 0) {
         mark_reachable(prog, prog.main_func);
-        // Mark all globals reachable — freed functions can't propagate IR_ADDR_GLOBAL
-        let is *d.IRGlobal as rg with mut = prog.globals;
-        while (cast(i64, rg) != 0) { rg.is_reachable = 1; rg = rg.next; }
+        // Globals placed in a custom ELF section are there for a side-effect
+        // (named section in the ELF/PE output) — keep them even if no
+        // reachable code references them.
+        let is *d.IRGlobal as sg with mut = prog.globals;
+        while (cast(i64, sg) != 0) {
+            if (sg.section_len > 0) { sg.is_reachable = 1; }
+            sg = sg.next;
+        }
         // Functions referenced only via fn_ptr in global init need to be kept alive.
         let is *d.IRGlobal as fg with mut = prog.globals;
         while (cast(i64, fg) != 0) {

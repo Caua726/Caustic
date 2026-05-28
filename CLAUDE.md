@@ -15,14 +15,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Compiler usage:**
 ```bash
-./caustic <source.cst>           # Generates <source.cst>.s assembly
-./caustic <source.cst> -o prog   # Full pipeline: compile + assemble + link
-./caustic -c <source.cst>        # Compile only (no main required, for libraries)
-./caustic -O1 <source.cst> -o p  # Optimized build
-./caustic -debuglexer <file>     # Debug tokenization
-./caustic -debugparser <file>    # Debug AST
-./caustic -debugir <file>        # Debug IR generation
-./caustic --profile <file> -o p  # Show per-phase timing
+./caustic <source.cst>                       # Generates <source.cst>.s assembly
+./caustic <source.cst> -o prog               # Full pipeline: compile + assemble + link
+./caustic -c <source.cst>                    # Compile only (no main required, for libraries)
+./caustic -O1 <source.cst> -o p              # Optimized build
+./caustic --target=linux-x86_64 ... (default)
+./caustic --target=windows-x86_64 src.cst -o p.exe   # Cross-compile PE/COFF for Windows
+./caustic -debuglexer <file>                 # Debug tokenization
+./caustic -debugparser <file>                # Debug AST
+./caustic -debugir <file>                    # Debug IR generation
+./caustic --profile <file> -o p              # Show per-phase timing
 
 # Full manual pipeline:
 ./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program && ./program
@@ -38,7 +40,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Caustic is a self-hosted native x86_64 Linux compiler, with no LLVM or runtime dependencies. Direct syscall-based execution.
+Caustic is a self-hosted native x86_64 compiler targeting **Linux (ELF) and Windows (PE)** with no LLVM or runtime dependencies. Linux builds use direct syscalls; Windows builds use kernel32/ws2_32/bcrypt DLL imports via the MS x64 ABI (System V internally, trampolined at FFI boundary).
 
 ### Compiler Pipeline (6 phases)
 
@@ -113,33 +115,140 @@ let is *u8 as cb = fn_ptr(Point_sum);        // impl method
 let is i64 as result = call(cb, arg1, arg2); // indirect call (type-checked)
 
 // Low-level
-syscall(1, 1, "hello", 5);  // direct syscall
+syscall(1, 1, "hello", 5);  // direct syscall (Linux only — rejected at codegen on Windows builds)
 asm("mov rax, 1\n");        // inline asm
 cast(*u8, address);         // type cast
+
+// Extern FFI (DLL imports on Windows builds)
+extern "kernel32.dll" fn ExitProcess(code as u32) as void;
+extern "ws2_32.dll" fn WSAStartup(version as u32, data as *u8) as i32;
+// Call sites lower to IR_FFI_CALL: shadow space + SysV→MS-x64 reorder
+// + `call qword ptr [rip+__imp_<name>]` (FF 15) via IAT.
+
+// Compile-time target detection
+let is i32 as os_id with imut = os.current;             // folded at parse: 1 = Linux, 2 = Windows
+if (os.current == os.OS_LINUX) { syscall(1, ...); }
+else if (os.current == os.OS_WINDOWS) { os.windows.WriteFile(...); }
 ```
+
+## Cross-target programming
+
+Code that needs to do OS-specific work uses `std/os.cst` as the single
+entry point. The `os.current` identifier folds to a literal `1` (Linux)
+or `2` (Windows) at parse time, and the IR generator dead-strips
+branches whose condition evaluates to a constant — so the wrong-target
+code path never reaches codegen and the syscall gate never fires:
+
+```cst
+use "std/os.cst" as os;
+
+fn write_byte(b as u8) as void {
+    if (os.current == os.OS_LINUX) {
+        syscall(1, 1, &b, 1);                // Linux: raw write(stdout, &b, 1)
+    } else if (os.current == os.OS_WINDOWS) {
+        let is u32 as w with mut = 0;
+        os.windows.WriteFile(
+            os.windows.GetStdHandle(os.windows.STD_OUTPUT_HANDLE),
+            &b, 1, &w, cast(*u8, 0));
+    }
+}
+```
+
+How the dispatch lowers:
+1. `os.current` is a `let with imut` global whose initialiser folds to a
+   literal at semantic time (`__target_is_linux * 1 + __target_is_windows * 2`).
+2. AST-level const-prop rewrites `os.current` references to `NK_NUM`.
+3. AST-level const-fold rewrites the comparison to `NK_NUM(0|1)`.
+4. IR-gen dead-branch elim drops the inactive arm of `if (NK_NUM)`.
+5. Codegen only sees the active arm — no kernel32 in Linux binaries,
+   no `syscall` instruction in Windows binaries.
+
+In practice, most user code just imports the **portable facades**
+(`std/io.cst`, `std/mem.cst`, `std/net.cst`, etc) which already use the
+`os.current == os.OS_X` pattern internally. Direct OS calls via
+`os.linux.X` / `os.windows.X` are for code that genuinely needs raw
+access; everything else delegates through the facades.
+
+### `with imut` semantics
+
+Caustic's `imut` qualifier means **both** "doesn't change after init"
+**and** "compile-time-known":
+
+- `let is i32 as X with imut = <expr>;` — init must fold to a literal at
+  semantic time. The compiler propagates the literal at every use site.
+  Foldable inits: literals, arithmetic on literals, references to other
+  imut globals with literal-foldable inits.
+- `let is i32 as X = some_runtime_call();` — variable is still immutable
+  (Caustic default), but the value is decided at runtime; the compiler
+  emits a normal load.
+
+This unification (`imut` = "no runtime dependency") is what makes
+`os.current == os.OS_LINUX` dead-strip cleanly without a `comptime`
+keyword.
+
+### Parser builtins (low-level)
+
+The compiler injects two integer literals at parse time:
+
+- `__target_is_linux` — `1` on `--target=linux-x86_64`, `0` otherwise
+- `__target_is_windows` — `1` on `--target=windows-x86_64`, `0` otherwise
+
+User code should generally **not** touch these directly — they exist as
+implementation primitives for `os.cst`'s `current` computation. Same
+mechanism as `__builtin_va_start` (parser intercepts the identifier and
+emits a literal NK_NUM in its place).
 
 ## Standard Library (`std/`)
 
-- `linux.cst` — 40+ syscall wrappers (file, process, memory, network, time)
+The stdlib is organised as **portable facades** (top-level) backed by
+**per-OS impls** in subdirectories. All facades work on both targets via
+the `os.current == os.OS_X` dispatch pattern; user code imports the
+facade only.
+
+**Raw OS bindings:**
+- `os.cst` — Hub re-exporting `os.linux` + `os.windows` submodules.
+  Exposes `os.current` (i32, 1=Linux, 2=Windows) and `os.OS_LINUX` /
+  `os.OS_WINDOWS` constants — used by portable code for target dispatch.
+- `os/linux.cst` — 40+ syscall wrappers (file, process, memory, network, time)
+- `os/windows.cst` — kernel32, ws2_32, bcrypt extern declarations
+  (CreateFileA, WriteFile, VirtualAlloc, WSASocketA, BCryptGenRandom, etc)
+
+**Portable facades** (dispatch internally via `os.current`):
 - `mem.cst` — Memory management hub with 5 allocators:
   - `mem/freelist.cst` — O(n) alloc/free, address-ordered coalescing
   - `mem/bins.cst` — O(1) alloc/free, slab-based, bitmap double-free detection
   - `mem/arena.cst` — O(1) bump allocator, bulk free
   - `mem/pool.cst` — O(1) fixed-size slots, optional debug
   - `mem/lifo.cst` — O(1) stack-like allocator
-- `string.cst` — Dynamic strings (concat, find, substring, split, trim, replace)
+  - `mem/linux.cst` / `mem/windows.cst` — page_alloc/page_free per OS (mmap vs VirtualAlloc)
 - `io.cst` — Buffered I/O, printf, file/directory operations
+  - `io/linux.cst` / `io/windows.cst` — write/read/open/lseek per OS
+- `string.cst` — Dynamic strings (concat, find, substring, split, trim, replace) — pure, no OS deps
 - `slice.cst` — Generic dynamic array (`Slice gen T`)
 - `types.cst` — `Option gen T` and `Result gen T, E`
 - `map.cst` — Hash maps (MapI64 splitmix64, MapStr FNV-1a)
-- `math.cst` — abs, min, max, pow, gcd, lcm, align_up/down
-- `sort.cst` — quicksort, heapsort, mergesort with fn_ptr comparators
-- `random.cst` — xoshiro256** PRNG, rejection sampling range
-- `net.cst` — TCP/UDP sockets, bind/listen/accept, poll
+- `math.cst` — abs, min, max, pow, gcd, lcm, align_up/down — pure
+- `sort.cst` — quicksort, heapsort, mergesort with fn_ptr comparators — pure
+- `random.cst` — xoshiro256** PRNG, rejection sampling range. Dispatches
+  entropy seed to `getrandom` (Linux) or `BCryptGenRandom` (Windows).
+- `net.cst` — TCP/UDP sockets, bind/listen/accept, poll. Auto-calls
+  `WSAStartup` on Windows; expose `net.init()` / `net.cleanup()` for
+  explicit lifecycle control.
 - `time.cst` — Monotonic/wall clock, sleep, elapsed
-- `env.cst` — argc/argv, getenv
-- `arena.cst` — Standalone bump allocator (same as mem/arena.cst)
-- `compatcffi.cst` — C FFI struct passing helpers
+  - `time/linux.cst` / `time/windows.cst` — clock_gettime vs QueryPerformanceCounter / GetSystemTimeAsFileTime
+- `env.cst` — argc/argv, getenv. On Windows, getenv routes through
+  `GetEnvironmentVariableA`; on Linux, walks the inherited envp[].
+  argc/argv come from the Windows entry stub's `__caustic_parse_argv`
+  (CommandLineToArgvA-equivalent, hand-rolled in `caustic-ld`).
+- `term.cst` — Terminal: ANSI escapes (portable bytes), raw mode
+  (termios on Linux, GetConsoleMode + ENABLE_VIRTUAL_TERMINAL_INPUT on Windows),
+  size query (TIOCGWINSZ vs GetConsoleScreenBufferInfo)
+- `process.cst` — fork/execve/wait on Linux; CreateProcessA +
+  WaitForSingleObject + GetExitCodeProcess on Windows. `capture()` is
+  Linux-only for now (Windows needs CreatePipe wiring).
+- `arena.cst` — Standalone bump allocator (delegates to `mem/core.cst`)
+- `compatcffi.cst` — C FFI struct passing helpers — pure, debug prints
+  route through `io.cst`
 
 ## Adding New Operators/Features
 
@@ -182,3 +291,11 @@ fn work() as i32 {
 - **Debug info**: Generated assembly includes `.file` and `.loc` DWARF directives for source-level debugging with GDB
 - **Packed structs**: No alignment padding between fields. `sizeof({i64,i32,i64})` = 20, not 24.
 - **Custom sections**: `with section(".name")` places globals/functions in named ELF sections. Linker merges by name across .o files. Only works on top-level declarations.
+- **PE debug info is Caustic-linker-only**: on `--target=windows-x86_64`, codegen emits `.cstdebug` / `.cstsigs` / `.cststructs` / `.cstlocals` custom sections per .obj. `caustic-ld` synthesizes the EXE's CodeView `.debug$S`/`.debug$T` content and the matching `.pdb` from those sections at link time. External linkers (lld-link, MSVC link.exe) do not understand these — linking Caustic objects with them silently drops all debug info. Same applies to `.cstimport` (PE import directives). Pure ELF builds never see these sections (codegen gates on `target.object_format == 2`).
+- **`syscall(...)` is Linux-only**: the codegen-time gate rejects emission of the `syscall` instruction when `target.syscall_supported == 0` (Windows). The check fires only for IR that survived DCE — so `syscall` calls inside `if (os.current == os.OS_LINUX)` branches don't break Windows builds (the branch is dead-stripped before codegen).
+- **PE section RVAs are dynamic**: `caustic-ld` sizes each PE section to its actual content (`.text` size may span multiple 4 KiB pages); `.idata`/`.rdata`/`.data`/`.pdata`/`.xdata`/`.reloc` RVAs follow at the next page-aligned slot. Earlier hardcoded RVAs caused section-overlap page faults once `.text` exceeded one page.
+- **WSAStartup is auto-init**: `std/net.cst` calls `WSAStartup(MAKEWORD(2,2), ...)` on first use of any socket dispatcher. Programs that never touch sockets don't pay for it (function-level DCE drops the loader-side `__imp_WSAStartup` entry).
+
+## Future work (not implemented)
+
+- **`with imut` on functions** — extend the `imut` qualifier from variables to functions, meaning "pure (no syscall, no extern fn, no mut globals, only calls to other imut) and parse-time evaluable when args are literals". When the compiler sees a call to a `with imut` fn with all-literal args, run the body in a tree-walking interpreter at semantic time and substitute the result as a literal. This is the "Layer 2" of the comptime design — variables and globals already have this in the form of init-expression const-prop; functions don't yet. Plan: ~500 lines (parser annotation + semantic purity check + AST interpreter). Defer until a concrete use case appears (lookup-table generation, compile-time string hashing, etc). See `/home/caua/.claude/projects/-home-caua-Documentos-Projetos-Pessoais-Caustic/memory/comptime_design.md` for the full design discussion.

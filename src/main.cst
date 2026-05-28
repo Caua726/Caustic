@@ -1,6 +1,6 @@
-use "../std/linux.cst" as linux;
 use "../std/mem.cst" as mem;
 use "../std/io.cst" as io;
+use "../std/time.cst" as time;
 use "lexer/tokens.cst" as tok;
 use "lexer/lexer.cst" as lex;
 use "parser/ast.cst" as ast;
@@ -28,23 +28,23 @@ use "parser/dump.cst" as dump;
 // ── Utility functions ──────────────────────────────────────────────
 
 fn read_file_size(path as *u8) as i64 {
-    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    let is i64 as fd = io._open_read(path);
     if (fd < 0) { return 0; }
-    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
-    linux.close(fd);
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._close_fd(fd);
     return size;
 }
 
 fn read_file(path as *u8, out_size as *i64) as *u8 {
-    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    let is i64 as fd = io._open_read(path);
     if (fd < 0) { return cast(*u8, 0); }
-    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
-    linux.lseek(fd, 0, linux.SEEK_SET);
-    if (size <= 0) { linux.close(fd); return cast(*u8, 0); }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (size <= 0) { io._close_fd(fd); return cast(*u8, 0); }
     let is *u8 as buf = ird.opt_alloc(size + 1);
-    linux.read(fd, buf, size);
+    io._read_fd(fd, buf, size);
     buf[size] = cast(u8, 0);
-    linux.close(fd);
+    io._close_fd(fd);
     *out_size = size;
     return buf;
 }
@@ -63,7 +63,7 @@ fn starts_with_dash_l(s as *u8) as i32 {
 fn get_dir_len(path_ptr as *u8, path_len as i32) as i32 {
     let is i32 as i with mut = path_len - 1;
     while (i >= 0) {
-        if (path_ptr[i] == 47) { return i; }
+        if (path_ptr[i] == 47 || path_ptr[i] == 92) { return i; }
         i = i - 1;
     }
     return 0;
@@ -76,9 +76,7 @@ fn strlen(s as *u8) as i32 {
 }
 
 fn get_time_us() as i64 {
-    let is [2]i64 as ts;
-    syscall(228, 1, &ts);
-    return ts[0] * 1000000 + ts[1] / 1000;
+    return time.now_us();
 }
 
 fn parse_int_arg(s as *u8) as i64 {
@@ -96,11 +94,12 @@ fn parse_int_arg(s as *u8) as i64 {
 fn estimate_source_size(filename as *u8, fname_len as i32) as i64 {
     let is i64 as fsize = read_file_size(filename);
     if (fsize <= 0) { return fsize; }
-    let is i64 as fd = linux.open(filename, linux.O_RDONLY, 0);
+    let is i64 as fd = io._open_read(filename);
     if (fd < 0) { return fsize; }
-    let is *u8 as buf = linux.mmap(cast(*u8, 0), fsize, 1, 2, fd, 0);
-    linux.close(fd);
-    if (cast(i64, buf) < 0) { return fsize; }
+    let is *u8 as buf = mem.core.mmap_anon(fsize);
+    if (cast(i64, buf) <= 0) { io._close_fd(fd); return fsize; }
+    io._read_fd(fd, buf, fsize);
+    io._close_fd(fd);
 
     let is i64 as total with mut = fsize;
     let is i32 as dir_len = get_dir_len(filename, fname_len);
@@ -141,13 +140,13 @@ fn estimate_source_size(filename as *u8, fname_len as i32) as i64 {
         }
     }
 
-    linux.munmap(buf, fsize);
+    mem.core.munmap(buf, fsize);
     return total * 5;
 }
 
 fn resolve_stdlib_dir() as void {
     let is [4096]u8 as buf;
-    let is i64 as n = linux.readlink("/proc/self/exe", &buf, 4096);
+    let is i64 as n = io.get_self_path(&buf, 4096);
     if (n <= 0) {
         sem.set_stdlib_dir("/usr/local/lib/caustic", 22);
         return;
@@ -168,9 +167,7 @@ fn resolve_stdlib_dir() as void {
     mem.memcpy(stdlib_path, &buf, cast(i64, parent_dir));
     mem.memcpy(cast(*u8, cast(i64, stdlib_path) + cast(i64, parent_dir)), "/lib/caustic", cast(i64, suffix_len));
     stdlib_path[total] = cast(u8, 0);
-    // Verify the computed path exists, otherwise fall back to /usr/local/lib/caustic
-    let is i64 as check_fd = linux.access(stdlib_path, linux.F_OK);
-    if (check_fd == 0) {
+    if (io.exists(stdlib_path) == 1) {
         sem.set_stdlib_dir(stdlib_path, total);
     } else {
         sem.set_stdlib_dir("/usr/local/lib/caustic", 22);
@@ -301,20 +298,16 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
             let is i32 as tlen = arglen - 9;
             let is i32 as ok = tgt.load_target(triple, tlen);
             if (ok == 0) {
-                io.write_str(linux.STDERR, "Error: unknown --target '");
-                io.write_bytes(linux.STDERR, triple, cast(i64, tlen));
-                io.write_str(linux.STDERR, "'. Supported: linux-x86_64, windows-x86_64\n");
-                return 1;
-            }
-            if (tgt.str_eq_local(triple, tlen, "windows-x86_64", 14) == 1) {
-                io.write_str(linux.STDERR, "Error: windows-x86_64 target not yet implemented (Fase 0 scaffolding)\n");
+                io.write_str(io.STDERR, "Error: unknown --target '");
+                io.write_bytes(io.STDERR, triple, cast(i64, tlen));
+                io.write_str(io.STDERR, "'. Supported: linux-x86_64, windows-x86_64\n");
                 return 1;
             }
         } else if (arg[0] == 45 && arglen > 1) {
             // Unknown flag starting with '-'
-            io.write_str(linux.STDERR, "Error: unknown option '");
-            io.write_bytes(linux.STDERR, arg, cast(i64, arglen));
-            io.write_str(linux.STDERR, "'\n");
+            io.write_str(io.STDERR, "Error: unknown option '");
+            io.write_bytes(io.STDERR, arg, cast(i64, arglen));
+            io.write_str(io.STDERR, "'\n");
             return 1;
         } else {
             if (g_file_count < 64) {
@@ -326,7 +319,7 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
     }
 
     if (g_file_count == 0) {
-        io.write_str(linux.STDERR, "Error: no input file\n");
+        io.write_str(io.STDERR, "Error: no input file\n");
         return 1;
     }
     return 0;
@@ -340,9 +333,9 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     let is i64 as file_size with mut = 0;
     let is *u8 as src with mut = read_file(filename, &file_size);
     if (cast(i64, src) == 0) {
-        io.write_str(linux.STDERR, "Error: cannot read file: ");
-        io.write_str(linux.STDERR, filename);
-        io.write_str(linux.STDERR, "\n");
+        io.write_str(io.STDERR, "Error: cannot read file: ");
+        io.write_str(io.STDERR, filename);
+        io.write_str(io.STDERR, "\n");
         return 1;
     }
     let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
@@ -353,7 +346,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         let is *u8 as loaded = ircr.read_ir_cache(ir_path, src_hash);
         if (cast(i64, loaded) != 0) {
             *prog_out = cast(i64, loaded);
-            if (g_quiet == 0) { io.write_str(linux.STDOUT, "caustic: "); io.write_str(linux.STDOUT, filename); io.write_str(linux.STDOUT, " (cached ir)\n"); }
+            if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, filename); io.write_str(io.STDOUT, " (cached ir)\n"); }
             return 0;
         }
     }
@@ -371,7 +364,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
             src = cached_src;
             file_size = cached_size;
             tok_cached = 1;
-            if (g_quiet == 0) { io.write_str(linux.STDOUT, "caustic: "); io.write_str(linux.STDOUT, filename); io.write_str(linux.STDOUT, " (cached tokens, "); io.write_int(linux.STDOUT, cast(i64, tokens.count)); io.write_str(linux.STDOUT, " tokens)\n"); }
+            if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, filename); io.write_str(io.STDOUT, " (cached tokens, "); io.write_int(io.STDOUT, cast(i64, tokens.count)); io.write_str(io.STDOUT, " tokens)\n"); }
         }
     }
 
@@ -383,7 +376,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
             prof.prof_source_bytes = file_size;
             prof.prof_token_count = tokens.count;
         }
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "caustic: "); io.write_str(linux.STDOUT, filename); io.write_str(linux.STDOUT, " ("); io.write_int(linux.STDOUT, file_size); io.write_str(linux.STDOUT, " bytes, "); io.write_int(linux.STDOUT, cast(i64, tokens.count)); io.write_str(linux.STDOUT, " tokens)\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, filename); io.write_str(io.STDOUT, " ("); io.write_int(io.STDOUT, file_size); io.write_str(io.STDOUT, " bytes, "); io.write_int(io.STDOUT, cast(i64, tokens.count)); io.write_str(io.STDOUT, " tokens)\n"); }
     }
 
     // Emit/cache tokens
@@ -392,7 +385,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         mem.memcpy(tok_path, filename, cast(i64, fname_len));
         mem.memcpy(cast(*u8, cast(i64, tok_path) + cast(i64, fname_len)), ".tokens", 8);
         tokcache.write_token_cache(tok_path, cast(*u8, &tokens), src, file_size);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, tok_path); io.write_str(linux.STDOUT, "\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, tok_path); io.write_str(io.STDOUT, "\n"); }
     }
     if (cast(i64, cache_dir) != 0 && tok_cached == 0) {
         let is *u8 as tok_cpath = build_cache_path(cache_dir, filename, ".tokens", 7);
@@ -411,7 +404,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
             dump.dump_ast(dn, 0);
             dn = dn.next;
         }
-        linux.exit(0);
+        io.exit(0);
     }
 
     // Emit AST
@@ -420,14 +413,14 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         mem.memcpy(ast_path, filename, cast(i64, fname_len));
         mem.memcpy(cast(*u8, cast(i64, ast_path) + cast(i64, fname_len)), ".ast", 5);
         astcw.write_ast_cache(ast_path, root, src_hash);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, ast_path); io.write_str(linux.STDOUT, "\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ast_path); io.write_str(io.STDOUT, "\n"); }
     }
 
     // Semantic
     let is i64 as t2 = get_time_us();
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
     prof.prof_record("semantic", get_time_us() - t2);
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "semantic: ok\n"); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "semantic: ok\n"); }
 
     // Emit interface and stop
     if ((cache_flags & 1) != 0) {
@@ -435,16 +428,16 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         mem.memcpy(csti_path, filename, cast(i64, fname_len));
         csti_path[fname_len] = 105;
         csti_path[fname_len + 1] = cast(u8, 0);
-        let is i64 as iface_fd = linux.open(csti_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+        let is i64 as iface_fd = io._open_write(csti_path);
         if (iface_fd < 0) {
-            io.write_str(linux.STDERR, "Error: cannot open interface file: ");
-            io.write_str(linux.STDERR, csti_path);
-            io.write_str(linux.STDERR, "\n");
+            io.write_str(io.STDERR, "Error: cannot open interface file: ");
+            io.write_str(io.STDERR, csti_path);
+            io.write_str(io.STDERR, "\n");
             return 1;
         }
         iface.emit_csti(cast(*u8, root), iface_fd);
-        linux.close(iface_fd);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, csti_path); io.write_str(linux.STDOUT, "\n"); }
+        io._close_fd(iface_fd);
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, csti_path); io.write_str(io.STDOUT, "\n"); }
         *prog_out = 0;
         return 0;
     }
@@ -456,8 +449,8 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     ird.ir_opt_level = g_opt_level;
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), no_main);
     prof.prof_record("ir", get_time_us() - t3);
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "ir: ok\n"); }
-    if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); linux.exit(0); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "ir: ok\n"); }
+    if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); io.exit(0); }
     if (g_debug_ir == 1 && g_opt_level >= 1) { irdebug.ir_print_phase(cast(*u8, prog), "before optimization"); }
     if (prof.prof_enabled == 1) {
         let is *ird.IRFunction as pf with mut = prog.functions;
@@ -485,7 +478,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     if (g_debug_ir == 1 && g_opt_level >= 1) {
         irdebug.dbg_show_dead = 1;
         irdebug.ir_print_phase(cast(*u8, prog), "after optimization");
-        linux.exit(0);
+        io.exit(0);
     }
 
     // Emit/cache IR
@@ -494,7 +487,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         mem.memcpy(ir_path, filename, cast(i64, fname_len));
         mem.memcpy(cast(*u8, cast(i64, ir_path) + cast(i64, fname_len)), ".ir", 4);
         ircw.write_ir_cache(ir_path, cast(*u8, prog), src_hash);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, ir_path); io.write_str(linux.STDOUT, "\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ir_path); io.write_str(io.STDOUT, "\n"); }
     }
     if (cast(i64, cache_dir) != 0) {
         let is *u8 as ir_cpath = build_cache_path(cache_dir, filename, ".ir", 3);
@@ -518,15 +511,15 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     asm_path[fname_len + 1] = 115;
     asm_path[fname_len + 2] = cast(u8, 0);
 
-    let is i64 as out_fd = linux.open(asm_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+    let is i64 as out_fd = io._open_write(asm_path);
     if (out_fd < 0) {
-        io.write_str(linux.STDERR, "Error: cannot open output file\n");
+        io.write_str(io.STDERR, "Error: cannot open output file\n");
         return 1;
     }
     cgd.set_opt_level(g_opt_level);
     cg.cg_quiet = g_quiet;
     cgd.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
-    linux.close(out_fd);
+    io._close_fd(out_fd);
     ird.ir_alloc_destroy();
     if (g_opt_level >= 1) { ph.optimize_asm(asm_path); }
     prof.prof_record("codegen", get_time_us() - t4);
@@ -549,12 +542,12 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     let is i64 as t5 = get_time_us();
     let is i32 as asm_err = asmmod.assemble_file(asm_path, obj_path);
     if (asm_err != 0) {
-        io.write_str(linux.STDERR, "Error: assembly failed\n");
+        io.write_str(io.STDERR, "Error: assembly failed\n");
         return 1;
     }
     prof.prof_record("assembler", get_time_us() - t5);
     if (prof.prof_enabled == 1) { prof.prof_obj_bytes = read_file_size(obj_path); }
-    linux.unlink(asm_path);
+    io.unlink(asm_path);
 
     // Copy obj_path to stack buffer
     let is i32 as oi with mut = 0;
@@ -591,7 +584,7 @@ fn run_single_file(filename as *u8) as i32 {
     let is i64 as file_size with mut = 0;
     let is *u8 as src = read_file(filename, &file_size);
     if (cast(i64, src) == 0) {
-        io.write_str(linux.STDERR, "Error: cannot read file\n");
+        io.write_str(io.STDERR, "Error: cannot read file\n");
         return 1;
     }
     let is i64 as t1 = get_time_us();
@@ -602,7 +595,7 @@ fn run_single_file(filename as *u8) as i32 {
         prof.prof_source_bytes = file_size;
         prof.prof_token_count = tokens.count;
     }
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "caustic: "); io.write_str(linux.STDOUT, filename); io.write_str(linux.STDOUT, " ("); io.write_int(linux.STDOUT, file_size); io.write_str(linux.STDOUT, " bytes, "); io.write_int(linux.STDOUT, cast(i64, tokens.count)); io.write_str(linux.STDOUT, " tokens)\n"); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, filename); io.write_str(io.STDOUT, " ("); io.write_int(io.STDOUT, file_size); io.write_str(io.STDOUT, " bytes, "); io.write_int(io.STDOUT, cast(i64, tokens.count)); io.write_str(io.STDOUT, " tokens)\n"); }
 
     let is i32 as fname_len = strlen(filename);
 
@@ -612,7 +605,7 @@ fn run_single_file(filename as *u8) as i32 {
         mem.memcpy(tok_path, filename, cast(i64, fname_len));
         mem.memcpy(cast(*u8, cast(i64, tok_path) + cast(i64, fname_len)), ".tokens", 8);
         tokcache.write_token_cache(tok_path, cast(*u8, &tokens), src, file_size);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, tok_path); io.write_str(linux.STDOUT, "\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, tok_path); io.write_str(io.STDOUT, "\n"); }
     }
 
     let is i64 as t2 = get_time_us();
@@ -626,7 +619,7 @@ fn run_single_file(filename as *u8) as i32 {
             dump.dump_ast(dn, 0);
             dn = dn.next;
         }
-        linux.exit(0);
+        io.exit(0);
     }
 
     // --emit-ast
@@ -636,21 +629,21 @@ fn run_single_file(filename as *u8) as i32 {
         mem.memcpy(cast(*u8, cast(i64, ast_path) + cast(i64, fname_len)), ".ast", 5);
         let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
         astcw.write_ast_cache(ast_path, root, src_hash);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, ast_path); io.write_str(linux.STDOUT, "\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ast_path); io.write_str(io.STDOUT, "\n"); }
     }
 
     let is i64 as t3 = get_time_us();
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
     prof.prof_record("semantic", get_time_us() - t3);
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "semantic: ok\n"); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "semantic: ok\n"); }
 
     let is i64 as t_ir = get_time_us();
     irg.ir_tl = cast(*u8, &tokens);
     ird.ir_opt_level = g_opt_level;
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), g_no_main);
     prof.prof_record("ir", get_time_us() - t_ir);
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "ir: ok\n"); }
-    if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); linux.exit(0); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "ir: ok\n"); }
+    if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); io.exit(0); }
     if (g_debug_ir == 1 && g_opt_level >= 1) { irdebug.ir_print_phase(cast(*u8, prog), "before optimization"); }
 
     let is i64 as t_opt = get_time_us();
@@ -663,7 +656,7 @@ fn run_single_file(filename as *u8) as i32 {
     if (g_debug_ir == 1 && g_opt_level >= 1) {
         irdebug.dbg_show_dead = 1;
         irdebug.ir_print_phase(cast(*u8, prog), "after optimization");
-        linux.exit(0);
+        io.exit(0);
     }
 
     // --emit-ir
@@ -673,7 +666,7 @@ fn run_single_file(filename as *u8) as i32 {
         mem.memcpy(cast(*u8, cast(i64, ir_path) + cast(i64, fname_len)), ".ir", 4);
         let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
         ircw.write_ir_cache(ir_path, cast(*u8, prog), src_hash);
-        if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, ir_path); io.write_str(linux.STDOUT, "\n"); }
+        if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ir_path); io.write_str(io.STDOUT, "\n"); }
     }
 
     let is i32 as asm_len = fname_len + 2;
@@ -682,9 +675,9 @@ fn run_single_file(filename as *u8) as i32 {
     asm_path[fname_len] = 46;
     asm_path[fname_len + 1] = 115;
     asm_path[fname_len + 2] = cast(u8, 0);
-    let is i64 as out_fd = linux.open(asm_path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 438);
+    let is i64 as out_fd = io._open_write(asm_path);
     if (out_fd < 0) {
-        io.write_str(linux.STDERR, "Error: cannot open output file\n");
+        io.write_str(io.STDERR, "Error: cannot open output file\n");
         return 1;
     }
     if (prof.prof_enabled == 1) { cg.cg_prof_init(4096); }
@@ -692,7 +685,7 @@ fn run_single_file(filename as *u8) as i32 {
     cgd.set_opt_level(g_opt_level);
     cg.cg_quiet = g_quiet;
     cgd.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
-    linux.close(out_fd);
+    io._close_fd(out_fd);
     ird.ir_alloc_destroy();
     if (g_opt_level >= 1) { ph.optimize_asm(asm_path); }
     prof.prof_record("codegen", get_time_us() - t4);
@@ -700,7 +693,7 @@ fn run_single_file(filename as *u8) as i32 {
     if (prof.prof_enabled == 1 && cg.cg_prof_count > 0) {
         prof.prof_print_top_funcs();
     }
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, asm_path); io.write_str(linux.STDOUT, "\n"); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, asm_path); io.write_str(io.STDOUT, "\n"); }
     prof.prof_print();
     return 0;
 }
@@ -731,7 +724,7 @@ fn link_objects(obj_paths_buf as *u8, obj_path_offsets as *i32,
     let is i32 as link_err = ldmod.link_objs(cast(*u8, &obj_arr), g_file_count, output_path,
                                               cast(*u8, &g_lib_names), g_lib_count);
     if (link_err != 0) {
-        io.write_str(linux.STDERR, "Error: linking failed\n");
+        io.write_str(io.STDERR, "Error: linking failed\n");
         return 1;
     }
     prof.prof_record("linker", get_time_us() - t6);
@@ -740,7 +733,7 @@ fn link_objects(obj_paths_buf as *u8, obj_path_offsets as *i32,
     let is i32 as ci with mut = 0;
     while (ci < g_file_count) {
         let is *u8 as opath = cast(*u8, cast(i64, obj_paths_buf) + cast(i64, obj_path_offsets[ci]));
-        linux.unlink(opath);
+        io.unlink(opath);
         ci = ci + 1;
     }
     return 0;
@@ -783,12 +776,12 @@ fn run_multi_file() as i32 {
     if (g_no_main == 1) {
         if (g_file_count == 1 && g_output_path != 0) {
             let is *u8 as gen_obj = cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[0]));
-            linux.rename(gen_obj, cast(*u8, g_output_path));
-            if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, cast(*u8, g_output_path)); io.write_str(linux.STDOUT, "\n"); }
+            io.rename(gen_obj, cast(*u8, g_output_path));
+            if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, cast(*u8, g_output_path)); io.write_str(io.STDOUT, "\n"); }
         } else {
             let is i32 as pi with mut = 0;
             while (pi < g_file_count) {
-                if (g_quiet == 0) { io.write_str(linux.STDOUT, "wrote: "); io.write_str(linux.STDOUT, cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[pi]))); io.write_str(linux.STDOUT, "\n"); }
+                if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, cast(*u8, cast(i64, &obj_paths_buf) + cast(i64, obj_path_offsets[pi]))); io.write_str(io.STDOUT, "\n"); }
                 pi = pi + 1;
             }
         }
@@ -797,14 +790,14 @@ fn run_multi_file() as i32 {
     }
 
     if (g_output_path == 0) {
-        io.write_str(linux.STDERR, "Error: -o required for linking\n");
+        io.write_str(io.STDERR, "Error: -o required for linking\n");
         return 1;
     }
 
     let is i32 as lerr = link_objects(&obj_paths_buf, &obj_path_offsets, cast(*u8, g_output_path));
     if (lerr != 0) { return 1; }
 
-    if (g_quiet == 0) { io.write_str(linux.STDOUT, "caustic: "); io.write_str(linux.STDOUT, cast(*u8, g_output_path)); io.write_str(linux.STDOUT, "\n"); }
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, cast(*u8, g_output_path)); io.write_str(io.STDOUT, "\n"); }
 
     prof.prof_print();
     return 0;
@@ -814,38 +807,38 @@ fn run_multi_file() as i32 {
 
 fn main(argc as i64, argv as i64) as i32 {
     if (argc < 2) {
-        io.write_str(linux.STDERR, "Usage: caustic <source.cst>... [-o output] [-c] [-O1] [--profile]\n");
-        io.write_str(linux.STDERR, "       caustic --version | --help\n");
+        io.write_str(io.STDERR, "Usage: caustic <source.cst>... [-o output] [-c] [-O1] [--profile]\n");
+        io.write_str(io.STDERR, "       caustic --version | --help\n");
         return 1;
     }
     let is *i64 as argv_arr_pre = cast(*i64, argv);
     let is *u8 as first_arg = cast(*u8, argv_arr_pre[1]);
     if (str_eq(first_arg, strlen(first_arg), "--version", 9) == 1) {
-        io.write_str(linux.STDOUT, "caustic ");
-        io.write_str(linux.STDOUT, ver.VERSION);
-        io.write_str(linux.STDOUT, "\n");
-        io.write_str(linux.STDOUT, "self-hosted native x86_64 Linux compiler\n");
-        io.write_str(linux.STDOUT, "target: x86_64-linux (static, no libc)\n");
-        io.write_str(linux.STDOUT, "author: Caua\n");
-        io.write_str(linux.STDOUT, "repo:   github.com/Caua726/Caustic\n");
+        io.write_str(io.STDOUT, "caustic ");
+        io.write_str(io.STDOUT, ver.VERSION);
+        io.write_str(io.STDOUT, "\n");
+        io.write_str(io.STDOUT, "self-hosted native x86_64 Linux compiler\n");
+        io.write_str(io.STDOUT, "target: x86_64-linux (static, no libc)\n");
+        io.write_str(io.STDOUT, "author: Caua\n");
+        io.write_str(io.STDOUT, "repo:   github.com/Caua726/Caustic\n");
         return 0;
     }
     if (str_eq(first_arg, strlen(first_arg), "--help", 6) == 1) {
-        io.write_str(linux.STDOUT, "caustic ");
-        io.write_str(linux.STDOUT, ver.VERSION);
-        io.write_str(linux.STDOUT, " — native x86_64 compiler\n\n");
-        io.write_str(linux.STDOUT, "Usage: caustic <source.cst>... [options]\n\n");
-        io.write_str(linux.STDOUT, "Options:\n");
-        io.write_str(linux.STDOUT, "  -o <file>       Output executable\n");
-        io.write_str(linux.STDOUT, "  -c              Compile only (no main required)\n");
-        io.write_str(linux.STDOUT, "  -O0, -O1        Optimization level\n");
-        io.write_str(linux.STDOUT, "  -lname          Link dynamic library\n");
-        io.write_str(linux.STDOUT, "  --profile       Show per-phase timing\n");
-        io.write_str(linux.STDOUT, "  --cache <dir>   Cache directory for incremental builds\n");
-        io.write_str(linux.STDOUT, "  --path <dir>    Extra module search path\n");
-        io.write_str(linux.STDOUT, "  --max-ram <MB>  Memory limit\n");
-        io.write_str(linux.STDOUT, "  --version       Show version\n");
-        io.write_str(linux.STDOUT, "  --help          Show this help\n");
+        io.write_str(io.STDOUT, "caustic ");
+        io.write_str(io.STDOUT, ver.VERSION);
+        io.write_str(io.STDOUT, " — native x86_64 compiler\n\n");
+        io.write_str(io.STDOUT, "Usage: caustic <source.cst>... [options]\n\n");
+        io.write_str(io.STDOUT, "Options:\n");
+        io.write_str(io.STDOUT, "  -o <file>       Output executable\n");
+        io.write_str(io.STDOUT, "  -c              Compile only (no main required)\n");
+        io.write_str(io.STDOUT, "  -O0, -O1        Optimization level\n");
+        io.write_str(io.STDOUT, "  -lname          Link dynamic library\n");
+        io.write_str(io.STDOUT, "  --profile       Show per-phase timing\n");
+        io.write_str(io.STDOUT, "  --cache <dir>   Cache directory for incremental builds\n");
+        io.write_str(io.STDOUT, "  --path <dir>    Extra module search path\n");
+        io.write_str(io.STDOUT, "  --max-ram <MB>  Memory limit\n");
+        io.write_str(io.STDOUT, "  --version       Show version\n");
+        io.write_str(io.STDOUT, "  --help          Show this help\n");
         return 0;
     }
     tgt.target_init();
@@ -853,7 +846,7 @@ fn main(argc as i64, argv as i64) as i32 {
     if (parse_args(argc, argv_arr) != 0) { return 1; }
 
     if (g_cache_dir != 0) {
-        linux.mkdir(cast(*u8, g_cache_dir), 493);
+        io.mkdir(cast(*u8, g_cache_dir));
     }
 
     // --emit-interface: compile to semantic only

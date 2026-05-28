@@ -1,4 +1,3 @@
-use "../../std/linux.cst" as linux;
 use "../../std/mem.cst" as mem;
 use "../../std/io.cst" as io;
 use "../lexer/tokens.cst" as tok;
@@ -6,6 +5,7 @@ use "ast.cst" as ast;
 use "util.cst" as pu;
 use "type.cst" as pt;
 use "stmt.cst" as ps;
+use "expr.cst" as pe;
 
 fn parse_params(fn_node as *ast.Node) as void {
     pu.expect(tok.TK_LPAREN);
@@ -103,10 +103,18 @@ fn parse_fn() as *ast.Node {
     } else {
         fn_node.return_type = ast.type_i32;
     }
-    // Optional: with section("...")
-    if (pu.cur().kind == tok.TK_WITH) {
+    // Optional: with <section("...") | imut>+
+    // Multiple `with` clauses allowed: `fn f() as i32 with imut with section(".x")`.
+    while (pu.cur().kind == tok.TK_WITH) {
         pu.advance();
-        if (pu.cur().kind == tok.TK_IDENT && tok.streq_lit(pu.cur().ptr, pu.cur().len, "section") == 1) {
+        if (pu.cur().kind == tok.TK_IDENT && tok.streq_lit(pu.cur().ptr, pu.cur().len, "imut") == 1) {
+            // `with imut` — marks the function as pure + parse-time-evaluable.
+            // Body must use only literals, lets, ifs, whiles, arith/cmp ops,
+            // and calls to other imut fns. Call sites with all-literal args
+            // are folded by the AST interpreter before IR gen.
+            fn_node.is_imut = 1;
+            pu.advance();
+        } else if (pu.cur().kind == tok.TK_IDENT && tok.streq_lit(pu.cur().ptr, pu.cur().len, "section") == 1) {
             pu.advance();
             pu.expect(tok.TK_LPAREN);
             if (pu.cur().kind != tok.TK_STRING) { pu.error_expected("expected string argument for section"); }
@@ -115,7 +123,7 @@ fn parse_fn() as *ast.Node {
             pu.advance();
             pu.expect(tok.TK_RPAREN);
         } else {
-            pu.error_expected("expected 'section' after 'with' in function declaration");
+            pu.error_expected("expected 'imut' or 'section' after 'with' in function declaration");
         }
     }
     fn_node.body = ps.parse_block();
@@ -252,6 +260,74 @@ fn parse_enum_decl() as *ast.Node {
     return n;
 }
 
+// Try to fold a parse-time-known integer expression. Supports parser
+// builtins (`__target_is_linux`, `__target_is_windows`), integer literals,
+// and the same arithmetic / comparison operators as semantic const-fold.
+// The parser deliberately accepts only a tiny grammar here — no calls,
+// no identifier lookups, no globals — so the fold can run BEFORE semantic
+// analysis. Returns 1 on success (value in *out), 0 if the expression
+// uses anything we can't evaluate at parse time.
+fn try_parse_time_fold(n as *ast.Node, out as *i64) as i32 {
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) { *out = n.val; return 1; }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL
+        || k == ast.NK_DIV || k == ast.NK_MOD
+        || k == ast.NK_EQ  || k == ast.NK_NE
+        || k == ast.NK_LT  || k == ast.NK_LE
+        || k == ast.NK_GT  || k == ast.NK_GE) {
+        let is i64 as l with mut = 0;
+        let is i64 as r with mut = 0;
+        if (try_parse_time_fold(n.lhs, &l) == 0) { return 0; }
+        if (try_parse_time_fold(n.rhs, &r) == 0) { return 0; }
+        if (k == ast.NK_ADD) { *out = l + r; return 1; }
+        if (k == ast.NK_SUB) { *out = l - r; return 1; }
+        if (k == ast.NK_MUL) { *out = l * r; return 1; }
+        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
+        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
+        if (k == ast.NK_EQ) { *out = 0; if (l == r) { *out = 1; } return 1; }
+        if (k == ast.NK_NE) { *out = 0; if (l != r) { *out = 1; } return 1; }
+        if (k == ast.NK_LT) { *out = 0; if (l <  r) { *out = 1; } return 1; }
+        if (k == ast.NK_LE) { *out = 0; if (l <= r) { *out = 1; } return 1; }
+        if (k == ast.NK_GT) { *out = 0; if (l >  r) { *out = 1; } return 1; }
+        if (k == ast.NK_GE) { *out = 0; if (l >= r) { *out = 1; } return 1; }
+    }
+    return 0;
+}
+
+// `if (CONST) use "..." as alias;` — top-level comptime-gated import.
+// When CONST folds to non-zero, the wrapped use is parsed and returned
+// normally. When CONST is zero, the use's path string is never resolved,
+// so the wrong-target stdlib backend doesn't get loaded at all. Returns
+// the use node or null if dead-stripped.
+fn parse_top_if_use() as *ast.Node {
+    pu.expect(tok.TK_IF);
+    pu.expect(tok.TK_LPAREN);
+    let is *ast.Node as cond = pe.parse_expr();
+    pu.expect(tok.TK_RPAREN);
+    let is i64 as v with mut = 0;
+    let is i32 as ok = try_parse_time_fold(cond, &v);
+    if (ok == 0) {
+        pu.error_expected("condition of top-level `if (...)` must fold at parse time (use __target_is_linux / __target_is_windows or integer literals)");
+        return cast(*ast.Node, 0);
+    }
+    if (v == 0) {
+        // Dead branch — skip the body without parsing the path string into
+        // a module load. Body must still be syntactically a top-level decl.
+        if (pu.cur().kind == tok.TK_USE) {
+            // Parse and discard
+            let is *ast.Node as discarded = parse_use();
+            return cast(*ast.Node, 0);
+        }
+        pu.error_expected("expected `use` after `if (...)`");
+        return cast(*ast.Node, 0);
+    }
+    // Condition is true — parse the inner decl normally.
+    if (pu.cur().kind == tok.TK_USE) { return parse_use(); }
+    pu.error_expected("expected `use` after `if (...)`");
+    return cast(*ast.Node, 0);
+}
+
 fn parse_use() as *ast.Node {
     let is i32 as tidx = pu.p_pos;
     pu.expect(tok.TK_USE);
@@ -363,6 +439,11 @@ fn parse_file(tl as *tok.TokenList, src as *u8, src_len as i64, filename as *u8)
         let is *ast.Node as node with mut = cast(*ast.Node, 0);
 
         if (pu.cur().kind == tok.TK_USE) { node = parse_use(); }
+        // Top-level `if (CONST) use "...";` — Zig-style comptime gate over
+        // an import. CONST must fold to a literal at parse time using only
+        // parser builtins (`__target_is_linux`, `__target_is_windows`).
+        // If false, skip the body; if true, parse the inner `use`.
+        else if (pu.cur().kind == tok.TK_IF) { node = parse_top_if_use(); }
         else if (pu.cur().kind == tok.TK_STRUCT) { node = parse_struct_decl(); }
         else if (pu.cur().kind == tok.TK_ENUM) { node = parse_enum_decl(); }
         else if (pu.cur().kind == tok.TK_LET) { node = ps.parse_var_decl(); }
@@ -392,8 +473,8 @@ fn parse_file(tl as *tok.TokenList, src as *u8, src_len as i64, filename as *u8)
     }
 
     if (pu.p_had_error == 1) {
-        io.write_str(linux.STDERR, "compilation aborted due to errors\n");
-        linux.exit(1);
+        io.write_str(io.STDERR, "compilation aborted due to errors\n");
+        io.exit(1);
     }
 
     return first;

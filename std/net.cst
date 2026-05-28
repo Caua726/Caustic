@@ -3,11 +3,147 @@
 // Networking primitives (IPv4 TCP/UDP)
 // =======================================================
 
-use "linux.cst" as linux;
+use "os.cst" as os;
+if (__target_is_linux)   use "os/linux.cst"   as linux;
+if (__target_is_windows) use "os/windows.cst" as win;
 use "mem.cst" only bins, core as mem;
 use "io.cst" as io;
 use "compatcffi.cst" as cffi;
 use "string.cst" as str;
+
+// === Cross-target socket dispatchers ===
+// Each helper picks the right backend at parse-time via const-prop. The
+// inactive branch is dead-stripped before codegen so neither Linux nor
+// Windows pays for the other's path.
+
+// Windows requires WSAStartup before any winsock call. Auto-init on first
+// use of any dispatcher — cheaper than asking the user to call net.init().
+let is i32 as _wsa_inited with mut = 0;
+let is [408]u8 as _wsa_data;
+
+fn _ensure_wsa() as void {
+    if (os.current == os.OS_WINDOWS) {
+        if (_wsa_inited == 0) {
+            win.WSAStartup(514, &_wsa_data);          // MAKEWORD(2, 2) = 0x0202
+            _wsa_inited = 1;
+        }
+    }
+}
+
+fn init() as i32 {
+    _ensure_wsa();
+    return 0;
+}
+
+fn cleanup() as i32 {
+    if (os.current == os.OS_WINDOWS) {
+        if (_wsa_inited == 1) {
+            win.WSACleanup();
+            _wsa_inited = 0;
+        }
+    }
+    return 0;
+}
+
+fn _sock_create(af as i32, sock_type as i32, proto as i32) as i64 {
+    _ensure_wsa();
+    if (os.current == os.OS_LINUX) {
+        return linux.socket(cast(i64, af), cast(i64, sock_type), cast(i64, proto));
+    }
+    if (os.current == os.OS_WINDOWS) {
+        return win.WSASocketA(af, sock_type, proto, cast(*u8, 0), 0, 0);
+    }
+    return 0 - 1;
+}
+
+fn _sock_close(s as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.close(s); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.closesocket(s)); }
+    return 0 - 1;
+}
+
+fn _sock_bind(s as i64, addr as *u8, addrlen as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.bind(s, addr, addrlen); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.bind(s, addr, cast(i32, addrlen))); }
+    return 0 - 1;
+}
+
+fn _sock_listen(s as i64, backlog as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.listen(s, backlog); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.listen(s, cast(i32, backlog))); }
+    return 0 - 1;
+}
+
+fn _sock_accept(s as i64, addr as *u8, addrlen as *u32) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.accept(s, addr, addrlen); }
+    if (os.current == os.OS_WINDOWS) {
+        let is i32 as alen with mut = 0;
+        if (cast(i64, addrlen) != 0) { alen = cast(i32, *addrlen); }
+        let is i64 as r = win.accept(s, addr, &alen);
+        if (cast(i64, addrlen) != 0) { *addrlen = cast(u32, alen); }
+        return r;
+    }
+    return 0 - 1;
+}
+
+fn _sock_connect(s as i64, addr as *u8, addrlen as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.connect(s, addr, addrlen); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.connect(s, addr, cast(i32, addrlen))); }
+    return 0 - 1;
+}
+
+fn _sock_setopt(s as i64, level as i64, opt as i64, val as *u8, vlen as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.setsockopt(s, level, opt, val, vlen); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.setsockopt(s, cast(i32, level), cast(i32, opt), val, cast(i32, vlen))); }
+    return 0 - 1;
+}
+
+fn _sock_send(s as i64, buf as *u8, len as i64, flags as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.sendto(s, buf, len, flags, cast(*u8, 0), 0); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.send(s, buf, cast(i32, len), cast(i32, flags))); }
+    return 0 - 1;
+}
+
+fn _sock_recv(s as i64, buf as *u8, len as i64, flags as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.recvfrom(s, buf, len, flags, cast(*u8, 0), cast(*u32, 0)); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.recv(s, buf, cast(i32, len), cast(i32, flags))); }
+    return 0 - 1;
+}
+
+fn _sock_sendto(s as i64, buf as *u8, len as i64, flags as i64, to as *u8, tolen as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.sendto(s, buf, len, flags, to, tolen); }
+    if (os.current == os.OS_WINDOWS) {
+        // Win has WSASendTo with WSABUF; for simplicity emulate via sendto-style
+        // call: ws2_32 export 'sendto' exists with the same signature.
+        return cast(i64, win.send(s, buf, cast(i32, len), cast(i32, flags)));
+    }
+    return 0 - 1;
+}
+
+fn _sock_recvfrom(s as i64, buf as *u8, len as i64, flags as i64, from as *u8, fromlen as *u32) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.recvfrom(s, buf, len, flags, from, fromlen); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.recv(s, buf, cast(i32, len), cast(i32, flags))); }
+    return 0 - 1;
+}
+
+fn _sock_set_nonblock(s as i64) as i64 {
+    if (os.current == os.OS_LINUX) {
+        let is i64 as flags = linux.fcntl(s, linux.F_GETFL, 0);
+        if (flags < 0) { return flags; }
+        return linux.fcntl(s, linux.F_SETFL, flags | linux.O_NONBLOCK);
+    }
+    if (os.current == os.OS_WINDOWS) {
+        let is u32 as on with mut = 1;
+        return cast(i64, win.ioctlsocket(s, win.W_FIONBIO, &on));
+    }
+    return 0 - 1;
+}
+
+fn _sock_poll(fds as *u8, n as i64, timeout_ms as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux.poll(fds, n, timeout_ms); }
+    if (os.current == os.OS_WINDOWS) { return cast(i64, win.WSAPoll(fds, cast(u32, n), cast(i32, timeout_ms))); }
+    return 0 - 1;
+}
 
 let is mem.Bins as _bins with mut;
 let is i32 as _ready with mut = 0;
@@ -26,12 +162,21 @@ fn _free(ptr as *u8) as void {
 // sockaddr_in layout: sin_family(2) + sin_port(2) + sin_addr(4) + padding(8) = 16 bytes
 let is i64 as SOCKADDR_IN_SIZE with imut = 16;
 
-// Socket options (SOL_SOCKET level)
-let is i64 as SO_KEEPALIVE  with imut = 9;
-let is i64 as SO_RCVTIMEO   with imut = 20;
-let is i64 as SO_SNDTIMEO   with imut = 21;
+// Cross-target socket constants. Linux and Windows agree on most TCP/UDP
+// numerics (AF_INET=2, SOCK_STREAM=1, IPPROTO_TCP=6, TCP_NODELAY=1, POLLIN=1,
+// POLLOUT=4) but disagree on SOL_SOCKET (1 vs 65535) and the SO_* family.
+// We pick per-target literals via the same __target_is_X * value trick used
+// by os.current, then const-prop folds each at use sites.
+let is i64 as SOL_SOCKET    with imut = (__target_is_linux * 1) + (__target_is_windows * 65535);
+let is i64 as SO_REUSEADDR  with imut = (__target_is_linux * 2) + (__target_is_windows * 4);
+let is i64 as SO_REUSEPORT  with imut = (__target_is_linux * 15) + (__target_is_windows * 4); // Win lacks SO_REUSEPORT; fall back to SO_REUSEADDR
+let is i64 as SO_KEEPALIVE  with imut = (__target_is_linux * 9) + (__target_is_windows * 8);
+let is i64 as SO_RCVTIMEO   with imut = (__target_is_linux * 20) + (__target_is_windows * 4102);
+let is i64 as SO_SNDTIMEO   with imut = (__target_is_linux * 21) + (__target_is_windows * 4101);
+let is i64 as POLLIN_FLAG   with imut = 1;
+let is i64 as POLLOUT_FLAG  with imut = 4;
 
-// TCP level options
+// TCP level options — same numeric on both targets.
 let is i64 as IPPROTO_TCP_LVL with imut = 6;
 let is i64 as TCP_NODELAY     with imut = 1;
 
@@ -170,17 +315,17 @@ fn ip4_parse(s as *u8) as i64 {
 
 // Create a TCP socket, returns fd or negative error
 fn tcp_socket() as i64 {
-    return linux.socket(linux.AF_INET, linux.SOCK_STREAM, 0);
+    return _sock_create(2, 1, 0);
 }
 
 // Create a UDP socket, returns fd or negative error
 fn udp_socket() as i64 {
-    return linux.socket(linux.AF_INET, linux.SOCK_DGRAM, 0);
+    return _sock_create(2, 2, 0);
 }
 
 // Close socket
 fn close(fd as i64) as void {
-    linux.close(fd);
+    _sock_close(fd);
 }
 
 // Set SO_REUSEADDR
@@ -188,7 +333,7 @@ fn set_reuseaddr(fd as i64) as i64 {
     let is [4]u8 as val;
     let is *i32 as p = cast(*i32, &val);
     *p = cast(i32, 1);
-    return linux.setsockopt(fd, linux.SOL_SOCKET, linux.SO_REUSEADDR, &val, 4);
+    return _sock_setopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, 4);
 }
 
 // Set SO_REUSEPORT
@@ -196,7 +341,7 @@ fn set_reuseport(fd as i64) as i64 {
     let is [4]u8 as val;
     let is *i32 as p = cast(*i32, &val);
     *p = cast(i32, 1);
-    return linux.setsockopt(fd, linux.SOL_SOCKET, linux.SO_REUSEPORT, &val, 4);
+    return _sock_setopt(fd, SOL_SOCKET, SO_REUSEPORT, &val, 4);
 }
 
 // Set TCP_NODELAY (disable Nagle)
@@ -204,7 +349,7 @@ fn set_nodelay(fd as i64) as i64 {
     let is [4]u8 as val;
     let is *i32 as p = cast(*i32, &val);
     *p = cast(i32, 1);
-    return linux.setsockopt(fd, IPPROTO_TCP_LVL, TCP_NODELAY, &val, 4);
+    return _sock_setopt(fd, IPPROTO_TCP_LVL, TCP_NODELAY, &val, 4);
 }
 
 // Set SO_KEEPALIVE
@@ -212,7 +357,7 @@ fn set_keepalive(fd as i64) as i64 {
     let is [4]u8 as val;
     let is *i32 as p = cast(*i32, &val);
     *p = cast(i32, 1);
-    return linux.setsockopt(fd, linux.SOL_SOCKET, SO_KEEPALIVE, &val, 4);
+    return _sock_setopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, 4);
 }
 
 // Set recv timeout in seconds
@@ -222,7 +367,7 @@ fn set_recv_timeout(fd as i64, secs as i64) as i64 {
     mem.core.memset(&tv, cast(i32, 0), 16);
     let is *i64 as p = cast(*i64, &tv);
     *p = secs;
-    return linux.setsockopt(fd, linux.SOL_SOCKET, SO_RCVTIMEO, &tv, 16);
+    return _sock_setopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, 16);
 }
 
 // Set send timeout in seconds
@@ -231,14 +376,12 @@ fn set_send_timeout(fd as i64, secs as i64) as i64 {
     mem.core.memset(&tv, cast(i32, 0), 16);
     let is *i64 as p = cast(*i64, &tv);
     *p = secs;
-    return linux.setsockopt(fd, linux.SOL_SOCKET, SO_SNDTIMEO, &tv, 16);
+    return _sock_setopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, 16);
 }
 
 // Set non-blocking mode
 fn set_nonblock(fd as i64) as i64 {
-    let is i64 as flags = linux.fcntl(fd, linux.F_GETFL, 0);
-    if (flags < 0) { return flags; }
-    return linux.fcntl(fd, linux.F_SETFL, flags | linux.O_NONBLOCK);
+    return _sock_set_nonblock(fd);
 }
 
 // --- Section 4: TCP operations ---
@@ -250,11 +393,11 @@ fn tcp_listen(a as Addr) as i64 {
 
     set_reuseaddr(fd);
 
-    let is i64 as r with mut = linux.bind(fd, a.data, SOCKADDR_IN_SIZE);
-    if (r < 0) { linux.close(fd); return r; }
+    let is i64 as r with mut = _sock_bind(fd, a.data, SOCKADDR_IN_SIZE);
+    if (r < 0) { _sock_close(fd); return r; }
 
-    r = linux.listen(fd, DEFAULT_BACKLOG);
-    if (r < 0) { linux.close(fd); return r; }
+    r = _sock_listen(fd, DEFAULT_BACKLOG);
+    if (r < 0) { _sock_close(fd); return r; }
 
     return fd;
 }
@@ -265,9 +408,9 @@ fn tcp_accept(server_fd as i64, client_buf as *u8) as i64 {
     let is u32 as addrlen with mut = cast(u32, SOCKADDR_IN_SIZE);
     let is i64 as fd with mut = 0;
     if (cast(i64, client_buf) != 0) {
-        fd = linux.accept(server_fd, client_buf, &addrlen);
+        fd = _sock_accept(server_fd, client_buf, &addrlen);
     } else {
-        fd = linux.accept(server_fd, cast(*u8, 0), cast(*u32, 0));
+        fd = _sock_accept(server_fd, cast(*u8, 0), cast(*u32, 0));
     }
     return fd;
 }
@@ -277,20 +420,20 @@ fn tcp_connect(a as Addr) as i64 {
     let is i64 as fd = tcp_socket();
     if (fd < 0) { return fd; }
 
-    let is i64 as r = linux.connect(fd, a.data, SOCKADDR_IN_SIZE);
-    if (r < 0) { linux.close(fd); return r; }
+    let is i64 as r = _sock_connect(fd, a.data, SOCKADDR_IN_SIZE);
+    if (r < 0) { _sock_close(fd); return r; }
 
     return fd;
 }
 
 // Send data. Returns bytes sent or negative error.
 fn send(fd as i64, buf as *u8, len as i64) as i64 {
-    return linux.sendto(fd, buf, len, 0, cast(*u8, 0), 0);
+    return _sock_send(fd, buf, len, 0);
 }
 
 // Receive data. Returns bytes received, 0 for EOF, or negative error.
 fn recv(fd as i64, buf as *u8, len as i64) as i64 {
-    return linux.recvfrom(fd, buf, len, 0, cast(*u8, 0), cast(*u32, 0));
+    return _sock_recv(fd, buf, len, 0);
 }
 
 // Send all data (loop until all bytes sent). Returns total sent or negative on first error.
@@ -357,15 +500,15 @@ fn udp_bind(a as Addr) as i64 {
     let is i64 as fd = udp_socket();
     if (fd < 0) { return fd; }
 
-    let is i64 as r = linux.bind(fd, a.data, SOCKADDR_IN_SIZE);
-    if (r < 0) { linux.close(fd); return r; }
+    let is i64 as r = _sock_bind(fd, a.data, SOCKADDR_IN_SIZE);
+    if (r < 0) { _sock_close(fd); return r; }
 
     return fd;
 }
 
 // Send UDP datagram to addr. Returns bytes sent or negative error.
 fn udp_send(fd as i64, buf as *u8, len as i64, a as Addr) as i64 {
-    return linux.sendto(fd, buf, len, 0, a.data, SOCKADDR_IN_SIZE);
+    return _sock_sendto(fd, buf, len, 0, a.data, SOCKADDR_IN_SIZE);
 }
 
 // Receive UDP datagram. Fills sender_buf (16 bytes sockaddr_in) if not null.
@@ -373,9 +516,9 @@ fn udp_send(fd as i64, buf as *u8, len as i64, a as Addr) as i64 {
 fn udp_recv(fd as i64, buf as *u8, len as i64, sender_buf as *u8) as i64 {
     let is u32 as addrlen with mut = cast(u32, SOCKADDR_IN_SIZE);
     if (cast(i64, sender_buf) != 0) {
-        return linux.recvfrom(fd, buf, len, 0, sender_buf, &addrlen);
+        return _sock_recvfrom(fd, buf, len, 0, sender_buf, &addrlen);
     }
-    return linux.recvfrom(fd, buf, len, 0, cast(*u8, 0), cast(*u32, 0));
+    return _sock_recv(fd, buf, len, 0);
 }
 
 // Send null-terminated string via UDP
@@ -408,16 +551,16 @@ fn pollfd_ready(pfd as *PollFd, event as i64) as i64 {
 // Poll on an array of PollFd. timeout_ms = -1 for infinite, 0 for non-blocking.
 // Returns number of ready fds, 0 for timeout, negative for error.
 fn net_poll(fds as *PollFd, count as i64, timeout_ms as i64) as i64 {
-    return linux.poll(cast(*u8, fds), count, timeout_ms);
+    return _sock_poll(cast(*u8, fds), count, timeout_ms);
 }
 
 // Convenience: wait for a single fd to be readable. Returns 1 if ready, 0 if timeout, -1 on error.
 fn wait_readable(fd as i64, timeout_ms as i64) as i64 {
     let is PollFd as pfd;
-    pollfd_init(&pfd, fd, linux.POLLIN);
-    let is i64 as r = linux.poll(cast(*u8, &pfd), 1, timeout_ms);
+    pollfd_init(&pfd, fd, POLLIN_FLAG);
+    let is i64 as r = _sock_poll(cast(*u8, &pfd), 1, timeout_ms);
     if (r > 0) {
-        if (pollfd_ready(&pfd, linux.POLLIN) == 1) { return 1; }
+        if (pollfd_ready(&pfd, POLLIN_FLAG) == 1) { return 1; }
     }
     if (r == 0) { return 0; }
     return 0 - 1;
@@ -426,10 +569,10 @@ fn wait_readable(fd as i64, timeout_ms as i64) as i64 {
 // Convenience: wait for a single fd to be writable. Returns 1 if ready, 0 if timeout, -1 on error.
 fn wait_writable(fd as i64, timeout_ms as i64) as i64 {
     let is PollFd as pfd;
-    pollfd_init(&pfd, fd, linux.POLLOUT);
-    let is i64 as r = linux.poll(cast(*u8, &pfd), 1, timeout_ms);
+    pollfd_init(&pfd, fd, POLLOUT_FLAG);
+    let is i64 as r = _sock_poll(cast(*u8, &pfd), 1, timeout_ms);
     if (r > 0) {
-        if (pollfd_ready(&pfd, linux.POLLOUT) == 1) { return 1; }
+        if (pollfd_ready(&pfd, POLLOUT_FLAG) == 1) { return 1; }
     }
     if (r == 0) { return 0; }
     return 0 - 1;

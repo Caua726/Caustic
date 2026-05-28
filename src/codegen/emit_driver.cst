@@ -1,5 +1,4 @@
 use "../../std/mem.cst" as mem;
-use "../../std/linux.cst" as linux;
 use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../ir/defs.cst" as d;
@@ -10,6 +9,7 @@ use "alloc_gc.cst" as gc;
 use "emit_output.cst" as eo;
 use "emit.cst" as e;
 use "emit_inst.cst" as ei;
+use "target.cst" as tgt;
 
 fn gen_func(func as *d.IRFunction) as void {
     // Init register cache, instruction selection use counts, and def table
@@ -31,11 +31,11 @@ fn gen_func(func as *d.IRFunction) as void {
         al.linear_scan_alloc(func, ctx);
     }
     if (eo.cg_quiet == 0) {
-        io.write_str(linux.STDERR, "    alloc ok, vregs=");
-        io.write_int(linux.STDERR, cast(i64, func.vreg_count));
-        io.write_str(linux.STDERR, " spills=");
-        io.write_int(linux.STDERR, cast(i64, ctx.stack_slots));
-        io.write_str(linux.STDERR, "\n");
+        io.write_str(io.STDERR, "    alloc ok, vregs=");
+        io.write_int(io.STDERR, cast(i64, func.vreg_count));
+        io.write_str(io.STDERR, " spills=");
+        io.write_int(io.STDERR, cast(i64, ctx.stack_slots));
+        io.write_str(io.STDERR, "\n");
     }
 
     // Set arg_spill_base so spill slots don't overlap with local vars
@@ -79,9 +79,24 @@ fn gen_func(func as *d.IRFunction) as void {
     if (mask & 8) { eo.out_line("push r14"); }
     if (mask & 16) { eo.out_line("push r15"); }
     if (ctx.aligned_stack_size > 0) {
-        eo.out_cstr("  sub rsp, ");
-        eo.out_int(cast(i64, ctx.aligned_stack_size));
-        eo.out_char(10);
+        // Windows: frames ≥ 4 KiB must probe guard pages before allocating,
+        // or the kernel refuses to commit the stack and raises a fault on
+        // the first store past the current commit limit. We call into
+        // __caustic_chkstk (emitted once by the PE linker) which touches
+        // each 4 KiB page descending from rsp, then we do the actual
+        // `sub rsp, rax`. Linux and small Windows frames keep the simple
+        // single-instruction prologue.
+        if (tgt.target_get().object_format == 2 && ctx.aligned_stack_size >= 4096) {
+            eo.out_cstr("  mov rax, ");
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
+            eo.out_line("call __caustic_chkstk");
+            eo.out_line("sub rsp, rax");
+        } else {
+            eo.out_cstr("  sub rsp, ");
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
+        }
     }
 
     // Variadic prologue: save 6 arg registers to register save area
@@ -326,7 +341,7 @@ fn set_opt_level(level as i32) as void {
 
 fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
     let is *d.IRProgram as p = cast(*d.IRProgram, prog);
-    if (eo.cg_quiet == 0) { io.write_str(linux.STDERR, "codegen: init\n"); }
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: init\n"); }
     d.opt_bins_init();
     eo.out_init(fd);
     eo.cg_filename = filename_ptr;
@@ -335,7 +350,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     eo.out_cstr(".intel_syntax noprefix\n");
 
     // data + bss
-    if (eo.cg_quiet == 0) { io.write_str(linux.STDERR, "codegen: data\n"); }
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: data\n"); }
     emit_data(p);
 
     // .text
@@ -346,7 +361,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     eo.out_cstr("\"\n");
 
     // Emit .globl for all reachable functions
-    if (eo.cg_quiet == 0) { io.write_str(linux.STDERR, "codegen: globl\n"); }
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: globl\n"); }
     let is *d.IRFunction as f with mut = p.functions;
     while (cast(i64, f) != 0) {
         if (f.is_reachable == 1) {
@@ -369,7 +384,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     }
 
     // Codegen per-function: regen freed functions, then codegen + free
-    if (eo.cg_quiet == 0) { io.write_str(linux.STDERR, "codegen: funcs\n"); }
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: funcs\n"); }
     f = p.functions;
     while (cast(i64, f) != 0) {
         if (f.is_reachable == 1) {
@@ -381,9 +396,9 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
                 }
             }
             if (eo.cg_quiet == 0) {
-                io.write_str(linux.STDERR, "  gen: ");
-                io.write_bytes(linux.STDERR, f.asm_name_ptr, cast(i64, f.asm_name_len));
-                io.write_str(linux.STDERR, "\n");
+                io.write_str(io.STDERR, "  gen: ");
+                io.write_bytes(io.STDERR, f.asm_name_ptr, cast(i64, f.asm_name_len));
+                io.write_str(io.STDERR, "\n");
             }
             if (eo.cg_prof_enabled == 1) {
                 let is i64 as t0 = eo.cg_prof_get_time_us();
@@ -399,12 +414,355 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     }
 
     // rodata (after codegen loop so regen'd strings are included)
-    if (eo.cg_quiet == 0) { io.write_str(linux.STDERR, "codegen: rodata\n"); }
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: rodata\n"); }
     p.strings = cast(*d.StringEntry, cast(i64, irp.get_string_head()));
     emit_rodata(p);
 
+    // .cststructs + .cstsigs + .cstlocals — function signature + struct +
+    // local-variable info for PDB type info. Struct table must be populated
+    // BEFORE .cstsigs so index assignment is stable (cstsigs encodes
+    // (300, struct_idx) pairs). .cstlocals consults the same table.
+    if (tgt.target_get().object_format == 2) {
+        _struct_table_init();
+        emit_cstsigs(p);
+        emit_cstlocals(p);
+        emit_cststructs();
+    }
+
     eo.out_flush();
-    if (eo.cg_quiet == 0) { io.write_str(linux.STDERR, "codegen: done\n"); }
+    if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: done\n"); }
+}
+
+// === Struct collection (for .cststructs) ===
+//
+// Codegen walks all reachable function signatures, collects every struct
+// type that appears, and assigns each a 0-based index. The .cststructs
+// section emits the definition (name + fields). .cstsigs encodes struct
+// types as (kind=300, extra=struct_index) so the linker can resolve them
+// to TPI LF_STRUCTURE records.
+
+let is i32 as MAX_STRUCTS with imut = 256;
+let is *u8 as g_struct_types with mut;        // *ast.Type[MAX_STRUCTS], lazy
+let is i32 as g_struct_count with mut = 0;
+
+// Lazy: first _struct_index_of call allocates the table. _struct_table_init
+// stays callable to RESET state for a second codegen pass.
+fn _struct_table_init() as void {
+    g_struct_types = cast(*u8, 0);
+    g_struct_count = 0;
+}
+
+// Return existing index, or add and return new index.
+fn _struct_index_of(t as *ast.Type) as i32 {
+    if (cast(i64, g_struct_types) == 0) {
+        g_struct_types = d.opt_alloc(cast(i64, MAX_STRUCTS) * 8);
+    }
+    let is *i64 as arr = cast(*i64, g_struct_types);
+    let is i32 as i with mut = 0;
+    while (i < g_struct_count) {
+        let is *ast.Type as e = cast(*ast.Type, arr[i]);
+        if (e.name_len == t.name_len) {
+            let is i32 as k with mut = 0;
+            let is i32 as eq with mut = 1;
+            while (k < t.name_len) {
+                if (e.name_ptr[k] != t.name_ptr[k]) { eq = 0; k = t.name_len; }
+                k = k + 1;
+            }
+            if (eq == 1) { return i; }
+        }
+        i = i + 1;
+    }
+    if (g_struct_count >= MAX_STRUCTS) { return 0; }
+    arr[g_struct_count] = cast(i64, t);
+    let is i32 as idx = g_struct_count;
+    g_struct_count = g_struct_count + 1;
+    return idx;
+}
+
+// === Type encoding for .cstsigs ===
+//
+// Each type is encoded as a (kind, extra) u32 pair. Kind values:
+//   0..16  primitive type — directly mirrors ast.TY_*
+//   100+P  pointer to primitive P (P in 0..16)
+//   200+P  array of primitive P (extra = element count)
+//   300    struct (extra = struct_index in .cststructs)
+//   400    function pointer (extra = 0)
+//   999    fallback / unknown
+//
+// Non-primitive bases (pointer-to-pointer, pointer-to-struct, array-of-struct)
+// collapse to 999 in this single-pair encoding. A future encoding can switch
+// to a per-function local type table for full recursion.
+fn _type_pair_kind(ty as *u8) as i32 {
+    if (cast(i64, ty) == 0) { return 0; }                       // void
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind >= 0 && t.kind <= 13) { return t.kind; }         // primitive 0..13
+    if (t.kind == ast.TY_PTR) {
+        let is *ast.Type as b = t.base;
+        if (cast(i64, b) != 0 && b.kind >= 0 && b.kind <= 13) {
+            return 100 + b.kind;
+        }
+        if (cast(i64, b) != 0 && b.kind == ast.TY_STRUCT) {
+            return 500;                                          // pointer-to-struct
+        }
+        return 999;
+    }
+    if (t.kind == ast.TY_ARRAY) {
+        let is *ast.Type as b = t.base;
+        if (cast(i64, b) != 0 && b.kind >= 0 && b.kind <= 13) {
+            return 200 + b.kind;
+        }
+        return 999;
+    }
+    if (t.kind == ast.TY_STRUCT) { return 300; }
+    if (t.kind == ast.TY_FN)     { return 400; }
+    return 999;
+}
+
+fn _type_pair_extra(ty as *u8) as i32 {
+    if (cast(i64, ty) == 0) { return 0; }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    if (t.kind == ast.TY_ARRAY) { return t.array_len; }
+    if (t.kind == ast.TY_STRUCT) { return _struct_index_of(t); }
+    if (t.kind == ast.TY_PTR) {
+        let is *ast.Type as b = t.base;
+        if (cast(i64, b) != 0 && b.kind == ast.TY_STRUCT) {
+            return _struct_index_of(b);
+        }
+    }
+    return 0;
+}
+
+fn _emit_type_pair(ty as *u8) as void {
+    eo.out_cstr("  .long ");
+    eo.out_int(cast(i64, _type_pair_kind(ty)));
+    eo.out_char(10);
+    eo.out_cstr("  .long ");
+    eo.out_int(cast(i64, _type_pair_extra(ty)));
+    eo.out_char(10);
+}
+
+// Recursively walk an AST subtree, emitting one entry per NK_LET node.
+// Single-pass: writes asm directives directly to the output stream and
+// returns the count. The caller (emit_cstlocals) writes the count first
+// into a separate buffered pass, then re-walks to emit; the two passes
+// follow identical rules so the count and the emit always agree.
+//
+// Recursion is restricted to STATEMENT-BEARING fields (body, stmts,
+// then_b, else_b, cases, for_init, payload_args, args, next) plus
+// init_expr (block-expressions used as rvalues can contain nested lets).
+// Pure-expression fields (cond, expr, for_step, lhs, rhs) are skipped.
+// For NK_LET nodes themselves we don't recurse into init_expr a second
+// time — that would re-visit nested lets reached via the let's own
+// initializer block from the parent scope's walk.
+fn _walk_locals(n as *u8, emit as i32, out_count as *i32) as void {
+    if (cast(i64, n) == 0) { return; }
+    let is *ast.Node as nd = cast(*ast.Node, n);
+    let is i32 as is_let with mut = 0;
+    if (nd.kind == ast.NK_LET && nd.is_extern == 0 && nd.is_global == 0
+        && nd.name_len > 0 && cast(i64, nd.ty) != 0) { is_let = 1; }
+    if (is_let == 1) {
+        if (emit == 1) {
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, nd.name_len));
+            eo.out_char(10);
+            eo.out_cstr("  .ascii \"");
+            eo.out_str(nd.name_ptr, nd.name_len);
+            eo.out_cstr("\"\n");
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, nd.var_offset));
+            eo.out_char(10);
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, _type_pair_kind(cast(*u8, nd.ty))));
+            eo.out_char(10);
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, _type_pair_extra(cast(*u8, nd.ty))));
+            eo.out_char(10);
+        }
+        *out_count = *out_count + 1;
+    }
+    _walk_locals(cast(*u8, nd.body), emit, out_count);
+    _walk_locals(cast(*u8, nd.stmts), emit, out_count);
+    _walk_locals(cast(*u8, nd.then_b), emit, out_count);
+    _walk_locals(cast(*u8, nd.else_b), emit, out_count);
+    _walk_locals(cast(*u8, nd.cases), emit, out_count);
+    _walk_locals(cast(*u8, nd.for_init), emit, out_count);
+    _walk_locals(cast(*u8, nd.payload_args), emit, out_count);
+    _walk_locals(cast(*u8, nd.args), emit, out_count);
+    if (is_let == 0) {
+        _walk_locals(cast(*u8, nd.init_expr), emit, out_count);
+    }
+    _walk_locals(cast(*u8, nd.next), emit, out_count);
+}
+
+// Emit .cstlocals section. Per reachable function:
+//   u32 name_len, byte[name_len] name, u32 num_locals,
+//   per local: u32 name_len, byte[name_len] name, u32 var_offset,
+//              u32 type_kind, u32 type_extra
+//
+// Locals include function parameters AND every NK_LET in the function
+// body (recursively walked). var_offset is positive; locals are accessed
+// via [rbp - var_offset] in the emitted code, so the linker emits
+// S_DEFRANGE_FRAMEPOINTER_REL with -var_offset as OffsetFP.
+fn emit_cstlocals(prog as *d.IRProgram) as void {
+    eo.out_cstr(".section .cstlocals\n");
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            let is *ast.Node as fnd = cast(*ast.Node, f.ast_node);
+            if (cast(i64, fnd) != 0) {
+                // Count: num_params + num_lets-in-body (count-only pass).
+                let is i32 as num_params with mut = 0;
+                let is *ast.Node as pc with mut = fnd.params;
+                while (cast(i64, pc) != 0) { num_params = num_params + 1; pc = pc.next; }
+                let is i32 as num_lets with mut = 0;
+                _walk_locals(cast(*u8, fnd.body), 0, &num_lets);
+                let is i32 as total = num_params + num_lets;
+
+                eo.out_cstr("  .long ");
+                eo.out_int(cast(i64, f.asm_name_len));
+                eo.out_char(10);
+                eo.out_cstr("  .ascii \"");
+                eo.out_str(f.asm_name_ptr, f.asm_name_len);
+                eo.out_cstr("\"\n");
+                eo.out_cstr("  .long ");
+                eo.out_int(cast(i64, total));
+                eo.out_char(10);
+
+                // Params first
+                let is *ast.Node as p with mut = fnd.params;
+                while (cast(i64, p) != 0) {
+                    eo.out_cstr("  .long ");
+                    eo.out_int(cast(i64, p.name_len));
+                    eo.out_char(10);
+                    eo.out_cstr("  .ascii \"");
+                    eo.out_str(p.name_ptr, p.name_len);
+                    eo.out_cstr("\"\n");
+                    eo.out_cstr("  .long ");
+                    eo.out_int(cast(i64, p.var_offset));
+                    eo.out_char(10);
+                    eo.out_cstr("  .long ");
+                    eo.out_int(cast(i64, _type_pair_kind(cast(*u8, p.ty))));
+                    eo.out_char(10);
+                    eo.out_cstr("  .long ");
+                    eo.out_int(cast(i64, _type_pair_extra(cast(*u8, p.ty))));
+                    eo.out_char(10);
+                    p = p.next;
+                }
+
+                // Then lets in body (emit pass).
+                let is i32 as let_emitted with mut = 0;
+                _walk_locals(cast(*u8, fnd.body), 1, &let_emitted);
+            } else {
+                // Synthesized function (no AST node) — emit 0 locals.
+                eo.out_cstr("  .long ");
+                eo.out_int(cast(i64, f.asm_name_len));
+                eo.out_char(10);
+                eo.out_cstr("  .ascii \"");
+                eo.out_str(f.asm_name_ptr, f.asm_name_len);
+                eo.out_cstr("\"\n");
+                eo.out_cstr("  .long 0\n");
+            }
+        }
+        f = f.next;
+    }
+}
+
+// Emit .cststructs section. Each entry, in collection order:
+//   u32 name_len, byte[name_len] name,
+//   u32 size_bytes,
+//   u32 num_fields,
+//   per field: u32 name_len, byte[name_len] name, u32 offset,
+//              u32 type_kind, u32 type_extra
+fn emit_cststructs() as void {
+    if (g_struct_count == 0) { return; }
+    eo.out_cstr(".section .cststructs\n");
+    let is *i64 as arr = cast(*i64, g_struct_types);
+    let is i32 as i with mut = 0;
+    while (i < g_struct_count) {
+        let is *ast.Type as t = cast(*ast.Type, arr[i]);
+        eo.out_cstr("  .long ");
+        eo.out_int(cast(i64, t.name_len));
+        eo.out_char(10);
+        eo.out_cstr("  .ascii \"");
+        eo.out_str(t.name_ptr, t.name_len);
+        eo.out_cstr("\"\n");
+        eo.out_cstr("  .long ");
+        eo.out_int(cast(i64, t.size));
+        eo.out_char(10);
+        // field_count on ast.Type isn't reliably populated; count the
+        // linked list ourselves.
+        let is i32 as fc with mut = 0;
+        let is *ast.Node as fcw with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, fcw) != 0) { fc = fc + 1; fcw = fcw.next; }
+        eo.out_cstr("  .long ");
+        eo.out_int(cast(i64, fc));
+        eo.out_char(10);
+        // fields linked list
+        let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, f) != 0) {
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, f.name_len));
+            eo.out_char(10);
+            eo.out_cstr("  .ascii \"");
+            eo.out_str(f.name_ptr, f.name_len);
+            eo.out_cstr("\"\n");
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, f.var_offset));
+            eo.out_char(10);
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, _type_pair_kind(cast(*u8, f.ty))));
+            eo.out_char(10);
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, _type_pair_extra(cast(*u8, f.ty))));
+            eo.out_char(10);
+            f = f.next;
+        }
+        i = i + 1;
+    }
+}
+
+// Emit .cstsigs section. Per reachable function:
+//   u32 name_len, byte[name_len] name, u32 num_args,
+//   (u32 kind, u32 extra)[1 + num_args]   ; ret type first, then args
+//
+// Records are not padded — the linker reads byte-aligned u32s.
+fn emit_cstsigs(prog as *d.IRProgram) as void {
+    eo.out_cstr(".section .cstsigs\n");
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1) {
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, f.asm_name_len));
+            eo.out_char(10);
+            eo.out_cstr("  .ascii \"");
+            eo.out_str(f.asm_name_ptr, f.asm_name_len);
+            eo.out_cstr("\"\n");
+            eo.out_cstr("  .long ");
+            eo.out_int(cast(i64, f.num_args));
+            eo.out_char(10);
+
+            // Return type then arg types — pulled from the AST FnDef node
+            // attached to this IRFunction. Missing nodes (synthesized
+            // functions) fall back to void/empty args.
+            let is *ast.Node as fnd = cast(*ast.Node, f.ast_node);
+            if (cast(i64, fnd) != 0) {
+                _emit_type_pair(cast(*u8, fnd.return_type));
+                let is *ast.Node as p with mut = fnd.params;
+                while (cast(i64, p) != 0) {
+                    _emit_type_pair(cast(*u8, p.ty));
+                    p = p.next;
+                }
+            } else {
+                _emit_type_pair(cast(*u8, 0));    // void return
+                let is i32 as ai with mut = 0;
+                while (ai < f.num_args) {
+                    _emit_type_pair(cast(*u8, 0));
+                    ai = ai + 1;
+                }
+            }
+        }
+        f = f.next;
+    }
 }
 
 fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
@@ -422,7 +780,7 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         }
 
         // Full invalidation on calls (all caller-saved regs clobbered)
-        if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_SYSCALL) { eo.ph_invalidate(); }
+        if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL) { eo.ph_invalidate(); }
 
         // Instruction selection: try fused patterns before standard emission
         if (op == d.IR_IMM) {
