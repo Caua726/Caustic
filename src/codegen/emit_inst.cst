@@ -1,11 +1,11 @@
 use "../../std/mem.cst" as mem;
-use "../../std/linux.cst" as linux;
 use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../ir/defs.cst" as d;
 use "alloc_core.cst" as al;
 use "emit_output.cst" as eo;
 use "emit.cst" as e;
+use "target.cst" as tgt;
 
 let is i32 as label_base with mut = 0;
 
@@ -742,6 +742,11 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_SYSCALL) {
+        let is *tgt.Target as t = tgt.target_get();
+        if (t.syscall_supported == 0) {
+            io.eprint_str("syscall() reached codegen on a target without kernel syscall support; rewrite using os.windows.<API> or std/io/<TARGET>.cst\n");
+            io.exit(1);
+        }
         eo.out_line("syscall");
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
@@ -795,26 +800,67 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         // call lands as `call qword ptr [rip+disp32]` (FF 15 form).
         let is i32 as arg_n = cast(i32, inst.src2.imm);
 
-        // Reorder integer args System V → MS x64
+        // MS x64 stack layout:
+        //   [rsp+0x00..0x1F] — shadow space (callee-owned, never read by caller)
+        //   [rsp+0x20+i*8]   — overflow arg (4+i), for i ≥ 0
+        // We must keep rsp 16-aligned at the call. The call pushes 8 bytes,
+        // so the `sub rsp, K` we emit needs K % 16 == 0 (combined with the
+        // 8-byte misalignment present at entry, this lands on the +8 form
+        // the ABI expects).
+        //
+        // Layout: K = ceil((32 + max(0, arg_n - 4) * 8) / 16) * 16
+        let is i32 as stack_args with mut = 0;
+        if (arg_n > 4) { stack_args = arg_n - 4; }
+        let is i32 as sub_amt with mut = 32 + stack_args * 8;
+        if (sub_amt % 16 != 0) { sub_amt = sub_amt + 8; }
+
+        // SysV places args 7+ as caller-pushed stack values (right-to-left
+        // by SET_ARG codegen). When we get here, SysV arg6 is at [rsp+0],
+        // arg7 at [rsp+8], etc., having consumed pushed_bytes of stack.
+        //   pushed_bytes = max(0, arg_n - 6) * 8
+        // After `sub rsp, sub_amt`, those SysV stack args live at
+        //   [rsp+sub_amt + i*8]   (i = 0 → arg6, i = 1 → arg7, ...)
+        // MS x64 needs them at [rsp + 48 + i*8] (after shadow + arg5/6
+        // slots at +32/+40). Copy via rax to relocate.
+        let is i32 as pushed_args with mut = 0;
+        if (arg_n > 6) { pushed_args = arg_n - 6; }
+        eo.out_cstr("  sub rsp, ");
+        eo.out_int(cast(i64, sub_amt));
+        eo.out_char(10);
+        if (arg_n >= 5) { eo.out_line("mov QWORD PTR [rsp+32], r8"); }
+        if (arg_n >= 6) { eo.out_line("mov QWORD PTR [rsp+40], r9"); }
+        let is i32 as pi with mut = 0;
+        while (pi < pushed_args) {
+            let is i64 as src_off = cast(i64, sub_amt) + cast(i64, pi) * 8;
+            let is i64 as dst_off = 48 + cast(i64, pi) * 8;
+            eo.out_cstr("  mov rax, QWORD PTR [rsp+");
+            eo.out_int(src_off);
+            eo.out_cstr("]\n");
+            eo.out_cstr("  mov QWORD PTR [rsp+");
+            eo.out_int(dst_off);
+            eo.out_cstr("], rax\n");
+            pi = pi + 1;
+        }
+
+        // Reorder integer args System V → MS x64 (regs only)
         if (arg_n >= 3) { eo.out_line("mov r10, rdx"); }   // save arg2 before clobbering rdx
         if (arg_n >= 4) { eo.out_line("mov r11, rcx"); }   // save arg3 before clobbering rcx
         if (arg_n >= 1) { eo.out_line("mov rcx, rdi"); }   // arg0
         if (arg_n >= 2) { eo.out_line("mov rdx, rsi"); }   // arg1
         if (arg_n >= 3) { eo.out_line("mov r8, r10"); }    // arg2
         if (arg_n >= 4) { eo.out_line("mov r9, r11"); }    // arg3
-        // Args 5+ not yet supported in Fase 2 (need stack juggle).
 
-        // 32-byte shadow space (caller-allocated, callee-owned, never used
-        // by caller across the call) + 8 bytes to keep rsp 16-aligned at
-        // the call instruction.
-        eo.out_line("sub rsp, 40");
-
-        // Indirect call through IAT slot named __imp_<callee>
-        eo.out_cstr("  call qword ptr [rip+__imp_");
+        // Indirect call through IAT slot named __imp_<callee>.
+        // QWORD PTR uppercase — the Caustic assembler's lexer matches the
+        // canonical Intel-syntax form `QWORD PTR [mem]` (it derives a
+        // TK_SIZE_PREFIX token only for uppercase B-W first chars).
+        eo.out_cstr("  call QWORD PTR [rip+__imp_");
         eo.out_str(inst.call_name_ptr, inst.call_name_len);
         eo.out_cstr("]\n");
 
-        eo.out_line("add rsp, 40");
+        eo.out_cstr("  add rsp, ");
+        eo.out_int(cast(i64, sub_amt));
+        eo.out_char(10);
 
         // Emit the .cstimport directive so the assembler records the
         // DLL→symbol mapping for the linker's import table builder.

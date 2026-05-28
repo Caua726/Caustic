@@ -1,6 +1,130 @@
-use "linux.cst" as linux;
+use "os.cst" as os;
+// Comptime-gated backend imports: only the target's submodule is loaded.
+// Linux builds save the cost of parsing+semantic-walking the Windows
+// backend; vice-versa for Windows. The `if (os.current == OS_X)` dispatch
+// inside this file folds to a literal at semantic time, and the semantic
+// dead-branch eliminator skips visiting the wrong-target's `*_io.X` calls,
+// so references to a backend that wasn't imported never get type-checked.
+if (__target_is_linux)   use "io/linux.cst"   as linux_io;
+if (__target_is_windows) use "io/windows.cst" as windows_io;
+// Linux-only raw bindings for directory ops not yet abstracted. Used only
+// inside `if (os.current == os.OS_LINUX)` branches — gated to skip the load
+// entirely on Windows builds via the semantic dead-branch eliminator.
+if (__target_is_linux) use "os/linux.cst" as linux;
 use "string.cst" as string;
 use "mem.cst" only bins, core as mem;
+
+// Standard fd values (mirror Linux convention; the Windows backend
+// (io/windows.cst) maps these internally to GetStdHandle results).
+let is i64 as STDIN  with imut = 0;
+let is i64 as STDOUT with imut = 1;
+let is i64 as STDERR with imut = 2;
+
+// === Internal OS dispatchers ===
+// All OS-touching primitives go through these — every `if (__target_is_X)`
+// pair gets dead-stripped at IR gen so neither target ships the other's code.
+
+fn _write_fd(fd as i64, buf as *u8, n as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.write(fd, buf, n); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.write(fd, buf, n); }
+    return 0 - 1;
+}
+
+fn _read_fd(fd as i64, buf as *u8, n as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.read(fd, buf, n); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.read(fd, buf, n); }
+    return 0 - 1;
+}
+
+fn _open_read(path as *u8) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.open_read(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.open_read(path); }
+    return 0 - 1;
+}
+
+fn _open_write(path as *u8) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.open_write(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.open_write(path); }
+    return 0 - 1;
+}
+
+fn _close_fd(fd as i64) as i32 {
+    if (os.current == os.OS_LINUX)   { return linux_io.close(fd); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.close(fd); }
+    return cast(i32, 0 - 1);
+}
+
+fn _open_append(path as *u8) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.open_append(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.open_append(path); }
+    return 0 - 1;
+}
+
+fn _lseek(fd as i64, offset as i64, whence as i32) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.lseek(fd, offset, whence); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.lseek(fd, offset, whence); }
+    return 0 - 1;
+}
+
+// Terminate the process with the given exit code (0–255 on POSIX,
+// truncated to u32 on Windows). Does not return.
+fn exit(code as i32) as void {
+    if (os.current == os.OS_LINUX)   { linux_io.exit(code); }
+    if (os.current == os.OS_WINDOWS) { windows_io.exit(code); }
+}
+
+let is i32 as _SEEK_SET with imut = 0;
+let is i32 as _SEEK_END with imut = 2;
+
+fn unlink(path as *u8) as i32 {
+    if (os.current == os.OS_LINUX)   { return linux_io.unlink(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.unlink(path); }
+    return cast(i32, 0 - 1);
+}
+
+fn rename(src as *u8, dst as *u8) as i32 {
+    if (os.current == os.OS_LINUX)   { return linux_io.rename(src, dst); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.rename(src, dst); }
+    return cast(i32, 0 - 1);
+}
+
+fn mkdir(path as *u8) as i32 {
+    if (os.current == os.OS_LINUX)   { return linux_io.mkdir(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.mkdir(path); }
+    return cast(i32, 0 - 1);
+}
+
+fn exists(path as *u8) as i32 {
+    if (os.current == os.OS_LINUX)   { return linux_io.exists(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.exists(path); }
+    return 0;
+}
+
+// Resolves the running executable's absolute path into `buf`. Returns the
+// number of bytes written (no trailing NUL), or 0 on failure.
+fn get_self_path(buf as *u8, size as i64) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.get_self_path(buf, size); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.get_self_path(buf, size); }
+    return 0;
+}
+
+// Marks `path` as executable. POSIX → chmod 0755; Windows → no-op
+// (executability is determined by the .exe extension).
+fn make_executable(path as *u8) as i32 {
+    if (os.current == os.OS_LINUX)   { return linux_io.make_executable(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.make_executable(path); }
+    return 0;
+}
+
+// Last-modification time of `path` as an opaque i64 value. Values are
+// only meaningful when compared against other `mtime()` results from
+// the same OS. Returns 0 if the file does not exist. Linux returns
+// `st_mtim.tv_sec`; Windows returns the FILETIME 64-bit tick count.
+fn mtime(path as *u8) as i64 {
+    if (os.current == os.OS_LINUX)   { return linux_io.mtime(path); }
+    if (os.current == os.OS_WINDOWS) { return windows_io.mtime(path); }
+    return 0;
+}
 
 let is mem.Bins as _bins with mut;
 let is i32 as _ready with mut = 0;
@@ -43,7 +167,7 @@ fn read(r as *Reader) as i32 {
     
     if (r.pos >= r.len) {
         r.pos = 0;
-        let is i64 as n = linux.read(fd, buf, cap);
+        let is i64 as n = _read_fd(fd, buf, cap);
         r.len = n;
         
         if (n <= 0) {
@@ -109,7 +233,7 @@ fn readline(r as *Reader) as string.String {
 fn peek(r as *Reader) as i32 {
     if (r.pos >= r.len) {
         r.pos = 0;
-        let is i64 as n = linux.read(r.fd, r.buf, r.cap);
+        let is i64 as n = _read_fd(r.fd, r.buf, r.cap);
         r.len = n;
         if (n <= 0) {
             return cast(i32, 0 - 1);
@@ -224,7 +348,7 @@ fn Writer(fd as i64, buf as *u8, cap as i64) as Writer {
 
 fn flush(w as *Writer) as void {
     if (w.len > 0) {
-        linux.write(w.fd, w.buf, w.len);
+        _write_fd(w.fd, w.buf, w.len);
         w.len = 0;
     }
 }
@@ -245,7 +369,7 @@ fn write(w as *Writer, s as string.String) as void {
     // Optimization: if string is larger than buffer, flush and write directly
     if (slen > w.cap) {
         flush(w);
-        linux.write(w.fd, s.ptr, slen);
+        _write_fd(w.fd, s.ptr, slen);
         return;
     }
 
@@ -258,7 +382,7 @@ fn write(w as *Writer, s as string.String) as void {
 fn writer_bytes(w as *Writer, ptr as *u8, len as i64) as void {
     if (len > w.cap) {
         flush(w);
-        linux.write(w.fd, ptr, len);
+        _write_fd(w.fd, ptr, len);
         return;
     }
     let is i64 as i with mut = 0;
@@ -308,15 +432,15 @@ fn strlen(s as *u8) as i64 {
 }
 
 fn write_str(fd as i64, s as *u8) as void {
-    linux.write(fd, s, strlen(s));
+    _write_fd(fd, s, strlen(s));
 }
 
 fn write_int(fd as i64, n as i64) as void {
-    if (n == 0) { linux.write(fd, "0", 1); return; }
+    if (n == 0) { _write_fd(fd, "0", 1); return; }
 
     // Special case INT64_MIN
     if (n == (0 - 9223372036854775807 - 1)) {
-        linux.write(fd, "-9223372036854775808", 20);
+        _write_fd(fd, "-9223372036854775808", 20);
         return;
     }
 
@@ -332,24 +456,24 @@ fn write_int(fd as i64, n as i64) as void {
     }
     if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
     let is i64 as start = cast(i64, pos) + 1;
-    linux.write(fd, cast(*u8, cast(i64, &buf) + start), 24 - start);
+    _write_fd(fd, cast(*u8, cast(i64, &buf) + start), 24 - start);
 }
 
 // --- Generic IO ---
 
 fn write_bytes(fd as i64, ptr as *u8, len as i64) as i64 {
-    return linux.write(fd, ptr, len);
+    return _write_fd(fd, ptr, len);
 }
 
 fn write_string(fd as i64, s as string.String) as i64 {
-    return linux.write(fd, s.ptr, cast(i64, s.len));
+    return _write_fd(fd, s.ptr, cast(i64, s.len));
 }
 
 fn read_exact(fd as i64, buf as *u8, count as i64) as i64 {
     let is i64 as total with mut = 0;
     while (total < count) {
         let is i64 as addr = cast(i64, buf) + total;
-        let is i64 as n = linux.read(fd, cast(*u8, addr), count - total);
+        let is i64 as n = _read_fd(fd, cast(*u8, addr), count - total);
         if (n <= 0) {
             break;
         }
@@ -376,14 +500,14 @@ fn print_hex(n as i64) as void {
         i = i - 1;
     }
 
-    linux.write(linux.STDOUT, &buf, 18);
+    _write_fd(STDOUT, &buf, 18);
 }
 
 fn print_bool(b as i32) as void {
     if (b != 0) {
-        linux.write(linux.STDOUT, "true", 4);
+        _write_fd(STDOUT, "true", 4);
     } else {
-        linux.write(linux.STDOUT, "false", 5);
+        _write_fd(STDOUT, "false", 5);
     }
 }
 
@@ -403,7 +527,7 @@ struct VaList {
 }
 
 fn print_uint(n as u64) as void {
-    if (n == 0) { linux.write(linux.STDOUT, "0", 1); return; }
+    if (n == 0) { _write_fd(STDOUT, "0", 1); return; }
     let is [20]u8 as buf;
     let is u64 as val with mut = n;
     let is i32 as pos with mut = 19;
@@ -413,13 +537,13 @@ fn print_uint(n as u64) as void {
         pos = pos - 1;
     }
     let is i64 as start = cast(i64, pos) + 1;
-    linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + start), 20 - start);
+    _write_fd(STDOUT, cast(*u8, cast(i64, &buf) + start), 20 - start);
 }
 
 fn _pad(count as i64, ch as u8) as void {
     let is u8 as c = ch;
     let is i64 as k with mut = 0;
-    while (k < count) { linux.write(linux.STDOUT, &c, 1); k = k + 1; }
+    while (k < count) { _write_fd(STDOUT, &c, 1); k = k + 1; }
 }
 
 fn printf(fmt as *u8, ...) as void {
@@ -429,7 +553,7 @@ fn printf(fmt as *u8, ...) as void {
 
     while (fmt[i] != 0) {
         if (fmt[i] != 37) {
-            linux.write(linux.STDOUT, &fmt[i], 1);
+            _write_fd(STDOUT, &fmt[i], 1);
             i = i + 1;
         } else {
             i = i + 1; // skip '%'
@@ -437,7 +561,7 @@ fn printf(fmt as *u8, ...) as void {
 
             if (fmt[i] == 37) { // '%%'
                 let is u8 as pct = 37;
-                linux.write(linux.STDOUT, &pct, 1);
+                _write_fd(STDOUT, &pct, 1);
                 i = i + 1;
             } else {
                 // Parse flags
@@ -479,7 +603,7 @@ fn printf(fmt as *u8, ...) as void {
                         let is i64 as dlen = 21 - cast(i64, dstart);
                         let is i64 as pad = cast(i64, width) - dlen;
                         if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        linux.write(linux.STDOUT, cast(*u8, cast(i64, &dbuf) + cast(i64, dstart)), dlen);
+                        _write_fd(STDOUT, cast(*u8, cast(i64, &dbuf) + cast(i64, dstart)), dlen);
                         if (left == 1 && pad > 0) { _pad(pad, 32); }
                     } else if (fmt[i] == 117) { // %u
                         let is [21]u8 as ubuf;
@@ -491,7 +615,7 @@ fn printf(fmt as *u8, ...) as void {
                         let is i64 as ulen = 21 - cast(i64, ustart);
                         let is i64 as pad = cast(i64, width) - ulen;
                         if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        linux.write(linux.STDOUT, cast(*u8, cast(i64, &ubuf) + cast(i64, ustart)), ulen);
+                        _write_fd(STDOUT, cast(*u8, cast(i64, &ubuf) + cast(i64, ustart)), ulen);
                         if (left == 1 && pad > 0) { _pad(pad, 32); }
                     } else if (fmt[i] == 115) { // %s
                         let is *u8 as val = cast(*u8, *arg_ptr);
@@ -499,27 +623,27 @@ fn printf(fmt as *u8, ...) as void {
                         while (val[slen] != 0) { slen = slen + 1; }
                         let is i64 as pad = cast(i64, width) - slen;
                         if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        linux.write(linux.STDOUT, val, slen);
+                        _write_fd(STDOUT, val, slen);
                         if (left == 1 && pad > 0) { _pad(pad, 32); }
                     } else if (fmt[i] == 83) { // %S
                         let is *string.String as s_ptr = cast(*string.String, *arg_ptr);
                         let is i64 as pad = cast(i64, width) - cast(i64, s_ptr.len);
                         if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        linux.write(linux.STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
+                        _write_fd(STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
                         if (left == 1 && pad > 0) { _pad(pad, 32); }
                     } else if (fmt[i] == 120) { // %x
                         print_hex(*arg_ptr);
                     } else if (fmt[i] == 99) { // %c
                         let is u8 as ch = cast(u8, *arg_ptr);
-                        linux.write(linux.STDOUT, &ch, 1);
+                        _write_fd(STDOUT, &ch, 1);
                     } else if (fmt[i] == 112) { // %p
                         print_hex(*arg_ptr);
                     }
                 } else {
                     // Unknown specifier — print literal, do NOT consume arg
                     let is u8 as pct = 37;
-                    linux.write(linux.STDOUT, &pct, 1);
-                    linux.write(linux.STDOUT, &fmt[i], 1);
+                    _write_fd(STDOUT, &pct, 1);
+                    _write_fd(STDOUT, &fmt[i], 1);
                 }
                 i = i + 1;
             }
@@ -629,28 +753,28 @@ struct File {
 
 fn print(s as string.String) as void {
     if (s.len > 0) {
-        linux.write(linux.STDOUT, s.ptr, cast(i64, s.len));
+        _write_fd(STDOUT, s.ptr, cast(i64, s.len));
     }
 }
 
 fn println(s as string.String) as void {
     print(s);
-    linux.write(linux.STDOUT, "\n", 1);
+    _write_fd(STDOUT, "\n", 1);
 }
 
 fn eprint(s as string.String) as void {
     if (s.len > 0) {
-        linux.write(linux.STDERR, s.ptr, cast(i64, s.len));
+        _write_fd(STDERR, s.ptr, cast(i64, s.len));
     }
 }
 
 fn eprintln(s as string.String) as void {
     eprint(s);
-    linux.write(linux.STDERR, "\n", 1);
+    _write_fd(STDERR, "\n", 1);
 }
 
 fn eprint_str(s as *u8) as void {
-    linux.write(linux.STDERR, s, strlen(s));
+    _write_fd(STDERR, s, strlen(s));
 }
 
 fn print_int(n as i64) as void {
@@ -663,7 +787,7 @@ fn print_int(n as i64) as void {
     else { while (val > 0) { buf[pos] = cast(u8, 48 + cast(i32, val % 10)); val = val / 10; pos = pos - 1; } }
     if (neg == 1) { buf[pos] = 45; pos = pos - 1; }
     let is i32 as start = pos + 1;
-    linux.write(linux.STDOUT, cast(*u8, cast(i64, &buf) + cast(i64, start)), 21 - cast(i64, start));
+    _write_fd(STDOUT, cast(*u8, cast(i64, &buf) + cast(i64, start)), 21 - cast(i64, start));
 }
 
 // Legacy read_line (slow, unbuffered) - kept for compatibility
@@ -685,7 +809,7 @@ fn read_line() as string.String {
         }
 
         let is i64 as addr = cast(i64, ptr) + len;
-        let is i64 as n = linux.read(linux.STDIN, cast(*u8, addr), 1);
+        let is i64 as n = _read_fd(STDIN, cast(*u8, addr), 1);
 
         if (n <= 0) {
             break;
@@ -709,23 +833,23 @@ fn read_line() as string.String {
 }
 
 fn read_file(path as string.String) as string.String {
-    let is i64 as fd = linux.open(path.ptr, linux.O_RDONLY, 0);
+    let is i64 as fd = _open_read(path.ptr);
     if (fd < 0) {
         return string.String("");
     }
 
-    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
+    let is i64 as size = _lseek(fd, 0, _SEEK_END);
     if (size < 0) {
-        linux.close(fd);
+        _close_fd(fd);
         return string.String("");
     }
-    linux.lseek(fd, 0, linux.SEEK_SET);
+    _lseek(fd, 0, _SEEK_SET);
 
     let is string.String as s;
 
     // Guard: String.len/cap are i32, max ~2GB
     if (size > 2147483647) {
-        linux.close(fd);
+        _close_fd(fd);
         s.ptr = cast(*u8, 0);
         s.len = 0;
         s.cap = 0;
@@ -743,66 +867,63 @@ fn read_file(path as string.String) as string.String {
         s.ptr = cast(*u8, 0);
     }
 
-    linux.close(fd);
+    _close_fd(fd);
     return s;
 }
 
 fn write_file(path as string.String, content as string.String) as i64 {
-    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC;
-    let is i64 as fd = linux.open(path.ptr, flags, 420);
+    let is i64 as fd = _open_write(path.ptr);
     if (fd < 0) { return fd; }
-    let is i64 as res = linux.write(fd, content.ptr, cast(i64, content.len));
-    linux.close(fd);
+    let is i64 as res = _write_fd(fd, content.ptr, cast(i64, content.len));
+    _close_fd(fd);
     return res;
 }
 
 fn append_file(path as string.String, content as string.String) as i64 {
-    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_APPEND;
-    let is i64 as fd = linux.open(path.ptr, flags, 420);
+    let is i64 as fd = _open_append(path.ptr);
     if (fd < 0) { return fd; }
-    let is i64 as res = linux.write(fd, content.ptr, cast(i64, content.len));
-    linux.close(fd);
+    let is i64 as res = _write_fd(fd, content.ptr, cast(i64, content.len));
+    _close_fd(fd);
     return res;
 }
 
 fn file_exists(path as string.String) as i32 {
-    let is i64 as fd = linux.open(path.ptr, 0, 0);
+    let is i64 as fd = _open_read(path.ptr);
     if (fd >= 0) {
-        linux.close(fd);
+        _close_fd(fd);
         return cast(i32, 1);
     }
     return cast(i32, 0);
 }
 
 fn file_size(path as *u8) as i64 {
-    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    let is i64 as fd = _open_read(path);
     if (fd < 0) {
         return cast(i64, 0 - 1);
     }
-    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
-    linux.close(fd);
+    let is i64 as size = _lseek(fd, 0, _SEEK_END);
+    _close_fd(fd);
     return size;
 }
 
 fn open_file(path as string.String) as File {
-    let is i64 as fd = linux.open(path.ptr, linux.O_RDONLY, 0);
+    let is i64 as fd = _open_read(path.ptr);
     let is File as f;
     f.fd = fd;
     return f;
 }
 
 fn close_file(file as File) as void {
-    linux.close(file.fd);
+    _close_fd(file.fd);
 }
 
 fn copy_file(src as string.String, dst as string.String) as i64 {
-    let is i64 as in_fd = linux.open(src.ptr, linux.O_RDONLY, 0);
+    let is i64 as in_fd = _open_read(src.ptr);
     if (in_fd < 0) { return in_fd; }
 
-    let is i64 as flags = linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC;
-    let is i64 as out_fd = linux.open(dst.ptr, flags, 420);
+    let is i64 as out_fd = _open_write(dst.ptr);
     if (out_fd < 0) {
-        linux.close(in_fd);
+        _close_fd(in_fd);
         return out_fd;
     }
 
@@ -810,24 +931,24 @@ fn copy_file(src as string.String, dst as string.String) as i64 {
     let is i64 as total with mut = 0;
 
     while (1 == 1) {
-        let is i64 as n = linux.read(in_fd, &buf, 4096);
+        let is i64 as n = _read_fd(in_fd, &buf, 4096);
         if (n <= 0) { break; }
-        let is i64 as w = linux.write(out_fd, &buf, n);
+        let is i64 as w = _write_fd(out_fd, &buf, n);
         if (w != n) {
-            linux.close(in_fd);
-            linux.close(out_fd);
+            _close_fd(in_fd);
+            _close_fd(out_fd);
             return cast(i64, 0 - 1);
         }
         total = total + n;
     }
 
-    linux.close(in_fd);
-    linux.close(out_fd);
+    _close_fd(in_fd);
+    _close_fd(out_fd);
     return total;
 }
 
 fn read_file_in(h as *u8, path as *u8) as string.String {
-    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    let is i64 as fd = _open_read(path);
     let is string.String as s;
 
     if (fd < 0) {
@@ -837,11 +958,11 @@ fn read_file_in(h as *u8, path as *u8) as string.String {
         return s;
     }
 
-    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
-    linux.lseek(fd, 0, linux.SEEK_SET);
+    let is i64 as size = _lseek(fd, 0, _SEEK_END);
+    _lseek(fd, 0, _SEEK_SET);
 
     if (size > 2147483647 || size <= 0) {
-        linux.close(fd);
+        _close_fd(fd);
         s.ptr = cast(*u8, 0);
         s.len = 0;
         s.cap = 0;
@@ -854,7 +975,7 @@ fn read_file_in(h as *u8, path as *u8) as string.String {
     read_exact(fd, s.ptr, size);
     s.ptr[size] = cast(u8, 0);
 
-    linux.close(fd);
+    _close_fd(fd);
     return s;
 }
 
@@ -887,7 +1008,10 @@ struct DirEntry {
 // Fills entries array. Names are copied to heap (caller must free name_ptr).
 // Skips "." and ".." automatically.
 // Returns number of entries found, or -1 on error.
+// Windows backend not yet implemented (FindFirstFileA/FindNextFileA path);
+// returns -1 there until the Windows directory enumerator lands.
 fn list_dir(path as *u8, entries as *DirEntry, max_entries as i32) as i32 {
+    if (os.current == os.OS_WINDOWS) { return cast(i32, 0 - 1); }
     let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
     if (fd < 0) { return cast(i32, 0 - 1); }
 
@@ -938,12 +1062,13 @@ fn list_dir(path as *u8, entries as *DirEntry, max_entries as i32) as i32 {
         }
     }
 
-    linux.close(fd);
+    _close_fd(fd);
     return count;
 }
 
 // Count entries in a directory (excluding . and ..)
 fn count_dir_entries(path as *u8) as i32 {
+    if (os.current == os.OS_WINDOWS) { return cast(i32, 0 - 1); }
     let is [4096]u8 as buf;
     let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
     if (fd < 0) { return cast(i32, 0 - 1); }
@@ -970,19 +1095,21 @@ fn count_dir_entries(path as *u8) as i32 {
         }
     }
 
-    linux.close(fd);
+    _close_fd(fd);
     return count;
 }
 
-// Check if path is a directory
+// Check if path is a directory. Windows backend not yet implemented.
 fn is_dir(path as *u8) as i32 {
+    if (os.current == os.OS_WINDOWS) { return 0; }
     let is i64 as fd = linux.open(path, linux.O_RDONLY + linux.O_DIRECTORY, 0);
     if (fd < 0) { return 0; }
-    linux.close(fd);
+    _close_fd(fd);
     return 1;
 }
 
-// Get current working directory
+// Get current working directory. Windows backend not yet implemented.
 fn get_cwd(buf as *u8, size as i64) as i64 {
+    if (os.current == os.OS_WINDOWS) { return 0 - 1; }
     return linux.getcwd(buf, size);
 }

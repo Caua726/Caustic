@@ -1,0 +1,169 @@
+// =======================================================
+// std/io/windows.cst — Portable I/O backend, Windows impl
+//
+// Per-OS portable subset used by code that imports via
+//   use "std/io/<TARGET>.cst" as io;
+// Windows backend uses kernel32 file/console APIs.
+//
+// Handles here are Win32 HANDLEs (i64). STDIN/STDOUT/STDERR are
+// resolved lazily via GetStdHandle on first use and cached so the
+// portable code can treat them as static IDs.
+// =======================================================
+
+use "../os.cst" as os;
+
+let is i64 as _h_stdin  with mut = 0 - 1;
+let is i64 as _h_stdout with mut = 0 - 1;
+let is i64 as _h_stderr with mut = 0 - 1;
+
+fn _get_stdin() as i64 {
+    if (_h_stdin == 0 - 1) { _h_stdin = os.windows.GetStdHandle(os.windows.STD_INPUT_HANDLE); }
+    return _h_stdin;
+}
+fn _get_stdout() as i64 {
+    if (_h_stdout == 0 - 1) { _h_stdout = os.windows.GetStdHandle(os.windows.STD_OUTPUT_HANDLE); }
+    return _h_stdout;
+}
+fn _get_stderr() as i64 {
+    if (_h_stderr == 0 - 1) { _h_stderr = os.windows.GetStdHandle(os.windows.STD_ERROR_HANDLE); }
+    return _h_stderr;
+}
+
+// Same numeric IDs as Linux for backwards compatibility — callers that
+// pass these to write()/read() get routed via GetStdHandle.
+let is i64 as STDIN  with imut = 0;
+let is i64 as STDOUT with imut = 1;
+let is i64 as STDERR with imut = 2;
+
+fn _resolve_std(h as i64) as i64 {
+    if (h == STDOUT) { return _get_stdout(); }
+    if (h == STDERR) { return _get_stderr(); }
+    if (h == STDIN)  { return _get_stdin(); }
+    return h;
+}
+
+fn write_stdout(buf as *u8, len as i64) as i64 {
+    let is u32 as wrote with mut = 0;
+    os.windows.WriteFile(_get_stdout(), buf, cast(u32, len), &wrote, cast(*u8, 0));
+    return cast(i64, wrote);
+}
+
+fn write_stderr(buf as *u8, len as i64) as i64 {
+    let is u32 as wrote with mut = 0;
+    os.windows.WriteFile(_get_stderr(), buf, cast(u32, len), &wrote, cast(*u8, 0));
+    return cast(i64, wrote);
+}
+
+fn read_stdin(buf as *u8, max as i64) as i64 {
+    let is u32 as got with mut = 0;
+    os.windows.ReadFile(_get_stdin(), buf, cast(u32, max), &got, cast(*u8, 0));
+    return cast(i64, got);
+}
+
+// Returns Win32 HANDLE (i64); INVALID_HANDLE_VALUE (-1) on failure.
+fn open_read(path as *u8) as i64 {
+    return os.windows.CreateFileA(path, os.windows.GENERIC_READ, os.windows.FILE_SHARE_READ,
+                           cast(*u8, 0), os.windows.OPEN_EXISTING,
+                           os.windows.FILE_ATTRIBUTE_NORMAL, 0);
+}
+
+fn open_write(path as *u8) as i64 {
+    return os.windows.CreateFileA(path, os.windows.GENERIC_WRITE, 0,
+                           cast(*u8, 0), os.windows.CREATE_ALWAYS,
+                           os.windows.FILE_ATTRIBUTE_NORMAL, 0);
+}
+
+fn read(handle as i64, buf as *u8, max as i64) as i64 {
+    let is i64 as h = _resolve_std(handle);
+    let is u32 as got with mut = 0;
+    let is i32 as ok = os.windows.ReadFile(h, buf, cast(u32, max), &got, cast(*u8, 0));
+    if (ok == 0) { return 0 - 1; }
+    return cast(i64, got);
+}
+
+fn write(handle as i64, buf as *u8, len as i64) as i64 {
+    let is i64 as h = _resolve_std(handle);
+    let is u32 as wrote with mut = 0;
+    let is i32 as ok = os.windows.WriteFile(h, buf, cast(u32, len), &wrote, cast(*u8, 0));
+    if (ok == 0) { return 0 - 1; }
+    return cast(i64, wrote);
+}
+
+fn close(handle as i64) as i32 {
+    let is i64 as h = _resolve_std(handle);
+    return os.windows.CloseHandle(h);
+}
+
+fn exit(code as i32) as void {
+    os.windows.ExitProcess(cast(u32, code));
+}
+
+// Opens existing file in append mode; positions pointer at end.
+fn open_append(path as *u8) as i64 {
+    let is i64 as h = os.windows.CreateFileA(path, os.windows.GENERIC_WRITE, 0,
+                                             cast(*u8, 0), os.windows.OPEN_ALWAYS,
+                                             os.windows.FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == os.windows.INVALID_HANDLE_VALUE) { return 0 - 1; }
+    os.windows.SetFilePointerEx(h, 0, cast(*i64, 0), 2);  // FILE_END
+    return h;
+}
+
+// SetFilePointerEx whence values match Win32: 0=BEGIN, 1=CURRENT, 2=END.
+fn lseek(handle as i64, offset as i64, whence as i32) as i64 {
+    let is i64 as new_pos with mut = 0;
+    let is i32 as ok = os.windows.SetFilePointerEx(handle, offset, &new_pos,
+                                                   cast(u32, whence));
+    if (ok == 0) { return 0 - 1; }
+    return new_pos;
+}
+
+let is i32 as SEEK_SET with imut = 0;
+let is i32 as SEEK_CUR with imut = 1;
+let is i32 as SEEK_END with imut = 2;
+
+// Filesystem mutators — returns 0 on success, -1 on failure.
+// Win32 boolean returns: nonzero = success, 0 = failure.
+fn unlink(path as *u8) as i32 {
+    if (os.windows.DeleteFileA(path) != 0) { return 0; }
+    return cast(i32, 0 - 1);
+}
+
+fn rename(src as *u8, dst as *u8) as i32 {
+    if (os.windows.MoveFileExA(src, dst, os.windows.MOVEFILE_REPLACE_EXISTING) != 0) { return 0; }
+    return cast(i32, 0 - 1);
+}
+
+fn mkdir(path as *u8) as i32 {
+    if (os.windows.CreateDirectoryA(path, cast(*u8, 0)) != 0) { return 0; }
+    return cast(i32, 0 - 1);
+}
+
+fn exists(path as *u8) as i32 {
+    let is [40]u8 as info;
+    if (os.windows.GetFileAttributesExA(path, os.windows.GetFileExInfoStandard, &info) != 0) { return 1; }
+    return 0;
+}
+
+fn get_self_path(buf as *u8, size as i64) as i64 {
+    let is u32 as n = os.windows.GetModuleFileNameA(0, buf, cast(u32, size));
+    return cast(i64, n);
+}
+
+// NTFS doesn't track POSIX execute bits — executability is decided by
+// the .exe extension and PE header. No-op here.
+fn make_executable(path as *u8) as i32 {
+    return 0;
+}
+
+// Last-modification time of `path` as an opaque i64 monotonic in the
+// Windows clock. Returns 0 if the file is missing. WIN32_FILE_ATTRIBUTE_DATA
+// is 36 bytes; ftLastWriteTime (FILETIME = 100-ns ticks since 1601-01-01) at
+// offset 20.
+fn mtime(path as *u8) as i64 {
+    let is [40]u8 as info;
+    if (os.windows.GetFileAttributesExA(path, os.windows.GetFileExInfoStandard, &info) == 0) {
+        return 0;
+    }
+    let is *i64 as ft = cast(*i64, cast(i64, &info) + 20);
+    return *ft;
+}

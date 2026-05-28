@@ -1,9 +1,17 @@
 // =======================================================
 // std/process.cst
-// Process management (fork, execve, wait, capture)
+// Process management — fork/execve on Linux, CreateProcessA on Windows.
+//
+// The "pid" return type is i64 on both platforms. On Linux it's a real PID;
+// on Windows it's a HANDLE (kernel object). Either way wait_pid accepts it
+// and returns the exit code. capture() is Linux-only for now — Windows pipe
+// + child output redirection needs more wiring (CreatePipe + SetHandle-
+// Information + STARTUPINFOA.hStdOutput plumbing).
 // =======================================================
 
-use "linux.cst" as linux;
+use "os.cst" as os;
+if (__target_is_linux)   use "os/linux.cst"   as linux;
+if (__target_is_windows) use "os/windows.cst" as win;
 use "env.cst" as env;
 use "mem.cst" only bins, core as mem;
 use "string.cst" as str;
@@ -20,81 +28,291 @@ fn _free(ptr as *u8) as void {
     if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
 }
 
-// Execute a program via execve, replacing current process.
+// === Windows STARTUPINFOA / PROCESS_INFORMATION helpers ===
+//
+// STARTUPINFOA layout (104 bytes):
+//   0   cb              u32
+//   8   lpReserved      *u8
+//   16  lpDesktop       *u8
+//   24  lpTitle         *u8
+//   32  dwX             u32
+//   36  dwY             u32
+//   40  dwXSize         u32
+//   44  dwYSize         u32
+//   48  dwXCountChars   u32
+//   52  dwYCountChars   u32
+//   56  dwFillAttribute u32
+//   60  dwFlags         u32
+//   64  wShowWindow     u16
+//   66  cbReserved2     u16
+//   72  lpReserved2     *u8
+//   80  hStdInput       i64
+//   88  hStdOutput      i64
+//   96  hStdError       i64
+//
+// PROCESS_INFORMATION (24 bytes):
+//   0   hProcess     i64
+//   8   hThread      i64
+//   16  dwProcessId  u32
+//   20  dwThreadId   u32
+fn _init_startupinfo(si as *u8) as void {
+    mem.core.memset(si, cast(i32, 0), 104);
+    let is *u32 as cb = cast(*u32, si);
+    *cb = cast(u32, 104);
+}
+
+// Windows path: spawn the process via CreateProcessA, return the process
+// handle as i64 (caller passes to wait_pid). On failure returns -1.
+fn _spawn_win(cmdline as *u8) as i64 {
+    let is [104]u8 as si;
+    let is [24]u8 as pi;
+    _init_startupinfo(&si);
+    mem.core.memset(&pi, cast(i32, 0), 24);
+    let is i32 as ok = win.CreateProcessA(
+        cast(*u8, 0), cmdline,
+        cast(*u8, 0), cast(*u8, 0),       // proc/thread attrs (default)
+        cast(i32, 0),                      // bInheritHandles
+        cast(u32, 0),                      // dwCreationFlags
+        cast(*u8, 0), cast(*u8, 0),       // env, current dir (inherit)
+        cast(*u8, &si), cast(*u8, &pi));
+    if (ok == 0) { return 0 - 1; }
+    let is *i64 as hproc = cast(*i64, &pi);
+    return *hproc;
+}
+
+// === Public API ===
+
+// Execute a program, replacing the current process (Linux) or spawning and
+// waiting + exiting with the child's code (Windows — CreateProcessA does not
+// support in-place replacement).
 fn run(path as *u8, argv as *u8) as void {
-    linux.execve(path, argv, env.envp());
-}
-
-// Fork and execve, return child PID.
-fn spawn(path as *u8, argv as *u8) as i64 {
-    let is i64 as pid = linux.fork();
-    if (pid == 0) {
+    if (os.current == os.OS_LINUX) {
         linux.execve(path, argv, env.envp());
-        linux.exit(127);
+        return;
     }
-    return pid;
+    if (os.current == os.OS_WINDOWS) {
+        let is i64 as h = _spawn_win(path);
+        if (h == 0 - 1) { win.ExitProcess(cast(u32, 127)); }
+        win.WaitForSingleObject(h, win.INFINITE);
+        let is u32 as code with mut = 0;
+        win.GetExitCodeProcess(h, &code);
+        win.CloseHandle(h);
+        win.ExitProcess(code);
+    }
 }
 
-// Fork and execvp (PATH search), return child PID.
+// Spawn a child process and return a pid/handle. wait_pid() consumes it.
+fn spawn(path as *u8, argv as *u8) as i64 {
+    if (os.current == os.OS_LINUX) {
+        let is i64 as pid = linux.fork();
+        if (pid == 0) {
+            linux.execve(path, argv, env.envp());
+            linux.exit(127);
+        }
+        return pid;
+    }
+    if (os.current == os.OS_WINDOWS) {
+        // Windows: argv-as-array isn't directly accepted by CreateProcessA;
+        // we use the path itself as the command line. Caller wanting argv
+        // should pre-join into a single string and pass via path.
+        return _spawn_win(path);
+    }
+    return 0 - 1;
+}
+
+// Spawn with PATH search.
 fn spawnp(file as *u8, argv as *u8) as i64 {
-    let is i64 as pid = linux.fork();
-    if (pid == 0) {
-        env.execvp(file, argv);
-        linux.exit(127);
+    if (os.current == os.OS_LINUX) {
+        let is i64 as pid = linux.fork();
+        if (pid == 0) {
+            env.execvp(file, argv);
+            linux.exit(127);
+        }
+        return pid;
     }
-    return pid;
+    if (os.current == os.OS_WINDOWS) {
+        // CreateProcessA searches PATH when lpApplicationName is null and
+        // lpCommandLine has just the program name — so spawn() with the
+        // bare `file` already covers PATH search.
+        return _spawn_win(file);
+    }
+    return 0 - 1;
 }
 
-// Wait for a specific PID, return exit code (0-255).
-fn wait_pid(pid as i64) as i32 {
-    let is i32 as status with mut = 0;
-    let is i64 as rc = linux.wait4(pid, &status, 0, cast(*u8, 0));
-    if (rc < 0) { return cast(i32, 0 - 1); }
-    return (status >> 8) & 255;
+// Wait for a child to exit; returns its exit code (0-255 normalised).
+fn wait_pid(pid_or_handle as i64) as i32 {
+    if (os.current == os.OS_LINUX) {
+        let is i32 as status with mut = 0;
+        let is i64 as rc = linux.wait4(pid_or_handle, &status, 0, cast(*u8, 0));
+        if (rc < 0) { return cast(i32, 0 - 1); }
+        return (status >> 8) & 255;
+    }
+    if (os.current == os.OS_WINDOWS) {
+        win.WaitForSingleObject(pid_or_handle, win.INFINITE);
+        let is u32 as code with mut = 0;
+        win.GetExitCodeProcess(pid_or_handle, &code);
+        win.CloseHandle(pid_or_handle);
+        return cast(i32, code);
+    }
+    return cast(i32, 0 - 1);
 }
 
 // Run a command and capture its stdout as a String.
+//   Linux: pipe + fork + dup2(write end → STDOUT) + execve, parent reads.
+//   Windows: CreatePipe + STARTF_USESTDHANDLES + CreateProcessA(inherit handles).
+// Returns empty String on failure. Caller owns s.ptr (call _free or leak).
 fn capture(path as *u8, argv as *u8) as str.String {
-    let is [2]i32 as pipefd;
-    linux.pipe(cast(*i32, &pipefd));
-
-    let is i64 as pid = linux.fork();
-    if (pid == 0) {
-        linux.close(cast(i64, pipefd[0]));
-        linux.dup2(cast(i64, pipefd[1]), linux.STDOUT);
-        linux.close(cast(i64, pipefd[1]));
-        linux.execve(path, argv, env.envp());
-        linux.exit(127);
-    }
-
-    linux.close(cast(i64, pipefd[1]));
-
-    let is i64 as cap with mut = 4096;
-    let is i64 as len with mut = 0;
-    let is *u8 as buf with mut = _alloc(cap);
-
-    while (1 == 1) {
-        if (len + 1024 > cap) {
-            let is i64 as new_cap = cap * 2;
-            let is *u8 as new_buf = _alloc(new_cap);
-            mem.core.memcpy(new_buf, buf, len);
-            _free(buf);
-            buf = new_buf;
-            cap = new_cap;
+    let is str.String as empty;
+    empty.ptr = cast(*u8, 0);
+    empty.len = 0;
+    empty.cap = 0;
+    if (os.current == os.OS_WINDOWS) {
+        // Build a single command-line string from argv (NULL-terminated array
+        // of *u8). Quoting matches what CommandLineToArgvA expects.
+        let is i64 as cmd_cap with mut = 4096;
+        let is *u8 as cmd with mut = _alloc(cmd_cap);
+        let is i64 as cmd_len with mut = 0;
+        let is *i64 as a = cast(*i64, argv);
+        let is i64 as ai with mut = 0;
+        while (a[ai] != 0) {
+            let is *u8 as arg = cast(*u8, a[ai]);
+            let is i64 as al with mut = 0;
+            while (arg[al] != 0) { al = al + 1; }
+            if (cmd_len + al + 4 >= cmd_cap) {
+                let is i64 as nc = cmd_cap * 2;
+                let is *u8 as nb = _alloc(nc);
+                mem.core.memcpy(nb, cmd, cmd_len);
+                _free(cmd); cmd = nb; cmd_cap = nc;
+            }
+            if (cmd_len > 0) { cmd[cmd_len] = cast(u8, 32); cmd_len = cmd_len + 1; }
+            mem.core.memcpy(cast(*u8, cast(i64, cmd) + cmd_len), arg, al);
+            cmd_len = cmd_len + al;
+            ai = ai + 1;
         }
-        let is i64 as n = linux.read(cast(i64, pipefd[0]), cast(*u8, cast(i64, buf) + len), 1024);
-        if (n <= 0) { break; }
-        len = len + n;
+        cmd[cmd_len] = cast(u8, 0);
+
+        // SECURITY_ATTRIBUTES with bInheritHandle=1 (24 bytes total).
+        let is [24]u8 as sa;
+        mem.core.memset(&sa, cast(i32, 0), 24);
+        let is *u32 as sa_len = cast(*u32, &sa);
+        *sa_len = cast(u32, 24);
+        let is *i32 as sa_inherit = cast(*i32, cast(i64, &sa) + 16);
+        *sa_inherit = 1;
+
+        let is i64 as h_read with mut = 0;
+        let is i64 as h_write with mut = 0;
+        if (win.CreatePipe(&h_read, &h_write, &sa, 0) == 0) {
+            _free(cmd);
+            return empty;
+        }
+        // Make sure the parent's read end is NOT inherited.
+        win.SetHandleInformation(h_read, win.HANDLE_FLAG_INHERIT, 0);
+
+        let is [104]u8 as si;
+        _init_startupinfo(&si);
+        let is *u32 as si_flags = cast(*u32, cast(i64, &si) + 60);
+        *si_flags = win.STARTF_USESTDHANDLES;
+        let is *i64 as si_out = cast(*i64, cast(i64, &si) + 88);
+        let is *i64 as si_err = cast(*i64, cast(i64, &si) + 96);
+        *si_out = h_write;
+        *si_err = h_write;
+
+        let is [24]u8 as pi;
+        mem.core.memset(&pi, cast(i32, 0), 24);
+
+        // bInheritHandles = TRUE so the child gets h_write.
+        let is i32 as ok = win.CreateProcessA(cast(*u8, 0), cmd,
+                                              cast(*u8, 0), cast(*u8, 0),
+                                              1, 0,
+                                              cast(*u8, 0), cast(*u8, 0),
+                                              &si, &pi);
+        win.CloseHandle(h_write);  // parent doesn't write
+        if (ok == 0) {
+            win.CloseHandle(h_read);
+            _free(cmd);
+            return empty;
+        }
+
+        // Read child's stdout until EOF (ReadFile returns 0 with last error
+        // ERROR_BROKEN_PIPE when the write end is gone — which we already
+        // closed plus the child eventually exits).
+        let is i64 as bcap with mut = 4096;
+        let is i64 as blen with mut = 0;
+        let is *u8 as buf with mut = _alloc(bcap);
+        while (1 == 1) {
+            if (blen + 1024 > bcap) {
+                let is i64 as nc = bcap * 2;
+                let is *u8 as nb = _alloc(nc);
+                mem.core.memcpy(nb, buf, blen);
+                _free(buf); buf = nb; bcap = nc;
+            }
+            let is u32 as got with mut = 0;
+            let is i32 as rok = win.ReadFile(h_read,
+                                             cast(*u8, cast(i64, buf) + blen),
+                                             1024, &got, cast(*u8, 0));
+            if (rok == 0 || got == 0) { break; }
+            blen = blen + cast(i64, got);
+        }
+        win.CloseHandle(h_read);
+
+        // Wait for child, swallow exit code.
+        let is *i64 as h_proc = cast(*i64, &pi);
+        win.WaitForSingleObject(*h_proc, win.INFINITE);
+        win.CloseHandle(*h_proc);
+        let is *i64 as h_thr = cast(*i64, cast(i64, &pi) + 8);
+        win.CloseHandle(*h_thr);
+
+        _free(cmd);
+        buf[blen] = 0;
+        let is str.String as s;
+        s.ptr = buf;
+        s.len = cast(i32, blen);
+        s.cap = cast(i32, bcap);
+        return s;
     }
-    linux.close(cast(i64, pipefd[0]));
+    if (os.current == os.OS_LINUX) {
+        let is [2]i32 as pipefd;
+        linux.pipe(cast(*i32, &pipefd));
 
-    let is i32 as _status with mut = 0;
-    linux.wait4(pid, &_status, 0, cast(*u8, 0));
+        let is i64 as pid = linux.fork();
+        if (pid == 0) {
+            linux.close(cast(i64, pipefd[0]));
+            linux.dup2(cast(i64, pipefd[1]), linux.STDOUT);
+            linux.close(cast(i64, pipefd[1]));
+            linux.execve(path, argv, env.envp());
+            linux.exit(127);
+        }
 
-    buf[len] = 0;
-    let is str.String as s;
-    s.ptr = buf;
-    s.len = cast(i32, len);
-    s.cap = cast(i32, cap);
-    return s;
+        linux.close(cast(i64, pipefd[1]));
+
+        let is i64 as cap with mut = 4096;
+        let is i64 as len with mut = 0;
+        let is *u8 as buf with mut = _alloc(cap);
+
+        while (1 == 1) {
+            if (len + 1024 > cap) {
+                let is i64 as new_cap = cap * 2;
+                let is *u8 as new_buf = _alloc(new_cap);
+                mem.core.memcpy(new_buf, buf, len);
+                _free(buf);
+                buf = new_buf;
+                cap = new_cap;
+            }
+            let is i64 as n = linux.read(cast(i64, pipefd[0]), cast(*u8, cast(i64, buf) + len), 1024);
+            if (n <= 0) { break; }
+            len = len + n;
+        }
+        linux.close(cast(i64, pipefd[0]));
+
+        let is i32 as _status with mut = 0;
+        linux.wait4(pid, &_status, 0, cast(*u8, 0));
+
+        buf[len] = 0;
+        let is str.String as s;
+        s.ptr = buf;
+        s.len = cast(i32, len);
+        s.cap = cast(i32, cap);
+        return s;
+    }
+    return empty;
 }

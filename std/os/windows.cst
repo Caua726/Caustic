@@ -1,14 +1,10 @@
 // =======================================================
-// std/os/windows.cst — Raw Win32 bindings (Fase 2.6 minimum)
+// std/os/windows.cst — Raw Win32 bindings
 //
-// This is the Caustic equivalent of <windows.h>: bare extern declarations
-// of Windows DLL functions, matching kernel32 / ws2_32 / bcrypt signatures.
-// User code can import this directly for low-level access. Portable
-// stdlib wrappers (io.cst, mem.cst, net.cst) sit on top of this.
-//
-// Fase 2.6 ships a minimum surface — just enough to build hello-world,
-// argv parsing, simple file I/O, and process exit. Phases 4-5 expand to
-// the full ~48-function surface (memory, networking, time, env).
+// Caustic equivalent of <windows.h>: bare extern declarations of Windows
+// DLL functions matching kernel32 / ws2_32 / bcrypt signatures. User code
+// can import this directly for low-level access; portable stdlib wrappers
+// (io.cst, mem.cst, net.cst) sit on top.
 //
 // Common STD_HANDLE values for GetStdHandle. Stored as i64 because
 // global init in Caustic doesn't currently accept narrowing of negative
@@ -69,6 +65,8 @@ extern "kernel32.dll" fn SetFilePointerEx(handle as i64, dist as i64,
 extern "kernel32.dll" fn GetFileSizeEx(handle as i64, size as *i64) as i32;
 extern "kernel32.dll" fn DeleteFileA(name as *u8) as i32;
 extern "kernel32.dll" fn MoveFileA(src as *u8, dst as *u8) as i32;
+extern "kernel32.dll" fn MoveFileExA(src as *u8, dst as *u8, flags as u32) as i32;
+let is u32 as MOVEFILE_REPLACE_EXISTING with imut = 1;
 extern "kernel32.dll" fn CreateDirectoryA(name as *u8, sec as *u8) as i32;
 extern "kernel32.dll" fn RemoveDirectoryA(name as *u8) as i32;
 
@@ -89,3 +87,119 @@ extern "kernel32.dll" fn GetCommandLineA() as *u8;
 extern "kernel32.dll" fn GetEnvironmentVariableA(name as *u8, buf as *u8, size as u32) as u32;
 extern "kernel32.dll" fn GetModuleFileNameA(mod as i64, buf as *u8, size as u32) as u32;
 extern "kernel32.dll" fn GetLastError() as u32;
+
+// === Directory enumeration (FindFirstFile/FindNext iterator model) ===
+// WIN32_FIND_DATAA is a 320-byte struct. Callers pass a *u8 buffer of at
+// least 320 bytes; FindFirstFileA writes the first entry's metadata there.
+extern "kernel32.dll" fn FindFirstFileA(name as *u8, data as *u8) as i64;
+extern "kernel32.dll" fn FindNextFileA(handle as i64, data as *u8) as i32;
+extern "kernel32.dll" fn FindClose(handle as i64) as i32;
+
+// stat() / fstat() equivalent — info_level 0 = GetFileExInfoStandard,
+// writes a WIN32_FILE_ATTRIBUTE_DATA (36 bytes).
+extern "kernel32.dll" fn GetFileAttributesExA(name as *u8, info_level as i32,
+                                              info as *u8) as i32;
+let is i32 as GetFileExInfoStandard with imut = 0;
+
+// === Console mode (raw mode / colors) ===
+// dwMode bits relevant for raw terminal control:
+let is u32 as ENABLE_PROCESSED_INPUT       with imut = 1;
+let is u32 as ENABLE_LINE_INPUT            with imut = 2;
+let is u32 as ENABLE_ECHO_INPUT            with imut = 4;
+let is u32 as ENABLE_VIRTUAL_TERMINAL_INPUT with imut = 512;   // 0x0200
+let is u32 as ENABLE_PROCESSED_OUTPUT      with imut = 1;
+let is u32 as ENABLE_WRAP_AT_EOL_OUTPUT    with imut = 2;
+let is u32 as ENABLE_VIRTUAL_TERMINAL_PROCESSING with imut = 4;
+extern "kernel32.dll" fn GetConsoleMode(handle as i64, mode as *u32) as i32;
+extern "kernel32.dll" fn SetConsoleMode(handle as i64, mode as u32) as i32;
+// CONSOLE_SCREEN_BUFFER_INFO is 22 bytes; callers pass a *u8 buffer ≥ 22.
+extern "kernel32.dll" fn GetConsoleScreenBufferInfo(handle as i64, info as *u8) as i32;
+
+// === Process creation / waiting ===
+// CreateProcessA has 10 args; STARTUPINFOA is 104 bytes, PROCESS_INFORMATION
+// is 24 bytes — callers allocate both as byte buffers.
+extern "kernel32.dll" fn CreateProcessA(app_name as *u8, cmd_line as *u8,
+                                        proc_attrs as *u8, thread_attrs as *u8,
+                                        inherit_handles as i32, creation_flags as u32,
+                                        environment as *u8, current_dir as *u8,
+                                        startup_info as *u8, proc_info as *u8) as i32;
+extern "kernel32.dll" fn WaitForSingleObject(handle as i64, ms as u32) as u32;
+extern "kernel32.dll" fn GetExitCodeProcess(handle as i64, code as *u32) as i32;
+
+// === Anonymous pipe (for capture()) ===
+// SECURITY_ATTRIBUTES (24 bytes): nLength(u32) + lpSecurityDescriptor(*u8) +
+//   bInheritHandle(i32). Pass &sa with bInheritHandle=1 to CreatePipe so the
+//   child inherits the write end. lpPipeAttributes can also be NULL.
+extern "kernel32.dll" fn CreatePipe(read as *i64, write as *i64,
+                                    sa as *u8, size as u32) as i32;
+// flag = 1 (HANDLE_FLAG_INHERIT); mask must be 1 to set it.
+extern "kernel32.dll" fn SetHandleInformation(handle as i64, mask as u32,
+                                              flags as u32) as i32;
+let is u32 as HANDLE_FLAG_INHERIT  with imut = 1;
+let is u32 as STARTF_USESTDHANDLES with imut = 256;  // 0x100
+let is u32 as INFINITE        with imut = 4294967295;  // 0xFFFFFFFF
+let is u32 as WAIT_OBJECT_0   with imut = 0;
+let is u32 as WAIT_TIMEOUT    with imut = 258;          // 0x102
+let is u32 as WAIT_FAILED     with imut = 4294967295;   // 0xFFFFFFFF
+
+// === ws2_32.dll — Winsock 2 ===
+// User MUST call WSAStartup(0x0202, &wsadata) (or net.init()) before any
+// other socket call; programs that never call any ws2_32 function don't
+// pay the DLL-load cost (function-level DCE in IR).
+
+// Address families:
+let is i32 as W_AF_UNSPEC with imut = 0;
+let is i32 as W_AF_INET   with imut = 2;
+let is i32 as W_AF_INET6  with imut = 23;
+
+// Socket types:
+let is i32 as W_SOCK_STREAM with imut = 1;
+let is i32 as W_SOCK_DGRAM  with imut = 2;
+
+// Protocols:
+let is i32 as W_IPPROTO_TCP with imut = 6;
+let is i32 as W_IPPROTO_UDP with imut = 17;
+
+// setsockopt levels / opts:
+let is i32 as W_SOL_SOCKET   with imut = 65535;  // 0xFFFF
+let is i32 as W_SO_REUSEADDR with imut = 4;
+let is i32 as W_SO_KEEPALIVE with imut = 8;
+let is i32 as W_SO_BROADCAST with imut = 32;
+
+// ioctlsocket cmd for non-blocking:
+let is u32 as W_FIONBIO with imut = 2147772030;  // 0x8004667E
+
+// INVALID_SOCKET = (SOCKET)(~0); SOCKET is UINT_PTR — on x64 a u64 but kept
+// as i64 here for consistency with handle-style returns.
+let is i64 as INVALID_SOCKET with imut = 0 - 1;
+let is i64 as SOCKET_ERROR   with imut = 0 - 1;
+
+extern "ws2_32.dll" fn WSAStartup(version as u32, wsadata as *u8) as i32;
+extern "ws2_32.dll" fn WSACleanup() as i32;
+extern "ws2_32.dll" fn WSAGetLastError() as i32;
+extern "ws2_32.dll" fn WSASocketA(af as i32, sock_type as i32, proto as i32,
+                                  info as *u8, group as u32, flags as u32) as i64;
+extern "ws2_32.dll" fn bind(s as i64, addr as *u8, len as i32) as i32;
+extern "ws2_32.dll" fn listen(s as i64, backlog as i32) as i32;
+extern "ws2_32.dll" fn accept(s as i64, addr as *u8, addrlen as *i32) as i64;
+extern "ws2_32.dll" fn connect(s as i64, addr as *u8, len as i32) as i32;
+extern "ws2_32.dll" fn send(s as i64, buf as *u8, len as i32, flags as i32) as i32;
+extern "ws2_32.dll" fn recv(s as i64, buf as *u8, len as i32, flags as i32) as i32;
+extern "ws2_32.dll" fn setsockopt(s as i64, level as i32, opt as i32,
+                                  val as *u8, len as i32) as i32;
+extern "ws2_32.dll" fn getsockopt(s as i64, level as i32, opt as i32,
+                                  val as *u8, len as *i32) as i32;
+extern "ws2_32.dll" fn closesocket(s as i64) as i32;
+extern "ws2_32.dll" fn ioctlsocket(s as i64, cmd as u32, arg as *u32) as i32;
+extern "ws2_32.dll" fn WSAPoll(fds as *u8, nfds as u32, timeout as i32) as i32;
+extern "ws2_32.dll" fn htons(host as u32) as u32;
+extern "ws2_32.dll" fn htonl(host as u32) as u32;
+extern "ws2_32.dll" fn ntohs(net as u32) as u32;
+extern "ws2_32.dll" fn ntohl(net as u32) as u32;
+
+// === bcrypt.dll — entropy ===
+// Pass alg = 0 to get system-provided RNG (BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+// in dwFlags). Returns 0 on success, NTSTATUS on failure.
+let is u32 as BCRYPT_USE_SYSTEM_PREFERRED_RNG with imut = 2;
+extern "bcrypt.dll" fn BCryptGenRandom(alg as i64, buf as *u8, len as u32,
+                                       flags as u32) as i32;
