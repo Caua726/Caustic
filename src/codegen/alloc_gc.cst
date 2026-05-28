@@ -705,72 +705,101 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         let is *i32 as stp = cast(*i32, cast(i64, stack) + cast(i64, stack_top) * 4);
         let is i32 as v = *stp;
 
-        // Build used colors set
-        let is [10]i32 as used;
-        let is i32 as ri with mut = 0;
-        while (ri < 10) { used[ri] = 0; ri = ri + 1; }
-
-        let is i32 as nb with mut = 0;
-        while (nb < n) {
-            if (nb != v && bm_test(matrix, n, v, nb) == 1) {
-                let is i32 as rnb = gc2_resolve(alias, nb);
-                let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
-                if (*cnb >= 0) {
-                    let is i32 as slot = core.reg_to_slot(*cnb);
-                    if (slot >= 0) { used[slot] = 1; }
-                }
-            }
-            nb = nb + 1;
+        // Look up class for v's representative interval.
+        let is i32 as v_class with mut = d.VR_GPR;
+        let is *i32 as v_iv_p = cast(*i32, cast(i64, v2iv) + cast(i64, v) * 4);
+        if (*v_iv_p >= 0) {
+            let is *core.LiveInterval as v_iv = gc2_get_iv(ctx.intervals, *v_iv_p);
+            v_class = v_iv.reg_class;
         }
 
-        // Exclude caller-saved if call-crossing
-        let is *i32 as cc_v = cast(*i32, cast(i64, crosses_call) + cast(i64, v) * 4);
-        if (*cc_v == 1) {
-            used[4] = 1;  // r8
-            used[5] = 1;  // r9
-            used[6] = 1;  // r10
-            used[7] = 1;  // rsi
-            used[8] = 1;  // rdi
-        }
-
-        // Exclude other params' ABI registers for GET_ARG vregs
-        // Prevents sequential GET_ARG emission from clobbering later params' ABI regs.
-        let is *i32 as ga_v = cast(*i32, cast(i64, ga_param) + cast(i64, v) * 4);
-        if (*ga_v >= 0) {
-            let is i32 as ga_ai with mut = 0;
-            while (ga_ai < ga_nargs) {
-                if (ga_ai != *ga_v && ga_abi_slot[ga_ai] >= 0) {
-                    used[ga_abi_slot[ga_ai]] = 1;
-                }
-                ga_ai = ga_ai + 1;
-            }
-        }
-
-        // Try coalesce hint: check if v has alias partner with color
         let is i32 as chosen with mut = cast(i32, 0 - 1);
-        let is i32 as mh with mut = 0;
-        while (mh < mov_count && chosen < 0) {
-            let is *GCMove as hmv = cast(*GCMove, cast(i64, moves) + cast(i64, mh) * sizeof(GCMove));
-            let is i32 as ha = gc2_resolve(alias, hmv.src);
-            let is i32 as hb = gc2_resolve(alias, hmv.dst);
-            if (ha == v || hb == v) {
-                let is i32 as partner with mut = ha;
-                if (ha == v) { partner = hb; }
-                let is *i32 as cp2 = cast(*i32, cast(i64, color) + cast(i64, partner) * 4);
-                if (*cp2 >= 0) {
-                    let is i32 as ps = core.reg_to_slot(*cp2);
-                    if (ps >= 0 && used[ps] == 0) { chosen = *cp2; }
+
+        if (v_class == d.VR_XMM) {
+            // === XMM class: 14-color pool (xmm2..xmm15) ===
+            // xmm0 and xmm1 are reserved as scratch for gen_inst_float and
+            // every load_op_xmm/store_op_xmm target. Allowing them in the
+            // pool would let the allocator give a live vreg a register that
+            // the codegen freely clobbers for f64 binops.
+            let is [16]i32 as used_xmm;
+            let is i32 as xi with mut = 0;
+            while (xi < 16) { used_xmm[xi] = 0; xi = xi + 1; }
+            used_xmm[0] = 1; used_xmm[1] = 1; // reserve xmm0, xmm1
+            let is i32 as nb with mut = 0;
+            while (nb < n) {
+                if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                    let is i32 as rnb = gc2_resolve(alias, nb);
+                    let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
+                    if (*cnb >= 16 && *cnb <= 31) {
+                        used_xmm[*cnb - 16] = 1;
+                    }
+                }
+                nb = nb + 1;
+            }
+            xi = 0;
+            while (xi < 16 && chosen < 0) {
+                if (used_xmm[xi] == 0) { chosen = 16 + xi; }
+                xi = xi + 1;
+            }
+        } else {
+            // === GPR class: 10-color pool (existing logic) ===
+            let is [10]i32 as used;
+            let is i32 as ri with mut = 0;
+            while (ri < 10) { used[ri] = 0; ri = ri + 1; }
+
+            let is i32 as nb with mut = 0;
+            while (nb < n) {
+                if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                    let is i32 as rnb = gc2_resolve(alias, nb);
+                    let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
+                    if (*cnb >= 0) {
+                        let is i32 as slot = core.reg_to_slot(*cnb);
+                        if (slot >= 0) { used[slot] = 1; }
+                    }
+                }
+                nb = nb + 1;
+            }
+
+            let is *i32 as cc_v = cast(*i32, cast(i64, crosses_call) + cast(i64, v) * 4);
+            if (*cc_v == 1) {
+                used[4] = 1; used[5] = 1; used[6] = 1; used[7] = 1; used[8] = 1;
+            }
+
+            let is *i32 as ga_v = cast(*i32, cast(i64, ga_param) + cast(i64, v) * 4);
+            if (*ga_v >= 0) {
+                let is i32 as ga_ai with mut = 0;
+                while (ga_ai < ga_nargs) {
+                    if (ga_ai != *ga_v && ga_abi_slot[ga_ai] >= 0) {
+                        used[ga_abi_slot[ga_ai]] = 1;
+                    }
+                    ga_ai = ga_ai + 1;
                 }
             }
-            mh = mh + 1;
-        }
 
-        // First-fit
-        if (chosen < 0) {
-            ri = 0;
-            while (ri < 10 && chosen < 0) {
-                if (used[ri] == 0) { chosen = regs[ri]; }
-                ri = ri + 1;
+            // Try coalesce hint: check if v has alias partner with color
+            let is i32 as mh with mut = 0;
+            while (mh < mov_count && chosen < 0) {
+                let is *GCMove as hmv = cast(*GCMove, cast(i64, moves) + cast(i64, mh) * sizeof(GCMove));
+                let is i32 as ha = gc2_resolve(alias, hmv.src);
+                let is i32 as hb = gc2_resolve(alias, hmv.dst);
+                if (ha == v || hb == v) {
+                    let is i32 as partner with mut = ha;
+                    if (ha == v) { partner = hb; }
+                    let is *i32 as cp2 = cast(*i32, cast(i64, color) + cast(i64, partner) * 4);
+                    if (*cp2 >= 0) {
+                        let is i32 as ps = core.reg_to_slot(*cp2);
+                        if (ps >= 0 && used[ps] == 0) { chosen = *cp2; }
+                    }
+                }
+                mh = mh + 1;
+            }
+
+            if (chosen < 0) {
+                ri = 0;
+                while (ri < 10 && chosen < 0) {
+                    if (used[ri] == 0) { chosen = regs[ri]; }
+                    ri = ri + 1;
+                }
             }
         }
 
@@ -779,9 +808,8 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             *cv = chosen;
             let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, v) * 4);
             *vp = chosen;
-            gc_mark_callee(chosen, ctx);
+            if (v_class == d.VR_GPR) { gc_mark_callee(chosen, ctx); }
         } else {
-            // Actual spill
             let is i32 as sp = ctx.next_spill;
             ctx.next_spill = ctx.next_spill + 1;
             let is *i32 as vp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, v) * 4);

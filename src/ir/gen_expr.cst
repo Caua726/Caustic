@@ -470,6 +470,29 @@ fn gen_expr(node as *ast.Node) as i32 {
 
     // NK_ASSIGN
     if (k == ast.NK_ASSIGN) {
+        // Fast path: `local = expr` (simple scalar). Emit `STORE [imm] = expr`
+        // directly so mem2reg can see a pure IMM-offset slot and promote it.
+        // Without this, the lhs goes through `IR_ADDR &[rbp-N]; STORE [vreg]`
+        // which makes find_promotable flag the slot as address-taken — that's
+        // what caused fannkuch's loop-carried scalars to stay on the stack.
+        if (node.lhs.kind == ast.NK_IDENT && node.lhs.is_global == 0
+            && ty.size <= 8) {
+            let is i32 as rhs_kind = node.rhs.kind;
+            if (rhs_kind == ast.NK_FNCALL || rhs_kind == ast.NK_SYSCALL) {
+                let is *d.IRInst as ctx_inst = d.new_inst(d.IR_SET_CTX);
+                ctx_inst.src1 = d.op_imm(0);
+                ctx_inst.line = line;
+                g.emit(ctx_inst);
+            }
+            let is i32 as rhs_val = gen_expr(node.rhs);
+            let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+            si.dest = d.op_imm(cast(i64, node.lhs.var_offset));
+            si.src1 = d.op_vreg(rhs_val);
+            si.cast_to = cast(*u8, ty);
+            si.line = line;
+            g.emit(si);
+            return rhs_val;
+        }
         let is i32 as lhs_addr = gen_addr(node.lhs);
         let is i32 as rhs_kind = node.rhs.kind;
         if (rhs_kind == ast.NK_FNCALL || rhs_kind == ast.NK_SYSCALL) {
@@ -743,9 +766,10 @@ fn gen_expr(node as *ast.Node) as i32 {
         return md;
     }
 
-    // Comparison ops
-    if (k == ast.NK_EQ) { return gen_cmp(node, d.IR_EQ, line, 0); }
-    if (k == ast.NK_NE) { return gen_cmp(node, d.IR_NE, line, 0); }
+    // Comparison ops — always carry operand type so codegen can dispatch
+    // f64/f32 compares to ucomisd + CF-based jumps.
+    if (k == ast.NK_EQ) { return gen_cmp(node, d.IR_EQ, line, 1); }
+    if (k == ast.NK_NE) { return gen_cmp(node, d.IR_NE, line, 1); }
     if (k == ast.NK_LT) { return gen_cmp(node, d.IR_LT, line, 1); }
     if (k == ast.NK_LE) { return gen_cmp(node, d.IR_LE, line, 1); }
     if (k == ast.NK_GT) { return gen_cmp(node, d.IR_GT, line, 1); }
@@ -931,6 +955,18 @@ fn gen_expr(node as *ast.Node) as i32 {
         vai.line = line;
         g.emit(vai);
         return va_addr;
+    }
+
+    // NK_SQRT — `__builtin_sqrt(x)` → IR_FSQRT (sqrtsd at codegen).
+    if (k == ast.NK_SQRT) {
+        let is i32 as src = gen_expr(node.expr);
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as si = d.new_inst(d.IR_FSQRT);
+        si.dest = d.op_vreg(dest);
+        si.src1 = d.op_vreg(src);
+        si.line = line;
+        g.emit(si);
+        return dest;
     }
 
     io.write_str(io.STDERR, "ir: unsupported expression kind: ");

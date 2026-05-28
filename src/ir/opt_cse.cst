@@ -1,0 +1,151 @@
+use "defs.cst" as d;
+
+// === Local CSE / GVN within a basic block ===
+// Hashes pure arithmetic/address expressions and replaces redundant copies
+// with the original vreg. Audit identified `bodies[i*7+0..6]` style address
+// computations (where i*7 is recomputed 7×) as the biggest single source of
+// instruction-count blow-up on nbody. Local CSE catches this without needing
+// dominance analysis or SSA.
+//
+// Pure ops handled: IMM, ADD, SUB, MUL, SHL, SHR, AND, OR, XOR.
+// LOAD, STORE, CALL, and ops with side effects reset the table when seen —
+// LOAD because a STORE after may alias; STORE/CALL because they can mutate
+// memory. Labels and jumps end the block.
+
+let is i32 as CSE_BUCKETS with imut = 256;
+// Per-entry: op(i32) + s1t(i32) + s1v(i64) + s2t(i32) + s2v(i64) + vreg(i32) = 32 bytes
+let is i32 as CSE_ENTRY_BYTES with imut = 32;
+let is *u8 as cse_table with mut;
+let is i32 as cse_count with mut = 0;
+
+fn cse_init_table() as void {
+    if (cast(i64, cse_table) == 0) {
+        cse_table = d.opt_alloc(cast(i64, CSE_BUCKETS) * cast(i64, CSE_ENTRY_BYTES));
+    }
+}
+
+fn cse_reset() as void {
+    if (cast(i64, cse_table) == 0) { return; }
+    let is i32 as i with mut = 0;
+    while (i < CSE_BUCKETS) {
+        let is *i32 as op_p = cast(*i32, cast(i64, cse_table) + cast(i64, i) * cast(i64, CSE_ENTRY_BYTES));
+        *op_p = 0 - 1;
+        i = i + 1;
+    }
+    cse_count = 0;
+}
+
+fn cse_hash(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i64) as i32 {
+    let is i64 as h with mut = cast(i64, op) * 2654435761;
+    h = h + s1v * 1597334677;
+    h = h + cast(i64, s1t) * 1357676777;
+    h = h + s2v * 2147483647;
+    h = h + cast(i64, s2t) * 16777619;
+    h = h & 9223372036854775807;
+    return cast(i32, h & cast(i64, CSE_BUCKETS - 1));
+}
+
+// Returns the vreg of the prior identical expression, or -1 if new.
+// On miss, stores the new entry.
+fn cse_lookup_or_insert(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i64, vreg as i32) as i32 {
+    let is i32 as h with mut = cse_hash(op, s1t, s1v, s2t, s2v);
+    let is i32 as tries with mut = 0;
+    while (tries < CSE_BUCKETS) {
+        let is i64 as off = cast(i64, cse_table) + cast(i64, h) * cast(i64, CSE_ENTRY_BYTES);
+        let is *i32 as op_p = cast(*i32, off);
+        if (*op_p == 0 - 1) {
+            // Empty slot — insert.
+            *op_p = op;
+            let is *i32 as s1t_p = cast(*i32, off + 4);  *s1t_p = s1t;
+            let is *i64 as s1v_p = cast(*i64, off + 8);  *s1v_p = s1v;
+            let is *i32 as s2t_p = cast(*i32, off + 16); *s2t_p = s2t;
+            let is *i64 as s2v_p = cast(*i64, off + 20); *s2v_p = s2v;
+            let is *i32 as vp = cast(*i32, off + 28);    *vp = vreg;
+            return cast(i32, 0 - 1);
+        }
+        if (*op_p == op) {
+            let is *i32 as s1t_p = cast(*i32, off + 4);
+            let is *i64 as s1v_p = cast(*i64, off + 8);
+            let is *i32 as s2t_p = cast(*i32, off + 16);
+            let is *i64 as s2v_p = cast(*i64, off + 20);
+            if (*s1t_p == s1t && *s1v_p == s1v && *s2t_p == s2t && *s2v_p == s2v) {
+                let is *i32 as vp = cast(*i32, off + 28);
+                return *vp;
+            }
+        }
+        h = (h + 1) & (CSE_BUCKETS - 1);
+        tries = tries + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn is_pure_op(op as i32) as i32 {
+    if (op == d.IR_IMM) { return 1; }
+    if (op == d.IR_ADD || op == d.IR_SUB) { return 1; }
+    if (op == d.IR_MUL) { return 1; }
+    if (op == d.IR_SHL || op == d.IR_SHR) { return 1; }
+    if (op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR) { return 1; }
+    return 0;
+}
+
+fn op_ends_block(op as i32) as i32 {
+    if (op == d.IR_LABEL) { return 1; }
+    if (op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { return 1; }
+    if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL) { return 1; }
+    if (op == d.IR_STORE) { return 1; }
+    if (op == d.IR_RET) { return 1; }
+    return 0;
+}
+
+fn pass_cse_local(func as *d.IRFunction) as void {
+    if (func.vreg_count < 4) { return; }
+    cse_init_table();
+    cse_reset();
+
+    let is *i32 as remap = cast(*i32, d.opt_alloc(cast(i64, func.vreg_count) * 4));
+    let is i32 as i with mut = 0;
+    while (i < func.vreg_count) {
+        let is *i32 as rp = cast(*i32, cast(i64, remap) + cast(i64, i) * 4);
+        *rp = i;
+        i = i + 1;
+    }
+
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 1) { inst = inst.next; }
+        else {
+            // Apply remap to src operands.
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg < func.vreg_count) {
+                let is *i32 as rp = cast(*i32, cast(i64, remap) + cast(i64, inst.src1.vreg) * 4);
+                inst.src1.vreg = *rp;
+            }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg < func.vreg_count) {
+                let is *i32 as rp = cast(*i32, cast(i64, remap) + cast(i64, inst.src2.vreg) * 4);
+                inst.src2.vreg = *rp;
+            }
+
+            if (op_ends_block(inst.op) == 1) { cse_reset(); }
+            else if (is_pure_op(inst.op) == 1 && inst.dest.op_type == d.OP_VREG) {
+                // Pack (op, src1, src2) and look up.
+                let is i32 as s1t = inst.src1.op_type;
+                let is i64 as s1v with mut = 0;
+                if (s1t == d.OP_VREG) { s1v = cast(i64, inst.src1.vreg); }
+                else if (s1t == d.OP_IMM) { s1v = inst.src1.imm; }
+                let is i32 as s2t = inst.src2.op_type;
+                let is i64 as s2v with mut = 0;
+                if (s2t == d.OP_VREG) { s2v = cast(i64, inst.src2.vreg); }
+                else if (s2t == d.OP_IMM) { s2v = inst.src2.imm; }
+                let is i32 as prior = cse_lookup_or_insert(inst.op, s1t, s1v, s2t, s2v, inst.dest.vreg);
+                if (prior >= 0 && prior != inst.dest.vreg) {
+                    // Redundant — kill this inst and remap dest → prior.
+                    let is *i32 as rp = cast(*i32, cast(i64, remap) + cast(i64, inst.dest.vreg) * 4);
+                    *rp = prior;
+                    inst.is_dead = 1;
+                }
+            }
+            inst = inst.next;
+        }
+    }
+
+    d.opt_free(cast(*u8, remap));
+}

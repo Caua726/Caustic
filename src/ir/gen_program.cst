@@ -62,6 +62,104 @@ fn eval_const_expr(node as *ast.Node) as i64 {
 
 // === mark_reachable ===
 
+// Hash table for mark_reachable. DJB2 + chaining, power-of-2 buckets.
+// Built once per top-level mark_reachable invocation; turns _reach_by_name
+// from O(F+G) into O(1) average.
+let is i32 as REACH_HASH_BUCKETS with imut = 4096;
+let is *i32 as _reach_fn_buckets with mut;
+let is *i64 as _reach_fn_ptrs with mut;
+let is *i32 as _reach_fn_next with mut;
+let is i32 as _reach_fn_count with mut = 0;
+let is *i32 as _reach_gl_buckets with mut;
+let is *i64 as _reach_gl_ptrs with mut;
+let is *i32 as _reach_gl_next with mut;
+let is i32 as _reach_gl_count with mut = 0;
+let is i32 as _reach_index_ready with mut = 0;
+
+fn _reach_hash(name_ptr as *u8, name_len as i32) as i32 {
+    let is i64 as h with mut = 5381;
+    let is i32 as i with mut = 0;
+    while (i < name_len) {
+        h = h * 33 + cast(i64, name_ptr[i]);
+        i = i + 1;
+    }
+    h = h & 9223372036854775807;
+    return cast(i32, h & cast(i64, REACH_HASH_BUCKETS - 1));
+}
+
+fn _reach_build_index(prog as *d.IRProgram) as void {
+    let is i32 as fcount with mut = 0;
+    let is *d.IRFunction as fc with mut = prog.functions;
+    while (cast(i64, fc) != 0) { fcount = fcount + 1; fc = fc.next; }
+    let is i32 as gcount with mut = 0;
+    let is *d.IRGlobal as gc with mut = prog.globals;
+    while (cast(i64, gc) != 0) { gcount = gcount + 1; gc = gc.next; }
+
+    let is i32 as fcap with mut = fcount;
+    if (fcap < 1) { fcap = 1; }
+    let is i32 as gcap with mut = gcount;
+    if (gcap < 1) { gcap = 1; }
+
+    _reach_fn_buckets = cast(*i32, d.opt_alloc(cast(i64, REACH_HASH_BUCKETS) * 4));
+    _reach_fn_ptrs    = cast(*i64, d.opt_alloc(cast(i64, fcap) * 8));
+    _reach_fn_next    = cast(*i32, d.opt_alloc(cast(i64, fcap) * 4));
+    _reach_gl_buckets = cast(*i32, d.opt_alloc(cast(i64, REACH_HASH_BUCKETS) * 4));
+    _reach_gl_ptrs    = cast(*i64, d.opt_alloc(cast(i64, gcap) * 8));
+    _reach_gl_next    = cast(*i32, d.opt_alloc(cast(i64, gcap) * 4));
+
+    let is i32 as i with mut = 0;
+    while (i < REACH_HASH_BUCKETS) {
+        _reach_fn_buckets[i] = 0 - 1;
+        _reach_gl_buckets[i] = 0 - 1;
+        i = i + 1;
+    }
+
+    _reach_fn_count = 0;
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        let is *u8 as fname with mut = f.name_ptr;
+        let is i32 as flen with mut = f.name_len;
+        if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
+        let is i32 as b = _reach_hash(fname, flen);
+        let is *i64 as pp = cast(*i64, cast(i64, _reach_fn_ptrs) + cast(i64, _reach_fn_count) * 8);
+        let is *i32 as np = cast(*i32, cast(i64, _reach_fn_next) + cast(i64, _reach_fn_count) * 4);
+        *pp = cast(i64, f);
+        *np = _reach_fn_buckets[b];
+        _reach_fn_buckets[b] = _reach_fn_count;
+        _reach_fn_count = _reach_fn_count + 1;
+        f = f.next;
+    }
+
+    _reach_gl_count = 0;
+    let is *d.IRGlobal as gg with mut = prog.globals;
+    while (cast(i64, gg) != 0) {
+        let is i32 as b = _reach_hash(gg.name_ptr, gg.name_len);
+        let is *i64 as pp = cast(*i64, cast(i64, _reach_gl_ptrs) + cast(i64, _reach_gl_count) * 8);
+        let is *i32 as np = cast(*i32, cast(i64, _reach_gl_next) + cast(i64, _reach_gl_count) * 4);
+        *pp = cast(i64, gg);
+        *np = _reach_gl_buckets[b];
+        _reach_gl_buckets[b] = _reach_gl_count;
+        _reach_gl_count = _reach_gl_count + 1;
+        gg = gg.next;
+    }
+
+    _reach_index_ready = 1;
+}
+
+fn _reach_global_by_name(tname as *u8, tlen as i32) as void {
+    let is i32 as b = _reach_hash(tname, tlen);
+    let is i32 as ix with mut = _reach_gl_buckets[b];
+    while (ix >= 0) {
+        let is *i64 as pp = cast(*i64, cast(i64, _reach_gl_ptrs) + cast(i64, ix) * 8);
+        let is *d.IRGlobal as gg = cast(*d.IRGlobal, *pp);
+        if (d.str_eq(gg.name_ptr, gg.name_len, tname, tlen) == 1) {
+            gg.is_reachable = 1;
+        }
+        let is *i32 as np = cast(*i32, cast(i64, _reach_gl_next) + cast(i64, ix) * 4);
+        ix = *np;
+    }
+}
+
 // Cache call/fn_addr target names before freeing instructions
 fn cache_call_targets(func as *d.IRFunction) as void {
     let is i32 as count with mut = 0;
@@ -107,25 +205,21 @@ fn cache_call_targets(func as *d.IRFunction) as void {
 }
 
 fn _reach_by_name(prog as *d.IRProgram, tname as *u8, tlen as i32) as void {
-    let is *d.IRFunction as f with mut = prog.functions;
-    while (cast(i64, f) != 0) {
+    let is i32 as b = _reach_hash(tname, tlen);
+    let is i32 as ix with mut = _reach_fn_buckets[b];
+    while (ix >= 0) {
+        let is *i64 as pp = cast(*i64, cast(i64, _reach_fn_ptrs) + cast(i64, ix) * 8);
+        let is *d.IRFunction as f = cast(*d.IRFunction, *pp);
         let is *u8 as fname with mut = f.name_ptr;
         let is i32 as flen with mut = f.name_len;
         if (f.asm_name_len > 0) { fname = f.asm_name_ptr; flen = f.asm_name_len; }
         if (d.str_eq(fname, flen, tname, tlen) == 1) {
             mark_reachable(prog, f);
         }
-        f = f.next;
+        let is *i32 as np = cast(*i32, cast(i64, _reach_fn_next) + cast(i64, ix) * 4);
+        ix = *np;
     }
-    // A name in the cached-targets buffer can refer to either a function
-    // (IR_CALL/IR_FN_ADDR) or a global (IR_ADDR_GLOBAL). Try both kinds.
-    let is *d.IRGlobal as gg with mut = prog.globals;
-    while (cast(i64, gg) != 0) {
-        if (d.str_eq(gg.name_ptr, gg.name_len, tname, tlen) == 1) {
-            gg.is_reachable = 1;
-        }
-        gg = gg.next;
-    }
+    _reach_global_by_name(tname, tlen);
 }
 
 fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
@@ -155,13 +249,7 @@ fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
             _reach_by_name(prog, inst.global_name_ptr, inst.global_name_len);
         }
         if (inst.op == d.IR_ADDR_GLOBAL && inst.global_name_len > 0) {
-            let is *d.IRGlobal as gg with mut = prog.globals;
-            while (cast(i64, gg) != 0) {
-                if (d.str_eq(gg.name_ptr, gg.name_len, inst.global_name_ptr, inst.global_name_len) == 1) {
-                    gg.is_reachable = 1;
-                }
-                gg = gg.next;
-            }
+            _reach_global_by_name(inst.global_name_ptr, inst.global_name_len);
         }
         inst = inst.next;
     }
@@ -505,6 +593,7 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
     prog.strings = g.string_head;
 
     if (cast(i64, prog.main_func) != 0) {
+        _reach_build_index(prog);
         mark_reachable(prog, prog.main_func);
         // Globals placed in a custom ELF section are there for a side-effect
         // (named section in the ELF/PE output) — keep them even if no

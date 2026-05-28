@@ -55,6 +55,9 @@ let is i32 as IR_CALL_INDIRECT with imut = 47;
 // The dll_name string (e.g. "kernel32.dll") rides on the IRInst so the
 // assembler can emit a `.cstimport <dll> <name>` directive.
 let is i32 as IR_FFI_CALL      with imut = 48;
+// Hardware sqrt: lowers to `sqrtsd xmm0, xmm0`. Bypasses libm; emitted when
+// the parser sees `__builtin_sqrt(x)` (and used by std/math.cst's sqrt wrapper).
+let is i32 as IR_FSQRT         with imut = 49;
 
 // === Operand types ===
 let is i32 as OP_NONE  with imut = 0;
@@ -117,8 +120,16 @@ struct IRFunction {
     ast_node as *u8;
     call_targets as *u8;
     call_target_count as i32;
+    // Per-vreg class (filled by infer_vreg_classes before regalloc):
+    //   0 = VR_GPR (integer/pointer, allocated to rax/rbx/r8…)
+    //   1 = VR_XMM (f64, allocated to xmm0…xmm15)
+    // Pointer is null until inferred.
+    vreg_class as *i32;
     next as *IRFunction;
 }
+
+let is i32 as VR_GPR with imut = 0;
+let is i32 as VR_XMM with imut = 1;
 
 struct IRGlobal {
     name_ptr as *u8;
@@ -300,4 +311,78 @@ fn str_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
     if (alen != blen) { return 0; }
     if (mem.core.memcmp(a, b, cast(i64, alen)) != 0) { return 0; }
     return 1;
+}
+
+// === Vreg class table accessors ===
+
+fn vreg_class_get(func as *IRFunction, vreg as i32) as i32 {
+    if (cast(i64, func.vreg_class) == 0) { return VR_GPR; }
+    if (vreg < 0 || vreg >= func.vreg_count) { return VR_GPR; }
+    let is *i32 as p = cast(*i32, cast(i64, func.vreg_class) + cast(i64, vreg) * 4);
+    return *p;
+}
+
+fn vreg_class_set(func as *IRFunction, vreg as i32, cls as i32) as void {
+    if (cast(i64, func.vreg_class) == 0) { return; }
+    if (vreg < 0 || vreg >= func.vreg_count) { return; }
+    let is *i32 as p = cast(*i32, cast(i64, func.vreg_class) + cast(i64, vreg) * 4);
+    *p = cls;
+}
+
+// Infer vreg classes from instruction stream. Run AFTER all IR for a func is
+// emitted but BEFORE regalloc.
+//
+// Rules (forward dataflow over the linked list of insts):
+//   - Result of IR_FADD/FSUB/FMUL/FDIV/FNEG/FSQRT is XMM.
+//   - Result of IR_LOAD/STORE with cast_to=f32/f64 is XMM.
+//   - Result of IR_CAST to float is XMM; to int is GPR (handled implicitly).
+//   - Result of IR_MOV/COPY inherits its source's class.
+//   - Result of IR_GET_ARG: GPR by default (caller passes f64 args via xmm
+//     registers per SysV ABI, but the get-arg emitter unpacks into the gpr
+//     so the f64 value still lives in a GPR vreg unless propagated later).
+//     We promote to XMM in a fix-up pass when the vreg's only uses are
+//     XMM-class consumers.
+// Default class is GPR. Iterates until fixed point so MOV chains propagate.
+fn infer_vreg_classes(func as *IRFunction) as void {
+    if (func.vreg_count == 0) { return; }
+    func.vreg_class = cast(*i32, opt_alloc(cast(i64, func.vreg_count) * 4));
+    let is i32 as i with mut = 0;
+    while (i < func.vreg_count) {
+        let is *i32 as p = cast(*i32, cast(i64, func.vreg_class) + cast(i64, i) * 4);
+        *p = VR_GPR;
+        i = i + 1;
+    }
+    // Initial seeding from defining op.
+    let is *IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == OP_VREG) {
+            let is i32 as op = inst.op;
+            if (op == IR_FADD || op == IR_FSUB || op == IR_FMUL || op == IR_FDIV
+                || op == IR_FNEG || op == IR_FSQRT) {
+                vreg_class_set(func, inst.dest.vreg, VR_XMM);
+            }
+        }
+        inst = inst.next;
+    }
+    // Propagate through MOV/COPY. Iterate until stable.
+    let is i32 as changed with mut = 1;
+    let is i32 as iters with mut = 0;
+    while (changed == 1 && iters < 32) {
+        changed = 0;
+        iters = iters + 1;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.dest.op_type == OP_VREG
+                && (inst.op == IR_MOV || inst.op == IR_COPY)
+                && inst.src1.op_type == OP_VREG) {
+                let is i32 as src_cls = vreg_class_get(func, inst.src1.vreg);
+                let is i32 as dst_cls = vreg_class_get(func, inst.dest.vreg);
+                if (src_cls == VR_XMM && dst_cls == VR_GPR) {
+                    vreg_class_set(func, inst.dest.vreg, VR_XMM);
+                    changed = 1;
+                }
+            }
+            inst = inst.next;
+        }
+    }
 }
