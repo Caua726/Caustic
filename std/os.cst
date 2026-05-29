@@ -5,22 +5,30 @@
 // import unconditionally on any target: extern declarations without bodies
 // are DCE'd from IR, and syscall-wrapping functions on the wrong-target
 // side are dead-stripped at codegen by the IR-gen branch elim once their
-// guarding `if (os.current == os.OS_X)` folds to false.
+// guarding `if (os.current() == os.OS_X)` folds to false.
 //
 // User pattern for portable code:
 //   use "std/os.cst" as os;
-//   if (os.current == os.OS_LINUX) {
+//   if (os.current() == os.OS_LINUX) {
 //       os.linux.write(1, "hi", 2);
-//   } else if (os.current == os.OS_WINDOWS) {
+//   } else if (os.current() == os.OS_WINDOWS) {
 //       let is u32 as w with mut = 0;
 //       os.windows.WriteFile(os.windows.GetStdHandle(0 - 11), "hi", 2, &w, cast(*u8, 0));
 //   }
 //
-// Mechanics: `os.current` is a `with imut` global whose init folds to a
-// literal in semantic (1 = Linux, 2 = Windows). The compiler propagates
-// that literal at every use site, so `os.current == os.OS_LINUX` collapses
-// to `1 == 1` → `1` → dead-branch elim — the wrong-target code path never
-// reaches codegen and the syscall/kernel32 gate never fires.
+// Mechanics: `os.current()` is a `with imut` function. In normal single-OS
+// builds (linux/windows/caustic targets, or CSE pure/bundle mode) its body
+// has no runtime dependency, so the AST interpreter folds the call to a
+// literal (1 = Linux, 2 = Windows) at semantic time. That literal propagates
+// to every use site, so `os.current() == os.OS_LINUX` collapses to `1` →
+// dead-branch elim — the wrong-target path never reaches codegen and the
+// syscall/kernel32 gate never fires.
+//
+// In CSE compat mode (--target=caustic --mode=compat), `__compat_mode` folds
+// to 1, so the body returns the `mut` global `_runtime_os_current`. Reading a
+// mut global is not foldable, so the call stays a real runtime dispatch and
+// both OS code paths are emitted, selected at run time. The bootstrap sets
+// `_runtime_os_current` to the detected OS before main().
 // =======================================================
 
 use "os/linux.cst" as linux;
@@ -31,8 +39,16 @@ let is i32 as OS_UNKNOWN with imut = 0;
 let is i32 as OS_LINUX   with imut = 1;
 let is i32 as OS_WINDOWS with imut = 2;
 
-// Active target, folded to a literal at parse time via the parser builtins.
-// __target_is_linux is 1 on Linux builds and 0 elsewhere (and vice versa
-// for Windows), so this expression evaluates to exactly one of the OS_*
-// values at semantic time.
-let is i32 as current with imut = __target_is_linux * OS_LINUX + __target_is_windows * OS_WINDOWS;
+// Runtime OS identity, used only in CSE compat mode where a single binary may
+// run on more than one OS. The bootstrap stub sets this before main(); in all
+// other builds it stays 0 and is never read (the compat branch is dead).
+let is i32 as _runtime_os_current with mut = 0;
+
+// Active OS. In normal/pure/bundle builds this folds to a literal at semantic
+// time (see header). In compat mode it resolves at run time.
+//   __target_is_linux is 1 on Linux/caustic builds and 0 elsewhere (and vice
+//   versa for Windows), so the folded expression yields exactly one OS_* value.
+fn current() as i32 with imut {
+    if (__compat_mode == 1) { return _runtime_os_current; }   // mut read → not foldable → runtime call
+    return __target_is_linux * OS_LINUX + __target_is_windows * OS_WINDOWS;
+}
