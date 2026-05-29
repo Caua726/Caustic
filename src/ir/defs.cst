@@ -350,6 +350,16 @@ fn vreg_class_set(func as *IRFunction, vreg as i32, cls as i32) as void {
 //     We promote to XMM in a fix-up pass when the vreg's only uses are
 //     XMM-class consumers.
 // Default class is GPR. Iterates until fixed point so MOV chains propagate.
+// True if the type pointer (an *ast.Type) is f32/f64. Reads the kind
+// field at offset 0 directly to avoid importing the parser into defs.
+// ast.TY_F32 = 9, ast.TY_F64 = 10.
+fn _ty_is_float(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 0; }
+    let is *i32 as kp = cast(*i32, cast(i64, ty_ptr));
+    if (*kp == 9 || *kp == 10) { return 1; }
+    return 0;
+}
+
 fn infer_vreg_classes(func as *IRFunction) as void {
     if (func.vreg_count == 0) { return; }
     func.vreg_class = cast(*i32, opt_alloc(cast(i64, func.vreg_count) * 4));
@@ -359,7 +369,7 @@ fn infer_vreg_classes(func as *IRFunction) as void {
         *p = VR_GPR;
         i = i + 1;
     }
-    // Initial seeding from defining op.
+    // Initial seeding: dest of every float op is XMM.
     let is *IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && inst.dest.op_type == OP_VREG) {
@@ -368,6 +378,21 @@ fn infer_vreg_classes(func as *IRFunction) as void {
                 || op == IR_FNEG || op == IR_FSQRT) {
                 vreg_class_set(func, inst.dest.vreg, VR_XMM);
             }
+        }
+        inst = inst.next;
+    }
+    // Seed XMM for every IR_LOAD whose cast_to is f32/f64. The loaded
+    // value is, by definition, a float held in memory — its only uses
+    // are float ops, f64 stores, f64->int casts, or being passed as a
+    // float arg, all of which already handle an xmm-class source. This
+    // lets the f64 LOAD fast path emit `movsd xmm,[mem]` directly
+    // instead of `mov gpr,[mem]; movq xmm,gpr`, and the forward MOV
+    // propagation below carries it through `mj = mov(load)` chains.
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == IR_LOAD && inst.dest.op_type == OP_VREG
+            && cast(i64, inst.cast_to) != 0 && _ty_is_float(inst.cast_to) == 1) {
+            vreg_class_set(func, inst.dest.vreg, VR_XMM);
         }
         inst = inst.next;
     }
