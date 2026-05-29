@@ -857,6 +857,89 @@ fn run_multi_file() as i32 {
     return 0;
 }
 
+// ── CSE polyglot: one-command orchestration ──────────────────────
+// `caustic --target=caustic-x86_64 --mode=compat|bundle src -o out` builds the
+// source for three targets (windows PE + linux ELF + caustic CST) by spawning
+// this same compiler, then welds them into one tri-format APE polyglot. The
+// user runs a single command; no manual 3-way build.
+
+fn cse_path_with_suffix(out as *u8, base as *u8, suffix as *u8) as *u8 {
+    let is i32 as bl = strlen(base);
+    let is i32 as sl = strlen(suffix);
+    mem.memcpy(out, base, cast(i64, bl));
+    mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, bl)), suffix, cast(i64, sl));
+    out[bl + sl] = cast(u8, 0);
+    return out;
+}
+
+// fork + execve + wait4 via raw Linux syscalls (the compiler always runs on
+// Linux). Returns the child's exit code, or 1 on fork failure. envp is the
+// parent's environment (so the sub-compiler keeps PATH etc.).
+fn cse_spawn_wait(path as *u8, argv as *u8, envp as *u8) as i32 {
+    let is i64 as pid = syscall(57, 0, 0, 0);   // fork
+    if (pid < 0) { return 1; }
+    if (pid == 0) {
+        syscall(59, cast(i64, path), cast(i64, argv), cast(i64, envp));  // execve
+        syscall(60, 127, 0, 0);                 // _exit(127) if execve failed
+    }
+    let is i64 as status with mut = 0;
+    syscall(61, pid, cast(i64, &status), 0, 0); // wait4(pid, &status, 0, NULL)
+    return cast(i32, (status >> 8) & 255);      // WEXITSTATUS
+}
+
+fn cse_subexec(self_path as *u8, targflag as *u8, modeflag as *u8,
+               out_path as *u8, envp as *u8) as i32 {
+    let is [128]i64 as cargv;
+    let is i32 as n with mut = 0;
+    cargv[n] = cast(i64, self_path); n = n + 1;
+    cargv[n] = cast(i64, targflag); n = n + 1;
+    if (cast(i64, modeflag) != 0) { cargv[n] = cast(i64, modeflag); n = n + 1; }
+    let is i32 as fi with mut = 0;
+    while (fi < g_file_count) { cargv[n] = g_input_files[fi]; n = n + 1; fi = fi + 1; }
+    cargv[n] = cast(i64, "-q"); n = n + 1;
+    cargv[n] = cast(i64, "-o"); n = n + 1;
+    cargv[n] = cast(i64, out_path); n = n + 1;
+    cargv[n] = 0;
+    return cse_spawn_wait(self_path, cast(*u8, &cargv), envp);
+}
+
+fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
+    let is *u8 as out = cast(*u8, g_output_path);
+    let is [512]u8 as pe_buf;
+    let is [512]u8 as elf_buf;
+    let is [512]u8 as cst_buf;
+    let is *u8 as pe = cse_path_with_suffix(cast(*u8, &pe_buf), out, ".__cse_pe.tmp");
+    let is *u8 as elf = cse_path_with_suffix(cast(*u8, &elf_buf), out, ".__cse_elf.tmp");
+    let is *u8 as cst = cse_path_with_suffix(cast(*u8, &cst_buf), out, ".__cse_cst.tmp");
+
+    if (cse_subexec(self_path, "--target=windows-x86_64", cast(*u8, 0), pe, envp) != 0) {
+        io.write_str(io.STDERR, "caustic: CSE polyglot: Windows PE build failed (program must be portable — no raw syscall(); use std facades)\n");
+        return 1;
+    }
+    if (cse_subexec(self_path, "--target=linux-x86_64", cast(*u8, 0), elf, envp) != 0) {
+        io.write_str(io.STDERR, "caustic: CSE polyglot: Linux ELF build failed\n");
+        return 1;
+    }
+    if (cse_subexec(self_path, "--target=caustic-x86_64", "--mode=pure", cst, envp) != 0) {
+        io.write_str(io.STDERR, "caustic: CSE polyglot: CST build failed\n");
+        return 1;
+    }
+    let is i32 as cerr = ldmod.cse_combine_files(pe, elf, cst, out);
+    io.unlink(pe);
+    io.unlink(elf);
+    io.unlink(cst);
+    // The Windows PE sub-build also drops a CodeView .pdb next to its output.
+    let is [512]u8 as pdb_buf;
+    io.unlink(cse_path_with_suffix(cast(*u8, &pdb_buf), pe, ".pdb"));
+    if (cerr != 0) { return 1; }
+    if (g_quiet == 0) {
+        io.write_str(io.STDOUT, "caustic: ");
+        io.write_str(io.STDOUT, out);
+        io.write_str(io.STDOUT, " (CSE polyglot: PE+ELF+CST)\n");
+    }
+    return 0;
+}
+
 // ── Main: thin orchestrator ──────────────────────────────────────
 
 fn main(argc as i64, argv as i64) as i32 {
@@ -901,6 +984,17 @@ fn main(argc as i64, argv as i64) as i32 {
 
     if (g_cache_dir != 0) {
         io.mkdir(cast(*u8, g_cache_dir));
+    }
+
+    // CSE polyglot: --target=caustic --mode=compat|bundle with -o builds all
+    // three targets and welds them. Sub-builds use single targets (pure/elf/pe)
+    // so this never recurses.
+    let is *tgt.Target as cse_t = tgt.target_get();
+    if (cse_t.object_format == 3 && tgt.cse_mode_get() != 0
+        && g_no_main == 0 && g_output_path != 0) {
+        // envp follows argv on the stack: argv[0..argc-1], NULL, envp[0..].
+        let is *u8 as envp = cast(*u8, cast(i64, argv) + (argc + 1) * 8);
+        return cse_orchestrate(cast(*u8, argv_arr[0]), envp);
     }
 
     // --emit-interface: compile to semantic only
