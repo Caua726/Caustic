@@ -102,6 +102,118 @@ fn pass_licm(func as *d.IRFunction) as void {
     d.opt_free(cast(*u8, def_cnt));
 }
 
+// === Address-hoist: pull IR_ADDR(IMM) / IR_ADDR_GLOBAL out of loops ===
+//
+// pass_licm only scans the header block, missing address computations
+// emitted inside the loop body. These IR_ADDR variants take no inputs
+// (just an immediate or a global symbol), so hoisting them out of every
+// loop they appear in is unconditionally safe. The win is concrete: in
+// fannkuch's flip loop, `lea r12, [rbp-116]` (the &perm address) was
+// re-emitted four times per iter — once hoisted, once per iter.
+fn pass_addr_hoist(func as *d.IRFunction) as void {
+    let is i32 as inst_count with mut = 0;
+    let is *d.IRInst as ti with mut = func.instructions;
+    while (cast(i64, ti) != 0) { inst_count = inst_count + 1; ti = ti.next; }
+    if (inst_count < 4) { return; }
+
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_pos = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as li with mut = 0;
+    while (li < lc) {
+        let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, li) * 4);
+        *lp = cast(i32, 0 - 1);
+        li = li + 1;
+    }
+
+    let is i32 as vc = func.vreg_count;
+    let is *i32 as def_pos = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as def_cnt = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as vi with mut = 0;
+    while (vi < vc) {
+        let is *i32 as dp = cast(*i32, cast(i64, def_pos) + cast(i64, vi) * 4); *dp = cast(i32, 0 - 1);
+        let is *i32 as dc = cast(*i32, cast(i64, def_cnt) + cast(i64, vi) * 4); *dc = 0;
+        vi = vi + 1;
+    }
+
+    let is i32 as pos with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_LABEL && it.dest.label < lc) {
+            let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, it.dest.label) * 4);
+            *lp = pos;
+        }
+        if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.op != d.IR_STORE && it.op != d.IR_COPY) {
+            let is i32 as dv = it.dest.vreg;
+            if (dv < vc) {
+                let is *i32 as dp = cast(*i32, cast(i64, def_pos) + cast(i64, dv) * 4); if (*dp < 0) { *dp = pos; }
+                let is *i32 as dc = cast(*i32, cast(i64, def_cnt) + cast(i64, dv) * 4); *dc = *dc + 1;
+            }
+        }
+        pos = pos + 1; it = it.next;
+    }
+
+    // Locate the outermost loop region containing each back-edge.
+    let is *d.IRInst as scan_jmp with mut = func.instructions;
+    let is *d.IRInst as scan_jmp_prev with mut = cast(*d.IRInst, 0);
+    let is i32 as jmp_pos with mut = 0;
+    while (cast(i64, scan_jmp) != 0) {
+        if (scan_jmp.is_dead == 0
+            && (scan_jmp.op == d.IR_JMP || scan_jmp.op == d.IR_JZ || scan_jmp.op == d.IR_JNZ)
+            && scan_jmp.dest.label < lc) {
+            let is *i32 as lp = cast(*i32, cast(i64, label_pos) + cast(i64, scan_jmp.dest.label) * 4);
+            let is i32 as header = *lp;
+            if (header >= 0 && header < jmp_pos) {
+                let is *d.IRInst as body with mut = func.instructions;
+                let is *d.IRInst as bprev with mut = cast(*d.IRInst, 0);
+                let is i32 as bp with mut = 0;
+                while (cast(i64, body) != 0 && bp <= jmp_pos) {
+                    let is *d.IRInst as bnext = body.next;
+                    let is i32 as hoistable with mut = 0;
+                    if (bp > header && bp < jmp_pos && body.is_dead == 0 && body.dest.op_type == d.OP_VREG) {
+                        if (body.op == d.IR_ADDR_GLOBAL) { hoistable = 1; }
+                        else if (body.op == d.IR_ADDR && body.src1.op_type == d.OP_IMM) { hoistable = 1; }
+                    }
+                    if (hoistable == 1) {
+                        let is i32 as is_single with mut = 1;
+                        if (body.dest.vreg < vc) {
+                            let is *i32 as ddc = cast(*i32, cast(i64, def_cnt) + cast(i64, body.dest.vreg) * 4);
+                            if (*ddc > 1) { is_single = 0; }
+                        }
+                        if (is_single == 1 && cast(i64, bprev) != 0) {
+                            // Unlink from current position
+                            bprev.next = bnext;
+                            // Insert before header label
+                            let is *d.IRInst as hp with mut = func.instructions;
+                            let is *d.IRInst as hprev with mut = cast(*d.IRInst, 0);
+                            let is i32 as hpp with mut = 0;
+                            while (cast(i64, hp) != 0 && hpp < header) {
+                                hprev = hp; hp = hp.next; hpp = hpp + 1;
+                            }
+                            if (cast(i64, hprev) != 0) { body.next = hp; hprev.next = body; }
+                            else { body.next = func.instructions; func.instructions = body; }
+                            if (body.dest.vreg < vc) {
+                                let is *i32 as mdp = cast(*i32, cast(i64, def_pos) + cast(i64, body.dest.vreg) * 4);
+                                *mdp = header - 1;
+                            }
+                            body = bnext;
+                            bp = bp + 1;
+                        } else {
+                            bprev = body; body = bnext; bp = bp + 1;
+                        }
+                    } else {
+                        bprev = body; body = bnext; bp = bp + 1;
+                    }
+                }
+            }
+        }
+        scan_jmp_prev = scan_jmp; scan_jmp = scan_jmp.next; jmp_pos = jmp_pos + 1;
+    }
+
+    d.opt_free(cast(*u8, label_pos));
+    d.opt_free(cast(*u8, def_pos));
+    d.opt_free(cast(*u8, def_cnt));
+}
+
 // === Function Inlining (-O1) ===
 
 // Check if callee has stack ops that survived mem2reg.
