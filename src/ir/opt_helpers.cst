@@ -173,6 +173,124 @@ fn pass_algebraic_identity(func as *d.IRFunction, copy_of as *i32, vc as i32) as
     }
 }
 
+// === Pass: LEA fusion (ADD(base, SHL(idx, k)) -> IR_LEA{2,4,8}) ===
+// Detects the canonical `base + idx << k` chain produced by array
+// indexing and rewrites the ADD into a single fused LEA op. Marks the
+// SHL dead. Fires only when the SHL's result is consumed exactly once
+// (the ADD) so the SHL's lifetime maps cleanly. Codegen for IR_LEA{N}
+// emits one `lea dest, [base + idx * N]` — replacing five instructions
+// of `mov + shl + add` chain with one. Runs after const/copy prop so
+// the operands are already resolved.
+fn pass_lea_fusion(func as *d.IRFunction, vc as i32) as void {
+    // Build per-vreg use_count (only live instructions count).
+    let is *i32 as uc = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as ui with mut = 0;
+    while (ui < vc) {
+        let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, ui) * 4);
+        *up = 0;
+        ui = ui + 1;
+    }
+    let is *d.IRInst as cinst with mut = func.instructions;
+    while (cast(i64, cinst) != 0) {
+        if (cinst.is_dead == 0) {
+            if (cinst.src1.op_type == d.OP_VREG && cinst.src1.vreg >= 0 && cinst.src1.vreg < vc) {
+                let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, cinst.src1.vreg) * 4);
+                *up = *up + 1;
+            }
+            if (cinst.src2.op_type == d.OP_VREG && cinst.src2.vreg >= 0 && cinst.src2.vreg < vc) {
+                let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, cinst.src2.vreg) * 4);
+                *up = *up + 1;
+            }
+            if ((cinst.op == d.IR_STORE || cinst.op == d.IR_COPY) && cinst.dest.op_type == d.OP_VREG && cinst.dest.vreg >= 0 && cinst.dest.vreg < vc) {
+                let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, cinst.dest.vreg) * 4);
+                *up = *up + 1;
+            }
+        }
+        cinst = cinst.next;
+    }
+
+    // Build def_inst[] for O(1) lookup of each vreg's defining instruction.
+    let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as di with mut = 0;
+    while (di < vc) {
+        let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, di) * 8);
+        *dp = 0;
+        di = di + 1;
+    }
+    let is *d.IRInst as dinst with mut = func.instructions;
+    while (cast(i64, dinst) != 0) {
+        if (dinst.is_dead == 0 && dinst.dest.op_type == d.OP_VREG && dinst.op != d.IR_STORE && dinst.op != d.IR_COPY) {
+            let is i32 as dv = dinst.dest.vreg;
+            if (dv >= 0 && dv < vc) {
+                let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, dv) * 8);
+                *dp = cast(i64, dinst);
+            }
+        }
+        dinst = dinst.next;
+    }
+
+    // Scan ADDs and try to fuse.
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_ADD
+            && inst.src1.op_type == d.OP_VREG
+            && inst.src2.op_type == d.OP_VREG) {
+            // The SHL can be on either side of the ADD. Pick whichever
+            // matches the canonical (base, shl) shape.
+            let is i32 as base_v with mut = cast(i32, 0 - 1);
+            let is *d.IRInst as shl_def with mut = cast(*d.IRInst, 0);
+            let is i32 as shl_vreg with mut = cast(i32, 0 - 1);
+
+            let is i32 as s1v = inst.src1.vreg;
+            let is i32 as s2v = inst.src2.vreg;
+            if (s2v >= 0 && s2v < vc) {
+                let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, s2v) * 8);
+                let is *d.IRInst as cand = cast(*d.IRInst, *dp);
+                if (cast(i64, cand) != 0 && cand.is_dead == 0 && cand.op == d.IR_SHL
+                    && cand.src1.op_type == d.OP_VREG
+                    && cand.src2.op_type == d.OP_IMM
+                    && cand.src2.imm >= 1 && cand.src2.imm <= 3) {
+                    let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, s2v) * 4);
+                    if (*up == 1) {
+                        base_v = s1v;
+                        shl_def = cand;
+                        shl_vreg = s2v;
+                    }
+                }
+            }
+            if (cast(i64, shl_def) == 0 && s1v >= 0 && s1v < vc) {
+                let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, s1v) * 8);
+                let is *d.IRInst as cand = cast(*d.IRInst, *dp);
+                if (cast(i64, cand) != 0 && cand.is_dead == 0 && cand.op == d.IR_SHL
+                    && cand.src1.op_type == d.OP_VREG
+                    && cand.src2.op_type == d.OP_IMM
+                    && cand.src2.imm >= 1 && cand.src2.imm <= 3) {
+                    let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, s1v) * 4);
+                    if (*up == 1) {
+                        base_v = s2v;
+                        shl_def = cand;
+                        shl_vreg = s1v;
+                    }
+                }
+            }
+
+            if (cast(i64, shl_def) != 0) {
+                let is i64 as shift = shl_def.src2.imm;
+                let is i32 as new_op with mut = d.IR_LEA4;
+                if (shift == 1) { new_op = d.IR_LEA2; }
+                else if (shift == 3) { new_op = d.IR_LEA8; }
+                inst.op = new_op;
+                inst.src1 = d.op_vreg(base_v);
+                inst.src2 = d.op_vreg(shl_def.src1.vreg);
+                shl_def.is_dead = 1;
+            }
+        }
+        inst = inst.next;
+    }
+    d.opt_free(cast(*u8, uc));
+    d.opt_free(cast(*u8, def_inst));
+}
+
 // === Pass 2: DCE (backward scan) ===
 
 fn pass_dce(func as *d.IRFunction, vc_alloc as i32, copy_of as *i32) as void {
