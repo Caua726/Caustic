@@ -1,139 +1,258 @@
 # Caustic
 
-Self-hosted x86_64 Linux compiler — no LLVM, no libc, no runtime.
+**A self-hosted, native x86_64 compiler — no LLVM, no libc, no runtime.**
 
-The entire toolchain — compiler, assembler, linker, and build system — is written in Caustic itself. Programs execute via direct Linux syscalls with zero external dependencies.
+![version](https://img.shields.io/badge/version-0.0.14-blue)
+![self-hosted](https://img.shields.io/badge/self--hosted-yes-success)
+![targets](https://img.shields.io/badge/targets-Linux%20%C2%B7%20Windows%20%C2%B7%20CausticOS-orange)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![arch](https://img.shields.io/badge/arch-x86__64-lightgrey)
 
-## Overview
-
-- **Self-hosted**: the compiler compiles itself (stable bootstrap since v0.0.1)
-- **Zero dependencies**: no LLVM, no libc, no runtime — only Linux syscalls
-- **Full toolchain**: compiler (`caustic`), assembler (`caustic-as`), linker (`caustic-ld`), build system (`caustic-mk`)
-- **Optimizing**: `-O1` with SSA, constant propagation, strength reduction, LICM, DCE, graph coloring register allocation
-- **~18K lines** of self-hosted Caustic code + 6.6K lines of standard library
+Caustic is a systems programming language whose **entire toolchain — compiler,
+assembler, linker, and build system — is written in Caustic itself.** It
+compiles straight to machine code and links its own executables, with no
+external dependencies: no LLVM backend, no libc, no language runtime. Programs
+talk to the OS directly (Linux syscalls, Windows DLL imports, or the CausticOS
+kernel ABI).
 
 ```cst
+use "std/io.cst" as io;
+
 fn main() as i32 {
-    syscall(1, 1, "Hello, World!\n", 14);
+    io.printf("Hello, World!\n");   // portable: same source builds for every target
     return 0;
 }
 ```
 
 ```sh
-./caustic hello.cst -o hello && ./hello
+./caustic hello.cst -o hello && ./hello                       # Linux  (ELF)
+./caustic --target=windows-x86_64 hello.cst -o hello.exe      # Windows (PE32+)
+./caustic --target=caustic-x86_64  hello.cst -o hello.cse     # CausticOS (CSE)
 ```
 
-## Features
+---
 
-### Language
-- **Types**: i8-i64, u8-u64, f32, f64, bool, char, string, void, pointers, arrays
-- **Generics**: monomorphization (`fn max gen T`, `struct Pair gen T, U`, `enum Option gen T`)
-- **Enums**: simple enums and tagged unions with pattern matching (`match`/`case`/`else`)
-- **Impl blocks**: methods and associated functions (`impl Point { fn sum(self) ... }`)
-- **Defer**: LIFO cleanup before return (`defer free(ptr);`)
-- **FFI**: `extern fn` for C interop, System V ABI struct passing
-- **Indirect calls**: `call(fn_ptr, args)` with compile-time type checking
-- **Modules**: `use "path" as alias`, `only` selective imports, submodule dot-notation
-- **Type aliases**: `type Size = i64;`
+## Contents
 
-### Standard Library
+- [Why Caustic](#why-caustic)
+- [Compilation targets](#compilation-targets)
+- [Quick start](#quick-start)
+- [Language at a glance](#language-at-a-glance)
+- [Standard library](#standard-library)
+- [Toolchain](#toolchain)
+- [Optimizer](#optimizer)
+- [Performance](#performance)
+- [Project layout](#project-layout)
+- [Build from source](#build-from-source)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
 
-| Module | Description |
-|--------|-------------|
-| `linux.cst` | 40+ syscall wrappers (file, process, memory, network, time) |
-| `mem.cst` | 5 allocators: freelist, bins (O(1)), arena, pool, lifo |
-| `string.cst` | Dynamic strings (concat, find, substring, split, trim, replace) |
-| `io.cst` | Buffered I/O, printf, file/directory operations |
-| `slice.cst` | Generic dynamic array (`Slice gen T` with push/pop/get/set) |
-| `types.cst` | `Option gen T` and `Result gen T, E` |
-| `map.cst` | Hash maps (MapI64, MapStr) with open addressing |
-| `math.cst` | abs, min, max, pow, gcd, lcm, align |
-| `sort.cst` | quicksort, heapsort, mergesort with fn_ptr comparators |
-| `random.cst` | xoshiro256** PRNG with rejection sampling |
-| `net.cst` | TCP/UDP sockets, bind/listen/accept, poll |
-| `time.cst` | Monotonic/wall clock, sleep, elapsed |
-| `env.cst` | argc/argv, getenv |
-| `arena.cst` | Standalone bump allocator |
-| `compatcffi.cst` | C FFI struct passing helpers |
+---
 
-### Toolchain
-- **Compiler** (`caustic`): 6-phase pipeline (lex → parse → semantic → IR → optimize → codegen)
-- **Assembler** (`caustic-as`): two-pass x86_64 assembler, 65 instructions, ELF .o output
-- **Linker** (`caustic-ld`): static and dynamic linking, PLT/GOT, multi-object
-- **Build system** (`caustic-mk`): Causticfile-based, git dependencies, system libraries
+## Why Caustic
 
-### Optimization (-O1)
-SSA mem2reg, constant propagation, store-load forwarding, LICM, strength reduction, DCE, function inlining, graph coloring register allocation (George & Appel 1996), peephole optimizer. **3.4x faster** than -O0.
+- **Self-hosted.** The compiler compiles itself; the assembler assembles itself;
+  the linker links itself. Stable bootstrap since v0.0.1.
+- **Zero dependencies.** No LLVM, no libc, no runtime — just the operating
+  system's raw interface. Statically linked binaries with nothing underneath.
+- **Cross-target from one source.** The same `.cst` file builds for Linux,
+  Windows, and CausticOS. OS-specific work goes through portable standard-library
+  facades that pick the right backend *at compile time* — the wrong target's code
+  is dead-stripped before it ever reaches codegen.
+- **Optimizing.** `-O1` runs SSA construction, constant propagation, store/load
+  forwarding, LICM, strength reduction, function inlining, DCE, a peephole pass,
+  and graph-coloring register allocation.
+- **Honest and explicit.** No hidden allocations, no implicit conversions, no
+  runtime surprises. Manual memory management with five allocator strategies.
+- **Real size.** ~39K lines of self-hosted toolchain (compiler + assembler +
+  linker + build system) backed by a ~9K-line standard library.
 
-## Performance
+## Compilation targets
 
-Benchmark totals (v0.0.13, same machine, CPU-pinned):
+A single source tree builds three different executable formats. Select one with
+`--target=` (Linux is the default):
 
-| Compiler | fib(38) | sieve(10M) | sort(1M) | matmul(64) | collatz(1M) | **Total** |
-|----------|---------|------------|----------|------------|-------------|-----------|
-| GCC -O2 | — | — | — | — | — | **242ms** |
-| GCC -O0 | — | — | — | — | — | **709ms** |
-| **Caustic -O1** | 175ms | 61ms | 261ms | 70ms | 185ms | **757ms** |
-| LuaJIT | — | — | — | — | — | **1081ms** |
+| Target | Flag | Output | OS interface | Status |
+|--------|------|--------|--------------|--------|
+| **Linux** | `--target=linux-x86_64` *(default)* | static **ELF64** | raw `syscall` | Stable |
+| **Windows** | `--target=windows-x86_64` | **PE32+** `.exe` (+ `.pdb`) | `kernel32` / `ws2_32` / `bcrypt` via IAT, MS x64 ABI | Stable — **cross-compiles from Linux** |
+| **CausticOS** | `--target=caustic-x86_64` | **CSE** (Caustic Standard Executable) | 7-syscall CausticOS kernel ABI | Experimental |
 
-## Quick Start
+**Cross-compilation works today.** A Windows `.exe` built on Linux runs under
+Wine (and on Windows) with no changes to the source — the FFI layer reorders
+arguments into the MS x64 ABI, reserves shadow space, and emits
+`call qword ptr [rip+__imp_<fn>]` through the import address table. The compiler,
+assembler, and linker all ship as native Windows binaries too (`caustic.exe`,
+`caustic-as.exe`, `caustic-ld.exe`).
 
-### Install
+**CausticOS / CSE** is the newest and most experimental target: a custom
+executable format for a from-scratch operating system whose kernel exposes a
+minimal 7-call ABI (serial write, time, sleep, exit, getpid, yield). In
+`--mode=compat`, the driver can emit a **PE + ELF + CSE polyglot** — one binary
+file that is simultaneously a valid Windows PE, a valid Linux ELF, and a valid
+CausticOS executable. Several pieces of the CSE linker path are still landing, so
+treat this target as a preview.
+
+> Behind the scenes, target dispatch is driven by `os.current`, which folds to a
+> compile-time literal (`1` Linux, `2` Windows, `3` CausticOS). Branches guarded
+> by it are dead-stripped, so a Linux build never contains a `kernel32` import and
+> a Windows build never emits a `syscall` instruction. See
+> [`CLAUDE.md`](CLAUDE.md) and [`docs/`](docs/README.md) for the full mechanism.
+
+## Quick start
+
+### Install a release
 
 ```sh
 tar xzf caustic-x86_64-linux.tar.gz
 sudo cp caustic-x86_64-linux/bin/* /usr/local/bin/
 sudo mkdir -p /usr/local/lib/caustic/std
-sudo cp caustic-x86_64-linux/lib/caustic/std/*.cst /usr/local/lib/caustic/std/
+sudo cp -r caustic-x86_64-linux/lib/caustic/std/* /usr/local/lib/caustic/std/
 ```
 
-### Using caustic-mk
+An [`install.sh`](install.sh) helper is included as well.
+
+### Compile and run
 
 ```sh
-./caustic-mk build hello    # compile examples/hello.cst
-./build/hello                # run it
-./caustic-mk test            # run test suite
-```
+./caustic program.cst -o program    # compile + assemble + link in one step
+./program
 
-### Manual pipeline
+# Cross-target:
+./caustic --target=windows-x86_64 program.cst -o program.exe
 
-```sh
-./caustic program.cst -o program    # compile + assemble + link
-./program                            # run
-
-# Or step by step:
-./caustic program.cst                # -> program.cst.s
-./caustic-as program.cst.s           # -> program.cst.s.o
+# Step-by-step pipeline:
+./caustic    program.cst             # -> program.cst.s   (assembly)
+./caustic-as program.cst.s           # -> program.cst.s.o (object)
 ./caustic-ld program.cst.s.o -o program
 ```
 
-## Build from Source
+### Useful flags
 
-Bootstrap the build system:
+| Flag | Purpose |
+|------|---------|
+| `-o <file>` | Output executable |
+| `-c` | Compile only — no `main` required (for libraries) |
+| `-O0` / `-O1` | Optimization level |
+| `--target=<triple>` | `linux-x86_64`, `windows-x86_64`, `caustic-x86_64` |
+| `-l<name>` | Link a dynamic library |
+| `--profile` | Per-phase timing |
+| `--cache <dir>` | Incremental build cache |
+| `--path <dir>` | Extra module search path |
+| `-debuglexer` / `-debugparser` / `-debugir` | Inspect a phase |
+
+### With the build system
 
 ```sh
-./caustic caustic-maker/main.cst
-./caustic-as caustic-maker/main.cst.s
-./caustic-ld caustic-maker/main.cst.s.o -o caustic-mk
+./caustic-mk build caustic    # build a target from the Causticfile
+./caustic-mk test             # run the test suite
+./caustic-mk clean            # remove .caustic/ and build/
 ```
 
-Then build everything:
+## Language at a glance
 
-```sh
-./caustic-mk build caustic       # compiler
-./caustic-mk build caustic-as    # assembler
-./caustic-mk build caustic-ld    # linker
-./caustic-mk build caustic-mk    # build system itself
+- **Types** — `i8`–`i64`, `u8`–`u64`, `f32`, `f64`, `bool`, `char`, `string`,
+  `void`, pointers (`*T`), arrays (`[N]T`), structs, and tagged-union enums.
+- **Generics** — monomorphized: `fn max gen T`, `struct Pair gen T, U`,
+  `enum Option gen T`.
+- **Pattern matching** — `match` / `case` / `else` over enums, with destructuring.
+- **Impl blocks** — methods and associated functions: `impl Point { fn sum(self) ... }`.
+- **Defer** — LIFO cleanup that runs before every `return`: `defer free(ptr);`.
+- **Modules** — `use "path" as alias`, `only` selective imports, submodule
+  dot-notation, module caching.
+- **Function pointers** — typed `fn_ptr(...)` plus type-checked indirect
+  `call(ptr, args)`.
+- **FFI** — `extern "kernel32.dll" fn ...` declarations and System V struct
+  passing for C interop.
+- **Low-level escape hatches** — `syscall(...)`, inline `asm("...")`,
+  `cast(T, x)`, `sizeof`, custom ELF/PE sections via `with section(".name")`.
+- **`with imut`** — "immutable *and* compile-time-known": the initializer folds to
+  a literal at semantic time and propagates at every use site. This is what makes
+  zero-cost compile-time target dispatch fall out for free.
+
+```cst
+use "std/mem.cst" as mem;
+use "std/io.cst"  as io;
+
+struct Point { x as i32; y as i32; }
+
+impl Point {
+    fn new(x as i32, y as i32) as Point {
+        let is Point as p;
+        p.x = x; p.y = y;
+        return p;
+    }
+    fn sum(self as *Point) as i32 { return self.x + self.y; }
+}
+
+fn main() as i32 {
+    mem.gheapinit(1048576);
+    let is Point as p = Point.new(3, 4);
+    io.printf("sum = %d\n", cast(i64, p.sum()));
+    return 0;
+}
 ```
 
-### Causticfile
+## Standard library
 
-Projects are configured via a `Causticfile`:
+The stdlib is built as **portable facades** (the top-level modules you import)
+backed by **per-OS implementations** in subdirectories (`std/io/linux.cst`,
+`std/io/windows.cst`, …). User code imports the facade; the facade dispatches to
+the right backend at compile time. Pure modules have no OS dependency at all.
+
+| Module | What it provides | Backend |
+|--------|------------------|---------|
+| `os.cst` | OS-identity hub (`os.current`, `OS_LINUX/WINDOWS/CAUSTIC`); re-exports raw `os/{linux,windows,causticos}` bindings | dispatched |
+| `io.cst` | Buffered I/O, `printf`/`sprintf`, files, directories | per-OS |
+| `mem.cst` | Memory hub: 5 allocators — freelist, bins (O(1) slab), arena, pool, lifo | per-OS pages |
+| `net.cst` | IPv4 TCP/UDP sockets, bind/listen/accept, poll (auto `WSAStartup` on Windows) | per-OS |
+| `time.cst` | Monotonic & wall clock, sleep, elapsed | per-OS |
+| `env.cst` | `argc`/`argv`, environment variables | per-OS |
+| `process.cst` | Spawn / exec / wait; `capture()` (Linux) | per-OS |
+| `term.cst` | Raw mode, ANSI escapes, terminal size, key input | per-OS |
+| `random.cst` | xoshiro256** PRNG, OS-seeded entropy | per-OS seed |
+| `string.cst` | Dynamic strings: concat, find, substring, split, trim, replace | pure |
+| `slice.cst` | Generic dynamic array (`Slice gen T`) | pure |
+| `map.cst` | Hash maps (`MapI64`, `MapStr`) with open addressing | pure |
+| `types.cst` | `Option gen T`, `Result gen T, E` | pure |
+| `math.cst` | abs, min/max, clamp, gcd/lcm, sqrt, isqrt, bit ops, alignment | pure |
+| `sort.cst` | quicksort, heapsort, mergesort with `fn_ptr` comparators | pure |
+| `path.cst` | Path join, dirname, basename, ext, `~` expansion | pure |
+| `errors.cst` | `__compile_error` aborts + runtime panic/assert | pure |
+| `arena.cst` | Standalone bump allocator | pure |
+| `compatcffi.cst` | C-ABI struct/union layout & errno helpers | pure |
+
+*New since the last release:* `os`, `errors`, `path`, `process`, `term`, and the
+portable-facade architecture across `io`, `net`, `time`, `env`, `random`, and
+`mem`.
+
+## Toolchain
+
+| Tool | Role |
+|------|------|
+| **`caustic`** | The compiler — 6-phase pipeline: lex → parse → semantic → IR → optimize → codegen (~23K lines) |
+| **`caustic-as`** | Two-pass x86_64 assembler emitting **ELF** *and* **COFF/PE** objects (~6.6K lines) |
+| **`caustic-ld`** | Linker — static & dynamic ELF (PLT/GOT), PE import tables + IAT + CodeView `.pdb`, multi-object, custom sections (~8K lines) |
+| **`caustic-mk`** | `Causticfile`-driven build system: targets, scripts, git/system dependencies (~1.2K lines) |
+
+```
+Source (.cst)
+   │  caustic
+   ▼
+Lexer → Parser → Semantic → IR → Optimize → Codegen → Assembly (.s)
+                                                          │  caustic-as
+                                                          ▼
+                                                   Object (.o / .obj)
+                                                          │  caustic-ld
+                                                          ▼
+                                              Executable (ELF / PE / CSE)
+```
+
+A `Causticfile` configures a project:
 
 ```
 name "myproject"
 version "0.1.0"
-author "Name"
 
 target "myapp" {
     src "src/main.cst"
@@ -145,37 +264,82 @@ script "test" {
 }
 ```
 
-## Syntax
+## Optimizer
 
-```cst
-use "std/mem.cst" as mem;
-use "std/io.cst" as io;
+`-O1` runs a real optimization pipeline over the virtual-register IR:
 
-struct Point { x as i32; y as i32; }
+SSA `mem2reg` · constant propagation & folding · store/load forwarding · common
+subexpression elimination · loop-invariant code motion · strength reduction
+(including magic-number division and induction-variable rewriting) · function
+inlining · dead-code elimination · a peephole pass · and **graph-coloring
+register allocation** (George & Appel, 1996) over 10 allocatable registers.
+Roughly **3.4× faster** than `-O0` output.
 
-impl Point {
-    fn new(x as i32, y as i32) as Point {
-        let is Point as p;
-        p.x = x; p.y = y;
-        return p;
-    }
+## Performance
 
-    fn sum(self as *Point) as i32 {
-        return self.x + self.y;
-    }
-}
+Benchmark totals (v0.0.13, one machine, CPU-pinned). Caustic `-O1` is in the
+ballpark of `gcc -O0` for tight numeric loops, with no runtime and no libc:
 
-fn main() as i32 {
-    mem.gheapinit(1048576);
-    let is Point as p = Point.new(3, 4);
-    io.printf("sum = %d\n", cast(i64, p.sum()));
-    return 0;
-}
+| Compiler | fib(38) | sieve(10M) | sort(1M) | matmul(64) | collatz(1M) | **Total** |
+|----------|--------:|-----------:|---------:|-----------:|------------:|----------:|
+| GCC -O2 | — | — | — | — | — | **242 ms** |
+| GCC -O0 | — | — | — | — | — | **709 ms** |
+| **Caustic -O1** | 175 ms | 61 ms | 261 ms | 70 ms | 185 ms | **757 ms** |
+| LuaJIT | — | — | — | — | — | **1081 ms** |
+
+## Project layout
+
 ```
+src/                compiler — lexer, parser, semantic, ir, codegen   (~23K)
+caustic-assembler/  caustic-as — x86_64 → ELF / COFF-PE objects        (~6.6K)   [submodule]
+caustic-linker/     caustic-ld — ELF / PE linking, .pdb, multi-object  (~8K)     [submodule]
+caustic-maker/      caustic-mk — Causticfile build system              (~1.2K)   [submodule]
+std/                standard library — facades + per-OS backends       (~9K)
+examples/           runnable sample programs                            (~2.4K)
+docs/               language guide + compiler-internals reference
+tests/              section / driver tests
+```
+
+## Build from source
+
+Bootstrap the build system with an existing `caustic`, then build the rest:
+
+```sh
+# 1. Build the build system
+./caustic    caustic-maker/main.cst
+./caustic-as caustic-maker/main.cst.s
+./caustic-ld caustic-maker/main.cst.s.o -o caustic-mk
+
+# 2. Build everything else
+./caustic-mk build caustic       # the compiler
+./caustic-mk build caustic-as    # the assembler
+./caustic-mk build caustic-ld    # the linker
+./caustic-mk build caustic-mk    # the build system itself
+```
+
+The submodules live in their own repos; clone with `--recurse-submodules` (or run
+`git submodule update --init`).
 
 ## Documentation
 
-Full documentation is available in [`docs/`](docs/README.md):
+Full documentation lives in [`docs/`](docs/README.md):
 
-- **[Guide](docs/README.md#guide)** — Learn the language from scratch
-- **[Reference](docs/README.md#reference)** — Compiler internals, IR, codegen, assembler, linker
+- **[Guide](docs/README.md#guide)** — learn the language from scratch: variables,
+  types, functions, control flow, structs, enums, generics, memory, modules,
+  impl blocks, the build system.
+- **[Reference](docs/README.md#reference)** — compiler internals: the full
+  pipeline, lexer, parser, semantic analysis, type system, IR, codegen,
+  assembler, linker, and per-module stdlib docs.
+- **[Examples](examples/README.md)** — runnable programs for every major feature.
+
+## Contributing
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). In short:
+bug fixes come with a test, performance changes come with a benchmark, and new
+stdlib functionality should be generally useful. Caustic values explicitness,
+speed, and zero dependencies.
+
+---
+
+*Caustic does not yet ship a formal license file. Until one is added, please
+contact the author before redistributing.*
