@@ -282,15 +282,31 @@ Roughly **3.4× faster** than `-O0` output.
 
 ## Performance
 
-Benchmark totals (v0.0.13, one machine, CPU-pinned). Caustic `-O1` is in the
-ballpark of `gcc -O0` for tight numeric loops, with no runtime and no libc:
+Five integer workloads (`fib(38)`, `sieve(10M)`, `quicksort(1M)`, `matmul(64×100)`,
+`collatz(1M)`), same source logic in every language, all results checksum-identical.
+Compute time in ms (best of 5), Ryzen 5 5600X, core-pinned. **Caustic `-O1`
+beats `gcc -O0`, TCC, LuaJIT, the JS runtimes and every interpreter** — while
+emitting a 28 KB static binary on ~17 MB of RAM, with no runtime and no libc.
 
-| Compiler | fib(38) | sieve(10M) | sort(1M) | matmul(64) | collatz(1M) | **Total** |
-|----------|--------:|-----------:|---------:|-----------:|------------:|----------:|
-| GCC -O2 | — | — | — | — | — | **242 ms** |
-| GCC -O0 | — | — | — | — | — | **709 ms** |
-| **Caustic -O1** | 175 ms | 61 ms | 261 ms | 70 ms | 185 ms | **757 ms** |
-| LuaJIT | — | — | — | — | — | **1081 ms** |
+| Toolchain | fib | sieve | sort | matmul | collatz | **Total** | Compile | Binary | RAM |
+|-----------|----:|------:|-----:|-------:|--------:|----------:|--------:|-------:|----:|
+| GCC -O2 | 43 | 12 | 51 | 7 | 106 | **218** | 120 ms | 16 KB | 17 MB |
+| **Caustic -O1** | 172 | 47 | 121 | 36 | 173 | **550** | 138 ms | 28 KB | 17 MB |
+| GCC -O0 | 171 | 50 | 120 | 65 | 274 | **680** | 46 ms | 16 KB | 17 MB |
+| TCC | 187 | 54 | 126 | 49 | 377 | **792** | 6 ms | 7 KB | 17 MB |
+| **Caustic -O0** | 197 | 133 | 207 | 91 | 390 | **1017** | 89 ms | 24 KB | 16 MB |
+| LuaJIT | 303 | 188 | 236 | 25 | 417 | **1169** | — | — | 139 MB |
+| Python 3.14 | 3888 | 564 | 3405 | 1962 | 5784 | **15604** | — | — | 52 MB |
+
+Full matrix — 28 build configs across **GCC, Clang, TCC, Rust, Zig, Go, C++,
+Java, C#, Node, Bun, Deno, LuaJIT, Lua, PHP, Python** with compile time, binary
+size, peak RAM and `hyperfine` wall-clock — in **[`benchmark.md`](benchmark.md)**.
+Reproduce it all with one self-contained Caustic program (it embeds every
+language's source and skips toolchains you don't have):
+
+```sh
+./caustic examples/benchmark.cst -o /tmp/benchmark && /tmp/benchmark
+```
 
 ## Project layout
 
