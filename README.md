@@ -106,16 +106,29 @@ so treat it as a preview.
 
 ## Quick start
 
-### Install a release
+### Install
+
+One line — installs `caustic` + the stdlib (source + `libcaustic.so`) into `~/.local`, no sudo:
 
 ```sh
-tar xzf caustic-x86_64-linux.tar.gz
-sudo cp caustic-x86_64-linux/bin/* /usr/local/bin/
-sudo mkdir -p /usr/local/lib/caustic/std
-sudo cp -r caustic-x86_64-linux/lib/caustic/std/* /usr/local/lib/caustic/std/
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh
 ```
 
-An [`install.sh`](install.sh) helper is included as well.
+Then make sure `~/.local/bin` is on your `PATH`. Other modes:
+
+```sh
+# interactive — pick the prefix, which tools (caustic-as/ld), and which stdlib pieces (source/.so/.csl)
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --custom
+# system-wide into /usr/local (uses sudo)
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --system
+```
+
+**From source** (needs an existing `caustic` to bootstrap):
+
+```sh
+git clone --recursive https://github.com/Caua726/Caustic.git && cd Caustic
+./caustic-mk build caustic && ./caustic-mk build caustic-as && ./caustic-mk build caustic-ld
+```
 
 ### Compile and run
 
