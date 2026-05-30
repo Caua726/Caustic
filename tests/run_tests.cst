@@ -1,0 +1,102 @@
+// tests/run_tests.cst — Caustic's test runner, written in Caustic.
+//
+// Replaces the old run_tests.sh: spawns the local toolchain (./caustic,
+// ./caustic-as, ./caustic-ld) with std/process, checks exit codes, and verifies
+// the bootstrap fixpoint (gen2 == gen3, byte-for-byte). Run from the repo root;
+// invoked by `caustic-mk test`. Exit 0 = all passed, 1 = something failed.
+use "../std/process.cst" as proc;
+use "../std/io.cst" as io;
+
+let is i32 as _pass with mut = 0;
+let is i32 as _fail with mut = 0;
+
+fn _slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
+fn _p(s as *u8) as void { io._write_fd(io.STDOUT, s, _slen(s)); }
+
+// Spawn `path` with a NUL-terminated argv array; return its exit code.
+fn _run(path as *u8, argv as *u8) as i32 {
+    let is i64 as pid = proc.spawn(path, argv);
+    if (pid < 0) { return cast(i32, 0 - 1); }
+    return proc.wait_pid(pid);
+}
+
+fn _check(name as *u8, ok as i32) as void {
+    if (ok == 1) { _p("  PASS  "); _pass = _pass + 1; }
+    else { _p("  FAIL  "); _fail = _fail + 1; }
+    _p(name); _p("\n");
+}
+
+// Byte-for-byte file comparison (bootstrap fixpoint check). Chunked through
+// stack buffers — no heap allocator needed.
+fn _files_equal(pa as *u8, pb as *u8) as i32 {
+    let is i64 as sa = io.file_size(pa);
+    let is i64 as sb = io.file_size(pb);
+    if (sa <= 0 || sa != sb) { return 0; }
+    let is i64 as fa = io._open_read(pa);
+    let is i64 as fb = io._open_read(pb);
+    if (fa < 0 || fb < 0) { return 0; }
+    let is [4096]u8 as bufa;
+    let is [4096]u8 as bufb;
+    let is i32 as eq with mut = 1;
+    let is i64 as ra with mut = io._read_fd(fa, cast(*u8, &bufa), 4096);
+    while (ra > 0 && eq == 1) {
+        let is i64 as rb = io._read_fd(fb, cast(*u8, &bufb), ra);
+        if (rb != ra) { eq = 0; }
+        let is i64 as i with mut = 0;
+        while (i < ra) { if (bufa[i] != bufb[i]) { eq = 0; i = ra; } i = i + 1; }
+        ra = io._read_fd(fa, cast(*u8, &bufa), 4096);
+    }
+    io._close_fd(fa); io._close_fd(fb);
+    return eq;
+}
+
+// compile (in-process, full pipeline) + run a single-file test.
+fn _unit(name as *u8, src as *u8) as void {
+    let is [6]i64 as c;
+    c[0] = cast(i64, "./caustic"); c[1] = cast(i64, "-q"); c[2] = cast(i64, src); c[3] = cast(i64, "-o"); c[4] = cast(i64, "/tmp/ct_unit"); c[5] = 0;
+    if (_run("./caustic", cast(*u8, &c)) != 0) { _check(name, 0); return; }
+    let is [2]i64 as r; r[0] = cast(i64, "/tmp/ct_unit"); r[1] = 0;
+    _check(name, cast(i32, _run("/tmp/ct_unit", cast(*u8, &r)) == 0));
+}
+
+fn main() as i32 {
+    _p("=== Caustic test suite (run_tests.cst) ===\n");
+
+    // --- Unit tests ---
+    _p("\n--- Unit ---\n");
+    _unit("section_test", "tests/section_test.cst");
+    _unit("section_fn_test", "tests/section_fn_test.cst");
+
+    // --- Bootstrap + fixpoint (gen1 -> gen2 -> gen3, gen2 == gen3) ---
+    _p("\n--- Bootstrap ---\n");
+    let is [7]i64 as g1; g1[0]=cast(i64,"./caustic"); g1[1]=cast(i64,"-q"); g1[2]=cast(i64,"-O1"); g1[3]=cast(i64,"src/main.cst"); g1[4]=cast(i64,"-o"); g1[5]=cast(i64,"/tmp/ct_gen1"); g1[6]=0;
+    let is [7]i64 as g2; g2[0]=cast(i64,"/tmp/ct_gen1"); g2[1]=cast(i64,"-q"); g2[2]=cast(i64,"-O1"); g2[3]=cast(i64,"src/main.cst"); g2[4]=cast(i64,"-o"); g2[5]=cast(i64,"/tmp/ct_gen2"); g2[6]=0;
+    let is [7]i64 as g3; g3[0]=cast(i64,"/tmp/ct_gen2"); g3[1]=cast(i64,"-q"); g3[2]=cast(i64,"-O1"); g3[3]=cast(i64,"src/main.cst"); g3[4]=cast(i64,"-o"); g3[5]=cast(i64,"/tmp/ct_gen3"); g3[6]=0;
+    let is i32 as boot with mut = 1;
+    if (_run("./caustic", cast(*u8,&g1)) != 0) { boot = 0; }
+    if (boot == 1 && _run("/tmp/ct_gen1", cast(*u8,&g2)) != 0) { boot = 0; }
+    if (boot == 1 && _run("/tmp/ct_gen2", cast(*u8,&g3)) != 0) { boot = 0; }
+    _check("gen1->gen2->gen3 build", boot);
+    if (boot == 1) { _check("fixpoint (gen2 == gen3)", _files_equal("/tmp/ct_gen2", "/tmp/ct_gen3")); }
+
+    // --- Toolchain: separate assembler + linker (manual pipeline) ---
+    _p("\n--- Toolchain (as + ld) ---\n");
+    let is [5]i64 as cc; cc[0]=cast(i64,"./caustic"); cc[1]=cast(i64,"-q"); cc[2]=cast(i64,"-c"); cc[3]=cast(i64,"tests/section_test.cst"); cc[4]=0;
+    let is [3]i64 as aa; aa[0]=cast(i64,"./caustic-as"); aa[1]=cast(i64,"tests/section_test.cst.s"); aa[2]=0;
+    let is [5]i64 as ld; ld[0]=cast(i64,"./caustic-ld"); ld[1]=cast(i64,"tests/section_test.cst.s.o"); ld[2]=cast(i64,"-o"); ld[3]=cast(i64,"/tmp/ct_tc"); ld[4]=0;
+    let is i32 as tc with mut = 1;
+    if (_run("./caustic", cast(*u8,&cc)) != 0) { tc = 0; }
+    if (tc == 1 && _run("./caustic-as", cast(*u8,&aa)) != 0) { tc = 0; }
+    if (tc == 1 && _run("./caustic-ld", cast(*u8,&ld)) != 0) { tc = 0; }
+    let is [2]i64 as rt; rt[0]=cast(i64,"/tmp/ct_tc"); rt[1]=0;
+    if (tc == 1 && _run("/tmp/ct_tc", cast(*u8,&rt)) != 0) { tc = 0; }
+    _check("caustic -c | caustic-as | caustic-ld", tc);
+
+    // --- Summary ---
+    _p("\n=== ");
+    if (_fail == 0) { _p("ALL PASSED"); } else { _p("FAILED"); }
+    _p(" === pass="); io.write_int(io.STDOUT, cast(i64, _pass));
+    _p(" fail="); io.write_int(io.STDOUT, cast(i64, _fail)); _p("\n");
+    if (_fail == 0) { return 0; }
+    return 1;
+}
