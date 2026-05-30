@@ -311,8 +311,8 @@ peak — the ~9–11 MB is the benchmark's own arrays, a do-nothing binary is ~1
 | LuaJIT | — | — | — | 139 MB |
 | Python 3.14 | — | — | — | 52 MB |
 
-<sub>Caustic compile RAM reflects the lazy bump-allocator pool in `std/mem/pool.cst`;
-rebuild `caustic` to realize it (a binary built before that fix peaks at ~163 MB).</sub>
+<sub>Caustic compile RAM is from the bootstrapped `caustic` in this repo (lazy
+bump-allocator pool in `std/mem/pool.cst`); the pre-fix binary peaked at ~163 MB.</sub>
 
 Full matrix — 28 build configs across **GCC, Clang, TCC, Rust, Zig, Go, C++,
 Java, C#, Node, Bun, Deno, LuaJIT, Lua, PHP, Python** with compile time, binary

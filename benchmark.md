@@ -176,9 +176,9 @@ arrays — a do-nothing binary is ~1.5 MB).
 uses a global build cache, so warm rebuilds are far faster.
 ² `.class` / `.dll` only — the JVM / .NET runtime must be installed separately.
 ³ Go uses a build cache; the number is a warm rebuild.
-⁴ With the lazy bump-allocator pool in `std/mem/pool.cst` (this repo). Rebuild
-`caustic` to realize it — a binary built before that fix peaks at ~163 MB
-(the IR instruction pool used to commit all 1M×152 B slots up front).
+⁴ Measured on the bootstrapped `caustic` in this repo (lazy bump-allocator pool
+in `std/mem/pool.cst`). The pre-fix compiler peaked at ~163 MB — its IR
+instruction pool committed all 1M × 152 B slots up front.
 
 ## Where Caustic lands
 
