@@ -110,12 +110,10 @@ fn measure_rss(cmd as *u8) as i64 {
     return *maxrss;
 }
 
-// run a command to completion WITHOUT a pipe (fork + wait). Needed for
-// compilers that spawn a separate assembler/linker — capture()'s stdout pipe
-// disrupts those grandchildren, but a plain fork+wait does not.
-fn run_wait(cmd as *u8) as void {
-    // env.envp() doesn't carry PATH, so gcc/rustc/etc. can't spawn cc1/as/ld.
-    // Export a sane PATH before the command so grandchildren inherit it.
+// run a command to completion via fork + wait (no stdout pipe) and return its
+// peak RSS in KB. env.envp() doesn't carry PATH/HOME, so gcc/rustc/zig/go can't
+// find cc1/as/ld or their build cache — export sane values first.
+fn run_wait(cmd as *u8) as i64 {
     let is [800]u8 as full;
     io.sprintf(cast(*u8, &full), 800, "export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin; export HOME=\"$(getent passwd \"$(id -u)\" | cut -d: -f6)\"; %s", cmd);
     let is [4]i64 as argv;
@@ -128,8 +126,12 @@ fn run_wait(cmd as *u8) as void {
         linux.execve("/bin/sh", cast(*u8, &argv), env.envp());
         linux.exit(127);
     }
+    let is [144]u8 as ru;
+    mem.core.memset(cast(*u8, &ru), cast(i32, 0), 144);
     let is i32 as status with mut = 0;
-    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    linux.wait4(pid, &status, 0, cast(*u8, &ru));
+    let is *i64 as maxrss = cast(*i64, cast(i64, &ru) + 32);
+    return *maxrss;
 }
 
 fn p_s(s as *u8) as void { io.write_str(io.STDOUT, s); }
@@ -145,9 +147,10 @@ fn run_one(label as *u8, tool as *u8, comp as *u8, binp as *u8, runc as *u8) as 
     }
     let is i64 as comp_ms with mut = 0 - 1;
     let is i64 as size with mut = 0 - 1;
+    let is i64 as comp_ram with mut = 0 - 1;
     if (comp[0] != cast(u8, 45)) {
         let is i64 as t0 = time.now_us();
-        run_wait(comp);
+        comp_ram = run_wait(comp);
         let is i64 as t1 = time.now_us();
         comp_ms = (t1 - t0) / 1000;
         size = io.file_size(binp);
@@ -185,15 +188,15 @@ fn run_one(label as *u8, tool as *u8, comp as *u8, binp as *u8, runc as *u8) as 
     let is i32 as k2 with mut = 0;
     while (k2 < 5) { tot = tot + best[k2]; k2 = k2 + 1; }
 
-    if (comp_ms < 0) { p_s("  compile=n/a  size=n/a"); }
-    else { p_s("  compile="); p_i(comp_ms); p_s("ms  size="); p_i(size); p_s("b"); }
+    if (comp_ms < 0) { p_s("  compile=n/a size=n/a compRAM=n/a"); }
+    else { p_s("  compile="); p_i(comp_ms); p_s("ms size="); p_i(size); p_s("b compRAM="); p_i(comp_ram / 1024); p_s("MB"); }
     p_s("  | fib="); p_i(best[0] / 1000);
     p_s(" sieve="); p_i(best[1] / 1000);
     p_s(" sort="); p_i(best[2] / 1000);
     p_s(" matmul="); p_i(best[3] / 1000);
     p_s(" collatz="); p_i(best[4] / 1000);
     p_s("  total="); p_i(tot / 1000); p_s("ms");
-    p_s("  rss="); p_i(rss); p_s("KB\n");
+    p_s("  runRAM="); p_i(rss / 1024); p_s("MB\n");
 }
 
 fn main() as i32 {
