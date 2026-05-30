@@ -290,7 +290,7 @@ interpreter** — with a 28 KB static binary on ~9 MB of RAM, no runtime, no lib
 
 | Toolchain | fib | sieve | sort | matmul | collatz | **Total** |
 |-----------|----:|------:|-----:|-------:|--------:|----------:|
-| GCC -O2 | 43 | 12 | 51 | 7 | 106 | **218 ms** |
+| GCC -O1 | 142 | 18 | 50 | 9 | 120 | **339 ms** |
 | **Caustic -O1** | 172 | 47 | 121 | 36 | 173 | **550 ms** |
 | GCC -O0 | 171 | 50 | 120 | 65 | 274 | **680 ms** |
 | TCC | 187 | 54 | 126 | 49 | 377 | **792 ms** |
@@ -303,7 +303,7 @@ peak — the ~9–11 MB is the benchmark's own arrays, a do-nothing binary is ~1
 
 | Toolchain | Compile | Binary | Compile RAM | Runtime RAM |
 |-----------|--------:|-------:|------------:|------------:|
-| GCC -O2 | 120 ms | 16 KB | 46 MB | 11 MB |
+| GCC -O1 | 67 ms | 16 KB | 45 MB | 11 MB |
 | **Caustic -O1** | 138 ms | 28 KB | **12 MB** | **9 MB** |
 | GCC -O0 | 46 ms | 16 KB | 37 MB | 11 MB |
 | TCC | 6 ms | 7 KB | 7 MB | 11 MB |
