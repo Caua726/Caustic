@@ -1,0 +1,71 @@
+// csl_loader — carrega o nosso formato .csl (CSL_): mmap dos segmentos +
+// resolução de símbolos pela export table. Núcleo do loader próprio.
+use "io.cst" as io;
+use "mem.cst" as mem;
+
+fn _rd_u32(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) + (cast(i64, p[off+1]) << 8) + (cast(i64, p[off+2]) << 16) + (cast(i64, p[off+3]) << 24);
+}
+fn _rd_u64(p as *u8, off as i64) as i64 { return _rd_u32(p, off) + (_rd_u32(p, off+4) << 32); }
+fn _seq(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+let is i64 as _csl_base with mut = 0;
+let is i64 as _csl_file with mut = 0;
+let is i64 as _csl_eoff with mut = 0;
+let is i32 as _csl_ecount with mut = 0;
+
+fn csl_open(path as *u8) as i64 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as sz = io._lseek(fd, 0, 2);          // SEEK_END
+    io._lseek(fd, 0, 0);                              // SEEK_SET
+    let is i64 as fbuf = syscall(9, 0, sz, 3, 34, 0 - 1, 0);   // mmap RW (file buffer)
+    if (fbuf < 0) { io._close_fd(fd); return 0; }
+    io._read_fd(fd, cast(*u8, fbuf), sz);
+    io._close_fd(fd);
+    let is *u8 as f = cast(*u8, fbuf);
+    if (f[0] != 67 || f[1] != 83 || f[2] != 76 || f[3] != 95) { return 0; }   // "CSL_"
+    let is i32 as segc = cast(i32, _rd_u32(f, 16));
+    _csl_ecount = cast(i32, _rd_u32(f, 20));
+    _csl_eoff = _rd_u64(f, 24);
+    let is i64 as imgsz with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < segc) {
+        let is i64 as so = 32 + cast(i64, i) * 24;
+        let is i64 as va = _rd_u64(f, so);
+        let is i64 as ms = _rd_u32(f, so + 16);
+        if (va + ms > imgsz) { imgsz = va + ms; }
+        i = i + 1;
+    }
+    let is i64 as base = syscall(9, 0, imgsz, 7, 34, 0 - 1, 0);   // mmap RWX (image)
+    if (base < 0) { return 0; }
+    i = 0;
+    while (i < segc) {
+        let is i64 as so = 32 + cast(i64, i) * 24;
+        let is i64 as va = _rd_u64(f, so);
+        let is i64 as fo = _rd_u32(f, so + 8);
+        let is i64 as fs = _rd_u32(f, so + 12);
+        if (fs > 0) { mem.memcpy(cast(*u8, base + va), cast(*u8, fbuf + fo), fs); }
+        i = i + 1;
+    }
+    _csl_base = base; _csl_file = fbuf;
+    return base;
+}
+
+fn csl_resolve(name as *u8) as i64 {
+    let is *u8 as f = cast(*u8, _csl_file);
+    let is i32 as i with mut = 0;
+    while (i < _csl_ecount) {
+        let is i64 as eo = _csl_eoff + cast(i64, i) * 12;
+        let is i64 as noff = _rd_u32(f, eo);
+        let is i64 as va = _rd_u64(f, eo + 4);
+        if (_seq(cast(*u8, cast(i64, f) + noff), name) == 1) { return _csl_base + va; }
+        i = i + 1;
+    }
+    return 0;
+}
