@@ -155,12 +155,12 @@ arrays — a do-nothing binary is ~1.5 MB).
 | GCC | -O1 | 67 ms | 16 KB | 45 MB | 11 MB |
 | Java | JIT | 363 ms | 2.8 KB² | 95 MB | 56 MB |
 | Go | go build | 34 ms³ | 2.4 MB | 65 MB | 19 MB |
-| **Caustic** | **-O1** | **138 ms** | **28 KB** | **163 MB** | **9 MB** |
+| **Caustic** | **-O1** | **138 ms** | **28 KB** | **12 MB⁴** | **9 MB** |
 | GCC | -O0 | 46 ms | 16 KB | 37 MB | 11 MB |
 | C++ g++ | -O0 | 900 ms | 30 KB | 186 MB | 13 MB |
 | TCC | default | **6 ms** | **7.4 KB** | **7 MB** | 11 MB |
 | Clang | -O0 | 54 ms | 16 KB | 89 MB | 11 MB |
-| **Caustic** | **-O0** | **89 ms** | **24 KB** | **163 MB** | **9 MB** |
+| **Caustic** | **-O0** | **89 ms** | **24 KB** | **13 MB⁴** | **9 MB** |
 | C# | .NET 10 | 915 ms | 6 KB² | 181 MB | 34 MB |
 | LuaJIT | JIT | — | — | — | 139 MB |
 | Zig | Debug | 294 ms | 9.9 MB | 129 MB | 10 MB |
@@ -176,6 +176,9 @@ arrays — a do-nothing binary is ~1.5 MB).
 uses a global build cache, so warm rebuilds are far faster.
 ² `.class` / `.dll` only — the JVM / .NET runtime must be installed separately.
 ³ Go uses a build cache; the number is a warm rebuild.
+⁴ With the lazy bump-allocator pool in `std/mem/pool.cst` (this repo). Rebuild
+`caustic` to realize it — a binary built before that fix peaks at ~163 MB
+(the IR instruction pool used to commit all 1M×152 B slots up front).
 
 ## Where Caustic lands
 
@@ -193,14 +196,14 @@ is genuinely competitive:
 - **Lean at runtime:** ~9 MB peak RSS (the leanest of the whole field, just the
   benchmark's own arrays) vs the JS runtimes' 65–91 MB, LuaJIT/Lua's 139–146 MB
   or PHP's 184 MB.
-- **Fast to compile:** 138 ms end-to-end (compile + assemble + link), quicker
-  than g++ (0.8 s), C# (0.9 s) or Zig ReleaseFast (10.8 s).
+- **Fast and light to compile:** 138 ms end-to-end (compile + assemble + link),
+  quicker than g++ (0.8 s), C# (0.9 s) or Zig ReleaseFast (10.8 s) — and it peaks
+  at just **~12 MB** of compiler memory, second only to TCC (7 MB) and far under
+  GCC (37–50 MB), Go (65 MB), Clang (103 MB), Rust (115 MB), C++ (171–186 MB),
+  C# (181 MB) or Zig (129–377 MB).
 
-The honest soft spot is **compile-time memory**: the Caustic pipeline peaks at
-~163 MB to build this small program — more than GCC (37–50 MB) or Go (65 MB),
-though still under Clang (103 MB), Rust (115 MB), C++ (171–186 MB), C# (181 MB)
-and Zig (129–377 MB). The remaining runtime gap to `-O2` is mostly `matmul`/`sieve`
-(vectorization) and `collatz` (magic division) — concrete optimizer targets.
+The remaining runtime gap to `-O2` is mostly `matmul`/`sieve` (vectorization) and
+`collatz` (magic division) — concrete optimizer targets.
 
 ## Reproducing
 
