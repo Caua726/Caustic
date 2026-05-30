@@ -27,7 +27,7 @@ fn main() as i32 {
 ```sh
 ./caustic hello.cst -o hello && ./hello                       # Linux  (ELF)
 ./caustic --target=windows-x86_64 hello.cst -o hello.exe      # Windows (PE32+)
-./caustic --target=caustic-x86_64  hello.cst -o hello.cse     # CausticOS (CSE)
+./caustic --target=caustic-x86_64  hello.cst -o hello.cse     # Universal CSE: one binary for Linux + Windows + CausticOS
 ```
 
 ---
@@ -72,11 +72,11 @@ fn main() as i32 {
 A single source tree builds three different executable formats. Select one with
 `--target=` (Linux is the default):
 
-| Target | Flag | Output | OS interface | Status |
-|--------|------|--------|--------------|--------|
-| **Linux** | `--target=linux-x86_64` *(default)* | static **ELF64** | raw `syscall` | Stable |
-| **Windows** | `--target=windows-x86_64` | **PE32+** `.exe` (+ `.pdb`) | `kernel32` / `ws2_32` / `bcrypt` via IAT, MS x64 ABI | Stable — **cross-compiles from Linux** |
-| **CausticOS** | `--target=caustic-x86_64` | **CSE** (Caustic Standard Executable) | 7-syscall CausticOS kernel ABI | Experimental |
+| Target | Flag | Output | Runs on | Status |
+|--------|------|--------|---------|--------|
+| **Linux** | `--target=linux-x86_64` *(default)* | static **ELF64**, raw `syscall` | Linux | Stable |
+| **Windows** | `--target=windows-x86_64` | **PE32+** `.exe` (+ `.pdb`), DLL imports via IAT | Windows | Stable — **cross-compiles from Linux** |
+| **Universal** | `--target=caustic-x86_64` | **CSE** (Caustic Standard Executable) | **Linux · Windows · CausticOS** | Experimental |
 
 **Cross-compilation works today.** A Windows `.exe` built on Linux runs under
 Wine (and on Windows) with no changes to the source — the FFI layer reorders
@@ -85,19 +85,24 @@ arguments into the MS x64 ABI, reserves shadow space, and emits
 assembler, and linker all ship as native Windows binaries too (`caustic.exe`,
 `caustic-as.exe`, `caustic-ld.exe`).
 
-**CausticOS / CSE** is the newest and most experimental target: a custom
-executable format for a from-scratch operating system whose kernel exposes a
-minimal 7-call ABI (serial write, time, sleep, exit, getpid, yield). In
-`--mode=compat`, the driver can emit a **PE + ELF + CSE polyglot** — one binary
-file that is simultaneously a valid Windows PE, a valid Linux ELF, and a valid
-CausticOS executable. Several pieces of the CSE linker path are still landing, so
-treat this target as a preview.
+**CSE is a *portable* executable, not a CausticOS-only one.** The Caustic
+Standard Executable is the project's universal binary format: in `--mode=compat`
+(or `--mode=bundle`) the driver emits a **PE + ELF + CSE polyglot** — *one* file
+that is at the same time a valid Windows PE, a valid Linux ELF, **and** a valid
+CausticOS executable. The exact same binary runs natively on all three operating
+systems; OS detection happens at startup and the program dispatches to the right
+backend. `--mode=pure` instead targets CausticOS alone — a from-scratch OS whose
+kernel exposes a minimal 7-call ABI (serial write, time, sleep, exit, getpid,
+yield). CSE is the newest target and parts of its linker path are still landing,
+so treat it as a preview.
 
-> Behind the scenes, target dispatch is driven by `os.current`, which folds to a
-> compile-time literal (`1` Linux, `2` Windows, `3` CausticOS). Branches guarded
-> by it are dead-stripped, so a Linux build never contains a `kernel32` import and
-> a Windows build never emits a `syscall` instruction. See
-> [`CLAUDE.md`](CLAUDE.md) and [`docs/`](docs/README.md) for the full mechanism.
+> Behind the scenes, target dispatch is driven by `os.current`. On single-OS
+> builds it folds to a compile-time literal (`1` Linux, `2` Windows, `3`
+> CausticOS) and branches guarded by it are dead-stripped — so a Linux build
+> never contains a `kernel32` import and a Windows build never emits a `syscall`
+> instruction. In CSE compat mode the same `os.current` becomes a runtime check,
+> which is what lets a single polyglot binary serve every OS. See
+> [`docs/`](docs/README.md) for the full mechanism.
 
 ## Quick start
 
