@@ -17,6 +17,7 @@ struct Pool {
     total_slots as i64;
     used_slots as i64;
     debug as i64;
+    high_water as i64;   // next never-yet-handed-out slot index (bump pointer)
 }
 
 
@@ -28,7 +29,7 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
         p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
         p.region_size = 0; p.bitmap_size = 0;
         p.freelist = cast(*u8, 0); p.slot_size = 0;
-        p.total_slots = 0; p.used_slots = 0; p.debug = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
         return p;
     }
 
@@ -41,7 +42,7 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
         p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
         p.region_size = 0; p.bitmap_size = 0;
         p.freelist = cast(*u8, 0); p.slot_size = 0;
-        p.total_slots = 0; p.used_slots = 0; p.debug = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
         return p;
     }
 
@@ -75,16 +76,13 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
         p.bitmap_size = 0;
     }
 
-    // Build freelist
-    let is i64 as i with mut = 0;
-    while (i < count - 1) {
-        let is *i64 as np = cast(*i64, cast(i64, region) + i * aligned);
-        *np = cast(i64, region) + (i + 1) * aligned;
-        i = i + 1;
-    }
-    let is *i64 as last = cast(*i64, cast(i64, region) + (count - 1) * aligned);
-    *last = 0;
-    p.freelist = region;
+    // Lazy: do NOT pre-link a freelist across every slot — that write-touches
+    // one page per slot and commits the whole region up front (a 1M-slot pool
+    // would resident ~150 MB before a single alloc). Instead hand out fresh
+    // slots by bumping high_water, and let free() build a freelist only for
+    // slots actually returned. RSS stays proportional to slots in use.
+    p.freelist = cast(*u8, 0);
+    p.high_water = 0;
 
     return p;
 }
@@ -99,11 +97,18 @@ fn create(slot_size as i64, count as i64, debug as i64) as Pool {
 
 // Alloc — O(1)
 fn alloc(p as *Pool) as *u8 {
-    if (cast(i64, p.freelist) == 0) { return cast(*u8, 0); }
-
-    let is *u8 as slot = p.freelist;
-    let is *i64 as np = cast(*i64, slot);
-    p.freelist = cast(*u8, *np);
+    let is *u8 as slot with mut = cast(*u8, 0);
+    if (cast(i64, p.freelist) != 0) {
+        // reuse a previously freed slot
+        slot = p.freelist;
+        let is *i64 as np = cast(*i64, slot);
+        p.freelist = cast(*u8, *np);
+    } else {
+        // bump a never-used slot (touches just this page)
+        if (p.high_water >= p.total_slots) { return cast(*u8, 0); }
+        slot = cast(*u8, cast(i64, p.region) + p.high_water * p.slot_size);
+        p.high_water = p.high_water + 1;
+    }
 
     if (p.debug == 1) {
         let is i64 as si = (cast(i64, slot) - cast(i64, p.region)) / p.slot_size;
@@ -142,25 +147,20 @@ fn destroy(p as *Pool) as void {
     p.freelist = cast(*u8, 0);
     p.region_size = 0; p.bitmap_size = 0;
     p.slot_size = 0; p.total_slots = 0;
-    p.used_slots = 0; p.debug = 0;
+    p.used_slots = 0; p.debug = 0; p.high_water = 0;
 }
 
 // Reset
 fn reset(p as *Pool) as void {
     if (cast(i64, p.region) == 0 || p.total_slots == 0) { return; }
 
-    let is i64 as i with mut = 0;
-    while (i < p.total_slots - 1) {
-        let is *i64 as np = cast(*i64, cast(i64, p.region) + i * p.slot_size);
-        *np = cast(i64, p.region) + (i + 1) * p.slot_size;
-        i = i + 1;
-    }
-    let is *i64 as last = cast(*i64, cast(i64, p.region) + (p.total_slots - 1) * p.slot_size);
-    *last = 0;
-    p.freelist = p.region;
+    // O(1) reset: drop the freelist and rewind the bump pointer. Frees every
+    // slot without touching the region (so RSS doesn't balloon on reset).
+    p.freelist = cast(*u8, 0);
+    p.high_water = 0;
 
     if (p.debug == 1) {
-        i = 0;
+        let is i64 as i with mut = 0;
         while (i < p.bitmap_size) { p.bitmap[i] = 255; i = i + 1; }
         let is i64 as extra = p.bitmap_size * 8 - p.total_slots;
         if (extra > 0) { p.bitmap[p.bitmap_size - 1] = cast(u8, (1 << (8 - extra)) - 1); }
