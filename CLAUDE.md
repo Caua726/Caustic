@@ -299,11 +299,6 @@ the format + loader + consumers, so there are no system-ABI constraints.
 - **Verified**: the same `.csl` loads + runs under **both** Linux (`mmap`) and Windows
   (`VirtualAlloc` under wine) — `cst_add(40,2)` → 42 on both.
 
-**Still TODO** for transparent use: the linker must auto-embed the loader as `_start`
-plus a GOT (so stdlib calls go through `call [GOT+slot]` and `-lcsl` is transparent),
-and the Windows compat path needs kernel32 emission on the caustic target + a PEB-walk
-in the loader to resolve `kernel32` (`.csl` has no import table yet).
-
 ## Adding New Operators/Features
 
 File change sequence:
