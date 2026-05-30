@@ -2,6 +2,21 @@
 // resolução de símbolos pela export table. Núcleo do loader próprio.
 use "io.cst" as io;
 use "mem.cst" as mem;
+use "os.cst" as os;
+
+// Allocate `size` bytes. exec=1 → executable (for code). os.current() folds
+// per-target: Linux build uses mmap (the Windows branch is dead-stripped);
+// Windows build uses VirtualAlloc (mmap stripped). One loader, both OSes.
+fn _csl_alloc(size as i64, exec as i32) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as prot with mut = 3;          // PROT_READ|WRITE
+        if (exec == 1) { prot = 7; }              // + PROT_EXEC
+        return syscall(9, 0, size, prot, 34, 0 - 1, 0);   // mmap MAP_PRIVATE|ANON
+    }
+    let is u32 as wprot with mut = 4;             // PAGE_READWRITE
+    if (exec == 1) { wprot = 64; }                // PAGE_EXECUTE_READWRITE
+    return cast(i64, os.windows.VirtualAlloc(cast(*u8, 0), size, 12288, wprot));  // MEM_COMMIT|RESERVE
+}
 
 fn _rd_u32(p as *u8, off as i64) as i64 {
     return cast(i64, p[off]) + (cast(i64, p[off+1]) << 8) + (cast(i64, p[off+2]) << 16) + (cast(i64, p[off+3]) << 24);
@@ -24,8 +39,8 @@ fn csl_open(path as *u8) as i64 {
     if (fd < 0) { return 0; }
     let is i64 as sz = io._lseek(fd, 0, 2);          // SEEK_END
     io._lseek(fd, 0, 0);                              // SEEK_SET
-    let is i64 as fbuf = syscall(9, 0, sz, 3, 34, 0 - 1, 0);   // mmap RW (file buffer)
-    if (fbuf < 0) { io._close_fd(fd); return 0; }
+    let is i64 as fbuf = _csl_alloc(sz, 0);                     // RW buffer for the file
+    if (fbuf <= 0) { io._close_fd(fd); return 0; }
     io._read_fd(fd, cast(*u8, fbuf), sz);
     io._close_fd(fd);
     let is *u8 as f = cast(*u8, fbuf);
@@ -42,8 +57,8 @@ fn csl_open(path as *u8) as i64 {
         if (va + ms > imgsz) { imgsz = va + ms; }
         i = i + 1;
     }
-    let is i64 as base = syscall(9, 0, imgsz, 7, 34, 0 - 1, 0);   // mmap RWX (image)
-    if (base < 0) { return 0; }
+    let is i64 as base = _csl_alloc(imgsz, 1);                    // RWX image region
+    if (base <= 0) { return 0; }
     i = 0;
     while (i < segc) {
         let is i64 as so = 32 + cast(i64, i) * 24;
