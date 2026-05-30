@@ -26,6 +26,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./caustic -debugir <file>                    # Debug IR generation
 ./caustic --profile <file> -o p              # Show per-phase timing
 
+# Shared libraries (opt-in; static is the default):
+./caustic --shared lib.cst -o libfoo.so                         # ELF .so (Linux) — callable from C/gcc/Rust (System V ABI)
+./caustic --target=windows-x86_64 --shared lib.cst -o foo.dll   # PE .dll (export directory)
+./caustic --target=caustic-x86_64 --shared --mode=pure lib.cst -o lib.csl   # Universal .csl (our own loader)
+./caustic main.cst -lcaustic -o main                            # Dynamically link the Caustic stdlib (libcaustic.so)
+
 # Full manual pipeline:
 ./caustic program.cst && ./caustic-as program.cst.s && ./caustic-ld program.cst.s.o -o program && ./program
 
@@ -249,6 +255,54 @@ facade only.
 - `arena.cst` — Standalone bump allocator (delegates to `mem/core.cst`)
 - `compatcffi.cst` — C FFI struct passing helpers — pure, debug prints
   route through `io.cst`
+
+## Shared Libraries (.so / .dll / .csl)
+
+Static linking is the **default** — every binary is a self-contained, zero-dependency
+static ELF/PE (raw syscalls, no libc, only the functions DCE keeps). Shared libraries
+are **opt-in** via `--shared`, in three flavours — two for external interop, one
+universal for the Caustic toolchain itself:
+
+| Output | Flag | Loaded by | Purpose |
+|--------|------|-----------|---------|
+| **`.so`** (ELF `ET_DYN`) | `--shared` (linux target) | system `ld-linux` | interop — callable from C/gcc/Rust (System V ABI). Real `.hash`/`.dynsym`/`.dynamic`; flat `file_off==vaddr` layout. |
+| **`.dll`** (PE) | `--target=windows-x86_64 --shared` | Windows loader | PE export directory (sorted names + ordinals, appended to `.rdata`). Export RVAs add `STUB_SIZE` to skip the prepended entry stub. |
+| **`.csl`** (`CSL_` image) | `--target=caustic-x86_64 --shared --mode=pure\|compat` | **our own** loader (`std/csl_loader.cst`) | the toolchain's own universal shared runtime — one file runs on Linux + Windows + CausticOS. |
+
+### `-lcaustic` — dynamic stdlib
+Makes a program import the stdlib from `libcaustic.so` instead of statically bundling
+it: codegen externalizes every `_std_*` function (skips its body) so the calls become
+dynamic imports the linker resolves at load. The self-host bootstrap passes a clean
+gen1==gen4 fixpoint built with `-lcaustic`. For a single program the static build
+still wins on RAM (no loader); the dynamic stdlib pays off only when many programs
+share one resident `libcaustic.so`. The libcaustic.so is built from a wrapper that
+imports every std facade, compiled `-c --allow-unsupported` (so the per-OS-unsupported
+`__compile_error` stubs become no-ops and all globals are kept).
+
+### `.csl` + the custom loader (closed ecosystem)
+The `.csl` is consumed **only** by the Caustic toolchain via **our own loader** —
+never by `ld-linux`/the Windows loader. That is *why* one `.csl` is cross-OS: we own
+the format + loader + consumers, so there are no system-ABI constraints.
+
+- **Format** (`CSL_`, see `caustic-linker/cse_writer.cst:cse_emit_csl_image`): a
+  CSE-family segment table (`vaddr, file_off, file_size, mem_size, perms`) + an
+  **export table** (`name_off, vaddr` + string blob). `flags` bit 0: `0` = pure
+  (CausticOS), `1` = compat (both OS code paths present, dispatched at run time).
+- **compat mode** relies on `os.current()` being a **runtime** value: in `--mode=compat`
+  the `__compat_mode` builtin is 1, so `os.current()` returns the `mut` global
+  `_runtime_os_current` (set by the loader) instead of folding to a literal — both the
+  Linux and Windows branches survive into the image.
+- **Loader** (`std/csl_loader.cst`): `csl_open()` reads the image and mmaps its
+  segments RWX (`mmap` syscall on Linux / `VirtualAlloc` on Windows, selected by
+  `os.current()` folding per target); `csl_resolve(name)` returns the loaded address.
+  Code is PC-relative so it runs at any base with no relocation.
+- **Verified**: the same `.csl` loads + runs under **both** Linux (`mmap`) and Windows
+  (`VirtualAlloc` under wine) — `cst_add(40,2)` → 42 on both.
+
+**Still TODO** for transparent use: the linker must auto-embed the loader as `_start`
+plus a GOT (so stdlib calls go through `call [GOT+slot]` and `-lcsl` is transparent),
+and the Windows compat path needs kernel32 emission on the caustic target + a PEB-walk
+in the loader to resolve `kernel32` (`.csl` has no import table yet).
 
 ## Adding New Operators/Features
 
