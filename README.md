@@ -304,12 +304,15 @@ peak — the ~9–11 MB is the benchmark's own arrays, a do-nothing binary is ~1
 | Toolchain | Compile | Binary | Compile RAM | Runtime RAM |
 |-----------|--------:|-------:|------------:|------------:|
 | GCC -O2 | 120 ms | 16 KB | 46 MB | 11 MB |
-| **Caustic -O1** | 138 ms | 28 KB | 163 MB | **9 MB** |
+| **Caustic -O1** | 138 ms | 28 KB | **12 MB** | **9 MB** |
 | GCC -O0 | 46 ms | 16 KB | 37 MB | 11 MB |
 | TCC | 6 ms | 7 KB | 7 MB | 11 MB |
-| **Caustic -O0** | 89 ms | 24 KB | 163 MB | **9 MB** |
+| **Caustic -O0** | 89 ms | 24 KB | **13 MB** | **9 MB** |
 | LuaJIT | — | — | — | 139 MB |
 | Python 3.14 | — | — | — | 52 MB |
+
+<sub>Caustic compile RAM reflects the lazy bump-allocator pool in `std/mem/pool.cst`;
+rebuild `caustic` to realize it (a binary built before that fix peaks at ~163 MB).</sub>
 
 Full matrix — 28 build configs across **GCC, Clang, TCC, Rust, Zig, Go, C++,
 Java, C#, Node, Bun, Deno, LuaJIT, Lua, PHP, Python** with compile time, binary
