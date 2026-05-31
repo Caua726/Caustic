@@ -1,0 +1,88 @@
+// spawntest — minimal kernel repro (serial only, no framebuffer). Isolates the
+// shell crash: spawn sysinfo two ways and see which faults.
+//   Test B: spawn(argv, NO channel) + wait        — argv-spawn + wait path
+//   Test C: spawn(argv, channel fd1) + read + wait — + channel-read path
+// If B faults -> argv-spawn/wait bug; if only C faults -> channel-read bug.
+use "../../std/os/causticos.cst" as sys;
+
+fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
+fn log(s as *u8) as void { sys.write_serial(s, slen(s)); }
+fn lognum(v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial("-", 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial("0", 1); return; }
+    let is [24]u8 as b; let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+}
+
+fn read_file(path as *u8, out_len as *i64) as *u8 {
+    *out_len = 0;
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0 || sz > 65536) { sys.close(fd); return cast(*u8, 0); }
+    let is i64 as va = sys.mmap(cast(i64, 0), 65536, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
+    let is *u8 as buf = cast(*u8, va);
+    let is i64 as got = sys.read(fd, buf, sz);
+    sys.close(fd);
+    *out_len = got;
+    return buf;
+}
+
+fn main() as i32 {
+    log("spawntest: begin\n");
+    let is i64 as img_len with mut = 0;
+    let is *u8 as img = read_file("/sysinfo.cse", &img_len);
+    if (cast(i64, img) == 0) { log("spawntest: read fail\n"); sys.exit(cast(i32, 1)); }
+    log("spawntest: img len="); lognum(img_len); log("\n");
+
+    let is [4]i64 as av;
+    av[0] = cast(i64, "sysinfo"); av[1] = 7;
+
+    // ---- Test A: NO argv (argc 0), NO channel + wait. Pure ring-3-parent spawn+wait. ----
+    log("== A: spawn no argv, no chan ==\n");
+    let is i64 as pidA = sys.spawn(img, img_len, cast(*u8, 0), 0, cast(*u8, 0), 0);
+    log("A: pid="); lognum(pidA); log("\n");
+    let is i64 as stA with mut = 0;
+    log("A: wait\n");
+    sys.wait(pidA, &stA);
+    log("A: exit="); lognum(stA); log(" -- A OK\n");
+
+    // ---- Test B: argv, NO channel (fdacts 0/0). sysinfo's fd1 write falls back to serial. ----
+    log("== B: spawn argv, no chan ==\n");
+    let is i64 as pidB = sys.spawn(img, img_len, cast(*u8, 0), 0, cast(*u8, &av[0]), 1);
+    log("B: pid="); lognum(pidB); log("\n");
+    let is i64 as stB with mut = 0;
+    log("B: wait\n");
+    sys.wait(pidB, &stB);
+    log("B: exit="); lognum(stB); log(" -- B OK\n");
+
+    // ---- Test C: argv + console channel; pump child stdout. ----
+    log("== C: spawn argv + chan, read ==\n");
+    let is [2]i64 as fds;
+    if (sys.channel_create(cast(*i64, &fds[0])) != 0) { log("C: chan fail\n"); sys.exit(cast(i32, 2)); }
+    let is [2]i64 as fdacts; fdacts[0] = 1; fdacts[1] = fds[1];
+    let is i64 as pidC = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 1, cast(*u8, &av[0]), 1);
+    sys.close(fds[1]);
+    log("C: pid="); lognum(pidC); log("\n");
+    let is [256]u8 as pbuf;
+    log("C: read\n");
+    let is i64 as n with mut = sys.read(fds[0], cast(*u8, &pbuf[0]), 256);
+    log("C: read n="); lognum(n); log("\n");
+    while (n > 0) {
+        sys.write_serial(cast(*u8, &pbuf[0]), n);
+        n = sys.read(fds[0], cast(*u8, &pbuf[0]), 256);
+        log("C: read n="); lognum(n); log("\n");
+    }
+    sys.close(fds[0]);
+    let is i64 as stC with mut = 0;
+    log("C: wait\n");
+    sys.wait(pidC, &stC);
+    log("C: exit="); lognum(stC); log(" -- C OK\n");
+    log("spawntest: done\n");
+    sys.exit(cast(i32, 0));
+    return 0;
+}
