@@ -18,9 +18,22 @@ let is i64 as MAX_ARGS  with imut = 16;
 let is i64 as LINE_CAP  with imut = 256;
 let is i64 as IMG_CAP   with imut = 65536;
 
+// Palette (soft Tango-ish console colours, not harsh #fff-on-#000).
+let is u32 as C_TEXT   with imut = 0x00d3d7cf;   // body text — soft light grey
+let is u32 as C_PROMPT with imut = 0x008bbf63;   // prompt — soft green (calmer than neon, blends with the body)
+let is u32 as C_ERR    with imut = 0x00ef5350;   // errors — red
+let is u32 as C_DIM    with imut = 0x00888a8c;   // secondary text — dim grey
+let is u32 as C_TITLE  with imut = 0x0073d0ff;   // headings — soft cyan-blue
+let is u32 as C_BG     with imut = 0x00121417;   // background
+
 // --- small helpers ---
 fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
 fn puts(t as *term.Term, s as *u8) as void { term.puts(t, s, slen(s)); }
+fn _col(t as *term.Term, fg as u32) as void { term.set_color(t, fg, C_BG); }
+fn prompt(t as *term.Term) as void { _col(t, C_PROMPT); puts(t, "> "); _col(t, C_TEXT); }
+fn err(t as *term.Term, s as *u8) as void { _col(t, C_ERR); puts(t, s); _col(t, C_TEXT); }
+// hline — draw n copies of a glyph byte (e.g. 0xC4 = CP437 '─') for separators.
+fn hline(t as *term.Term, ch as i64, n as i64) as void { let is i64 as i with mut = 0; while (i < n) { term.putc(t, ch); i = i + 1; } }
 
 // serial trace (headless): markers so a screenless boot can confirm the path.
 fn _log(s as *u8) as void { sys.write_serial(s, slen(s)); }
@@ -60,7 +73,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     let is [128]u8 as path;
     let is *u8 as cmd = cast(*u8, argv_ptr[0]);
     let is i64 as cl = argv_len[0];
-    if (cl > 110) { puts(t, "name too long\n"); return; }
+    if (cl > 110) { err(t, "name too long\n"); return; }
     path[0] = cast(u8, 47);                              // '/'
     let is i64 as i with mut = 0;
     while (i < cl) { path[1 + i] = cmd[i]; i = i + 1; }
@@ -71,11 +84,14 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
 
     let is i64 as img_len with mut = 0;
     let is *u8 as img = read_file(cast(*u8, &path[0]), &img_len);
-    if (cast(i64, img) == 0) { puts(t, cast(*u8, &path[0])); puts(t, ": not found\n"); return; }
+    if (cast(i64, img) == 0) {
+        _col(t, C_ERR); puts(t, cast(*u8, &path[0])); puts(t, ": not found\n"); _col(t, C_TEXT);
+        return;
+    }
 
     // console channel: child's stdout (fd 1) = channel write end.
     let is [2]i64 as fds;
-    if (sys.channel_create(cast(*i64, &fds[0])) != 0) { puts(t, "channel fail\n"); return; }
+    if (sys.channel_create(cast(*i64, &fds[0])) != 0) { err(t, "channel fail\n"); return; }
     let is [2]i64 as fdacts;
     fdacts[0] = 1;                                       // child_fd 1 (stdout)
     fdacts[1] = fds[1];                                  // <- shell's channel write end
@@ -88,7 +104,8 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 1, cast(*u8, &av[0]), argc);
     sys.close(fds[1]);                                   // shell drops the write end; child holds it
     _log("shell: spawn "); _log(cast(*u8, &path[0])); _log(" len="); _lognum(img_len); _log(" pid="); _lognum(pid); _log("\n");
-    if (pid < 0) { puts(t, "spawn failed\n"); sys.close(fds[0]); return; }
+    if (pid < 0) { err(t, "spawn failed\n"); sys.close(fds[0]); return; }
+    _col(t, C_TEXT);                                     // program output in body colour
 
     // pump the child's stdout to the screen until it closes (EOF) / exits. Also
     // tee to serial so a screenless boot can see the program's actual output
@@ -145,7 +162,14 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as void {
     let is *u8 as cmd = cast(*u8, argv_ptr[0]);
     let is i64 as cl = argv_len[0];
     if (streq(cmd, cl, "help") == 1) {
-        puts(t, "builtin: help. programs on disk: echo cat ls uptime sysinfo\n");
+        _col(t, C_DIM); puts(t, "built-in\n"); _col(t, C_TEXT);
+        puts(t, "  help              show this help\n");
+        _col(t, C_DIM); puts(t, "programs  (/<name>.cse)\n"); _col(t, C_TEXT);
+        puts(t, "  echo <args...>    print the arguments\n");
+        puts(t, "  cat  <file>       print a file\n");
+        puts(t, "  ls   [path]       list a directory\n");
+        puts(t, "  uptime            time since boot\n");
+        puts(t, "  sysinfo           kernel version + limits\n");
         return;
     }
     run_program(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc);
@@ -155,28 +179,22 @@ fn main() as i32 {
     let is gfx.Framebuffer as fb = gfx.open();
     if (fb.ok == 0) { sys.write_serial("shell: NO FB\n", 13); sys.exit(cast(i32, 1)); }
     let is term.Term as t = term.init(fb.base, fb.fd, fb.width, fb.height, fb.pitch, fb.bpp);
-    term.set_color(&t, 0x0040ff80, 0x00101018);
-    puts(&t, "CausticOS shell v0\n");
-    term.set_color(&t, 0x00c8c8c8, 0x00101018);
-    puts(&t, "type 'help'. programs run from /<cmd>.cse with args + a console channel.\n\n");
+    _col(&t, C_TITLE);
+    puts(&t, "Caustic Shell  v0.1\n");
+    _col(&t, C_DIM);
+    hline(&t, 0xC4, 36); puts(&t, "\n");                 // 0xC4 = CP437 '─'
+    puts(&t, "type 'help' for commands\n\n");
+    _col(&t, C_TEXT);
     sys.write_serial("shell: ready\n", 13);
 
     let is i64 as kfd = input.open_keyboard();
     if (kfd < 0) { sys.write_serial("shell: NO KBD\n", 14); sys.exit(cast(i32, 2)); }
 
-    // headless self-test: spawn two programs with args end-to-end (no keyboard
-    // needed) so a screenless boot proves argv + console-channel + pump. A real
-    // session past this point is driven by the keyboard loop below.
-    _log("shell: demo begin\n");
-    puts(&t, "$ sysinfo\n");        run_line(&t, "sysinfo", 7);
-    puts(&t, "$ echo hello world\n"); run_line(&t, "echo hello world", 16);
-    _log("shell: demo end\n");
-
     let is [256]u8 as line;
     let is i64 as llen with mut = 0;
     let is i64 as shift with mut = 0;
     let is input.KeyEvent as ev;
-    puts(&t, "$ ");
+    prompt(&t);
     term.flush(&t);
     while (1 == 1) {
         if (input.read_event(kfd, &ev) == 1) {
@@ -187,7 +205,7 @@ fn main() as i32 {
                     term.putc(&t, 0x0A); term.flush(&t);
                     run_line(&t, cast(*u8, &line[0]), llen);
                     llen = 0;
-                    puts(&t, "$ "); term.flush(&t);
+                    prompt(&t); term.flush(&t);
                 } else if (c == 0x08) {
                     if (llen > 0) { llen = llen - 1; term.putc(&t, 0x08); term.flush(&t); }
                 } else if (c != 0) {
