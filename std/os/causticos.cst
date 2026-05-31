@@ -1,26 +1,32 @@
 // =======================================================
 // std/os/causticos.cst — CausticOS raw kernel bindings
 //
-// CausticOS is its own operating system (os.OS_CAUSTIC), NOT Linux. It has
-// its own kernel syscall ABI: only 7 syscalls exist today, with their own
-// numbers AND shapes. The instruction convention is standard x86_64:
+// CausticOS (os.OS_CAUSTIC) is its own operating system, NOT Linux. It has its
+// own kernel syscall ABI. The instruction convention is standard x86_64:
 //   rax = number; args rdi, rsi, rdx, r10, r8, r9; return in rax.
 //   preserves rbx, rbp, r12-r15, rsp; clobbers rax, rcx, r11 + arg regs.
-// An unknown/unimplemented number returns E_NOSYS (-2) WITHOUT killing the
-// thread.
+// A negative return is an errno; an unknown number returns E_NOSYS WITHOUT
+// killing the thread. The `syscall(...)` builtin emits the call directly (rax =
+// first arg, the rest in the arg registers) — no inline-asm wrapper, so the
+// prologue-clobbers-rdi/rsi gotcha never applies.
 //
-// Syscall table (everything that exists):
-//   0 KERN_INFO(buf,size)   -> bytes written; size==0 -> 48 (probe)
-//   1 TIME_NOW_NS()         -> monotonic ns since boot
-//   2 TIME_SLEEP_NS(ns)     -> 0; ns<0 -> E_INVAL
-//   3 PROC_EXIT(code)       -> never returns
-//   4 PROC_GETPID()         -> tid
-//   5 PROC_YIELD()          -> 0
-//   6 IO_WRITE_SERIAL(buf,len) -> bytes written (COM1; no fd)
-//
-// NOT available (calling -> E_NOSYS): read, open, close, mmap/brk, any fd or
-// VFS op. The portable facades surface those as a compile-time error on this
-// target via __compile_error.
+// Syscall table (mirrors causticos kernel/abi.cst — keep in sync):
+//   0 KERN_INFO(buf,size)        -> bytes; size==0 -> probe ceiling
+//   1 TIME_NOW_NS()              -> monotonic ns since boot
+//   2 TIME_SLEEP_NS(ns)          -> 0; ns<0 -> E_INVAL
+//   3 PROC_EXIT(code)            -> never returns
+//   4 PROC_GETPID()              -> pid
+//   5 PROC_YIELD()               -> 0
+//   6 IO_WRITE_SERIAL(buf,len)   -> bytes (COM1 console; no fd)
+//   7 MMAP(hint,len,prot)        -> vaddr | errno   (prot: R=1 W=2 X=4)
+//   8 MUNMAP(addr,len)           -> 0 | errno
+//   9 OPEN(path,len,flags)       -> fd | errno
+//  10 READ(fd,buf,n)             -> bytes | errno
+//  11 WRITE(fd,buf,n)            -> bytes | errno    (real VFS fd only)
+//  12 CLOSE(fd)                  -> 0 | errno
+//  13 LSEEK(fd,off,whence)       -> off | errno
+//  14 SPAWN(img,len,fdacts,nact) -> pid | errno
+//  15 WAIT(pid,status_ptr)       -> exit_code | errno
 // =======================================================
 
 let is i64 as SYS_KERN_INFO       with imut = 0;
@@ -30,28 +36,125 @@ let is i64 as SYS_PROC_EXIT       with imut = 3;
 let is i64 as SYS_PROC_GETPID     with imut = 4;
 let is i64 as SYS_PROC_YIELD      with imut = 5;
 let is i64 as SYS_IO_WRITE_SERIAL with imut = 6;
+let is i64 as SYS_MMAP            with imut = 7;
+let is i64 as SYS_MUNMAP          with imut = 8;
+let is i64 as SYS_OPEN            with imut = 9;
+let is i64 as SYS_READ            with imut = 10;
+let is i64 as SYS_WRITE           with imut = 11;
+let is i64 as SYS_CLOSE           with imut = 12;
+let is i64 as SYS_LSEEK           with imut = 13;
+let is i64 as SYS_SPAWN           with imut = 14;
+let is i64 as SYS_WAIT            with imut = 15;
+let is i64 as SYS_UNLINK          with imut = 16;
+let is i64 as SYS_MKDIR           with imut = 17;
+let is i64 as SYS_RMDIR           with imut = 18;
+let is i64 as SYS_RENAME          with imut = 19;
+let is i64 as SYS_STAT            with imut = 20;
+let is i64 as SYS_READDIR         with imut = 21;
+let is i64 as SYS_DEV_OPEN        with imut = 22;
+let is i64 as SYS_PRESENT         with imut = 23;
+let is i64 as SYS_CHANNEL_CREATE  with imut = 24;
+let is i64 as SYS_SURFACE_INFO    with imut = 25;
+let is i64 as SYS_DEV_COUNT       with imut = 26;
+let is i64 as SYS_COUNT           with imut = 27;
 
-// Errno values the kernel returns (negative in rax; (u64)rax > (u64)-4096).
+// Errno values the kernel returns (negative in rax).
 let is i64 as E_OK    with imut = 0;
 let is i64 as E_INVAL with imut = 0 - 1;
 let is i64 as E_NOSYS with imut = 0 - 2;
 let is i64 as E_FAULT with imut = 0 - 3;
+let is i64 as E_BADF  with imut = 0 - 4;
+let is i64 as E_NOMEM with imut = 0 - 5;
+let is i64 as E_NOENT with imut = 0 - 9;
 
-// IO_WRITE_SERIAL(buf, len) — the only output channel (serial console / COM1).
-// CRITICAL: there is NO fd. The portable io.cst dispatcher calls write with a
-// Linux-shaped (fd, buf, n); we DROP the fd and pass (buf, n) -> (rdi, rsi).
+// mmap prot bits.
+let is i64 as PROT_READ  with imut = 1;
+let is i64 as PROT_WRITE with imut = 2;
+let is i64 as PROT_EXEC  with imut = 4;
+
+// open flags (same bit values the VFS uses).
+let is i64 as O_RDONLY with imut = 0x0000;
+let is i64 as O_WRONLY with imut = 0x0001;
+let is i64 as O_RDWR   with imut = 0x0002;
+let is i64 as O_CREAT  with imut = 0x0040;
+let is i64 as O_TRUNC  with imut = 0x0200;
+let is i64 as O_APPEND with imut = 0x0400;
+
+// lseek whence.
+let is i64 as SEEK_SET with imut = 0;
+let is i64 as SEEK_CUR with imut = 1;
+let is i64 as SEEK_END with imut = 2;
+
+// dev_open device classes, fd-backed mmap flag, surface pixel format.
+let is i64 as DEV_FB               with imut = 0;
+let is i64 as DEV_KEYBOARD         with imut = 1;
+let is i64 as MMAP_FD              with imut = 0x10;
+let is i64 as SURFACE_FMT_XRGB8888 with imut = 0;
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// ---- io facade backend (called by std/io.cst's OS_CAUSTIC dispatch) ----
+
+// write(fd, buf, n): stdio (fd 0-2) has no VFS fd, so it goes to the serial
+// console via IO_WRITE_SERIAL; any other fd is a real VFS file → SYS_WRITE.
 fn write(fd as i64, buf as *u8, n as i64) as i64 {
-    return syscall(6, buf, n);
+    if (fd <= 2) { return syscall(6, buf, n); }
+    return syscall(11, fd, buf, n);
 }
+fn read(fd as i64, buf as *u8, n as i64) as i64 { return syscall(10, fd, buf, n); }
+fn open_read(path as *u8) as i64   { return syscall(9, path, _slen(path), O_RDONLY); }
+fn open_write(path as *u8) as i64  { return syscall(9, path, _slen(path), O_WRONLY | O_CREAT | O_TRUNC); }
+fn open_append(path as *u8) as i64 { return syscall(9, path, _slen(path), O_WRONLY | O_CREAT | O_APPEND); }
+fn close(fd as i64) as i32         { return cast(i32, syscall(12, fd)); }
+fn lseek(fd as i64, offset as i64, whence as i32) as i64 { return syscall(13, fd, offset, cast(i64, whence)); }
 
-// PROC_EXIT(code) — terminates the thread; never returns.
-fn exit(code as i32) as void {
-    syscall(3, cast(i64, code));
-}
+// PROC_EXIT(code) — terminates the process; never returns.
+fn exit(code as i32) as void { syscall(3, cast(i64, code)); }
 
-// Direct kernel services (for code that targets CausticOS specifically).
+// ---- direct kernel services (for code that targets CausticOS specifically) ----
 fn getpid() as i64 { return syscall(4); }
 fn yield_cpu() as i64 { return syscall(5); }
 fn sleep_ns(ns as i64) as i64 { return syscall(2, ns); }
 fn time_ns() as i64 { return syscall(1); }
 fn kern_info(buf as *u8, size as i64) as i64 { return syscall(0, buf, size); }
+fn write_serial(buf as *u8, len as i64) as i64 { return syscall(6, buf, len); }
+
+// memory: anonymous mappings (no fd/offset in v0).
+fn mmap(hint as i64, len as i64, prot as i64) as i64 { return syscall(7, hint, len, prot); }
+fn munmap(addr as i64, len as i64) as i64 { return syscall(8, addr, len); }
+
+// process: spawn a child from an in-memory CSE image; wait for a child.
+fn spawn(img as *u8, len as i64) as i64 { return syscall(14, img, len, cast(i64, 0), cast(i64, 0)); }
+fn wait(pid as i64, status_ptr as *i64) as i64 { return syscall(15, pid, status_ptr); }
+
+// VFS metadata (kernel syscalls 16-21) — forward path + length. `stat`/`readdir`
+// fill a caller-provided VfsStat / VfsDirEntry buffer (layout from kernel/vfs.cst).
+fn unlink(path as *u8) as i32 { return cast(i32, syscall(16, path, _slen(path))); }
+fn mkdir(path as *u8) as i32  { return cast(i32, syscall(17, path, _slen(path))); }
+fn rmdir(path as *u8) as i32  { return cast(i32, syscall(18, path, _slen(path))); }
+fn rename(src as *u8, dst as *u8) as i32 { return cast(i32, syscall(19, src, _slen(src), dst, _slen(dst))); }
+fn stat(path as *u8, out as *u8) as i32 { return cast(i32, syscall(20, path, _slen(path), out)); }
+fn exists(path as *u8) as i32 {
+    let is [4]i64 as st;   // VfsStat is 32 bytes; only the success/fail of stat matters here
+    if (syscall(20, path, _slen(path), cast(*u8, &st)) == 0) { return 1; }
+    return 0;
+}
+fn readdir(fd as i64, out as *u8) as i64 { return syscall(21, fd, out); }
+
+// --- display / surface (dev_open DEV_FB → a surface fd) ---
+fn dev_open(class as i64, index as i64, flags as i64) as i64 { return syscall(22, class, index, flags); }
+fn present(fd as i64, x as i64, y as i64, w as i64, h as i64) as i64 { return syscall(23, fd, x, y, w, h); }
+// dev_count(class) — how many devices of this class exist (a device manager
+// asks this, then dev_opens each index 0..count-1).
+fn dev_count(class as i64) as i64 { return syscall(26, class); }
+fn surface_info(fd as i64, out as *u8) as i64 { return syscall(25, fd, out); }
+// fd-backed mmap of a surface's backbuffer: hint=0, len ignored, fd in r10.
+fn mmap_fd(prot as i64, fd as i64) as i64 { return syscall(7, cast(i64, 0), cast(i64, 0), prot | MMAP_FD, fd); }
+
+// --- IPC: channel_create writes [fd_a, fd_b] (2 x i64) to `out`. read/write/close
+//     on either endpoint use the existing read()/write()/close() (any fd kind). ---
+fn channel_create(out as *i64) as i64 { return syscall(24, out); }

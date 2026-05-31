@@ -1,0 +1,128 @@
+// std/causticos/term.cst — text-grid renderer on a CausticOS framebuffer.
+//
+// CausticOS-ONLY. Turns a surface backbuffer + the 8x8 font into a scrolling
+// character grid: putc/puts with a cursor, newline, backspace, and scroll;
+// flush() blits via SYS_PRESENT. The terminal program drives this; it does not
+// touch the keyboard (that's input.cst) — only rendering. Takes the raw fb
+// fields (from gfx.Framebuffer) so it needn't embed a cross-module struct.
+//
+//   let is gfx.Framebuffer as fb = gfx.open();
+//   let is term.Term as t = term.init(fb.base, fb.fd, fb.width, fb.height, fb.pitch, fb.bpp);
+//   term.puts(&t, "hello\n", 6);  term.flush(&t);
+use "../os/causticos.cst" as cos;
+use "font.cst" as font;
+
+let is i64 as GLYPH_W with imut = 8;
+let is i64 as GLYPH_H with imut = 8;
+
+struct Term {
+    base   as *u8;   // backbuffer user VA
+    fd     as i64;   // surface fd (for present)
+    width  as i64;   // pixels
+    height as i64;
+    pitch  as i64;   // bytes per row
+    bpp    as i64;   // bytes per pixel
+    cols   as i64;   // width / 8
+    rows   as i64;   // height / 8
+    cx     as i64;   // cursor column
+    cy     as i64;   // cursor row
+    fg     as u32;
+    bg     as u32;
+}
+
+fn _putpix(t as *Term, x as i64, y as i64, color as u32) as void {
+    if (x < 0 || y < 0 || x >= t.width || y >= t.height) { return; }
+    let is *u32 as p = cast(*u32, cast(i64, t.base) + y * t.pitch + x * t.bpp);
+    p[0] = color;
+}
+
+// Blit one glyph cell at pixel (px,py): set bits → fg, clear bits → bg (so the
+// cell is fully repainted, erasing whatever was there).
+fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
+    let is *u8 as g = font.get_glyph(cast(i32, ch));
+    let is i64 as row with mut = 0;
+    while (row < GLYPH_H) {
+        let is i64 as bits = cast(i64, g[row]);
+        let is i64 as col with mut = 0;
+        while (col < GLYPH_W) {
+            let is i64 as mask = 128 >> col;     // MSB = leftmost
+            if ((bits & mask) != 0) { _putpix(t, px + col, py + row, t.fg); }
+            else { _putpix(t, px + col, py + row, t.bg); }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// Scroll the whole grid up one text row (GLYPH_H pixel rows) and clear the
+// bottom row. i64-at-a-time copy (dst < src → forward copy is safe).
+fn _scroll(t as *Term) as void {
+    let is i64 as base = cast(i64, t.base);
+    let is i64 as rowbytes = t.pitch * GLYPH_H;
+    let is i64 as used = t.pitch * (t.rows * GLYPH_H);
+    let is *i64 as dst = cast(*i64, base);
+    let is *i64 as src = cast(*i64, base + rowbytes);
+    let is i64 as words = (used - rowbytes) / 8;
+    let is i64 as i with mut = 0;
+    while (i < words) { dst[i] = src[i]; i = i + 1; }
+    // clear the bottom text row (rowbytes) to bg, as u32 pixels
+    let is *u32 as p = cast(*u32, base + (used - rowbytes));
+    let is i64 as pw = rowbytes / 4;
+    let is i64 as j with mut = 0;
+    while (j < pw) { p[j] = t.bg; j = j + 1; }
+    if (t.cy > 0) { t.cy = t.cy - 1; }
+}
+
+fn _newline(t as *Term) as void {
+    t.cx = 0;
+    t.cy = t.cy + 1;
+    if (t.cy >= t.rows) { _scroll(t); }
+}
+
+fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp as i64) as Term {
+    font.init();
+    let is Term as t;
+    t.base = base; t.fd = fd; t.width = width; t.height = height;
+    t.pitch = pitch; t.bpp = bpp;
+    t.cols = width / GLYPH_W; t.rows = height / GLYPH_H;
+    t.cx = 0; t.cy = 0;
+    t.fg = 0x00c8c8c8; t.bg = 0x00101018;
+    // clear the whole backbuffer to bg
+    let is *u32 as p = cast(*u32, cast(i64, base));
+    let is i64 as pw = (pitch * height) / 4;
+    let is i64 as i with mut = 0;
+    while (i < pw) { p[i] = t.bg; i = i + 1; }
+    return t;
+}
+
+fn putc(t as *Term, ch as i64) as void {
+    if (ch == 0x0A) { _newline(t); return; }                 // \n
+    if (ch == 0x0D) { t.cx = 0; return; }                    // \r
+    if (ch == 0x08) {                                        // backspace
+        if (t.cx > 0) { t.cx = t.cx - 1; _glyph(t, 0x20, t.cx * GLYPH_W, t.cy * GLYPH_H); }
+        return;
+    }
+    if (ch == 0x09) {                                        // tab → 4 spaces
+        let is i64 as k with mut = 0;
+        while (k < 4) { putc(t, 0x20); k = k + 1; }
+        return;
+    }
+    _glyph(t, ch, t.cx * GLYPH_W, t.cy * GLYPH_H);
+    t.cx = t.cx + 1;
+    if (t.cx >= t.cols) { _newline(t); }
+}
+
+fn puts(t as *Term, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { putc(t, cast(i64, s[i])); i = i + 1; }
+}
+
+// flush — publish the whole grid to the scanout. Call after a batch of writes.
+fn flush(t as *Term) as void {
+    cos.present(t.fd, 0, 0, t.width, t.height);
+}
+
+// set_color — change the foreground/background for subsequent glyphs.
+fn set_color(t as *Term, fg as u32, bg as u32) as void {
+    t.fg = fg; t.bg = bg;
+}
