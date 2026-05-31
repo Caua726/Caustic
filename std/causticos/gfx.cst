@@ -1,0 +1,76 @@
+// std/causticos/gfx.cst — CausticOS framebuffer / surface facade.
+//
+// CausticOS-ONLY. This wraps the kernel's surface model directly (dev_open
+// DEV_FB → SYS_SURFACE_INFO → mmap MMAP_FD → draw → SYS_PRESENT); there is no
+// portable backend, by design — a framebuffer surface is OS-specific. Import
+// only from a program built with `--target=caustic-x86_64`. The std/causticos/
+// path is the signal: everything here is the CausticOS userspace API, not a
+// portable std facade.
+//
+//   let is gfx.Framebuffer as fb = gfx.open();
+//   if (fb.ok == 1) {
+//       gfx.clear(&fb, 0x00101018);
+//       gfx.fill_rect(&fb, 10, 10, 100, 40, 0x00ff8800);
+//       gfx.present(&fb, 0, 0, fb.width, fb.height);
+//   }
+use "../os/causticos.cst" as cos;
+
+struct Framebuffer {
+    fd     as i64;
+    base   as *u8;    // mmap'd backbuffer (user VA); valid only when ok == 1
+    width  as i64;    // pixels
+    height as i64;    // rows the backbuffer covers
+    pitch  as i64;    // bytes per row (>= width*bpp; may include padding)
+    bpp    as i64;    // bytes per pixel (4 = XRGB8888)
+    ok     as i64;    // 1 if open() fully succeeded
+}
+
+// open() — dev_open(DEV_FB) → surface fd; surface_info → geometry; mmap_fd →
+// backbuffer VA. On any failure the returned Framebuffer has ok == 0.
+fn open() as Framebuffer {
+    if (__target_is_caustic == 0) { __compile_error("std/causticos/gfx is CausticOS-only — build with --target=caustic-x86_64"); }
+    let is Framebuffer as fb;
+    fb.fd = 0 - 1; fb.base = cast(*u8, 0);
+    fb.width = 0; fb.height = 0; fb.pitch = 0; fb.bpp = 0; fb.ok = 0;
+    let is i64 as fd = cos.dev_open(cos.DEV_FB, 0, 0);
+    if (fd < 0) { return fb; }
+    let is [5]i64 as info;     // {width, height, pitch, bpp_bytes, format}
+    if (cos.surface_info(fd, cast(*u8, &info[0])) != 0) { cos.close(fd); return fb; }
+    let is i64 as va = cos.mmap_fd(cos.PROT_READ | cos.PROT_WRITE, fd);
+    if (va < 0) { cos.close(fd); return fb; }
+    fb.fd = fd;
+    fb.base = cast(*u8, va);
+    fb.width = info[0]; fb.height = info[1]; fb.pitch = info[2]; fb.bpp = info[3];
+    fb.ok = 1;
+    return fb;
+}
+
+// present — publish a damage rect [x,y,w,h] from the backbuffer to the scanout.
+fn present(fb as *Framebuffer, x as i64, y as i64, w as i64, h as i64) as i64 {
+    return cos.present(fb.fd, x, y, w, h);
+}
+
+// put_pixel — one XRGB8888 pixel (0x00RRGGBB). Bounds-checked; indexes by pitch.
+fn put_pixel(fb as *Framebuffer, x as i64, y as i64, color as u32) as void {
+    if (x < 0 || y < 0 || x >= fb.width || y >= fb.height) { return; }
+    let is i64 as off = y * fb.pitch + x * fb.bpp;
+    let is *u32 as p = cast(*u32, cast(i64, fb.base) + off);
+    p[0] = color;
+}
+
+fn fill_rect(fb as *Framebuffer, x as i64, y as i64, w as i64, h as i64, color as u32) as void {
+    let is i64 as yy with mut = y;
+    while (yy < y + h) {
+        let is i64 as xx with mut = x;
+        while (xx < x + w) { put_pixel(fb, xx, yy, color); xx = xx + 1; }
+        yy = yy + 1;
+    }
+}
+
+fn clear(fb as *Framebuffer, color as u32) as void {
+    fill_rect(fb, 0, 0, fb.width, fb.height, color);
+}
+
+fn close(fb as *Framebuffer) as void {
+    cos.close(fb.fd);
+}
