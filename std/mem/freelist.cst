@@ -12,20 +12,35 @@ struct Header {
 }
 
 struct Heap {
-    freelist as *Header;
-    start    as *u8;
-    top      as *u8;
-    limit    as *u8;
+    freelist  as *Header;
+    start     as *u8;
+    top       as *u8;
+    limit     as *u8;
+    committed as *u8;     // end of the backed region; the bump commits more on demand
 }
+
+// Commit granularity for the reserve-large + commit-on-grow path. The window is
+// reserved once; each chunk is backed only when the bump pointer reaches it
+// (on CausticOS via SYS_COMMIT; a no-op where the OS demand-pages).
+let is i64 as COMMIT_CHUNK with imut = 65536;
 
 fn reserve(req_size as i64) as *Heap {
     let is i64 as size with mut = req_size;
     let is i64 as total with mut = size + sizeof(Heap);
 
-    let is *u8 as ptr = core.mmap_anon(total);
+    // Reserve the whole window, then back only the first chunk (enough for the
+    // Heap header + the initial allocations); alloc commits more as it grows.
+    let is *u8 as ptr = core.reserve_anon(total);
 
     if (cast(i64, ptr) < 0 || cast(i64, ptr) == 0) {
-        core.write_str(2, "mmap failed\n");
+        core.write_str(2, "reserve failed\n");
+        return cast(*Heap, 0);
+    }
+
+    let is i64 as init with mut = total;
+    if (init > COMMIT_CHUNK) { init = COMMIT_CHUNK; }
+    if (core.commit_anon(ptr, init) != cast(i32, 0)) {
+        core.munmap(ptr, total);
         return cast(*Heap, 0);
     }
 
@@ -36,6 +51,7 @@ fn reserve(req_size as i64) as *Heap {
     h.start = cast(*u8, data_start);
     h.top   = cast(*u8, data_start);
     h.limit = cast(*u8, base + total);
+    h.committed = cast(*u8, base + init);
     h.freelist = cast(*Header, 0);
 
     return h;
@@ -79,13 +95,24 @@ fn alloc(h as *Heap, req_size as i64) as *u8 {
         curr = curr.next;
     }
 
-    let is *u8 as _current_top_ptr = h.top;
     let is i64 as current_top with mut = cast(i64, h.top);
     let is i64 as limit = cast(i64, h.limit);
     let is i64 as needed = sizeof(Header) + size;
 
     if (current_top + needed > limit) {
         return cast(*u8, 0);
+    }
+
+    // Commit-on-grow: if the bump would pass the backed region, back more chunks
+    // (rounded up to COMMIT_CHUNK, clamped to limit) before writing.
+    let is i64 as committed = cast(i64, h.committed);
+    if (current_top + needed > committed) {
+        let is i64 as newc with mut = (current_top + needed + (COMMIT_CHUNK - 1)) & (0 - COMMIT_CHUNK);
+        if (newc > limit) { newc = limit; }
+        if (core.commit_anon(h.committed, newc - committed) != cast(i32, 0)) {
+            return cast(*u8, 0);
+        }
+        h.committed = cast(*u8, newc);
     }
 
     let is *Header as new_head = cast(*Header, h.top);
