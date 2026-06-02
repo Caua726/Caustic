@@ -58,6 +58,32 @@ toolchain.
 per-module objects can't. The **linker** must DCE at link time (it already keeps
 "only the functions DCE keeps" for static ELF — confirm/extend `caustic-ld`).
 
+#### Stage 1 — implementation notes (mapped)
+- **Mangling.** A function's symbol is `<module_prefix>_<name>`, built in
+  `semantic/walk_module.cst:370` from `sc.current_mod_prefix_*`. The prefix is
+  computed by `scope.cst:588 get_mod_prefix(path)` — `_` + path with `/ . \ -`
+  replaced by `_` (e.g. `src/ir/opt_mem.cst` → `_src_ir_opt_mem_cst`). So the
+  target module's prefix is just `get_mod_prefix(<input path>)`.
+- **Blocker — root vs import prefix (non-obvious).** The *root/input* file is
+  compiled UNPREFIXED (entry convention): `caustic -c src/ir/opt_mem.cst` emits
+  `opt_alloc`, `.globl opt_alloc`. But when `main.cst` imports it, the symbol is
+  `_src_ir_opt_mem_cst_opt_alloc`. So a separately-compiled module's symbols
+  WON'T match its importers' references → link error. **Fix:** in `--module-only`
+  mode, assign the root module its canonical import prefix
+  (`get_mod_prefix(input)`) instead of the empty root prefix — a small change in
+  the semantic entry / `walk_module` where the root's `current_mod_prefix` is set.
+- **No-main.** `--module-only` implies a library compile (no `main` required) —
+  reuse the existing `--no-main` / `-c` path.
+- **Reachability/DCE.** Compiling a library has no `main` to root reachability,
+  so emit ALL of the module's own functions (don't rely on `is_reachable`). All
+  cross-references resolve (every function is emitted in some `.o`); the cost is
+  bloat (unreachable functions kept) until the linker GCs them — hence the
+  linker DCE below is required to make incremental binaries non-bloated.
+- **Linker has no DCE today** (`caustic-ld` resolves symbols but no
+  reachability GC). Needed: from `_start`/entry, mark functions reachable via
+  relocation edges, drop the rest. Independently testable on a normal
+  whole-program `.o` (must not change behavior; suite + fixpoint hold).
+
 ### Stage 2 — maker orchestration (incremental driver)
 Teach the maker to drive separate compilation:
 - Discover the module graph (the compiler can emit a dep list, or the maker
