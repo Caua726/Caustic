@@ -104,6 +104,25 @@ per-module objects can't. The **linker** must DCE at link time (it already keeps
   binary) — `clean` after rebuilding the compiler itself. Per-module flags
   (`-O`, `--target`) aren't threaded yet (default ELF/-O0). Bloat awaits linker DCE.
 
+### Stage 3 attempt 1 — "skip import bodies in --module-only" (reverted)
+A lighter idea than full `.csti`: in `--module-only`, the target only needs
+imports' SIGNATURES (passes 1-5), not their bodies — so skip pass 6
+(`analyze_bodies`) + the `gen_ir` NK_USE recursion for imports. **It got the
+first/clean incremental build from 5.7 s → ~0.73 s.** But it cascaded:
+1. Segfault in IR-gen (gen_ir was generating IR for unanalyzed import bodies) —
+   fixed by also gating the NK_USE recursion in `gen_program.cst` on
+   `tgt.module_only_get() == 0`.
+2. Then `std/mem/core.cst:110 nao e modulo 'mem_windows'` — **conditional
+   imports** (`if (__target_is_windows) use ... as mem_windows`) stop resolving
+   when the import isn't fully processed. And generic instances (appended to
+   `ast_tail`, generics.cst:534) may be attributed to a module that no longer
+   gets IR-gen'd → undefined symbols.
+**Reverted** — the compiler's whole-program assumptions (conditional imports,
+generic instantiation site, cross-module reachability) are baked deep enough
+that a partial skip miscompiles. A correct version must treat imports as truly
+external *consistently* across semantic + IR-gen + reachability, OR go the full
+`.csti` route below. This is a dedicated effort, not an end-of-session change.
+
 ### Stage 3 — interface (`.csti`) consumption (compiler) — removes redundant semantic
 Make `semantic/modules.cst` import via a module's **interface** instead of its
 full source: read a cached `.csti` (exported signatures + types) and populate the
