@@ -18,6 +18,7 @@ use "codegen/target.cst" as tgt;
 use "interface.cst" as iface;
 use "lexer/cache.cst" as tokcache;
 use "parser/cache_write.cst" as astcw;
+use "parser/cache_read.cst" as astcr;
 use "ir/cache_write.cst" as ircw;
 use "ir/cache_read.cst" as ircr;
 use "../caustic-assembler/main.cst" as asmmod;
@@ -481,11 +482,32 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         tokcache.write_token_cache(tok_cpath, cast(*u8, &tokens), src, file_size);
     }
 
-    // Parse
-    let is i64 as t1 = get_time_us();
+    // Parse (or load the AST from cache). The AST is the source of truth —
+    // codegen regenerates IR from it (functions free their insts and re-gen
+    // from ast_node), so the AST is the faithful, self-contained caching
+    // layer. Tokens are still loaded above (line info via tok_idx); a cache
+    // hit skips only parse, and everything downstream runs unchanged.
     ast.types_init();
-    let is *ast.Node as root = top.parse_file(&tokens, src, file_size, filename);
-    prof.prof_record("parse", get_time_us() - t1);
+    let is *ast.Node as root with mut = cast(*ast.Node, 0);
+    let is i32 as ast_cached with mut = 0;
+    if (cast(i64, cache_dir) != 0) {
+        let is *u8 as ast_rpath = build_cache_path(cache_dir, filename, ".ast", 4);
+        let is *ast.Node as cached_root = astcr.read_ast_cache(ast_rpath, cache_hash);
+        if (cast(i64, cached_root) != 0) {
+            root = cached_root;
+            ast_cached = 1;
+            if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, filename); io.write_str(io.STDOUT, " (cached ast)\n"); }
+        }
+    }
+    if (ast_cached == 0) {
+        let is i64 as t1 = get_time_us();
+        root = top.parse_file(&tokens, src, file_size, filename);
+        prof.prof_record("parse", get_time_us() - t1);
+        if (cast(i64, cache_dir) != 0) {
+            let is *u8 as ast_wpath = build_cache_path(cache_dir, filename, ".ast", 4);
+            astcw.write_ast_cache(ast_wpath, root, cache_hash);
+        }
+    }
 
     if (g_debug_parser == 1) {
         let is *ast.Node as dn with mut = root;
