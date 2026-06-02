@@ -17,7 +17,46 @@ use "target.cst" as tgt;
 // dynamically (NEEDED libcaustic.so). User code is emitted normally.
 let is i32 as g_dyn_stdlib with mut = 0;
 fn set_dyn_stdlib(v as i32) as void { g_dyn_stdlib = v; }
+
+// --module-only (separate compilation): a function belongs to the target
+// module iff its mangled name is `<module_prefix>_<name>`. Everything else is
+// defined in another object and must not be emitted here.
+fn _belongs_to_target_module(f as *d.IRFunction) as i32 {
+    let is *u8 as p = tgt.module_prefix_ptr_get();
+    let is i32 as plen = tgt.module_prefix_len_get();
+    if (plen == 0) { return 0; }
+    if (f.asm_name_len < plen + 1) { return 0; }
+    let is *u8 as n = f.asm_name_ptr;
+    let is i32 as i with mut = 0;
+    while (i < plen) {
+        if (n[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    if (n[plen] != 95) { return 0; } // boundary: '_' separator
+    return 1;
+}
+
+// Whether a global should be DEFINED in this object. Outside --module-only,
+// always yes (whole-program). In --module-only, only the target module's own
+// globals — others are external (defined in their module's object).
+fn _global_belongs(g as *d.IRGlobal) as i32 {
+    if (tgt.module_only_get() == 0) { return 1; }
+    let is *u8 as p = tgt.module_prefix_ptr_get();
+    let is i32 as plen = tgt.module_prefix_len_get();
+    if (plen == 0) { return 0; }
+    if (g.name_len < plen + 1) { return 0; }
+    let is *u8 as n = g.name_ptr;
+    let is i32 as i with mut = 0;
+    while (i < plen) { if (n[i] != p[i]) { return 0; } i = i + 1; }
+    if (n[plen] != 95) { return 0; } // boundary: '_' separator
+    return 1;
+}
+
 fn _is_dyn_extern(f as *d.IRFunction) as i32 {
+    // module-only: functions outside the target module are external (defined
+    // in another .o), so don't emit their bodies — call sites stay undefined
+    // and the linker resolves them.
+    if (tgt.module_only_get() == 1 && _belongs_to_target_module(f) == 0) { return 1; }
     if (g_dyn_stdlib == 0) { return 0; }
     if (f.asm_name_len < 5) { return 0; }
     let is *u8 as n = f.asm_name_ptr;
@@ -315,7 +354,7 @@ fn emit_data(prog as *d.IRProgram) as void {
     // Custom sections first (globals with section attribute)
     let is *d.IRGlobal as sg with mut = prog.globals;
     while (cast(i64, sg) != 0) {
-        if (sg.is_reachable == 1 && sg.section_len > 0) {
+        if (sg.is_reachable == 1 && sg.section_len > 0 && _global_belongs(sg) == 1) {
             eo.out_str(".section ", 9);
             eo.out_str(sg.section_ptr, sg.section_len);
             eo.out_str(", \"aw\", @progbits\n", 18);
@@ -327,7 +366,7 @@ fn emit_data(prog as *d.IRProgram) as void {
     // .data section (initialized, no custom section)
     let is *d.IRGlobal as g with mut = prog.globals;
     while (cast(i64, g) != 0) {
-        if (g.is_reachable == 1 && g.is_initialized == 1 && g.is_string_init == 0 && g.section_len == 0) {
+        if (g.is_reachable == 1 && g.is_initialized == 1 && g.is_string_init == 0 && g.section_len == 0 && _global_belongs(g) == 1) {
             if (has_data == 0) {
                 eo.out_str(".data\n", 6);
                 has_data = 1;
@@ -339,7 +378,7 @@ fn emit_data(prog as *d.IRProgram) as void {
     // .bss section (uninitialized, no custom section)
     g = prog.globals;
     while (cast(i64, g) != 0) {
-        if (g.is_reachable == 1 && g.is_initialized == 0 && g.section_len == 0) {
+        if (g.is_reachable == 1 && g.is_initialized == 0 && g.section_len == 0 && _global_belongs(g) == 1) {
             if (has_bss == 0) {
                 eo.out_str(".bss\n", 5);
                 has_bss = 1;
