@@ -41,7 +41,7 @@ linker resolves them.
 
 ## Stages
 
-### Stage 1 — module-only emission (compiler)
+### Stage 1 — module-only emission (compiler) — ✅ DONE (commit 2e66ee0)
 Add a mode (`--module-only=<src-path>` or derive from the lone input) so codegen
 emits **only functions belonging to the target module** and leaves calls to
 other modules as undefined symbols (resolved at link). Concretely:
@@ -84,15 +84,25 @@ per-module objects can't. The **linker** must DCE at link time (it already keeps
   relocation edges, drop the rest. Independently testable on a normal
   whole-program `.o` (must not change behavior; suite + fixpoint hold).
 
-### Stage 2 — maker orchestration (incremental driver)
-Teach the maker to drive separate compilation:
-- Discover the module graph (the compiler can emit a dep list, or the maker
-  scans `use` transitively).
-- Per module: `hash(source)` → `.caustic/obj/<hash>.o`. If present, reuse;
-  else `caustic --module-only=M -o M.s && caustic-as M.s && cache M.o`.
-- Link all `.o` → binary (with DCE).
-- Dev-loop win: change one module → recompile just that `.o` + relink.
-**Risk:** first/clean build still pays redundant semantic per module (see Stage 3).
+### Stage 2 — maker orchestration (incremental driver) — ✅ DONE
+`caustic-mk build <target> --incremental` (commit caustic-maker a634f98 + compiler
+463bc95):
+- **Module discovery via `--emit-deps`** (compiler-side): `modules.cst` records
+  every loaded module's normalized path; emitted after semantic. 101 modules for
+  the compiler. The maker caches this list (it only changes on a use-graph edit;
+  `clean` to refresh) so body edits skip the ~400 ms emit pass.
+- **Per-module object cache**: `hash_file(M)` (streamed djb2) → `.caustic/obj/<h>.o`;
+  reuse if present, else `caustic --module-only M && caustic-as M.s` → cache the `.o`.
+- **Link**: all `.o` + `--entry=_<mangled-main>_main`.
+- **Measured (compiler self-build)**: dev-loop (1 module changed) **~164 ms** vs
+  **~945 ms** whole-program (**~5.8×**); the incremental compiler is correct
+  (compiles tiny→42, fibonacci, …), ~22% larger (no linker DCE yet).
+- **Known cost**: first/clean build ~5.7 s (6× slower) — each module re-runs
+  semantic on its import closure (the redundant-semantic problem → Stage 3). So
+  `--incremental` is a dev-loop accelerator, not for clean/CI builds.
+- **Caveats**: object cache is keyed on source hash only (not the compiler
+  binary) — `clean` after rebuilding the compiler itself. Per-module flags
+  (`-O`, `--target`) aren't threaded yet (default ELF/-O0). Bloat awaits linker DCE.
 
 ### Stage 3 — interface (`.csti`) consumption (compiler) — removes redundant semantic
 Make `semantic/modules.cst` import via a module's **interface** instead of its
