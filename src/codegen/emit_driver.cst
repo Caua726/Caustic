@@ -83,6 +83,13 @@ fn gen_func(func as *d.IRFunction) as void {
     }
     ctx.aligned_stack_size = total;
 
+    // Record this frame for the CSE stack-usage analysis while the instruction
+    // list is still live (it is freed right after gen_func). frame = return addr
+    // (8) + push rbp (8) + callee-saved pushes + the aligned sub-rsp body.
+    if (tgt.target_get().object_format == 3) {
+        sa_record(func, 16 + push_count * 8 + total);
+    }
+
     // Function label
     eo.out_str(func.asm_name_ptr, func.asm_name_len);
     eo.out_str(":\n", 2);
@@ -360,6 +367,113 @@ fn set_opt_level(level as i32) as void {
     else { eo.peep_set_enabled(0); }
 }
 
+// ============================================================
+// Worst-case stack-usage analysis (declares the CSE stack — no OS default, no
+// toolchain default). gen_func records each function's exact frame; here we walk
+// the call graph from main and take the deepest weighted path. A non-recursive
+// program gets an EXACT computed stack, derived from its own code. Recursion (a
+// cycle) or an indirect call (callee unknowable statically) is the irreducible
+// case only the author can bound — there we require --stack-size and error
+// otherwise. CSE target only.
+// ============================================================
+
+// System V entry overhead below the deepest call chain: the argv/envp/auxv block
+// the loader lays in the top page (kernel bounds it to <=1 page), the _start stub
+// frame, the SysV red zone, and 16-byte alignment slack. Traceable ABI cost.
+let is i32 as SA_ENTRY_OVERHEAD with imut = 8192;
+
+let is i32 as sa_recursion_seen with mut = 0;
+let is i32 as sa_indirect_seen with mut = 0;
+
+// Record frame + direct-call edges + indirect-call flag while instructions live.
+fn sa_record(func as *d.IRFunction, frame_bytes as i32) as void {
+    func.sa_frame = frame_bytes;
+    func.sa_state = 0;
+    func.sa_longest = 0;
+    func.sa_indirect = 0;
+    let is i32 as count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) { count = count + 1; }
+        if (inst.op == d.IR_CALL_INDIRECT) { func.sa_indirect = 1; }
+        inst = inst.next;
+    }
+    func.sa_edge_count = count;
+    if (count == 0) { func.sa_edges = cast(*u8, 0); return; }
+    let is *u8 as buf = d.opt_alloc(cast(i64, count) * 12);
+    let is i32 as idx with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.call_name_len > 0) {
+            let is *i64 as pp = cast(*i64, cast(i64, buf) + cast(i64, idx) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, buf) + cast(i64, idx) * 12 + 8);
+            *pp = cast(i64, inst.call_name_ptr);
+            *pl = inst.call_name_len;
+            idx = idx + 1;
+        }
+        inst = inst.next;
+    }
+    func.sa_edges = buf;
+}
+
+// Resolve a callee name → IRFunction (by source or asm name). 0 if not a known
+// caustic function (builtin/inlined/extern) — a leaf that adds no caustic frame.
+fn sa_resolve(p as *d.IRProgram, name as *u8, nlen as i32) as *d.IRFunction {
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (d.str_eq(f.name_ptr, f.name_len, name, nlen) == 1) { return f; }
+        if (f.asm_name_len > 0 && d.str_eq(f.asm_name_ptr, f.asm_name_len, name, nlen) == 1) { return f; }
+        f = f.next;
+    }
+    return cast(*d.IRFunction, 0);
+}
+
+// Deepest stack from f down (longest weighted path). A back edge (state 1 on
+// re-entry) is recursion; an indirect call is unbounded — both set a *_seen flag
+// and short-circuit (the exact number is then irrelevant; the author declares).
+fn sa_longest(p as *d.IRProgram, f as *d.IRFunction) as i32 {
+    if (sa_recursion_seen == 1 || sa_indirect_seen == 1) { return 0; }
+    if (f.sa_state == 2) { return f.sa_longest; }
+    if (f.sa_state == 1) { sa_recursion_seen = 1; return 0; }
+    if (f.sa_indirect == 1) { sa_indirect_seen = 1; return 0; }
+    f.sa_state = 1;
+    let is i32 as max_child with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < f.sa_edge_count) {
+        let is *i64 as pp = cast(*i64, cast(i64, f.sa_edges) + cast(i64, i) * 12);
+        let is *i32 as pl = cast(*i32, cast(i64, f.sa_edges) + cast(i64, i) * 12 + 8);
+        let is *d.IRFunction as callee = sa_resolve(p, cast(*u8, *pp), *pl);
+        if (cast(i64, callee) != 0) {
+            let is i32 as c = sa_longest(p, callee);
+            if (c > max_child) { max_child = c; }
+        }
+        i = i + 1;
+    }
+    f.sa_longest = f.sa_frame + max_child;
+    f.sa_state = 2;
+    return f.sa_longest;
+}
+
+// After codegen (CSE only): set the declared stack to the computed value, honor
+// --stack-size override, or error when uncomputable and no flag was given.
+fn sa_compute(p as *d.IRProgram) as void {
+    if (cast(i64, p.main_func) == 0) { return; }   // no entry (lib / -c)
+    sa_recursion_seen = 0;
+    sa_indirect_seen = 0;
+    let is i32 as deepest = sa_longest(p, p.main_func);
+    let is i32 as flag = tgt.cse_stack_size_get();
+    if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
+        if (flag > 0) { return; }   // author declared it — honor the flag
+        io.write_str(io.STDERR, "caustic: cannot compute worst-case stack (");
+        if (sa_recursion_seen == 1) { io.write_str(io.STDERR, "recursion"); }
+        else { io.write_str(io.STDERR, "indirect call via function pointer"); }
+        io.write_str(io.STDERR, ") — declare it explicitly with --stack-size=<bytes>\n");
+        io.exit(1);
+    }
+    if (flag > 0) { return; }   // explicit override wins even when computable
+    tgt.cse_stack_size_set(deepest + SA_ENTRY_OVERHEAD);
+}
+
 fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
     let is *d.IRProgram as p = cast(*d.IRProgram, prog);
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: init\n"); }
@@ -443,6 +557,9 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
         }
         f = f.next;
     }
+
+    // Declare the program's stack from its now-known frames (CSE target only).
+    if (tgt.target_get().object_format == 3) { sa_compute(p); }
 
     // rodata (after codegen loop so regen'd strings are included)
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: rodata\n"); }
