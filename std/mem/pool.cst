@@ -18,7 +18,16 @@ struct Pool {
     used_slots as i64;
     debug as i64;
     high_water as i64;   // next never-yet-handed-out slot index (bump pointer)
+    committed as i64;    // bytes backed from region start. The region is RESERVED
+                         // (VA only); alloc commits a chunk before bumping into it.
+                         // On Linux/Windows reserve already backed it lazily and
+                         // commit is a no-op, so RSS still tracks slots in use; on
+                         // CausticOS (strict reserve/commit, no demand paging) this
+                         // is what keeps a 1M-slot pool from committing ~150 MB up
+                         // front and OOM-ing.
 }
+
+let is i64 as _POOL_COMMIT_CHUNK with imut = 65536;
 
 
 
@@ -30,6 +39,7 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
         p.region_size = 0; p.bitmap_size = 0;
         p.freelist = cast(*u8, 0); p.slot_size = 0;
         p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+        p.committed = 0;
         return p;
     }
 
@@ -37,12 +47,29 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
     if (aligned < 8) { aligned = 8; }
 
     let is i64 as total = aligned * count;
-    let is *u8 as region = core.mmap_anon(total);
+    // RESERVE the whole region (VA only); commit grows on demand in alloc(). On
+    // Linux/Windows reserve_anon is a lazy mmap (commit no-ops), so this is the
+    // same behaviour as before; on CausticOS it avoids committing `total` (which
+    // for the compiler's 1M-slot IRInst pool is ~150 MB) up front.
+    let is *u8 as region = core.reserve_anon(total);
     if (cast(i64, region) < 0) {
         p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
         p.region_size = 0; p.bitmap_size = 0;
         p.freelist = cast(*u8, 0); p.slot_size = 0;
         p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+        p.committed = 0;
+        return p;
+    }
+    // Back the first chunk so the initial slots are usable.
+    let is i64 as first with mut = total;
+    if (first > _POOL_COMMIT_CHUNK) { first = _POOL_COMMIT_CHUNK; }
+    if (core.commit_anon(region, first) != cast(i32, 0)) {
+        core.munmap(region, total);
+        p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
+        p.region_size = 0; p.bitmap_size = 0;
+        p.freelist = cast(*u8, 0); p.slot_size = 0;
+        p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+        p.committed = 0;
         return p;
     }
 
@@ -52,6 +79,7 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
     p.total_slots = count;
     p.used_slots = 0;
     p.debug = with_debug;
+    p.committed = first;
 
     // Bitmap (only if debug)
     if (with_debug == 1) {
@@ -62,7 +90,8 @@ fn _init_pool(slot_size as i64, count as i64, with_debug as i64) as Pool {
             p.region = cast(*u8, 0); p.bitmap = cast(*u8, 0);
             p.region_size = 0; p.bitmap_size = 0;
             p.freelist = cast(*u8, 0); p.slot_size = 0;
-            p.total_slots = 0; p.used_slots = 0; p.debug = 0;
+            p.total_slots = 0; p.used_slots = 0; p.debug = 0; p.high_water = 0;
+            p.committed = 0;
             return p;
         }
         p.bitmap = bm;
@@ -107,6 +136,19 @@ fn alloc(p as *Pool) as *u8 {
         // bump a never-used slot (touches just this page)
         if (p.high_water >= p.total_slots) { return cast(*u8, 0); }
         slot = cast(*u8, cast(i64, p.region) + p.high_water * p.slot_size);
+        // Commit-on-grow: back [slot, slot+slot_size) before handing it out. On
+        // Linux/Windows commit_anon no-ops (reserve was lazy); on CausticOS this
+        // commits a fresh chunk so the strict reserve/commit OS never has to back
+        // the whole region. Out of physical RAM here returns null cleanly.
+        let is i64 as need_end = p.high_water * p.slot_size + p.slot_size;
+        if (need_end > p.committed) {
+            let is i64 as newc with mut = (need_end + (_POOL_COMMIT_CHUNK - 1)) & (0 - _POOL_COMMIT_CHUNK);
+            if (newc > p.region_size) { newc = p.region_size; }
+            if (core.commit_anon(cast(*u8, cast(i64, p.region) + p.committed), newc - p.committed) != cast(i32, 0)) {
+                return cast(*u8, 0);
+            }
+            p.committed = newc;
+        }
         p.high_water = p.high_water + 1;
     }
 
