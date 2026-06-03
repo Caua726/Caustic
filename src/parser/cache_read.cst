@@ -8,12 +8,14 @@ use "ast.cst" as ast;
 // ============================================================
 
 let is i32 as MAGIC   with imut = 1128354883; // 0x43415354 = "CAST"
-let is i32 as VERSION with imut = 2;
+let is i32 as MAGIC_CSTI with imut = 1230263107; // 0x49545343 = "CSTI" (interface image)
+let is i32 as VERSION with imut = 4;
 
-// Serialized sizes per entry
-let is i32 as SER_TYPE_SIZE with imut = 48;  // 12 i32 fields
-let is i32 as SER_NODE_SIZE with imut = 168; // 38 i32 + 2 i64 fields
-let is i32 as HEADER_SIZE   with imut = 32;
+// Serialized sizes per entry (v3 adds generic side-tables + is_imut/base_name;
+// v4 adds only_start/only_count for `use ... only ...` submodule filters)
+let is i32 as SER_TYPE_SIZE with imut = 64;  // 12 i32 (v2) + base_name_off/len + gp_start/ga_start
+let is i32 as SER_NODE_SIZE with imut = 192; // 184 (v3) + only_start + only_count
+let is i32 as HEADER_SIZE   with imut = 48;  // 32 (v2) + gp_count + ga_count + 2 reserved
 
 // Max capacity for collection pass
 let is i32 as MAX_NODES with imut = 65536;
@@ -93,13 +95,16 @@ fn deserialize_type(src as *u8, off as i32, t as *ast.Type, strtab as *u8, types
     t.gen_arg_count = read_i32(b, 40);
     t.payload_offset = read_i32(b, 44);
 
-    // Clear fields that need second pass
+    // v3: base_name (for generic type refs)
+    let is i32 as bnoff = read_i32(b, 48);
+    t.base_name_len = read_i32(b, 52);
+    t.base_name_ptr = str_tab_ptr(strtab, bnoff, t.base_name_len);
+
+    // Cleared here; restored in second passes that need nodes / GP / GA tables.
     t.fields       = cast(*u8, 0);
     t.gen_params   = cast(*u8, 0);
     t.gen_args     = cast(*u8, 0);
     t.max_payload  = 0;
-    t.base_name_ptr = cast(*u8, 0);
-    t.base_name_len = 0;
 }
 
 // ============================================================
@@ -170,9 +175,14 @@ fn deserialize_node(src as *u8, off as i32, n as *ast.Node, strtab as *u8,
     n.asm_name_len = read_i32(b, 164);
     n.asm_name_ptr = str_tab_ptr(strtab, aoff, n.asm_name_len);
 
-    // Clear fields not serialized (generic packed arrays)
+    // v3: is_imut (separate field). generic_params/generic_args restored in the
+    // second pass (they need the GP/GA side-tables + types_base).
+    n.is_imut    = read_i32(b, 168);
     n.generic_params = cast(*u8, 0);
     n.generic_args   = cast(*u8, 0);
+    // v4: only_count (use ... only ...). only_names rebuilt in the second pass.
+    n.only_count = read_i32(b, 184);
+    n.only_names = cast(*u8, 0);
 }
 
 // ============================================================
@@ -196,11 +206,112 @@ fn fixup_type_fields(type_src as *u8, types_base as *u8, nodes_base as *u8,
 }
 
 // ============================================================
+// Second pass (v3): rebuild the packed generic arrays from the GP/GA side-tables.
+//   GP table: {str_off:i32, str_len:i32} entries (param NAMES).
+//   GA table: i32 entries (type indices).
+// node.generic_params / type.gen_params <- GP[start .. start+count]
+// node.generic_args   / type.gen_args   <- GA[start .. start+count]
+// ============================================================
+fn fixup_generics(type_src as *u8, node_src as *u8, gp_base as *u8, ga_base as *u8,
+                  types_base as *u8, nodes_base as *u8, strtab as *u8,
+                  tc as i32, nc as i32) as void {
+    // Nodes
+    let is i32 as ni with mut = 0;
+    while (ni < nc) {
+        let is *ast.Node as n = idx_to_node(nodes_base, ni);
+        let is i32 as n_gpc = read_i32(node_src, ni * SER_NODE_SIZE + 100);
+        let is i32 as n_gps = read_i32(node_src, ni * SER_NODE_SIZE + 172);
+        if (n_gpc > 0 && n_gps >= 0) {
+            let is *u8 as n_gpbuf = ast.gp_alloc(n_gpc);
+            let is i32 as nj with mut = 0;
+            while (nj < n_gpc) {
+                let is i32 as soff = read_i32(gp_base, (n_gps + nj) * 8);
+                let is i32 as slen = read_i32(gp_base, (n_gps + nj) * 8 + 4);
+                ast.gp_set(n_gpbuf, nj, str_tab_ptr(strtab, soff, slen), slen);
+                nj = nj + 1;
+            }
+            n.generic_params = n_gpbuf;
+        }
+        let is i32 as n_gac = read_i32(node_src, ni * SER_NODE_SIZE + 104);
+        let is i32 as n_gas = read_i32(node_src, ni * SER_NODE_SIZE + 176);
+        if (n_gac > 0 && n_gas >= 0) {
+            let is *u8 as n_gabuf = ast.ga_alloc(n_gac);
+            let is i32 as nk with mut = 0;
+            while (nk < n_gac) {
+                let is i32 as tidx = read_i32(ga_base, (n_gas + nk) * 4);
+                ast.ga_set(n_gabuf, nk, ast.canon_type(idx_to_type(types_base, tidx)));
+                nk = nk + 1;
+            }
+            n.generic_args = n_gabuf;
+        }
+        // v4: only_names (same {ptr,len}×N layout as generic params → reuse gp_*).
+        let is i32 as n_oc = read_i32(node_src, ni * SER_NODE_SIZE + 184);
+        let is i32 as n_os = read_i32(node_src, ni * SER_NODE_SIZE + 180);
+        if (n_oc > 0 && n_os >= 0) {
+            let is *u8 as n_obuf = ast.gp_alloc(n_oc);
+            let is i32 as nm with mut = 0;
+            while (nm < n_oc) {
+                let is i32 as osoff = read_i32(gp_base, (n_os + nm) * 8);
+                let is i32 as oslen = read_i32(gp_base, (n_os + nm) * 8 + 4);
+                ast.gp_set(n_obuf, nm, str_tab_ptr(strtab, osoff, oslen), oslen);
+                nm = nm + 1;
+            }
+            n.only_names = n_obuf;
+        }
+        ni = ni + 1;
+    }
+    // Types
+    let is i32 as tti with mut = 0;
+    while (tti < tc) {
+        let is *ast.Type as t = idx_to_type(types_base, tti);
+        let is i32 as t_gpc = read_i32(type_src, tti * SER_TYPE_SIZE + 36);
+        let is i32 as t_gps = read_i32(type_src, tti * SER_TYPE_SIZE + 56);
+        if (t_gpc > 0 && t_gps >= 0) {
+            let is *u8 as t_gpbuf = ast.gp_alloc(t_gpc);
+            let is i32 as tj with mut = 0;
+            while (tj < t_gpc) {
+                let is i32 as soff2 = read_i32(gp_base, (t_gps + tj) * 8);
+                let is i32 as slen2 = read_i32(gp_base, (t_gps + tj) * 8 + 4);
+                ast.gp_set(t_gpbuf, tj, str_tab_ptr(strtab, soff2, slen2), slen2);
+                tj = tj + 1;
+            }
+            t.gen_params = t_gpbuf;
+        }
+        let is i32 as t_gac = read_i32(type_src, tti * SER_TYPE_SIZE + 40);
+        let is i32 as t_gas = read_i32(type_src, tti * SER_TYPE_SIZE + 60);
+        if (t_gac > 0 && t_gas >= 0) {
+            let is *u8 as t_gabuf = ast.ga_alloc(t_gac);
+            let is i32 as tk with mut = 0;
+            while (tk < t_gac) {
+                let is i32 as tidx2 = read_i32(ga_base, (t_gas + tk) * 4);
+                ast.ga_set(t_gabuf, tk, ast.canon_type(idx_to_type(types_base, tidx2)));
+                tk = tk + 1;
+            }
+            t.gen_args = t_gabuf;
+        }
+        tti = tti + 1;
+    }
+}
+
+// ============================================================
 // read_ast_cache: deserialize AST from file
 // Returns root node pointer or null on error/mismatch
 // ============================================================
 
 fn read_ast_cache(path as *u8, expected_hash as i64) as *ast.Node {
+    return read_image(path, expected_hash, MAGIC, 1);
+}
+
+// read_csti_nocheck: load a per-module interface image (magic "CSTI") whose
+// freshness is already guaranteed externally (load_module's mtime check), so the
+// embedded source hash is not verified.
+fn read_csti_nocheck(path as *u8) as *ast.Node {
+    return read_image(path, 0, MAGIC_CSTI, 0);
+}
+
+// read_image: shared deserializer for both the AST cache (CAST) and interface
+// images (CSTI). `check_hash` gates the embedded source-hash verification.
+fn read_image(path as *u8, expected_hash as i64, expect_magic as i32, check_hash as i32) as *ast.Node {
     // Open file
     let is i64 as fd = io._open_read(path);
     if (fd < 0) { return cast(*ast.Node, 0); }
@@ -222,7 +333,7 @@ fn read_ast_cache(path as *u8, expected_hash as i64) as *ast.Node {
 
     // Validate header
     let is i32 as magic = read_i32(data, 0);
-    if (magic != MAGIC) { return cast(*ast.Node, 0); }
+    if (magic != expect_magic) { return cast(*ast.Node, 0); }
 
     let is i32 as version = read_i32(data, 4);
     if (version != VERSION) { return cast(*ast.Node, 0); }
@@ -233,22 +344,27 @@ fn read_ast_cache(path as *u8, expected_hash as i64) as *ast.Node {
     let is i32 as root_idx = read_i32(data, 20);
     let is i32 as hash_lo = read_i32(data, 24);
     let is i32 as hash_hi = read_i32(data, 28);
+    let is i32 as gp_cnt = read_i32(data, 32);
+    let is i32 as ga_cnt = read_i32(data, 36);
 
     // Reconstruct and verify hash (mask to avoid sign extension)
     let is i64 as hmask = cast(i64, 65535) * 65536 + 65535; // 0xFFFFFFFF
     let is i64 as stored_hash = (cast(i64, hash_lo) & hmask) + ((cast(i64, hash_hi) & hmask) << 32);
-    if (stored_hash != expected_hash) { return cast(*ast.Node, 0); }
+    if (check_hash == 1 && stored_hash != expected_hash) { return cast(*ast.Node, 0); }
 
-    // Verify file size matches expected
+    // Verify file size matches expected (incl. GP/GA side-tables)
     let is i64 as expected_size = cast(i64, HEADER_SIZE) + cast(i64, stab_size)
         + cast(i64, tc) * cast(i64, SER_TYPE_SIZE)
-        + cast(i64, nc) * cast(i64, SER_NODE_SIZE);
+        + cast(i64, nc) * cast(i64, SER_NODE_SIZE)
+        + cast(i64, gp_cnt) * 8 + cast(i64, ga_cnt) * 4;
     if (file_size != expected_size) { return cast(*ast.Node, 0); }
 
     // Pointers into the data buffer
     let is *u8 as strtab = cast(*u8, cast(i64, data) + cast(i64, HEADER_SIZE));
     let is *u8 as type_src = cast(*u8, cast(i64, strtab) + cast(i64, stab_size));
     let is *u8 as node_src = cast(*u8, cast(i64, type_src) + cast(i64, tc) * cast(i64, SER_TYPE_SIZE));
+    let is *u8 as gp_base = cast(*u8, cast(i64, node_src) + cast(i64, nc) * cast(i64, SER_NODE_SIZE));
+    let is *u8 as ga_base = cast(*u8, cast(i64, gp_base) + cast(i64, gp_cnt) * 8);
 
     // Allocate contiguous arrays for types and nodes
     let is *u8 as types_base = ast.ast_alloc(cast(i64, tc) * sizeof(ast.Type));
@@ -296,6 +412,9 @@ fn read_ast_cache(path as *u8, expected_hash as i64) as *ast.Node {
 
     // Second pass: fixup type.fields pointers (needs nodes)
     fixup_type_fields(type_src, types_base, nodes_base, tc);
+
+    // Second pass (v3): rebuild packed generic arrays from the GP/GA side-tables.
+    fixup_generics(type_src, node_src, gp_base, ga_base, types_base, nodes_base, strtab, tc, nc);
 
     // Validate root index
     if (root_idx < 0 || root_idx >= nc) { return cast(*ast.Node, 0); }

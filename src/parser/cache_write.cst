@@ -8,16 +8,27 @@ use "ast.cst" as ast;
 // ============================================================
 
 let is i32 as MAGIC   with imut = 1128354883; // 0x43415354 = "CAST"
-let is i32 as VERSION with imut = 2;
+let is i32 as MAGIC_CSTI with imut = 1230263107; // 0x49545343 = "CSTI" (interface image)
+let is i32 as VERSION with imut = 4;
 
-// Serialized sizes per entry
-let is i32 as SER_TYPE_SIZE with imut = 48;  // 12 i32 fields
-let is i32 as SER_NODE_SIZE with imut = 168; // 38 i32 + 2 i64 fields
-let is i32 as HEADER_SIZE   with imut = 32;
+// Serialized sizes per entry (v3 adds generic side-tables + is_imut/base_name;
+// v4 adds only_start/only_count for `use ... only ...` submodule filters)
+let is i32 as SER_TYPE_SIZE with imut = 64;  // 12 i32 (v2) + base_name_off/len + gp_start/ga_start
+let is i32 as SER_NODE_SIZE with imut = 192; // 184 (v3) + only_start + only_count
+let is i32 as HEADER_SIZE   with imut = 48;  // 32 (v2) + gp_count + ga_count + 2 reserved
 
-// Max capacity for collection pass
-let is i32 as MAX_NODES with imut = 65536;
-let is i32 as MAX_TYPES with imut = 16384;
+// Max capacity for collection pass. A single module's post-semantic AST (its own
+// decls + generic instances it triggers) can be large, so these are generous; an
+// overflow is detected and turned into a soft failure (no image written → the
+// importer falls back to source) rather than silent truncation.
+let is i32 as MAX_NODES with imut = 262144;  // 2^18
+let is i32 as MAX_TYPES with imut = 65536;   // 2^16
+
+// Pointer->index hash capacities (power of two, > MAX_* so load factor < 0.5).
+// Make node_to_idx/type_to_idx/has_node/has_type O(1) instead of O(n) linear
+// scans — without this, serialize is O(n^2) and hangs on large modules.
+let is i32 as HT_NODE_CAP with imut = 524288; // 2^19
+let is i32 as HT_TYPE_CAP with imut = 131072; // 2^17
 
 // ============================================================
 // Collection state: arrays of pointers for index mapping
@@ -33,6 +44,33 @@ let is i32 as type_count with mut;
 let is *u8 as str_buf with mut;
 let is i32 as str_len with mut;
 let is i32 as str_cap with mut;
+
+// Generic side-tables (v3): variable-length generic param/arg data referenced by
+// node/type entries via a start index + the existing count field.
+//   GP table — generic param NAMES (node.generic_params, type.gen_params):
+//     each entry is {str_off:i32, str_len:i32} (8 bytes).
+//   GA table — generic ARG type indices (node.generic_args, type.gen_args):
+//     each entry is type_idx:i32 (4 bytes).
+let is *u8 as gp_buf with mut;
+let is i32 as gp_count with mut;   // number of {off,len} entries
+let is i32 as gp_cap with mut;
+let is *u8 as ga_buf with mut;
+let is i32 as ga_count with mut;   // number of i32 entries
+let is i32 as ga_cap with mut;
+
+// Pointer->index hashes (open addressing, linear probe). key 0 = empty slot
+// (heap pointers are never 0). Built incrementally in register_node/register_type.
+let is *u8 as nht_keys with mut;   // i64[HT_NODE_CAP]
+let is *u8 as nht_vals with mut;   // i32[HT_NODE_CAP]
+let is *u8 as tht_keys with mut;   // i64[HT_TYPE_CAP]
+let is *u8 as tht_vals with mut;   // i32[HT_TYPE_CAP]
+let is i32 as g_ser_overflow with mut = 0;  // set if MAX_NODES/MAX_TYPES exceeded
+// When 1 (set by write_csti), collect does NOT follow an NK_USE node's `.body`
+// (which semantic set to the imported module's whole AST). An interface image must
+// contain ONLY this module's own declarations — importers load each import from its
+// OWN .csti. Without this, collect drags in the entire import closure (e.g.
+// emit_driver.csti would be ~79k nodes / 15 MB instead of a few hundred).
+let is i32 as g_skip_use_body with mut = 0;
 
 // ============================================================
 // Collection helpers
@@ -58,61 +96,78 @@ fn type_ptr_set(idx as i32, t as *ast.Type) as void {
     *p = cast(i64, t);
 }
 
-// Find index of a node pointer, or -1 if null
-fn node_to_idx(n as *ast.Node) as i32 {
-    if (cast(i64, n) == 0) { return cast(i32, 0 - 1); }
-    let is i32 as i with mut = 0;
-    while (i < node_count) {
-        if (cast(i64, node_ptr_get(i)) == cast(i64, n)) { return i; }
-        i = i + 1;
+// Allocate + zero the pointer->index hashes. Call once per write, before collect.
+fn ser_ht_init() as void {
+    nht_keys = ast.ast_alloc(cast(i64, HT_NODE_CAP) * 8);
+    mem.memset(nht_keys, 0, cast(i64, HT_NODE_CAP) * 8);
+    nht_vals = ast.ast_alloc(cast(i64, HT_NODE_CAP) * 4);
+    tht_keys = ast.ast_alloc(cast(i64, HT_TYPE_CAP) * 8);
+    mem.memset(tht_keys, 0, cast(i64, HT_TYPE_CAP) * 8);
+    tht_vals = ast.ast_alloc(cast(i64, HT_TYPE_CAP) * 4);
+    g_ser_overflow = 0;
+}
+
+fn nht_put(key as i64, idx as i32) as void {
+    let is i32 as h with mut = cast(i32, (key >> 4) & cast(i64, HT_NODE_CAP - 1));
+    while (read_i64(nht_keys, h * 8) != 0) {
+        if (read_i64(nht_keys, h * 8) == key) { return; }
+        h = (h + 1) & (HT_NODE_CAP - 1);
+    }
+    write_i64(nht_keys, h * 8, key);
+    write_i32(nht_vals, h * 4, idx);
+}
+
+fn nht_get(key as i64) as i32 {
+    if (key == 0) { return cast(i32, 0 - 1); }
+    let is i32 as h with mut = cast(i32, (key >> 4) & cast(i64, HT_NODE_CAP - 1));
+    while (read_i64(nht_keys, h * 8) != 0) {
+        if (read_i64(nht_keys, h * 8) == key) { return read_i32(nht_vals, h * 4); }
+        h = (h + 1) & (HT_NODE_CAP - 1);
     }
     return cast(i32, 0 - 1);
 }
 
-// Find index of a type pointer, or -1 if null
-fn type_to_idx(t as *ast.Type) as i32 {
-    if (cast(i64, t) == 0) { return cast(i32, 0 - 1); }
-    let is i32 as i with mut = 0;
-    while (i < type_count) {
-        if (cast(i64, type_ptr_get(i)) == cast(i64, t)) { return i; }
-        i = i + 1;
+fn tht_put(key as i64, idx as i32) as void {
+    let is i32 as h with mut = cast(i32, (key >> 4) & cast(i64, HT_TYPE_CAP - 1));
+    while (read_i64(tht_keys, h * 8) != 0) {
+        if (read_i64(tht_keys, h * 8) == key) { return; }
+        h = (h + 1) & (HT_TYPE_CAP - 1);
+    }
+    write_i64(tht_keys, h * 8, key);
+    write_i32(tht_vals, h * 4, idx);
+}
+
+fn tht_get(key as i64) as i32 {
+    if (key == 0) { return cast(i32, 0 - 1); }
+    let is i32 as h with mut = cast(i32, (key >> 4) & cast(i64, HT_TYPE_CAP - 1));
+    while (read_i64(tht_keys, h * 8) != 0) {
+        if (read_i64(tht_keys, h * 8) == key) { return read_i32(tht_vals, h * 4); }
+        h = (h + 1) & (HT_TYPE_CAP - 1);
     }
     return cast(i32, 0 - 1);
 }
 
-// Check if node already registered
-fn has_node(n as *ast.Node) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < node_count) {
-        if (cast(i64, node_ptr_get(i)) == cast(i64, n)) { return 1; }
-        i = i + 1;
-    }
-    return 0;
-}
-
-// Check if type already registered
-fn has_type(t as *ast.Type) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < type_count) {
-        if (cast(i64, type_ptr_get(i)) == cast(i64, t)) { return 1; }
-        i = i + 1;
-    }
-    return 0;
-}
+// Find index of a node/type pointer, or -1 if null/absent — O(1) via the hash.
+fn node_to_idx(n as *ast.Node) as i32 { return nht_get(cast(i64, n)); }
+fn type_to_idx(t as *ast.Type) as i32 { return tht_get(cast(i64, t)); }
+fn has_node(n as *ast.Node) as i32 { if (nht_get(cast(i64, n)) >= 0) { return 1; } return 0; }
+fn has_type(t as *ast.Type) as i32 { if (tht_get(cast(i64, t)) >= 0) { return 1; } return 0; }
 
 fn register_node(n as *ast.Node) as void {
     if (cast(i64, n) == 0) { return; }
     if (has_node(n) == 1) { return; }
-    if (node_count >= MAX_NODES) { return; }
+    if (node_count >= MAX_NODES) { g_ser_overflow = 1; return; }
     node_ptr_set(node_count, n);
+    nht_put(cast(i64, n), node_count);
     node_count = node_count + 1;
 }
 
 fn register_type(t as *ast.Type) as void {
     if (cast(i64, t) == 0) { return; }
     if (has_type(t) == 1) { return; }
-    if (type_count >= MAX_TYPES) { return; }
+    if (type_count >= MAX_TYPES) { g_ser_overflow = 1; return; }
     type_ptr_set(type_count, t);
+    tht_put(cast(i64, t), type_count);
     type_count = type_count + 1;
 }
 
@@ -129,17 +184,11 @@ fn str_tab_init() as void {
 fn str_tab_add(ptr as *u8, slen as i32) as i32 {
     if (cast(i64, ptr) == 0) { return 0; }
     if (slen <= 0) { return 0; }
-    // Check if already in table (dedup)
-    let is i32 as i with mut = 0;
-    while (i + slen <= str_len) {
-        if (mem.memcmp(cast(*u8, cast(i64, str_buf) + cast(i64, i)), ptr, cast(i64, slen)) == 0) {
-            return i;
-        }
-        i = i + 1;
-    }
-    // Append
-    if (str_len + slen > str_cap) {
-        // Grow
+    // Append only — no dedup. The reader resolves strings by (offset,len), so
+    // duplicate strings are harmless; the former linear-scan dedup was O(n^2) over
+    // the whole table and hung on string-heavy modules. Trades a little file size
+    // for O(1) amortized inserts.
+    while (str_len + slen > str_cap) {
         let is i32 as new_cap = str_cap * 2;
         let is *u8 as new_buf = ast.ast_alloc(cast(i64, new_cap));
         mem.memcpy(new_buf, str_buf, cast(i64, str_len));
@@ -150,6 +199,41 @@ fn str_tab_add(ptr as *u8, slen as i32) as i32 {
     mem.memcpy(cast(*u8, cast(i64, str_buf) + cast(i64, str_len)), ptr, cast(i64, slen));
     str_len = str_len + slen;
     return off;
+}
+
+// === Generic side-tables ===
+
+fn gp_tab_init() as void {
+    gp_cap = 1024;
+    gp_buf = ast.ast_alloc(cast(i64, gp_cap) * 8);
+    gp_count = 0;
+    ga_cap = 1024;
+    ga_buf = ast.ast_alloc(cast(i64, ga_cap) * 4);
+    ga_count = 0;
+}
+
+// Append one {str_off, str_len} param-name entry; returns nothing (gp_count tracks).
+fn gp_tab_add(soff as i32, slen as i32) as void {
+    if (gp_count >= gp_cap) {
+        let is i32 as nc = gp_cap * 2;
+        let is *u8 as nb = ast.ast_alloc(cast(i64, nc) * 8);
+        mem.memcpy(nb, gp_buf, cast(i64, gp_count) * 8);
+        gp_buf = nb; gp_cap = nc;
+    }
+    write_i32(gp_buf, gp_count * 8, soff);
+    write_i32(gp_buf, gp_count * 8 + 4, slen);
+    gp_count = gp_count + 1;
+}
+
+fn ga_tab_add(type_idx as i32) as void {
+    if (ga_count >= ga_cap) {
+        let is i32 as nc = ga_cap * 2;
+        let is *u8 as nb = ast.ast_alloc(cast(i64, nc) * 4);
+        mem.memcpy(nb, ga_buf, cast(i64, ga_count) * 4);
+        ga_buf = nb; ga_cap = nc;
+    }
+    write_i32(ga_buf, ga_count * 4, type_idx);
+    ga_count = ga_count + 1;
 }
 
 // ============================================================
@@ -203,7 +287,11 @@ fn collect_node(n as *ast.Node) as void {
     collect_node(n.rhs);
     collect_node(n.expr);
     collect_node(n.init_expr);
-    collect_node(n.body);
+    // For NK_USE, `.body` is the imported module's whole AST — skip it in interface
+    // mode so the image stays scoped to THIS module's own declarations.
+    if (g_skip_use_body == 0 || n.kind != ast.NK_USE) {
+        collect_node(n.body);
+    }
     collect_node(n.cond);
     collect_node(n.then_b);
     collect_node(n.else_b);
@@ -216,6 +304,16 @@ fn collect_node(n as *ast.Node) as void {
     collect_node_list(n.stmts);
     collect_node_list(n.cases);
     collect_node_list(n.payload_args);
+
+    // Collect generic arg types (packed *Type array) so they land in the type
+    // table and serialize as indices (v3).
+    if (n.generic_arg_count > 0 && cast(i64, n.generic_args) != 0) {
+        let is i32 as gi with mut = 0;
+        while (gi < n.generic_arg_count) {
+            collect_type(ast.ga_get(n.generic_args, gi));
+            gi = gi + 1;
+        }
+    }
 
     // Collect next (top-level linked list)
     collect_node(n.next);
@@ -271,6 +369,36 @@ fn serialize_type(buf as *u8, off as i32, t as *ast.Type) as void {
     write_i32(b, 36, t.gen_param_count);
     write_i32(b, 40, t.gen_arg_count);
     write_i32(b, 44, t.payload_offset);
+
+    // v3: base_name (for generic type refs like Slice<T>) + generic side-tables
+    write_i32(b, 48, str_tab_add(t.base_name_ptr, t.base_name_len));
+    write_i32(b, 52, t.base_name_len);
+
+    // gen_params (names): append to GP table, store start index (-1 if none)
+    if (t.gen_param_count > 0 && cast(i64, t.gen_params) != 0) {
+        write_i32(b, 56, gp_count);
+        let is i32 as gi with mut = 0;
+        while (gi < t.gen_param_count) {
+            let is *u8 as np = ast.gp_ptr(t.gen_params, gi);
+            let is i32 as nl = ast.gp_len(t.gen_params, gi);
+            gp_tab_add(str_tab_add(np, nl), nl);
+            gi = gi + 1;
+        }
+    } else {
+        write_i32(b, 56, 0 - 1);
+    }
+
+    // gen_args (type indices): append to GA table, store start index (-1 if none)
+    if (t.gen_arg_count > 0 && cast(i64, t.gen_args) != 0) {
+        write_i32(b, 60, ga_count);
+        let is i32 as ai with mut = 0;
+        while (ai < t.gen_arg_count) {
+            ga_tab_add(type_to_idx(ast.ga_get(t.gen_args, ai)));
+            ai = ai + 1;
+        }
+    } else {
+        write_i32(b, 60, 0 - 1);
+    }
 }
 
 // ============================================================
@@ -334,6 +462,54 @@ fn serialize_node(buf as *u8, off as i32, n as *ast.Node) as void {
     write_i32(b, 156, n.is_global);
     write_i32(b, 160, str_tab_add(n.asm_name_ptr, n.asm_name_len));
     write_i32(b, 164, n.asm_name_len);
+
+    // v3: is_imut (separate field, not in flags) + generic side-tables + pad
+    write_i32(b, 168, n.is_imut);
+
+    // generic_params (names): append to GP table, store start index (-1 if none)
+    if (n.generic_param_count > 0 && cast(i64, n.generic_params) != 0) {
+        write_i32(b, 172, gp_count);
+        let is i32 as gi with mut = 0;
+        while (gi < n.generic_param_count) {
+            let is *u8 as np = ast.gp_ptr(n.generic_params, gi);
+            let is i32 as nl = ast.gp_len(n.generic_params, gi);
+            gp_tab_add(str_tab_add(np, nl), nl);
+            gi = gi + 1;
+        }
+    } else {
+        write_i32(b, 172, 0 - 1);
+    }
+
+    // generic_args (type indices): append to GA table, store start index (-1 if none)
+    if (n.generic_arg_count > 0 && cast(i64, n.generic_args) != 0) {
+        write_i32(b, 176, ga_count);
+        let is i32 as ai with mut = 0;
+        while (ai < n.generic_arg_count) {
+            ga_tab_add(type_to_idx(ast.ga_get(n.generic_args, ai)));
+            ai = ai + 1;
+        }
+    } else {
+        write_i32(b, 176, 0 - 1);
+    }
+
+    // v4: only_names (`use M only a,b as X`) — submodule filter names. Same packed
+    // {i64 ptr, i32 len}×N layout as generic_params, so reuse the GP name table.
+    // Without this, has_only/submodules are lost on round-trip and cross-module
+    // types like `mem.Bins` (resolved via a submodule search) fail to re-resolve.
+    write_i32(b, 184, n.only_count);
+    if (n.only_count > 0 && cast(i64, n.only_names) != 0) {
+        write_i32(b, 180, gp_count);
+        let is i32 as oi with mut = 0;
+        while (oi < n.only_count) {
+            let is *i64 as opp = cast(*i64, cast(i64, n.only_names) + cast(i64, oi) * 12);
+            let is *i32 as olp = cast(*i32, cast(i64, n.only_names) + cast(i64, oi) * 12 + 8);
+            gp_tab_add(str_tab_add(cast(*u8, *opp), *olp), *olp);
+            oi = oi + 1;
+        }
+    } else {
+        write_i32(b, 180, 0 - 1);
+    }
+    write_i32(b, 188, 0); // reserved pad → keeps 8-byte alignment
 }
 
 // ============================================================
@@ -349,10 +525,11 @@ fn write_ast_cache(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
     type_ptrs = ast.ast_alloc(cast(i64, MAX_TYPES) * 8);
     node_count = 0;
     type_count = 0;
-    str_tab_init();
+    ser_ht_init();
 
-    // Pass 1: collect all nodes and types
+    // Pass 1: collect all nodes and types (str/GP/GA tables filled later in emit_image)
     collect_node(root);
+    if (g_ser_overflow == 1) { return cast(i32, 0 - 3); } // too large → caller falls back
 
     // Generics guard: the generic_params/generic_args (Node) and gen_params/
     // gen_args (Type) packed arrays are NOT serialized yet — only their counts
@@ -378,23 +555,32 @@ fn write_ast_cache(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
         gti = gti + 1;
     }
 
-    // Pass 2: collect strings (done lazily in serialize_* via str_tab_add)
-    // Pass 3: build output buffer
-    let is i32 as root_idx = node_to_idx(root);
+    // Serialize + write the image (shared with write_csti).
+    return emit_image(path, node_to_idx(root), MAGIC, source_hash);
+}
+
+// ============================================================
+// emit_image: serialize the already-collected node/type tables to `path` with
+// the given magic. Fills the string + GP + GA side-tables during serialization.
+// Shared by write_ast_cache (magic "CAST") and write_csti (magic "CSTI").
+// Image layout (v3):
+//   header(48) | string_table | type_table[64B] | node_table[184B] | GP[8B] | GA[4B]
+// ============================================================
+fn emit_image(path as *u8, root_idx as i32, magic as i32, source_hash as i64) as i32 {
+    str_tab_init();
+    gp_tab_init();
+
     let is i32 as type_table_size = type_count * SER_TYPE_SIZE;
     let is i32 as node_table_size = node_count * SER_NODE_SIZE;
-
-    // We need to serialize to collect strings first, then write header
     let is *u8 as type_buf = ast.ast_alloc(cast(i64, type_table_size) + 1);
     let is *u8 as node_buf = ast.ast_alloc(cast(i64, node_table_size) + 1);
 
-    // Serialize all types
+    // Serialize all types (populates str + GP + GA tables)
     let is i32 as ti with mut = 0;
     while (ti < type_count) {
         serialize_type(type_buf, ti * SER_TYPE_SIZE, type_ptr_get(ti));
         ti = ti + 1;
     }
-
     // Serialize all nodes
     let is i32 as ni with mut = 0;
     while (ni < node_count) {
@@ -402,47 +588,129 @@ fn write_ast_cache(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
         ni = ni + 1;
     }
 
-    // Now str_len is final, compute total size
-    let is i32 as total_size = HEADER_SIZE + str_len + type_table_size + node_table_size;
+    // side-table sizes are final after serialization
+    let is i32 as gp_table_size = gp_count * 8;
+    let is i32 as ga_table_size = ga_count * 4;
+    let is i32 as total_size = HEADER_SIZE + str_len + type_table_size + node_table_size
+        + gp_table_size + ga_table_size;
     let is *u8 as out = ast.ast_alloc(cast(i64, total_size));
 
-    // Write header (32 bytes)
-    write_i32(out, 0, MAGIC);
+    // Header (48 bytes, v3)
+    write_i32(out, 0, magic);
     write_i32(out, 4, VERSION);
     write_i32(out, 8, node_count);
     write_i32(out, 12, type_count);
     write_i32(out, 16, str_len);
     write_i32(out, 20, root_idx);
-    // Split source_hash into lo/hi i32 parts (mask to preserve all 64 bits)
     let is i64 as hmask = cast(i64, 65535) * 65536 + 65535; // 0xFFFFFFFF
     write_i32(out, 24, cast(i32, source_hash & hmask));
     write_i32(out, 28, cast(i32, ((source_hash >> 16) >> 16) & hmask));
+    write_i32(out, 32, gp_count);
+    write_i32(out, 36, ga_count);
+    write_i32(out, 40, 0); // reserved
+    write_i32(out, 44, 0); // reserved
 
-    // Write string table
     let is i32 as str_off = HEADER_SIZE;
     if (str_len > 0) {
         mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, str_off)), str_buf, cast(i64, str_len));
     }
-
-    // Write type table
     let is i32 as type_off = str_off + str_len;
     if (type_table_size > 0) {
         mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, type_off)), type_buf, cast(i64, type_table_size));
     }
-
-    // Write node table
     let is i32 as node_off = type_off + type_table_size;
     if (node_table_size > 0) {
         mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, node_off)), node_buf, cast(i64, node_table_size));
     }
+    let is i32 as gp_off = node_off + node_table_size;
+    if (gp_table_size > 0) {
+        mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, gp_off)), gp_buf, cast(i64, gp_table_size));
+    }
+    let is i32 as ga_off = gp_off + gp_table_size;
+    if (ga_table_size > 0) {
+        mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, ga_off)), ga_buf, cast(i64, ga_table_size));
+    }
 
-    // Write to file
     let is i64 as fd = io._open_write(path);
     if (fd < 0) { return cast(i32, 0 - 1); }
     let is i64 as written = io._write_fd(fd, out, cast(i64, total_size));
     io._close_fd(fd);
-
     if (written != cast(i64, total_size)) { return cast(i32, 0 - 1); }
     return 0;
+}
+
+// ============================================================
+// write_csti: emit a per-module INTERFACE image (magic "CSTI").
+//
+// Same on-disk format as the AST cache, but filtered to what importers need:
+// types, signatures, globals, `with imut` bodies (folded at importer call sites)
+// and generic templates (cloned at instantiation) are kept FULL; every other
+// (regular) function has its body stripped to a signature — its machine code
+// lives in that module's own .o. The strip is done by temporarily nulling the
+// fn body before collection (so the body subtree isn't serialized) and restoring
+// it afterwards, leaving the in-memory AST intact.
+// Returns 0 on success, -1 on error.
+// ============================================================
+fn write_csti(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
+    if (cast(i64, root) == 0) { return cast(i32, 0 - 1); }
+
+    // 0. Truncate generic INSTANCES off the chain. instantiate_fn appends every
+    //    instance to the root chain's tail (ast_tail), so all is_ginst nodes are
+    //    contiguous at the end — find the first and snip the chain before it. The
+    //    instances are this module's internal codegen (in its own .o); importers
+    //    only need the templates. Restored after emit. (This is what keeps the
+    //    interface from ballooning — e.g. emit_driver.csti 13.8MB → small.)
+    let is *ast.Node as ginst_prev with mut = cast(*ast.Node, 0);
+    let is *ast.Node as ginst_head with mut = cast(*ast.Node, 0);
+    let is *ast.Node as scan with mut = root;
+    while (cast(i64, scan) != 0 && cast(i64, ginst_head) == 0) {
+        let is *ast.Node as nx = scan.next;
+        if (cast(i64, nx) != 0 && nx.kind == ast.NK_FN && nx.is_ginst == 1) {
+            ginst_prev = scan;
+            ginst_head = nx;
+            scan.next = cast(*ast.Node, 0);
+        }
+        scan = scan.next;
+    }
+
+    // 1. Strip regular-function bodies (save originals for restore).
+    let is *u8 as saved_nodes = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    let is *u8 as saved_bodies = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    let is i32 as saved_count with mut = 0;
+    let is *ast.Node as cur with mut = root;
+    while (cast(i64, cur) != 0) {
+        if (cur.kind == ast.NK_FN && cur.is_imut == 0 && cur.generic_param_count == 0
+            && cur.is_extern == 0 && cast(i64, cur.body) != 0) {
+            write_i64(saved_nodes, saved_count * 8, cast(i64, cur));
+            write_i64(saved_bodies, saved_count * 8, cast(i64, cur.body));
+            saved_count = saved_count + 1;
+            cur.body = cast(*ast.Node, 0);
+        }
+        cur = cur.next;
+    }
+
+    // 2. Collect (regular fns now body-less → bodies not collected) and emit.
+    node_ptrs = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    type_ptrs = ast.ast_alloc(cast(i64, MAX_TYPES) * 8);
+    node_count = 0;
+    type_count = 0;
+    ser_ht_init();
+    g_skip_use_body = 1;
+    collect_node(root);
+    g_skip_use_body = 0;
+    let is i32 as rc with mut = cast(i32, 0 - 3); // overflow default
+    if (g_ser_overflow == 0) {
+        rc = emit_image(path, node_to_idx(root), MAGIC_CSTI, source_hash);
+    }
+
+    // 3. Restore stripped bodies + the truncated generic-instance tail.
+    let is i32 as i with mut = 0;
+    while (i < saved_count) {
+        let is *ast.Node as fn_node = cast(*ast.Node, read_i64(saved_nodes, i * 8));
+        fn_node.body = cast(*ast.Node, read_i64(saved_bodies, i * 8));
+        i = i + 1;
+    }
+    if (cast(i64, ginst_prev) != 0) { ginst_prev.next = ginst_head; }
+    return rc;
 }
 
