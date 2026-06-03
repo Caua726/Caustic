@@ -7,6 +7,7 @@ use "parser/ast.cst" as ast;
 use "parser/top.cst" as top;
 use "semantic/walk_module.cst" as sem;
 use "semantic/scope.cst" as sc;
+use "semantic/modules.cst" as mod;
 use "ir/defs.cst" as ird;
 use "ir/gen.cst" as irg;
 use "ir/gen_program.cst" as irp;
@@ -236,6 +237,10 @@ let is i64 as g_output_path with mut = 0;
 let is i32 as g_no_main with mut = 0;
 let is i32 as g_cache_flags with mut = 0; // bit0=iface, bit1=tokens, bit2=ast, bit3=ir
 let is i64 as g_cache_dir with mut = 0;
+// --module-objects <dir>: batch separate compilation. ONE process does the
+// whole-program frontend once, then loops codegen+assemble per module, writing
+// <dir>/<module_prefix>.o for each. Kills the per-module process-spawn floor.
+let is i64 as g_module_objects_dir with mut = 0;
 // IR-level cache (.ir): currently disabled. Its (de)serialization is lossy —
 // it round-trips only kind+size of cast_to/cast_from types and omits several
 // IRFunction fields (is_recursive, has_stack_ops, live_inst_count, ...), so a
@@ -310,6 +315,13 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         } else if (str_eq(arg, arglen, "--cache", 7) == 1) {
             ai = ai + 1;
             if (ai < argc) { g_cache_dir = argv_arr[ai]; }
+        } else if (str_eq(arg, arglen, "--module-objects", 16) == 1) {
+            // Batch separate compilation: one process emits <dir>/<prefix>.o for
+            // every module from a single whole-program frontend.
+            ai = ai + 1;
+            if (ai < argc) { g_module_objects_dir = argv_arr[ai]; }
+            tgt.module_only_set(1);
+            g_no_main = 1;
         } else if (str_eq(arg, arglen, "--module-only", 13) == 1) {
             // Separate compilation: emit only this module's own functions
             // (externs for the rest). Implies a library compile (no main).
@@ -932,6 +944,72 @@ fn link_objects(obj_paths_buf as *u8, obj_path_offsets as *i32,
 
 // ── Multi-file compile + assemble + link path ────────────────────
 
+// ── --module-objects: batch separate compilation ───────────────────
+// One process: whole-program frontend once, then codegen+assemble per module.
+
+fn _mo_path(dir as *u8, prefix as *u8, plen as i32, suffix as *u8, suffix_len as i32) as *u8 {
+    let is i32 as dlen = strlen(dir);
+    let is i32 as total = dlen + 1 + plen + suffix_len;
+    let is *u8 as p = ird.opt_alloc(cast(i64, total) + 1);
+    mem.memcpy(p, dir, cast(i64, dlen));
+    p[dlen] = 47; // '/'
+    mem.memcpy(cast(*u8, cast(i64, p) + cast(i64, dlen) + 1), prefix, cast(i64, plen));
+    mem.memcpy(cast(*u8, cast(i64, p) + cast(i64, dlen) + 1 + cast(i64, plen)), suffix, cast(i64, suffix_len));
+    p[total] = cast(u8, 0);
+    return p;
+}
+
+fn _emit_one_obj(prog as *u8, prefix as *u8, plen as i32, dir as *u8, filename as *u8, fname_len as i32) as i32 {
+    if (plen <= 0) { return 0; }
+    tgt.module_prefix_set(prefix, plen);
+    let is *u8 as spath = _mo_path(dir, prefix, plen, ".s", 2);
+    let is *u8 as opath = _mo_path(dir, prefix, plen, ".o", 2);
+    let is i64 as fd = io._open_write(spath);
+    if (fd < 0) {
+        io.write_str(io.STDERR, "module-objects: cannot write "); io.write_str(io.STDERR, spath); io.write_str(io.STDERR, "\n");
+        return 1;
+    }
+    cgd.codegen(prog, cast(i32, fd), filename, fname_len);
+    io._close_fd(fd);
+    if (g_opt_level >= 1) { ph.optimize_asm(spath); }
+    if (asmmod.assemble_file(spath, opath) != 0) {
+        io.write_str(io.STDERR, "module-objects: assemble failed for "); io.write_str(io.STDERR, spath); io.write_str(io.STDERR, "\n");
+        return 1;
+    }
+    return 0;
+}
+
+fn run_module_objects() as i32 {
+    let is *u8 as filename = cast(*u8, g_input_files[0]);
+    let is i32 as flen = strlen(filename);
+    resolve_stdlib_dir();
+    sem.set_extra_paths(cast(*i64, &g_extra_paths), g_extra_path_count);
+
+    let is i64 as prog_ptr with mut = 0;
+    if (compile_frontend(filename, flen, 1, g_cache_flags, cast(*u8, g_cache_dir), &prog_ptr) != 0) { return 1; }
+    let is *u8 as prog = cast(*u8, prog_ptr);
+
+    cgd.set_opt_level(g_opt_level);
+    cg.cg_quiet = 1;
+    let is *u8 as dir = cast(*u8, g_module_objects_dir);
+
+    // The input file is itself a module (gets the canonical prefix because
+    // --module-objects implies --module-only).
+    if (_emit_one_obj(prog, sc.get_mod_prefix(filename, flen), sc.get_mod_prefix_len(filename, flen), dir, filename, flen) != 0) { return 1; }
+
+    // Every loaded import module.
+    let is i32 as n = mod.mo_count();
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (_emit_one_obj(prog, mod.mo_prefix_ptr(i), mod.mo_prefix_len(i), dir, filename, flen) != 0) { return 1; }
+        i = i + 1;
+    }
+    if (g_quiet == 0) {
+        io.write_str(io.STDOUT, "module-objects: emitted "); io.write_int(io.STDOUT, cast(i64, n) + 1); io.write_str(io.STDOUT, " objects\n");
+    }
+    return 0;
+}
+
 fn run_multi_file() as i32 {
     let is [32768]u8 as obj_paths_buf;
     let is [64]i32 as obj_path_offsets;
@@ -1147,6 +1225,12 @@ fn main(argc as i64, argv as i64) as i32 {
         // envp follows argv on the stack: argv[0..argc-1], NULL, envp[0..].
         let is *u8 as envp = cast(*u8, cast(i64, argv) + (argc + 1) * 8);
         return cse_orchestrate(cast(*u8, argv_arr[0]), envp);
+    }
+
+    // --module-objects: batch separate compilation — one process emits one
+    // object per module from a single whole-program frontend.
+    if (g_module_objects_dir != 0) {
+        return run_module_objects();
     }
 
     // --emit-interface: compile to semantic only
