@@ -9,6 +9,8 @@ use "../parser/ast.cst" as ast;
 use "../lexer/tokens.cst" as tok;
 use "../lexer/lexer.cst" as lex;
 use "../parser/top.cst" as top;
+use "../parser/cache_read.cst" as cr;
+use "../codegen/target.cst" as tgt;
 
 // === Module loading (needs lexer+parser) ===
 
@@ -16,6 +18,46 @@ fn load_module(path_ptr as *u8, path_len as i32) as *u8 {
     // Resolve + normalize relative to current source directory
     let is i32 as norm_len with mut = 0;
     let is *u8 as norm = sc.resolve_module_path(path_ptr, path_len, &norm_len);
+
+    // Stage 3: when --csti-dir is configured (incremental --module-only build),
+    // read this import's interface from <csti_dir>/<prefix>.csti — a binary image
+    // carrying types/signatures/globals + imut bodies + generic templates (regular
+    // fn bodies stripped). Skips full re-analysis of the import. GATED on csti_dir
+    // so whole-program builds never consume .csti. Freshness via mtime.
+    let is *u8 as cdir = tgt.csti_dir_get();
+    if (cast(i64, cdir) != 0) {
+        let is i32 as cdlen = tgt.csti_dir_len_get();
+        let is *u8 as pfx = sc.get_mod_prefix(norm, norm_len);
+        let is i32 as pfxlen = sc.get_mod_prefix_len(norm, norm_len);
+        let is *u8 as cpath = d.sem_alloc(cast(i64, cdlen) + cast(i64, pfxlen) + 7);
+        mem.memcpy(cpath, cdir, cast(i64, cdlen));
+        cpath[cdlen] = cast(u8, 47); // '/'
+        mem.memcpy(cast(*u8, cast(i64, cpath) + cast(i64, cdlen) + 1), pfx, cast(i64, pfxlen));
+        let is i32 as eat = cdlen + 1 + pfxlen;
+        mem.memcpy(cast(*u8, cast(i64, cpath) + cast(i64, eat)), ".csti", 5);
+        cpath[eat + 5] = cast(u8, 0);
+        let is i64 as cmt = io.mtime(cpath);
+        if (cmt > 0 && cmt >= io.mtime(norm)) {
+            let is *ast.Node as csti_root = cr.read_csti_nocheck(cpath);
+            if (cast(i64, csti_root) != 0) {
+                // current_source_dir lets the module's own `use` lines (carried in
+                // the image) resolve transitively (they also hit this .csti path).
+                let is i32 as ndl = sc.get_dir_len(norm, norm_len);
+                if (ndl > 0) {
+                    sc.current_source_dir_ptr = d.str_dup(norm, ndl);
+                    sc.current_source_dir_len = ndl;
+                } else {
+                    sc.current_source_dir_ptr = cast(*u8, 0);
+                    sc.current_source_dir_len = 0;
+                }
+                mod.last_loaded_src = cast(*u8, 0);
+                mod.last_loaded_src_len = 0;
+                mod.last_loaded_tl = cast(*u8, 0);
+                mod.last_loaded_filename = norm;
+                return cast(*u8, csti_root);
+            }
+        }
+    }
 
     // Check if .csti interface exists and is newer than .cst
     let is *u8 as load_path with mut = norm;

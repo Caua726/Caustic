@@ -6,6 +6,7 @@ use "lexer/lexer.cst" as lex;
 use "parser/ast.cst" as ast;
 use "parser/top.cst" as top;
 use "semantic/walk_module.cst" as sem;
+use "semantic/scope.cst" as sc;
 use "ir/defs.cst" as ird;
 use "ir/gen.cst" as irg;
 use "ir/gen_program.cst" as irp;
@@ -292,6 +293,11 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         } else if (str_eq(arg, arglen, "--emit-interface", 16) == 1) {
             g_cache_flags = g_cache_flags + 1;
             g_no_main = 1;
+        } else if (str_eq(arg, arglen, "--emit-csti", 11) == 1) {
+            // Stage 3: emit a BINARY interface image (.csti, magic CSTI) instead
+            // of the textual --emit-interface. No main required (library-style).
+            g_cache_flags = g_cache_flags + 16;
+            g_no_main = 1;
         } else if (str_eq(arg, arglen, "--emit-tokens", 13) == 1) {
             g_cache_flags = g_cache_flags + 2;
         } else if (str_eq(arg, arglen, "--emit-ast", 10) == 1) {
@@ -315,6 +321,14 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
             ai = ai + 1;
             if (ai < argc) { tgt.emit_deps_path_set(cast(*u8, argv_arr[ai])); }
             g_no_main = 1;
+        } else if (str_eq(arg, arglen, "--csti-dir", 10) == 1) {
+            // Directory of per-module binary interface images. Stage 3: gates
+            // .csti consumption (imports read from here) AND --emit-csti output.
+            ai = ai + 1;
+            if (ai < argc) {
+                let is *u8 as cd = cast(*u8, argv_arr[ai]);
+                tgt.csti_dir_set(cd, strlen(cd));
+            }
         } else if (str_eq(arg, arglen, "-O0", 3) == 1) {
             g_opt_level = 0;
         } else if (str_eq(arg, arglen, "-O1", 3) == 1) {
@@ -420,6 +434,39 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         return 1;
     }
     return 0;
+}
+
+// write_module_interface: emit `root`'s binary interface image (.csti). Writes to
+// <csti_dir>/<mod-prefix>.csti when --csti-dir is set (the SAME prefix that
+// load_module recomputes via sc.get_mod_prefix on read), else to the adjacent
+// <file>.csti. Best-effort: returns write_csti's rc (0 = ok; nonzero = not written,
+// e.g. AST too large → the importer transparently falls back to source). Shared by
+// the standalone --emit-csti path and the single-pass --module-only --emit-csti path.
+fn write_module_interface(filename as *u8, fname_len as i32, root as *ast.Node, hash as i64) as i32 {
+    let is *u8 as path with mut = cast(*u8, 0);
+    let is *u8 as cdir = tgt.csti_dir_get();
+    if (cast(i64, cdir) != 0) {
+        let is i32 as cdlen = tgt.csti_dir_len_get();
+        let is *u8 as pfx = sc.get_mod_prefix(filename, fname_len);
+        let is i32 as pfxlen = sc.get_mod_prefix_len(filename, fname_len);
+        path = ird.opt_alloc(cast(i64, cdlen) + cast(i64, pfxlen) + 7);
+        mem.memcpy(path, cdir, cast(i64, cdlen));
+        path[cdlen] = cast(u8, 47); // '/'
+        mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, cdlen) + 1), pfx, cast(i64, pfxlen));
+        let is i32 as eat = cdlen + 1 + pfxlen;
+        mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, eat)), ".csti", 5);
+        path[eat + 5] = cast(u8, 0);
+    } else {
+        path = ird.opt_alloc(cast(i64, fname_len) + 2);
+        mem.memcpy(path, filename, cast(i64, fname_len));
+        path[fname_len] = 105; // 'i' : .cst -> .csti
+        path[fname_len + 1] = cast(u8, 0);
+    }
+    let is i32 as rc = astcw.write_csti(path, root, hash);
+    if (rc == 0 && g_quiet == 0) {
+        io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, path); io.write_str(io.STDOUT, "\n");
+    }
+    return rc;
 }
 
 // ── Compilation: frontend phases (lex → parse → semantic → IR → optimize) ──
@@ -567,6 +614,14 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         iface.emit_csti(cast(*u8, root), iface_fd);
         io._close_fd(iface_fd);
         if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, csti_path); io.write_str(io.STDOUT, "\n"); }
+        *prog_out = 0;
+        return 0;
+    }
+
+    // Standalone --emit-csti: emit the interface and stop (no codegen). The
+    // single-pass --module-only + --emit-csti path emits in run_single_file instead.
+    if ((cache_flags & 16) != 0) {
+        write_module_interface(filename, fname_len, root, cache_hash);
         *prog_out = 0;
         return 0;
     }
@@ -765,6 +820,13 @@ fn run_single_file(filename as *u8) as i32 {
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
     prof.prof_record("semantic", get_time_us() - t3);
     if (g_quiet == 0) { io.write_str(io.STDOUT, "semantic: ok\n"); }
+
+    // Stage 3 single-pass: with --emit-csti + --csti-dir (the maker passes both
+    // alongside --module-only), emit this module's interface right after semantic —
+    // analyzed ONCE — then fall through to codegen for its .o. Best-effort.
+    if ((g_cache_flags & 16) != 0) {
+        write_module_interface(filename, fname_len, root, 0); // freshness via mtime, not this hash
+    }
 
     let is i64 as t_ir = get_time_us();
     irg.ir_tl = cast(*u8, &tokens);
@@ -1089,6 +1151,19 @@ fn main(argc as i64, argv as i64) as i32 {
 
     // --emit-interface: compile to semantic only
     if ((g_cache_flags & 1) != 0) {
+        let is *u8 as filename = cast(*u8, g_input_files[0]);
+        resolve_stdlib_dir();
+        sem.set_extra_paths(cast(*i64, &g_extra_paths), g_extra_path_count);
+        let is [512]u8 as dummy_obj;
+        return compile_one(filename, 1, g_cache_flags, cast(*u8, g_cache_dir), &dummy_obj);
+    }
+
+    // --emit-csti ALONE: compile to semantic only, emit the interface, stop.
+    // When combined with --module-only (the maker's single-pass), DON'T stop here —
+    // fall through to the normal --module-only path, which emits the .csti right
+    // after semantic (run_single_file) and then continues to codegen. That way the
+    // module is analyzed ONCE for both its interface and its object.
+    if ((g_cache_flags & 16) != 0 && tgt.module_only_get() == 0) {
         let is *u8 as filename = cast(*u8, g_input_files[0]);
         resolve_stdlib_dir();
         sem.set_extra_paths(cast(*i64, &g_extra_paths), g_extra_path_count);

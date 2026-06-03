@@ -39,7 +39,11 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
     let is *u8 as norm = sc.resolve_module_path(raw_path, raw_len, &norm_len);
     let is *u8 as prefix = sc.get_mod_prefix(norm, norm_len);
     let is i32 as plen = sc.get_mod_prefix_len(norm, norm_len);
-    mod.record_dep(norm, norm_len);   // for --emit-deps / incremental builds
+    // record_dep moved to POST-order (after register_structs recurses into this
+    // module's own imports, below) so --emit-deps lists dependencies BEFORE
+    // dependents — a true topological order. The maker's single-pass then builds
+    // each module's deps' .csti before the module itself, eliminating source
+    // fallbacks. (Pre-order here mis-ordered DAG cross-edges.)
 
     // Save state
     let is *u8 as old_prefix = sc.current_mod_prefix_ptr;
@@ -111,6 +115,9 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
                 current_only_names = prev_only;
                 current_only_count = prev_oc;
             }
+            // POST-order: this module is fully loaded and all its own imports +
+            // submodules were recorded above → record it now, after its deps.
+            mod.record_dep(norm, norm_len);
         } else {
             n.body = cast(*ast.Node, cached.body);
             sc.current_source_dir_ptr = cached.source_dir_ptr;
@@ -522,8 +529,8 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
         tgt.module_prefix_set(mprefix, mplen);
     }
 
-    // Record the entry file itself as a dependency (it's a module too).
-    mod.record_dep(filename_ptr, filename_len);
+    // (The entry file records itself AFTER the passes below, so it lands LAST in
+    // the dependency list — it's the final dependent, imported by nobody.)
 
     // Find ast_tail
     gn.ast_tail = cast(*ast.Node, root);
@@ -541,6 +548,10 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
     register_fns(root);
     register_vars(root);
     analyze_bodies(root);
+
+    // Record the entry file LAST (post-order): every import is already recorded
+    // above, so the entry — the final dependent — lands at the end of the list.
+    mod.record_dep(filename_ptr, filename_len);
 
     // --emit-deps: now that every import has been resolved + loaded, write the
     // full module path list for the maker's incremental driver.
