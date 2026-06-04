@@ -1,7 +1,33 @@
 use "../../std/mem.cst" as mem;
+use "../../std/mem/bins.cst" as bins;
 use "../ir/opt_mem.cst" as om;
 
 fn ast_alloc(size as i64) as *u8 { return om.opt_alloc(size); }
+
+// Transient node arena: function-body AST nodes (statements/expressions) are
+// dead once their IR has been generated — codegen works from IR, and at -O1 the
+// IR is now kept resident through codegen rather than freed+regenerated, so the
+// body AST is never re-read. While `_node_t_active` is set (during function-body
+// parsing) new_node allocates from a SEPARATE bins arena that
+// destroy_transient_nodes() releases WHOLESALE after IR-gen, reclaiming the bulk
+// of the AST. Types (new_type) and everything outside a function body (globals,
+// decls, params) stay in the main opt_bins arena and survive — codegen still
+// needs them. The destroy is skipped on PE builds, which walk the body AST for
+// .cstlocals debug info.
+let is bins.Bins as _node_t_bins with mut;
+let is i32 as _node_t_ready with mut = 0;
+let is i32 as _node_t_active with mut = 0;
+
+fn node_transient_begin() as void { _node_t_active = 1; }
+fn node_transient_end() as void { _node_t_active = 0; }
+
+fn destroy_transient_nodes() as void {
+    if (_node_t_ready == 1) {
+        bins.bins_destroy(&_node_t_bins);
+        _node_t_ready = 0;
+    }
+    _node_t_active = 0;
+}
 
 // === Node kinds ===
 let is i32 as NK_NUM       with imut = 0;
@@ -234,7 +260,13 @@ fn new_type(kind as i32) as *Type {
 }
 
 fn new_node(kind as i32) as *Node {
-    let is *Node as n = cast(*Node, ast_alloc(sizeof(Node)));
+    let is *Node as n with mut;
+    if (_node_t_active == 1) {
+        if (_node_t_ready == 0) { _node_t_bins = bins.bins_new(131072); _node_t_ready = 1; }
+        n = cast(*Node, bins.bins_alloc(&_node_t_bins, sizeof(Node)));
+    } else {
+        n = cast(*Node, ast_alloc(sizeof(Node)));
+    }
     memzero(cast(*u8, n), sizeof(Node));
     n.kind = kind;
     return n;
