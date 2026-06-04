@@ -330,24 +330,41 @@ fn try_pat3(buf as *u8, i as i32) as i32 {
 
 // ── Main pass ────────────────────────────────────────────────────────
 
+// File entry: read the .s, optimize it in memory, write back if it changed.
 fn optimize_asm(path as *u8) as void {
     let is i64 as fd = io._open_read(path);
     if (fd < 0) { return; }
     let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
     io._lseek(fd, 0, io._SEEK_SET);
     if (size <= 0) { io._close_fd(fd); return; }
-
     let is i64 as buf_size = size + 4096;
     let is *u8 as buf = mem.core.mmap_anon(buf_size);
-    if (cast(i64, buf) <= 0) { return; }
+    if (cast(i64, buf) <= 0) { io._close_fd(fd); return; }
     io._read_fd(fd, buf, size);
     buf[size] = cast(u8, 0);
     io._close_fd(fd);
+    let is i64 as olen with mut = 0;
+    let is *u8 as outp = optimize_asm_buf(buf, size, &olen);
+    if (cast(i64, outp) != cast(i64, buf)) {
+        let is i64 as wfd = io._open_write(path);
+        if (wfd >= 0) { io._write_fd(wfd, outp, olen); io._close_fd(wfd); }
+        mem.core.munmap(outp, olen + 4096);
+    }
+    mem.core.munmap(buf, buf_size);
+}
+
+// In-memory peephole. Returns `buf` unchanged (with *out_len = size) when nothing
+// matched, else a freshly mmap'd buffer (the caller owns it; *out_len is its len).
+// The in-process pipeline calls this on codegen's captured .s so the optimized
+// assembly never round-trips through disk before the assembler reads it.
+fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
+    *out_len = size;
+    if (size <= 0) { return buf; }
 
     let is i64 as max_lines = size / 4 + 1024;
     let is i64 as tbl_size = max_lines * 12 + 131072;
     let is *u8 as tbl = mem.core.mmap_anon(tbl_size);
-    if (cast(i64, tbl) <= 0) { return; }
+    if (cast(i64, tbl) <= 0) { return buf; }
 
     line_offs = tbl;
     line_lens = cast(*u8, cast(i64, tbl) + max_lines * 8);
@@ -360,7 +377,7 @@ fn optimize_asm(path as *u8) as void {
 
     let is i64 as pos with mut = 0;
     while (pos < size) {
-        if (cast(i64, line_count) >= max_lines) { return; }
+        if (cast(i64, line_count) >= max_lines) { mem.core.munmap(tbl, tbl_size); return buf; }
         let is i64 as start = pos;
         while (pos < size && buf[pos] != 10) { pos = pos + 1; }
         set_off(line_count, start);
@@ -394,7 +411,7 @@ fn optimize_asm(path as *u8) as void {
     }
 
     // 8.2: early exit — if no patterns matched, file is already correct
-    if (stat_removed == 0 && stat_fused == 0) { return; }
+    if (stat_removed == 0 && stat_fused == 0) { mem.core.munmap(tbl, tbl_size); return buf; }
 
     // 8.1: buffered write — compute total, write once
     let is i64 as out_total with mut = 0;
@@ -405,7 +422,7 @@ fn optimize_asm(path as *u8) as void {
         li = li + 1;
     }
     let is *u8 as out_buf = mem.core.mmap_anon(out_total + 4096);
-    if (cast(i64, out_buf) <= 0) { return; }
+    if (cast(i64, out_buf) <= 0) { mem.core.munmap(tbl, tbl_size); return buf; }
     let is i64 as out_pos with mut = 0;
     li = 0;
     while (li < line_count) {
@@ -425,10 +442,7 @@ fn optimize_asm(path as *u8) as void {
         }
         li = li + 1;
     }
-    let is i64 as wfd = io._open_write(path);
-    if (wfd >= 0) {
-        io._write_fd(wfd, out_buf, out_pos);
-        io._close_fd(wfd);
-    }
-    mem.core.munmap(out_buf, out_total + 4096);
+    mem.core.munmap(tbl, tbl_size);
+    *out_len = out_pos;
+    return out_buf;
 }

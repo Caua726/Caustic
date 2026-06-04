@@ -201,7 +201,10 @@ fn is_singleton(t as *ast.Type) as i32 {
 
 fn clone_node_deep(n as *ast.Node) as *ast.Node {
     if (cast(i64, n) == 0) { return cast(*ast.Node, 0); }
-    let is *ast.Node as c = cast(*ast.Node, d.sem_alloc(sizeof(ast.Node)));
+    // node_alloc_raw routes to the transient bump arena when instantiate_fn has
+    // set _node_t_active — generic-instance bodies are body nodes (freed after
+    // IR-gen, exact-size) just like parsed bodies, not persistent slab allocs.
+    let is *ast.Node as c = ast.node_alloc_raw();
     mem.memcpy(cast(*u8, c), cast(*u8, n), sizeof(ast.Node));
     c.next = cast(*ast.Node, 0);
     // Clear semantic fields
@@ -496,11 +499,17 @@ fn instantiate_fn(tmpl as *d.GenericTemplate, concrete_args as *u8, count as i32
     if (is_instantiated(mangled_ptr, mangled_len) == 1) { return cast(*ast.Node, 0); }
     mark_instantiated(mangled_ptr, mangled_len);
 
-    // Clone template AST
+    // Clone + specialize the template into the TRANSIENT body arena: an instance
+    // is a function body with the same lifecycle as a parsed body (read during
+    // IR-gen, dead after — codegen reads the IR, not the AST, on non-PE). This
+    // gives exact-size bump allocation instead of the slab's 384B class and lets
+    // destroy_transient_nodes reclaim instances after IR-gen. instantiate_fn runs
+    // post-parse so the flag is off on entry; the window has no early return.
+    ast.node_transient_begin();
     let is *ast.Node as fn_clone = clone_node_deep(cast(*ast.Node, tmpl.ast));
-
     // Substitute type params
     substitute_in_node(fn_clone, tmpl.params, concrete_args, count);
+    ast.node_transient_end();
 
     // Rename function
     fn_clone.name_ptr = d.str_dup(mangled_ptr, mangled_len);

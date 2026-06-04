@@ -106,6 +106,7 @@ fn memmove(dst as *u8, src as *u8, n as i64) as *u8 {
 // --- mmap/munmap wrappers ---
 
 fn mmap_anon(size as i64) as *u8 {
+    _mem_guard(size);
     if (os.current() == os.OS_LINUX)   { return mem_linux.page_alloc(size); }
     if (os.current() == os.OS_WINDOWS) { return mem_windows.page_alloc(size); }
     if (os.current() == os.OS_CAUSTIC) { return mem_caustic.page_alloc(size); }
@@ -124,6 +125,7 @@ fn munmap(ptr as *u8, size as i64) as void {
 // commit is a no-op. On CausticOS (strict, no demand paging) reserve claims VA
 // only and commit explicitly backs each chunk. munmap releases either.
 fn reserve_anon(size as i64) as *u8 {
+    _mem_guard(0);   // re-check real RSS; reserved VA isn't resident yet, so don't count it
     if (os.current() == os.OS_LINUX)   { return mem_linux.page_alloc(size); }    // mmap is lazy
     if (os.current() == os.OS_WINDOWS) { return mem_windows.page_alloc(size); }
     if (os.current() == os.OS_CAUSTIC) { return mem_caustic.reserve(size); }
@@ -133,6 +135,60 @@ fn reserve_anon(size as i64) as *u8 {
 fn commit_anon(ptr as *u8, size as i64) as i32 {
     if (os.current() == os.OS_CAUSTIC) { return mem_caustic.commit(ptr, size); }
     return cast(i32, 0);   // Linux/Windows: reserve already backed it (lazily)
+}
+
+// --- Memory limit (--max-ram) ---
+// Hard cap on the compiler's memory use, enforced at allocation-growth points
+// (mmap_anon / reserve_anon). On Linux the check reads the process's TRUE
+// resident set size from /proc/self/statm, so the cap measures real RAM — not
+// the large but lazily-paged virtual reservations (e.g. the IR instruction
+// pool). On other targets it falls back to a running count of bytes handed out
+// by mmap_anon. 0 = unlimited (the default; the guard then no-ops).
+let is i64 as _mem_limit   with mut = 0;   // bytes; 0 = unlimited
+let is i64 as _mem_counted with mut = 0;   // fallback byte counter (non-Linux)
+
+fn set_mem_limit(bytes as i64) as void { _mem_limit = bytes; }
+
+fn _mem_rss() as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as fd = io_linux.open_read("/proc/self/statm");
+        if (fd < 0) { return _mem_counted; }
+        let is [128]u8 as sbuf;
+        let is i64 as n = io_linux.read(fd, &sbuf, 128);
+        io_linux.close(fd);
+        if (n <= 0) { return _mem_counted; }
+        // "size resident shared text lib data dt" — resident is field 1 (pages).
+        let is i64 as i with mut = 0;
+        while (i < n && sbuf[i] != 32) { i = i + 1; }   // skip field 0 (size)
+        while (i < n && sbuf[i] == 32) { i = i + 1; }   // skip the space(s)
+        let is i64 as pages with mut = 0;
+        while (i < n && sbuf[i] >= 48 && sbuf[i] <= 57) {
+            pages = pages * 10 + (cast(i64, sbuf[i]) - 48);
+            i = i + 1;
+        }
+        return pages * 4096;
+    }
+    return _mem_counted;
+}
+
+fn _mem_abort(used as i64) as void {
+    write_str(2, "error: --max-ram limit exceeded (");
+    write_int(2, _mem_limit / 1048576);
+    write_str(2, " MB cap, ");
+    write_int(2, used / 1048576);
+    write_str(2, " MB resident)\n");
+    if (os.current() == os.OS_LINUX)   { os.linux.exit(1); }
+    if (os.current() == os.OS_WINDOWS) { os.windows.ExitProcess(cast(u32, 1)); }
+    if (os.current() == os.OS_CAUSTIC) { os.caustic.exit(1); }
+}
+
+// Call before backing more memory. `extra` is added to the non-Linux fallback
+// counter; on Linux the real RSS is read instead. Aborts if over the cap.
+fn _mem_guard(extra as i64) as void {
+    if (_mem_limit <= 0) { return; }
+    _mem_counted = _mem_counted + extra;
+    let is i64 as used = _mem_rss();
+    if (used > _mem_limit) { _mem_abort(used); }
 }
 
 // --- Bitmap helpers ---

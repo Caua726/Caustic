@@ -82,22 +82,28 @@ let is f64 as x = 3.14;    // stays f64
 let is f32 as y = 2.5;     // 2.5 narrows from f64 to f32
 ```
 
-## No Implicit Conversions
+## Implicit Conversions
 
-Beyond literal narrowing, Caustic performs no implicit type conversions. All of the following require explicit `cast()`:
+Beyond literal narrowing, Caustic allows a small, fixed set of implicit conversions:
+
+- **Same-signedness integer widening** (e.g. `i32` -> `i64`, `u16` -> `u64`).
+- **Function pointer <-> `*u8`** (both are 8-byte addresses).
+
+Everything else requires an explicit `cast()`:
 
 - Integer to float (or float to integer)
-- Signed to unsigned (or vice versa)
-- Between different pointer types
+- Signed to unsigned, or vice versa — even when widening
 - Integer to pointer (or pointer to integer)
-- Between differently-sized integers when the source is not a literal
+- Narrowing a non-literal to a smaller integer
 
 ```cst
 let is i32 as x = 10;
-let is i64 as y = cast(i64, x);     // explicit cast required
-let is f64 as z = cast(f64, x);     // explicit cast required
-let is u32 as w = cast(u32, x);     // explicit cast required
+let is i64 as y = x;                // OK: same-sign widening, no cast
+let is f64 as z = cast(f64, x);     // explicit cast required (int -> float)
+let is u32 as w = cast(u32, x);     // explicit cast required (sign change)
 ```
+
+> Different pointer types (`*T` -> `*U`) are currently accepted implicitly as well — a known, temporary loosening; see [Type Compatibility › Pointer Compatibility](../type-system/type-compatibility.md#pointer-compatibility).
 
 ## Limitations
 
