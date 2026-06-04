@@ -62,7 +62,9 @@ Serialize the generated IR to an `.ir` binary cache file.
 
 ### `--max-ram <MB>`
 
-Limit heap memory in megabytes. The compiler normally sizes its heap based on source file complexity. Use `0` for unlimited (default).
+Abort the compile if the process would use more than `<MB>` megabytes of memory, instead of growing unbounded and risking an OOM kill — useful on memory-constrained machines. `0` (the default) means no limit.
+
+On Linux the cap is checked against the process's true resident set size (read from `/proc/self/statm`) at each allocation-growth point, so it measures real RAM rather than lazily-mapped virtual address space. On other targets it falls back to counting bytes handed out by the page allocator. When the limit is hit the compiler prints `error: --max-ram limit exceeded (...)` and exits non-zero.
 
 ### `--path <dir>`
 
