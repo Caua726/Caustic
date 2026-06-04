@@ -1,6 +1,6 @@
 # Type Compatibility
 
-Type compatibility determines which types can be used interchangeably and which require explicit conversion. Caustic has a strict type system with very few implicit conversions.
+Type compatibility determines which types can be used interchangeably and which require explicit conversion. Caustic has a strict type system with a small, fixed set of implicit conversions: literal narrowing, same-signedness integer widening, and function-pointer/`*u8` interchange. Everything else requires an explicit `cast`.
 
 ## Type Identity: Pointer Equality
 
@@ -22,12 +22,12 @@ This is an internal compiler invariant. All code that constructs or substitutes 
 
 ## Exact Match
 
-Within the same type kind, compatibility requires the same size. No implicit conversions occur between different primitive types, even when one could hold all values of the other:
+Within the same type kind, sizes must match — with one exception: same-signedness **widening** is implicit (see [Implicit Integer Widening](#implicit-integer-widening) below). A sign change always requires an explicit `cast`:
 
 ```cst
 let is i32 as a = 10;
-let is i64 as b = cast(i64, a);   // explicit cast required
-let is u32 as c = cast(u32, a);   // explicit cast required
+let is i64 as b = a;              // OK: i32 widens to i64 implicitly
+let is u32 as c = cast(u32, a);  // cast required: i32 -> u32 is a sign change
 ```
 
 ## Integer Literal Narrowing
@@ -65,15 +65,27 @@ let is f32 as x = 2.5;   // f64 literal narrows to f32
 
 No implicit narrowing occurs for float variables (`cast` is required for `f64` to `f32` when using variables).
 
-## No Implicit Integer Widening
+## Implicit Integer Widening
 
-There is no implicit widening in Caustic. An `i32` variable cannot be assigned to an `i64` variable without an explicit cast, even though every `i32` value fits in `i64`:
+An integer value implicitly widens to a **larger** integer of the **same signedness** — no cast needed — in initializers, assignments, and return values:
 
 ```cst
 let is i32 as small = 10;
-// let is i64 as big = small;    // ERROR
-let is i64 as big = cast(i64, small);  // OK
+let is i64 as big = small;        // OK: i32 -> i64 (same sign)
+let is u16 as a = 7;
+let is u64 as b = a;              // OK: u16 -> u64 (same sign)
 ```
+
+Two related conversions still require an explicit `cast`:
+
+```cst
+let is i64 as big = 1;
+let is i32 as x = cast(i32, big);   // narrowing (larger -> smaller) of a non-literal
+let is i32 as s = 1;
+let is u64 as u = cast(u64, s);     // sign change (signed -> unsigned), even when widening
+```
+
+> **Known limitation.** Non-literal **call arguments** are currently *not* type-checked against the parameter type (only literal arguments are validated and narrowed). A mismatched non-literal argument is accepted silently rather than widened or rejected. Pass the right type, or `cast` explicitly, at call sites.
 
 ## No Implicit Float/Integer Conversion
 
@@ -86,17 +98,25 @@ let is i32 as i = cast(i32, some_f64);
 
 ## Pointer Compatibility
 
-A pointer type `*T` is compatible only with another `*T` of the same base type. Different pointer types require an explicit cast:
+> **Known limitation.** The compiler currently accepts an implicit conversion between **any** two pointer types (`*T` → `*U`) with no cast and no error. This is a deliberate, temporary loosening: the strict same-base-type check was reverted because it rejected valid self-referential struct fields (e.g. `next as *Node` inside `struct Node`) during the compiler's own bootstrap. It is intended to be re-tightened once named-type identity is tracked through the type hash table.
+
+Until then, pointer assignments are **not** checked by base type. Still write `cast(*U, p)` at deliberate reinterpretations — it documents intent and will keep compiling once the check is restored:
 
 ```cst
 let is *i32 as a = &x;
-// let is *u8  as b = a;      // ERROR: *i32 is not *u8
-let is *u8  as b = cast(*u8, a);   // OK
+let is *u8  as b = a;             // currently accepted (no error) — see note above
+let is *u8  as b = cast(*u8, a);  // preferred: explicit and future-proof
 ```
 
-Multi-level pointers follow the same rule: `**i32` is not compatible with `**u8`.
-
 There is no `*void` in Caustic. Use `*u8` as a generic raw pointer type, which is the convention used throughout the standard library.
+
+## Function Pointers and `*u8`
+
+A typed function pointer and a raw `*u8` are interchangeable without a cast — both are 8-byte addresses at runtime. This lets `fn_ptr(...)` results be stored in, passed as, and returned as `*u8`, which is the idiom used throughout the standard library:
+
+```cst
+let is *u8 as cb = fn_ptr(my_func);   // function pointer stored as *u8, no cast
+```
 
 ## Array Type Compatibility
 
@@ -170,13 +190,18 @@ Struct-to-struct casts are not supported through `cast`. Reinterpret a struct vi
 
 ## Compatibility Summary
 
-| Conversion                  | Implicit | Literal only | Requires cast |
-|-----------------------------|----------|-------------|---------------|
-| Same type                   | Yes      | -           | -             |
-| i64 literal -> narrower int | -        | Yes         | -             |
-| f64 literal -> f32          | -        | Yes         | -             |
-| i32 variable -> i64         | No       | -           | Yes           |
-| int -> float (any)          | No       | -           | Yes           |
-| float -> int (any)          | No       | -           | Yes           |
-| *T -> *U (different T, U)   | No       | -           | Yes           |
-| StructA -> StructB          | No       | -           | Not supported |
+| Conversion                    | Implicit | Literal only | Requires cast |
+|-------------------------------|----------|-------------|---------------|
+| Same type                     | Yes      | -           | -             |
+| i64 literal -> narrower int   | -        | Yes         | -             |
+| f64 literal -> f32            | -        | Yes         | -             |
+| int -> larger int, same sign  | Yes      | -           | -             |
+| int -> int, sign change       | No       | -           | Yes           |
+| larger int -> smaller (var)   | No       | -           | Yes           |
+| int -> float (any)            | No       | -           | Yes           |
+| float -> int (any)            | No       | -           | Yes           |
+| function pointer <-> *u8      | Yes      | -           | -             |
+| *T -> *U (different T, U)     | Yes¹     | -           | recommended   |
+| StructA -> StructB            | No       | -           | Not supported |
+
+¹ Currently accepted implicitly — a known, temporary loosening; see [Pointer Compatibility](#pointer-compatibility).

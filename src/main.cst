@@ -109,61 +109,6 @@ fn parse_int_arg(s as *u8) as i64 {
     return val;
 }
 
-// ── Source size estimation ─────────────────────────────────────────
-
-fn estimate_source_size(filename as *u8, fname_len as i32) as i64 {
-    let is i64 as fsize = read_file_size(filename);
-    if (fsize <= 0) { return fsize; }
-    let is i64 as fd = io._open_read(filename);
-    if (fd < 0) { return fsize; }
-    let is *u8 as buf = mem.core.mmap_anon(fsize);
-    if (cast(i64, buf) <= 0) { io._close_fd(fd); return fsize; }
-    io._read_fd(fd, buf, fsize);
-    io._close_fd(fd);
-
-    let is i64 as total with mut = fsize;
-    let is i32 as dir_len = get_dir_len(filename, fname_len);
-
-    let is i64 as i with mut = 0;
-    while (i < fsize - 5) {
-        if (buf[i] == 117 && buf[i + 1] == 115 && buf[i + 2] == 101 && buf[i + 3] == 32 && buf[i + 4] == 34) {
-            let is i64 as start = i + 5;
-            let is i64 as end with mut = start;
-            while (end < fsize && buf[end] != 34) { end = end + 1; }
-            let is i32 as path_len = cast(i32, end - start);
-            if (path_len > 0 && dir_len + 1 + path_len < 1023) {
-                let is [1024]u8 as resolved;
-                let is i32 as rlen with mut = 0;
-                if (dir_len > 0) {
-                    let is i32 as di with mut = 0;
-                    while (di < dir_len) {
-                        resolved[rlen] = filename[di];
-                        rlen = rlen + 1;
-                        di = di + 1;
-                    }
-                    resolved[rlen] = 47;
-                    rlen = rlen + 1;
-                }
-                let is i32 as pi with mut = 0;
-                while (pi < path_len) {
-                    resolved[rlen] = buf[start + cast(i64, pi)];
-                    rlen = rlen + 1;
-                    pi = pi + 1;
-                }
-                resolved[rlen] = cast(u8, 0);
-                let is i64 as imp_size = read_file_size(&resolved);
-                if (imp_size > 0) { total = total + imp_size; }
-            }
-            i = end + 1;
-        } else {
-            i = i + 1;
-        }
-    }
-
-    mem.core.munmap(buf, fsize);
-    return total * 5;
-}
-
 
 fn resolve_stdlib_dir() as void {
     let is [4096]u8 as buf;
@@ -193,16 +138,6 @@ fn resolve_stdlib_dir() as void {
     } else {
         sem.set_stdlib_dir("/usr/local/lib/caustic", 22);
     }
-}
-
-fn calc_heap_size(filename as *u8, max_ram as i64) as i64 {
-    let is i32 as flen with mut = 0;
-    while (filename[flen] != cast(u8, 0)) { flen = flen + 1; }
-    let is i64 as est_size = estimate_source_size(filename, flen);
-    let is i64 as heap_size with mut = est_size * 300 + 33554432;
-    if (heap_size < 67108864) { heap_size = 67108864; }
-    if (max_ram > 0 && heap_size > max_ram) { heap_size = max_ram; }
-    return heap_size;
 }
 
 fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len as i32) as *u8 {
@@ -250,6 +185,8 @@ let is i64 as g_module_objects_dir with mut = 0;
 // cache (the real speedup) is unaffected. Re-enable once the round-trip is
 // faithful and CACHE_VERSION is bumped.
 let is i32 as IR_CACHE_ENABLED with imut = 0;
+// --max-ram <MB>: hard cap on resident memory (0 = unlimited). Wired into the
+// core page allocator via mem.core.set_mem_limit once arg parsing finishes.
 let is i64 as g_max_ram with mut = 0;
 let is [32]i64 as g_lib_names with mut;
 let is i32 as g_lib_count with mut = 0;
@@ -257,6 +194,11 @@ let is i32 as g_opt_level with mut = 0;
 let is i32 as g_debug_ir with mut = 0;
 let is i32 as g_debug_parser with mut = 0;
 let is i32 as g_quiet with mut = 0;
+// Write the .s to disk as a debug cache after the in-process pipeline assembles
+// it from memory (default on). --no-asm-cache skips the write — the .s isn't
+// needed downstream (the assembler already consumed the in-memory copy), so
+// skipping it removes the single biggest write of the build, a win on slow disks.
+let is i32 as g_asm_cache with mut = 1;
 let is [16]i64 as g_extra_paths with mut;
 let is i32 as g_extra_path_count with mut = 0;
 
@@ -355,6 +297,8 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
             }
         } else if (str_eq(arg, arglen, "-q", 2) == 1 || str_eq(arg, arglen, "--quiet", 7) == 1) {
             g_quiet = 1;
+        } else if (str_eq(arg, arglen, "--no-asm-cache", 14) == 1) {
+            g_asm_cache = 0;
         } else if (str_eq(arg, arglen, "-debuglexer", 11) == 1) {
             // pass through
         } else if (str_eq(arg, arglen, "-debugparser", 12) == 1) {
@@ -445,6 +389,7 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         io.write_str(io.STDERR, "Error: no input file\n");
         return 1;
     }
+    mem.core.set_mem_limit(g_max_ram);
     return 0;
 }
 
@@ -690,6 +635,12 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         ircw.write_ir_cache(ir_cpath, cast(*u8, prog), cache_hash);
     }
 
+    // Function bodies are now fully lowered to IR; codegen reads the IR, not the
+    // body AST (the inliner no longer regenerates IR from the AST). Release the
+    // transient body-node arena — the bulk of the AST — before codegen. PE builds
+    // walk the body AST for .cstlocals debug info, so skip the release there.
+    if (tgt.target_get().object_format != 2) { ast.destroy_transient_nodes(); }
+
     *prog_out = cast(i64, prog);
     return 0;
 }
@@ -701,49 +652,74 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     if (prof.prof_enabled == 1) { cg.cg_prof_init(4096); }
     let is i64 as t4 = get_time_us();
     let is i32 as asm_len = fname_len + 2;
-    let is *u8 as asm_path = ird.opt_alloc(cast(i64, asm_len) + 1);
+    let is [4096]u8 as asm_buf;                  // stack: survives the opt_bins reset below
+    let is *u8 as asm_path = cast(*u8, &asm_buf);
     mem.memcpy(asm_path, filename, cast(i64, fname_len));
     asm_path[fname_len] = 46;
     asm_path[fname_len + 1] = 115;
     asm_path[fname_len + 2] = cast(u8, 0);
 
-    let is i64 as out_fd = io._open_write(asm_path);
-    if (out_fd < 0) {
-        io.write_str(io.STDERR, "Error: cannot open output file\n");
-        return 1;
-    }
     cgd.set_opt_level(g_opt_level);
     cg.cg_quiet = g_quiet;
-    cgd.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
-    io._close_fd(out_fd);
+    // In-memory pipeline: codegen captures the assembly into a buffer (fd = -1 =
+    // no .s file write during codegen); we peephole-optimize it in memory and feed
+    // it straight to the assembler — eliminating the .s write + optimize read/write
+    // + assembler read round-trips through disk. The .s and .o are still written
+    // (below / by the assembler) as a cache: debugging + the incremental build's
+    // hash-keyed .o cache.
+    cg.capture_begin();
+    cgd.codegen(cast(*u8, prog), cast(i32, 0 - 1), filename, fname_len);
+    cg.capture_end();
     ird.ir_alloc_destroy();
-    if (g_opt_level >= 1) { ph.optimize_asm(asm_path); }
-    prof.prof_record("codegen", get_time_us() - t4);
-    if (prof.prof_enabled == 1) { prof.prof_asm_bytes = read_file_size(asm_path); }
 
+    // Free the frontend's AST/semantic arena before the assembler runs (big RSS
+    // cut). The captured assembly is mmap'd separately, so it survives. Single-unit
+    // only — multi-file reuses module ASTs across later units.
+    if (g_file_count == 1) { ird.opt_bins_destroy(); }
+
+    let is *u8 as s_ptr = cg.capture_ptr();
+    let is i64 as s_len with mut = cg.capture_len();
+    let is *u8 as opt_ptr with mut = s_ptr;
+    if (g_opt_level >= 1) {
+        let is i64 as olen with mut = 0;
+        opt_ptr = ph.optimize_asm_buf(s_ptr, s_len, &olen);
+        s_len = olen;
+    }
+
+    // Write the (optimized) .s to disk as a cache (kept, not unlinked) unless
+    // --no-asm-cache asked to skip it (the assembler already has it in memory).
+    if (g_asm_cache == 1) {
+        let is i64 as sfd = io._open_write(asm_path);
+        if (sfd >= 0) { io._write_fd(sfd, opt_ptr, s_len); io._close_fd(sfd); }
+    }
+    prof.prof_record("codegen", get_time_us() - t4);
+    if (prof.prof_enabled == 1) { prof.prof_asm_bytes = s_len; }
     if (prof.prof_enabled == 1 && cg.cg_prof_count > 0) {
         prof.prof_print_top_funcs();
     }
 
-    // Build obj path: asm_path + ".o"
+    // Build obj path: asm_path + ".o" (stack — survives any arena reset)
     let is i32 as obj_len = asm_len + 2;
-    let is *u8 as obj_path = ird.opt_alloc(cast(i64, obj_len) + 1);
+    let is [4096]u8 as obj_buf;
+    let is *u8 as obj_path = cast(*u8, &obj_buf);
     mem.memcpy(obj_path, asm_path, cast(i64, asm_len));
     obj_path[asm_len] = 46;
     obj_path[asm_len + 1] = 111;
     obj_path[asm_len + 2] = cast(u8, 0);
 
-    // Assemble
+    // Assemble straight from the in-memory assembly (no .s read-back).
     if (prof.prof_enabled == 1) { asmmod.asm_prof_enabled = 1; }
     let is i64 as t5 = get_time_us();
-    let is i32 as asm_err = asmmod.assemble_file(asm_path, obj_path);
+    let is i32 as asm_err = asmmod.assemble_buf(opt_ptr, s_len, obj_path);
+    if (cast(i64, opt_ptr) != cast(i64, s_ptr)) { mem.core.munmap(opt_ptr, s_len + 4096); }
+    cg.capture_free();
     if (asm_err != 0) {
         io.write_str(io.STDERR, "Error: assembly failed\n");
         return 1;
     }
     prof.prof_record("assembler", get_time_us() - t5);
     if (prof.prof_enabled == 1) { prof.prof_obj_bytes = read_file_size(obj_path); }
-    io.unlink(asm_path);
+    // .s is kept on disk as a cache (no longer unlinked).
 
     // Copy obj_path to stack buffer
     let is i32 as oi with mut = 0;

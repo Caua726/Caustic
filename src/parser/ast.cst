@@ -1,7 +1,40 @@
 use "../../std/mem.cst" as mem;
+use "../../std/mem/bins.cst" as bins;
+use "../../std/mem/arena.cst" as arena;
 use "../ir/opt_mem.cst" as om;
 
 fn ast_alloc(size as i64) as *u8 { return om.opt_alloc(size); }
+
+// Transient node arena: function-body AST nodes (statements/expressions) are
+// dead once their IR has been generated — codegen works from IR, and at -O1 the
+// IR is now kept resident through codegen rather than freed+regenerated, so the
+// body AST is never re-read. While `_node_t_active` is set (during function-body
+// parsing) new_node bump-allocates from a SEPARATE arena that
+// destroy_transient_nodes() releases WHOLESALE after IR-gen, reclaiming the bulk
+// of the AST. A BUMP allocator (not the bins slab) is the right tool here: the
+// nodes are freed all at once, and bump hands out each node at its exact
+// 8-aligned size — the bins slab would round every node up to its 384-byte size
+// class, wasting ~100B/node (×~250K nodes = ~25MB). The region is mmap'd lazily
+// (RSS = nodes actually written); if it ever fills, new_node falls back to the
+// growable opt_bins arena (correct, just not bulk-freed). Types (new_type) and
+// everything outside a function body (globals, decls, params) stay in opt_bins
+// and survive — codegen still needs them. Destroy is skipped on PE builds, which
+// walk the body AST for .cstlocals debug info.
+let is arena.Arena as _node_t_arena with mut;
+let is i32 as _node_t_ready with mut = 0;
+let is i32 as _node_t_active with mut = 0;
+let is i64 as _NODE_ARENA_SIZE with imut = 268435456;   // 256MB, lazily mapped
+
+fn node_transient_begin() as void { _node_t_active = 1; }
+fn node_transient_end() as void { _node_t_active = 0; }
+
+fn destroy_transient_nodes() as void {
+    if (_node_t_ready == 1) {
+        arena.destroy(&_node_t_arena);
+        _node_t_ready = 0;
+    }
+    _node_t_active = 0;
+}
 
 // === Node kinds ===
 let is i32 as NK_NUM       with imut = 0;
@@ -112,6 +145,13 @@ struct Type {
 
 // === Node struct ===
 struct Node {
+    // Low-cardinality fields are narrowed (i32->i16/i8) to shrink the node: at
+    // ~249K live nodes in the self-host build, every byte trimmed is ~0.25MB off
+    // the AST. Storage only — reads widen back to i32 and the AST cache
+    // (cache_read/write) serializes by VALUE (write_i32) so the format is
+    // unchanged. Fields that can legitimately hold large values
+    // (name_len: string-literal bytes; tok_idx; var_offset; stack_size; val)
+    // stay i32/i64.
     kind as i32;
     next as *Node;
     ty as *Type;
@@ -128,23 +168,23 @@ struct Node {
     name_ptr as *u8;
     name_len as i32;
     member_ptr as *u8;
-    member_len as i32;
+    member_len as i16;
     return_type as *Type;
-    flags as i32;
+    flags as i8;              // VF_NONE/MUT/IMUT (0-2)
     // function
     body as *Node;
     params as *Node;
-    is_variadic as i32;
-    is_extern as i32;
+    is_variadic as i8;
+    is_extern as i8;
     impl_ptr as *u8;
-    impl_len as i32;
+    impl_len as i16;
     // call
     args as *Node;
     // generics (packed arrays)
     generic_params as *u8;
-    generic_param_count as i32;
+    generic_param_count as i16;
     generic_args as *u8;
-    generic_arg_count as i32;
+    generic_arg_count as i16;
     // block
     stmts as *Node;
     // control flow (shared: if/while/for/do_while/match)
@@ -157,29 +197,29 @@ struct Node {
     match_type as *Type;
     cases as *Node;
     // enum literal
-    discriminant as i32;
+    discriminant as i16;
     payload_args as *Node;
     // semantic phase
     var_offset as i32;
     stack_size as i32;
-    is_global as i32;
-    is_string_const as i32;
+    is_global as i8;
+    is_string_const as i8;
     asm_name_ptr as *u8;
-    asm_name_len as i32;
+    asm_name_len as i16;
     // only filter for use statements
     only_names as *u8;
-    only_count as i32;
+    only_count as i16;
     // section attribute: with section(".name")
     section_ptr as *u8;
-    section_len as i32;
+    section_len as i16;
     // `with imut` on functions: pure, deterministic, evaluable at parse-time
     // when called with all-literal args. Layer 2 comptime.
-    is_imut as i32;
+    is_imut as i8;
     // 1 if this NK_FN is a generic INSTANCE (clone appended to the root chain by
     // instantiate_fn) rather than a source declaration. Such instances are a
     // module's internal codegen (emitted into its own .o), NOT part of its
     // interface — write_csti truncates them out so .csti images stay small.
-    is_ginst as i32;
+    is_ginst as i8;
 }
 
 // === Bitcast helper: f64 <-> i64 via stack buffer ===
@@ -233,8 +273,23 @@ fn new_type(kind as i32) as *Type {
     return t;
 }
 
+// Raw Node allocation (uninitialized): from the transient bump arena while
+// `_node_t_active` is set (function-body parsing AND generic-instance cloning —
+// both are body nodes freed wholesale after IR-gen), else from opt_bins. Callers
+// that overwrite the whole node (clone via memcpy) use this directly; new_node
+// zeroes + sets kind on top.
+fn node_alloc_raw() as *Node {
+    if (_node_t_active == 1) {
+        if (_node_t_ready == 0) { _node_t_arena = arena.create(_NODE_ARENA_SIZE); _node_t_ready = 1; }
+        let is *u8 as p = arena.alloc(&_node_t_arena, sizeof(Node));
+        if (cast(i64, p) != 0) { return cast(*Node, p); }
+        // arena full: fall back to the growable opt_bins
+    }
+    return cast(*Node, ast_alloc(sizeof(Node)));
+}
+
 fn new_node(kind as i32) as *Node {
-    let is *Node as n = cast(*Node, ast_alloc(sizeof(Node)));
+    let is *Node as n = node_alloc_raw();
     memzero(cast(*u8, n), sizeof(Node));
     n.kind = kind;
     return n;
