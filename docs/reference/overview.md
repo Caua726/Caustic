@@ -102,7 +102,7 @@ The compiler (`caustic`) transforms `.cst` source through six sequential phases:
 Orchestrates the full pipeline:
 
 1. Parses CLI arguments (16 flags: `-c`, `-o`, `-O0`/`-O1`, `--profile`, `--cache`, `--max-ram`, `--path`, `-l<lib>`, `--emit-*`, `-debug*`)
-2. Estimates heap size from source + imports, initializes heap via `mem.gheapinit()`
+2. Initializes the standard-library allocators on demand — each pool `mmap`s lazily as it grows (no single upfront heap to size); `--max-ram` sets a hard resident-memory ceiling
 3. For each input file: lex → parse → semantic → IR → optimize (-O1) → codegen → assemble (in-process via caustic-as)
 4. If `-o` specified: link all objects into final executable (in-process via caustic-ld)
 5. Supports caching (token/AST/IR) via `--cache` for fast rebuilds
