@@ -1,6 +1,7 @@
 use "../../std/mem.cst" as mem;
 use "defs.cst" as d;
 use "../../std/io.cst" as io;
+use "../ir/opt_mem.cst" as om;
 
 // === Global state ===
 let is *d.Module as module_list with mut;
@@ -56,6 +57,29 @@ fn modules_init() as void {
     last_loaded_tl = cast(*u8, 0);
     last_loaded_filename = cast(*u8, 0);
     _dep_count = 0;
+}
+
+// Free every imported module's token array after semantic analysis. The tokens
+// are only needed during parse + semantic; IR-gen never reads them (g.ir_tl is 0
+// throughout gen_ir — confirmed) and the root module's own tokens live in a
+// separate stack local, not in module_list. Each Module.token_list points at a
+// TokenList whose .data (the big tok_alloc'd array, on opt_alloc's mmap path) is
+// at offset 0; freeing it munmaps real resident pages. A cached re-import makes
+// two Module records share one TokenList, so we null .data after freeing to make
+// the second sweep a no-op (avoids a double-munmap). "Allocate only what we use":
+// stop carrying ~50 modules' token arrays resident through codegen.
+fn free_module_tokens() as void {
+    let is *d.Module as m with mut = module_list;
+    while (cast(i64, m) != 0) {
+        if (cast(i64, m.token_list) != 0) {
+            let is *i64 as datap = cast(*i64, m.token_list);  // TokenList.data @ offset 0
+            if (*datap != 0) {
+                om.opt_free(cast(*u8, *datap));
+                *datap = 0;
+            }
+        }
+        m = m.next;
+    }
 }
 
 fn set_load_module(fp as *u8) as void {
