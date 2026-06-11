@@ -155,6 +155,21 @@ struct Type {
     base_name_len as i32;
 }
 
+// Side-struct for rare declaration-only Node fields. Only NK_FN / NK_USE / impl
+// / sectioned-decl nodes ever set these; the ~184K function-body expr/stmt nodes
+// leave Node.extra null and so carry 8B instead of these 32B. Lazily allocated
+// (node_ensure_extra) in opt_bins, where the decl nodes that own it also live.
+struct Node_Extra {
+    impl_ptr as *u8;          // extern/impl method DLL or type name
+    impl_len as i16;
+    only_names as *u8;        // `use ... only a, b`
+    only_count as i16;
+    section_ptr as *u8;       // `with section(".name")`
+    section_len as i16;
+    is_imut as i8;            // `with imut` function
+    is_ginst as i8;           // NK_FN that is a generic instance clone
+}
+
 // === Node struct ===
 struct Node {
     // Low-cardinality fields are narrowed (i32->i16/i8) to shrink the node: at
@@ -188,8 +203,6 @@ struct Node {
     params as *Node;
     is_variadic as i8;
     is_extern as i8;
-    impl_ptr as *u8;
-    impl_len as i16;
     // call
     args as *Node;
     // generics (packed arrays)
@@ -218,20 +231,11 @@ struct Node {
     is_string_const as i8;
     asm_name_ptr as *u8;
     asm_name_len as i16;
-    // only filter for use statements
-    only_names as *u8;
-    only_count as i16;
-    // section attribute: with section(".name")
-    section_ptr as *u8;
-    section_len as i16;
-    // `with imut` on functions: pure, deterministic, evaluable at parse-time
-    // when called with all-literal args. Layer 2 comptime.
-    is_imut as i8;
-    // 1 if this NK_FN is a generic INSTANCE (clone appended to the root chain by
-    // instantiate_fn) rather than a source declaration. Such instances are a
-    // module's internal codegen (emitted into its own .o), NOT part of its
-    // interface — write_csti truncates them out so .csti images stay small.
-    is_ginst as i8;
+    // Rare declaration-only fields (impl/extern name, `use only`, `with section`,
+    // `with imut`, generic-instance flag) moved to a lazily-allocated side-struct
+    // so body nodes don't carry 32B of dead fields. Use the ast.nx_* getters
+    // (null-safe, default 0) and node_ensure_extra() before a set.
+    extra as *Node_Extra;
 }
 
 // === Bitcast helper: f64 <-> i64 via stack buffer ===
@@ -319,6 +323,27 @@ fn new_node(kind as i32) as *Node {
     n.kind = kind;
     return n;
 }
+
+// --- Node_Extra accessors ---
+// Lazily allocate the side-struct (in opt_bins; decl nodes that own it survive
+// through codegen). Setters do `node_ensure_extra(n).field = v`; getters are
+// null-safe and return the zero default body nodes would have had inline.
+fn node_ensure_extra(n as *Node) as *Node_Extra {
+    if (cast(i64, n.extra) == 0) {
+        let is *Node_Extra as e = cast(*Node_Extra, ast_alloc(sizeof(Node_Extra)));
+        memzero(cast(*u8, e), sizeof(Node_Extra));
+        n.extra = e;
+    }
+    return n.extra;
+}
+fn nx_impl_ptr(n as *Node) as *u8    { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.impl_ptr; }
+fn nx_impl_len(n as *Node) as i32    { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.impl_len); }
+fn nx_only_names(n as *Node) as *u8  { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.only_names; }
+fn nx_only_count(n as *Node) as i32  { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.only_count); }
+fn nx_section_ptr(n as *Node) as *u8 { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.section_ptr; }
+fn nx_section_len(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.section_len); }
+fn nx_is_imut(n as *Node) as i32     { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.is_imut); }
+fn nx_is_ginst(n as *Node) as i32    { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.is_ginst); }
 
 fn make_type_sized(kind as i32, size as i32) as *Type {
     let is *Type as t = new_type(kind);
