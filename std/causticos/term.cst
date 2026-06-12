@@ -40,7 +40,20 @@ struct Term {
     d_y1   as i64;        // commit/present.
     grid   as i64;        // *i64 cell array (0 = no grid attached)
     grid_stride as i64;   // cells per grid row (fixed at attach)
-    grid_rows   as i64;   // grid row capacity
+    grid_rows   as i64;   // grid row capacity (a RING of lines)
+    live_top as i64;      // physical grid row of the first LIVE visible line
+    hist_count as i64;    // valid history lines above the live view
+    view_off as i64;      // 0 = live; >0 = scrolled back this many lines
+}
+
+// The grid is a ring of grid_rows text lines. The live view occupies
+// physical rows live_top..live_top+rows-1 (mod grid_rows); scrolling
+// advances live_top and the line that falls off the top BECOMES history
+// (up to grid_rows - rows lines of it). view_off slides the visible
+// window up into that history; any output snaps it back to live.
+fn _phys_row(t as *Term, r as i64) as i64 {
+    let is i64 as p = t.live_top + t.grid_rows - t.view_off + r;
+    return p - (p / t.grid_rows) * t.grid_rows;     // p % grid_rows
 }
 
 // A grid cell packs everything needed to repaint it after a resize:
@@ -108,13 +121,68 @@ fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
     _glyph_c(t, ch, px, py, t.fg, t.bg);
 }
 
-// Record the cell at (col,row) in the grid, if one is attached. The grid is
-// what makes resize() possible: pixels alone can't be re-laid-out.
+// Record the cell at visible (col,row) in the grid, if one is attached.
+// Writers always target the LIVE view (callers reset view_off first).
 fn _grid_set(t as *Term, col as i64, row as i64, ch as i64) as void {
     if (t.grid == 0) { return; }
     if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
+    let is i64 as p = t.live_top + row;
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
     let is *i64 as g = cast(*i64, t.grid);
-    g[row * t.grid_stride + col] = _cell_pack(ch, t.fg, t.bg);
+    g[phys * t.grid_stride + col] = _cell_pack(ch, t.fg, t.bg);
+}
+
+// Blank one physical grid row.
+fn _grid_blank_phys(t as *Term, phys as i64) as void {
+    let is *i64 as g = cast(*i64, t.grid);
+    let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
+    let is i64 as c with mut = 0;
+    while (c < t.grid_stride) {
+        g[phys * t.grid_stride + c] = blank;
+        c = c + 1;
+    }
+    return;
+}
+
+// Repaint every visible cell from the grid (honors view_off) and refill the
+// background first — the one true re-render, used by resize and scrollback.
+fn _repaint_view(t as *Term) as void {
+    _fill_bg(t, t.width, t.height);
+    if (t.grid == 0) { _mark(t, 0, 0, t.width, t.height); return; }
+    let is *i64 as g = cast(*i64, t.grid);
+    let is i64 as r with mut = 0;
+    while (r < t.rows) {
+        let is i64 as phys = _phys_row(t, r);
+        let is i64 as c with mut = 0;
+        while (c < t.cols) {
+            let is i64 as cell = g[phys * t.grid_stride + c];
+            let is i64 as ch = cell & 0xFF;
+            let is u32 as cfg = cast(u32, (cell >> 8) & 0xFFFFFF);
+            let is u32 as cbg = cast(u32, (cell >> 32) & 0xFFFFFF);
+            if (ch != 0x20 || cbg != t.bg) {
+                _glyph_c(t, ch, _cellx(t, c), _celly(t, r), cfg, cbg);
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    _mark(t, 0, 0, t.width, t.height);
+    return;
+}
+
+// scroll_view — slide the visible window into history (delta > 0 = older)
+// or back toward live (delta < 0). Clamped to what history holds; any
+// change re-renders. The cursor is only drawn at live (flush skips it
+// while scrolled back).
+fn scroll_view(t as *Term, delta as i64) as void {
+    if (t.grid == 0) { return; }
+    let is i64 as v with mut = t.view_off + delta;
+    if (v < 0) { v = 0; }
+    if (v > t.hist_count) { v = t.hist_count; }
+    if (v == t.view_off) { return; }
+    t.view_off = v;
+    _repaint_view(t);
+    return;
 }
 
 // Scroll the text area up one row (GLYPH_H px) and clear the bottom row. The
@@ -137,22 +205,15 @@ fn _scroll(t as *Term) as void {
     let is i64 as j with mut = 0;
     while (j < pw) { p[j] = t.bg; j = j + 1; }
     if (t.grid != 0) {
-        let is *i64 as g = cast(*i64, t.grid);
-        let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
-        let is i64 as r with mut = 0;
-        while (r < t.rows - 1) {
-            let is i64 as c with mut = 0;
-            while (c < t.grid_stride) {
-                g[r * t.grid_stride + c] = g[(r + 1) * t.grid_stride + c];
-                c = c + 1;
-            }
-            r = r + 1;
-        }
-        let is i64 as c2 with mut = 0;
-        while (c2 < t.grid_stride) {
-            g[(t.rows - 1) * t.grid_stride + c2] = blank;
-            c2 = c2 + 1;
-        }
+        // the ring absorbs the scroll: the line leaving the top becomes
+        // history, the fresh bottom line is blanked in place
+        t.live_top = t.live_top + 1;
+        if (t.live_top >= t.grid_rows) { t.live_top = 0; }
+        let is i64 as p = t.live_top + t.rows - 1;
+        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+        _grid_blank_phys(t, phys);
+        let is i64 as hmax = t.grid_rows - t.rows;
+        if (t.hist_count < hmax) { t.hist_count = t.hist_count + 1; }
     }
     _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
     if (t.cy > 0) { t.cy = t.cy - 1; }
@@ -176,6 +237,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.present_mode = 1;
     t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
     t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
     let is i64 as pw = (pitch * height) / 4;
@@ -201,6 +263,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.present_mode = 0;
     t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
     t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -226,6 +289,9 @@ fn attach_grid(t as *Term, cells as *i64, stride as i64, nrows as i64) as void {
     t.grid = cast(i64, cells);
     t.grid_stride = stride;
     t.grid_rows = nrows;
+    t.live_top = 0;
+    t.hist_count = 0;
+    t.view_off = 0;
     if (t.cols > stride) { t.cols = stride; }
     if (t.rows > nrows) { t.rows = nrows; }
     let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
@@ -238,6 +304,7 @@ fn attach_grid(t as *Term, cells as *i64, stride as i64, nrows as i64) as void {
 // empty input cell, so painting/erasing the whole cell is safe. putc lifts it
 // before moving; flush repaints it after a batch — so it tracks (cx,cy) cleanly.
 fn _cursor(t as *Term, on as i64) as void {
+    if (t.view_off != 0) { return; }     // the cursor lives at the live view only
     let is i64 as px = _cellx(t, t.cx);
     let is i64 as py = _celly(t, t.cy);
     let is u32 as color with mut = t.bg;
@@ -252,6 +319,10 @@ fn _cursor(t as *Term, on as i64) as void {
 }
 
 fn putc(t as *Term, ch as i64) as void {
+    if (t.view_off != 0) {                                   // output snaps back to live
+        t.view_off = 0;
+        _repaint_view(t);
+    }
     _cursor(t, 0);                                           // lift the cursor before moving/writing
     if (ch == 0x0A) { _newline(t); return; }                 // \n
     if (ch == 0x0D) { t.cx = 0; return; }                    // \r
@@ -305,6 +376,9 @@ fn clear(t as *Term) as void {
         let is i64 as i with mut = 0;
         let is i64 as total = t.grid_stride * t.grid_rows;
         while (i < total) { g[i] = blank; i = i + 1; }
+        t.live_top = 0;
+        t.hist_count = 0;
+        t.view_off = 0;
     }
     t.cx = 0; t.cy = 0;
     _mark(t, 0, 0, t.width, t.height);
@@ -326,56 +400,33 @@ fn resize(t as *Term, new_w as i64, new_h as i64) as void {
     if (t.grid != 0) {
         if (new_cols > t.grid_stride) { new_cols = t.grid_stride; }
         if (new_rows > t.grid_rows) { new_rows = t.grid_rows; }
-        // bottom anchor: shift the grid up so the cursor row stays visible
+        t.view_off = 0;                              // a resize snaps to live
+        // bottom anchor: lines pushed off the top become HISTORY (the ring
+        // just advances — nothing is copied or lost)
         if (t.cy >= new_rows) {
-            let is *i64 as g = cast(*i64, t.grid);
             let is i64 as shift = t.cy - new_rows + 1;
-            let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
-            let is i64 as r with mut = 0;
-            while (r + shift < t.grid_rows) {
-                let is i64 as c with mut = 0;
-                while (c < t.grid_stride) {
-                    g[r * t.grid_stride + c] = g[(r + shift) * t.grid_stride + c];
-                    c = c + 1;
-                }
-                r = r + 1;
-            }
-            while (r < t.grid_rows) {
-                let is i64 as c2 with mut = 0;
-                while (c2 < t.grid_stride) {
-                    g[r * t.grid_stride + c2] = blank;
-                    c2 = c2 + 1;
-                }
-                r = r + 1;
-            }
+            let is i64 as p = t.live_top + shift;
+            t.live_top = p - (p / t.grid_rows) * t.grid_rows;
+            t.hist_count = t.hist_count + shift;
             t.cy = new_rows - 1;
         }
+        // growing: physical rows entering at the bottom may hold recycled
+        // ancient ring lines — blank them
+        if (new_rows > t.rows) {
+            let is i64 as r with mut = t.rows;
+            while (r < new_rows) {
+                let is i64 as q = t.live_top + r;
+                _grid_blank_phys(t, q - (q / t.grid_rows) * t.grid_rows);
+                r = r + 1;
+            }
+        }
+        let is i64 as hmax = t.grid_rows - new_rows;
+        if (t.hist_count > hmax) { t.hist_count = hmax; }
     } else {
         if (t.cy >= new_rows) { t.cy = new_rows - 1; }
     }
     if (t.cx >= new_cols) { t.cx = new_cols - 1; }
     t.width = new_w; t.height = new_h;
     t.cols = new_cols; t.rows = new_rows;
-    _fill_bg(t, new_w, new_h);
-    if (t.grid != 0) {
-        let is *i64 as g2 = cast(*i64, t.grid);
-        let is i64 as rr with mut = 0;
-        while (rr < new_rows) {
-            let is i64 as cc with mut = 0;
-            while (cc < new_cols) {
-                let is i64 as cell = g2[rr * t.grid_stride + cc];
-                let is i64 as ch = cell & 0xFF;
-                let is u32 as cfg = cast(u32, (cell >> 8) & 0xFFFFFF);
-                let is u32 as cbg = cast(u32, (cell >> 32) & 0xFFFFFF);
-                // repaint glyphs, and also blank cells whose bg differs from
-                // the fill (a colored prompt's spaces keep their background)
-                if (ch != 0x20 || cbg != t.bg) {
-                    _glyph_c(t, ch, _cellx(t, cc), _celly(t, rr), cfg, cbg);
-                }
-                cc = cc + 1;
-            }
-            rr = rr + 1;
-        }
-    }
-    _mark(t, 0, 0, new_w, new_h);
+    _repaint_view(t);
 }
