@@ -986,15 +986,44 @@ fn run_module_objects() as i32 {
     // --module-objects implies --module-only).
     if (_emit_one_obj(prog, sc.get_mod_prefix(filename, flen), sc.get_mod_prefix_len(filename, flen), dir, filename, flen) != 0) { return 1; }
 
-    // Every loaded import module.
+    // Every loaded import module — emitted EXACTLY ONCE each. A module
+    // re-imported under a different alias/only-filter has MULTIPLE Module
+    // records in module_list sharing one canonical prefix (walk_module
+    // registers a fresh record for a cached re-import, e.g. std/mem.cst is
+    // imported both plain and `only bins, core`). Emitting a prefix twice is
+    // not just wasted work: the first codegen pass emits the bodies and then
+    // frees each function's IR (free_func_insts), so the second pass emits
+    // prologue-only husks (no body, no ret) and OVERWRITES the good .o —
+    // callers of those functions fall through into the next function and
+    // crash (the incremental-build segfault).
+    let is [1024]i64 as seen_ptrs;
+    let is [1024]i32 as seen_lens;
+    let is i32 as seen_n with mut = 0;
     let is i32 as n = mod.mo_count();
     let is i32 as i with mut = 0;
+    let is i32 as emitted with mut = 0;
     while (i < n) {
-        if (_emit_one_obj(prog, mod.mo_prefix_ptr(i), mod.mo_prefix_len(i), dir, filename, flen) != 0) { return 1; }
+        let is *u8 as pp = mod.mo_prefix_ptr(i);
+        let is i32 as pl = mod.mo_prefix_len(i);
+        let is i32 as dup with mut = 0;
+        let is i32 as si with mut = 0;
+        while (si < seen_n) {
+            if (str_eq(cast(*u8, seen_ptrs[si]), seen_lens[si], pp, pl) == 1) { dup = 1; si = seen_n; }
+            else { si = si + 1; }
+        }
+        if (dup == 0) {
+            if (seen_n < 1024) {
+                seen_ptrs[seen_n] = cast(i64, pp);
+                seen_lens[seen_n] = pl;
+                seen_n = seen_n + 1;
+            }
+            if (_emit_one_obj(prog, pp, pl, dir, filename, flen) != 0) { return 1; }
+            emitted = emitted + 1;
+        }
         i = i + 1;
     }
     if (g_quiet == 0) {
-        io.write_str(io.STDOUT, "module-objects: emitted "); io.write_int(io.STDOUT, cast(i64, n) + 1); io.write_str(io.STDOUT, " objects\n");
+        io.write_str(io.STDOUT, "module-objects: emitted "); io.write_int(io.STDOUT, cast(i64, emitted) + 1); io.write_str(io.STDOUT, " objects\n");
     }
     return 0;
 }
