@@ -31,6 +31,47 @@ struct Term {
     cy     as i64;   // cursor row
     fg     as u32;
     bg     as u32;
+    // -- appended (all i64): windowed-rendering support --
+    present_mode as i64;  // 1 = flush() presents (init, the fullscreen path);
+                          // 0 = render-only (init_buffer: a segment, no surface)
+    d_x0   as i64;        // accumulated dirty rect (pixel coords, x1/y1
+    d_y0   as i64;        // EXCLUSIVE); empty when d_x1 <= d_x0. The caller
+    d_x1   as i64;        // drains it with take_dirty() to know what to
+    d_y1   as i64;        // commit/present.
+    grid   as i64;        // *i64 cell array (0 = no grid attached)
+    grid_stride as i64;   // cells per grid row (fixed at attach)
+    grid_rows   as i64;   // grid row capacity
+}
+
+// A grid cell packs everything needed to repaint it after a resize:
+// ch (8 bits, CP437) | fg (24-bit RGB) << 8 | bg (24-bit RGB) << 32.
+fn _cell_pack(ch as i64, fgc as u32, bgc as u32) as i64 {
+    return (ch & 0xFF) | ((cast(i64, fgc) & 0xFFFFFF) << 8) | ((cast(i64, bgc) & 0xFFFFFF) << 32);
+}
+
+// Accumulate a pixel rect into the dirty union (x1/y1 exclusive).
+fn _mark(t as *Term, x as i64, y as i64, w as i64, h as i64) as void {
+    if (w <= 0 || h <= 0) { return; }
+    if (t.d_x1 <= t.d_x0) {              // empty → take the rect as-is
+        t.d_x0 = x; t.d_y0 = y; t.d_x1 = x + w; t.d_y1 = y + h;
+        return;
+    }
+    if (x < t.d_x0) { t.d_x0 = x; }
+    if (y < t.d_y0) { t.d_y0 = y; }
+    if (x + w > t.d_x1) { t.d_x1 = x + w; }
+    if (y + h > t.d_y1) { t.d_y1 = y + h; }
+}
+
+// Drain the dirty rect: writes {x, y, w, h} to out and resets the
+// accumulator. Returns 1 if there was anything to take, 0 if clean.
+fn take_dirty(t as *Term, out as *i64) as i64 {
+    if (t.d_x1 <= t.d_x0) { return 0; }
+    out[0] = t.d_x0;
+    out[1] = t.d_y0;
+    out[2] = t.d_x1 - t.d_x0;
+    out[3] = t.d_y1 - t.d_y0;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    return 1;
 }
 
 fn _putpix(t as *Term, x as i64, y as i64, color as u32) as void {
@@ -43,9 +84,10 @@ fn _putpix(t as *Term, x as i64, y as i64, color as u32) as void {
 fn _cellx(t as *Term, cx as i64) as i64 { return PAD_X + cx * GLYPH_W; }
 fn _celly(t as *Term, cy as i64) as i64 { return PAD_Y + cy * GLYPH_H; }
 
-// Blit one 8x16 glyph cell at pixel (px,py): set bits → fg, clear bits → bg, so
-// the cell is fully repainted (erasing whatever was there). MSB = leftmost.
-fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
+// Blit one 8x16 glyph cell at pixel (px,py) with explicit colors: set bits →
+// fgc, clear bits → bgc, so the cell is fully repainted (erasing whatever was
+// there). MSB = leftmost.
+fn _glyph_c(t as *Term, ch as i64, px as i64, py as i64, fgc as u32, bgc as u32) as void {
     let is *u8 as g = font.get_glyph(cast(i32, ch));
     let is i64 as row with mut = 0;
     while (row < GLYPH_H) {
@@ -53,16 +95,33 @@ fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
         let is i64 as col with mut = 0;
         while (col < GLYPH_W) {
             let is i64 as mask = 128 >> col;
-            if ((bits & mask) != 0) { _putpix(t, px + col, py + row, t.fg); }
-            else { _putpix(t, px + col, py + row, t.bg); }
+            if ((bits & mask) != 0) { _putpix(t, px + col, py + row, fgc); }
+            else { _putpix(t, px + col, py + row, bgc); }
             col = col + 1;
         }
         row = row + 1;
     }
+    _mark(t, px, py, GLYPH_W, GLYPH_H);
+}
+
+fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
+    _glyph_c(t, ch, px, py, t.fg, t.bg);
+}
+
+// Record the cell at (col,row) in the grid, if one is attached. The grid is
+// what makes resize() possible: pixels alone can't be re-laid-out.
+fn _grid_set(t as *Term, col as i64, row as i64, ch as i64) as void {
+    if (t.grid == 0) { return; }
+    if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
+    let is *i64 as g = cast(*i64, t.grid);
+    g[row * t.grid_stride + col] = _cell_pack(ch, t.fg, t.bg);
 }
 
 // Scroll the text area up one row (GLYPH_H px) and clear the bottom row. The
-// copy spans full pitch rows (side margins are bg, copying them up is a no-op).
+// copy spans full pitch rows (side margins are bg, copying them up is a no-op;
+// in windowed mode — pitch wider than the window — the overshoot stays inside
+// the caller's own buffer and outside its visible rect, harmless). The grid,
+// when attached, shifts in lockstep so a later resize() re-renders the truth.
 fn _scroll(t as *Term) as void {
     let is i64 as top = cast(i64, t.base) + PAD_Y * t.pitch;   // top of text area
     let is i64 as rowbytes = t.pitch * GLYPH_H;
@@ -77,6 +136,25 @@ fn _scroll(t as *Term) as void {
     let is i64 as pw = rowbytes / 4;
     let is i64 as j with mut = 0;
     while (j < pw) { p[j] = t.bg; j = j + 1; }
+    if (t.grid != 0) {
+        let is *i64 as g = cast(*i64, t.grid);
+        let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
+        let is i64 as r with mut = 0;
+        while (r < t.rows - 1) {
+            let is i64 as c with mut = 0;
+            while (c < t.grid_stride) {
+                g[r * t.grid_stride + c] = g[(r + 1) * t.grid_stride + c];
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        let is i64 as c2 with mut = 0;
+        while (c2 < t.grid_stride) {
+            g[(t.rows - 1) * t.grid_stride + c2] = blank;
+            c2 = c2 + 1;
+        }
+    }
+    _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
     if (t.cy > 0) { t.cy = t.cy - 1; }
 }
 
@@ -95,12 +173,65 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.cx = 0; t.cy = 0;
     t.fg = 0x00d3d7cf;        // soft light grey (Tango), not harsh pure white
     t.bg = 0x00121417;        // near-black blue-grey, easier on the eyes than #000
+    t.present_mode = 1;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
     let is i64 as pw = (pitch * height) / 4;
     let is i64 as i with mut = 0;
     while (i < pw) { p[i] = t.bg; i = i + 1; }
+    _mark(&t, 0, 0, width, height);
     return t;
+}
+
+// init_buffer — construct a Term over plain memory (a shared segment, not a
+// surface): clears the visible w x h region only (the buffer may be a full-
+// screen-pitch window sub-rect), never presents (no fd to present on); the
+// holder drains take_dirty() and tells its compositor what changed.
+fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i64) as Term {
+    font.init();
+    let is Term as t;
+    t.base = base; t.fd = 0 - 1; t.width = width; t.height = height;
+    t.pitch = pitch; t.bpp = bpp;
+    t.cols = (width - 2 * PAD_X) / GLYPH_W; t.rows = (height - 2 * PAD_Y) / GLYPH_H;
+    t.cx = 0; t.cy = 0;
+    t.fg = 0x00d3d7cf;
+    t.bg = 0x00121417;
+    t.present_mode = 0;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    _fill_bg(&t, width, height);
+    _mark(&t, 0, 0, width, height);
+    return t;
+}
+
+// Clear the visible w x h region to bg, row by row (pitch-aware: in windowed
+// mode the buffer is wider than the window and the slack is not ours to wipe
+// beyond a clean row — staying inside w keeps the write pattern obvious).
+fn _fill_bg(t as *Term, w as i64, h as i64) as void {
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is *u32 as p = cast(*u32, cast(i64, t.base) + y * t.pitch);
+        let is i64 as x with mut = 0;
+        while (x < w) { p[x] = t.bg; x = x + 1; }
+        y = y + 1;
+    }
+}
+
+// attach_grid — give the Term a cell-grid backing store so resize() can
+// re-render content. `cells` must hold stride * nrows i64 cells. The visible
+// grid is clamped to the backing dimensions; the cells are blanked.
+fn attach_grid(t as *Term, cells as *i64, stride as i64, nrows as i64) as void {
+    t.grid = cast(i64, cells);
+    t.grid_stride = stride;
+    t.grid_rows = nrows;
+    if (t.cols > stride) { t.cols = stride; }
+    if (t.rows > nrows) { t.rows = nrows; }
+    let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
+    let is i64 as i with mut = 0;
+    let is i64 as total = stride * nrows;
+    while (i < total) { cells[i] = blank; i = i + 1; }
 }
 
 // Cursor: a thin underline (bottom 2 rows of the cell) in fg. It sits on the
@@ -117,6 +248,7 @@ fn _cursor(t as *Term, on as i64) as void {
         while (rx < GLYPH_W) { _putpix(t, px + rx, py + ry, color); rx = rx + 1; }
         ry = ry + 1;
     }
+    _mark(t, px, py + GLYPH_H - 2, GLYPH_W, 2);
 }
 
 fn putc(t as *Term, ch as i64) as void {
@@ -124,7 +256,11 @@ fn putc(t as *Term, ch as i64) as void {
     if (ch == 0x0A) { _newline(t); return; }                 // \n
     if (ch == 0x0D) { t.cx = 0; return; }                    // \r
     if (ch == 0x08) {                                        // backspace
-        if (t.cx > 0) { t.cx = t.cx - 1; _glyph(t, 0x20, _cellx(t, t.cx), _celly(t, t.cy)); }
+        if (t.cx > 0) {
+            t.cx = t.cx - 1;
+            _glyph(t, 0x20, _cellx(t, t.cx), _celly(t, t.cy));
+            _grid_set(t, t.cx, t.cy, 0x20);
+        }
         return;
     }
     if (ch == 0x09) {                                        // tab → 4 spaces
@@ -133,6 +269,7 @@ fn putc(t as *Term, ch as i64) as void {
         return;
     }
     _glyph(t, ch, _cellx(t, t.cx), _celly(t, t.cy));
+    _grid_set(t, t.cx, t.cy, ch);
     t.cx = t.cx + 1;
     if (t.cx >= t.cols) { _newline(t); }
 }
@@ -142,10 +279,14 @@ fn puts(t as *Term, s as *u8, n as i64) as void {
     while (i < n) { putc(t, cast(i64, s[i])); i = i + 1; }
 }
 
-// flush — paint the cursor, then publish the grid to the scanout.
+// flush — paint the cursor, then (fullscreen mode) publish to the scanout.
+// In render-only mode (init_buffer) presenting is the holder's job: it drains
+// take_dirty() and routes the rect to its compositor instead.
 fn flush(t as *Term) as void {
     _cursor(t, 1);
-    cos.present(t.fd, 0, 0, t.width, t.height);
+    if (t.present_mode == 1) {
+        cos.present(t.fd, 0, 0, t.width, t.height);
+    }
 }
 
 // set_color — change fg/bg for subsequent glyphs (the shell uses this to colour
@@ -154,12 +295,87 @@ fn set_color(t as *Term, fg as u32, bg as u32) as void {
     t.fg = fg; t.bg = bg;
 }
 
-// clear — wipe the backbuffer to bg and home the cursor (the shell's `clear`).
+// clear — wipe the visible region to bg and home the cursor (the shell's
+// `clear`). Pitch-aware row fill so windowed buffers only touch their rect.
 fn clear(t as *Term) as void {
-    let is *u32 as p = cast(*u32, cast(i64, t.base));
-    let is i64 as pw = (t.pitch * t.height) / 4;
-    let is i64 as i with mut = 0;
-    while (i < pw) { p[i] = t.bg; i = i + 1; }
+    _fill_bg(t, t.width, t.height);
+    if (t.grid != 0) {
+        let is *i64 as g = cast(*i64, t.grid);
+        let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
+        let is i64 as i with mut = 0;
+        let is i64 as total = t.grid_stride * t.grid_rows;
+        while (i < total) { g[i] = blank; i = i + 1; }
+    }
     t.cx = 0; t.cy = 0;
+    _mark(t, 0, 0, t.width, t.height);
     flush(t);
+}
+
+// resize — re-lay the terminal out over a new w x h inside the SAME buffer
+// (the buffer is allocated full-screen once; pitch never changes). Lines do
+// not re-wrap: each grid row maps to the same row, truncated to the new
+// width. The view anchors at the BOTTOM — if the cursor row would fall off,
+// the grid shifts up so the prompt stays visible. Requires an attached grid
+// to re-render content; without one the screen is cleared (documented: a
+// grid is what makes content survive a resize).
+fn resize(t as *Term, new_w as i64, new_h as i64) as void {
+    let is i64 as new_cols with mut = (new_w - 2 * PAD_X) / GLYPH_W;
+    let is i64 as new_rows with mut = (new_h - 2 * PAD_Y) / GLYPH_H;
+    if (new_cols < 1) { new_cols = 1; }
+    if (new_rows < 1) { new_rows = 1; }
+    if (t.grid != 0) {
+        if (new_cols > t.grid_stride) { new_cols = t.grid_stride; }
+        if (new_rows > t.grid_rows) { new_rows = t.grid_rows; }
+        // bottom anchor: shift the grid up so the cursor row stays visible
+        if (t.cy >= new_rows) {
+            let is *i64 as g = cast(*i64, t.grid);
+            let is i64 as shift = t.cy - new_rows + 1;
+            let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
+            let is i64 as r with mut = 0;
+            while (r + shift < t.grid_rows) {
+                let is i64 as c with mut = 0;
+                while (c < t.grid_stride) {
+                    g[r * t.grid_stride + c] = g[(r + shift) * t.grid_stride + c];
+                    c = c + 1;
+                }
+                r = r + 1;
+            }
+            while (r < t.grid_rows) {
+                let is i64 as c2 with mut = 0;
+                while (c2 < t.grid_stride) {
+                    g[r * t.grid_stride + c2] = blank;
+                    c2 = c2 + 1;
+                }
+                r = r + 1;
+            }
+            t.cy = new_rows - 1;
+        }
+    } else {
+        if (t.cy >= new_rows) { t.cy = new_rows - 1; }
+    }
+    if (t.cx >= new_cols) { t.cx = new_cols - 1; }
+    t.width = new_w; t.height = new_h;
+    t.cols = new_cols; t.rows = new_rows;
+    _fill_bg(t, new_w, new_h);
+    if (t.grid != 0) {
+        let is *i64 as g2 = cast(*i64, t.grid);
+        let is i64 as rr with mut = 0;
+        while (rr < new_rows) {
+            let is i64 as cc with mut = 0;
+            while (cc < new_cols) {
+                let is i64 as cell = g2[rr * t.grid_stride + cc];
+                let is i64 as ch = cell & 0xFF;
+                let is u32 as cfg = cast(u32, (cell >> 8) & 0xFFFFFF);
+                let is u32 as cbg = cast(u32, (cell >> 32) & 0xFFFFFF);
+                // repaint glyphs, and also blank cells whose bg differs from
+                // the fill (a colored prompt's spaces keep their background)
+                if (ch != 0x20 || cbg != t.bg) {
+                    _glyph_c(t, ch, _cellx(t, cc), _celly(t, rr), cfg, cbg);
+                }
+                cc = cc + 1;
+            }
+            rr = rr + 1;
+        }
+    }
+    _mark(t, 0, 0, new_w, new_h);
 }
