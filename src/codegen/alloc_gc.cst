@@ -39,6 +39,44 @@ fn bm_test(matrix as *u8, n as i32, i as i32, j as i32) as i32 {
     return 0;
 }
 
+// --- Adjacency-list index over the interference graph ---
+// The bit matrix stays the authoritative O(1) pair-membership oracle (every
+// bm_test pair query keeps using it). These per-node neighbor LISTS exist only to
+// replace the O(n) `while (nb < n) bm_test(v, nb)` enumeration scans with an
+// O(degree) walk — the source of the allocator's O(n^2) cost on big functions.
+// The graph is sparse (short live ranges), so degree << n.
+//
+// File-level state (the allocator runs one function at a time per process;
+// parallel workers are separate processes). Built once after the interference
+// sweep and updated on coalesce edge additions (the only post-build mutation).
+// gadj_on=0 disables the lists (dense function or pool overflow) → callers fall
+// back to the matrix scan, which is always complete.
+let is *i32 as gadj_head with mut = cast(*i32, 0);   // [n] first link per node, -1 = none
+let is *i32 as gadj_nbr  with mut = cast(*i32, 0);   // [cap] neighbor vreg at this link
+let is *i32 as gadj_nxt  with mut = cast(*i32, 0);   // [cap] next link, -1 = end
+let is i32  as gadj_top  with mut = 0;               // bump cursor into nbr/nxt
+let is i32  as gadj_cap  with mut = 0;
+let is i32  as gadj_on   with mut = 0;
+
+// Add undirected edge (u,v) = two directed links. On overflow, disable the index
+// (fall back to matrix scans for the rest of this function). Caller still does
+// bm_set, so the matrix stays complete.
+fn adj_add_edge(u as i32, v as i32) as void {
+    if (gadj_on == 0) { return; }
+    if (gadj_top + 2 > gadj_cap) { gadj_on = 0; return; }
+    let is i32 as k = gadj_top;
+    let is *i32 as nb1 = cast(*i32, cast(i64, gadj_nbr) + cast(i64, k) * 4);  *nb1 = v;
+    let is *i32 as nx1 = cast(*i32, cast(i64, gadj_nxt) + cast(i64, k) * 4);
+    let is *i32 as h1  = cast(*i32, cast(i64, gadj_head) + cast(i64, u) * 4);
+    *nx1 = *h1;  *h1 = k;
+    let is i32 as k2 = k + 1;
+    let is *i32 as nb2 = cast(*i32, cast(i64, gadj_nbr) + cast(i64, k2) * 4); *nb2 = u;
+    let is *i32 as nx2 = cast(*i32, cast(i64, gadj_nxt) + cast(i64, k2) * 4);
+    let is *i32 as h2  = cast(*i32, cast(i64, gadj_head) + cast(i64, v) * 4);
+    *nx2 = *h2;  *h2 = k2;
+    gadj_top = k + 2;
+}
+
 // --- resolve_alias with path compression ---
 fn gc2_resolve(alias as *i32, v as i32) as i32 {
     let is i32 as root with mut = v;
@@ -258,6 +296,49 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         i = i + 1;
     }
 
+    // === Build adjacency-list index (neighbor enumeration accelerator) ===
+    // degree[] is now final for the initial graph; sum(degree) = directed-link
+    // count. Skip the index for dense functions (it would cost O(n^2) memory and
+    // wouldn't beat the matrix scan): there callers keep the matrix scan.
+    let is i64 as init_links with mut = 0;
+    i = 0;
+    while (i < n) { let is *i32 as dpp = cast(*i32, cast(i64, degree) + cast(i64, i) * 4); init_links = init_links + cast(i64, *dpp); i = i + 1; }
+    gadj_on = 0;
+    gadj_head = cast(*i32, 0);
+    gadj_nbr = cast(*i32, 0);
+    gadj_nxt = cast(*i32, 0);
+    // Dense guard: cap avg degree at 512 (covers the compiler's hot functions,
+    // whose interference degree runs ~250-470). Above that the lists would cost
+    // more memory than the matrix without a worthwhile iteration win → matrix scan.
+    if (init_links <= cast(i64, n) * 512) {
+        // Pool: initial links (= init_links) + slack for coalesce-added edges.
+        gadj_cap = cast(i32, init_links + init_links) + n * 2 + 64;
+        gadj_head = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+        gadj_nbr = cast(*i32, d.opt_alloc(cast(i64, gadj_cap) * 4));
+        gadj_nxt = cast(*i32, d.opt_alloc(cast(i64, gadj_cap) * 4));
+        i = 0;
+        while (i < n) { let is *i32 as hp = cast(*i32, cast(i64, gadj_head) + cast(i64, i) * 4); *hp = cast(i32, 0 - 1); i = i + 1; }
+        gadj_top = 0;
+        gadj_on = 1;
+        // Second sweep: same overlap logic, populate the lists.
+        let is i32 as ai with mut = 0;
+        while (ai < iv_count) {
+            let is *core.LiveInterval as aa = gc2_get_iv(ctx.intervals, ai);
+            if (aa.start != INT_MAX) {
+                let is i32 as ava = aa.vreg;
+                let is i32 as aa_end = aa.end_pos;
+                let is i32 as aj with mut = ai + 1;
+                while (aj < iv_count) {
+                    let is *core.LiveInterval as ab = gc2_get_iv(ctx.intervals, aj);
+                    if (ab.start > aa_end) { aj = iv_count; }
+                    else if (ab.start != INT_MAX) { adj_add_edge(ava, ab.vreg); }
+                    aj = aj + 1;
+                }
+            }
+            ai = ai + 1;
+        }
+    }
+
     // === Loop depth detection ===
     // Count instructions first
     let is i32 as inst_count with mut = 0;
@@ -441,8 +522,10 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             *st_v = 1;
             // Decrement neighbors
             let is i32 as nb with mut = 0;
+            let is i32 as sk with mut = cast(i32, 0 - 1);
+            if (gadj_on == 1) { sk = *(cast(*i32, cast(i64, gadj_head) + cast(i64, v) * 4)); if (sk >= 0) { nb = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, sk) * 4)); } else { nb = n; } }
             while (nb < n) {
-                if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                if (gadj_on == 1 || (nb != v && bm_test(matrix, n, v, nb) == 1)) {
                     let is *i32 as st_nb = cast(*i32, cast(i64, status) + cast(i64, nb) * 4);
                     if (*st_nb == 0) {
                         let is *i32 as dnb = cast(*i32, cast(i64, degree) + cast(i64, nb) * 4);
@@ -462,7 +545,8 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         }
                     }
                 }
-                nb = nb + 1;
+                if (gadj_on == 1) { sk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, sk) * 4)); if (sk >= 0) { nb = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, sk) * 4)); } else { nb = n; } }
+                else { nb = nb + 1; }
             }
             progress = 1;
         }
@@ -483,23 +567,40 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         mv.status = 3;
                         did_coalesce = 1;
                     } else {
-                        // George criterion: can merge a into b?
+                        // George criterion: can merge a into b? (AND over a's
+                        // neighbors → order-independent; bm_test(t,b) stays a pair query)
                         let is i32 as ok with mut = 1;
-                        let is i32 as t with mut = 0;
-                        while (t < n && ok == 1) {
-                            if (t != a && bm_test(matrix, n, a, t) == 1) {
-                                let is *i32 as st_t = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
-                                if (*st_t == 0) {
-                                    if (bm_test(matrix, n, t, b) == 0) {
-                                        let is *i32 as cc_t = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
-                                        let is i32 as k_t with mut = 10;
-                                        if (*cc_t == 1) { k_t = 5; }
-                                        let is *i32 as dt = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
-                                        if (*dt >= k_t) { ok = 0; }
+                        let is i32 as t with mut = 0;   // shared with the transfer/reclassify loops below
+                        if (gadj_on == 1) {
+                            let is i32 as gk with mut = *(cast(*i32, cast(i64, gadj_head) + cast(i64, a) * 4));
+                            while (gk >= 0) {
+                                let is i32 as tt = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, gk) * 4));
+                                let is *i32 as st_t = cast(*i32, cast(i64, status) + cast(i64, tt) * 4);
+                                if (*st_t == 0 && bm_test(matrix, n, tt, b) == 0) {
+                                    let is *i32 as cc_t = cast(*i32, cast(i64, crosses_call) + cast(i64, tt) * 4);
+                                    let is i32 as k_t with mut = 10;
+                                    if (*cc_t == 1) { k_t = 5; }
+                                    let is *i32 as dt = cast(*i32, cast(i64, degree) + cast(i64, tt) * 4);
+                                    if (*dt >= k_t) { ok = 0; }
+                                }
+                                if (ok == 0) { gk = 0 - 1; } else { gk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, gk) * 4)); }
+                            }
+                        } else {
+                            while (t < n && ok == 1) {
+                                if (t != a && bm_test(matrix, n, a, t) == 1) {
+                                    let is *i32 as st_t = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
+                                    if (*st_t == 0) {
+                                        if (bm_test(matrix, n, t, b) == 0) {
+                                            let is *i32 as cc_t = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
+                                            let is i32 as k_t with mut = 10;
+                                            if (*cc_t == 1) { k_t = 5; }
+                                            let is *i32 as dt = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
+                                            if (*dt >= k_t) { ok = 0; }
+                                        }
                                     }
                                 }
+                                t = t + 1;
                             }
-                            t = t + 1;
                         }
                         if (ok == 1) {
                             // Merge a into b
@@ -523,6 +624,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                     if (*st_t2 == 0) {
                                         if (bm_test(matrix, n, t, b) == 0) {
                                             bm_set(matrix, n, t, b);
+                                            adj_add_edge(t, b);   // mirror the new edge into the index
                                             let is *i32 as db = cast(*i32, cast(i64, degree) + cast(i64, b) * 4);
                                             *db = *db + 1;
                                             let is *i32 as dt2 = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
@@ -552,8 +654,10 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                             }
                             // Check neighbors of b that may have become low-degree
                             t = 0;
+                            let is i32 as rk with mut = cast(i32, 0 - 1);
+                            if (gadj_on == 1) { rk = *(cast(*i32, cast(i64, gadj_head) + cast(i64, b) * 4)); if (rk >= 0) { t = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, rk) * 4)); } else { t = n; } }
                             while (t < n) {
-                                if (t != b && bm_test(matrix, n, b, t) == 1) {
+                                if (gadj_on == 1 || (t != b && bm_test(matrix, n, b, t) == 1)) {
                                     let is *i32 as st_t3 = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
                                     if (*st_t3 == 0) {
                                         let is *i32 as dt3 = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
@@ -571,7 +675,8 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                         }
                                     }
                                 }
-                                t = t + 1;
+                                if (gadj_on == 1) { rk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, rk) * 4)); if (rk >= 0) { t = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, rk) * 4)); } else { t = n; } }
+                                else { t = t + 1; }
                             }
                             mv.status = 1;
                             did_coalesce = 1;
@@ -670,8 +775,10 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                     *st_sv = 1;
                     // Decrement neighbors
                     let is i32 as snb with mut = 0;
+                    let is i32 as pk with mut = cast(i32, 0 - 1);
+                    if (gadj_on == 1) { pk = *(cast(*i32, cast(i64, gadj_head) + cast(i64, sv) * 4)); if (pk >= 0) { snb = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, pk) * 4)); } else { snb = n; } }
                     while (snb < n) {
-                        if (snb != sv && bm_test(matrix, n, sv, snb) == 1) {
+                        if (gadj_on == 1 || (snb != sv && bm_test(matrix, n, sv, snb) == 1)) {
                             let is *i32 as st_snb = cast(*i32, cast(i64, status) + cast(i64, snb) * 4);
                             if (*st_snb == 0) {
                                 let is *i32 as dsnb = cast(*i32, cast(i64, degree) + cast(i64, snb) * 4);
@@ -691,7 +798,8 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                 }
                             }
                         }
-                        snb = snb + 1;
+                        if (gadj_on == 1) { pk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, pk) * 4)); if (pk >= 0) { snb = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, pk) * 4)); } else { snb = n; } }
+                        else { snb = snb + 1; }
                     }
                     progress = 1;
                 }
@@ -725,16 +833,25 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             let is i32 as xi with mut = 0;
             while (xi < 16) { used_xmm[xi] = 0; xi = xi + 1; }
             used_xmm[0] = 1; used_xmm[1] = 1; // reserve xmm0, xmm1
-            let is i32 as nb with mut = 0;
-            while (nb < n) {
-                if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+            if (gadj_on == 1) {
+                let is i32 as kk with mut = *(cast(*i32, cast(i64, gadj_head) + cast(i64, v) * 4));
+                while (kk >= 0) {
+                    let is i32 as nb = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, kk) * 4));
                     let is i32 as rnb = gc2_resolve(alias, nb);
                     let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
-                    if (*cnb >= 16 && *cnb <= 31) {
-                        used_xmm[*cnb - 16] = 1;
-                    }
+                    if (*cnb >= 16 && *cnb <= 31) { used_xmm[*cnb - 16] = 1; }
+                    kk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, kk) * 4));
                 }
-                nb = nb + 1;
+            } else {
+                let is i32 as nb with mut = 0;
+                while (nb < n) {
+                    if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                        let is i32 as rnb = gc2_resolve(alias, nb);
+                        let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
+                        if (*cnb >= 16 && *cnb <= 31) { used_xmm[*cnb - 16] = 1; }
+                    }
+                    nb = nb + 1;
+                }
             }
             xi = 0;
             while (xi < 16 && chosen < 0) {
@@ -747,17 +864,31 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             let is i32 as ri with mut = 0;
             while (ri < 10) { used[ri] = 0; ri = ri + 1; }
 
-            let is i32 as nb with mut = 0;
-            while (nb < n) {
-                if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+            if (gadj_on == 1) {
+                let is i32 as kk with mut = *(cast(*i32, cast(i64, gadj_head) + cast(i64, v) * 4));
+                while (kk >= 0) {
+                    let is i32 as nb = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, kk) * 4));
                     let is i32 as rnb = gc2_resolve(alias, nb);
                     let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
                     if (*cnb >= 0) {
                         let is i32 as slot = core.reg_to_slot(*cnb);
                         if (slot >= 0) { used[slot] = 1; }
                     }
+                    kk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, kk) * 4));
                 }
-                nb = nb + 1;
+            } else {
+                let is i32 as nb with mut = 0;
+                while (nb < n) {
+                    if (nb != v && bm_test(matrix, n, v, nb) == 1) {
+                        let is i32 as rnb = gc2_resolve(alias, nb);
+                        let is *i32 as cnb = cast(*i32, cast(i64, color) + cast(i64, rnb) * 4);
+                        if (*cnb >= 0) {
+                            let is i32 as slot = core.reg_to_slot(*cnb);
+                            if (slot >= 0) { used[slot] = 1; }
+                        }
+                    }
+                    nb = nb + 1;
+                }
             }
 
             let is *i32 as cc_v = cast(*i32, cast(i64, crosses_call) + cast(i64, v) * 4);
@@ -896,4 +1027,15 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     d.opt_free(cast(*u8, spill_wl));
     d.opt_free(cast(*u8, ga_param));
     d.opt_free(cast(*u8, stack));
+    // Adjacency index (guard on the pointer: overflow can clear gadj_on while the
+    // arrays are still allocated). Null them so the next function starts clean.
+    if (cast(i64, gadj_head) != 0) {
+        d.opt_free(cast(*u8, gadj_head));
+        d.opt_free(cast(*u8, gadj_nbr));
+        d.opt_free(cast(*u8, gadj_nxt));
+        gadj_head = cast(*i32, 0);
+        gadj_nbr = cast(*i32, 0);
+        gadj_nxt = cast(*i32, 0);
+    }
+    gadj_on = 0;
 }
