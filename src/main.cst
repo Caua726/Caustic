@@ -1021,6 +1021,69 @@ fn _emit_mo_slice(prog as *u8, dir as *u8, filename as *u8, flen as i32,
     return st;
 }
 
+// Fork ws workers (parent = worker 0, also emits the root module) to emit the
+// root + the ntask import modules into <dir>/<prefix>.o. Each .o is written by
+// exactly one worker from the COW-shared, post-frontend program state, so the
+// outputs are independent and order-free. ws<=1 or non-Linux → sequential.
+// Returns 0 on success, 1 if any worker failed.
+fn _fork_emit(prog as *u8, dir as *u8, filename as *u8, flen as i32,
+              tp as *i64, tl as *i32, ntask as i32,
+              root_pp as *u8, root_pl as i32, ws as i32) as i32 {
+    let is i32 as status with mut = 0;
+    if (ws <= 1 || os.current() != os.OS_LINUX) {
+        if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
+        if (_emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, 0, 1) != 0) { status = 1; }
+        return status;
+    }
+    let is i32 as w with mut = 1;
+    while (w < ws) {
+        let is i64 as pid = os.linux.fork();
+        if (pid == 0) {
+            let is i32 as cst = _emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, w, ws);
+            os.linux.exit(cast(i64, cst));   // child process exits with its slice status
+        }
+        w = w + 1;
+    }
+    if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
+    if (_emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, 0, ws) != 0) { status = 1; }
+    let is i32 as c with mut = 1;
+    while (c < ws) {
+        let is i32 as wstatus with mut = 0;
+        os.linux.wait4(0 - 1, cast(*i32, &wstatus), 0, cast(*u8, 0));
+        if (((wstatus >> 8) & 255) != 0) { status = 1; }
+        c = c + 1;
+    }
+    return status;
+}
+
+// Build the dedup'd import-module task list into tp/tl (prefix ptr + len), up to
+// maxn. A module re-imported under a different alias/only-filter has MULTIPLE
+// Module records sharing one canonical prefix; emitting a prefix twice corrupts
+// the .o (1st pass frees the IR, 2nd emits prologue-only husks — d985253). The
+// prefix pointers reference Module records (stable across fork COW). Returns ntask.
+fn _build_module_tasks(tp as *i64, tl as *i32, maxn as i32) as i32 {
+    let is i32 as ntask with mut = 0;
+    let is i32 as n = mod.mo_count();
+    let is i32 as i with mut = 0;
+    while (i < n && ntask < maxn) {
+        let is *u8 as pp = mod.mo_prefix_ptr(i);
+        let is i32 as pl = mod.mo_prefix_len(i);
+        let is i32 as dup with mut = 0;
+        let is i32 as si with mut = 0;
+        while (si < ntask) {
+            if (str_eq(cast(*u8, tp[si]), tl[si], pp, pl) == 1) { dup = 1; si = ntask; }
+            else { si = si + 1; }
+        }
+        if (dup == 0) {
+            tp[ntask] = cast(i64, pp);
+            tl[ntask] = pl;
+            ntask = ntask + 1;
+        }
+        i = i + 1;
+    }
+    return ntask;
+}
+
 fn run_module_objects() as i32 {
     let is *u8 as filename = cast(*u8, g_input_files[0]);
     let is i32 as flen = strlen(filename);
@@ -1040,73 +1103,105 @@ fn run_module_objects() as i32 {
     // maker would otherwise run on a cold build).
     mod.emit_deps(_mo_path(dir, "deps", 4, ".txt", 4));
 
-    // Build the dedup'd import-module task list. A module re-imported under a
-    // different alias/only-filter has MULTIPLE Module records sharing one
-    // canonical prefix; emitting a prefix twice corrupts the .o (the 1st pass
-    // frees the IR, the 2nd emits prologue-only husks — the d985253 segfault).
-    let is [1024]i64 as task_ptr;   // prefix ptr (module records — stable across fork COW)
+    let is [1024]i64 as task_ptr;
     let is [1024]i32 as task_len;
-    let is i32 as ntask with mut = 0;
-    let is i32 as n = mod.mo_count();
-    let is i32 as i with mut = 0;
-    while (i < n && ntask < 1024) {
-        let is *u8 as pp = mod.mo_prefix_ptr(i);
-        let is i32 as pl = mod.mo_prefix_len(i);
-        let is i32 as dup with mut = 0;
-        let is i32 as si with mut = 0;
-        while (si < ntask) {
-            if (str_eq(cast(*u8, task_ptr[si]), task_len[si], pp, pl) == 1) { dup = 1; si = ntask; }
-            else { si = si + 1; }
-        }
-        if (dup == 0) {
-            task_ptr[ntask] = cast(i64, pp);
-            task_len[ntask] = pl;
-            ntask = ntask + 1;
-        }
-        i = i + 1;
-    }
+    let is i32 as ntask = _build_module_tasks(cast(*i64, &task_ptr), cast(*i32, &task_len), 1024);
 
-    // Worker pool. Each .o is written by exactly one worker and its content is a
-    // pure function of the (post-frontend, COW-shared) AST + the module, so the
-    // outputs are independent and order-free. Fork AFTER the frontend so every
-    // worker shares the one frontend pass via copy-on-write.
+    // Worker pool — fork after the frontend so workers share the one frontend
+    // pass via copy-on-write; each .o is order-free and worker-independent.
     let is i32 as ws = _detect_jobs(ntask + 1);
     let is *u8 as root_pp = sc.get_mod_prefix(filename, flen);
     let is i32 as root_pl = sc.get_mod_prefix_len(filename, flen);
-    let is i32 as status with mut = 0;
-
-    if (ws <= 1 || os.current() != os.OS_LINUX) {
-        // Sequential (W=1, or no fork available).
-        if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
-        if (_emit_mo_slice(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, 0, 1) != 0) { status = 1; }
-    } else {
-        // Fork ws-1 children; the parent is worker 0 and also emits the root.
-        let is i32 as w with mut = 1;
-        while (w < ws) {
-            let is i64 as pid = os.linux.fork();
-            if (pid == 0) {
-                let is i32 as cst = _emit_mo_slice(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, w, ws);
-                os.linux.exit(cast(i64, cst));   // child process exits with its slice status
-            }
-            w = w + 1;
-        }
-        if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
-        if (_emit_mo_slice(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, 0, ws) != 0) { status = 1; }
-        // Reap children; OR their exit codes into status.
-        let is i32 as c with mut = 1;
-        while (c < ws) {
-            let is i32 as wstatus with mut = 0;
-            os.linux.wait4(0 - 1, cast(*i32, &wstatus), 0, cast(*u8, 0));
-            if (((wstatus >> 8) & 255) != 0) { status = 1; }
-            c = c + 1;
-        }
-    }
+    let is i32 as status = _fork_emit(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, root_pp, root_pl, ws);
 
     if (g_quiet == 0) {
         io.write_str(io.STDOUT, "module-objects: emitted "); io.write_int(io.STDOUT, cast(i64, ntask) + 1);
         io.write_str(io.STDOUT, " objects ("); io.write_int(io.STDOUT, cast(i64, ws)); io.write_str(io.STDOUT, " workers)\n");
     }
     return status;
+}
+
+// ── Parallel-by-default executable build ─────────────────────────────
+// A normal `caustic x.cst -o out` build, parallelized internally: ONE frontend
+// pass, the whole-program inline pass run in the parent (so cross-module
+// inlining is preserved and IR is final), then fork W workers that each codegen
+// a slice of modules into per-module .o files, then link them into `out`. Output
+// is deterministic and byte-identical across -j (codegen of a function reads
+// only that function's already-inlined IR). Linux only; caller falls back to the
+// serial whole-program path otherwise.
+fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
+    resolve_stdlib_dir();
+    sem.set_extra_paths(cast(*i64, &g_extra_paths), g_extra_path_count);
+
+    // module_only + no_main=1 BEFORE the frontend so the root's main is mangled
+    // <root_prefix>_main (same as --module-objects) — that mangling is decided
+    // during the frontend, and we set it as the link entry below.
+    tgt.module_only_set(1);
+    let is i64 as prog_ptr with mut = 0;
+    if (compile_frontend(filename, flen, 1, g_cache_flags, cast(*u8, g_cache_dir), &prog_ptr) != 0) { return 1; }
+    if (prog_ptr == 0) { io.write_str(io.STDERR, "Error: no program to emit\n"); return 1; }
+    let is *u8 as prog = cast(*u8, prog_ptr);
+
+    cgd.set_opt_level(g_opt_level);
+    cg.cg_quiet = g_quiet;
+
+    // Whole-program inline pass in the parent (preinline_all toggles module_only
+    // off internally so it inlines across all modules) → every function's IR is
+    // final; then per-module emission skips Phase 2.
+    cgd.preinline_all(prog);
+    cgd.set_preinlined(1);
+
+    // Temp dir for per-module .o/.s (removed after linking).
+    let is [4096]u8 as dirbuf;
+    let is *u8 as dir = cast(*u8, &dirbuf);
+    let is i32 as ol = strlen(cast(*u8, g_output_path));
+    mem.memcpy(dir, cast(*u8, g_output_path), cast(i64, ol));
+    mem.memcpy(cast(*u8, cast(i64, dir) + ol), ".pobj", 5);
+    dir[ol + 5] = cast(u8, 0);
+    io.mkdir(dir);
+
+    let is [1024]i64 as task_ptr;
+    let is [1024]i32 as task_len;
+    let is i32 as ntask = _build_module_tasks(cast(*i64, &task_ptr), cast(*i32, &task_len), 1024);
+
+    let is i32 as ws = _detect_jobs(ntask + 1);
+    let is *u8 as root_pp = sc.get_mod_prefix(filename, flen);
+    let is i32 as root_pl = sc.get_mod_prefix_len(filename, flen);
+    let is i32 as st = _fork_emit(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, root_pp, root_pl, ws);
+    if (st != 0) { io.write_str(io.STDERR, "Error: parallel emission failed\n"); return 1; }
+
+    // Collect .o paths (root first) and link into the executable.
+    let is [1025]i64 as obj_arr;
+    obj_arr[0] = cast(i64, _mo_path(dir, root_pp, root_pl, ".o", 2));
+    let is i32 as nobj with mut = 1;
+    let is i32 as ti with mut = 0;
+    while (ti < ntask) {
+        obj_arr[nobj] = cast(i64, _mo_path(dir, cast(*u8, task_ptr[ti]), task_len[ti], ".o", 2));
+        nobj = nobj + 1;
+        ti = ti + 1;
+    }
+    // In module-only emission the root's main is mangled `<root_prefix>_main`
+    // (not the bare `main` the linker defaults to), so set the entry explicitly.
+    let is [512]u8 as entrybuf;
+    mem.memcpy(cast(*u8, &entrybuf), root_pp, cast(i64, root_pl));
+    mem.memcpy(cast(*u8, cast(i64, &entrybuf) + root_pl), "_main", 5);
+    entrybuf[root_pl + 5] = cast(u8, 0);
+    ldmod.g_entry_name = cast(i64, &entrybuf);
+
+    let is i32 as lerr = ldmod.link_objs(cast(*u8, &obj_arr), nobj, cast(*u8, g_output_path), cast(*u8, &g_lib_names), g_lib_count);
+    if (lerr != 0) { io.write_str(io.STDERR, "Error: linking failed\n"); return 1; }
+
+    // Cleanup .o + .s, then the temp dir.
+    ti = 0;
+    while (ti < nobj) { io.unlink(cast(*u8, obj_arr[ti])); ti = ti + 1; }
+    io.unlink(_mo_path(dir, root_pp, root_pl, ".s", 2));
+    ti = 0;
+    while (ti < ntask) { io.unlink(_mo_path(dir, cast(*u8, task_ptr[ti]), task_len[ti], ".s", 2)); ti = ti + 1; }
+    os.linux.rmdir(dir);
+
+    if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, cast(*u8, g_output_path)); io.write_str(io.STDOUT, "\n"); }
+    prof.prof_print();
+    return 0;
 }
 
 fn run_multi_file() as i32 {
@@ -1359,6 +1454,17 @@ fn main(argc as i64, argv as i64) as i32 {
     // Single file, no -o, no --cache: legacy .s output
     if (g_file_count == 1 && g_output_path == 0 && g_cache_dir == 0) {
         return run_single_file(cast(*u8, g_input_files[0]));
+    }
+
+    // Parallel-by-default: a single-source executable build forks per-module
+    // emission internally and links the objects (Linux host, ELF/PE targets,
+    // no -l libs / shared / freestanding). Falls back to the serial whole-program
+    // path for everything else. -j 1 still goes parallel-capable (1 worker).
+    if (g_file_count == 1 && g_no_main == 0 && g_output_path != 0
+        && ldmod.g_shared == 0 && ldmod.g_freestanding == 0 && g_lib_count == 0
+        && os.current() == os.OS_LINUX
+        && tgt.target_get().object_format != 3) {
+        return run_parallel_exe(cast(*u8, g_input_files[0]), strlen(cast(*u8, g_input_files[0])));
     }
 
     // Compile + assemble + link
