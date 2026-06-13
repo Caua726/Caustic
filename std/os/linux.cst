@@ -358,3 +358,79 @@ fn fcntl(fd as i64, cmd as i64, arg as i64) as i64 {
 fn poll(fds as *u8, nfds as i64, timeout as i64) as i64 {
     return syscall(7, fds, nfds, timeout);
 }
+
+// --- Threads (B3) ---
+//
+// clone() itself is NOT wrapped here: invoking it via syscall() would let
+// codegen run normal frame code in the child (which wakes on a fresh stack
+// inside this very function, rbp still pointing into the parent frame under
+// CLONE_VM). The clone is issued only from the `with naked` trampoline in
+// std/thread/linux.cst. These wrappers are the safe, frame-agnostic pieces.
+
+// clone(2) flags (x86-64). Thread set = musl/NPTL minus DETACHED (obsolete).
+let is i64 as CLONE_VM             with imut = 256;       // 0x00000100
+let is i64 as CLONE_FS             with imut = 512;       // 0x00000200
+let is i64 as CLONE_FILES          with imut = 1024;      // 0x00000400
+let is i64 as CLONE_SIGHAND        with imut = 2048;      // 0x00000800
+let is i64 as CLONE_THREAD         with imut = 65536;     // 0x00010000
+let is i64 as CLONE_SYSVSEM        with imut = 262144;    // 0x00040000
+let is i64 as CLONE_SETTLS         with imut = 524288;    // 0x00080000
+let is i64 as CLONE_PARENT_SETTID  with imut = 1048576;   // 0x00100000
+let is i64 as CLONE_CHILD_CLEARTID with imut = 2097152;   // 0x00200000
+// Thread spawn flag set: VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID
+let is i64 as CLONE_THREAD_FLAGS   with imut = 4001536;   // 0x003D0F00
+
+// futex(2) ops
+let is i64 as FUTEX_WAIT           with imut = 0;
+let is i64 as FUTEX_WAKE           with imut = 1;
+let is i64 as FUTEX_PRIVATE_FLAG   with imut = 128;       // 0x80
+let is i64 as FUTEX_WAIT_PRIVATE   with imut = 128;       // FUTEX_WAIT | PRIVATE
+let is i64 as FUTEX_WAKE_PRIVATE   with imut = 129;       // FUTEX_WAKE | PRIVATE
+
+// mmap PROT/MAP for thread stacks
+let is i64 as PROT_NONE            with imut = 0;
+let is i64 as PROT_READ            with imut = 1;
+let is i64 as PROT_WRITE           with imut = 2;
+let is i64 as MAP_PRIVATE          with imut = 2;
+let is i64 as MAP_ANONYMOUS        with imut = 32;        // 0x20
+let is i64 as MAP_STACK            with imut = 131072;    // 0x20000
+let is i64 as MAP_FAILED_PTR       with imut = 0 - 1;     // mmap returns -1 on failure
+
+// arch_prctl subfunctions (fs/gs base)
+let is i64 as ARCH_SET_FS          with imut = 4098;      // 0x1002
+let is i64 as ARCH_GET_FS          with imut = 4099;      // 0x1003
+
+// 202: FUTEX — uaddr is a *u32. NOTE: the join wait must NOT set PRIVATE: the
+// kernel's CLONE_CHILD_CLEARTID wake at thread death is a NON-private FUTEX_WAKE,
+// so a private waiter hashes to a different bucket and misses it.
+fn futex(uaddr as *u8, op as i64, val as i64, timeout as *u8, uaddr2 as *u8, val3 as i64) as i64 {
+    return syscall(202, uaddr, op, val, timeout, uaddr2, val3);
+}
+
+// 186: GETTID — kernel thread id (== pid for the main thread).
+fn gettid() as i64 {
+    return syscall(186);
+}
+
+// 24: SCHED_YIELD
+fn sched_yield() as i64 {
+    return syscall(24);
+}
+
+// 204: SCHED_GETAFFINITY — fills `mask` with online-CPU bits for `pid` (0=self).
+// Returns the number of bytes written (popcount the mask for the CPU count).
+fn sched_getaffinity(pid as i64, size as i64, mask as *u8) as i64 {
+    return syscall(204, pid, size, mask);
+}
+
+// 60: EXIT — terminate THIS thread only (NOT exit_group/231 which kills the
+// whole process). Worker threads must end via this (the trampoline emits it).
+fn exit_thread(code as i64) as void {
+    syscall(60, code);
+}
+
+// 158: ARCH_PRCTL — set/get fs or gs base. Used to install the main thread's
+// TCB pointer (thread.slot()) ; spawned threads get fs via CLONE_SETTLS instead.
+fn arch_prctl(code as i64, addr as i64) as i64 {
+    return syscall(158, code, addr);
+}

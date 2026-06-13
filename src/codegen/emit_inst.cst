@@ -598,6 +598,10 @@ fn gen_inst_shift_bitwise(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     if (op == d.IR_RET) {
+        // Naked functions emit no epilogue/ret — their asm body terminates
+        // control flow itself (ret / syscall). Drop any implicit IR_RET.
+        let is *d.IRFunction as cf = cast(*d.IRFunction, ctx.func);
+        if (cast(i64, cf) != 0 && cf.is_naked == 1) { return; }
         if (inst.src1.op_type != d.OP_NONE) {
             e.load_op(inst.src1.vreg, ctx, "rax");
         }
@@ -646,6 +650,75 @@ fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 }
 
 // === gen_inst: ADDR, ADDR_GLOBAL, FN_ADDR, GET_ALLOC_ADDR, LOAD, STORE, COPY, ASM, CAST ===
+
+// === Atomics (B1, seq_cst) ===
+// All ops are full barriers; the dispatcher (gen_inst) calls ph_invalidate for
+// them, so the -O1 register cache is cleared around each. Uses fixed rax/rcx/rdx
+// (none allocatable, so no conflict with live vregs — same model as IR_SYSCALL).
+// sz is 4 or 8 (cast_to = pointee). For 32-bit ops the 32-bit register form
+// zero-extends into the full 64-bit reg, so store_op of the 64-bit name is correct.
+fn gen_inst_atomic(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as op = inst.op;
+
+    if (op == d.IR_FENCE) { eo.out_line("mfence"); return; }
+
+    if (op == d.IR_ATOMIC_LOAD) {
+        // Plain mov is a seq_cst (acquire) load on x86-TSO.
+        let is i32 as sz = e.get_type_size(inst.cast_to);
+        let is i32 as si = e.get_scratch_idx(inst.dest.vreg, ctx);
+        let is *u8 as scr = eo.reg64(si);
+        let is *u8 as scr32 = eo.reg32(si);
+        e.load_op(inst.src1.vreg, ctx, scr);
+        if (sz == 4) {
+            eo.out_str("  mov ", 6); eo.out_cstr(scr32); eo.out_str(", DWORD PTR [", 13); eo.out_cstr(scr); eo.out_str("]\n", 2);
+        } else {
+            eo.out_str("  mov ", 6); eo.out_cstr(scr); eo.out_str(", QWORD PTR [", 13); eo.out_cstr(scr); eo.out_str("]\n", 2);
+        }
+        e.store_op(inst.dest.vreg, ctx, scr);
+        return;
+    }
+
+    if (op == d.IR_CAS_EXPECTED) {
+        // Load the expected value into rax; must immediately precede IR_ATOMIC_CAS.
+        e.load_op(inst.src1.vreg, ctx, "rax");
+        return;
+    }
+
+    if (op == d.IR_ATOMIC_CAS) {
+        // rax already holds the expected value (IR_CAS_EXPECTED). rdx = address,
+        // rcx = desired (both non-allocatable; loading them never clobbers rax).
+        let is i32 as sz = e.get_type_size(inst.cast_to);
+        e.load_op(inst.src1.vreg, ctx, "rdx");
+        e.load_op(inst.src2.vreg, ctx, "rcx");
+        if (sz == 4) {
+            eo.out_line("lock cmpxchg DWORD PTR [rdx], ecx");
+        } else {
+            eo.out_line("lock cmpxchg QWORD PTR [rdx], rcx");
+        }
+        e.store_op(inst.dest.vreg, ctx, "rax");   // rax = old value
+        return;
+    }
+
+    // STORE / ADD / XCHG: rax = address, rcx = value.
+    let is i32 as sz = e.get_type_size(inst.cast_to);
+    e.load_op(inst.src1.vreg, ctx, "rax");
+    e.load_op(inst.src2.vreg, ctx, "rcx");
+    if (op == d.IR_ATOMIC_STORE) {
+        if (sz == 4) { eo.out_line("xchg DWORD PTR [rax], ecx"); }
+        else { eo.out_line("xchg QWORD PTR [rax], rcx"); }
+        return;
+    }
+    if (op == d.IR_ATOMIC_ADD) {
+        if (sz == 4) { eo.out_line("lock xadd DWORD PTR [rax], ecx"); }
+        else { eo.out_line("lock xadd QWORD PTR [rax], rcx"); }
+        e.store_op(inst.dest.vreg, ctx, "rcx");   // rcx = old value
+        return;
+    }
+    // IR_ATOMIC_XCHG
+    if (sz == 4) { eo.out_line("xchg DWORD PTR [rax], ecx"); }
+    else { eo.out_line("xchg QWORD PTR [rax], rcx"); }
+    e.store_op(inst.dest.vreg, ctx, "rcx");        // rcx = old value
+}
 
 fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;

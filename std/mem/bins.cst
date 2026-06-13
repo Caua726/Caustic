@@ -44,6 +44,8 @@ struct Bins {
     page_size as i64;
     lookup as *u8;
     lookup_entries as i64;
+    lock as u32;          // B6: lazy futex lock (no-op until mem.set_mt())
+    _pad as u32;
 }
 
 
@@ -259,16 +261,28 @@ fn bins_custom(page_size as i64, sizes as *i64, count as i64) as Bins {
 }
 
 // Alloc — O(1) lookup + O(1) freelist pop
+// Public entry: lazy-locked wrapper (no-op lock until mem.set_mt()).
 fn bins_alloc(b as *Bins, size as i64) as *u8 {
+    core._lk(&b.lock);
+    let is *u8 as r = _bins_alloc_inner(b, size);
+    core._unlk(&b.lock);
+    return r;
+}
+
+fn _bins_alloc_inner(b as *Bins, size as i64) as *u8 {
     if (size <= 0) { return cast(*u8, 0); }
 
     // Lazy auto-init: if caller forgot bins_new (or we're loading from a
     // cache path that bypassed init), do it on first alloc. Triggers when
     // lookup_entries == 0 (uninitialized state on a zero-filled struct).
+    // Runs UNDER the lock (double-checked); preserve the lock word across the
+    // struct re-init since *b = bins_new(...) would otherwise zero it.
     if (b.lookup_entries == 0) {
         let is i64 as init_size with mut = 65536;
         if (size > init_size) { init_size = size + 4096; }
+        let is u32 as saved_lock = b.lock;
         *b = bins_new(init_size);
+        b.lock = saved_lock;
     }
 
     let is i64 as idx = _lookup_bin(b, size);
@@ -325,8 +339,15 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
     return cast(*u8, cast(i64, slot) + HEADER_SIZE);
 }
 
-// Free — O(1): header read (no division) + bit test + freelist push
+// Public entry: lazy-locked wrapper.
 fn bins_free(b as *Bins, ptr as *u8) as void {
+    core._lk(&b.lock);
+    _bins_free_inner(b, ptr);
+    core._unlk(&b.lock);
+}
+
+// Free — O(1): header read (no division) + bit test + freelist push
+fn _bins_free_inner(b as *Bins, ptr as *u8) as void {
     if (cast(i64, ptr) == 0) { return; }
 
     let is *u8 as slot = cast(*u8, cast(i64, ptr) - HEADER_SIZE);

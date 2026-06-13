@@ -59,13 +59,20 @@ fn walk_fn_def(node as *ast.Node) as void {
     if (cast(i64, node.body) == 0 && node.is_extern == 0) {
         return;
     }
+    // `with naked` functions take full control: the asm-only body reads args
+    // from registers (never by name) and terminates control flow itself. Skip
+    // param declaration (avoids spurious unused-param warnings) and the
+    // returns-on-all-paths check (the asm body has no IR return).
+    let is i32 as naked = ast.nx_is_naked(node);
     sc.enter_scope();
     sc.stack_offset = 48;
-    let is *ast.Node as param with mut = node.params;
-    while (cast(i64, param) != 0) {
-        let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags);
-        param.var_offset = var.offset;
-        param = param.next;
+    if (naked == 0) {
+        let is *ast.Node as param with mut = node.params;
+        while (cast(i64, param) != 0) {
+            let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags);
+            param.var_offset = var.offset;
+            param = param.next;
+        }
     }
     let is *d.Function as fs = sc.lookup_fn(node.name_ptr, node.name_len);
     if (cast(i64, fs) != 0 && fs.asm_name_len > 0) {
@@ -76,7 +83,7 @@ fn walk_fn_def(node as *ast.Node) as void {
     sc.current_return_type = cast(*u8, node.return_type);
     walk(node.body);
     let is *ast.Type as rt = cast(*ast.Type, node.return_type);
-    if (cast(i64, rt) != cast(i64, ast.type_void) && body_always_returns(node.body) == 0) {
+    if (naked == 0 && cast(i64, rt) != cast(i64, ast.type_void) && body_always_returns(node.body) == 0) {
         sc.sem_error_at2(node, "funcao nao retorna em todos os paths", node.name_ptr, node.name_len);
     }
     node.stack_size = sc.stack_offset;
@@ -697,6 +704,26 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_STRUCT_LIT) { walk_struct_lit(node); return; }
     if (k == ast.NK_VA_START) { walk(node.expr); node.ty = ast.type_void; return; }
     if (k == ast.NK_SQRT) { walk(node.expr); node.ty = ast.type_f64; return; }
+    if (k == ast.NK_ATOMIC) {
+        // Atomic builtins (seq_cst). arg0 must be a pointer to a 4/8-byte int
+        // or pointer; result type is the pointee (LOAD/ADD/XCHG/CAS return the
+        // OLD value), or void for STORE/FENCE.
+        let is *ast.Node as a with mut = node.args;
+        while (cast(i64, a) != 0) { walk(a); a = a.next; }
+        let is i32 as sub = cast(i32, node.val);
+        if (sub == ast.ATOMIC_FENCE) { node.ty = ast.type_void; return; }
+        let is *ast.Node as p0 = node.args;
+        if (cast(i64, p0) == 0 || cast(i64, p0.ty) == 0 || p0.ty.kind != ast.TY_PTR) {
+            sc.sem_error_at(node, "atomic requer ponteiro como primeiro argumento");
+            node.ty = ast.type_i64; return;
+        }
+        let is *ast.Type as pointee = p0.ty.base;
+        if (cast(i64, pointee) == 0 || (pointee.size != 4 && pointee.size != 8)) {
+            sc.sem_error_at(node, "atomic requer ponteiro para inteiro de 4 ou 8 bytes");
+        }
+        if (sub == ast.ATOMIC_STORE) { node.ty = ast.type_void; return; }
+        node.ty = pointee; return;
+    }
     if (k == ast.NK_FNCALL) { walk_fncall(node); return; }
     if (k == ast.NK_CALL_INDIRECT) {
         walk(node.expr);

@@ -11,12 +11,17 @@ struct Header {
     next as *u8;
 }
 
+// THREADS: shared use is lazy-locked (no-op until mem.set_mt()). O(n) coalescing
+// needs a global view, so this stays a single locked heap — for scalable
+// per-thread allocation, give each thread its own Heap.
 struct Heap {
     freelist  as *Header;
     start     as *u8;
     top       as *u8;
     limit     as *u8;
     committed as *u8;     // end of the backed region; the bump commits more on demand
+    lock      as u32;     // B6: lazy futex lock
+    _pad      as u32;
 }
 
 // Commit granularity for the reserve-large + commit-on-grow path. The window is
@@ -64,6 +69,12 @@ fn release(h as *Heap) as void {
 }
 
 fn alloc(h as *Heap, req_size as i64) as *u8 {
+    core._lk(&h.lock);
+    let is *u8 as r = _alloc_inner(h, req_size);
+    core._unlk(&h.lock);
+    return r;
+}
+fn _alloc_inner(h as *Heap, req_size as i64) as *u8 {
     if (req_size <= 0) { return cast(*u8, 0); }
     let is i64 as size with mut = (req_size + 7) & (0 - 8);
     if (size < 8) { size = 8; }
@@ -123,6 +134,11 @@ fn alloc(h as *Heap, req_size as i64) as *u8 {
 }
 
 fn free(h as *Heap, ptr as *u8) as void {
+    core._lk(&h.lock);
+    _free_inner(h, ptr);
+    core._unlk(&h.lock);
+}
+fn _free_inner(h as *Heap, ptr as *u8) as void {
     if (cast(i64, ptr) == 0) { return; }
     if (cast(i64, h) == 0) { return; }
 

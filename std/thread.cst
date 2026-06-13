@@ -1,0 +1,183 @@
+// =======================================================
+// std/thread.cst — Portable 1:1 OS threads (B4)
+//
+// Model: one kernel thread per spawn, no runtime/scheduler. Linux uses a raw
+// clone(2) via a `with naked` trampoline; Windows uses CreateThread. The worker
+// has the fixed signature `fn(arg as i64) as i64`; pass multiple values via a
+// pointer to a context struct. join() returns the worker's i64 result.
+//
+// THREADS: this module is the threading primitive itself. Data races on shared
+// non-atomic memory are UB — synchronize via std/sync.cst or atomic builtins.
+// =======================================================
+
+use "os.cst" as os;
+use "mem/core.cst" as memcore;
+
+// Caller-owned thread handle. Field order matters: fn_addr/arg are first two so
+// the Windows entry shim can read them as [rcx+0]/[rcx+8]; result is at +16 so
+// the clone trampoline can store the worker's return as [rbx+16].
+struct Thread {
+    fn_addr as i64;     // +0   worker fn address
+    arg as i64;         // +8   worker argument
+    result as i64;      // +16  worker return value (written by trampoline/shim)
+    state as i32;       // +24  Linux: kernel-managed tid/ctid futex word (0 = dead)
+    slot as i32;        // +28  worker slot id (compiler parallelization; B-future)
+    handle as i64;      // +32  Windows HANDLE
+    stack_base as i64;  // +40  Linux mmap base (0 once reclaimed)
+    stack_size as i64;  // +48  Linux mmap size
+}
+
+// --- Linux clone trampoline (naked: no prologue would survive the child waking
+// on a fresh stack). SysV args: rdi=flags rsi=newsp rdx=ptid rcx=ctid r8=tls.
+// clone(2) wants ctid in r10 and tls in r8; only rcx->r10 needs moving.
+// Child (rax==0) pops [fn][arg][&t] off its own stack, runs the worker, stores
+// the result at &t+16, and exits THIS thread (syscall 60). Parent returns the tid.
+fn _clone_thread(flags as i64, newsp as i64, ptid as i64, ctid as i64, tls as i64) as i64 with naked {
+    asm("mov r10, rcx\nmov eax, 56\nsyscall\ntest rax, rax\njz .Lcaustic_clone_child\nret\n.Lcaustic_clone_child:\nxor ebp, ebp\npop rax\npop rdi\npop rbx\ncall rax\nmov QWORD PTR [rbx+16], rax\nxor edi, edi\nmov eax, 60\nsyscall\nint 3\n");
+}
+
+// --- Windows entry shim (naked: MS x64 -> SysV). CreateThread passes param in
+// rcx. Preserve rsi/rdi/rbx (MS callee-saved); read fn/arg from the Thread, call
+// the SysV worker with arg in rdi, store result at +16. 3 pushes align rsp so
+// the worker sees rsp%16==8 at entry.
+fn _entry_shim(p as i64) as i64 with naked {
+    asm("push rsi\npush rdi\npush rbx\nmov rbx, rcx\nmov rax, QWORD PTR [rbx]\nmov rdi, QWORD PTR [rbx+8]\ncall rax\nmov QWORD PTR [rbx+16], rax\npop rbx\npop rdi\npop rsi\nret\n");
+}
+
+// === Public API ===
+
+// Start a worker thread. f = fn_ptr(worker) where worker is fn(arg as i64) as i64.
+// Returns 0 on success, -1 on failure. The Thread storage is caller-owned and
+// must outlive the thread (until join).
+fn spawn(t as *Thread, f as *u8, arg as i64) as i32 {
+    // Activate lazy allocator locking before the first thread exists (the 0->1
+    // transition is race-free here — still single-threaded). Idempotent.
+    memcore.set_mt();
+    t.fn_addr = cast(i64, f);
+    t.arg = arg;
+    t.result = 0;
+    t.state = 0;
+    t.handle = 0;
+    t.stack_base = 0;
+    t.stack_size = 0;
+
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as size = 2097152;   // 2 MiB
+        let is *u8 as base = os.linux.mmap(cast(*u8, 0), size, os.linux.PROT_NONE,
+            os.linux.MAP_PRIVATE + os.linux.MAP_ANONYMOUS + os.linux.MAP_STACK, 0 - 1, 0);
+        if (cast(i64, base) == os.linux.MAP_FAILED_PTR || cast(i64, base) == 0) { return cast(i32, 0 - 1); }
+        // Guard page at the lowest address; RW above it. Order matters: the guard
+        // exists before the stack is ever usable (glibc/musl discipline).
+        os.linux.mprotect(cast(*u8, cast(i64, base) + 4096), size - 4096,
+            os.linux.PROT_READ + os.linux.PROT_WRITE);
+        let is i64 as top = cast(i64, base) + size;   // page-aligned => 16-aligned
+        // Seed [top-24]=fn [top-16]=arg [top-8]=&t ; newsp = top-24.
+        let is *i64 as s0 = cast(*i64, top - 24); *s0 = cast(i64, f);
+        let is *i64 as s1 = cast(*i64, top - 16); *s1 = arg;
+        let is *i64 as s2 = cast(*i64, top - 8);  *s2 = cast(i64, t);
+        t.stack_base = cast(i64, base);
+        t.stack_size = size;
+        // ptid==ctid==&t.state: PARENT_SETTID writes the tid before clone returns;
+        // CHILD_CLEARTID zeroes it and (non-private) futex-wakes on death.
+        let is i64 as tid = _clone_thread(os.linux.CLONE_THREAD_FLAGS, top - 24,
+            cast(i64, &t.state), cast(i64, &t.state), cast(i64, t));
+        if (tid < 0) {
+            os.linux.munmap(base, size);
+            t.stack_base = 0;
+            return cast(i32, 0 - 1);
+        }
+        return 0;
+    }
+
+    if (os.current() == os.OS_WINDOWS) {
+        let is i64 as h = os.windows.CreateThread(cast(*u8, 0), 2097152,
+            fn_ptr(_entry_shim), cast(*u8, t), os.windows.STACK_SIZE_PARAM_IS_A_RESERVATION,
+            cast(*u32, 0));
+        if (h == 0) { return cast(i32, 0 - 1); }
+        t.handle = h;
+        return 0;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// Wait for the thread to finish; returns its i64 result. Idempotent (a second
+// join sees state already 0 / handle reclaimed).
+fn join(t as *Thread) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        // NON-private wait: the kernel's CLEARTID wake is a non-private FUTEX_WAKE;
+        // a private waiter hashes to a different bucket and misses it.
+        let is i32 as s with mut = atomic_load(&t.state);
+        while (s != 0) {
+            os.linux.futex(cast(*u8, &t.state), os.linux.FUTEX_WAIT, cast(i64, s),
+                cast(*u8, 0), cast(*u8, 0), 0);
+            s = atomic_load(&t.state);
+        }
+        let is i64 as r = t.result;
+        if (t.stack_base != 0) {
+            os.linux.munmap(cast(*u8, t.stack_base), t.stack_size);
+            t.stack_base = 0;   // double-join safe
+        }
+        return r;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        if (t.handle != 0) {
+            os.windows.WaitForSingleObject(t.handle, os.windows.INFINITE);
+            os.windows.CloseHandle(t.handle);
+            t.handle = 0;
+        }
+        return t.result;
+    }
+    return t.result;
+}
+
+fn current_id() as i64 {
+    if (os.current() == os.OS_LINUX)   { return os.linux.gettid(); }
+    if (os.current() == os.OS_WINDOWS) { return cast(i64, os.windows.GetCurrentThreadId()); }
+    return 0;
+}
+
+fn yield_now() as void {
+    if (os.current() == os.OS_LINUX)   { os.linux.sched_yield(); return; }
+    if (os.current() == os.OS_WINDOWS) { os.windows.SwitchToThread(); return; }
+}
+
+// CPU spin-loop hint (x86 `pause`) — yields the pipeline in a busy-wait, cutting
+// power and easing the memory-order machinery during lock spins.
+fn spin_hint() as void with naked { asm("pause\nret\n"); }
+
+// Cache line size for padding shared/per-slot data against false sharing.
+let is i64 as CACHE_LINE with imut = 64;
+
+// === Portable futex shim — the single OS-abstraction point all of std/sync.cst
+// builds on. Lock words are u32. Spurious wakeups are allowed by contract on
+// both backends, so every caller must re-check in a loop. These use PRIVATE on
+// Linux (process-local locks); join() above deliberately does NOT (kernel wake).
+
+fn futex_wait(addr as *u32, expect as u32) as void {
+    if (os.current() == os.OS_LINUX) {
+        os.linux.futex(cast(*u8, addr), os.linux.FUTEX_WAIT_PRIVATE, cast(i64, expect),
+            cast(*u8, 0), cast(*u8, 0), 0);
+        return;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        let is u32 as cmp with mut = expect;
+        os.windows.RtlWaitOnAddress(cast(*u8, addr), cast(*u8, &cmp), 4, cast(*u8, 0));
+        return;
+    }
+}
+
+fn futex_wake_one(addr as *u32) as void {
+    if (os.current() == os.OS_LINUX) {
+        os.linux.futex(cast(*u8, addr), os.linux.FUTEX_WAKE_PRIVATE, 1, cast(*u8, 0), cast(*u8, 0), 0);
+        return;
+    }
+    if (os.current() == os.OS_WINDOWS) { os.windows.RtlWakeAddressSingle(cast(*u8, addr)); return; }
+}
+
+fn futex_wake_all(addr as *u32) as void {
+    if (os.current() == os.OS_LINUX) {
+        os.linux.futex(cast(*u8, addr), os.linux.FUTEX_WAKE_PRIVATE, 2147483647, cast(*u8, 0), cast(*u8, 0), 0);
+        return;
+    }
+    if (os.current() == os.OS_WINDOWS) { os.windows.RtlWakeAddressAll(cast(*u8, addr)); return; }
+}
