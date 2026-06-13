@@ -28,7 +28,6 @@ use "../caustic-linker/main.cst" as ldmod;
 use "version.cst" as ver;
 use "parser/dump.cst" as dump;
 use "../std/os.cst" as os;
-use "../std/env.cst" as env;
 
 // ── Utility functions ──────────────────────────────────────────────
 
@@ -196,6 +195,9 @@ let is i32 as g_opt_level with mut = 0;
 let is i32 as g_debug_ir with mut = 0;
 let is i32 as g_debug_parser with mut = 0;
 let is i32 as g_quiet with mut = 0;
+// Worker count for parallel --module-objects emission. 0 = auto (online cores).
+// Set by `-j N`.
+let is i32 as g_jobs with mut = 0;
 // Write the .s to disk as a debug cache after the in-process pipeline assembles
 // it from memory (default on). --no-asm-cache skips the write — the .s isn't
 // needed downstream (the assembler already consumed the in-memory copy), so
@@ -215,6 +217,11 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         } else if (str_eq(arg, arglen, "-o", 2) == 1) {
             ai = ai + 1;
             if (ai < argc) { g_output_path = argv_arr[ai]; }
+        } else if (str_eq(arg, arglen, "--parallel", 10) == 1 || str_eq(arg, arglen, "-j", 2) == 1) {
+            // Degree of parallelism for --module-objects emission. `--parallel N`
+            // (or the short `-j N`). 0 / omitted = auto-detect online cores.
+            ai = ai + 1;
+            if (ai < argc) { g_jobs = cast(i32, parse_int_arg(cast(*u8, argv_arr[ai]))); }
         } else if (str_eq(arg, arglen, "--max-ram", 9) == 1) {
             ai = ai + 1;
             if (ai < argc) {
@@ -965,18 +972,14 @@ fn _emit_one_obj(prog as *u8, prefix as *u8, plen as i32, dir as *u8, filename a
     return 0;
 }
 
-// Worker count for parallel --module-objects emission. CAUSTIC_JOBS overrides;
-// otherwise the online-CPU count (Linux sched_getaffinity), capped to the task
-// count and to MAX_MO_WORKERS. Non-Linux or W<=1 falls back to sequential.
+// Degree of parallelism for --module-objects emission. The `--parallel N` / `-j N`
+// flag (g_jobs) wins; otherwise the online-CPU count (Linux sched_getaffinity),
+// capped to the task count and to MAX_MO_WORKERS. Non-Linux or W<=1 → sequential.
 let is i32 as MAX_MO_WORKERS with imut = 64;
 
 fn _detect_jobs(ntasks as i32) as i32 {
-    let is *u8 as e = env.getenv("CAUSTIC_JOBS");
-    if (cast(i64, e) != 0 && e[0] != cast(u8, 0)) {
-        let is i32 as v with mut = 0;
-        let is i64 as i with mut = 0;
-        while (e[i] >= cast(u8, 48) && e[i] <= cast(u8, 57)) { v = v * 10 + cast(i32, e[i]) - 48; i = i + 1; }
-        if (v < 1) { v = 1; }
+    if (g_jobs >= 1) {
+        let is i32 as v with mut = g_jobs;
         if (v > ntasks) { v = ntasks; }
         if (v > MAX_MO_WORKERS) { v = MAX_MO_WORKERS; }
         return v;
@@ -1264,8 +1267,6 @@ fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
 // ── Main: thin orchestrator ──────────────────────────────────────
 
 fn main(argc as i64, argv as i64) as i32 {
-    // Initialize env so getenv() works (CAUSTIC_JOBS for parallel emission).
-    env.init(argc, cast(*u8, argv));
     if (argc < 2) {
         io.write_str(io.STDERR, "Usage: caustic <source.cst>... [-o output] [-c] [-O1] [--profile]\n");
         io.write_str(io.STDERR, "       caustic --version | --help\n");
@@ -1292,6 +1293,8 @@ fn main(argc as i64, argv as i64) as i32 {
         io.write_str(io.STDOUT, "  -o <file>       Output executable\n");
         io.write_str(io.STDOUT, "  -c              Compile only (no main required)\n");
         io.write_str(io.STDOUT, "  -O0, -O1        Optimization level\n");
+        io.write_str(io.STDOUT, "  --parallel N    Parallel workers for --module-objects emission\n");
+        io.write_str(io.STDOUT, "  -j N            (Linux; default: number of cores)\n");
         io.write_str(io.STDOUT, "  -lname          Link dynamic library\n");
         io.write_str(io.STDOUT, "  --profile       Show per-phase timing\n");
         io.write_str(io.STDOUT, "  --cache <dir>   Cache directory for incremental builds\n");
