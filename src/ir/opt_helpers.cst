@@ -402,6 +402,91 @@ fn pass_dce(func as *d.IRFunction, vc_alloc as i32, copy_of as *i32) as void {
     d.opt_free(cast(*u8, def_count));
 }
 
+// === Vreg compaction ===
+// new_vreg() is a monotonic counter; mem2reg/copy-prop/CSE/DCE delete the
+// instructions that defined many vregs but never renumber, so func.vreg_count is
+// a high-water mark riddled with dead holes. The register allocator is O(n^2) in
+// vreg_count (n*n interference matrix + per-vreg neighbor scans), so it pays full
+// price for every hole. Renumber the live vregs into a dense [0..m) range: a
+// bijective rename — zero codegen-quality change — that shrinks n and gives a
+// quadratic speedup in regalloc (and shrinks the matrix + every per-vreg array).
+//
+// Dead instructions are skipped by build_intervals (alloc_core) and codegen, so
+// their operands are never read; we still remap them (clamping unknown vregs to
+// 0) so no stale out-of-range vreg can survive. Assignment is in instruction-scan
+// order, so the result is deterministic. Output differs from the pre-compaction
+// allocator (different but valid coloring) — verify via the self-host fixpoint.
+fn pass_compact_vregs(func as *d.IRFunction) as void {
+    let is i32 as old_n = func.vreg_count;
+    if (old_n <= 0) { return; }
+    let is *i32 as vmap = cast(*i32, d.opt_alloc(cast(i64, old_n) * 4));
+    let is i32 as i with mut = 0;
+    while (i < old_n) {
+        let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, i) * 4);
+        *mp = cast(i32, 0 - 1);
+        i = i + 1;
+    }
+    let is i32 as nxt with mut = 0;
+    // Pass 1: live instructions — assign dense ids (scan order) and rewrite.
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.dest.op_type == d.OP_VREG) {
+                let is i32 as o = inst.dest.vreg;
+                if (o >= 0 && o < old_n) {
+                    let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, o) * 4);
+                    if (*mp < 0) { *mp = nxt; nxt = nxt + 1; }
+                    inst.dest.vreg = *mp;
+                }
+            }
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is i32 as o = inst.src1.vreg;
+                if (o >= 0 && o < old_n) {
+                    let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, o) * 4);
+                    if (*mp < 0) { *mp = nxt; nxt = nxt + 1; }
+                    inst.src1.vreg = *mp;
+                }
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as o = inst.src2.vreg;
+                if (o >= 0 && o < old_n) {
+                    let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, o) * 4);
+                    if (*mp < 0) { *mp = nxt; nxt = nxt + 1; }
+                    inst.src2.vreg = *mp;
+                }
+            }
+        }
+        inst = inst.next;
+    }
+    // Pass 2: dead instructions — remap if known, else clamp to 0 (keep in range).
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 1) {
+            if (inst.dest.op_type == d.OP_VREG) {
+                let is i32 as o = inst.dest.vreg;
+                let is i32 as nv with mut = 0;
+                if (o >= 0 && o < old_n) { let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, o) * 4); if (*mp >= 0) { nv = *mp; } }
+                inst.dest.vreg = nv;
+            }
+            if (inst.src1.op_type == d.OP_VREG) {
+                let is i32 as o = inst.src1.vreg;
+                let is i32 as nv with mut = 0;
+                if (o >= 0 && o < old_n) { let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, o) * 4); if (*mp >= 0) { nv = *mp; } }
+                inst.src1.vreg = nv;
+            }
+            if (inst.src2.op_type == d.OP_VREG) {
+                let is i32 as o = inst.src2.vreg;
+                let is i32 as nv with mut = 0;
+                if (o >= 0 && o < old_n) { let is *i32 as mp = cast(*i32, cast(i64, vmap) + cast(i64, o) * 4); if (*mp >= 0) { nv = *mp; } }
+                inst.src2.vreg = nv;
+            }
+        }
+        inst = inst.next;
+    }
+    func.vreg_count = nxt;
+    d.opt_free(cast(*u8, vmap));
+}
+
 // === Pass 3: Final resolve (forward) ===
 
 fn pass_final_resolve(func as *d.IRFunction, copy_of as *i32) as void {
