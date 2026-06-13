@@ -133,6 +133,36 @@ fn gen_func(func as *d.IRFunction) as void {
     eo.out_str(func.asm_name_ptr, func.asm_name_len);
     eo.out_str(":\n", 2);
 
+    // Dynamic-stack probe (recursion/indirect programs). Before this frame
+    // descends — pushes AND sub rsp — make sure the committed stack reaches the
+    // lowest address it (plus the grow helper) will touch; if not,
+    // __caustic_stkgrow commits more via SYS_COMMIT. Emitted ABOVE the pushes so
+    // it guards them too. rax is caller-saved scratch at entry (never an arg),
+    // so clobbering it here is free; the helper preserves everything else. Every
+    // function probes because recursion can place any of them at unbounded
+    // depth. The helper itself is hand-emitted (not via gen_func) so it never
+    // probes itself.
+    if (tgt.target_get().object_format == 3 && tgt.cse_stack_dynamic_get() == 1) {
+        let is i32 as descent = (1 + push_count) * 8 + total;
+        let is i64 as pid2 = cast(i64, sa_probe_counter);
+        sa_probe_counter = sa_probe_counter + 1;
+        eo.out_cstr("  lea rax, [rsp-");
+        eo.out_int(cast(i64, descent) + cast(i64, SA_PROBE_MARGIN));
+        eo.out_cstr("]\n");
+        // r11 is caller-saved scratch (never an arg), free to clobber at entry.
+        // Load-then-compare avoids `cmp reg, [rip+mem]`, which the ALU encoder
+        // doesn't form (only mov does rip-relative memory).
+        eo.out_cstr("  mov r11, QWORD PTR [rip+__caustic_stk_bottom]\n");
+        eo.out_cstr("  cmp rax, r11\n");
+        eo.out_cstr("  jae .Lsk");
+        eo.out_int(pid2);
+        eo.out_cstr("\n");
+        eo.out_cstr("  call __caustic_stkgrow\n");
+        eo.out_cstr(".Lsk");
+        eo.out_int(pid2);
+        eo.out_cstr(":\n");
+    }
+
     // Prologue
     eo.out_line("push rbp");
     eo.out_line("mov rbp, rsp");
@@ -439,8 +469,26 @@ fn set_opt_level(level as i32) as void {
 // frame, the SysV red zone, and 16-byte alignment slack. Traceable ABI cost.
 let is i32 as SA_ENTRY_OVERHEAD with imut = 8192;
 
+// Default reserve ceiling for a dynamic-stack program (no --stack-size given):
+// 8 MiB, the Linux RLIMIT_STACK default. The program commits up to here on
+// demand; recursing past it is a clean stack-overflow exit. --stack-size raises
+// or lowers it. MUST match the kernel's elf.STACK_DYN_CEILING.
+let is i32 as STACK_DYN_CEILING_DEFAULT with imut = 8388608;
+
 let is i32 as sa_recursion_seen with mut = 0;
 let is i32 as sa_indirect_seen with mut = 0;
+
+// Unique-label counter for dynamic-stack prologue probes. Monotonic per
+// compile (one compile per process) → deterministic labels → byte-identical
+// self-host output.
+let is i32 as sa_probe_counter with mut = 0;
+
+// Stack-probe margin (bytes): committed headroom the probe reserves below the
+// frame for __caustic_stkgrow's own call frame + register saves, so the helper
+// always runs in committed memory. Comfortably covers its 8 pushes + the
+// syscall path; the growth invariant (every caller enters >= MARGIN above the
+// committed bottom) holds by induction from _start's 128 KiB initial window.
+let is i32 as SA_PROBE_MARGIN with imut = 512;
 
 // Record frame + direct-call edges + indirect-call flag while instructions live.
 fn sa_record(func as *d.IRFunction, frame_bytes as i32) as void {
@@ -520,15 +568,116 @@ fn sa_compute(p as *d.IRProgram) as void {
     let is i32 as deepest = sa_longest(p, p.main_func);
     let is i32 as flag = tgt.cse_stack_size_get();
     if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
-        if (flag > 0) { return; }   // author declared it — honor the flag
-        io.write_str(io.STDERR, "caustic: cannot compute worst-case stack (");
-        if (sa_recursion_seen == 1) { io.write_str(io.STDERR, "recursion"); }
-        else { io.write_str(io.STDERR, "indirect call via function pointer"); }
-        io.write_str(io.STDERR, ") — declare it explicitly with --stack-size=<bytes>\n");
-        io.exit(1);
+        // Undecidable statically (recursion depth / indirect target are runtime
+        // facts). Don't refuse and don't over-commit — mark the program DYNAMIC:
+        // codegen emits prologue stack probes that grow the committed stack on
+        // demand via SYS_COMMIT (see emit_dynamic_stack_runtime + the probe in
+        // gen_func). The header stacksize becomes the reserve CEILING.
+        tgt.cse_stack_dynamic_set(1);
+        if (flag <= 0) { tgt.cse_stack_size_set(STACK_DYN_CEILING_DEFAULT); }
+        return;
     }
     if (flag > 0) { return; }   // explicit override wins even when computable
     tgt.cse_stack_size_set(deepest + SA_ENTRY_OVERHEAD);
+}
+
+// Decide dynamic-ness BEFORE the codegen loop, so gen_func knows whether to
+// emit prologue probes. sa_compute (after the loop) sizes the stack, but the
+// PROBE has to be emitted during gen_func — hence this early pass. Runs after
+// the -O1 inline phase so it sees the same call graph gen_func will emit:
+// materialize each reachable function's IR (regen if freed), build its call
+// edges (sa_record), then walk from main for a cycle (recursion) or an indirect
+// call. Either → the program grows its stack dynamically. CSE target only.
+fn sa_predetect(p as *d.IRProgram) as void {
+    if (tgt.target_get().object_format != 3) { return; }
+    if (cast(i64, p.main_func) == 0) { return; }
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
+            if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+                irp.regen_func_ir(f);
+            }
+            sa_record(f, 0);   // edges + sa_indirect; gen_func sets the real frame later
+        }
+        f = f.next;
+    }
+    sa_recursion_seen = 0;
+    sa_indirect_seen = 0;
+    sa_longest(p, p.main_func);
+    if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
+        tgt.cse_stack_dynamic_set(1);
+        let is i32 as flag = tgt.cse_stack_size_get();
+        if (flag <= 0) { tgt.cse_stack_size_set(STACK_DYN_CEILING_DEFAULT); }
+    }
+}
+
+// Emit the dynamic-stack runtime (CSE dynamic programs only): the committed-
+// bottom tracker + the grow helper. Called once after all functions.
+//
+// __caustic_stk_bottom holds the lowest currently-committed stack address,
+// pre-initialized to (USER_STACK_TOP_VA - INITIAL_STACK_COMMIT) — no _start
+// patch needed since both are compile-time constants. THESE TWO CONSTANTS MUST
+// MATCH THE KERNEL (causticos kernel/elf.cst: USER_STACK_TOP_VA and
+// INITIAL_STACK_COMMIT); they are the explicit-growth ABI between toolchain and
+// loader.
+//
+// __caustic_stkgrow(rax = lowest address the caller needs): commit
+// [page_down(rax) - 64 KiB, committed_bottom) via SYS_COMMIT(27), update the
+// tracker. Leaf, preserves every GP register (it runs mid-prologue, before the
+// caller has saved its args). Recursing past the reserved ceiling makes
+// SYS_COMMIT fail → exit(134), a clean stack overflow.
+fn emit_dynamic_stack_runtime() as void {
+    if (tgt.target_get().object_format != 3) { return; }
+    if (tgt.cse_stack_dynamic_get() != 1) { return; }
+
+    eo.out_cstr(".section .data\n");
+    eo.out_cstr("__caustic_stk_bottom:\n");
+    eo.out_cstr("  .quad ");
+    eo.out_int(0x00007FFFFFFFE000 - 0x20000);   // USER_STACK_TOP_VA - INITIAL_STACK_COMMIT
+    eo.out_cstr("\n");
+
+    eo.out_cstr(".section .text\n");
+    eo.out_cstr("__caustic_stkgrow:\n");
+    eo.out_line("push rdi");
+    eo.out_line("push rsi");
+    eo.out_line("push rdx");
+    eo.out_line("push rcx");
+    eo.out_line("push r8");
+    eo.out_line("push r9");
+    eo.out_line("push r10");
+    eo.out_line("push r11");
+    eo.out_line("shr rax, 12");                     // page-align the needed address down
+    eo.out_line("shl rax, 12");                     // (avoids AND with a negative immediate)
+    eo.out_line("sub rax, 65536");                  // grow 64 KiB ahead to amortize
+    eo.out_cstr("  mov rcx, QWORD PTR [rip+__caustic_stk_bottom]\n");
+    eo.out_line("cmp rax, rcx");                     // already covered? (defensive)
+    eo.out_cstr("  jae .Lsg_done\n");
+    eo.out_line("mov rdi, rax");                     // SYS_COMMIT addr = new bottom
+    eo.out_line("mov rsi, rcx");
+    eo.out_line("sub rsi, rax");                     // len = old_bottom - new_bottom
+    eo.out_line("mov rdx, 3");                       // PROT_READ | PROT_WRITE
+    eo.out_line("mov rax, 27");                      // SYS_COMMIT
+    eo.out_line("syscall");
+    eo.out_line("test rax, rax");
+    eo.out_cstr("  jnz .Lsg_fail\n");
+    // The assembler forms rip-relative LOADs but not STOREs, so take the
+    // address first (r10 is saved above) and store through it.
+    eo.out_cstr("  lea r10, [rip+__caustic_stk_bottom]\n");
+    eo.out_cstr("  mov QWORD PTR [r10], rdi\n");
+    eo.out_cstr(".Lsg_done:\n");
+    eo.out_line("pop r11");
+    eo.out_line("pop r10");
+    eo.out_line("pop r9");
+    eo.out_line("pop r8");
+    eo.out_line("pop rcx");
+    eo.out_line("pop rdx");
+    eo.out_line("pop rsi");
+    eo.out_line("pop rdi");
+    eo.out_line("ret");
+    eo.out_cstr(".Lsg_fail:\n");
+    eo.out_line("mov rdi, 134");                     // stack-overflow exit code
+    eo.out_line("mov rax, 3");                       // SYS_PROC_EXIT
+    eo.out_line("syscall");
 }
 
 fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
@@ -587,6 +736,11 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
         }
     }
 
+    // Decide dynamic-stack-ness before emitting any prologue (the probe lives
+    // in gen_func and needs cse_stack_dynamic set). Post-inline so the call
+    // graph matches what we're about to emit.
+    sa_predetect(p);
+
     // Codegen per-function: regen freed functions, then codegen + free
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: funcs\n"); }
     f = p.functions;
@@ -619,6 +773,10 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
 
     // Declare the program's stack from its now-known frames (CSE target only).
     if (tgt.target_get().object_format == 3) { sa_compute(p); }
+
+    // Dynamic-stack runtime: the committed-bottom global + grow helper the
+    // prologue probes reference (no-op unless the program was marked dynamic).
+    emit_dynamic_stack_runtime();
 
     // rodata (after codegen loop so regen'd strings are included)
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: rodata\n"); }
