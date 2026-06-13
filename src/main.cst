@@ -1021,11 +1021,36 @@ fn _emit_mo_slice(prog as *u8, dir as *u8, filename as *u8, flen as i32,
     return st;
 }
 
-// Fork ws workers (parent = worker 0, also emits the root module) to emit the
-// root + the ntask import modules into <dir>/<prefix>.o. Each .o is written by
-// exactly one worker from the COW-shared, post-frontend program state, so the
-// outputs are independent and order-free. ws<=1 or non-Linux → sequential.
-// Returns 0 on success, 1 if any worker failed.
+// Pull tasks atomically from the shared counter at *ctr until the unified task
+// list (index 0 = root module, 1..ntask = import modules) is exhausted. Dynamic
+// work-stealing: a worker that finishes a small module immediately claims the
+// next one, so uneven module sizes — and the parent paying frontend+link — don't
+// strand cores the way static striding did. Each .o is independent of who emits
+// it (codegen reads one function's IR), so the result stays deterministic.
+fn _emit_dynamic(prog as *u8, dir as *u8, filename as *u8, flen as i32,
+                 tp as *i64, tl as *i32, ntask as i32,
+                 root_pp as *u8, root_pl as i32, ctr as *i64) as i32 {
+    let is i32 as st with mut = 0;
+    let is i64 as total = cast(i64, ntask) + 1;
+    while (1 == 1) {
+        let is i64 as i = atomic_add(ctr, 1);   // claim a task; returns the OLD value
+        if (i >= total) { return st; }
+        if (i == 0) {
+            if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { st = 1; }
+        } else {
+            let is i32 as ti = cast(i32, i) - 1;
+            if (_emit_one_obj(prog, cast(*u8, tp[ti]), tl[ti], dir, filename, flen) != 0) { st = 1; }
+        }
+    }
+    return st;
+}
+
+// Fork ws workers (parent works too) to emit the root + the ntask import modules
+// into <dir>/<prefix>.o. Each .o is written by exactly one worker from the COW-
+// shared, post-frontend program state, so the outputs are independent and order-
+// free. Tasks are handed out dynamically through a MAP_SHARED atomic counter so
+// the cores stay busy regardless of module-size skew. ws<=1 or non-Linux →
+// sequential. Returns 0 on success, 1 if any worker failed.
 fn _fork_emit(prog as *u8, dir as *u8, filename as *u8, flen as i32,
               tp as *i64, tl as *i32, ntask as i32,
               root_pp as *u8, root_pl as i32, ws as i32) as i32 {
@@ -1035,17 +1060,23 @@ fn _fork_emit(prog as *u8, dir as *u8, filename as *u8, flen as i32,
         if (_emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, 0, 1) != 0) { status = 1; }
         return status;
     }
+    // Shared task counter: MAP_SHARED so atomic_add is visible across the fork
+    // (a private/COW page would give each process its own copy). mmap zero-fills,
+    // so the counter starts at 0 = the root task.
+    let is *u8 as ctrp = os.linux.mmap(cast(*u8, 0), 4096,
+        os.linux.PROT_READ | os.linux.PROT_WRITE,
+        os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0);
+    let is *i64 as ctr = cast(*i64, ctrp);
     let is i32 as w with mut = 1;
     while (w < ws) {
         let is i64 as pid = os.linux.fork();
         if (pid == 0) {
-            let is i32 as cst = _emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, w, ws);
-            os.linux.exit(cast(i64, cst));   // child process exits with its slice status
+            let is i32 as cst = _emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr);
+            os.linux.exit(cast(i64, cst));   // child exits with its status
         }
         w = w + 1;
     }
-    if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
-    if (_emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, 0, ws) != 0) { status = 1; }
+    if (_emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr) != 0) { status = 1; }
     let is i32 as c with mut = 1;
     while (c < ws) {
         let is i32 as wstatus with mut = 0;
@@ -1053,6 +1084,7 @@ fn _fork_emit(prog as *u8, dir as *u8, filename as *u8, flen as i32,
         if (((wstatus >> 8) & 255) != 0) { status = 1; }
         c = c + 1;
     }
+    os.linux.munmap(ctrp, 4096);
     return status;
 }
 
