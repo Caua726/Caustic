@@ -186,7 +186,8 @@ fn _mem_abort(used as i64) as void {
 // counter; on Linux the real RSS is read instead. Aborts if over the cap.
 fn _mem_guard(extra as i64) as void {
     if (_mem_limit <= 0) { return; }
-    _mem_counted = _mem_counted + extra;
+    atomic_add(&_mem_counted, extra);   // stat counter; may be touched off-lock
+
     let is i64 as used = _mem_rss();
     if (used > _mem_limit) { _mem_abort(used); }
 }
@@ -266,4 +267,47 @@ fn write_str(fd as i64, s as *u8) as void {
     let is i64 as len with mut = 0;
     while (s[len] != cast(u8, 0)) { len = len + 1; }
     _write_raw(fd, s, len);
+}
+
+// --- Lazy allocator locking (B6) ---
+// Single-threaded programs pay one load+branch per lock op (the `_mt == 0`
+// fast path) — exactly the glibc __libc_single_threaded design. _mt is set to 1
+// (and never reset) by thread.spawn() before the first thread is created, when
+// the process is still single-threaded, so the 0->1 transition is race-free.
+// The lock itself is a Drepper 3-state futex mutex on a u32 word (matching
+// std/sync.cst), implemented inline here to avoid a mem<->thread import cycle.
+let is i32 as _mt with mut = 0;
+
+fn set_mt() as void { _mt = 1; fence(); }
+fn mt_active() as i32 { return _mt; }
+
+fn _lk_wait(addr as *u32, expect as u32) as void {
+    if (os.current() == os.OS_LINUX) {
+        os.linux.futex(cast(*u8, addr), os.linux.FUTEX_WAIT_PRIVATE, cast(i64, expect),
+            cast(*u8, 0), cast(*u8, 0), 0);
+        return;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        let is u32 as cmp with mut = expect;
+        os.windows.RtlWaitOnAddress(cast(*u8, addr), cast(*u8, &cmp), 4, cast(*u8, 0));
+        return;
+    }
+}
+fn _lk_wake(addr as *u32) as void {
+    if (os.current() == os.OS_LINUX) {
+        os.linux.futex(cast(*u8, addr), os.linux.FUTEX_WAKE_PRIVATE, 1, cast(*u8, 0), cast(*u8, 0), 0);
+        return;
+    }
+    if (os.current() == os.OS_WINDOWS) { os.windows.RtlWakeAddressSingle(cast(*u8, addr)); return; }
+}
+
+// Lock/unlock a u32 word. No-op until set_mt() (single-thread fast path).
+fn _lk(l as *u32) as void {
+    if (_mt == 0) { return; }
+    if (atomic_cas(l, 0, 1) == 0) { return; }
+    while (atomic_xchg(l, 2) != 0) { _lk_wait(l, 2); }
+}
+fn _unlk(l as *u32) as void {
+    if (_mt == 0) { return; }
+    if (atomic_xchg(l, 0) == 2) { _lk_wake(l); }
 }

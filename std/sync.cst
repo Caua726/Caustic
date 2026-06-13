@@ -1,0 +1,311 @@
+// =======================================================
+// std/sync.cst — Synchronization primitives (B5)
+//
+// All primitives are built on the portable futex shim in std/thread.cst
+// (futex_wait / futex_wake_one / futex_wake_all over u32 words) plus the
+// seq_cst atomic builtins. Every lock word is a u32; every primitive is valid
+// from its zero value (no init/destroy lifecycle). Spurious wakeups are allowed
+// by the futex contract, so every wait is in a loop.
+//
+// Memory model: DRF-SC. Data races on non-atomic shared memory are UB; lock()/
+// unlock() (and atomic ops) establish happens-before. The compiler does not
+// reorder memory across atomics.
+//
+// THREADS: this module is thread-safe by construction (that is its purpose).
+// =======================================================
+
+use "thread.cst" as thread;
+use "mem.cst" only bins as mem;
+
+// Channel buffers come from a lazy bins instance (allocated once at channel
+// creation — create channels before spawning workers; send/recv never allocate).
+let is mem.Bins as _ch_bins with mut;
+let is i32 as _ch_ready with mut = 0;
+fn _ch_alloc(size as i64) as *u8 {
+    if (_ch_ready == 0) { _ch_bins = mem.bins.bins_new(65536); _ch_ready = 1; }
+    return mem.bins.bins_alloc(&_ch_bins, size);
+}
+
+// ---- u32 subtract-by-one helper (lock xadd of 0xFFFFFFFF) ----
+fn _dec_word(w as *u32) as u32 { return atomic_add(w, cast(u32, 0 - 1)); }
+
+// =======================================================
+// Spinlock — TTAS (test, then test-and-set). Spin on a plain load until the
+// word looks free, only then attempt the locking CAS — this keeps the cache
+// line Shared across spinners instead of an RFO storm. For SHORT critical
+// sections with threads <= cores; otherwise use Mutex.
+// =======================================================
+struct Spinlock { state as u32; }
+
+fn spin_lock(s as *Spinlock) as void {
+    while (1) {
+        if (atomic_cas(&s.state, 0, 1) == 0) { return; }
+        while (atomic_load(&s.state) != 0) { thread.spin_hint(); }
+    }
+}
+fn spin_trylock(s as *Spinlock) as i32 {
+    if (atomic_cas(&s.state, 0, 1) == 0) { return 1; }
+    return 0;
+}
+fn spin_unlock(s as *Spinlock) as void { atomic_store(&s.state, 0); }
+
+// =======================================================
+// Mutex — Drepper 3-state futex mutex (the Rust std / glibc lll design).
+//   state: 0 = unlocked, 1 = locked (no waiters), 2 = locked (maybe waiters)
+// Uncontended lock/unlock is one CAS / one xchg, zero syscalls. A bounded spin
+// precedes parking; once any waiter parks (state==2) further spinning is futile.
+// =======================================================
+struct Mutex { state as u32; }
+
+fn mutex_lock(m as *Mutex) as void {
+    // Fast path.
+    if (atomic_cas(&m.state, 0, 1) == 0) { return; }
+    // Bounded spin (relaxed loads). Stop if a waiter has already parked.
+    let is i32 as spins with mut = 0;
+    while (spins < 100) {
+        let is u32 as s = atomic_load(&m.state);
+        if (s == 0) {
+            if (atomic_cas(&m.state, 0, 1) == 0) { return; }
+        } else if (s == 2) {
+            spins = 100;   // someone parked — spinning can't win
+        } else {
+            thread.spin_hint();
+            spins = spins + 1;
+        }
+    }
+    // Contended: mark CONTENDED and park until we win. Re-acquire as 2 (not 1):
+    // we can't know there are no other waiters (Drepper's rule).
+    while (atomic_xchg(&m.state, 2) != 0) {
+        thread.futex_wait(&m.state, 2);
+    }
+}
+
+fn mutex_trylock(m as *Mutex) as i32 {
+    if (atomic_cas(&m.state, 0, 1) == 0) { return 1; }
+    return 0;
+}
+
+fn mutex_unlock(m as *Mutex) as void {
+    // If there were waiters (state was 2), wake one. NB: after this store the
+    // mutex memory must not be touched again (it may be freed by another thread).
+    if (atomic_xchg(&m.state, 0) == 2) { thread.futex_wake_one(&m.state); }
+}
+
+// =======================================================
+// Cond — condition variable as a single notification counter (Rust std design).
+// wait() snapshots the counter, drops the mutex, and futex-waits on the counter;
+// a notify between unlock and wait bumps the counter, so futex_wait returns
+// immediately — missed wakeups are impossible. Always wait in a predicate loop.
+// =======================================================
+struct Cond { seq as u32; }
+
+fn cond_wait(c as *Cond, m as *Mutex) as void {
+    let is u32 as s = atomic_load(&c.seq);
+    mutex_unlock(m);
+    thread.futex_wait(&c.seq, s);
+    mutex_lock(m);
+}
+fn cond_signal(c as *Cond) as void {
+    atomic_add(&c.seq, 1);
+    thread.futex_wake_one(&c.seq);
+}
+fn cond_broadcast(c as *Cond) as void {
+    atomic_add(&c.seq, 1);
+    thread.futex_wake_all(&c.seq);
+}
+
+// =======================================================
+// Once — run an initializer exactly once across threads.
+//   state: 0 = not run, 1 = running, 2 = done
+// =======================================================
+struct Once { state as u32; }
+
+// f = fn_ptr(init) where init is fn() as void.
+fn once_run(o as *Once, f as *u8) as void {
+    if (atomic_load(&o.state) == 2) { return; }
+    if (atomic_cas(&o.state, 0, 1) == 0) {
+        call(f);
+        atomic_store(&o.state, 2);
+        thread.futex_wake_all(&o.state);
+        return;
+    }
+    while (atomic_load(&o.state) != 2) {
+        thread.futex_wait(&o.state, 1);
+    }
+}
+
+// =======================================================
+// WaitGroup — wait for a batch of tasks (Go/Zig style: one atomic counter + a
+// futex). add() before spawning, done() per task, wait() blocks until zero.
+// =======================================================
+struct WaitGroup { count as u32; }
+
+fn wg_add(wg as *WaitGroup, n as i64) as void { atomic_add(&wg.count, cast(u32, n)); }
+fn wg_done(wg as *WaitGroup) as void {
+    if (_dec_word(&wg.count) == 1) { thread.futex_wake_all(&wg.count); }   // reached 0
+}
+fn wg_wait(wg as *WaitGroup) as void {
+    let is u32 as c with mut = atomic_load(&wg.count);
+    while (c != 0) {
+        thread.futex_wait(&wg.count, c);
+        c = atomic_load(&wg.count);
+    }
+}
+
+// =======================================================
+// RwLock — many readers OR one writer. v1 is a simple correct design (writer
+// bit + reader count in one u32); writers can be starved by a steady reader
+// stream. (A writer-priority two-word port of Rust's rwlock is future work.)
+//   state: bit 31 (WRITER) set = write-locked; bits 0..30 = active reader count.
+// =======================================================
+let is u32 as _RW_WRITER with imut = 2147483648;   // 0x80000000
+
+struct RwLock { state as u32; }
+
+fn rw_read_lock(rw as *RwLock) as void {
+    while (1) {
+        let is u32 as s = atomic_load(&rw.state);
+        if ((s & _RW_WRITER) != 0) {
+            thread.futex_wait(&rw.state, s);
+        } else {
+            if (atomic_cas(&rw.state, s, s + 1) == s) { return; }
+        }
+    }
+}
+fn rw_read_unlock(rw as *RwLock) as void {
+    // Last reader leaving wakes any waiting writer.
+    if (_dec_word(&rw.state) == 1) { thread.futex_wake_all(&rw.state); }
+}
+fn rw_write_lock(rw as *RwLock) as void {
+    while (1) {
+        if (atomic_cas(&rw.state, 0, _RW_WRITER) == 0) { return; }
+        thread.futex_wait(&rw.state, atomic_load(&rw.state));
+    }
+}
+fn rw_write_unlock(rw as *RwLock) as void {
+    atomic_store(&rw.state, 0);
+    thread.futex_wake_all(&rw.state);
+}
+
+// =======================================================
+// Typed atomic wrappers — thin sugar over the builtins for callers who want a
+// named type. The builtins themselves are the canonical API.
+// =======================================================
+struct AtomicI64 { v as i64; }
+fn ai64_load(a as *AtomicI64) as i64        { return atomic_load(&a.v); }
+fn ai64_store(a as *AtomicI64, x as i64) as void { atomic_store(&a.v, x); }
+fn ai64_add(a as *AtomicI64, x as i64) as i64    { return atomic_add(&a.v, x); }   // returns old
+fn ai64_xchg(a as *AtomicI64, x as i64) as i64   { return atomic_xchg(&a.v, x); }
+fn ai64_cas(a as *AtomicI64, e as i64, d as i64) as i64 { return atomic_cas(&a.v, e, d); }
+
+struct AtomicI32 { v as i32; }
+fn ai32_load(a as *AtomicI32) as i32        { return atomic_load(&a.v); }
+fn ai32_store(a as *AtomicI32, x as i32) as void { atomic_store(&a.v, x); }
+fn ai32_add(a as *AtomicI32, x as i32) as i32    { return atomic_add(&a.v, x); }
+fn ai32_xchg(a as *AtomicI32, x as i32) as i32   { return atomic_xchg(&a.v, x); }
+fn ai32_cas(a as *AtomicI32, e as i32, d as i32) as i32 { return atomic_cas(&a.v, e, d); }
+
+// =======================================================
+// Channel — bounded MPSC ring buffer + Mutex + 2 Conds (the Go hchan shape).
+// One representation, fixed at creation; no lock-free, no spin, no select.
+// Elements are copied BY VALUE into the buffer. Convention for pointer payloads:
+// sending a pointer transfers ownership ("send = move") — the language has no
+// borrow checker to enforce it.
+// Capacity is rounded up to a power of two (index wrap by mask).
+// =======================================================
+struct Channel {
+    buf as *u8;
+    cap as i64;        // power of two
+    mask as i64;       // cap - 1
+    elem_size as i64;
+    head as i64;       // recv index
+    tail as i64;       // send index
+    count as i64;      // occupied slots
+    closed as i32;
+    _pad as i32;
+    lock as Mutex;
+    not_empty as Cond;
+    not_full as Cond;
+}
+
+fn _round_pow2(n as i64) as i64 {
+    let is i64 as p with mut = 1;
+    while (p < n) { p = p * 2; }
+    return p;
+}
+
+// Initialize a caller-owned Channel. capacity >= 1, elem_size in bytes.
+// Returns 0 on success, -1 on allocation failure.
+fn chan_init(ch as *Channel, capacity as i64, elem_size as i64) as i32 {
+    let is i64 as cap = _round_pow2(capacity);
+    ch.buf = _ch_alloc(cap * elem_size);
+    if (cast(i64, ch.buf) == 0) { return cast(i32, 0 - 1); }
+    ch.cap = cap;
+    ch.mask = cap - 1;
+    ch.elem_size = elem_size;
+    ch.head = 0;
+    ch.tail = 0;
+    ch.count = 0;
+    ch.closed = 0;
+    ch.lock.state = 0;
+    ch.not_empty.seq = 0;
+    ch.not_full.seq = 0;
+    return 0;
+}
+
+// Blocking send. Copies elem_size bytes from `elem`. Returns 0 on success,
+// -1 if the channel was closed.
+fn chan_send(ch as *Channel, elem as *u8) as i32 {
+    mutex_lock(&ch.lock);
+    while (ch.count == ch.cap && ch.closed == 0) {
+        cond_wait(&ch.not_full, &ch.lock);
+    }
+    if (ch.closed == 1) { mutex_unlock(&ch.lock); return cast(i32, 0 - 1); }
+    let is i64 as off = (ch.tail & ch.mask) * ch.elem_size;
+    mem.memcpy(cast(*u8, cast(i64, ch.buf) + off), elem, ch.elem_size);
+    ch.tail = ch.tail + 1;
+    ch.count = ch.count + 1;
+    cond_signal(&ch.not_empty);
+    mutex_unlock(&ch.lock);
+    return 0;
+}
+
+// Blocking receive into `out` (elem_size bytes). Returns 0 on success, -1 if the
+// channel is closed AND drained.
+fn chan_recv(ch as *Channel, out as *u8) as i32 {
+    mutex_lock(&ch.lock);
+    while (ch.count == 0 && ch.closed == 0) {
+        cond_wait(&ch.not_empty, &ch.lock);
+    }
+    if (ch.count == 0 && ch.closed == 1) { mutex_unlock(&ch.lock); return cast(i32, 0 - 1); }
+    let is i64 as off = (ch.head & ch.mask) * ch.elem_size;
+    mem.memcpy(out, cast(*u8, cast(i64, ch.buf) + off), ch.elem_size);
+    ch.head = ch.head + 1;
+    ch.count = ch.count - 1;
+    cond_signal(&ch.not_full);
+    mutex_unlock(&ch.lock);
+    return 0;
+}
+
+// Non-blocking receive. Returns 1 if an element was taken, 0 if empty.
+fn chan_try_recv(ch as *Channel, out as *u8) as i32 {
+    mutex_lock(&ch.lock);
+    if (ch.count == 0) { mutex_unlock(&ch.lock); return 0; }
+    let is i64 as off = (ch.head & ch.mask) * ch.elem_size;
+    mem.memcpy(out, cast(*u8, cast(i64, ch.buf) + off), ch.elem_size);
+    ch.head = ch.head + 1;
+    ch.count = ch.count - 1;
+    cond_signal(&ch.not_full);
+    mutex_unlock(&ch.lock);
+    return 1;
+}
+
+// Close: wake all blocked senders/receivers. Further sends fail; receives drain
+// the buffer then fail.
+fn chan_close(ch as *Channel) as void {
+    mutex_lock(&ch.lock);
+    ch.closed = 1;
+    cond_broadcast(&ch.not_empty);
+    cond_broadcast(&ch.not_full);
+    mutex_unlock(&ch.lock);
+}

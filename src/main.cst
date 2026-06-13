@@ -27,6 +27,8 @@ use "../caustic-assembler/main.cst" as asmmod;
 use "../caustic-linker/main.cst" as ldmod;
 use "version.cst" as ver;
 use "parser/dump.cst" as dump;
+use "../std/os.cst" as os;
+use "../std/env.cst" as env;
 
 // ── Utility functions ──────────────────────────────────────────────
 
@@ -963,6 +965,59 @@ fn _emit_one_obj(prog as *u8, prefix as *u8, plen as i32, dir as *u8, filename a
     return 0;
 }
 
+// Worker count for parallel --module-objects emission. CAUSTIC_JOBS overrides;
+// otherwise the online-CPU count (Linux sched_getaffinity), capped to the task
+// count and to MAX_MO_WORKERS. Non-Linux or W<=1 falls back to sequential.
+let is i32 as MAX_MO_WORKERS with imut = 64;
+
+fn _detect_jobs(ntasks as i32) as i32 {
+    let is *u8 as e = env.getenv("CAUSTIC_JOBS");
+    if (cast(i64, e) != 0 && e[0] != cast(u8, 0)) {
+        let is i32 as v with mut = 0;
+        let is i64 as i with mut = 0;
+        while (e[i] >= cast(u8, 48) && e[i] <= cast(u8, 57)) { v = v * 10 + cast(i32, e[i]) - 48; i = i + 1; }
+        if (v < 1) { v = 1; }
+        if (v > ntasks) { v = ntasks; }
+        if (v > MAX_MO_WORKERS) { v = MAX_MO_WORKERS; }
+        return v;
+    }
+    if (os.current() == os.OS_LINUX) {
+        let is [128]u8 as mask;
+        mem.memset(cast(*u8, &mask), 0, 128);
+        let is i64 as r = os.linux.sched_getaffinity(0, 128, cast(*u8, &mask));
+        if (r > 0) {
+            let is i32 as cnt with mut = 0;
+            let is i64 as bi with mut = 0;
+            while (bi < r) {
+                let is i32 as b = cast(i32, mask[bi]);
+                let is i32 as k with mut = 0;
+                while (k < 8) { if ((b & (1 << k)) != 0) { cnt = cnt + 1; } k = k + 1; }
+                bi = bi + 1;
+            }
+            if (cnt >= 1) {
+                if (cnt > ntasks) { cnt = ntasks; }
+                if (cnt > MAX_MO_WORKERS) { cnt = MAX_MO_WORKERS; }
+                return cnt;
+            }
+        }
+    }
+    if (ntasks < 4) { return ntasks; }
+    return 4;
+}
+
+// Emit the strided slice of import-module tasks owned by worker `w` (indices
+// w, w+W, w+2W, ...). Returns 0 on success, 1 on any emit failure.
+fn _emit_mo_slice(prog as *u8, dir as *u8, filename as *u8, flen as i32,
+                  tp as *i64, tl as *i32, ntask as i32, w as i32, ws as i32) as i32 {
+    let is i32 as i with mut = w;
+    let is i32 as st with mut = 0;
+    while (i < ntask) {
+        if (_emit_one_obj(prog, cast(*u8, tp[i]), tl[i], dir, filename, flen) != 0) { st = 1; }
+        i = i + ws;
+    }
+    return st;
+}
+
 fn run_module_objects() as i32 {
     let is *u8 as filename = cast(*u8, g_input_files[0]);
     let is i32 as flen = strlen(filename);
@@ -982,50 +1037,73 @@ fn run_module_objects() as i32 {
     // maker would otherwise run on a cold build).
     mod.emit_deps(_mo_path(dir, "deps", 4, ".txt", 4));
 
-    // The input file is itself a module (gets the canonical prefix because
-    // --module-objects implies --module-only).
-    if (_emit_one_obj(prog, sc.get_mod_prefix(filename, flen), sc.get_mod_prefix_len(filename, flen), dir, filename, flen) != 0) { return 1; }
-
-    // Every loaded import module — emitted EXACTLY ONCE each. A module
-    // re-imported under a different alias/only-filter has MULTIPLE Module
-    // records in module_list sharing one canonical prefix (walk_module
-    // registers a fresh record for a cached re-import, e.g. std/mem.cst is
-    // imported both plain and `only bins, core`). Emitting a prefix twice is
-    // not just wasted work: the first codegen pass emits the bodies and then
-    // frees each function's IR (free_func_insts), so the second pass emits
-    // prologue-only husks (no body, no ret) and OVERWRITES the good .o —
-    // callers of those functions fall through into the next function and
-    // crash (the incremental-build segfault).
-    let is [1024]i64 as seen_ptrs;
-    let is [1024]i32 as seen_lens;
-    let is i32 as seen_n with mut = 0;
+    // Build the dedup'd import-module task list. A module re-imported under a
+    // different alias/only-filter has MULTIPLE Module records sharing one
+    // canonical prefix; emitting a prefix twice corrupts the .o (the 1st pass
+    // frees the IR, the 2nd emits prologue-only husks — the d985253 segfault).
+    let is [1024]i64 as task_ptr;   // prefix ptr (module records — stable across fork COW)
+    let is [1024]i32 as task_len;
+    let is i32 as ntask with mut = 0;
     let is i32 as n = mod.mo_count();
     let is i32 as i with mut = 0;
-    let is i32 as emitted with mut = 0;
-    while (i < n) {
+    while (i < n && ntask < 1024) {
         let is *u8 as pp = mod.mo_prefix_ptr(i);
         let is i32 as pl = mod.mo_prefix_len(i);
         let is i32 as dup with mut = 0;
         let is i32 as si with mut = 0;
-        while (si < seen_n) {
-            if (str_eq(cast(*u8, seen_ptrs[si]), seen_lens[si], pp, pl) == 1) { dup = 1; si = seen_n; }
+        while (si < ntask) {
+            if (str_eq(cast(*u8, task_ptr[si]), task_len[si], pp, pl) == 1) { dup = 1; si = ntask; }
             else { si = si + 1; }
         }
         if (dup == 0) {
-            if (seen_n < 1024) {
-                seen_ptrs[seen_n] = cast(i64, pp);
-                seen_lens[seen_n] = pl;
-                seen_n = seen_n + 1;
-            }
-            if (_emit_one_obj(prog, pp, pl, dir, filename, flen) != 0) { return 1; }
-            emitted = emitted + 1;
+            task_ptr[ntask] = cast(i64, pp);
+            task_len[ntask] = pl;
+            ntask = ntask + 1;
         }
         i = i + 1;
     }
-    if (g_quiet == 0) {
-        io.write_str(io.STDOUT, "module-objects: emitted "); io.write_int(io.STDOUT, cast(i64, emitted) + 1); io.write_str(io.STDOUT, " objects\n");
+
+    // Worker pool. Each .o is written by exactly one worker and its content is a
+    // pure function of the (post-frontend, COW-shared) AST + the module, so the
+    // outputs are independent and order-free. Fork AFTER the frontend so every
+    // worker shares the one frontend pass via copy-on-write.
+    let is i32 as ws = _detect_jobs(ntask + 1);
+    let is *u8 as root_pp = sc.get_mod_prefix(filename, flen);
+    let is i32 as root_pl = sc.get_mod_prefix_len(filename, flen);
+    let is i32 as status with mut = 0;
+
+    if (ws <= 1 || os.current() != os.OS_LINUX) {
+        // Sequential (W=1, or no fork available).
+        if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
+        if (_emit_mo_slice(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, 0, 1) != 0) { status = 1; }
+    } else {
+        // Fork ws-1 children; the parent is worker 0 and also emits the root.
+        let is i32 as w with mut = 1;
+        while (w < ws) {
+            let is i64 as pid = os.linux.fork();
+            if (pid == 0) {
+                let is i32 as cst = _emit_mo_slice(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, w, ws);
+                os.linux.exit(cast(i64, cst));   // child process exits with its slice status
+            }
+            w = w + 1;
+        }
+        if (_emit_one_obj(prog, root_pp, root_pl, dir, filename, flen) != 0) { status = 1; }
+        if (_emit_mo_slice(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, 0, ws) != 0) { status = 1; }
+        // Reap children; OR their exit codes into status.
+        let is i32 as c with mut = 1;
+        while (c < ws) {
+            let is i32 as wstatus with mut = 0;
+            os.linux.wait4(0 - 1, cast(*i32, &wstatus), 0, cast(*u8, 0));
+            if (((wstatus >> 8) & 255) != 0) { status = 1; }
+            c = c + 1;
+        }
     }
-    return 0;
+
+    if (g_quiet == 0) {
+        io.write_str(io.STDOUT, "module-objects: emitted "); io.write_int(io.STDOUT, cast(i64, ntask) + 1);
+        io.write_str(io.STDOUT, " objects ("); io.write_int(io.STDOUT, cast(i64, ws)); io.write_str(io.STDOUT, " workers)\n");
+    }
+    return status;
 }
 
 fn run_multi_file() as i32 {
@@ -1186,6 +1264,8 @@ fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
 // ── Main: thin orchestrator ──────────────────────────────────────
 
 fn main(argc as i64, argv as i64) as i32 {
+    // Initialize env so getenv() works (CAUSTIC_JOBS for parallel emission).
+    env.init(argc, cast(*u8, argv));
     if (argc < 2) {
         io.write_str(io.STDERR, "Usage: caustic <source.cst>... [-o output] [-c] [-O1] [--profile]\n");
         io.write_str(io.STDERR, "       caustic --version | --help\n");

@@ -66,6 +66,21 @@ let is i32 as IR_LEA2          with imut = 50;
 let is i32 as IR_LEA4          with imut = 51;
 let is i32 as IR_LEA8          with imut = 52;
 
+// === Atomics (B1) — all seq_cst. cast_to carries the pointee type (4/8-byte).
+// Each behaves as a full memory barrier / opaque read-write call: it must be
+// in every optimizer side-effect list (has_side_effects, opt_cse, opt_prop,
+// opt_loop, opt_sr) and a regalloc call-position clobber (alloc_core), exactly
+// like IR_SYSCALL. CAS uses a fixed two-instruction pair: IR_CAS_EXPECTED loads
+// the expected value into rax, IR_ATOMIC_CAS does `lock cmpxchg` and leaves the
+// OLD value in rax. The pair must stay adjacent.
+let is i32 as IR_ATOMIC_LOAD   with imut = 53;  // dest=old, src1=ptr            (plain mov; load is acquire on x86)
+let is i32 as IR_ATOMIC_STORE  with imut = 54;  // src1=ptr, src2=val            (xchg [mem], val — seq_cst store)
+let is i32 as IR_ATOMIC_ADD    with imut = 55;  // dest=old, src1=ptr, src2=val  (lock xadd)
+let is i32 as IR_ATOMIC_XCHG   with imut = 56;  // dest=old, src1=ptr, src2=val  (xchg)
+let is i32 as IR_CAS_EXPECTED  with imut = 57;  // src1=expected -> rax
+let is i32 as IR_ATOMIC_CAS    with imut = 58;  // dest=old, src1=ptr, src2=desired (lock cmpxchg)
+let is i32 as IR_FENCE         with imut = 59;  // mfence
+
 // === Operand types ===
 let is i32 as OP_NONE  with imut = 0;
 let is i32 as OP_VREG  with imut = 1;
@@ -125,6 +140,7 @@ struct IRFunction {
     stack_size as i32;
     num_args as i32;
     is_variadic as i32;
+    is_naked as i32;          // `with naked`: skip prologue/epilogue (asm-only body)
     has_stack_ops as i32;
     is_recursive as i32;
     live_inst_count as i32;
@@ -195,6 +211,29 @@ struct IRProgram {
 
 // === Config ===
 let is i32 as ir_opt_level with mut = 0;
+
+// Cross-module inline restriction. In --module-objects/--module-only mode this
+// is set to the target module's mangled prefix so pass_inline only inlines
+// SAME-module callees — matching --module-only (where imports are interface-only,
+// no bodies to inline) and making batch emission order-independent (deterministic
+// across -jN and convergent with the warm per-module .o). 0 = no restriction.
+let is *u8 as inline_mod_prefix_ptr with mut = cast(*u8, 0);
+let is i32 as inline_mod_prefix_len with mut = 0;
+fn set_inline_module(ptr as *u8, len as i32) as void { inline_mod_prefix_ptr = ptr; inline_mod_prefix_len = len; }
+
+// True iff `f` may be inlined under the current restriction (always true when no
+// restriction is set; otherwise only if f's asm_name is `<prefix>_...`).
+fn inline_callee_ok(f as *IRFunction) as i32 {
+    let is i32 as plen = inline_mod_prefix_len;
+    if (plen == 0) { return 1; }
+    if (f.asm_name_len < plen + 1) { return 0; }
+    let is *u8 as n = f.asm_name_ptr;
+    let is *u8 as p = inline_mod_prefix_ptr;
+    let is i32 as i with mut = 0;
+    while (i < plen) { if (n[i] != p[i]) { return 0; } i = i + 1; }
+    if (n[plen] != 95) { return 0; }   // '_' module/name boundary
+    return 1;
+}
 
 // === Allocator globals ===
 

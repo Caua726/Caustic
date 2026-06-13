@@ -371,6 +371,61 @@ fn gen_syscall(node as *ast.Node, line as i32) as i32 {
     return dest;
 }
 
+// Atomic builtins (seq_cst). cast_to carries the pointee type so codegen picks
+// 32 vs 64-bit. LOAD/ADD/XCHG/CAS return the OLD value in a fresh vreg;
+// STORE/FENCE return 0 (void — never consumed, guaranteed by semantic).
+fn gen_atomic(node as *ast.Node, line as i32) as i32 {
+    let is i32 as sub = cast(i32, node.val);
+    if (sub == ast.ATOMIC_FENCE) {
+        let is *d.IRInst as fi = d.new_inst(d.IR_FENCE);
+        fi.line = line; g.emit(fi);
+        return 0;
+    }
+    let is *ast.Node as p0 = node.args;
+    let is *u8 as pointee with mut = cast(*u8, 0);
+    if (cast(i64, p0) != 0 && cast(i64, p0.ty) != 0) { pointee = cast(*u8, p0.ty.base); }
+    let is i32 as ptr_reg = gen_expr(p0);
+
+    if (sub == ast.ATOMIC_LOAD) {
+        let is i32 as dest = g.new_vreg();
+        let is *d.IRInst as li = d.new_inst(d.IR_ATOMIC_LOAD);
+        li.dest = d.op_vreg(dest); li.src1 = d.op_vreg(ptr_reg);
+        li.cast_to = pointee; li.line = line; g.emit(li);
+        return dest;
+    }
+
+    let is *ast.Node as p1 = p0.next;
+    if (sub == ast.ATOMIC_STORE) {
+        let is i32 as val_reg = gen_expr(p1);
+        let is *d.IRInst as si = d.new_inst(d.IR_ATOMIC_STORE);
+        si.src1 = d.op_vreg(ptr_reg); si.src2 = d.op_vreg(val_reg);
+        si.cast_to = pointee; si.line = line; g.emit(si);
+        return 0;
+    }
+    if (sub == ast.ATOMIC_ADD || sub == ast.ATOMIC_XCHG) {
+        let is i32 as val_reg = gen_expr(p1);
+        let is i32 as dest = g.new_vreg();
+        let is i32 as opc with mut = d.IR_ATOMIC_ADD;
+        if (sub == ast.ATOMIC_XCHG) { opc = d.IR_ATOMIC_XCHG; }
+        let is *d.IRInst as ai = d.new_inst(opc);
+        ai.dest = d.op_vreg(dest); ai.src1 = d.op_vreg(ptr_reg); ai.src2 = d.op_vreg(val_reg);
+        ai.cast_to = pointee; ai.line = line; g.emit(ai);
+        return dest;
+    }
+    // ATOMIC_CAS: args = ptr, expected, desired. IR_CAS_EXPECTED loads expected
+    // into rax and must immediately precede IR_ATOMIC_CAS (kept adjacent here).
+    let is *ast.Node as p2 = p1.next;
+    let is i32 as exp_reg = gen_expr(p1);
+    let is i32 as des_reg = gen_expr(p2);
+    let is *d.IRInst as ce = d.new_inst(d.IR_CAS_EXPECTED);
+    ce.src1 = d.op_vreg(exp_reg); ce.line = line; g.emit(ce);
+    let is i32 as dest = g.new_vreg();
+    let is *d.IRInst as ci = d.new_inst(d.IR_ATOMIC_CAS);
+    ci.dest = d.op_vreg(dest); ci.src1 = d.op_vreg(ptr_reg); ci.src2 = d.op_vreg(des_reg);
+    ci.cast_to = pointee; ci.line = line; g.emit(ci);
+    return dest;
+}
+
 fn gen_enum_lit(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
     let is i32 as disc = node.discriminant;
     // Simple enum (no payload, small)
@@ -942,6 +997,9 @@ fn gen_expr(node as *ast.Node) as i32 {
 
     // NK_SYSCALL
     if (k == ast.NK_SYSCALL) { return gen_syscall(node, line); }
+
+    // NK_ATOMIC — atomic builtins (seq_cst)
+    if (k == ast.NK_ATOMIC) { return gen_atomic(node, line); }
 
     // NK_ENUM_LIT
     if (k == ast.NK_ENUM_LIT) { return gen_enum_lit(node, ty, line); }
