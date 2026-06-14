@@ -1,0 +1,218 @@
+// lsp/handlers_complete.cst — textDocument/completion handler.
+// Extracted from handlers.cst (imported as `h` for shared helpers).
+use "json.cst" as json;
+use "json_write.cst" as jw;
+use "rpc.cst" as rpc;
+use "documents.cst" as docs;
+use "symbols.cst" as syms;
+use "handlers.cst" as h;
+
+fn handle_completion(id as i64, params as *json.JsonValue) as void {
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = h._get_doc(params, &uri_str, &uri_len);
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    if (cast(i64, d) != 0) { h._get_position(params, &line, &col); }
+
+    // Check if cursor is right after "mod." — provide module member completions
+    if (cast(i64, d) != 0 && col > 1) {
+        // Find the character before cursor — look for '.'
+        let is i32 as cpos with mut = 0;
+        let is i32 as cline with mut = 1;
+        let is i32 as cline_start with mut = 0;
+        while (cpos < d.text_len && cline < line) {
+            if (d.text_ptr[cpos] == 10) { cline = cline + 1; cline_start = cpos + 1; }
+            cpos = cpos + 1;
+        }
+        let is i32 as cursor_offset = cline_start + col - 1;
+        // Walk back to find if there's a "name." pattern
+        if (cursor_offset > 1 && cursor_offset <= d.text_len) {
+            let is i32 as dot_pos with mut = cursor_offset - 1;
+            // Skip partial identifier the user is typing
+            while (dot_pos > 0 && syms._is_alnum(d.text_ptr[dot_pos]) == 1) {
+                dot_pos = dot_pos - 1;
+            }
+            if (dot_pos >= 0 && d.text_ptr[dot_pos] == 46) {
+                // Found a dot! Get the module name before it
+                let is i32 as mod_end = dot_pos;
+                let is i32 as mod_start with mut = mod_end - 1;
+                while (mod_start > 0 && syms._is_alnum(d.text_ptr[mod_start - 1]) == 1) {
+                    mod_start = mod_start - 1;
+                }
+                if (mod_start < mod_end) {
+                    let is *u8 as mod_name = cast(*u8, cast(i64, d.text_ptr) + cast(i64, mod_start));
+                    let is i32 as mod_nlen = mod_end - mod_start;
+                    let is i32 as mod_idx = syms.find_by_name(mod_name, mod_nlen);
+                    if (mod_idx >= 0 && syms.sym_kinds[mod_idx] == syms.SK_MODULE) {
+                        // Resolve and read module file
+                        let is i32 as rlen with mut = 0;
+                        let is *u8 as resolved = syms.resolve_module_path(
+                            d.path_ptr, d.path_len,
+                            cast(*u8, syms.sym_types[mod_idx]), syms.sym_type_lens[mod_idx], &rlen);
+                        let is i32 as flen with mut = 0;
+                        let is *u8 as fsrc = syms._read_file(resolved, &flen);
+                        if (cast(i64, fsrc) != 0 && flen > 0) {
+                            syms.scan_module_exports(fsrc, flen);
+                            _send_module_completions(id);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Context-aware: check if we're in a type position (after "is " or "as " or "gen ")
+    if (cast(i64, d) != 0 && col > 3) {
+        let is i32 as tpos with mut = 0;
+        let is i32 as tline with mut = 1;
+        let is i32 as tline_start with mut = 0;
+        while (tpos < d.text_len && tline < line) {
+            if (d.text_ptr[tpos] == 10) { tline = tline + 1; tline_start = tpos + 1; }
+            tpos = tpos + 1;
+        }
+        let is i32 as tcoff = tline_start + col - 1;
+        // Skip back over partial ident being typed
+        let is i32 as tback with mut = tcoff - 1;
+        while (tback > 0 && syms._is_alnum(d.text_ptr[tback]) == 1) { tback = tback - 1; }
+        // Skip whitespace
+        while (tback > 0 && (d.text_ptr[tback] == 32 || d.text_ptr[tback] == 9)) { tback = tback - 1; }
+        // Check if previous word ends with "is" or "as" or "gen" (check last 2-3 chars)
+        let is i32 as is_type_ctx with mut = 0;
+        if (tback >= 1 && d.text_ptr[tback - 1] == 105 && d.text_ptr[tback] == 115) { is_type_ctx = 1; } // "is"
+        if (tback >= 1 && d.text_ptr[tback - 1] == 97 && d.text_ptr[tback] == 115) { is_type_ctx = 1; }  // "as"
+        if (tback >= 2 && d.text_ptr[tback - 2] == 103 && d.text_ptr[tback - 1] == 101 && d.text_ptr[tback] == 110) { is_type_ctx = 1; } // "gen"
+
+        if (is_type_ctx == 1) {
+            let is jw.Writer as tw = jw.writer_new();
+            jw.obj_start(&tw);
+            jw.kv_str_c(&tw, "jsonrpc", "2.0");
+            jw.kv_int(&tw, "id", id);
+            jw.key_c(&tw, "result");
+            jw.arr_start(&tw);
+            _add_type_completions(&tw);
+            jw.arr_end(&tw);
+            jw.obj_end(&tw);
+            rpc.write_message(jw.finish(&tw), jw.finish_len(&tw));
+            return;
+        }
+    }
+
+    // Default: return all local symbols
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+
+    // Add keywords
+    _add_keyword_completions(&w);
+
+    let is i32 as i with mut = 0;
+    while (i < syms.sym_count) {
+        jw.obj_start(&w);
+        jw.kv_str(&w, "label", cast(*u8, syms.sym_names[i]), syms.sym_name_lens[i]);
+        jw.kv_int(&w, "kind", cast(i64, syms.sym_kinds[i]));
+        if (syms.sym_type_lens[i] > 0) {
+            jw.kv_str(&w, "detail", cast(*u8, syms.sym_types[i]), syms.sym_type_lens[i]);
+        }
+        jw.obj_end(&w);
+        i = i + 1;
+    }
+
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn _send_module_completions(id as i64) as void {
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.arr_start(&w);
+    let is i32 as i with mut = 0;
+    while (i < syms.mod_export_count) {
+        jw.obj_start(&w);
+        jw.kv_str(&w, "label", cast(*u8, syms.mod_export_names[i]), syms.mod_export_name_lens[i]);
+        jw.kv_int(&w, "kind", cast(i64, syms.mod_export_kinds[i]));
+        if (syms.mod_export_detail_lens[i] > 0) {
+            jw.kv_str(&w, "detail", cast(*u8, syms.mod_export_details[i]), syms.mod_export_detail_lens[i]);
+        }
+        jw.obj_end(&w);
+        i = i + 1;
+    }
+    jw.arr_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
+fn _add_keyword_completions(w as *jw.Writer) as void {
+    _kw_item(w, "fn", 2, "Declare a function", 18);
+    _kw_item(w, "let", 3, "Declare a variable", 18);
+    _kw_item(w, "return", 6, "Return from function", 20);
+    _kw_item(w, "if", 2, "Conditional branch", 18);
+    _kw_item(w, "else", 4, "Else branch", 11);
+    _kw_item(w, "while", 5, "While loop", 10);
+    _kw_item(w, "for", 3, "For loop", 8);
+    _kw_item(w, "break", 5, "Break out of loop", 17);
+    _kw_item(w, "continue", 8, "Skip to next iteration", 22);
+    _kw_item(w, "struct", 6, "Define a struct", 15);
+    _kw_item(w, "enum", 4, "Define a tagged union", 21);
+    _kw_item(w, "match", 5, "Pattern match on enum", 21);
+    _kw_item(w, "case", 4, "Match case branch", 17);
+    _kw_item(w, "use", 3, "Import a module", 15);
+    _kw_item(w, "impl", 4, "Implement methods", 17);
+    _kw_item(w, "defer", 5, "Defer call until return", 23);
+    _kw_item(w, "cast", 4, "Type cast", 9);
+    _kw_item(w, "sizeof", 6, "Size of type in bytes", 21);
+    _kw_item(w, "syscall", 7, "Direct Linux syscall", 20);
+    _kw_item(w, "asm", 3, "Inline assembly", 15);
+    _kw_item(w, "extern", 6, "External function", 17);
+    _kw_item(w, "type", 4, "Type alias", 10);
+    _kw_item(w, "gen", 3, "Generic type parameter", 22);
+    _kw_item(w, "fn_ptr", 6, "Typed function pointer", 22);
+    _kw_item(w, "do", 2, "Do-while loop", 13);
+    _kw_item(w, "call", 4, "Indirect call via fn pointer", 28);
+}
+
+fn _kw_item(w as *jw.Writer, label as *u8, label_len as i32, doc as *u8, doc_len as i32) as void {
+    jw.obj_start(w);
+    jw.kv_str(w, "label", label, label_len);
+    jw.kv_int(w, "kind", 14);
+    if (doc_len > 0) {
+        jw.kv_str(w, "detail", doc, doc_len);
+    }
+    jw.obj_end(w);
+}
+
+// === Context-aware Completions ===
+
+fn _type_item(w as *jw.Writer, label as *u8, label_len as i32) as void {
+    jw.obj_start(w);
+    jw.kv_str(w, "label", label, label_len);
+    jw.kv_int(w, "kind", 25);
+    jw.obj_end(w);
+}
+
+fn _add_type_completions(w as *jw.Writer) as void {
+    _type_item(w, "i8", 2); _type_item(w, "i16", 3); _type_item(w, "i32", 3); _type_item(w, "i64", 3);
+    _type_item(w, "u8", 2); _type_item(w, "u16", 3); _type_item(w, "u32", 3); _type_item(w, "u64", 3);
+    _type_item(w, "f32", 3); _type_item(w, "f64", 3);
+    _type_item(w, "bool", 4); _type_item(w, "char", 4); _type_item(w, "void", 4);
+    _type_item(w, "string", 6);
+    _type_item(w, "*u8", 3);
+    let is i32 as i with mut = 0;
+    while (i < syms.sym_count) {
+        if (syms.sym_kinds[i] == syms.SK_STRUCT || syms.sym_kinds[i] == syms.SK_ENUM || syms.sym_kinds[i] == syms.SK_TYPE_ALIAS) {
+            jw.obj_start(w);
+            jw.kv_str(w, "label", cast(*u8, syms.sym_names[i]), syms.sym_name_lens[i]);
+            jw.kv_int(w, "kind", 25);
+            jw.obj_end(w);
+        }
+        i = i + 1;
+    }
+}

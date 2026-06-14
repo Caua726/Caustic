@@ -1,0 +1,209 @@
+// lsp/handlers_sig.cst — textDocument/signatureHelp handler.
+// Extracted from handlers.cst (imported as `h` for shared helpers).
+use "json.cst" as json;
+use "json_write.cst" as jw;
+use "rpc.cst" as rpc;
+use "documents.cst" as docs;
+use "symbols.cst" as syms;
+use "handlers.cst" as h;
+
+fn handle_signature_help(id as i64, params as *json.JsonValue) as void {
+    let is i32 as line with mut = 0;
+    let is i32 as col with mut = 0;
+    let is *u8 as uri_str with mut = cast(*u8, 0);
+    let is i32 as uri_len with mut = 0;
+    let is *docs.Document as d = h._get_doc(params, &uri_str, &uri_len);
+    if (cast(i64, d) == 0 || h._get_position(params, &line, &col) == 0) {
+        h.send_null_result(id);
+        return;
+    }
+
+    // Find the function call context: walk back from cursor to find opening ( and function name
+    let is i32 as cpos with mut = 0;
+    let is i32 as cln with mut = 1;
+    let is i32 as cln_start with mut = 0;
+    while (cpos < d.text_len && cln < line) {
+        if (d.text_ptr[cpos] == 10) { cln = cln + 1; cln_start = cpos + 1; }
+        cpos = cpos + 1;
+    }
+    let is i32 as cursor_off = cln_start + col - 1;
+
+    // Walk back to find unmatched '('
+    let is i32 as depth with mut = 0;
+    let is i32 as paren_off with mut = cursor_off - 1;
+    let is i32 as active_param with mut = 0;
+    while (paren_off >= 0) {
+        let is u8 as ch = d.text_ptr[paren_off];
+        if (ch == 41) { depth = depth + 1; }
+        else if (ch == 40) {
+            if (depth == 0) { break; }
+            depth = depth - 1;
+        }
+        else if (ch == 44 && depth == 0) { active_param = active_param + 1; }
+        paren_off = paren_off - 1;
+    }
+
+    if (paren_off < 0) { h.send_null_result(id); return; }
+
+    // Get function name before the '('
+    let is i32 as name_end with mut = paren_off;
+    while (name_end > 0 && (d.text_ptr[name_end - 1] == 32 || d.text_ptr[name_end - 1] == 9)) {
+        name_end = name_end - 1;
+    }
+    let is i32 as name_start with mut = name_end;
+    while (name_start > 0 && (syms._is_alnum(d.text_ptr[name_start - 1]) == 1 || d.text_ptr[name_start - 1] == 46)) {
+        name_start = name_start - 1;
+    }
+    if (name_start >= name_end) { h.send_null_result(id); return; }
+
+    let is *u8 as fn_name = cast(*u8, cast(i64, d.text_ptr) + cast(i64, name_start));
+    let is i32 as fn_name_len = name_end - name_start;
+
+    // Check if it contains a dot (module.func)
+    let is i32 as dot_pos with mut = 0;
+    let is i32 as has_dot with mut = 0;
+    while (dot_pos < fn_name_len) {
+        if (fn_name[dot_pos] == 46) { has_dot = 1; break; }
+        dot_pos = dot_pos + 1;
+    }
+
+    // Find the signature
+    let is [2048]u8 as sig_buf;
+    let is i32 as sig_len with mut = 0;
+    let is i32 as found with mut = 0;
+
+    if (has_dot == 1) {
+        // Module function: look up in module source or docs
+        let is *u8 as mod_name = fn_name;
+        let is i32 as mod_nlen = dot_pos;
+        let is *u8 as mem_name = cast(*u8, cast(i64, fn_name) + cast(i64, dot_pos) + 1);
+        let is i32 as mem_nlen = fn_name_len - dot_pos - 1;
+        let is i32 as midx = syms.find_by_name(mod_name, mod_nlen);
+        if (midx >= 0 && syms.sym_kinds[midx] == syms.SK_MODULE) {
+            // Try docs first
+            let is i32 as imp_len = syms.sym_type_lens[midx];
+            let is *u8 as imp = cast(*u8, syms.sym_types[midx]);
+            let is i32 as bs with mut = imp_len - 1;
+            while (bs > 0 && imp[bs] != 47) { bs = bs - 1; }
+            if (imp[bs] == 47) { bs = bs + 1; }
+            let is i32 as be with mut = imp_len;
+            if (be > 4 && imp[be - 4] == 46) { be = be - 4; }
+            if (syms.lookup_in_docs(cast(*u8, cast(i64, imp) + cast(i64, bs)), be - bs,
+                                    mem_name, mem_nlen, &sig_buf, 2000, &sig_len) == 1 && sig_len > 0) {
+                found = 1;
+            }
+            // Fallback: module source
+            if (found == 0) {
+                let is i32 as rlen with mut = 0;
+                let is *u8 as resolved = syms.resolve_module_path(d.path_ptr, d.path_len, imp, imp_len, &rlen);
+                let is i32 as flen with mut = 0;
+                let is *u8 as fsrc = syms._read_file(resolved, &flen);
+                if (cast(i64, fsrc) != 0 && flen > 0) {
+                    if (syms.lookup_in_file(fsrc, flen, mem_name, mem_nlen, &sig_buf, 2000, &sig_len) == 1 && sig_len > 0) {
+                        found = 1;
+                    }
+                }
+            }
+        }
+    } else {
+        // Local function
+        if (syms.lookup_in_file(d.text_ptr, d.text_len, fn_name, fn_name_len, &sig_buf, 2000, &sig_len) == 1 && sig_len > 0) {
+            found = 1;
+        }
+    }
+
+    if (found == 0) { h.send_null_result(id); return; }
+
+    // Extract just the first line (the signature line)
+    let is i32 as first_line_len with mut = 0;
+    while (first_line_len < sig_len && sig_buf[first_line_len] != 10) {
+        first_line_len = first_line_len + 1;
+    }
+
+    // Count parameters from signature — find '(' and count commas inside
+    let is i32 as param_count with mut = 0;
+    let is i32 as sp with mut = 0;
+    let is i32 as paren_start with mut = 0;
+    while (sp < first_line_len && sig_buf[sp] != 40) { sp = sp + 1; }
+    if (sp < first_line_len) {
+        paren_start = sp;
+        sp = sp + 1;
+        // Check for empty params
+        while (sp < first_line_len && (sig_buf[sp] == 32 || sig_buf[sp] == 9)) { sp = sp + 1; }
+        if (sp < first_line_len && sig_buf[sp] != 41) {
+            param_count = 1;
+            let is i32 as pdepth with mut = 0;
+            while (sp < first_line_len) {
+                if (sig_buf[sp] == 40) { pdepth = pdepth + 1; }
+                else if (sig_buf[sp] == 41) {
+                    if (pdepth == 0) { break; }
+                    pdepth = pdepth - 1;
+                }
+                else if (sig_buf[sp] == 44 && pdepth == 0) { param_count = param_count + 1; }
+                sp = sp + 1;
+            }
+        }
+    }
+
+    let is jw.Writer as w = jw.writer_new();
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "jsonrpc", "2.0");
+    jw.kv_int(&w, "id", id);
+    jw.key_c(&w, "result");
+    jw.obj_start(&w);
+    jw.key_c(&w, "signatures");
+    jw.arr_start(&w);
+    jw.obj_start(&w);
+    jw.kv_str(&w, "label", &sig_buf, first_line_len);
+    jw.key_c(&w, "documentation");
+    jw.obj_start(&w);
+    jw.kv_str_c(&w, "kind", "markdown");
+    jw.kv_str(&w, "value", &sig_buf, sig_len);
+    jw.obj_end(&w);
+
+    // Parameters: extract each param from the signature
+    if (param_count > 0) {
+        jw.key_c(&w, "parameters");
+        jw.arr_start(&w);
+        let is i32 as pp with mut = paren_start + 1;
+        let is i32 as pi with mut = 0;
+        while (pi < param_count && pp < first_line_len) {
+            // Find start of this param (skip whitespace)
+            while (pp < first_line_len && (sig_buf[pp] == 32 || sig_buf[pp] == 9)) { pp = pp + 1; }
+            let is i32 as param_start = pp;
+            // Find end: next comma or closing paren
+            let is i32 as pd with mut = 0;
+            while (pp < first_line_len) {
+                if (sig_buf[pp] == 40) { pd = pd + 1; }
+                else if (sig_buf[pp] == 41) {
+                    if (pd == 0) { break; }
+                    pd = pd - 1;
+                }
+                else if (sig_buf[pp] == 44 && pd == 0) { break; }
+                pp = pp + 1;
+            }
+            let is i32 as param_end with mut = pp;
+            // Trim trailing whitespace
+            while (param_end > param_start && (sig_buf[param_end - 1] == 32 || sig_buf[param_end - 1] == 9)) {
+                param_end = param_end - 1;
+            }
+            jw.obj_start(&w);
+            jw.kv_str(&w, "label", cast(*u8, cast(i64, &sig_buf) + cast(i64, param_start)), param_end - param_start);
+            jw.obj_end(&w);
+            if (pp < first_line_len && sig_buf[pp] == 44) { pp = pp + 1; }
+            pi = pi + 1;
+        }
+        jw.arr_end(&w);
+    }
+
+    jw.obj_end(&w);
+    jw.arr_end(&w);
+    if (active_param < param_count) {
+        jw.kv_int(&w, "activeParameter", cast(i64, active_param));
+    }
+    jw.kv_int(&w, "activeSignature", 0);
+    jw.obj_end(&w);
+    jw.obj_end(&w);
+    rpc.write_message(jw.finish(&w), jw.finish_len(&w));
+}
+
