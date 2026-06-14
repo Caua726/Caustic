@@ -29,6 +29,58 @@ fn vec_emit(after as *d.IRInst, ni as *d.IRInst) as *d.IRInst {
     after.next = ni;
     return ni;
 }
+// resolve through single-def MOV copies AND no-op CASTs (i32->i32, same type).
+// i32 reductions are full of `CAST vN = vM (i32->i32)` no-ops that the MOV-only
+// ur.ur_resolve can't see past; following them lets the recurrence match.
+fn vec_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 64) {
+        if (cur < 0 || cur >= vc) { return cur; }
+        let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, cur) * 4);
+        if (*dcp != 1) { return cur; }
+        let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+        let is *d.IRInst as di = cast(*d.IRInst, *dip);
+        if (cast(i64, di) == 0) { return cur; }
+        if (di.op == d.IR_MOV && di.src1.op_type == d.OP_VREG) { cur = di.src1.vreg; }
+        else if (di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && cast(i64, di.cast_to) == cast(i64, di.cast_from)) { cur = di.src1.vreg; }
+        else { return cur; }
+        guard = guard + 1;
+    }
+    return cur;
+}
+fn vec_const(def_inst as *i64, def_count as *i32, vc as i32, v as i32, out as *i64) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 64) {
+        if (cur < 0 || cur >= vc) { return 0; }
+        let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, cur) * 4);
+        if (*dcp != 1) { return 0; }
+        let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+        let is *d.IRInst as di = cast(*d.IRInst, *dip);
+        if (cast(i64, di) == 0) { return 0; }
+        if (di.op == d.IR_IMM && di.src1.op_type == d.OP_IMM) { *out = di.src1.imm; return 1; }
+        if (di.op == d.IR_MOV && di.src1.op_type == d.OP_VREG) { cur = di.src1.vreg; guard = guard + 1; }
+        else if (di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && cast(i64, di.cast_to) == cast(i64, di.cast_from)) { cur = di.src1.vreg; guard = guard + 1; }
+        else { return 0; }
+    }
+    return 0;
+}
+fn vec_val_const(def_inst as *i64, def_count as *i32, vc as i32, op_type as i32, vreg as i32, imm as i64, out as *i64) as i32 {
+    if (op_type == d.OP_IMM) { *out = imm; return 1; }
+    if (op_type == d.OP_VREG) { return vec_const(def_inst, def_count, vc, vreg, out); }
+    return 0;
+}
+fn vec_add_is_iv_plus1(add as *d.IRInst, def_inst as *i64, def_count as *i32, vc as i32, iv as i32) as i32 {
+    if (cast(i64, add) == 0 || add.op != d.IR_ADD) { return 0; }
+    let is i64 as cv with mut = 0;
+    if (add.src1.op_type == d.OP_VREG && vec_resolve(def_inst, def_count, vc, add.src1.vreg) == iv
+        && vec_val_const(def_inst, def_count, vc, cast(i32, add.src2.op_type), add.src2.vreg, add.src2.imm, &cv) == 1 && cv == 1) { return 1; }
+    if (add.src2.op_type == d.OP_VREG && vec_resolve(def_inst, def_count, vc, add.src2.vreg) == iv
+        && vec_val_const(def_inst, def_count, vc, cast(i32, add.src1.op_type), add.src1.vreg, add.src1.imm, &cv) == 1 && cv == 1) { return 1; }
+    return 0;
+}
+
 fn pass_vectorize(func as *d.IRFunction) as i32 {
     let is i32 as vc = func.vreg_count;
     if (vc <= 0) { return 0; }
@@ -111,8 +163,8 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     let is *d.IRInst as ltd = cast(*d.IRInst, *cdp);
     if (cast(i64, ltd) == 0 || ltd.op != d.IR_LT || ltd.src1.op_type != d.OP_VREG) { return 0; }
     let is i64 as nbound with mut = 0;
-    if (ur.ur_val_const(def_inst, def_count, vc, cast(i32, ltd.src2.op_type), ltd.src2.vreg, ltd.src2.imm, &nbound) == 0) { return 0; }
-    let is i32 as iv = ur.ur_resolve(def_inst, def_count, vc, ltd.src1.vreg);
+    if (vec_val_const(def_inst, def_count, vc, cast(i32, ltd.src2.op_type), ltd.src2.vreg, ltd.src2.imm, &nbound) == 0) { return 0; }
+    let is i32 as iv = vec_resolve(def_inst, def_count, vc, ltd.src1.vreg);
     if (iv < 0 || iv >= vc) { return 0; }
 
     // body up to back-edge; straight-line; NO stores (reduction reads only)
@@ -157,8 +209,8 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     let is *d.IRInst as add = cast(*d.IRInst, *vtp);
     if (cast(i64, add) == 0 || add.op != d.IR_ADD || add.src1.op_type != d.OP_VREG || add.src2.op_type != d.OP_VREG) { return 0; }
     // which operand is the accumulator (resolves to s), which is the loaded value x
-    let is i32 as a1 = ur.ur_resolve(def_inst, def_count, vc, add.src1.vreg);
-    let is i32 as a2 = ur.ur_resolve(def_inst, def_count, vc, add.src2.vreg);
+    let is i32 as a1 = vec_resolve(def_inst, def_count, vc, add.src1.vreg);
+    let is i32 as a2 = vec_resolve(def_inst, def_count, vc, add.src2.vreg);
     let is i32 as xv with mut = cast(i32, 0 - 1);
     if (a1 == s_acc) { xv = add.src2.vreg; }
     else if (a2 == s_acc) { xv = add.src1.vreg; }
@@ -175,10 +227,18 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     if (addrv < 0 || addrv >= vc) { return 0; }
     let is *i64 as ap = cast(*i64, cast(i64, def_inst) + cast(i64, addrv) * 8);
     let is *d.IRInst as lea = cast(*d.IRInst, *ap);
-    if (cast(i64, lea) == 0 || lea.op != d.IR_LEA8 || lea.src1.op_type != d.OP_VREG || lea.src2.op_type != d.OP_VREG) { return 0; }
+    if (cast(i64, lea) == 0 || lea.src1.op_type != d.OP_VREG || lea.src2.op_type != d.OP_VREG) { return 0; }
+    // element width from the LEA scale: LEA8 -> i64 (2-wide), LEA4 -> i32 (4-wide)
+    let is i32 as elem with mut = 0;
+    let is i32 as wide with mut = 0;
+    let is i32 as vadd_op with mut = 0;
+    let is i32 as vred_op with mut = 0;
+    if (lea.op == d.IR_LEA8) { elem = 8; wide = 2; vadd_op = d.IR_VADDQ; vred_op = d.IR_VREDUCEQ; }
+    else if (lea.op == d.IR_LEA4) { elem = 4; wide = 4; vadd_op = d.IR_VADDD; vred_op = d.IR_VREDUCED; }
+    else { return 0; }
     // one LEA operand resolves to iv (the index), the other to base (loop-invariant)
-    let is i32 as l1 = ur.ur_resolve(def_inst, def_count, vc, lea.src1.vreg);
-    let is i32 as l2 = ur.ur_resolve(def_inst, def_count, vc, lea.src2.vreg);
+    let is i32 as l1 = vec_resolve(def_inst, def_count, vc, lea.src1.vreg);
+    let is i32 as l2 = vec_resolve(def_inst, def_count, vc, lea.src2.vreg);
     let is i32 as base with mut = cast(i32, 0 - 1);
     if (l1 == iv) { base = l2; }
     else if (l2 == iv) { base = l1; }
@@ -194,8 +254,8 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
             iv_writes = iv_writes + 1;
             if (b.op == d.IR_MOV && b.src1.op_type == d.OP_VREG) {
                 let is *i64 as vtd = cast(*i64, cast(i64, def_inst) + cast(i64, b.src1.vreg) * 8);
-                if (ur.ur_add_is_iv_plus1(cast(*d.IRInst, *vtd), def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
-            } else if (ur.ur_add_is_iv_plus1(b, def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
+                if (vec_add_is_iv_plus1(cast(*d.IRInst, *vtd), def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
+            } else if (vec_add_is_iv_plus1(b, def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
         }
         b = b.next;
     }
@@ -206,7 +266,7 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     while (cast(i64, s2) != 0 && cast(i64, s2) != cast(i64, hdr)) {
         if (s2.is_dead == 0 && s2.dest.op_type == d.OP_VREG && s2.dest.vreg == iv && s2.op != d.IR_STORE && s2.op != d.IR_COPY) {
             if (s2.op == d.IR_IMM && s2.src1.op_type == d.OP_IMM) { init = s2.src1.imm; init_ok = 1; }
-            else if (s2.op == d.IR_MOV && s2.src1.op_type == d.OP_VREG) { let is i64 as cv with mut = 0; if (ur.ur_const(def_inst, def_count, vc, s2.src1.vreg, &cv) == 1) { init = cv; init_ok = 1; } else { init_ok = 0; } }
+            else if (s2.op == d.IR_MOV && s2.src1.op_type == d.OP_VREG) { let is i64 as cv with mut = 0; if (vec_const(def_inst, def_count, vc, s2.src1.vreg, &cv) == 1) { init = cv; init_ok = 1; } else { init_ok = 0; } }
             else { init_ok = 0; }
         }
         s2 = s2.next;
@@ -214,7 +274,7 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     if (init_ok == 0) { return 0; }
     let is i64 as trip = nbound - init;
     if (trip < 2 || trip > cast(i64, VEC_MAX_TRIP)) { return 0; }
-    if ((trip & 1) != 0) { return 0; }   // need even trip for 2-wide (no remainder yet)
+    if ((trip % cast(i64, wide)) != 0) { return 0; }   // trip must be a multiple of the vector width (no remainder yet)
 
     // s_init: the pre-loop value of s (the vreg feeding s before the loop).
     let is i32 as s_init_vreg with mut = cast(i32, 0 - 1);
@@ -227,8 +287,8 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     if (s_init_vreg < 0) { return 0; }
 
     // ===== rewrite: insert the vector reduction before the header, kill the loop =====
-    let is i32 as init_byte = cast(i32, init) * 8;   // base + init*8 is element 0's address
-    let is *d.IRInst as ip with mut = prev;          // insertion cursor (before hdr)
+    let is i64 as init_byte = init * cast(i64, elem);   // base + init*elem is element 0's address
+    let is *d.IRInst as ip with mut = prev;             // insertion cursor (before hdr)
 
     // vacc = VZERO
     let is i32 as vacc = vec_new_vreg(func);
@@ -241,7 +301,7 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     // never modified — it stays live in its own register across all the loads.)
     let is i64 as k with mut = 0;
     while (k < trip) {
-        let is i64 as off = cast(i64, init_byte) + k * 8;
+        let is i64 as off = init_byte + k * cast(i64, elem);
         let is i32 as vld = vec_new_vreg(func);
         let is *d.IRInst as vl = d.new_inst(d.IR_VLOADQ);
         vl.dest.op_type = cast(i8, d.OP_VREG); vl.dest.vreg = vld;
@@ -249,17 +309,17 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         vl.src2.op_type = cast(i8, d.OP_IMM);  vl.src2.imm = off;
         vl.line = hdr.line;
         ip = vec_emit(ip, vl);
-        let is *d.IRInst as va = d.new_inst(d.IR_VADDQ);
+        let is *d.IRInst as va = d.new_inst(vadd_op);
         va.dest.op_type = cast(i8, d.OP_VREG); va.dest.vreg = vacc;
         va.src1.op_type = cast(i8, d.OP_VREG); va.src1.vreg = vacc;
         va.src2.op_type = cast(i8, d.OP_VREG); va.src2.vreg = vld;
         va.line = hdr.line;
         ip = vec_emit(ip, va);
-        k = k + 2;
+        k = k + cast(i64, wide);
     }
-    // h = VREDUCEQ(vacc) ; s = s_init + h
+    // h = VREDUCE(vacc) ; s = s_init + h
     let is i32 as hv = vec_new_vreg(func);
-    let is *d.IRInst as vr = d.new_inst(d.IR_VREDUCEQ);
+    let is *d.IRInst as vr = d.new_inst(vred_op);
     vr.dest.op_type = cast(i8, d.OP_VREG); vr.dest.vreg = hv;
     vr.src1.op_type = cast(i8, d.OP_VREG); vr.src1.vreg = vacc;
     vr.line = hdr.line;
