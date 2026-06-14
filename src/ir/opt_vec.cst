@@ -1,0 +1,280 @@
+use "defs.cst" as d;
+use "opt_unroll.cst" as ur;
+
+// === Auto-vectorizer: integer i64 sum reduction `s += a[i]` ===
+//
+// -O2 only, run at codegen time (gen_func), like the unroller. SAFE first target:
+// a sum reduction only READS the array, so no aliasing analysis is needed, and
+// integer add is associative so reassociating into SIMD lanes is exact.
+//
+// Matches the canonical counted loop `while (i < N) { s = s + a[i]; i = i+1; }`
+// with N a small even compile-time constant. Rewrites it (fully unrolled, no
+// vector loop) to:
+//     vacc = 0 (xmm)
+//     for k in 0,2,4,...,N-2:  vacc += movdqu[a + k*8]   (paddq, 2 lanes)
+//     s = s_init + (vacc.lane0 + vacc.lane1)
+// Only the SCALAR loop is replaced; correctness verified vs the scalar version.
+
+let is i32 as VEC_MAX_TRIP with imut = 64;
+
+fn vec_new_vreg(func as *d.IRFunction) as i32 {
+    let is i32 as v = func.vreg_count;
+    func.vreg_count = func.vreg_count + 1;
+    return v;
+}
+
+// append an instruction after `after`, return the new inst (becomes next `after`).
+fn vec_emit(after as *d.IRInst, ni as *d.IRInst) as *d.IRInst {
+    ni.next = after.next;
+    after.next = ni;
+    return ni;
+}
+fn pass_vectorize(func as *d.IRFunction) as i32 {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return 0; }
+    let is *i32 as def_count = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4); *p = 0;
+        let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, i) * 8); *q = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.op != d.IR_STORE && w.op != d.IR_COPY
+            && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, w.dest.vreg) * 4); *p = *p + 1;
+            let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, w.dest.vreg) * 8); *q = cast(i64, w);
+        }
+        w = w.next;
+    }
+    // Safety guard: vector vregs are 128-bit but spill slots are 8 bytes, so a
+    // spilled vector vreg would corrupt. Only vectorize FLOAT-FREE functions —
+    // then the only XMM vregs are our ≤2 live vector vregs, which always get a
+    // register (14 free) and never spill. Bail if the function uses any float op.
+    let is *d.IRInst as fchk with mut = func.instructions;
+    while (cast(i64, fchk) != 0) {
+        if (fchk.is_dead == 0 && (fchk.op == d.IR_FADD || fchk.op == d.IR_FSUB || fchk.op == d.IR_FMUL
+            || fchk.op == d.IR_FDIV || fchk.op == d.IR_FNEG || fchk.op == d.IR_FSQRT)) {
+            d.opt_free(cast(*u8, def_inst)); d.opt_free(cast(*u8, def_count));
+            return 0;
+        }
+        fchk = fchk.next;
+    }
+
+    let is i32 as did with mut = 0;
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as hdr with mut = func.instructions;
+    while (cast(i64, hdr) != 0 && did == 0) {
+        if (hdr.is_dead == 0 && hdr.op == d.IR_LABEL) {
+            did = vec_try(func, hdr, prev, def_inst, def_count, vc);
+        }
+        prev = hdr;
+        hdr = hdr.next;
+    }
+    d.opt_free(cast(*u8, def_inst));
+    d.opt_free(cast(*u8, def_count));
+    return did;
+}
+
+// is vreg `v` used as a src by some live body inst strictly before `stop`?
+fn vec_used_before(body_first as *d.IRInst, stop as *d.IRInst, v as i32) as i32 {
+    let is *d.IRInst as p with mut = body_first;
+    while (cast(i64, p) != 0 && cast(i64, p) != cast(i64, stop)) {
+        if (p.is_dead == 0) {
+            if (p.src1.op_type == d.OP_VREG && p.src1.vreg == v) { return 1; }
+            if (p.src2.op_type == d.OP_VREG && p.src2.vreg == v) { return 1; }
+        }
+        p = p.next;
+    }
+    return 0;
+}
+
+fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
+           def_inst as *i64, def_count as *i32, vc as i32) as i32 {
+    if (cast(i64, prev) == 0) { return 0; }
+    let is i32 as hlabel = hdr.dest.label;
+
+    // --- loop skeleton (mirror unroll's counted-loop detection) ---
+    let is *d.IRInst as c with mut = ur.ur_next_live(hdr);
+    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
+    let is i32 as sg with mut = 0;
+    while (cast(i64, c) != 0 && sg < VEC_MAX_TRIP) {
+        if (c.op == d.IR_JZ) { jz = c; c = cast(*d.IRInst, 0); }
+        else if (ur.ur_is_barrier(c.op) == 1) { return 0; }
+        else { c = ur.ur_next_live(c); sg = sg + 1; }
+    }
+    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG || jz.dest.op_type != d.OP_LABEL) { return 0; }
+    if (jz.src1.vreg < 0 || jz.src1.vreg >= vc) { return 0; }
+    let is *i64 as cdp = cast(*i64, cast(i64, def_inst) + cast(i64, jz.src1.vreg) * 8);
+    let is *d.IRInst as ltd = cast(*d.IRInst, *cdp);
+    if (cast(i64, ltd) == 0 || ltd.op != d.IR_LT || ltd.src1.op_type != d.OP_VREG) { return 0; }
+    let is i64 as nbound with mut = 0;
+    if (ur.ur_val_const(def_inst, def_count, vc, cast(i32, ltd.src2.op_type), ltd.src2.vreg, ltd.src2.imm, &nbound) == 0) { return 0; }
+    let is i32 as iv = ur.ur_resolve(def_inst, def_count, vc, ltd.src1.vreg);
+    if (iv < 0 || iv >= vc) { return 0; }
+
+    // body up to back-edge; straight-line; NO stores (reduction reads only)
+    let is *d.IRInst as body_first with mut = ur.ur_next_live(jz);
+    if (cast(i64, body_first) == 0) { return 0; }
+    let is *d.IRInst as backedge with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as b with mut = body_first;
+    let is i32 as bsize with mut = 0;
+    while (cast(i64, b) != 0 && bsize <= VEC_MAX_TRIP) {
+        if (b.op == d.IR_JMP) { if (b.dest.op_type == d.OP_LABEL && b.dest.label == hlabel) { backedge = b; b = cast(*d.IRInst, 0); } else { return 0; } }
+        else if (b.op == d.IR_STORE || b.op == d.IR_COPY) { return 0; }   // a store -> not a pure reduction
+        else if (ur.ur_is_barrier(b.op) == 1) { return 0; }
+        else { bsize = bsize + 1; b = ur.ur_next_live(b); }
+    }
+    if (cast(i64, backedge) == 0 || bsize == 0) { return 0; }
+
+    // --- find the carried vars (read-before-write in body): expect exactly {iv, s} ---
+    let is i32 as s_acc with mut = cast(i32, 0 - 1);
+    let is *d.IRInst as s_write with mut = cast(*d.IRInst, 0);
+    let is i32 as iv_seen with mut = 0;
+    let is i32 as carried_extra with mut = 0;
+    b = body_first;
+    while (cast(i64, b) != 0 && cast(i64, b) != cast(i64, backedge)) {
+        if (b.is_dead == 0 && b.op == d.IR_MOV && b.dest.op_type == d.OP_VREG && b.src1.op_type == d.OP_VREG) {
+            let is i32 as cd = b.dest.vreg;
+            if (vec_used_before(body_first, b, cd) == 1) {       // carried update
+                if (cd == iv) { iv_seen = 1; }
+                else if (s_acc < 0) { s_acc = cd; s_write = b; }
+                else { carried_extra = 1; }
+            }
+        }
+        b = b.next;
+    }
+    if (iv_seen == 0 || s_acc < 0 || carried_extra == 1) { return 0; }
+
+    // --- verify s_write: s = (s + LOAD[base + iv*8]) ---
+    // s_write: MOV s = vt;  vt = ADD(p,q) with one operand resolving to s, other = x;
+    // x = LOAD[addr];  addr = LEA8(base, iv').
+    let is i32 as vt = s_write.src1.vreg;
+    if (vt < 0 || vt >= vc) { return 0; }
+    let is *i64 as vtp = cast(*i64, cast(i64, def_inst) + cast(i64, vt) * 8);
+    let is *d.IRInst as add = cast(*d.IRInst, *vtp);
+    if (cast(i64, add) == 0 || add.op != d.IR_ADD || add.src1.op_type != d.OP_VREG || add.src2.op_type != d.OP_VREG) { return 0; }
+    // which operand is the accumulator (resolves to s), which is the loaded value x
+    let is i32 as a1 = ur.ur_resolve(def_inst, def_count, vc, add.src1.vreg);
+    let is i32 as a2 = ur.ur_resolve(def_inst, def_count, vc, add.src2.vreg);
+    let is i32 as xv with mut = cast(i32, 0 - 1);
+    if (a1 == s_acc) { xv = add.src2.vreg; }
+    else if (a2 == s_acc) { xv = add.src1.vreg; }
+    else { return 0; }
+    // x = LOAD[addr]
+    if (xv < 0 || xv >= vc) { return 0; }
+    let is *i64 as xp = cast(*i64, cast(i64, def_inst) + cast(i64, xv) * 8);
+    let is *d.IRInst as ld = cast(*d.IRInst, *xp);
+    if (cast(i64, ld) == 0 || ld.op != d.IR_LOAD || ld.src1.op_type != d.OP_VREG) { return 0; }
+    // integer load only (skip float — different packed op)
+    if (cast(i64, ld.cast_to) != 0 && d._ty_is_float(ld.cast_to) == 1) { return 0; }
+    // addr = LEA8(base, iv')  (scale 8 = i64 stride)
+    let is i32 as addrv = ld.src1.vreg;
+    if (addrv < 0 || addrv >= vc) { return 0; }
+    let is *i64 as ap = cast(*i64, cast(i64, def_inst) + cast(i64, addrv) * 8);
+    let is *d.IRInst as lea = cast(*d.IRInst, *ap);
+    if (cast(i64, lea) == 0 || lea.op != d.IR_LEA8 || lea.src1.op_type != d.OP_VREG || lea.src2.op_type != d.OP_VREG) { return 0; }
+    // one LEA operand resolves to iv (the index), the other to base (loop-invariant)
+    let is i32 as l1 = ur.ur_resolve(def_inst, def_count, vc, lea.src1.vreg);
+    let is i32 as l2 = ur.ur_resolve(def_inst, def_count, vc, lea.src2.vreg);
+    let is i32 as base with mut = cast(i32, 0 - 1);
+    if (l1 == iv) { base = l2; }
+    else if (l2 == iv) { base = l1; }
+    else { return 0; }
+    if (base < 0 || base >= vc) { return 0; }
+
+    // --- iv step +1 and init constant (mirror unroll) ---
+    let is i32 as iv_writes with mut = 0;
+    let is i32 as step_ok with mut = 0;
+    b = body_first;
+    while (cast(i64, b) != 0 && cast(i64, b) != cast(i64, backedge)) {
+        if (b.is_dead == 0 && b.dest.op_type == d.OP_VREG && b.dest.vreg == iv && b.op != d.IR_STORE) {
+            iv_writes = iv_writes + 1;
+            if (b.op == d.IR_MOV && b.src1.op_type == d.OP_VREG) {
+                let is *i64 as vtd = cast(*i64, cast(i64, def_inst) + cast(i64, b.src1.vreg) * 8);
+                if (ur.ur_add_is_iv_plus1(cast(*d.IRInst, *vtd), def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
+            } else if (ur.ur_add_is_iv_plus1(b, def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
+        }
+        b = b.next;
+    }
+    if (iv_writes != 1 || step_ok != 1) { return 0; }
+    let is i64 as init with mut = 0;
+    let is i32 as init_ok with mut = 0;
+    let is *d.IRInst as s2 with mut = func.instructions;
+    while (cast(i64, s2) != 0 && cast(i64, s2) != cast(i64, hdr)) {
+        if (s2.is_dead == 0 && s2.dest.op_type == d.OP_VREG && s2.dest.vreg == iv && s2.op != d.IR_STORE && s2.op != d.IR_COPY) {
+            if (s2.op == d.IR_IMM && s2.src1.op_type == d.OP_IMM) { init = s2.src1.imm; init_ok = 1; }
+            else if (s2.op == d.IR_MOV && s2.src1.op_type == d.OP_VREG) { let is i64 as cv with mut = 0; if (ur.ur_const(def_inst, def_count, vc, s2.src1.vreg, &cv) == 1) { init = cv; init_ok = 1; } else { init_ok = 0; } }
+            else { init_ok = 0; }
+        }
+        s2 = s2.next;
+    }
+    if (init_ok == 0) { return 0; }
+    let is i64 as trip = nbound - init;
+    if (trip < 2 || trip > cast(i64, VEC_MAX_TRIP)) { return 0; }
+    if ((trip & 1) != 0) { return 0; }   // need even trip for 2-wide (no remainder yet)
+
+    // s_init: the pre-loop value of s (the vreg feeding s before the loop).
+    let is i32 as s_init_vreg with mut = cast(i32, 0 - 1);
+    s2 = func.instructions;
+    while (cast(i64, s2) != 0 && cast(i64, s2) != cast(i64, hdr)) {
+        if (s2.is_dead == 0 && s2.dest.op_type == d.OP_VREG && s2.dest.vreg == s_acc
+            && s2.op == d.IR_MOV && s2.src1.op_type == d.OP_VREG) { s_init_vreg = s2.src1.vreg; }
+        s2 = s2.next;
+    }
+    if (s_init_vreg < 0) { return 0; }
+
+    // ===== rewrite: insert the vector reduction before the header, kill the loop =====
+    let is i32 as init_byte = cast(i32, init) * 8;   // base + init*8 is element 0's address
+    let is *d.IRInst as ip with mut = prev;          // insertion cursor (before hdr)
+
+    // vacc = VZERO
+    let is i32 as vacc = vec_new_vreg(func);
+    let is *d.IRInst as vz = d.new_inst(d.IR_VZERO);
+    vz.dest.op_type = cast(i8, d.OP_VREG); vz.dest.vreg = vacc; vz.line = hdr.line;
+    ip = vec_emit(ip, vz);
+
+    // for k = 0,2,...,trip-2 : v = VLOADQ(base, off = init_byte + k*8); vacc += v
+    // (VLOADQ adds the constant byte offset to a scratch reg, so `base` itself is
+    // never modified — it stays live in its own register across all the loads.)
+    let is i64 as k with mut = 0;
+    while (k < trip) {
+        let is i64 as off = cast(i64, init_byte) + k * 8;
+        let is i32 as vld = vec_new_vreg(func);
+        let is *d.IRInst as vl = d.new_inst(d.IR_VLOADQ);
+        vl.dest.op_type = cast(i8, d.OP_VREG); vl.dest.vreg = vld;
+        vl.src1.op_type = cast(i8, d.OP_VREG); vl.src1.vreg = base;
+        vl.src2.op_type = cast(i8, d.OP_IMM);  vl.src2.imm = off;
+        vl.line = hdr.line;
+        ip = vec_emit(ip, vl);
+        let is *d.IRInst as va = d.new_inst(d.IR_VADDQ);
+        va.dest.op_type = cast(i8, d.OP_VREG); va.dest.vreg = vacc;
+        va.src1.op_type = cast(i8, d.OP_VREG); va.src1.vreg = vacc;
+        va.src2.op_type = cast(i8, d.OP_VREG); va.src2.vreg = vld;
+        va.line = hdr.line;
+        ip = vec_emit(ip, va);
+        k = k + 2;
+    }
+    // h = VREDUCEQ(vacc) ; s = s_init + h
+    let is i32 as hv = vec_new_vreg(func);
+    let is *d.IRInst as vr = d.new_inst(d.IR_VREDUCEQ);
+    vr.dest.op_type = cast(i8, d.OP_VREG); vr.dest.vreg = hv;
+    vr.src1.op_type = cast(i8, d.OP_VREG); vr.src1.vreg = vacc;
+    vr.line = hdr.line;
+    ip = vec_emit(ip, vr);
+    let is *d.IRInst as fin = d.new_inst(d.IR_ADD);
+    fin.dest.op_type = cast(i8, d.OP_VREG); fin.dest.vreg = s_acc;
+    fin.src1.op_type = cast(i8, d.OP_VREG); fin.src1.vreg = s_init_vreg;
+    fin.src2.op_type = cast(i8, d.OP_VREG); fin.src2.vreg = hv;
+    fin.line = hdr.line;
+    ip = vec_emit(ip, fin);
+
+    // kill the scalar loop body + control (labels stay; harmless)
+    jz.is_dead = 1;
+    backedge.is_dead = 1;
+    b = body_first;
+    while (cast(i64, b) != 0 && cast(i64, b) != cast(i64, backedge)) { b.is_dead = 1; b = b.next; }
+    return 1;
+}
