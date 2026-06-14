@@ -1,0 +1,281 @@
+use "defs.cst" as d;
+
+// === Loop unrolling: full-unroll small constant-trip straight-line loops ===
+//
+// -O2 only. Recognizes the canonical counted loop the front-end emits for
+// `while (i < N) { <straight-line body>; i = i + 1; }` with N a compile-time
+// constant and a small trip count, and replaces it with K back-to-back copies
+// of the body (K = N - init), dropping the per-iteration test + conditional
+// branch + back-edge. Vregs are REUSED across copies (no renaming): loop-carried
+// values (the induction var and accumulators) are read at the top of each copy
+// and rewritten at the bottom, so reuse threads them correctly; temporaries are
+// recomputed each copy. The body must be a single straight-line block (no
+// labels/branches/calls inside) so cloning needs no label remap and the trip
+// count is exact.
+//
+// Conservative by construction (small K, small body, exact LT(i,N)+1 step) and
+// gated >=2 so -O1/self-host is unaffected. Returns 1 if it unrolled a loop.
+
+let is i32 as MAX_UNROLL with imut = 8;
+let is i32 as MAX_BODY with imut = 32;
+
+// resolve v through single-def MOV-copy chains; stops at a multi-def vreg (so it
+// lands on the loop-carried induction var rather than over-resolving past it).
+fn ur_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 64) {
+        if (cur < 0 || cur >= vc) { return cur; }
+        let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, cur) * 4);
+        if (*dcp != 1) { return cur; }
+        let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+        let is *d.IRInst as di = cast(*d.IRInst, *dip);
+        if (cast(i64, di) == 0) { return cur; }
+        if (di.op != d.IR_MOV || di.src1.op_type != d.OP_VREG) { return cur; }
+        cur = di.src1.vreg;
+        guard = guard + 1;
+    }
+    return cur;
+}
+
+// If v (single-def) ultimately holds a constant (IMM, possibly via MOV copies),
+// write it to *out and return 1.
+fn ur_const(def_inst as *i64, def_count as *i32, vc as i32, v as i32, out as *i64) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 64) {
+        if (cur < 0 || cur >= vc) { return 0; }
+        let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, cur) * 4);
+        if (*dcp != 1) { return 0; }
+        let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+        let is *d.IRInst as di = cast(*d.IRInst, *dip);
+        if (cast(i64, di) == 0) { return 0; }
+        if (di.op == d.IR_IMM && di.src1.op_type == d.OP_IMM) { *out = di.src1.imm; return 1; }
+        if (di.op == d.IR_MOV && di.src1.op_type == d.OP_VREG) { cur = di.src1.vreg; guard = guard + 1; }
+        else { return 0; }
+    }
+    return 0;
+}
+
+// constant value of an operand (IMM directly, or a vreg resolving to a const).
+// Robust to the bound/step being a not-yet-folded IMM vreg at this pipeline pos.
+fn ur_val_const(def_inst as *i64, def_count as *i32, vc as i32, op_type as i32, vreg as i32, imm as i64, out as *i64) as i32 {
+    if (op_type == d.OP_IMM) { *out = imm; return 1; }
+    if (op_type == d.OP_VREG) { return ur_const(def_inst, def_count, vc, vreg, out); }
+    return 0;
+}
+
+// is `add` an `iv + 1` (either operand order, the 1 as IMM or const-vreg)?
+fn ur_add_is_iv_plus1(add as *d.IRInst, def_inst as *i64, def_count as *i32, vc as i32, iv as i32) as i32 {
+    if (cast(i64, add) == 0 || add.op != d.IR_ADD) { return 0; }
+    let is i64 as cv with mut = 0;
+    if (add.src1.op_type == d.OP_VREG && ur_resolve(def_inst, def_count, vc, add.src1.vreg) == iv
+        && ur_val_const(def_inst, def_count, vc, cast(i32, add.src2.op_type), add.src2.vreg, add.src2.imm, &cv) == 1 && cv == 1) { return 1; }
+    if (add.src2.op_type == d.OP_VREG && ur_resolve(def_inst, def_count, vc, add.src2.vreg) == iv
+        && ur_val_const(def_inst, def_count, vc, cast(i32, add.src1.op_type), add.src1.vreg, add.src1.imm, &cv) == 1 && cv == 1) { return 1; }
+    return 0;
+}
+
+// clone one instruction's fields (no list link).
+fn ur_clone_inst(src as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n = d.new_inst(src.op);
+    n.dest.op_type = src.dest.op_type; n.dest.vreg = src.dest.vreg; n.dest.imm = src.dest.imm; n.dest.label = src.dest.label;
+    n.src1.op_type = src.src1.op_type; n.src1.vreg = src.src1.vreg; n.src1.imm = src.src1.imm; n.src1.label = src.src1.label;
+    n.src2.op_type = src.src2.op_type; n.src2.vreg = src.src2.vreg; n.src2.imm = src.src2.imm; n.src2.label = src.src2.label;
+    n.line = src.line;
+    n.cast_to = src.cast_to; n.cast_from = src.cast_from;
+    n.call_name_ptr = src.call_name_ptr; n.call_name_len = src.call_name_len;
+    n.is_variadic_call = src.is_variadic_call; n.is_extern_call = src.is_extern_call;
+    n.global_name_ptr = src.global_name_ptr; n.global_name_len = src.global_name_len;
+    n.is_extern_global = src.is_extern_global;
+    n.asm_str_ptr = src.asm_str_ptr; n.asm_str_len = src.asm_str_len;
+    n.disp_tail_bytes = src.disp_tail_bytes;
+    return n;
+}
+
+// op that breaks straight-line-ness (control flow / side-effecting call/barrier).
+fn ur_is_barrier(op as i32) as i32 {
+    if (op == d.IR_LABEL || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_JMP
+        || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+        || op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
+        || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) {
+        return 1;
+    }
+    return 0;
+}
+
+fn pass_unroll(func as *d.IRFunction) as i32 {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return 0; }
+
+    // def_count (live) + def_inst (last live def)
+    let is *i32 as def_count = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4); *p = 0;
+        let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, i) * 8); *q = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.op != d.IR_STORE && w.op != d.IR_COPY
+            && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, w.dest.vreg) * 4); *p = *p + 1;
+            let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, w.dest.vreg) * 8); *q = cast(i64, w);
+        }
+        w = w.next;
+    }
+
+    let is i32 as did with mut = 0;
+    let is *d.IRInst as hdr with mut = func.instructions;
+    while (cast(i64, hdr) != 0 && did == 0) {
+        if (hdr.is_dead == 0 && hdr.op == d.IR_LABEL) {
+            did = ur_try(func, hdr, def_inst, def_count, vc);
+        }
+        hdr = hdr.next;
+    }
+
+    d.opt_free(cast(*u8, def_inst));
+    d.opt_free(cast(*u8, def_count));
+    return did;
+}
+
+fn ur_next_live(inst as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as p with mut = inst.next;
+    while (cast(i64, p) != 0 && p.is_dead == 1) { p = p.next; }
+    return p;
+}
+
+// Try to unroll the loop whose header LABEL is `hdr`. Returns 1 on success.
+fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count as *i32, vc as i32) as i32 {
+    let is i32 as hlabel = hdr.dest.label;
+
+    // header → first conditional must be the exit test: LT(i,N); JZ Lexit
+    let is *d.IRInst as c with mut = ur_next_live(hdr);
+    // skip the leading MOV/LT computation up to the JZ; bail on any barrier other than the JZ
+    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
+    let is i32 as scan_guard with mut = 0;
+    while (cast(i64, c) != 0 && scan_guard < MAX_BODY) {
+        if (c.op == d.IR_JZ) { jz = c; c = cast(*d.IRInst, 0); }
+        else if (ur_is_barrier(c.op) == 1) { return 0; }   // some other control before the test
+        else { c = ur_next_live(c); scan_guard = scan_guard + 1; }
+    }
+    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG || jz.dest.op_type != d.OP_LABEL) { return 0; }
+
+    // condition vreg must be LT(i, IMM N)
+    if (jz.src1.vreg < 0 || jz.src1.vreg >= vc) { return 0; }
+    let is *i64 as cdp = cast(*i64, cast(i64, def_inst) + cast(i64, jz.src1.vreg) * 8);
+    let is *d.IRInst as ltd = cast(*d.IRInst, *cdp);
+    if (cast(i64, ltd) == 0 || ltd.op != d.IR_LT || ltd.src1.op_type != d.OP_VREG) { return 0; }
+    let is i64 as nbound with mut = 0;
+    if (ur_val_const(def_inst, def_count, vc, cast(i32, ltd.src2.op_type), ltd.src2.vreg, ltd.src2.imm, &nbound) == 0) { return 0; }
+    let is i32 as iv = ur_resolve(def_inst, def_count, vc, ltd.src1.vreg);
+    if (iv < 0 || iv >= vc) { return 0; }
+
+    // body = live insts strictly between jz and the back-edge JMP to hlabel.
+    // must be straight-line; the back-edge must target hlabel.
+    let is *d.IRInst as body_first with mut = ur_next_live(jz);
+    if (cast(i64, body_first) == 0) { return 0; }
+    let is *d.IRInst as backedge with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as body_last with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as b with mut = body_first;
+    let is i32 as bsize with mut = 0;
+    while (cast(i64, b) != 0 && bsize <= MAX_BODY) {
+        if (b.op == d.IR_JMP) {
+            if (b.dest.op_type == d.OP_LABEL && b.dest.label == hlabel) { backedge = b; b = cast(*d.IRInst, 0); }
+            else { return 0; }   // jump elsewhere → not a simple loop
+        } else if (ur_is_barrier(b.op) == 1) {
+            return 0;            // label/branch/call inside body → bail
+        } else {
+            body_last = b;
+            bsize = bsize + 1;
+            b = ur_next_live(b);
+        }
+    }
+    if (cast(i64, backedge) == 0 || cast(i64, body_last) == 0 || bsize == 0 || bsize > MAX_BODY) { return 0; }
+
+    // induction var: exactly one live write in the body, and it must be +1.
+    let is i32 as iv_writes with mut = 0;
+    let is i32 as step_ok with mut = 0;
+    b = body_first;
+    while (cast(i64, b) != 0) {
+        if (cast(i64, b) == cast(i64, backedge)) { b = cast(*d.IRInst, 0); }
+        else {
+            if (b.is_dead == 0 && b.dest.op_type == d.OP_VREG && b.dest.vreg == iv
+                && b.op != d.IR_STORE && b.op != d.IR_COPY) {
+                iv_writes = iv_writes + 1;
+                // accept `MOV iv = vt` where vt = ADD(iv + 1), or a direct `ADD iv = iv,1`
+                // (the `1` may be an IMM or a not-yet-folded const vreg, either operand order)
+                if (b.op == d.IR_MOV && b.src1.op_type == d.OP_VREG) {
+                    let is *i64 as vtd = cast(*i64, cast(i64, def_inst) + cast(i64, b.src1.vreg) * 8);
+                    let is *d.IRInst as add = cast(*d.IRInst, *vtd);
+                    if (ur_add_is_iv_plus1(add, def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
+                } else if (ur_add_is_iv_plus1(b, def_inst, def_count, vc, iv) == 1) { step_ok = 1; }
+            }
+            b = b.next;
+        }
+    }
+    if (iv_writes != 1 || step_ok != 1) { return 0; }
+
+    // init: last live write to iv BEFORE the header, resolving to a constant.
+    let is i64 as init with mut = 0;
+    let is i32 as init_ok with mut = 0;
+    let is *d.IRInst as s with mut = func.instructions;
+    while (cast(i64, s) != 0 && cast(i64, s) != cast(i64, hdr)) {
+        if (s.is_dead == 0 && s.dest.op_type == d.OP_VREG && s.dest.vreg == iv
+            && s.op != d.IR_STORE && s.op != d.IR_COPY) {
+            if (s.op == d.IR_IMM && s.src1.op_type == d.OP_IMM) { init = s.src1.imm; init_ok = 1; }
+            else if (s.op == d.IR_MOV && s.src1.op_type == d.OP_VREG) {
+                let is i64 as cv with mut = 0;
+                if (ur_const(def_inst, def_count, vc, s.src1.vreg, &cv) == 1) { init = cv; init_ok = 1; }
+                else { init_ok = 0; }
+            } else { init_ok = 0; }
+        }
+        s = s.next;
+    }
+    if (init_ok == 0) { return 0; }
+
+    // trip count = N - init, must be a small positive constant.
+    let is i64 as kk = nbound - init;
+    if (kk < 1 || kk > cast(i64, MAX_UNROLL)) { return 0; }
+    let is i32 as k = cast(i32, kk);
+
+    // --- transform: drop test + back-edge, clone body K-1 times after it ---
+    // Snapshot the live body insts into an array FIRST. Cloning by walking the
+    // live list would be unsound: each clone is linked after body_last, so the
+    // walker's `.next` would step INTO the just-inserted clones and re-clone them.
+    let is i32 as nb with mut = 0;
+    let is *d.IRInst as cnt with mut = body_first;
+    while (cast(i64, cnt) != 0 && cast(i64, cnt) != cast(i64, backedge)) {
+        if (cnt.is_dead == 0) { nb = nb + 1; }
+        cnt = cnt.next;
+    }
+    if (nb == 0) { return 0; }
+    let is *i64 as barr = cast(*i64, d.opt_alloc(cast(i64, nb) * 8));
+    let is i32 as bi with mut = 0;
+    cnt = body_first;
+    while (cast(i64, cnt) != 0 && cast(i64, cnt) != cast(i64, backedge)) {
+        if (cnt.is_dead == 0) { let is *i64 as bp = cast(*i64, cast(i64, barr) + cast(i64, bi) * 8); *bp = cast(i64, cnt); bi = bi + 1; }
+        cnt = cnt.next;
+    }
+
+    jz.is_dead = 1;
+    backedge.is_dead = 1;
+    let is i32 as copy with mut = 1;
+    let is *d.IRInst as insert_after with mut = body_last;
+    while (copy < k) {
+        let is i32 as j with mut = 0;
+        while (j < nb) {
+            let is *i64 as bp = cast(*i64, cast(i64, barr) + cast(i64, j) * 8);
+            let is *d.IRInst as cl = ur_clone_inst(cast(*d.IRInst, *bp));
+            cl.next = insert_after.next;
+            insert_after.next = cl;
+            insert_after = cl;
+            j = j + 1;
+        }
+        copy = copy + 1;
+    }
+    d.opt_free(cast(*u8, barr));
+    return 1;
+}
