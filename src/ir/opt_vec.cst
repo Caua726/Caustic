@@ -101,19 +101,25 @@ fn pass_vectorize(func as *d.IRFunction) as i32 {
         }
         w = w.next;
     }
-    // Safety guard: vector vregs are 128-bit but spill slots are 8 bytes, so a
-    // spilled vector vreg would corrupt. Only vectorize FLOAT-FREE functions —
-    // then the only XMM vregs are our ≤2 live vector vregs, which always get a
-    // register (14 free) and never spill. Bail if the function uses any float op.
+    // Spill safety: vector vregs are 128-bit but spill slots are 8 bytes, so a
+    // spilled vector vreg would corrupt (movsd drops the upper lane). We add <=2
+    // live vector vregs; to guarantee they get a register (never spill), bail if
+    // the function already has high XMM pressure. Count float-producing insts
+    // (the only things besides our vectors that take xmm regs); if there are more
+    // than a handful, don't vectorize. Float-free functions (typical integer
+    // reductions) trivially pass; pure float reductions have ~2-3 and pass.
+    let is i32 as nfloat with mut = 0;
     let is *d.IRInst as fchk with mut = func.instructions;
     while (cast(i64, fchk) != 0) {
-        if (fchk.is_dead == 0 && (fchk.op == d.IR_FADD || fchk.op == d.IR_FSUB || fchk.op == d.IR_FMUL
-            || fchk.op == d.IR_FDIV || fchk.op == d.IR_FNEG || fchk.op == d.IR_FSQRT)) {
-            d.opt_free(cast(*u8, def_inst)); d.opt_free(cast(*u8, def_count));
-            return 0;
+        if (fchk.is_dead == 0) {
+            let is i32 as fop = fchk.op;
+            if (fop == d.IR_FADD || fop == d.IR_FSUB || fop == d.IR_FMUL || fop == d.IR_FDIV
+                || fop == d.IR_FNEG || fop == d.IR_FSQRT) { nfloat = nfloat + 1; }
+            else if (fop == d.IR_LOAD && cast(i64, fchk.cast_to) != 0 && d._ty_is_float(fchk.cast_to) == 1) { nfloat = nfloat + 1; }
         }
         fchk = fchk.next;
     }
+    if (nfloat > 6) { d.opt_free(cast(*u8, def_inst)); d.opt_free(cast(*u8, def_count)); return 0; }
 
     let is i32 as did with mut = 0;
     let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
@@ -207,7 +213,11 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     if (vt < 0 || vt >= vc) { return 0; }
     let is *i64 as vtp = cast(*i64, cast(i64, def_inst) + cast(i64, vt) * 8);
     let is *d.IRInst as add = cast(*d.IRInst, *vtp);
-    if (cast(i64, add) == 0 || add.op != d.IR_ADD || add.src1.op_type != d.OP_VREG || add.src2.op_type != d.OP_VREG) { return 0; }
+    if (cast(i64, add) == 0 || add.src1.op_type != d.OP_VREG || add.src2.op_type != d.OP_VREG) { return 0; }
+    // IR_ADD -> integer reduction; IR_FADD -> f64 reduction (FP reassoc OK at -O2)
+    let is i32 as is_float with mut = 0;
+    if (add.op == d.IR_FADD) { is_float = 1; }
+    else if (add.op != d.IR_ADD) { return 0; }
     // which operand is the accumulator (resolves to s), which is the loaded value x
     let is i32 as a1 = vec_resolve(def_inst, def_count, vc, add.src1.vreg);
     let is i32 as a2 = vec_resolve(def_inst, def_count, vc, add.src2.vreg);
@@ -220,8 +230,10 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     let is *i64 as xp = cast(*i64, cast(i64, def_inst) + cast(i64, xv) * 8);
     let is *d.IRInst as ld = cast(*d.IRInst, *xp);
     if (cast(i64, ld) == 0 || ld.op != d.IR_LOAD || ld.src1.op_type != d.OP_VREG) { return 0; }
-    // integer load only (skip float — different packed op)
-    if (cast(i64, ld.cast_to) != 0 && d._ty_is_float(ld.cast_to) == 1) { return 0; }
+    // the load's element type must match the reduction kind (float<->float, int<->int)
+    let is i32 as ld_is_float with mut = 0;
+    if (cast(i64, ld.cast_to) != 0 && d._ty_is_float(ld.cast_to) == 1) { ld_is_float = 1; }
+    if (ld_is_float != is_float) { return 0; }
     // addr = LEA8(base, iv')  (scale 8 = i64 stride)
     let is i32 as addrv = ld.src1.vreg;
     if (addrv < 0 || addrv >= vc) { return 0; }
@@ -233,7 +245,11 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     let is i32 as wide with mut = 0;
     let is i32 as vadd_op with mut = 0;
     let is i32 as vred_op with mut = 0;
-    if (lea.op == d.IR_LEA8) { elem = 8; wide = 2; vadd_op = d.IR_VADDQ; vred_op = d.IR_VREDUCEQ; }
+    if (is_float == 1) {
+        // f64: 8-byte stride (LEA8), 2 lanes, addpd + f64 horizontal reduce.
+        if (lea.op != d.IR_LEA8) { return 0; }
+        elem = 8; wide = 2; vadd_op = d.IR_VADDPD; vred_op = d.IR_VREDUCEPD;
+    } else if (lea.op == d.IR_LEA8) { elem = 8; wide = 2; vadd_op = d.IR_VADDQ; vred_op = d.IR_VREDUCEQ; }
     else if (lea.op == d.IR_LEA4) { elem = 4; wide = 4; vadd_op = d.IR_VADDD; vred_op = d.IR_VREDUCED; }
     else { return 0; }
     // one LEA operand resolves to iv (the index), the other to base (loop-invariant)
@@ -324,7 +340,9 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     vr.src1.op_type = cast(i8, d.OP_VREG); vr.src1.vreg = vacc;
     vr.line = hdr.line;
     ip = vec_emit(ip, vr);
-    let is *d.IRInst as fin = d.new_inst(d.IR_ADD);
+    let is i32 as fin_op with mut = d.IR_ADD;
+    if (is_float == 1) { fin_op = d.IR_FADD; }
+    let is *d.IRInst as fin = d.new_inst(fin_op);
     fin.dest.op_type = cast(i8, d.OP_VREG); fin.dest.vreg = s_acc;
     fin.src1.op_type = cast(i8, d.OP_VREG); fin.src1.vreg = s_init_vreg;
     fin.src2.op_type = cast(i8, d.OP_VREG); fin.src2.vreg = hv;
