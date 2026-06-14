@@ -1,0 +1,117 @@
+use "defs.cst" as d;
+
+// === If-conversion: branchy value-select -> branchless cmov ===
+//
+// Runs LATE (in gen_func, just before register allocation, after every mid-end
+// pass incl. DCE/inlining), so no other pass needs to know about IR_CMOV. It
+// matches the exact post-optimization shape the compiler emits for
+// `if (c) x = A; else x = B;` (a phi destroyed into two predecessor MOVs):
+//
+//       JZ   cond -> Lelse                 ; src1=cond, dest.label=Lelse
+//       <pure MOV/IMM ...>                 ; then arm; last live inst: MOV dest = St
+//       JMP  -> Ljoin
+//     Lelse:
+//       <pure MOV/IMM ...>                 ; else arm; last live inst: MOV dest = Sf
+//     Ljoin:
+//
+// becomes (both arms' pure work now runs unconditionally — MOV/IMM never fault):
+//
+//       <then pure work>                   ; its phi-mov MOV dest=St is dropped
+//     Lelse:
+//       <else pure work>                   ; its phi-mov MOV dest=Sf is the false-preload
+//       CMOV dest, cond, St                ; dest = cond ? St : Sf  (test cond; cmovne)
+//     Ljoin:
+//
+// Conservative by construction: only fires when BOTH arms contain nothing but
+// MOV/IMM (side-effect-free, non-faulting), both write the same dest, and the
+// two labels are referenced by exactly this JZ/JMP (no shared merge points).
+
+fn ic_next_live(inst as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as p with mut = inst.next;
+    while (cast(i64, p) != 0 && p.is_dead == 1) { p = p.next; }
+    return p;
+}
+
+// How many live branches target label L (guards against shared merge points).
+fn ic_count_label_refs(func as *d.IRFunction, L as i32) as i32 {
+    let is i32 as cnt with mut = 0;
+    let is *d.IRInst as p with mut = func.instructions;
+    while (cast(i64, p) != 0) {
+        if (p.is_dead == 0 && (p.op == d.IR_JMP || p.op == d.IR_JZ || p.op == d.IR_JNZ)
+            && p.dest.op_type == d.OP_LABEL && p.dest.label == L) { cnt = cnt + 1; }
+        p = p.next;
+    }
+    return cnt;
+}
+
+// Try to match + convert a diamond starting at `jz`. Returns 1 if converted.
+fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
+    let is i32 as cond = jz.src1.vreg;
+    let is i32 as else_label = jz.dest.label;
+
+    // --- then arm: pure MOV/IMM up to the JMP; last live inst is the phi-mov ---
+    let is *d.IRInst as t with mut = ic_next_live(jz);
+    let is *d.IRInst as then_phi with mut = cast(*d.IRInst, 0);
+    let is i32 as ok with mut = 1;
+    while (cast(i64, t) != 0 && t.op != d.IR_JMP && ok == 1) {
+        if (t.op != d.IR_MOV && t.op != d.IR_IMM) { ok = 0; }
+        else { then_phi = t; t = ic_next_live(t); }
+    }
+    if (ok == 0) { return 0; }
+    if (cast(i64, t) == 0 || t.op != d.IR_JMP) { return 0; }
+    let is *d.IRInst as jmp = t;
+    let is i32 as join_label = jmp.dest.label;
+    if (cast(i64, then_phi) == 0 || then_phi.op != d.IR_MOV
+        || then_phi.src1.op_type != d.OP_VREG || then_phi.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as destT = then_phi.dest.vreg;
+    let is i32 as srcT = then_phi.src1.vreg;
+
+    // --- else label must match the JZ target ---
+    let is *d.IRInst as lel = ic_next_live(jmp);
+    if (cast(i64, lel) == 0 || lel.op != d.IR_LABEL || lel.dest.label != else_label) { return 0; }
+
+    // --- else arm: pure MOV/IMM up to the join label ---
+    let is *d.IRInst as e with mut = ic_next_live(lel);
+    let is *d.IRInst as else_phi with mut = cast(*d.IRInst, 0);
+    ok = 1;
+    while (cast(i64, e) != 0 && e.op != d.IR_LABEL && ok == 1) {
+        if (e.op != d.IR_MOV && e.op != d.IR_IMM) { ok = 0; }
+        else { else_phi = e; e = ic_next_live(e); }
+    }
+    if (ok == 0) { return 0; }
+    if (cast(i64, e) == 0 || e.op != d.IR_LABEL || e.dest.label != join_label) { return 0; }
+    if (cast(i64, else_phi) == 0 || else_phi.op != d.IR_MOV
+        || else_phi.src1.op_type != d.OP_VREG || else_phi.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as destE = else_phi.dest.vreg;
+
+    // --- guards ---
+    if (destE != destT) { return 0; }
+    if (srcT == destE) { return 0; }   // cmov dest,dest could never select St
+    if (ic_count_label_refs(func, else_label) != 1) { return 0; }
+    if (ic_count_label_refs(func, join_label) != 1) { return 0; }
+
+    // --- transform ---
+    jz.is_dead = 1;
+    then_phi.is_dead = 1;       // then value St flows via the kept then-arm work
+    jmp.is_dead = 1;
+    // else_phi (MOV destE = Sf) survives as the false-value preload into destE.
+    let is *d.IRInst as cmov = d.new_inst(d.IR_CMOV);
+    cmov.dest.op_type = d.OP_VREG; cmov.dest.vreg = destE;
+    cmov.src1.op_type = d.OP_VREG; cmov.src1.vreg = cond;
+    cmov.src2.op_type = d.OP_VREG; cmov.src2.vreg = srcT;
+    cmov.line = else_phi.line;
+    cmov.next = else_phi.next;
+    else_phi.next = cmov;
+    return 1;
+}
+
+fn pass_ifconv(func as *d.IRFunction) as void {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_JZ && inst.src1.op_type == d.OP_VREG
+            && inst.dest.op_type == d.OP_LABEL) {
+            ic_try(func, inst);
+        }
+        inst = inst.next;
+    }
+}

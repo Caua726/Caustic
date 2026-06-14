@@ -296,6 +296,10 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
             g_opt_level = 0;
         } else if (str_eq(arg, arglen, "-O1", 3) == 1) {
             g_opt_level = 1;
+        } else if (str_eq(arg, arglen, "-O2", 3) == 1) {
+            // Release tier: -O1 + heavy global passes (GVN/SCCP/...) + SIMD
+            // vectorization. Never used by the self-host bootstrap.
+            g_opt_level = 2;
         } else if (str_eq(arg, arglen, "--path", 6) == 1) {
             ai = ai + 1;
             if (ai < argc) {
@@ -955,19 +959,49 @@ fn _mo_path(dir as *u8, prefix as *u8, plen as i32, suffix as *u8, suffix_len as
 fn _emit_one_obj(prog as *u8, prefix as *u8, plen as i32, dir as *u8, filename as *u8, fname_len as i32) as i32 {
     if (plen <= 0) { return 0; }
     tgt.module_prefix_set(prefix, plen);
-    let is *u8 as spath = _mo_path(dir, prefix, plen, ".s", 2);
     let is *u8 as opath = _mo_path(dir, prefix, plen, ".o", 2);
-    let is i64 as fd = io._open_write(spath);
-    if (fd < 0) {
-        io.write_str(io.STDERR, "module-objects: cannot write "); io.write_str(io.STDERR, spath); io.write_str(io.STDERR, "\n");
+    let is i64 as t_cg = get_time_us();
+    // In-memory pipeline (same as the single-file backend): codegen captures the
+    // assembly into a buffer (fd = -1), we peephole-optimize it in memory and
+    // feed it straight to the assembler — no per-module .s write + optimize
+    // read/rewrite + assembler read round-trip through disk. Nobody reads the
+    // per-module .s (run_parallel_exe deletes it, the maker links .o), so it's
+    // dropped entirely.
+    cg.capture_begin();
+    cgd.codegen(prog, cast(i32, 0 - 1), filename, fname_len);
+    cg.capture_end();
+    let is *u8 as s_ptr = cg.capture_ptr();
+    let is i64 as s_len with mut = cg.capture_len();
+    let is i64 as cg_us = get_time_us() - t_cg;
+    let is i64 as t_ph = get_time_us();
+    let is *u8 as opt_ptr with mut = s_ptr;
+    if (g_opt_level >= 1) {
+        let is i64 as olen with mut = 0;
+        opt_ptr = ph.optimize_asm_buf(s_ptr, s_len, &olen);
+        s_len = olen;
+    }
+    let is i64 as ph_us = get_time_us() - t_ph;
+    prof.prof_peephole_us = prof.prof_peephole_us + ph_us;
+    let is i64 as t_as = get_time_us();
+    let is i32 as asm_err = asmmod.assemble_buf(opt_ptr, s_len, opath);
+    if (cast(i64, opt_ptr) != cast(i64, s_ptr)) { mem.core.munmap(opt_ptr, s_len + 4096); }
+    // Keep the capture buffer alive across modules: capture_begin just resets the
+    // length, so the next module reuses the grown buffer instead of re-mmapping.
+    // Reclaimed at process exit (worker or parent). Avoids per-module mmap churn.
+    if (asm_err != 0) {
+        io.write_str(io.STDERR, "module-objects: assemble failed for "); io.write_str(io.STDERR, opath); io.write_str(io.STDERR, "\n");
         return 1;
     }
-    cgd.codegen(prog, cast(i32, fd), filename, fname_len);
-    io._close_fd(fd);
-    if (g_opt_level >= 1) { ph.optimize_asm(spath); }
-    if (asmmod.assemble_file(spath, opath) != 0) {
-        io.write_str(io.STDERR, "module-objects: assemble failed for "); io.write_str(io.STDERR, spath); io.write_str(io.STDERR, "\n");
-        return 1;
+    let is i64 as as_us = get_time_us() - t_as;
+    // Aggregate per-module emit timings into the shared accumulator page (set by
+    // run_parallel_exe when --profile is on). atomic_add so concurrent workers
+    // don't race; in the -j 1 path the same adds land in one process.
+    if (prof.prof_enabled == 1 && prof.emit_acc != 0) {
+        atomic_add(cast(*i64, prof.emit_acc + prof.EMIT_ACC_CODEGEN), cg_us);
+        atomic_add(cast(*i64, prof.emit_acc + prof.EMIT_ACC_ASM), as_us);
+        atomic_add(cast(*i64, prof.emit_acc + prof.EMIT_ACC_NMOD), 1);
+        atomic_add(cast(*i64, prof.emit_acc + prof.EMIT_ACC_ASMBYTES), s_len);
+        atomic_add(cast(*i64, prof.emit_acc + prof.EMIT_ACC_OBJBYTES), read_file_size(opath));
     }
     return 0;
 }
@@ -1205,8 +1239,42 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     let is i32 as ws = _detect_jobs(ntask + 1);
     let is *u8 as root_pp = sc.get_mod_prefix(filename, flen);
     let is i32 as root_pl = sc.get_mod_prefix_len(filename, flen);
+
+    // --profile: aggregate the forked workers' per-module codegen/assembler time
+    // through a MAP_SHARED accumulator page (set before the fork so children
+    // inherit the pointer; the page itself is shared, so their atomic_adds are
+    // visible to the parent after wait4). The per-function codegen breakdown
+    // (cg_prof) lives in a per-process buffer and only aggregates when emission
+    // is sequential (ws<=1, e.g. -j 1), so gate it on that.
+    if (prof.prof_enabled == 1) {
+        prof.emit_acc = cast(i64, os.linux.mmap(cast(*u8, 0), 4096,
+            os.linux.PROT_READ | os.linux.PROT_WRITE,
+            os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0));
+        if (ws <= 1) { cg.cg_prof_init(8192); cgd.gc_set_prof(1); iropt.opt_prof_init(); }
+    }
+
     let is i32 as st = _fork_emit(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, root_pp, root_pl, ws);
     if (st != 0) { io.write_str(io.STDERR, "Error: parallel emission failed\n"); return 1; }
+
+    if (prof.prof_enabled == 1 && prof.emit_acc != 0) {
+        prof.prof_record("codegen", *cast(*i64, prof.emit_acc + prof.EMIT_ACC_CODEGEN));
+        prof.prof_record("assembler", *cast(*i64, prof.emit_acc + prof.EMIT_ACC_ASM));
+        prof.prof_asm_bytes = *cast(*i64, prof.emit_acc + prof.EMIT_ACC_ASMBYTES);
+        prof.prof_obj_bytes = *cast(*i64, prof.emit_acc + prof.EMIT_ACC_OBJBYTES);
+        // Per-function codegen breakdown — only valid for sequential emission.
+        if (ws <= 1 && cg.cg_prof_count > 0) { prof.prof_print_top_funcs(); }
+        if (ws <= 1) { cgd.gc_phase_report(); iropt.opt_prof_print();
+            io.write_str(io.STDOUT, "\n  peephole (in codegen total) "); io.write_int(io.STDOUT, prof.prof_peephole_us / 1000); io.write_str(io.STDOUT, "ms\n");
+        }
+        // With >1 worker the codegen/assembler totals are summed CPU time across
+        // the fork pool, NOT wall-clock — flag it so the pipeline bars aren't
+        // misread (use -j 1 for a true single-thread profile).
+        if (ws > 1) {
+            io.write_str(io.STDOUT, "\nnote: codegen/assembler = aggregate CPU across ");
+            io.write_int(io.STDOUT, cast(i64, ws));
+            io.write_str(io.STDOUT, " workers (not wall-clock); use -j 1 for single-thread timing\n");
+        }
+    }
 
     // Collect .o paths (root first) and link into the executable.
     let is [1025]i64 as obj_arr;
@@ -1226,16 +1294,21 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     entrybuf[root_pl + 5] = cast(u8, 0);
     ldmod.g_entry_name = cast(i64, &entrybuf);
 
+    let is i64 as t_link = get_time_us();
     let is i32 as lerr = ldmod.link_objs(cast(*u8, &obj_arr), nobj, cast(*u8, g_output_path), cast(*u8, &g_lib_names), g_lib_count);
     if (lerr != 0) { io.write_str(io.STDERR, "Error: linking failed\n"); return 1; }
+    if (prof.prof_enabled == 1) { prof.prof_record("linker", get_time_us() - t_link); }
 
-    // Cleanup .o + .s, then the temp dir.
+    // Cleanup .o, then the temp dir. (No .s files: the in-memory pipeline in
+    // _emit_one_obj never writes them.)
     ti = 0;
     while (ti < nobj) { io.unlink(cast(*u8, obj_arr[ti])); ti = ti + 1; }
-    io.unlink(_mo_path(dir, root_pp, root_pl, ".s", 2));
-    ti = 0;
-    while (ti < ntask) { io.unlink(_mo_path(dir, cast(*u8, task_ptr[ti]), task_len[ti], ".s", 2)); ti = ti + 1; }
     os.linux.rmdir(dir);
+
+    if (prof.prof_enabled == 1 && prof.emit_acc != 0) {
+        os.linux.munmap(cast(*u8, prof.emit_acc), 4096);
+        prof.emit_acc = 0;
+    }
 
     if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, cast(*u8, g_output_path)); io.write_str(io.STDOUT, "\n"); }
     prof.prof_print();

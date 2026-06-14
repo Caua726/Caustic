@@ -1,0 +1,70 @@
+use "defs.cst" as d;
+
+// === Reassociation: combine constant addends/multipliers in a chain ===
+//
+// After fold_immediates, `(x + a) + b` is two ADDs each with an IMM right
+// operand. This pass collapses the constants: `t = x + a; y = t + b` -> `y = x +
+// (a+b)` (and marks the inner dead). Same for chained MUL. Integer-only opcodes
+// (IR_ADD/IR_MUL are never float — floats use IR_F*), and two's-complement
+// add/mul are associative under wraparound, so combining the constants is exact.
+// Fires only when the inner result is used exactly once (the outer op), so the
+// inner op truly dies. Forward order naturally collapses longer chains in one
+// pass (each rewritten outer becomes the next iteration's inner). Mainly a
+// canonicalizer that exposes more CSE/GVN; small standalone win.
+fn pass_reassoc(func as *d.IRFunction, vc as i32) as void {
+    if (vc <= 0) { return; }
+    let is *i32 as uc = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, i) * 4); *up = 0;
+        let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, i) * 8); *dp = 0;
+        i = i + 1;
+    }
+    // Pass 1: per-vreg use counts + last defining instruction (live only).
+    let is *d.IRInst as p with mut = func.instructions;
+    while (cast(i64, p) != 0) {
+        if (p.is_dead == 0) {
+            if (p.src1.op_type == d.OP_VREG && p.src1.vreg >= 0 && p.src1.vreg < vc) {
+                let is *i32 as u = cast(*i32, cast(i64, uc) + cast(i64, p.src1.vreg) * 4); *u = *u + 1;
+            }
+            if (p.src2.op_type == d.OP_VREG && p.src2.vreg >= 0 && p.src2.vreg < vc) {
+                let is *i32 as u = cast(*i32, cast(i64, uc) + cast(i64, p.src2.vreg) * 4); *u = *u + 1;
+            }
+            if ((p.op == d.IR_STORE || p.op == d.IR_COPY) && p.dest.op_type == d.OP_VREG && p.dest.vreg >= 0 && p.dest.vreg < vc) {
+                let is *i32 as u = cast(*i32, cast(i64, uc) + cast(i64, p.dest.vreg) * 4); *u = *u + 1;
+            }
+            if (p.dest.op_type == d.OP_VREG && p.op != d.IR_STORE && p.op != d.IR_COPY && p.dest.vreg >= 0 && p.dest.vreg < vc) {
+                let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, p.dest.vreg) * 8); *dp = cast(i64, p);
+            }
+        }
+        p = p.next;
+    }
+    // Pass 2: combine.
+    p = func.instructions;
+    while (cast(i64, p) != 0) {
+        if (p.is_dead == 0 && (p.op == d.IR_ADD || p.op == d.IR_MUL)
+            && p.src1.op_type == d.OP_VREG && p.src2.op_type == d.OP_IMM
+            && p.src1.vreg >= 0 && p.src1.vreg < vc) {
+            let is i32 as V = p.src1.vreg;
+            let is *i32 as up = cast(*i32, cast(i64, uc) + cast(i64, V) * 4);
+            if (*up == 1) {
+                let is *i64 as dp = cast(*i64, cast(i64, def_inst) + cast(i64, V) * 8);
+                let is *d.IRInst as di = cast(*d.IRInst, *dp);
+                if (cast(i64, di) != 0 && di.is_dead == 0 && di.op == p.op
+                    && di.src1.op_type == d.OP_VREG && di.src2.op_type == d.OP_IMM) {
+                    let is i64 as c = p.src2.imm;
+                    let is i64 as dd = di.src2.imm;
+                    let is i64 as comb with mut = 0;
+                    if (p.op == d.IR_ADD) { comb = c + dd; } else { comb = c * dd; }
+                    p.src1.vreg = di.src1.vreg;
+                    p.src2.imm = comb;
+                    di.is_dead = 1;
+                }
+            }
+        }
+        p = p.next;
+    }
+    d.opt_free(cast(*u8, uc));
+    d.opt_free(cast(*u8, def_inst));
+}
