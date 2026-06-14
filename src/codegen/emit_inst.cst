@@ -383,6 +383,57 @@ fn _xmm_acc_for(dest_vreg as i32, ctx as *al.AllocCtx) as *u8 {
     return "xmm0";
 }
 
+// === gen_inst: SIMD (auto-vectorizer) — packed 2x i64 ===
+// Vector vregs are 128-bit so they MUST move with movdqu (NOT movsd, which is
+// 64-bit and drops lane1). pass_vectorize only fires on float-free functions, so
+// vector vregs never compete with f64 and never spill (≤2 live -> always xmm2..15).
+fn _vec_xmm(vreg as i32, ctx as *al.AllocCtx) as *u8 {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 16 && loc <= 31) { return eo.reg_xmm(loc); }
+    return "xmm0";   // unreachable for vectorized fns (no-spill guard); scratch fallback
+}
+fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as op = inst.op;
+    if (op == d.IR_VZERO) {
+        let is *u8 as dr = _vec_xmm(inst.dest.vreg, ctx);
+        eo.out_str("  pxor ", 7); eo.out_cstr(dr); eo.out_str(", ", 2); eo.out_cstr(dr); eo.out_char(10);
+        return;
+    }
+    if (op == d.IR_VLOADQ) {
+        e.load_op(inst.src1.vreg, ctx, "rcx");   // base -> rcx (base never modified)
+        if (inst.src2.op_type == d.OP_IMM && inst.src2.imm != 0) {
+            eo.out_str("  add rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
+        }
+        let is *u8 as dr = _vec_xmm(inst.dest.vreg, ctx);
+        eo.out_str("  movdqu ", 9); eo.out_cstr(dr); eo.out_str(", [rcx]\n", 8);
+        return;
+    }
+    if (op == d.IR_VADDQ) {
+        let is *u8 as dr = _vec_xmm(inst.dest.vreg, ctx);
+        let is *u8 as s1 = _vec_xmm(inst.src1.vreg, ctx);
+        let is *u8 as s2 = _vec_xmm(inst.src2.vreg, ctx);
+        if (cast(i64, dr) != cast(i64, s1)) {
+            eo.out_str("  movdqu ", 9); eo.out_cstr(dr); eo.out_str(", ", 2); eo.out_cstr(s1); eo.out_char(10);
+        }
+        eo.out_str("  paddq ", 8); eo.out_cstr(dr); eo.out_str(", ", 2); eo.out_cstr(s2); eo.out_char(10);
+        return;
+    }
+    if (op == d.IR_VREDUCEQ) {
+        let is *u8 as s1r = _vec_xmm(inst.src1.vreg, ctx);
+        eo.out_str("  movdqu xmm0, ", 15); eo.out_cstr(s1r); eo.out_char(10);   // copy (psrldq destroys)
+        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
+        let is *u8 as dr with mut = "rax";
+        if (dloc >= 0 && dloc < 16) { dr = eo.reg64(dloc); }
+        eo.out_str("  movq ", 7); eo.out_cstr(dr); eo.out_str(", xmm0\n", 7);   // lane0
+        eo.out_str("  psrldq xmm0, 8\n", 17);
+        eo.out_str("  movq rcx, xmm0\n", 17);                                    // lane1
+        eo.out_str("  add ", 6); eo.out_cstr(dr); eo.out_str(", rcx\n", 6);
+        if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(eo.reg_name_to_idx(dr)); }
+        if (dloc < 0 || dloc >= 16) { e.store_op(inst.dest.vreg, ctx, dr); }
+        return;
+    }
+}
+
 fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
