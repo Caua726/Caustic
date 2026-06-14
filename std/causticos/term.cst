@@ -39,7 +39,12 @@ struct Term {
     bg     as u32;
     // -- appended (all i64): windowed-rendering support --
     present_mode as i64;  // 1 = flush() presents (init, the fullscreen path);
-                          // 0 = render-only (init_buffer: a segment, no surface)
+                          // 0 = render-only PIXELS (init_buffer: a pixel segment,
+                          //     no surface — the holder commits dirty pixel rects);
+                          // 2 = TEXT (init_text: NO pixel backbuffer at all — the
+                          //     glyph rasterisers are no-ops, only the cell grid is
+                          //     maintained; the holder flattens the grid into a text
+                          //     segment and the WM rasterises it on compose).
     d_x0   as i64;        // accumulated dirty rect (pixel coords, x1/y1
     d_y0   as i64;        // EXCLUSIVE); empty when d_x1 <= d_x0. The caller
     d_x1   as i64;        // drains it with take_dirty() to know what to
@@ -104,6 +109,7 @@ fn take_dirty(t as *Term, out as *i64) as i64 {
 }
 
 fn _putpix(t as *Term, x as i64, y as i64, color as u32) as void {
+    if (t.present_mode == 2) { return; }   // TEXT mode: no pixel backbuffer to write
     if (x < 0 || y < 0 || x >= t.width || y >= t.height) { return; }
     let is *u32 as p = cast(*u32, cast(i64, t.base) + y * t.pitch + x * t.bpp);
     p[0] = color;
@@ -207,19 +213,22 @@ fn scroll_view(t as *Term, delta as i64) as void {
 // the caller's own buffer and outside its visible rect, harmless). The grid,
 // when attached, shifts in lockstep so a later resize() re-renders the truth.
 fn _scroll(t as *Term) as void {
-    let is i64 as top = cast(i64, t.base) + PAD_Y * t.pitch;   // top of text area
-    let is i64 as rowbytes = t.pitch * GLYPH_H;
-    let is i64 as span = t.pitch * (t.rows * GLYPH_H);          // text-area height
-    let is *i64 as dst = cast(*i64, top);
-    let is *i64 as src = cast(*i64, top + rowbytes);
-    let is i64 as words = (span - rowbytes) / 8;
-    let is i64 as i with mut = 0;
-    while (i < words) { dst[i] = src[i]; i = i + 1; }
-    // clear the bottom text row to bg, as u32 pixels
-    let is *u32 as p = cast(*u32, top + (span - rowbytes));
-    let is i64 as pw = rowbytes / 4;
-    let is i64 as j with mut = 0;
-    while (j < pw) { p[j] = t.bg; j = j + 1; }
+    if (t.present_mode != 2) {              // TEXT mode keeps NO pixel backbuffer:
+        // scroll the pixels; the grid (below) carries the scroll on its own.
+        let is i64 as top = cast(i64, t.base) + PAD_Y * t.pitch;   // top of text area
+        let is i64 as rowbytes = t.pitch * GLYPH_H;
+        let is i64 as span = t.pitch * (t.rows * GLYPH_H);          // text-area height
+        let is *i64 as dst = cast(*i64, top);
+        let is *i64 as src = cast(*i64, top + rowbytes);
+        let is i64 as words = (span - rowbytes) / 8;
+        let is i64 as i with mut = 0;
+        while (i < words) { dst[i] = src[i]; i = i + 1; }
+        // clear the bottom text row to bg, as u32 pixels
+        let is *u32 as p = cast(*u32, top + (span - rowbytes));
+        let is i64 as pw = rowbytes / 4;
+        let is i64 as j with mut = 0;
+        while (j < pw) { p[j] = t.bg; j = j + 1; }
+    }
     if (t.grid != 0) {
         // the ring absorbs the scroll: the line leaving the top becomes
         // history, the fresh bottom line is blanked in place
@@ -289,10 +298,38 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     return t;
 }
 
+// init_text — construct a Term that keeps NO pixel backbuffer (present_mode 2).
+// The glyph rasterisers are inert (they no-op on t.base) and only the cell grid
+// is maintained: every putc still updates the grid via _grid_set and accumulates
+// a dirty rect via _mark. The holder (wterm) attaches a grid, then on flush
+// flattens the visible grid view into a small TEXT segment for the WM to
+// rasterise — so a terminal costs (header + cols*rows) i64 instead of a
+// full-screen pixel buffer. width/height are in PIXELS (the WM frames the window
+// in pixels and 8x16 cells), used only to derive cols/rows the same way init does.
+fn init_text(width as i64, height as i64) as Term {
+    font.init();
+    let is Term as t;
+    t.base = cast(*u8, 0); t.fd = 0 - 1; t.width = width; t.height = height;
+    t.pitch = 0; t.bpp = 4;
+    t.cols = (width - 2 * PAD_X) / GLYPH_W; t.rows = (height - 2 * PAD_Y) / GLYPH_H;
+    t.cx = 0; t.cy = 0;
+    t.fg = 0x00d3d7cf;
+    t.bg = 0x00121417;
+    t.present_mode = 2;
+    t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0;
+    t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
+    t.live_top = 0; t.hist_count = 0; t.view_off = 0;
+    t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
+    _mark(&t, 0, 0, width, height);
+    return t;
+}
+
 // Clear the visible w x h region to bg, row by row (pitch-aware: in windowed
 // mode the buffer is wider than the window and the slack is not ours to wipe
 // beyond a clean row — staying inside w keeps the write pattern obvious).
 fn _fill_bg(t as *Term, w as i64, h as i64) as void {
+    if (t.present_mode == 2) { return; }   // TEXT mode: no pixel backbuffer
     let is i64 as y with mut = 0;
     while (y < h) {
         let is *u32 as p = cast(*u32, cast(i64, t.base) + y * t.pitch);
