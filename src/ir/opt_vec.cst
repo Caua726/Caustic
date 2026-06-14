@@ -940,8 +940,7 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
 
         // --- AVX2 dispatch: 256-bit map loop (2x wider) when the CPU has AVX2; else
         //     fall to the SSE2 loop below. Both exit to .Lhdr (the scalar remainder).
-        //     (Skipped for broadcast maps — AVX2 broadcast not wired yet; SSE2 only.) ---
-        if (is_bcast == 0) {
+        //     Handles two-array (vload b) and broadcast (vbroadcastsd k) maps. ---
         let is i32 as wideA = wide * 2;
         let is i32 as vop256 with mut = d.IR_VADDQ256;
         if (is_float == 1) {
@@ -994,13 +993,24 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         laA.src1.op_type = cast(i8, d.OP_VREG); laA.src1.vreg = aaA;
         laA.src2.op_type = cast(i8, d.OP_IMM);  laA.src2.imm = 0; laA.line = ln;
         ip2 = vec_emit(ip2, laA);
-        let is i32 as abA with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_b, iv, ln, &abA);
-        let is i32 as vlbA = vec_new_vreg(func);
-        let is *d.IRInst as lbA = d.new_inst(d.IR_VLOADQ256);
-        lbA.dest.op_type = cast(i8, d.OP_VREG); lbA.dest.vreg = vlbA;
-        lbA.src1.op_type = cast(i8, d.OP_VREG); lbA.src1.vreg = abA;
-        lbA.src2.op_type = cast(i8, d.OP_IMM);  lbA.src2.imm = 0; lbA.line = ln;
-        ip2 = vec_emit(ip2, lbA);
+        let is i32 as vlbA with mut = cast(i32, 0 - 1);
+        if (is_bcast == 1) {
+            // vlbA = [k,k,k,k] (vbroadcastsd) — per-iter, keeps k live across the loop
+            vlbA = vec_new_vreg(func);
+            let is *d.IRInst as splA = d.new_inst(d.IR_VSPLATPD256);
+            splA.dest.op_type = cast(i8, d.OP_VREG); splA.dest.vreg = vlbA;
+            splA.src1.op_type = cast(i8, d.OP_VREG); splA.src1.vreg = kvreg;
+            splA.line = ln;
+            ip2 = vec_emit(ip2, splA);
+        } else {
+            let is i32 as abA with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_b, iv, ln, &abA);
+            vlbA = vec_new_vreg(func);
+            let is *d.IRInst as lbA = d.new_inst(d.IR_VLOADQ256);
+            lbA.dest.op_type = cast(i8, d.OP_VREG); lbA.dest.vreg = vlbA;
+            lbA.src1.op_type = cast(i8, d.OP_VREG); lbA.src1.vreg = abA;
+            lbA.src2.op_type = cast(i8, d.OP_IMM);  lbA.src2.imm = 0; lbA.line = ln;
+            ip2 = vec_emit(ip2, lbA);
+        }
         let is i32 as vrA = vec_new_vreg(func);
         let is *d.IRInst as voA = d.new_inst(vop256);
         voA.dest.op_type = cast(i8, d.OP_VREG); voA.dest.vreg = vrA;
@@ -1025,9 +1035,8 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         let is *d.IRInst as lblSseM = d.new_inst(d.IR_LABEL);
         lblSseM.dest.op_type = cast(i8, d.OP_LABEL); lblSseM.dest.label = LsseM; lblSseM.line = ln;
         ip2 = vec_emit(ip2, lblSseM);
-        }   // end if (is_bcast == 0): AVX2 dispatch block
 
-        // --- SSE2 loop (128-bit; the always-available path / broadcast's only path) ---
+        // --- SSE2 loop (128-bit; the always-available path) ---
         // For broadcast, k is splatted to [k,k] INSIDE the loop (cheap movddup) so the
         // scalar k stays live across the loop — the kept scalar remainder (.Lhdr,
         // reached by the loop's back-edge) reads k, and the linear allocator would
