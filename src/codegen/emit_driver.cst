@@ -3,11 +3,33 @@ use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../ir/defs.cst" as d;
 use "../ir/opt.cst" as opt;
+use "../ir/opt_ifconv.cst" as ifc;
 use "../ir/gen_program.cst" as irp;
 use "alloc_core.cst" as al;
 use "alloc_gc.cst" as gc;
 use "emit_output.cst" as eo;
 use "emit.cst" as e;
+use "../../std/time.cst" as gtime;
+
+// --- codegen sub-phase profiling (temporary diagnostic instrumentation) ---
+let is i64 as gd_t_intervals with mut = 0;
+let is i64 as gd_t_alloc     with mut = 0;
+let is i64 as gd_t_emit      with mut = 0;
+let is i64 as gd_t_opt       with mut = 0;
+let is i64 as gd_t_clone     with mut = 0;
+let is i64 as gd_t_free      with mut = 0;
+let is i32 as gd_prof_on     with mut = 0;
+
+fn gen_phase_report() as void {
+    if (gd_prof_on == 0) { return; }
+    io.write_str(io.STDOUT, "\n--- codegen sub-phases (per-function) ---\n");
+    io.write_str(io.STDOUT, "  optimize  "); io.write_int(io.STDOUT, gd_t_opt / 1000);       io.write_str(io.STDOUT, "ms\n");
+    io.write_str(io.STDOUT, "  clone_ir  "); io.write_int(io.STDOUT, gd_t_clone / 1000);     io.write_str(io.STDOUT, "ms\n");
+    io.write_str(io.STDOUT, "  free_ir   "); io.write_int(io.STDOUT, gd_t_free / 1000);      io.write_str(io.STDOUT, "ms\n");
+    io.write_str(io.STDOUT, "  intervals "); io.write_int(io.STDOUT, gd_t_intervals / 1000); io.write_str(io.STDOUT, "ms\n");
+    io.write_str(io.STDOUT, "  alloc     "); io.write_int(io.STDOUT, gd_t_alloc / 1000);     io.write_str(io.STDOUT, "ms\n");
+    io.write_str(io.STDOUT, "  emit      "); io.write_int(io.STDOUT, gd_t_emit / 1000);      io.write_str(io.STDOUT, "ms\n");
+}
 use "emit_inst.cst" as ei;
 use "target.cst" as tgt;
 
@@ -66,6 +88,10 @@ fn _is_dyn_extern(f as *d.IRFunction) as i32 {
 }
 
 fn gen_func(func as *d.IRFunction) as void {
+    // If-conversion: rewrite tiny if/else value-selects into branchless cmov.
+    // Runs here (post-optimize, pre-regalloc) so IR_CMOV is codegen-only and the
+    // interval-overlap allocator handles its tied dest automatically.
+    if (al.al_opt_level >= 1) { ifc.pass_ifconv(func); }
     // Init register cache, instruction selection use counts, and def table
     eo.rc_init();
     eo.peep_reset();
@@ -79,13 +105,18 @@ fn gen_func(func as *d.IRFunction) as void {
     ctx.func = cast(*u8, func);
     ctx.next_spill = 1;
 
+    let is i64 as _gt0 = gtime.now_us();
     d.infer_vreg_classes(func);
     al.build_intervals(func, ctx);
+    let is i64 as _gt1 = gtime.now_us();
+    gd_t_intervals = gd_t_intervals + (_gt1 - _gt0);
     if (al.al_opt_level >= 1) {
         gc.graph_coloring_alloc_v2(func, ctx);
     } else {
         al.linear_scan_alloc(func, ctx);
     }
+    let is i64 as _gt2 = gtime.now_us();
+    gd_t_alloc = gd_t_alloc + (_gt2 - _gt1);
     if (eo.cg_quiet == 0) {
         io.write_str(io.STDERR, "    alloc ok, vregs=");
         io.write_int(io.STDERR, cast(i64, func.vreg_count));
@@ -225,6 +256,7 @@ fn gen_func(func as *d.IRFunction) as void {
         inst = inst.next;
     }
 
+    gd_t_emit = gd_t_emit + (gtime.now_us() - _gt2);
     // The function is fully emitted; its register-allocation context is now
     // dead. Free it so codegen doesn't accumulate one ctx per function.
     al.free_alloc_ctx(ctx);
@@ -456,6 +488,10 @@ fn set_opt_level(level as i32) as void {
     if (level >= 1) { eo.peep_set_enabled(1); }
     else { eo.peep_set_enabled(0); }
 }
+
+// Passthroughs for the graph-coloring allocator's phase diagnostics.
+fn gc_set_prof(on as i32) as void { gc.gc_prof_on = on; gd_prof_on = on; }
+fn gc_phase_report() as void { gc.gc_phase_report(); gen_phase_report(); }
 
 // ============================================================
 // Worst-case stack-usage analysis (declares the CSE stack — no OS default, no
@@ -813,14 +849,20 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
                 snap_rec = f.is_recursive;
                 snap_stk = f.has_stack_ops;
                 did_snap = 1;
+                let is i64 as _ct0 = gtime.now_us();
                 f.instructions = d.clone_insts(snap_insts);
+                gd_t_clone = gd_t_clone + (gtime.now_us() - _ct0);
+                let is i64 as _ot0 = gtime.now_us();
                 opt.optimize_inline_func(f, prog);
+                gd_t_opt = gd_t_opt + (gtime.now_us() - _ot0);
             }
             // Regen IR + re-optimize for functions freed after Phase 1
             if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
                 irp.regen_func_ir(f);
                 if (al.al_opt_level >= 1) {
+                    let is i64 as _ot1 = gtime.now_us();
                     opt.optimize_func(f);
+                    gd_t_opt = gd_t_opt + (gtime.now_us() - _ot1);
                 }
             }
             if (eo.cg_quiet == 0) {
@@ -835,7 +877,9 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
             } else {
                 gen_func(f);
             }
+            let is i64 as _ft0 = gtime.now_us();
             d.free_func_insts(f);
+            gd_t_free = gd_t_free + (gtime.now_us() - _ft0);
             ei.label_base = ei.label_base + f.label_count + 1;
             // Restore the pristine record so later-emitted modules in this same
             // process inline `f` from its un-inlined body (free_func_insts only
@@ -1251,6 +1295,7 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_RET || op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { ei.gen_inst_control(inst, ctx); return; }
     if (op == d.IR_SET_ARG || op == d.IR_GET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_SYSCALL || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_VA_START || op == d.IR_FFI_CALL) { ei.gen_inst_calls(inst, ctx); return; }
     if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) { ei.gen_inst_atomic(inst, ctx); return; }
+    if (op == d.IR_CMOV) { ei.gen_inst_cmov(inst, ctx); return; }
     // Memory, load/store, copy, asm, cast, set_ctx
     ei.gen_inst_memory(inst, ctx);
 }
