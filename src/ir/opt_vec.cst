@@ -530,6 +530,17 @@ fn vec_emit_vv(func as *d.IRFunction, ip as *d.IRInst, op as i32, av as i32, bv 
     *out = nv;
     return vec_emit(ip, ni);
 }
+// emit `out = LEA<scale>(base, idx)` (= base + idx*scale); advance and return cursor.
+fn vec_emit_lea(func as *d.IRFunction, ip as *d.IRInst, lea_op as i32, base as i32, idx as i32, line as i32, out as *i32) as *d.IRInst {
+    let is i32 as nv = vec_new_vreg(func);
+    let is *d.IRInst as ni = d.new_inst(lea_op);
+    ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = nv;
+    ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = base;
+    ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = idx;
+    ni.line = line;
+    *out = nv;
+    return vec_emit(ip, ni);
+}
 
 fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
                def_inst as *i64, def_count as *i32, vc as i32) as i32 {
@@ -555,8 +566,16 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     let is *i64 as cdp = cast(*i64, cast(i64, def_inst) + cast(i64, jz.src1.vreg) * 8);
     let is *d.IRInst as ltd = cast(*d.IRInst, *cdp);
     if (cast(i64, ltd) == 0 || ltd.op != d.IR_LT || ltd.src1.op_type != d.OP_VREG) { return 0; }
+    // bound N: const -> unrolled vector twin; runtime vreg -> vector-loop + remainder
     let is i64 as nbound with mut = 0;
-    if (vec_val_const(def_inst, def_count, vc, cast(i32, ltd.src2.op_type), ltd.src2.vreg, ltd.src2.imm, &nbound) == 0) { return 0; }
+    let is i32 as nbound_is_const with mut = 0;
+    let is i32 as nbound_vreg with mut = cast(i32, 0 - 1);
+    if (vec_val_const(def_inst, def_count, vc, cast(i32, ltd.src2.op_type), ltd.src2.vreg, ltd.src2.imm, &nbound) == 1) { nbound_is_const = 1; }
+    else if (ltd.src2.op_type == d.OP_VREG && ltd.src2.vreg >= 0 && ltd.src2.vreg < vc) {
+        nbound_vreg = vec_resolve(def_inst, def_count, vc, ltd.src2.vreg);
+        if (nbound_vreg < 0 || nbound_vreg >= vc) { return 0; }
+    }
+    else { return 0; }
     let is i32 as iv = vec_resolve(def_inst, def_count, vc, ltd.src1.vreg);
     if (iv < 0 || iv >= vc) { return 0; }
 
@@ -669,13 +688,22 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         }
         s2 = s2.next;
     }
-    if (init_ok == 0) { return 0; }
-    let is i64 as trip = nbound - init;
-    if (trip < 2 || trip > cast(i64, VEC_MAX_TRIP)) { return 0; }
-    if ((trip % cast(i64, wide)) != 0) { return 0; }
+    // init_ok required only for the const fully-unrolled twin.
+    let is i32 as lea_op with mut = d.IR_LEA8;
+    if (elem == 4) { lea_op = d.IR_LEA4; }
+    let is i32 as use_unroll with mut = 0;
+    if (nbound_is_const == 1 && init_ok == 1) {
+        let is i64 as tripc = nbound - init;
+        if (tripc >= 2 && tripc <= cast(i64, VEC_MAX_TRIP) && (tripc % cast(i64, wide)) == 0) { use_unroll = 1; }
+    }
+    // Only two map shapes are handled: const-small-aligned (fully-unrolled twin) and
+    // runtime length (vector loop + scalar-loop remainder). A const-but-large/unaligned
+    // trip would need the scalar loop as remainder, which the unroller may flatten
+    // (it assumes iv=init) — so skip it rather than risk a jump into unrolled code.
+    if (nbound_is_const == 1 && use_unroll == 0) { return 0; }
 
-    // iv must NOT be live after the loop: the vector path skips the loop and never
-    // sets iv to its final value. Bail if anything past the back-edge reads it.
+    // iv must NOT be live after the loop (conservative; both vector paths leave iv
+    // in a path-dependent state otherwise).
     let is *d.IRInst as lo with mut = backedge.next;
     while (cast(i64, lo) != 0) {
         if (lo.is_dead == 0) {
@@ -685,15 +713,22 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         lo = lo.next;
     }
 
-    // ===== rewrite: alias check before the loop + unrolled vector version after =====
-    let is i64 as init_byte = init * cast(i64, elem);
-    let is i64 as sz_check = nbound * cast(i64, elem);   // superset of the accessed byte range
-
-    // (1) before hdr: compute `any = overlap(c,a) | overlap(c,b)`, JZ any -> .Lvec
+    // ===== (1) before hdr: alias check `any = overlap(c,a) | overlap(c,b)`, JZ any -> .Lvec
+    // overlap([p,p+sz),[q,q+sz)) == p<q+sz & q<p+sz; end = base + N*elem.
     let is *d.IRInst as ip with mut = prev;
-    let is i32 as a_end with mut = 0; ip = vec_emit_addimm(func, ip, base_a, sz_check, ln, &a_end);
-    let is i32 as b_end with mut = 0; ip = vec_emit_addimm(func, ip, base_b, sz_check, ln, &b_end);
-    let is i32 as c_end with mut = 0; ip = vec_emit_addimm(func, ip, base_c, sz_check, ln, &c_end);
+    let is i32 as a_end with mut = 0;
+    let is i32 as b_end with mut = 0;
+    let is i32 as c_end with mut = 0;
+    if (nbound_is_const == 1) {
+        let is i64 as sz_check = nbound * cast(i64, elem);   // superset of the accessed range
+        ip = vec_emit_addimm(func, ip, base_a, sz_check, ln, &a_end);
+        ip = vec_emit_addimm(func, ip, base_b, sz_check, ln, &b_end);
+        ip = vec_emit_addimm(func, ip, base_c, sz_check, ln, &c_end);
+    } else {
+        ip = vec_emit_lea(func, ip, lea_op, base_a, nbound_vreg, ln, &a_end);   // a + N*elem
+        ip = vec_emit_lea(func, ip, lea_op, base_b, nbound_vreg, ln, &b_end);
+        ip = vec_emit_lea(func, ip, lea_op, base_c, nbound_vreg, ln, &c_end);
+    }
     let is i32 as t1 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, a_end, ln, &t1);   // c < a_end
     let is i32 as t2 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_a, c_end, ln, &t2);   // a < c_end
     let is i32 as ova with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t1, t2, ln, &ova);
@@ -708,32 +743,101 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     jzv.line = ln;
     ip = vec_emit(ip, jzv);
 
-    // (2) after backedge: .Lvec + unrolled vload(a)/vload(b)/vop/vstore(c) + JMP .Lexit
+    // ===== (2) after backedge: .Lvec (the no-overlap version)
     let is *d.IRInst as ip2 with mut = backedge;
-    // Skip-guard JMP to .Lexit, placed BEFORE .Lvec. Unreachable while the scalar
-    // loop keeps its back-edge, but if a later pass (the unroller) fully unrolls
-    // the scalar fallback it drops the exit jump and the straight-line code would
-    // otherwise fall through into .Lvec and run BOTH versions. This catches it.
+    // Skip-guard JMP to .Lexit before .Lvec — dead while the scalar loop keeps its
+    // back-edge, but catches a unroller-flattened fallback falling into .Lvec.
     let is *d.IRInst as jskip = d.new_inst(d.IR_JMP);
     jskip.dest.op_type = cast(i8, d.OP_LABEL); jskip.dest.label = exit_label; jskip.line = ln;
     ip2 = vec_emit(ip2, jskip);
     let is *d.IRInst as lbl = d.new_inst(d.IR_LABEL);
     lbl.dest.op_type = cast(i8, d.OP_LABEL); lbl.dest.label = label_vec; lbl.line = ln;
     ip2 = vec_emit(ip2, lbl);
-    let is i64 as k with mut = 0;
-    while (k < trip) {
-        let is i64 as off = init_byte + k * cast(i64, elem);
+
+    if (use_unroll == 1) {
+        // const small trip -> fully unrolled twin; c[init+k]=a[..] OP b[..]; JMP .Lexit
+        let is i64 as init_byte = init * cast(i64, elem);
+        let is i64 as trip = nbound - init;
+        let is i64 as k with mut = 0;
+        while (k < trip) {
+            let is i64 as off = init_byte + k * cast(i64, elem);
+            let is i32 as vla = vec_new_vreg(func);
+            let is *d.IRInst as la = d.new_inst(d.IR_VLOADQ);
+            la.dest.op_type = cast(i8, d.OP_VREG); la.dest.vreg = vla;
+            la.src1.op_type = cast(i8, d.OP_VREG); la.src1.vreg = base_a;
+            la.src2.op_type = cast(i8, d.OP_IMM);  la.src2.imm = off; la.line = ln;
+            ip2 = vec_emit(ip2, la);
+            let is i32 as vlb = vec_new_vreg(func);
+            let is *d.IRInst as lb = d.new_inst(d.IR_VLOADQ);
+            lb.dest.op_type = cast(i8, d.OP_VREG); lb.dest.vreg = vlb;
+            lb.src1.op_type = cast(i8, d.OP_VREG); lb.src1.vreg = base_b;
+            lb.src2.op_type = cast(i8, d.OP_IMM);  lb.src2.imm = off; lb.line = ln;
+            ip2 = vec_emit(ip2, lb);
+            let is i32 as vr = vec_new_vreg(func);
+            let is *d.IRInst as vo = d.new_inst(vop);
+            vo.dest.op_type = cast(i8, d.OP_VREG); vo.dest.vreg = vr;
+            vo.src1.op_type = cast(i8, d.OP_VREG); vo.src1.vreg = vla;
+            vo.src2.op_type = cast(i8, d.OP_VREG); vo.src2.vreg = vlb; vo.line = ln;
+            ip2 = vec_emit(ip2, vo);
+            let is *d.IRInst as vs = d.new_inst(d.IR_VSTOREQ);
+            vs.src1.op_type = cast(i8, d.OP_VREG); vs.src1.vreg = base_c;
+            vs.src2.op_type = cast(i8, d.OP_VREG); vs.src2.vreg = vr;
+            vs.dest.op_type = cast(i8, d.OP_IMM);  vs.dest.imm = off; vs.line = ln;
+            ip2 = vec_emit(ip2, vs);
+            k = k + cast(i64, wide);
+        }
+        let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
+        jmp.dest.op_type = cast(i8, d.OP_LABEL); jmp.dest.label = exit_label; jmp.line = ln;
+        ip2 = vec_emit(ip2, jmp);
+    } else {
+        // runtime / large / non-multiple -> vector LOOP over the aligned prefix, then
+        // jump into the kept scalar loop (.Lhdr) which runs iv..N as the remainder.
+        // lim = N - (wide-1)  (`iv < lim` == `iv + wide <= N`)
+        let is i32 as lim_is_imm with mut = 0;
+        let is i64 as lim_imm with mut = 0;
+        let is i32 as lim_vreg with mut = cast(i32, 0 - 1);
+        if (nbound_is_const == 1) { lim_is_imm = 1; lim_imm = nbound - cast(i64, wide - 1); }
+        else {
+            lim_vreg = vec_new_vreg(func);
+            let is *d.IRInst as sub = d.new_inst(d.IR_SUB);
+            sub.dest.op_type = cast(i8, d.OP_VREG); sub.dest.vreg = lim_vreg;
+            sub.src1.op_type = cast(i8, d.OP_VREG); sub.src1.vreg = nbound_vreg;
+            sub.src2.op_type = cast(i8, d.OP_IMM);  sub.src2.imm = cast(i64, wide - 1);
+            sub.line = ln;
+            ip2 = vec_emit(ip2, sub);
+        }
+        let is i32 as Lvl = vec_new_label(func);
+        let is *d.IRInst as lblv = d.new_inst(d.IR_LABEL);
+        lblv.dest.op_type = cast(i8, d.OP_LABEL); lblv.dest.label = Lvl; lblv.line = ln;
+        ip2 = vec_emit(ip2, lblv);
+        // vcond = iv < lim ; JZ vcond -> .Lhdr (vector done -> scalar remainder)
+        let is i32 as vcond = vec_new_vreg(func);
+        let is *d.IRInst as lt = d.new_inst(d.IR_LT);
+        lt.dest.op_type = cast(i8, d.OP_VREG); lt.dest.vreg = vcond;
+        lt.src1.op_type = cast(i8, d.OP_VREG); lt.src1.vreg = iv;
+        if (lim_is_imm == 1) { lt.src2.op_type = cast(i8, d.OP_IMM); lt.src2.imm = lim_imm; }
+        else { lt.src2.op_type = cast(i8, d.OP_VREG); lt.src2.vreg = lim_vreg; }
+        lt.line = ln;
+        ip2 = vec_emit(ip2, lt);
+        let is *d.IRInst as jzr = d.new_inst(d.IR_JZ);
+        jzr.src1.op_type = cast(i8, d.OP_VREG); jzr.src1.vreg = vcond;
+        jzr.dest.op_type = cast(i8, d.OP_LABEL); jzr.dest.label = hlabel;
+        jzr.line = ln;
+        ip2 = vec_emit(ip2, jzr);
+        // aa = LEA(base_a, iv); vla = [aa]
+        let is i32 as aa with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_a, iv, ln, &aa);
         let is i32 as vla = vec_new_vreg(func);
         let is *d.IRInst as la = d.new_inst(d.IR_VLOADQ);
         la.dest.op_type = cast(i8, d.OP_VREG); la.dest.vreg = vla;
-        la.src1.op_type = cast(i8, d.OP_VREG); la.src1.vreg = base_a;
-        la.src2.op_type = cast(i8, d.OP_IMM);  la.src2.imm = off; la.line = ln;
+        la.src1.op_type = cast(i8, d.OP_VREG); la.src1.vreg = aa;
+        la.src2.op_type = cast(i8, d.OP_IMM);  la.src2.imm = 0; la.line = ln;
         ip2 = vec_emit(ip2, la);
+        let is i32 as ab with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_b, iv, ln, &ab);
         let is i32 as vlb = vec_new_vreg(func);
         let is *d.IRInst as lb = d.new_inst(d.IR_VLOADQ);
         lb.dest.op_type = cast(i8, d.OP_VREG); lb.dest.vreg = vlb;
-        lb.src1.op_type = cast(i8, d.OP_VREG); lb.src1.vreg = base_b;
-        lb.src2.op_type = cast(i8, d.OP_IMM);  lb.src2.imm = off; lb.line = ln;
+        lb.src1.op_type = cast(i8, d.OP_VREG); lb.src1.vreg = ab;
+        lb.src2.op_type = cast(i8, d.OP_IMM);  lb.src2.imm = 0; lb.line = ln;
         ip2 = vec_emit(ip2, lb);
         let is i32 as vr = vec_new_vreg(func);
         let is *d.IRInst as vo = d.new_inst(vop);
@@ -741,17 +845,24 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         vo.src1.op_type = cast(i8, d.OP_VREG); vo.src1.vreg = vla;
         vo.src2.op_type = cast(i8, d.OP_VREG); vo.src2.vreg = vlb; vo.line = ln;
         ip2 = vec_emit(ip2, vo);
+        let is i32 as ac with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_c, iv, ln, &ac);
         let is *d.IRInst as vs = d.new_inst(d.IR_VSTOREQ);
-        vs.src1.op_type = cast(i8, d.OP_VREG); vs.src1.vreg = base_c;
+        vs.src1.op_type = cast(i8, d.OP_VREG); vs.src1.vreg = ac;
         vs.src2.op_type = cast(i8, d.OP_VREG); vs.src2.vreg = vr;
-        vs.dest.op_type = cast(i8, d.OP_IMM);  vs.dest.imm = off; vs.line = ln;
+        vs.dest.op_type = cast(i8, d.OP_IMM);  vs.dest.imm = 0; vs.line = ln;
         ip2 = vec_emit(ip2, vs);
-        k = k + cast(i64, wide);
+        // iv += wide ; JMP .Lvl
+        let is *d.IRInst as ivadd = d.new_inst(d.IR_ADD);
+        ivadd.dest.op_type = cast(i8, d.OP_VREG); ivadd.dest.vreg = iv;
+        ivadd.src1.op_type = cast(i8, d.OP_VREG); ivadd.src1.vreg = iv;
+        ivadd.src2.op_type = cast(i8, d.OP_IMM);  ivadd.src2.imm = cast(i64, wide);
+        ivadd.line = ln;
+        ip2 = vec_emit(ip2, ivadd);
+        let is *d.IRInst as jmpb = d.new_inst(d.IR_JMP);
+        jmpb.dest.op_type = cast(i8, d.OP_LABEL); jmpb.dest.label = Lvl; jmpb.line = ln;
+        ip2 = vec_emit(ip2, jmpb);
     }
-    let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
-    jmp.dest.op_type = cast(i8, d.OP_LABEL); jmp.dest.label = exit_label; jmp.line = ln;
-    ip2 = vec_emit(ip2, jmp);
-    // scalar loop kept intact as the aliasing fallback.
+    // scalar loop kept intact: alias fallback (overlap path) AND remainder (vector path).
     hdr.is_extern_call = 1;
     return 1;
 }
