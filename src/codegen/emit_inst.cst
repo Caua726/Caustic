@@ -403,8 +403,131 @@ fn _packed_mn(op as i32) as *u8 {
     if (op == d.IR_VMULPD) { return "mulpd"; }
     return "divpd";   // IR_VDIVPD
 }
+// xmm/ymm register NUMBER (0-15) of a vector vreg (loc 16..31 -> 0..15).
+fn _vec_num(vreg as i32, ctx as *al.AllocCtx) as i32 {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 16 && loc <= 31) { return loc - 16; }
+    return 0;   // no-spill guard makes this unreachable for vector vregs
+}
+// emit a 256-bit VEX reg-reg op as `.byte` (L=1, W=0): dst = op(src1, src2).
+// pp: 1=66 2=F3; mmm: 1=0F. (matches addpd/paddq family + vmovdqu)
+fn _avx_rr(opcode as i32, pp as i32, mmm as i32, dnum as i32, s1num as i32, s2num as i32) as void {
+    let is i32 as rbit with mut = 1; if (dnum >= 8) { rbit = 0; }
+    let is i32 as bbit with mut = 1; if (s2num >= 8) { bbit = 0; }
+    let is i32 as b1 = rbit * 128 + 64 + bbit * 32 + mmm;
+    let is i32 as b2 = (15 - s1num) * 8 + 4 + pp;
+    let is i32 as modrm = 192 + (dnum % 8) * 8 + (s2num % 8);
+    eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", "); eo.out_int(cast(i64, b2));
+    eo.out_cstr(", "); eo.out_int(cast(i64, opcode)); eo.out_cstr(", "); eo.out_int(cast(i64, modrm)); eo.out_char(10);
+}
+// vextracti128/vextractf128 xmm1, ymm<src>, imm  (opcode 0x39 int / 0x19 float).
+fn _avx_extract(opcode as i32, src_num as i32, imm as i32) as void {
+    let is i32 as rbit with mut = 1; if (src_num >= 8) { rbit = 0; }
+    let is i32 as b1 = rbit * 128 + 64 + 32 + 3;   // X=1, B=1 (dst xmm1), mmm=3 (0F3A)
+    let is i32 as modrm = 192 + (src_num % 8) * 8 + 1;   // reg=src, rm=xmm1
+    eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", 125, "); eo.out_int(cast(i64, opcode));
+    eo.out_cstr(", "); eo.out_int(cast(i64, modrm)); eo.out_cstr(", "); eo.out_int(cast(i64, imm)); eo.out_char(10);
+}
 fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
+    // ---- AVX2 (256-bit) ----
+    if (op == d.IR_HASAVX2) {
+        // result = (cpuid.7:0.ebx bit 5). Save/restore rax-rdx around cpuid via the
+        // stack; carry the result out through a stack temp so dest can be any GPR.
+        eo.out_line("sub rsp, 8");
+        eo.out_line("push rax"); eo.out_line("push rbx"); eo.out_line("push rcx"); eo.out_line("push rdx");
+        eo.out_line("mov eax, 7"); eo.out_line("xor ecx, ecx"); eo.out_line(".byte 15, 162");   // cpuid
+        eo.out_line("shr ebx, 5"); eo.out_line("and ebx, 1"); eo.out_line("mov QWORD PTR [rsp+32], rbx");
+        eo.out_line("pop rdx"); eo.out_line("pop rcx"); eo.out_line("pop rbx"); eo.out_line("pop rax");
+        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
+        if (dloc >= 0 && dloc < 16) {
+            eo.out_str("  mov ", 6); eo.out_cstr(eo.reg64(dloc)); eo.out_cstr(", QWORD PTR [rsp]"); eo.out_char(10);
+            eo.out_line("add rsp, 8");
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(dloc); }
+        } else {
+            eo.out_line("mov rax, QWORD PTR [rsp]"); eo.out_line("add rsp, 8");
+            e.store_op(inst.dest.vreg, ctx, "rax");
+        }
+        return;
+    }
+    if (op == d.IR_VZERO256) {
+        let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
+        _avx_rr(239, 1, 1, dn, dn, dn);   // vpxor ymm,ymm,ymm
+        return;
+    }
+    if (op == d.IR_VLOADQ256) {
+        e.load_op(inst.src1.vreg, ctx, "rcx");
+        if (inst.src2.op_type == d.OP_IMM && inst.src2.imm != 0) {
+            eo.out_str("  add rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
+        }
+        let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
+        let is i32 as rbit with mut = 1; if (dn >= 8) { rbit = 0; }
+        let is i32 as b1 = rbit * 128 + 64 + 32 + 1;        // X=1,B=1(rcx),0F
+        let is i32 as modrm = (dn % 8) * 8 + 1;             // mod=00, rm=rcx
+        eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", 126, 111, ");   // F3,L=1; vmovdqu load
+        eo.out_int(cast(i64, modrm)); eo.out_char(10);
+        return;
+    }
+    if (op == d.IR_VADDQ256 || op == d.IR_VADDD256 || op == d.IR_VADDPD256) {
+        let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
+        let is i32 as s1 = _vec_num(inst.src1.vreg, ctx);
+        let is i32 as s2 = _vec_num(inst.src2.vreg, ctx);
+        let is i32 as oc with mut = 212;                    // vpaddq
+        if (op == d.IR_VADDD256) { oc = 254; }              // vpaddd
+        else if (op == d.IR_VADDPD256) { oc = 88; }         // vaddpd
+        _avx_rr(oc, 1, 1, dn, s1, s2);
+        return;
+    }
+    if (op == d.IR_VREDUCEQ256) {
+        let is i32 as s1 = _vec_num(inst.src1.vreg, ctx);
+        _avx_extract(57, s1, 1);                            // vextracti128 xmm1, ymm, 1
+        eo.out_line(".byte 197, 248, 119");                 // vzeroupper
+        let is *u8 as accx = eo.reg_xmm(s1 + 16);
+        eo.out_str("  paddq ", 8); eo.out_cstr(accx); eo.out_cstr(", xmm1"); eo.out_char(10);   // [l0+l2, l1+l3]
+        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
+        let is *u8 as dr with mut = "rax";
+        if (dloc >= 0 && dloc < 16) { dr = eo.reg64(dloc); }
+        eo.out_str("  movq ", 7); eo.out_cstr(dr); eo.out_cstr(", "); eo.out_cstr(accx); eo.out_char(10);
+        eo.out_str("  movdqu xmm1, ", 15); eo.out_cstr(accx); eo.out_char(10);
+        eo.out_line("psrldq xmm1, 8"); eo.out_line("movq rcx, xmm1");
+        eo.out_str("  add ", 6); eo.out_cstr(dr); eo.out_cstr(", rcx"); eo.out_char(10);
+        if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(eo.reg_name_to_idx(dr)); }
+        if (dloc < 0 || dloc >= 16) { e.store_op(inst.dest.vreg, ctx, dr); }
+        return;
+    }
+    if (op == d.IR_VREDUCED256) {
+        let is i32 as s1 = _vec_num(inst.src1.vreg, ctx);
+        _avx_extract(57, s1, 1);                            // vextracti128 xmm1, ymm, 1
+        eo.out_line(".byte 197, 248, 119");                 // vzeroupper
+        let is *u8 as accx = eo.reg_xmm(s1 + 16);
+        eo.out_str("  paddd ", 8); eo.out_cstr(accx); eo.out_cstr(", xmm1"); eo.out_char(10);  // -> 4 lanes
+        eo.out_str("  movdqu xmm1, ", 15); eo.out_cstr(accx); eo.out_char(10);
+        eo.out_line("psrldq xmm1, 8"); eo.out_str("  paddd ", 8); eo.out_cstr(accx); eo.out_cstr(", xmm1"); eo.out_char(10);
+        eo.out_str("  movdqu xmm1, ", 15); eo.out_cstr(accx); eo.out_char(10);
+        eo.out_line("psrldq xmm1, 4"); eo.out_str("  paddd ", 8); eo.out_cstr(accx); eo.out_cstr(", xmm1"); eo.out_char(10);
+        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
+        let is *u8 as dr with mut = "rax";
+        if (dloc >= 0 && dloc < 16) { dr = eo.reg64(dloc); }
+        let is *u8 as dr32 with mut = "eax";
+        if (dloc >= 0 && dloc < 16) { dr32 = eo.reg32(dloc); }
+        eo.out_str("  movd ", 7); eo.out_cstr(dr32); eo.out_cstr(", "); eo.out_cstr(accx); eo.out_char(10);
+        if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(eo.reg_name_to_idx(dr)); }
+        if (dloc < 0 || dloc >= 16) { e.store_op(inst.dest.vreg, ctx, dr); }
+        return;
+    }
+    if (op == d.IR_VREDUCEPD256) {
+        let is i32 as s1 = _vec_num(inst.src1.vreg, ctx);
+        _avx_extract(25, s1, 1);                            // vextractf128 xmm1, ymm, 1
+        eo.out_line(".byte 197, 248, 119");                 // vzeroupper
+        let is *u8 as accx = eo.reg_xmm(s1 + 16);
+        eo.out_str("  addpd ", 8); eo.out_cstr(accx); eo.out_cstr(", xmm1"); eo.out_char(10);   // [l0+l2, l1+l3]
+        let is *u8 as dacc = _xmm_acc_for(inst.dest.vreg, ctx);
+        eo.out_str("  movdqu ", 9); eo.out_cstr(dacc); eo.out_cstr(", "); eo.out_cstr(accx); eo.out_char(10);
+        eo.out_str("  movdqu xmm1, ", 15); eo.out_cstr(accx); eo.out_char(10);
+        eo.out_line("psrldq xmm1, 8"); eo.out_str("  addsd ", 8); eo.out_cstr(dacc); eo.out_cstr(", xmm1"); eo.out_char(10);
+        e.store_op_xmm(inst.dest.vreg, ctx, dacc);
+        return;
+    }
     if (op == d.IR_VZERO) {
         let is *u8 as dr = _vec_xmm(inst.dest.vreg, ctx);
         eo.out_str("  pxor ", 7); eo.out_cstr(dr); eo.out_str(", ", 2); eo.out_cstr(dr); eo.out_char(10);

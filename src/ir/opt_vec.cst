@@ -374,6 +374,111 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     //   .Lv: if (iv >= lim) goto .Lvend; v = [base + iv*elem]; vacc += v; iv += wide; goto .Lv
     //   .Lvend: s = s_init + reduce(vacc)      then the kept scalar loop runs iv..N onto s
     let is *d.IRInst as ipb with mut = prev;
+
+    // --- AVX2 dispatch: if the CPU has AVX2, run a 256-bit (2x wider) vector loop;
+    //     otherwise fall to the SSE2 loop below. Both fold into s, then jump past to
+    //     the scalar remainder. iv starts at init for whichever path runs. ---
+    let is i32 as wideA = wide * 2;
+    let is i32 as vadd256 with mut = d.IR_VADDQ256;
+    let is i32 as vred256 with mut = d.IR_VREDUCEQ256;
+    if (is_float == 1) { vadd256 = d.IR_VADDPD256; vred256 = d.IR_VREDUCEPD256; }
+    else if (elem == 4) { vadd256 = d.IR_VADDD256; vred256 = d.IR_VREDUCED256; }
+    let is i32 as flagv = vec_new_vreg(func);
+    let is *d.IRInst as hav = d.new_inst(d.IR_HASAVX2);
+    hav.dest.op_type = cast(i8, d.OP_VREG); hav.dest.vreg = flagv; hav.line = hdr.line;
+    ipb = vec_emit(ipb, hav);
+    let is i32 as Lsse = vec_new_label(func);
+    let is i32 as Lafter = vec_new_label(func);
+    let is *d.IRInst as jzf = d.new_inst(d.IR_JZ);
+    jzf.src1.op_type = cast(i8, d.OP_VREG); jzf.src1.vreg = flagv;
+    jzf.dest.op_type = cast(i8, d.OP_LABEL); jzf.dest.label = Lsse; jzf.line = hdr.line;
+    ipb = vec_emit(ipb, jzf);
+    let is i32 as vacc8 = vec_new_vreg(func);
+    let is *d.IRInst as vz8 = d.new_inst(d.IR_VZERO256);
+    vz8.dest.op_type = cast(i8, d.OP_VREG); vz8.dest.vreg = vacc8; vz8.line = hdr.line;
+    ipb = vec_emit(ipb, vz8);
+    let is i32 as limA_is_imm with mut = 0;
+    let is i64 as limA_imm with mut = 0;
+    let is i32 as limA_vreg with mut = cast(i32, 0 - 1);
+    if (nbound_is_const == 1) { limA_is_imm = 1; limA_imm = nbound - cast(i64, wideA - 1); }
+    else {
+        limA_vreg = vec_new_vreg(func);
+        let is *d.IRInst as subA = d.new_inst(d.IR_SUB);
+        subA.dest.op_type = cast(i8, d.OP_VREG); subA.dest.vreg = limA_vreg;
+        subA.src1.op_type = cast(i8, d.OP_VREG); subA.src1.vreg = nbound_vreg;
+        subA.src2.op_type = cast(i8, d.OP_IMM);  subA.src2.imm = cast(i64, wideA - 1);
+        subA.line = hdr.line;
+        ipb = vec_emit(ipb, subA);
+    }
+    let is i32 as LvA = vec_new_label(func);
+    let is i32 as LvendA = vec_new_label(func);
+    let is *d.IRInst as lblvA = d.new_inst(d.IR_LABEL);
+    lblvA.dest.op_type = cast(i8, d.OP_LABEL); lblvA.dest.label = LvA; lblvA.line = hdr.line;
+    ipb = vec_emit(ipb, lblvA);
+    let is i32 as vcondA = vec_new_vreg(func);
+    let is *d.IRInst as ltA = d.new_inst(d.IR_LT);
+    ltA.dest.op_type = cast(i8, d.OP_VREG); ltA.dest.vreg = vcondA;
+    ltA.src1.op_type = cast(i8, d.OP_VREG); ltA.src1.vreg = iv;
+    if (limA_is_imm == 1) { ltA.src2.op_type = cast(i8, d.OP_IMM); ltA.src2.imm = limA_imm; }
+    else { ltA.src2.op_type = cast(i8, d.OP_VREG); ltA.src2.vreg = limA_vreg; }
+    ltA.line = hdr.line;
+    ipb = vec_emit(ipb, ltA);
+    let is *d.IRInst as jzvA = d.new_inst(d.IR_JZ);
+    jzvA.src1.op_type = cast(i8, d.OP_VREG); jzvA.src1.vreg = vcondA;
+    jzvA.dest.op_type = cast(i8, d.OP_LABEL); jzvA.dest.label = LvendA; jzvA.line = hdr.line;
+    ipb = vec_emit(ipb, jzvA);
+    let is i32 as addrA = vec_new_vreg(func);
+    let is *d.IRInst as leaA = d.new_inst(lea_op);
+    leaA.dest.op_type = cast(i8, d.OP_VREG); leaA.dest.vreg = addrA;
+    leaA.src1.op_type = cast(i8, d.OP_VREG); leaA.src1.vreg = base;
+    leaA.src2.op_type = cast(i8, d.OP_VREG); leaA.src2.vreg = iv;
+    leaA.line = hdr.line;
+    ipb = vec_emit(ipb, leaA);
+    let is i32 as vldA = vec_new_vreg(func);
+    let is *d.IRInst as vlA = d.new_inst(d.IR_VLOADQ256);
+    vlA.dest.op_type = cast(i8, d.OP_VREG); vlA.dest.vreg = vldA;
+    vlA.src1.op_type = cast(i8, d.OP_VREG); vlA.src1.vreg = addrA;
+    vlA.src2.op_type = cast(i8, d.OP_IMM);  vlA.src2.imm = 0;
+    vlA.line = hdr.line;
+    ipb = vec_emit(ipb, vlA);
+    let is *d.IRInst as vaA = d.new_inst(vadd256);
+    vaA.dest.op_type = cast(i8, d.OP_VREG); vaA.dest.vreg = vacc8;
+    vaA.src1.op_type = cast(i8, d.OP_VREG); vaA.src1.vreg = vacc8;
+    vaA.src2.op_type = cast(i8, d.OP_VREG); vaA.src2.vreg = vldA;
+    vaA.line = hdr.line;
+    ipb = vec_emit(ipb, vaA);
+    let is *d.IRInst as ivaddA = d.new_inst(d.IR_ADD);
+    ivaddA.dest.op_type = cast(i8, d.OP_VREG); ivaddA.dest.vreg = iv;
+    ivaddA.src1.op_type = cast(i8, d.OP_VREG); ivaddA.src1.vreg = iv;
+    ivaddA.src2.op_type = cast(i8, d.OP_IMM);  ivaddA.src2.imm = cast(i64, wideA);
+    ivaddA.line = hdr.line;
+    ipb = vec_emit(ipb, ivaddA);
+    let is *d.IRInst as jmpvA = d.new_inst(d.IR_JMP);
+    jmpvA.dest.op_type = cast(i8, d.OP_LABEL); jmpvA.dest.label = LvA; jmpvA.line = hdr.line;
+    ipb = vec_emit(ipb, jmpvA);
+    let is *d.IRInst as lblendA = d.new_inst(d.IR_LABEL);
+    lblendA.dest.op_type = cast(i8, d.OP_LABEL); lblendA.dest.label = LvendA; lblendA.line = hdr.line;
+    ipb = vec_emit(ipb, lblendA);
+    let is i32 as hvA = vec_new_vreg(func);
+    let is *d.IRInst as vrA = d.new_inst(vred256);
+    vrA.dest.op_type = cast(i8, d.OP_VREG); vrA.dest.vreg = hvA;
+    vrA.src1.op_type = cast(i8, d.OP_VREG); vrA.src1.vreg = vacc8;
+    vrA.line = hdr.line;
+    ipb = vec_emit(ipb, vrA);
+    let is *d.IRInst as finA = d.new_inst(fin_op);
+    finA.dest.op_type = cast(i8, d.OP_VREG); finA.dest.vreg = s_acc;
+    finA.src1.op_type = cast(i8, d.OP_VREG); finA.src1.vreg = s_init_vreg;
+    finA.src2.op_type = cast(i8, d.OP_VREG); finA.src2.vreg = hvA;
+    finA.line = hdr.line;
+    ipb = vec_emit(ipb, finA);
+    let is *d.IRInst as jmpAf = d.new_inst(d.IR_JMP);
+    jmpAf.dest.op_type = cast(i8, d.OP_LABEL); jmpAf.dest.label = Lafter; jmpAf.line = hdr.line;
+    ipb = vec_emit(ipb, jmpAf);
+    let is *d.IRInst as lblSse = d.new_inst(d.IR_LABEL);
+    lblSse.dest.op_type = cast(i8, d.OP_LABEL); lblSse.dest.label = Lsse; lblSse.line = hdr.line;
+    ipb = vec_emit(ipb, lblSse);
+
+    // --- SSE2 path (128-bit, the always-available fallback) ---
     let is i32 as vacc with mut = vec_new_vreg(func);
     let is *d.IRInst as vzb = d.new_inst(d.IR_VZERO);
     vzb.dest.op_type = cast(i8, d.OP_VREG); vzb.dest.vreg = vacc; vzb.line = hdr.line;
@@ -457,6 +562,10 @@ fn vec_try(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     finb.src2.op_type = cast(i8, d.OP_VREG); finb.src2.vreg = hvb;
     finb.line = hdr.line;
     ipb = vec_emit(ipb, finb);
+    // .Lafter: both vector paths converge here, then fall into the scalar remainder.
+    let is *d.IRInst as lblAfter = d.new_inst(d.IR_LABEL);
+    lblAfter.dest.op_type = cast(i8, d.OP_LABEL); lblAfter.dest.label = Lafter; lblAfter.line = hdr.line;
+    ipb = vec_emit(ipb, lblAfter);
     // scalar loop kept intact — runs from iv (post-vector) to N as the remainder.
     hdr.is_extern_call = 1;
     return 1;
