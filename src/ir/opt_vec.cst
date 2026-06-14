@@ -741,17 +741,39 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     if (is_float != st_float) { return 0; }
     if (valdef.src1.op_type != d.OP_VREG || valdef.src2.op_type != d.OP_VREG) { return 0; }
 
+    // src1 must be the iv-indexed array load a[i].
     let is *d.IRInst as lda = vec_sdef(def_inst, def_count, vc, vec_resolve(def_inst, def_count, vc, valdef.src1.vreg));
-    let is *d.IRInst as ldb = vec_sdef(def_inst, def_count, vc, vec_resolve(def_inst, def_count, vc, valdef.src2.vreg));
-    if (cast(i64, lda) == 0 || cast(i64, ldb) == 0 || lda.op != d.IR_LOAD || ldb.op != d.IR_LOAD) { return 0; }
-    if (lda.src1.op_type != d.OP_VREG || ldb.src1.op_type != d.OP_VREG) { return 0; }
-    if (vec_ld_is_float(lda) != is_float || vec_ld_is_float(ldb) != is_float) { return 0; }
+    if (cast(i64, lda) == 0 || lda.op != d.IR_LOAD || lda.src1.op_type != d.OP_VREG) { return 0; }
+    if (vec_ld_is_float(lda) != is_float) { return 0; }
     let is i32 as elem_a with mut = 0;
-    let is i32 as elem_b with mut = 0;
     let is i32 as base_a = vec_lea_base(vec_sdef(def_inst, def_count, vc, lda.src1.vreg), def_inst, def_count, vc, iv, &elem_a);
-    let is i32 as base_b = vec_lea_base(vec_sdef(def_inst, def_count, vc, ldb.src1.vreg), def_inst, def_count, vc, iv, &elem_b);
-    if (base_a < 0 || base_b < 0 || base_a >= vc || base_b >= vc) { return 0; }
-    if (elem_a != elem_c || elem_b != elem_c) { return 0; }
+    if (base_a < 0 || base_a >= vc || elem_a != elem_c) { return 0; }
+    // src2: iv-indexed array load b[i] (two-array map) OR a loop-invariant f64 scalar
+    // k (broadcast map -> c[i] = a[i] OP k, with k splatted to all lanes).
+    let is i32 as is_bcast with mut = 0;
+    let is i32 as base_b with mut = cast(i32, 0 - 1);
+    let is i32 as kvreg with mut = cast(i32, 0 - 1);
+    let is i32 as r2 = vec_resolve(def_inst, def_count, vc, valdef.src2.vreg);
+    let is *d.IRInst as ldb = vec_sdef(def_inst, def_count, vc, r2);
+    let is i32 as ldb_ok with mut = 0;
+    if (cast(i64, ldb) != 0 && ldb.op == d.IR_LOAD && ldb.src1.op_type == d.OP_VREG && vec_ld_is_float(ldb) == is_float) {
+        let is i32 as elem_b with mut = 0;
+        base_b = vec_lea_base(vec_sdef(def_inst, def_count, vc, ldb.src1.vreg), def_inst, def_count, vc, iv, &elem_b);
+        if (base_b >= 0 && base_b < vc && elem_b == elem_c) { ldb_ok = 1; }
+    }
+    if (ldb_ok == 0) {
+        // broadcast: src2 = a loop-invariant f64 scalar (not written anywhere in the body)
+        if (is_float != 1) { return 0; }            // f64 broadcast only for now
+        if (r2 < 0 || r2 >= vc) { return 0; }
+        let is i32 as invariant with mut = 1;
+        let is *d.IRInst as bb with mut = body_first;
+        while (cast(i64, bb) != 0 && cast(i64, bb) != cast(i64, backedge)) {
+            if (bb.is_dead == 0 && bb.dest.op_type == d.OP_VREG && bb.dest.vreg == r2) { invariant = 0; }
+            bb = bb.next;
+        }
+        if (invariant == 0) { return 0; }
+        is_bcast = 1; kvreg = r2;
+    }
 
     let is i32 as elem = elem_c;
     let is i32 as wide with mut = 0;
@@ -810,6 +832,9 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
     // trip would need the scalar loop as remainder, which the unroller may flatten
     // (it assumes iv=init) — so skip it rather than risk a jump into unrolled code.
     if (nbound_is_const == 1 && use_unroll == 0) { return 0; }
+    // Broadcast maps only take the runtime path (avoids the const-unroll hazard above);
+    // a const-length broadcast stays scalar (small fixed arrays — low value).
+    if (is_bcast == 1 && nbound_is_const == 1) { return 0; }
 
     // iv must NOT be live after the loop (conservative; both vector paths leave iv
     // in a path-dependent state otherwise).
@@ -822,29 +847,40 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         lo = lo.next;
     }
 
-    // ===== (1) before hdr: alias check `any = overlap(c,a) | overlap(c,b)`, JZ any -> .Lvec
-    // overlap([p,p+sz),[q,q+sz)) == p<q+sz & q<p+sz; end = base + N*elem.
+    // ===== (1) before hdr: alias check, JZ any -> .Lvec. Two-array: any = overlap(c,a)
+    // | overlap(c,b). Broadcast (no b array): any = overlap(c,a). overlap([p,p+sz),
+    // [q,q+sz)) == p<q+sz & q<p+sz; end = base + N*elem (runtime via LEA).
     let is *d.IRInst as ip with mut = prev;
     let is i32 as a_end with mut = 0;
-    let is i32 as b_end with mut = 0;
     let is i32 as c_end with mut = 0;
+    let is i32 as anyv with mut = 0;
     if (nbound_is_const == 1) {
         let is i64 as sz_check = nbound * cast(i64, elem);   // superset of the accessed range
         ip = vec_emit_addimm(func, ip, base_a, sz_check, ln, &a_end);
-        ip = vec_emit_addimm(func, ip, base_b, sz_check, ln, &b_end);
+        let is i32 as b_end with mut = 0; ip = vec_emit_addimm(func, ip, base_b, sz_check, ln, &b_end);
         ip = vec_emit_addimm(func, ip, base_c, sz_check, ln, &c_end);
+        let is i32 as t1 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, a_end, ln, &t1);
+        let is i32 as t2 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_a, c_end, ln, &t2);
+        let is i32 as ova with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t1, t2, ln, &ova);
+        let is i32 as t3 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, b_end, ln, &t3);
+        let is i32 as t4 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_b, c_end, ln, &t4);
+        let is i32 as ovb with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t3, t4, ln, &ovb);
+        ip = vec_emit_vv(func, ip, d.IR_OR, ova, ovb, ln, &anyv);
     } else {
         ip = vec_emit_lea(func, ip, lea_op, base_a, nbound_vreg, ln, &a_end);   // a + N*elem
-        ip = vec_emit_lea(func, ip, lea_op, base_b, nbound_vreg, ln, &b_end);
         ip = vec_emit_lea(func, ip, lea_op, base_c, nbound_vreg, ln, &c_end);
+        let is i32 as t1 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, a_end, ln, &t1);   // c < a_end
+        let is i32 as t2 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_a, c_end, ln, &t2);   // a < c_end
+        let is i32 as ova with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t1, t2, ln, &ova);
+        if (is_bcast == 1) { anyv = ova; }                                       // no b array
+        else {
+            let is i32 as b_end with mut = 0; ip = vec_emit_lea(func, ip, lea_op, base_b, nbound_vreg, ln, &b_end);
+            let is i32 as t3 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, b_end, ln, &t3);   // c < b_end
+            let is i32 as t4 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_b, c_end, ln, &t4);   // b < c_end
+            let is i32 as ovb with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t3, t4, ln, &ovb);
+            ip = vec_emit_vv(func, ip, d.IR_OR, ova, ovb, ln, &anyv);
+        }
     }
-    let is i32 as t1 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, a_end, ln, &t1);   // c < a_end
-    let is i32 as t2 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_a, c_end, ln, &t2);   // a < c_end
-    let is i32 as ova with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t1, t2, ln, &ova);
-    let is i32 as t3 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_c, b_end, ln, &t3);   // c < b_end
-    let is i32 as t4 with mut = 0; ip = vec_emit_vv(func, ip, d.IR_LT, base_b, c_end, ln, &t4);   // b < c_end
-    let is i32 as ovb with mut = 0; ip = vec_emit_vv(func, ip, d.IR_AND, t3, t4, ln, &ovb);
-    let is i32 as anyv with mut = 0; ip = vec_emit_vv(func, ip, d.IR_OR, ova, ovb, ln, &anyv);
     let is i32 as label_vec = vec_new_label(func);
     let is *d.IRInst as jzv = d.new_inst(d.IR_JZ);                        // JZ any -> .Lvec (jump if no overlap)
     jzv.src1.op_type = cast(i8, d.OP_VREG); jzv.src1.vreg = anyv;
@@ -903,7 +939,9 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         // jump into the kept scalar loop (.Lhdr) which runs iv..N as the remainder.
 
         // --- AVX2 dispatch: 256-bit map loop (2x wider) when the CPU has AVX2; else
-        //     fall to the SSE2 loop below. Both exit to .Lhdr (the scalar remainder). ---
+        //     fall to the SSE2 loop below. Both exit to .Lhdr (the scalar remainder).
+        //     (Skipped for broadcast maps — AVX2 broadcast not wired yet; SSE2 only.) ---
+        if (is_bcast == 0) {
         let is i32 as wideA = wide * 2;
         let is i32 as vop256 with mut = d.IR_VADDQ256;
         if (is_float == 1) {
@@ -987,8 +1025,14 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         let is *d.IRInst as lblSseM = d.new_inst(d.IR_LABEL);
         lblSseM.dest.op_type = cast(i8, d.OP_LABEL); lblSseM.dest.label = LsseM; lblSseM.line = ln;
         ip2 = vec_emit(ip2, lblSseM);
+        }   // end if (is_bcast == 0): AVX2 dispatch block
 
-        // --- SSE2 fallback (128-bit): lim = N - (wide-1)  (`iv < lim` == `iv + wide <= N`) ---
+        // --- SSE2 loop (128-bit; the always-available path / broadcast's only path) ---
+        // For broadcast, k is splatted to [k,k] INSIDE the loop (cheap movddup) so the
+        // scalar k stays live across the loop — the kept scalar remainder (.Lhdr,
+        // reached by the loop's back-edge) reads k, and the linear allocator would
+        // otherwise free k's register after a once-before-loop splat.
+        // lim = N - (wide-1)  (`iv < lim` == `iv + wide <= N`)
         let is i32 as lim_is_imm with mut = 0;
         let is i64 as lim_imm with mut = 0;
         let is i32 as lim_vreg with mut = cast(i32, 0 - 1);
@@ -1028,13 +1072,24 @@ fn vec_try_map(func as *d.IRFunction, hdr as *d.IRInst, prev as *d.IRInst,
         la.src1.op_type = cast(i8, d.OP_VREG); la.src1.vreg = aa;
         la.src2.op_type = cast(i8, d.OP_IMM);  la.src2.imm = 0; la.line = ln;
         ip2 = vec_emit(ip2, la);
-        let is i32 as ab with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_b, iv, ln, &ab);
-        let is i32 as vlb = vec_new_vreg(func);
-        let is *d.IRInst as lb = d.new_inst(d.IR_VLOADQ);
-        lb.dest.op_type = cast(i8, d.OP_VREG); lb.dest.vreg = vlb;
-        lb.src1.op_type = cast(i8, d.OP_VREG); lb.src1.vreg = ab;
-        lb.src2.op_type = cast(i8, d.OP_IMM);  lb.src2.imm = 0; lb.line = ln;
-        ip2 = vec_emit(ip2, lb);
+        let is i32 as vlb with mut = cast(i32, 0 - 1);
+        if (is_bcast == 1) {
+            // vlb = [k,k] (movddup) — recomputed each iteration, keeping k live
+            vlb = vec_new_vreg(func);
+            let is *d.IRInst as spl = d.new_inst(d.IR_VSPLATPD);
+            spl.dest.op_type = cast(i8, d.OP_VREG); spl.dest.vreg = vlb;
+            spl.src1.op_type = cast(i8, d.OP_VREG); spl.src1.vreg = kvreg;
+            spl.line = ln;
+            ip2 = vec_emit(ip2, spl);
+        } else {
+            let is i32 as ab with mut = 0; ip2 = vec_emit_lea(func, ip2, lea_op, base_b, iv, ln, &ab);
+            vlb = vec_new_vreg(func);
+            let is *d.IRInst as lb = d.new_inst(d.IR_VLOADQ);
+            lb.dest.op_type = cast(i8, d.OP_VREG); lb.dest.vreg = vlb;
+            lb.src1.op_type = cast(i8, d.OP_VREG); lb.src1.vreg = ab;
+            lb.src2.op_type = cast(i8, d.OP_IMM);  lb.src2.imm = 0; lb.line = ln;
+            ip2 = vec_emit(ip2, lb);
+        }
         let is i32 as vr = vec_new_vreg(func);
         let is *d.IRInst as vo = d.new_inst(vop);
         vo.dest.op_type = cast(i8, d.OP_VREG); vo.dest.vreg = vr;
