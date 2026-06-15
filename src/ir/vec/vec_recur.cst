@@ -1,0 +1,119 @@
+// === vec2: induction & recurrence (reduction) descriptors ===
+//
+// Lifted in spirit from LLVM's IVDescriptors.h. Detection only — no IR mutation.
+// Operates on the loop body as a linear instruction range (header.first..latch.last),
+// which is valid because Caustic IR is a linear list and a natural loop body is a
+// contiguous span. Uses the def side-table + scev_resolve from vec_scev.
+
+use "../defs.cst" as d;
+use "../cfg.cst" as cfg;
+use "vec_loops.cst" as vl;
+use "vec_scev.cst" as sc;
+
+// recurrence kinds (M1 scope: RK_ADD / RK_FADD; the rest land in M6)
+let is i32 as RK_ADD  with imut = 0;
+let is i32 as RK_FADD with imut = 1;
+
+struct InductionDescriptor {
+    iv as i32;          // induction vreg
+    kind as i8;         // 1 = integer (M1 scope)
+    start_imm as i64;   // constant start value
+    start_known as i8;  // 1 if start_imm is a known constant
+    step_imm as i64;    // per-iteration step
+}
+
+struct RecurrenceDescriptor {
+    phi as i32;         // the accumulator vreg (carried across iterations)
+    exit as i32;        // the value live out of the loop (== phi here)
+    start as i32;       // pre-loop initial value vreg
+    kind as i8;         // RK_ADD / RK_FADD
+    is_float as i8;     // 1 if FP recurrence
+}
+
+// is vreg `v` used as a src by a live body inst strictly before `stop`?
+fn used_before(body_first as *d.IRInst, stop as *d.IRInst, v as i32) as i32 {
+    let is *d.IRInst as p with mut = body_first;
+    while (cast(i64, p) != 0 && cast(i64, p) != cast(i64, stop)) {
+        if (p.is_dead == 0) {
+            if (p.src1.op_type == d.OP_VREG && p.src1.vreg == v) { return 1; }
+            if (p.src2.op_type == d.OP_VREG && p.src2.vreg == v) { return 1; }
+        }
+        p = p.next;
+    }
+    return 0;
+}
+
+// Fill the induction descriptor. iv/step come from find_loop_iv; start is the
+// pre-loop constant initialiser of iv (scanned before the header). Returns 1.
+fn detect_induction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                    iv as i32, step as i64, def_inst as *i64, def_count as *i32, vc as i32,
+                    out as *InductionDescriptor) as i32 {
+    out.iv = iv; out.kind = cast(i8, 1); out.step_imm = step; out.start_imm = 0; out.start_known = cast(i8, 0);
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    // scan instructions before the header for the last `iv = const`
+    let is *d.IRInst as p with mut = func.instructions;
+    while (cast(i64, p) != 0 && cast(i64, p) != cast(i64, hb.first)) {
+        if (p.is_dead == 0 && p.dest.op_type == d.OP_VREG && p.dest.vreg == iv && p.op != d.IR_STORE && p.op != d.IR_COPY) {
+            if (p.op == d.IR_IMM && p.src1.op_type == d.OP_IMM) { out.start_imm = p.src1.imm; out.start_known = cast(i8, 1); }
+            else if (p.op == d.IR_MOV && p.src1.op_type == d.OP_VREG) {
+                let is *d.IRInst as sd = sc.scev_sdef(def_inst, def_count, vc, p.src1.vreg);
+                if (cast(i64, sd) != 0 && sd.op == d.IR_IMM && sd.src1.op_type == d.OP_IMM) { out.start_imm = sd.src1.imm; out.start_known = cast(i8, 1); }
+                else { out.start_known = cast(i8, 0); }
+            } else { out.start_known = cast(i8, 0); }
+        }
+        p = p.next;
+    }
+    return 1;
+}
+
+// Detect an RK_ADD / RK_FADD reduction in the loop body. The accumulator `s` is a
+// carried MOV `s = vt` (s used before it in the body) whose value vt = ADD/FADD with
+// one operand resolving back to s. start = the pre-loop value of s. Returns 1 on hit.
+fn detect_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                    iv as i32, def_inst as *i64, def_count as *i32, vc as i32,
+                    out as *RecurrenceDescriptor) as i32 {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is *d.IRInst as body_first = hb.first;
+    let is *d.IRInst as body_end = lb.last;   // inclusive
+
+    let is i32 as s_acc with mut = cast(i32, 0 - 1);
+    let is *d.IRInst as s_write with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as b with mut = body_first;
+    let is i32 as guard with mut = 0;
+    while (cast(i64, b) != 0 && guard < 100000) {
+        if (b.is_dead == 0 && b.op == d.IR_MOV && b.dest.op_type == d.OP_VREG && b.src1.op_type == d.OP_VREG) {
+            let is i32 as cd = b.dest.vreg;
+            if (cd != iv && used_before(body_first, b, cd) == 1) {
+                if (s_acc < 0) { s_acc = cd; s_write = b; }
+                else { return 0; }   // more than one carried non-iv var: defer (M1 RK_ADD scope)
+            }
+        }
+        if (cast(i64, b) == cast(i64, body_end)) { b = cast(*d.IRInst, 0); } else { b = b.next; }
+        guard = guard + 1;
+    }
+    if (s_acc < 0) { return 0; }
+
+    // s_write: s = vt ; vt = ADD/FADD(p,q) with one operand resolving to s
+    let is i32 as vt = s_write.src1.vreg;
+    let is *d.IRInst as add = sc.scev_sdef(def_inst, def_count, vc, vt);
+    if (cast(i64, add) == 0 || add.src1.op_type != d.OP_VREG || add.src2.op_type != d.OP_VREG) { return 0; }
+    let is i32 as is_float with mut = 0;
+    if (add.op == d.IR_FADD) { is_float = 1; } else if (add.op != d.IR_ADD) { return 0; }
+    let is i32 as a1 = sc.scev_resolve(def_inst, def_count, vc, add.src1.vreg);
+    let is i32 as a2 = sc.scev_resolve(def_inst, def_count, vc, add.src2.vreg);
+    if (a1 != s_acc && a2 != s_acc) { return 0; }
+
+    // start: pre-loop value feeding s (MOV s = start before the header)
+    let is i32 as start_vreg with mut = cast(i32, 0 - 1);
+    let is *d.IRInst as p with mut = func.instructions;
+    while (cast(i64, p) != 0 && cast(i64, p) != cast(i64, hb.first)) {
+        if (p.is_dead == 0 && p.dest.op_type == d.OP_VREG && p.dest.vreg == s_acc
+            && p.op == d.IR_MOV && p.src1.op_type == d.OP_VREG) { start_vreg = p.src1.vreg; }
+        p = p.next;
+    }
+    out.phi = s_acc; out.exit = s_acc; out.start = start_vreg;
+    out.kind = cast(i8, RK_ADD); if (is_float == 1) { out.kind = cast(i8, RK_FADD); }
+    out.is_float = cast(i8, is_float);
+    return 1;
+}
