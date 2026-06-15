@@ -78,6 +78,102 @@ fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *v
     let is i32 as ln = hb.first.line;
     let is *d.IRInst as ip with mut = prev;
 
+    // --- AVX2 dispatch: 256-bit (2x wider) reduction when the CPU has AVX2, else the
+    //     SSE2 loop below; both fold into the accumulator, then fall to the remainder ---
+    let is i32 as wideA = wide * 2;
+    let is i32 as vadd256 with mut = d.IR_VADDQ256;
+    let is i32 as vred256 with mut = d.IR_VREDUCEQ256;
+    if (is_f == 1) { vadd256 = d.IR_VADDPD256; vred256 = d.IR_VREDUCEPD256; }
+    else if (elem == 4) { vadd256 = d.IR_VADDD256; vred256 = d.IR_VREDUCED256; }
+    let is i32 as Lafter = new_label(func);
+    let is i32 as flagv = new_vreg(func);
+    let is *d.IRInst as hav = d.new_inst(d.IR_HASAVX2);
+    hav.dest.op_type = cast(i8, d.OP_VREG); hav.dest.vreg = flagv; hav.line = ln;
+    ip = emit(ip, hav);
+    let is i32 as Lsse = new_label(func);
+    let is *d.IRInst as jzf = d.new_inst(d.IR_JZ);
+    jzf.src1.op_type = cast(i8, d.OP_VREG); jzf.src1.vreg = flagv;
+    jzf.dest.op_type = cast(i8, d.OP_LABEL); jzf.dest.label = Lsse; jzf.line = ln;
+    ip = emit(ip, jzf);
+    let is i32 as vacc8 = new_vreg(func);
+    let is *d.IRInst as vz8 = d.new_inst(d.IR_VZERO256);
+    vz8.dest.op_type = cast(i8, d.OP_VREG); vz8.dest.vreg = vacc8; vz8.line = ln;
+    ip = emit(ip, vz8);
+    let is i32 as limA_is_imm with mut = 0;
+    let is i64 as limA_imm with mut = 0;
+    let is i32 as limA_vreg with mut = cast(i32, 0 - 1);
+    if (n_is_imm == 1) { limA_is_imm = 1; limA_imm = n_imm - cast(i64, wideA - 1); }
+    else {
+        limA_vreg = new_vreg(func);
+        let is *d.IRInst as subA = d.new_inst(d.IR_SUB);
+        subA.dest.op_type = cast(i8, d.OP_VREG); subA.dest.vreg = limA_vreg;
+        subA.src1.op_type = cast(i8, d.OP_VREG); subA.src1.vreg = n_vreg;
+        subA.src2.op_type = cast(i8, d.OP_IMM);  subA.src2.imm = cast(i64, wideA - 1); subA.line = ln;
+        ip = emit(ip, subA);
+    }
+    let is i32 as LvA = new_label(func);
+    let is i32 as LvendA = new_label(func);
+    let is *d.IRInst as lblvA = d.new_inst(d.IR_LABEL);
+    lblvA.dest.op_type = cast(i8, d.OP_LABEL); lblvA.dest.label = LvA; lblvA.line = ln;
+    ip = emit(ip, lblvA);
+    let is i32 as vcondA = new_vreg(func);
+    let is *d.IRInst as ltA = d.new_inst(d.IR_LT);
+    ltA.dest.op_type = cast(i8, d.OP_VREG); ltA.dest.vreg = vcondA;
+    ltA.src1.op_type = cast(i8, d.OP_VREG); ltA.src1.vreg = iv;
+    if (limA_is_imm == 1) { ltA.src2.op_type = cast(i8, d.OP_IMM); ltA.src2.imm = limA_imm; }
+    else { ltA.src2.op_type = cast(i8, d.OP_VREG); ltA.src2.vreg = limA_vreg; }
+    ltA.line = ln;
+    ip = emit(ip, ltA);
+    let is *d.IRInst as jzvA = d.new_inst(d.IR_JZ);
+    jzvA.src1.op_type = cast(i8, d.OP_VREG); jzvA.src1.vreg = vcondA;
+    jzvA.dest.op_type = cast(i8, d.OP_LABEL); jzvA.dest.label = LvendA; jzvA.line = ln;
+    ip = emit(ip, jzvA);
+    let is i32 as addrA = new_vreg(func);
+    let is *d.IRInst as leaA = d.new_inst(lea_op);
+    leaA.dest.op_type = cast(i8, d.OP_VREG); leaA.dest.vreg = addrA;
+    leaA.src1.op_type = cast(i8, d.OP_VREG); leaA.src1.vreg = base;
+    leaA.src2.op_type = cast(i8, d.OP_VREG); leaA.src2.vreg = iv; leaA.line = ln;
+    ip = emit(ip, leaA);
+    let is i32 as vldA = new_vreg(func);
+    let is *d.IRInst as vlA = d.new_inst(d.IR_VLOADQ256);
+    vlA.dest.op_type = cast(i8, d.OP_VREG); vlA.dest.vreg = vldA;
+    vlA.src1.op_type = cast(i8, d.OP_VREG); vlA.src1.vreg = addrA;
+    vlA.src2.op_type = cast(i8, d.OP_IMM);  vlA.src2.imm = 0; vlA.line = ln;
+    ip = emit(ip, vlA);
+    let is *d.IRInst as vaA = d.new_inst(vadd256);
+    vaA.dest.op_type = cast(i8, d.OP_VREG); vaA.dest.vreg = vacc8;
+    vaA.src1.op_type = cast(i8, d.OP_VREG); vaA.src1.vreg = vacc8;
+    vaA.src2.op_type = cast(i8, d.OP_VREG); vaA.src2.vreg = vldA; vaA.line = ln;
+    ip = emit(ip, vaA);
+    let is *d.IRInst as ivaddA = d.new_inst(d.IR_ADD);
+    ivaddA.dest.op_type = cast(i8, d.OP_VREG); ivaddA.dest.vreg = iv;
+    ivaddA.src1.op_type = cast(i8, d.OP_VREG); ivaddA.src1.vreg = iv;
+    ivaddA.src2.op_type = cast(i8, d.OP_IMM);  ivaddA.src2.imm = cast(i64, wideA); ivaddA.line = ln;
+    ip = emit(ip, ivaddA);
+    let is *d.IRInst as jmpvA = d.new_inst(d.IR_JMP);
+    jmpvA.dest.op_type = cast(i8, d.OP_LABEL); jmpvA.dest.label = LvA; jmpvA.line = ln;
+    ip = emit(ip, jmpvA);
+    let is *d.IRInst as lblendA = d.new_inst(d.IR_LABEL);
+    lblendA.dest.op_type = cast(i8, d.OP_LABEL); lblendA.dest.label = LvendA; lblendA.line = ln;
+    ip = emit(ip, lblendA);
+    let is i32 as hvA = new_vreg(func);
+    let is *d.IRInst as vrA = d.new_inst(vred256);
+    vrA.dest.op_type = cast(i8, d.OP_VREG); vrA.dest.vreg = hvA;
+    vrA.src1.op_type = cast(i8, d.OP_VREG); vrA.src1.vreg = vacc8; vrA.line = ln;
+    ip = emit(ip, vrA);
+    let is *d.IRInst as finA = d.new_inst(fin_op);
+    finA.dest.op_type = cast(i8, d.OP_VREG); finA.dest.vreg = red.phi;
+    finA.src1.op_type = cast(i8, d.OP_VREG); finA.src1.vreg = red.start;
+    finA.src2.op_type = cast(i8, d.OP_VREG); finA.src2.vreg = hvA; finA.line = ln;
+    ip = emit(ip, finA);
+    let is *d.IRInst as jmpAf = d.new_inst(d.IR_JMP);
+    jmpAf.dest.op_type = cast(i8, d.OP_LABEL); jmpAf.dest.label = Lafter; jmpAf.line = ln;
+    ip = emit(ip, jmpAf);
+    let is *d.IRInst as lblSse = d.new_inst(d.IR_LABEL);
+    lblSse.dest.op_type = cast(i8, d.OP_LABEL); lblSse.dest.label = Lsse; lblSse.line = ln;
+    ip = emit(ip, lblSse);
+
+    // --- SSE2 path (always-available fallback) ---
     // vacc = VZERO
     let is i32 as vacc = new_vreg(func);
     let is *d.IRInst as vz = d.new_inst(d.IR_VZERO);
@@ -156,6 +252,11 @@ fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *v
     fin.src1.op_type = cast(i8, d.OP_VREG); fin.src1.vreg = red.start;
     fin.src2.op_type = cast(i8, d.OP_VREG); fin.src2.vreg = hv; fin.line = ln;
     ip = emit(ip, fin);
+
+    // .Lafter: both ISA paths converge here, then fall into the scalar remainder.
+    let is *d.IRInst as lblAfter = d.new_inst(d.IR_LABEL);
+    lblAfter.dest.op_type = cast(i8, d.OP_LABEL); lblAfter.dest.label = Lafter; lblAfter.line = ln;
+    ip = emit(ip, lblAfter);
 
     // the scalar loop is kept as the remainder; guard against re-vectorization
     hb.first.is_extern_call = cast(i8, 1);
