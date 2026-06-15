@@ -1,0 +1,156 @@
+// === vec2: natural-loop discovery on the existing CFG/dom infrastructure ===
+//
+// A natural loop is identified by a back-edge b -> h where the header h dominates
+// its latch b. The loop body is {h} plus every block that reaches b without going
+// through h (reverse reachability over predecessors). The preheader is the unique
+// predecessor of h that is NOT in the body.
+//
+// Reuses cfg.build_cfg / build_preds / compute_rpo + dom.compute_idom (all already
+// battle-tested by mem2reg). Detection only — no IR mutation.
+
+use "../defs.cst" as d;
+use "../cfg.cst" as cfg;
+
+let is i32 as MAX_LOOPS with imut = 256;
+
+struct VecLoop {
+    header as i32;        // header block index
+    latch as i32;         // latch block index (back-edge source)
+    preheader as i32;     // unique non-body predecessor of the header, or -1
+    header_label as i32;  // IR label id of the header block (or -1)
+    nbody as i32;         // number of blocks in the loop body
+    innermost as i32;     // 1 = contains no nested loop
+    depth as i32;         // nesting depth (number of enclosing loops)
+}
+
+fn bb_at(blocks as *cfg.BasicBlock, i as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, i) * sizeof(cfg.BasicBlock));
+}
+
+// Does block `a` dominate block `b`? Walk b's idom chain up to the entry (block 0).
+fn dom_blk(blocks as *cfg.BasicBlock, a as i32, b as i32) as i32 {
+    let is i32 as x with mut = b;
+    let is i32 as guard with mut = 0;
+    while (guard < cfg.MAX_BLOCKS + 2) {
+        if (x == a) { return 1; }
+        if (x == 0) { return 0; }            // reached entry without seeing a (a != 0)
+        x = bb_at(blocks, x).idom;
+        guard = guard + 1;
+    }
+    return 0;
+}
+
+// Discover natural loops; fill out_loops (cap MAX_LOOPS); return the count.
+// preds/pred_starts/pred_counts must come from cfg.build_preds.
+fn discover_loops(func as *d.IRFunction, blocks as *cfg.BasicBlock, nblocks as i32,
+                  preds as *i32, pred_starts as *i32, pred_counts as *i32,
+                  out_loops as *VecLoop) as i32 {
+    let is i32 as nloops with mut = 0;
+
+    // --- Pass 1: back-edges b -> s with s dominating b (one loop per header) ---
+    let is i32 as b with mut = 0;
+    while (b < nblocks && nloops < MAX_LOOPS) {
+        let is *cfg.BasicBlock as bb = bb_at(blocks, b);
+        let is i32 as si with mut = 0;
+        while (si < 2) {
+            let is i32 as s with mut = cast(i32, 0 - 1);
+            if (si == 0) { s = bb.succ0; } else { s = bb.succ1; }
+            if (s >= 0 && dom_blk(blocks, s, b) == 1) {
+                // dedup: keep only the first back-edge to a given header (multi-latch
+                // loops are rejected later by can_vectorize; one entry per header here).
+                let is i32 as dup with mut = 0;
+                let is i32 as q with mut = 0;
+                while (q < nloops) {
+                    let is *VecLoop as Lq = cast(*VecLoop, cast(i64, out_loops) + cast(i64, q) * sizeof(VecLoop));
+                    if (Lq.header == s) { dup = 1; }
+                    q = q + 1;
+                }
+                if (dup == 0 && nloops < MAX_LOOPS) {
+                    let is *VecLoop as L = cast(*VecLoop, cast(i64, out_loops) + cast(i64, nloops) * sizeof(VecLoop));
+                    L.header = s; L.latch = b; L.preheader = cast(i32, 0 - 1);
+                    L.header_label = cast(i32, 0 - 1); L.nbody = 0; L.innermost = 1; L.depth = 0;
+                    let is *cfg.BasicBlock as hb = bb_at(blocks, s);
+                    if (cast(i64, hb.first) != 0 && hb.first.op == d.IR_LABEL && hb.first.dest.op_type == d.OP_LABEL) {
+                        L.header_label = hb.first.dest.label;
+                    }
+                    nloops = nloops + 1;
+                }
+            }
+            si = si + 1;
+        }
+        b = b + 1;
+    }
+    if (nloops == 0) { return 0; }
+
+    // --- Pass 2: body (reverse BFS, stop at header), preheader, innermost/depth ---
+    let is *i32 as mark = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is i32 as zi with mut = 0;
+    while (zi < nblocks) { let is *i32 as mp = cast(*i32, cast(i64, mark) + cast(i64, zi) * 4); *mp = 0; zi = zi + 1; }
+    let is *i32 as wl = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+
+    let is i32 as i with mut = 0;
+    while (i < nloops) {
+        let is *VecLoop as L = cast(*VecLoop, cast(i64, out_loops) + cast(i64, i) * sizeof(VecLoop));
+        let is i32 as stamp = i + 1;
+        let is i32 as wln with mut = 0;
+        let is i32 as nbody with mut = 1;
+        let is *i32 as mh = cast(*i32, cast(i64, mark) + cast(i64, L.header) * 4); *mh = stamp;
+        if (L.latch != L.header) {
+            let is *i32 as ml = cast(*i32, cast(i64, mark) + cast(i64, L.latch) * 4); *ml = stamp;
+            nbody = 2;
+            let is *i32 as w0 = cast(*i32, cast(i64, wl)); *w0 = L.latch; wln = 1;
+        }
+        while (wln > 0) {
+            wln = wln - 1;
+            let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, wln) * 4);
+            let is i32 as n = *wp;
+            let is *i32 as ps = cast(*i32, cast(i64, pred_starts) + cast(i64, n) * 4);
+            let is *i32 as pc = cast(*i32, cast(i64, pred_counts) + cast(i64, n) * 4);
+            let is i32 as k with mut = 0;
+            while (k < *pc) {
+                let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *ps + k) * 4);
+                let is i32 as p = *pp;
+                let is *i32 as mp = cast(*i32, cast(i64, mark) + cast(i64, p) * 4);
+                if (*mp != stamp) {
+                    *mp = stamp; nbody = nbody + 1;
+                    let is *i32 as wpush = cast(*i32, cast(i64, wl) + cast(i64, wln) * 4); *wpush = p; wln = wln + 1;
+                }
+                k = k + 1;
+            }
+        }
+        L.nbody = nbody;
+
+        // preheader: the unique predecessor of the header not in the body
+        let is *i32 as hps = cast(*i32, cast(i64, pred_starts) + cast(i64, L.header) * 4);
+        let is *i32 as hpc = cast(*i32, cast(i64, pred_counts) + cast(i64, L.header) * 4);
+        let is i32 as ph with mut = cast(i32, 0 - 1);
+        let is i32 as nph with mut = 0;
+        let is i32 as kk with mut = 0;
+        while (kk < *hpc) {
+            let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *hps + kk) * 4);
+            let is i32 as p = *pp;
+            let is *i32 as mp = cast(*i32, cast(i64, mark) + cast(i64, p) * 4);
+            if (*mp != stamp) { ph = p; nph = nph + 1; }
+            kk = kk + 1;
+        }
+        if (nph == 1) { L.preheader = ph; }
+
+        // innermost/depth: any OTHER loop whose header sits inside this body is nested
+        let is i32 as j with mut = 0;
+        while (j < nloops) {
+            if (j != i) {
+                let is *VecLoop as Lj = cast(*VecLoop, cast(i64, out_loops) + cast(i64, j) * sizeof(VecLoop));
+                let is *i32 as mhj = cast(*i32, cast(i64, mark) + cast(i64, Lj.header) * 4);
+                if (*mhj == stamp && Lj.header != L.header) {
+                    L.innermost = 0;          // this loop encloses loop j
+                    Lj.depth = Lj.depth + 1;  // loop j is nested one level deeper
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, mark));
+    d.opt_free(cast(*u8, wl));
+    return nloops;
+}

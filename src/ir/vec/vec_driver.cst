@@ -1,26 +1,76 @@
 // === Vectorizer v2 — Legal -> Plan -> Execute auto-vectorizer (LLVM-class) ===
 //
-// This is the package entry point. It replaces the legacy pattern-matcher
-// (opt_vec.cst) incrementally; until the cut-over (milestone M4/C17) it is gated
-// behind d.vec_use_v2 and the legacy pass remains the default.
+// Package entry point. Replaces the legacy pattern-matcher (opt_vec.cst)
+// incrementally; gated behind d.vec_use_v2 until it strictly dominates (M4/C17).
 //
-// Architecture (see ~/.claude/plans/vectorizer-llvm/MASTER-PLAN.md):
+// Architecture (~/.claude/plans/vectorizer-llvm/MASTER-PLAN.md):
 //   build CFG/dom (reuse cfg.cst/dom.cst) -> discover natural loops ->
-//   for each innermost loop: LEGAL (mini-SCEV affine addresses + IV/recurrence
-//   descriptors + dependence test) -> PLAN (VPlan-lite recipes + cost/VF/UF) ->
+//   for each innermost loop: LEGAL (mini-SCEV + IV/recurrence descriptors +
+//   dependence test) -> PLAN (VPlan-lite recipes + cost/VF/UF) ->
 //   EXECUTE (splice widened SIMD IR + skeleton + runtime alias/ISA dispatch).
 //
-// Runs at codegen time (gen_func), -O2 only, post mid-end, before pass_unroll —
-// the same seam the legacy pass uses. Returns 1 if it transformed a loop (the
-// caller re-invokes to a fixpoint, <=16), 0 otherwise.
+// Runs at codegen time (gen_func), -O2 only, post mid-end, before pass_unroll.
+// Returns 1 if it transformed a loop (caller re-invokes to a fixpoint, <=16), else 0.
 //
-// M0/C1: scaffold only — pass_vectorize2 is a no-op (returns 0). The analysis
-// spine (loop discovery, SCEV, descriptors, dependence) lands in C2-C5 with zero
-// codegen risk; the first IR-emitting commit is M3/C13.
+// Progress: M0/C1 scaffold (done). M0/C2 loop discovery (this commit) — builds the
+// CFG and discovers natural loops, dumping them under vec_debug; still returns 0
+// (no transform). The first IR-emitting commit is M3/C13.
 
 use "../defs.cst" as d;
+use "../cfg.cst" as cfg;
+use "../dom.cst" as dom;
+use "vec_loops.cst" as vl;
+use "../debug.cst" as dbg;
+
+fn dump_loops(loops as *vl.VecLoop, nloops as i32) as void {
+    dbg.pr_str("[vec] ");
+    dbg.pr_int(cast(i64, nloops));
+    dbg.pr_str(" loop(s)\n");
+    let is i32 as i with mut = 0;
+    while (i < nloops) {
+        let is *vl.VecLoop as L = cast(*vl.VecLoop, cast(i64, loops) + cast(i64, i) * sizeof(vl.VecLoop));
+        dbg.pr_str("  loop hdr=L"); dbg.pr_int(cast(i64, L.header_label));
+        dbg.pr_str(" latch=bb"); dbg.pr_int(cast(i64, L.latch));
+        dbg.pr_str(" pre=bb"); dbg.pr_int(cast(i64, L.preheader));
+        dbg.pr_str(" nbody="); dbg.pr_int(cast(i64, L.nbody));
+        dbg.pr_str(" inner="); dbg.pr_int(cast(i64, L.innermost));
+        dbg.pr_str(" depth="); dbg.pr_int(cast(i64, L.depth));
+        dbg.pr_str("\n");
+        i = i + 1;
+    }
+}
 
 fn pass_vectorize2(func as *d.IRFunction) as i32 {
-    // M0 scaffold: no transformation yet.
+    // --- build CFG + predecessors + dominators (reuse mem2reg's infra) ---
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg.MAX_BLOCKS) * sizeof(cfg.BasicBlock)));
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as li with mut = 0;
+    while (li < lc) { let is *i32 as p = cast(*i32, cast(i64, label_to_bb) + cast(i64, li) * 4); *p = 0; li = li + 1; }
+    let is i32 as nblocks with mut = 0;
+    cfg.build_cfg(func, blocks, &nblocks, label_to_bb);
+    if (nblocks <= 1) {
+        d.opt_free(cast(*u8, blocks)); d.opt_free(cast(*u8, label_to_bb));
+        return 0;   // no loops possible in a single block
+    }
+    let is *i32 as preds = cast(*i32, d.opt_alloc(cast(i64, nblocks * 2 + 4) * 4));
+    let is *i32 as pred_starts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is *i32 as pred_counts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    cfg.build_preds(blocks, nblocks, preds, pred_starts, pred_counts);
+    let is *i32 as rpo_order = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+    let is i32 as rpo_count with mut = 0;
+    cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
+    dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds, pred_starts, pred_counts);
+
+    // --- discover natural loops ---
+    let is *vl.VecLoop as loops = cast(*vl.VecLoop, d.opt_alloc(cast(i64, vl.MAX_LOOPS) * sizeof(vl.VecLoop)));
+    let is i32 as nloops = vl.discover_loops(func, blocks, nblocks, preds, pred_starts, pred_counts, loops);
+    if (d.vec_debug == 1) { dump_loops(loops, nloops); }
+
+    d.opt_free(cast(*u8, loops));
+    d.opt_free(cast(*u8, rpo_order));
+    d.opt_free(cast(*u8, pred_counts)); d.opt_free(cast(*u8, pred_starts)); d.opt_free(cast(*u8, preds));
+    d.opt_free(cast(*u8, label_to_bb)); d.opt_free(cast(*u8, blocks));
+    // M0/C2: discovery only — no transformation yet.
     return 0;
 }
