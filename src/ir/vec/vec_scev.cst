@@ -1,0 +1,163 @@
+// === vec2: mini-SCEV — affine {base, +, step} analysis of loop values/addresses ===
+//
+// For a loop with induction variable iv (running iv_step per iteration), every
+// integer/pointer vreg is classified as:
+//   AE_INVARIANT  v = base(+base_imm)          (step 0, loop-invariant)
+//   AE_AFFINE     v = base + base_imm + step*t  (t = iteration, step in BYTES for
+//                 addresses / in the value's units otherwise)
+//   AE_UNKNOWN    not representable
+//
+// The init of iv is intentionally folded out (treated as iv contributing
+// {base=-1, base_imm=0, step=iv_step}): it is common to every address derived from
+// iv, so it cancels in dependence DISTANCE and is irrelevant to STRIDE. This single
+// primitive yields stride (step/elem) and distance (base_imm difference), which the
+// dependence test (vec_depend) consumes. Detection only — no IR mutation.
+
+use "../defs.cst" as d;
+
+let is i32 as AE_INVARIANT with imut = 0;
+let is i32 as AE_AFFINE    with imut = 1;
+let is i32 as AE_UNKNOWN   with imut = 2;
+
+struct AffineExpr {
+    kind as i8;
+    base as i32;      // invariant base vreg, or -1 for a pure constant
+    base_imm as i64;  // constant part
+    step as i64;      // per-iteration increment (0 = invariant)
+    nowrap as i8;
+}
+
+// --- def side-table: def_count[v] = number of live (non-dead) defs of v;
+//     def_inst[v] = the (last) defining IRInst. Single-def (count==1) is usable. ---
+fn build_def_table(func as *d.IRFunction, vc as i32, def_count as *i32, def_inst as *i64) as void {
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4); *p = 0;
+        let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, i) * 8); *q = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.op != d.IR_STORE && w.op != d.IR_COPY
+            && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, w.dest.vreg) * 4); *p = *p + 1;
+            let is *i64 as q = cast(*i64, cast(i64, def_inst) + cast(i64, w.dest.vreg) * 8); *q = cast(i64, w);
+        }
+        w = w.next;
+    }
+}
+
+// single-def inst of v, or 0 if multi-def / undefined / out of range
+fn scev_sdef(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as *d.IRInst {
+    if (v < 0 || v >= vc) { return cast(*d.IRInst, 0); }
+    let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, v) * 4);
+    if (*dcp != 1) { return cast(*d.IRInst, 0); }
+    let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, v) * 8);
+    return cast(*d.IRInst, *dip);
+}
+
+// follow single-def MOV copies + no-op CASTs (cast_to == cast_from) to the source
+fn scev_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 64) {
+        if (cur < 0 || cur >= vc) { return cur; }
+        let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, cur) * 4);
+        if (*dcp != 1) { return cur; }
+        let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+        let is *d.IRInst as di = cast(*d.IRInst, *dip);
+        if (cast(i64, di) == 0) { return cur; }
+        if (di.op == d.IR_MOV && di.src1.op_type == d.OP_VREG) { cur = di.src1.vreg; }
+        else if (di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && cast(i64, di.cast_to) == cast(i64, di.cast_from)) { cur = di.src1.vreg; }
+        else { return cur; }
+        guard = guard + 1;
+    }
+    return cur;
+}
+
+fn ae_set(out as *AffineExpr, kind as i32, base as i32, base_imm as i64, step as i64, nowrap as i32) as void {
+    out.kind = cast(i8, kind); out.base = base; out.base_imm = base_imm; out.step = step; out.nowrap = cast(i8, nowrap);
+}
+
+// out = a + sign*b  (sign = +1 / -1). A vreg base on the negated side, or two vreg
+// bases, is not representable -> UNKNOWN.
+fn ae_combine(a as *AffineExpr, b as *AffineExpr, sign as i64, out as *AffineExpr) as void {
+    if (cast(i32, a.kind) == AE_UNKNOWN || cast(i32, b.kind) == AE_UNKNOWN) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+    let is i32 as nb with mut = a.base;
+    if (b.base != cast(i32, 0 - 1)) {
+        if (a.base != cast(i32, 0 - 1)) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+        if (sign < 0) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+        nb = b.base;
+    }
+    let is i64 as ni = a.base_imm + sign * b.base_imm;
+    let is i64 as ns = a.step + sign * b.step;
+    let is i32 as nw with mut = 0; if (cast(i32, a.nowrap) == 1 && cast(i32, b.nowrap) == 1) { nw = 1; }
+    if (ns != 0) { ae_set(out, AE_AFFINE, nb, ni, ns, nw); } else { ae_set(out, AE_INVARIANT, nb, ni, 0, nw); }
+}
+
+// out = a * c  (scaling a vreg base is not representable -> UNKNOWN)
+fn ae_scale(a as *AffineExpr, c as i64, out as *AffineExpr) as void {
+    if (cast(i32, a.kind) == AE_UNKNOWN || a.base != cast(i32, 0 - 1)) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+    let is i64 as ns = a.step * c;
+    if (ns != 0) { ae_set(out, AE_AFFINE, cast(i32, 0 - 1), a.base_imm * c, ns, cast(i32, a.nowrap)); }
+    else { ae_set(out, AE_INVARIANT, cast(i32, 0 - 1), a.base_imm * c, 0, cast(i32, a.nowrap)); }
+}
+
+fn scev_of_operand(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_step as i64,
+                   op_type as i32, vreg as i32, imm as i64, out as *AffineExpr, depth as i32) as void {
+    if (op_type == d.OP_IMM) { ae_set(out, AE_INVARIANT, cast(i32, 0 - 1), imm, 0, 1); return; }
+    if (op_type == d.OP_VREG) { scev_of_vreg(def_inst, def_count, vc, iv, iv_step, vreg, out, depth); return; }
+    ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0);
+}
+
+// The recursive affine walk. iv is the loop's induction vreg (step iv_step).
+fn scev_of_vreg(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_step as i64,
+                v as i32, out as *AffineExpr, depth as i32) as void {
+    if (depth > 32) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+    let is i32 as r = scev_resolve(def_inst, def_count, vc, v);
+    if (r == iv) { ae_set(out, AE_AFFINE, cast(i32, 0 - 1), 0, iv_step, 1); return; }
+    let is *d.IRInst as di = scev_sdef(def_inst, def_count, vc, r);
+    if (cast(i64, di) == 0) { ae_set(out, AE_INVARIANT, r, 0, 0, 0); return; }  // param / multi-def → invariant base
+    let is i32 as op = di.op;
+    if (op == d.IR_IMM && di.src1.op_type == d.OP_IMM) { ae_set(out, AE_INVARIANT, cast(i32, 0 - 1), di.src1.imm, 0, 1); return; }
+    if (op == d.IR_ADD || op == d.IR_SUB) {
+        let is AffineExpr as ax; let is AffineExpr as ay;
+        scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src1.op_type), di.src1.vreg, di.src1.imm, &ax, depth + 1);
+        scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src2.op_type), di.src2.vreg, di.src2.imm, &ay, depth + 1);
+        let is i64 as sgn with mut = 1; if (op == d.IR_SUB) { sgn = cast(i64, 0 - 1); }
+        ae_combine(&ax, &ay, sgn, out);
+        return;
+    }
+    if (op == d.IR_MUL) {
+        // scale one side by the other when the other resolves to a pure constant
+        // (handles both `i * 2` with an immediate and `i * c` with c materialized
+        // into a vreg by IR_IMM).
+        let is AffineExpr as ax; let is AffineExpr as ay;
+        scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src1.op_type), di.src1.vreg, di.src1.imm, &ax, depth + 1);
+        scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src2.op_type), di.src2.vreg, di.src2.imm, &ay, depth + 1);
+        if (cast(i32, ay.kind) == AE_INVARIANT && ay.base == cast(i32, 0 - 1)) { ae_scale(&ax, ay.base_imm, out); return; }
+        if (cast(i32, ax.kind) == AE_INVARIANT && ax.base == cast(i32, 0 - 1)) { ae_scale(&ay, ax.base_imm, out); return; }
+        ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return;
+    }
+    if (op == d.IR_SHL && di.src2.op_type == d.OP_IMM) {
+        let is i64 as c with mut = 1; let is i64 as sh with mut = 0;
+        while (sh < di.src2.imm) { c = c * 2; sh = sh + 1; }
+        let is AffineExpr as ax; scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src1.op_type), di.src1.vreg, di.src1.imm, &ax, depth + 1);
+        ae_scale(&ax, c, out); return;
+    }
+    if (op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) {
+        let is i64 as scale with mut = 8;
+        if (op == d.IR_LEA2) { scale = 2; } else if (op == d.IR_LEA4) { scale = 4; }
+        let is AffineExpr as ab; let is AffineExpr as ai;
+        scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src1.op_type), di.src1.vreg, di.src1.imm, &ab, depth + 1);
+        scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src2.op_type), di.src2.vreg, di.src2.imm, &ai, depth + 1);
+        if (cast(i32, ab.kind) == AE_UNKNOWN || cast(i32, ai.kind) == AE_UNKNOWN || ab.step != 0) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+        let is i64 as ni = ab.base_imm + scale * ai.base_imm;
+        let is i64 as ns = scale * ai.step;
+        let is i32 as nw with mut = 0; if (cast(i32, ab.nowrap) == 1 && cast(i32, ai.nowrap) == 1) { nw = 1; }
+        if (ns != 0) { ae_set(out, AE_AFFINE, ab.base, ni, ns, nw); } else { ae_set(out, AE_INVARIANT, ab.base, ni, 0, nw); }
+        return;
+    }
+    // a no-op cast was already chased by scev_resolve; anything else is opaque.
+    ae_set(out, AE_INVARIANT, r, 0, 0, 0);
+}
