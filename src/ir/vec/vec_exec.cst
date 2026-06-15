@@ -348,15 +348,18 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     // (1) alias check at prev: any = overlap(c,a) | overlap(c,b); JZ any -> .Lvec
     let is *d.IRInst as ip with mut = prev;
     let is i32 as a_end with mut = 0; ip = emit_end_addr(func, ip, base_a, n_is_imm, n_imm, n_vreg, elem, lea_op, ln, &a_end);
-    let is i32 as b_end with mut = 0; ip = emit_end_addr(func, ip, base_b, n_is_imm, n_imm, n_vreg, elem, lea_op, ln, &b_end);
     let is i32 as c_end with mut = 0; ip = emit_end_addr(func, ip, base_c, n_is_imm, n_imm, n_vreg, elem, lea_op, ln, &c_end);
     let is i32 as t1 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_c, a_end, ln, &t1);
     let is i32 as t2 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_a, c_end, ln, &t2);
     let is i32 as ova with mut = 0; ip = emit_vv(func, ip, d.IR_AND, t1, t2, ln, &ova);
-    let is i32 as t3 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_c, b_end, ln, &t3);
-    let is i32 as t4 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_b, c_end, ln, &t4);
-    let is i32 as ovb with mut = 0; ip = emit_vv(func, ip, d.IR_AND, t3, t4, ln, &ovb);
-    let is i32 as anyv with mut = 0; ip = emit_vv(func, ip, d.IR_OR, ova, ovb, ln, &anyv);
+    let is i32 as anyv with mut = ova;   // broadcast: overlap(c,a) only (no b array)
+    if (cast(i32, mp.is_bcast) == 0) {
+        let is i32 as b_end with mut = 0; ip = emit_end_addr(func, ip, base_b, n_is_imm, n_imm, n_vreg, elem, lea_op, ln, &b_end);
+        let is i32 as t3 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_c, b_end, ln, &t3);
+        let is i32 as t4 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_b, c_end, ln, &t4);
+        let is i32 as ovb with mut = 0; ip = emit_vv(func, ip, d.IR_AND, t3, t4, ln, &ovb);
+        ip = emit_vv(func, ip, d.IR_OR, ova, ovb, ln, &anyv);
+    }
     let is i32 as Lvec = new_label(func);
     let is *d.IRInst as jzv = d.new_inst(d.IR_JZ);
     jzv.src1.op_type = cast(i8, d.OP_VREG); jzv.src1.vreg = anyv;
@@ -425,13 +428,22 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     laA.src1.op_type = cast(i8, d.OP_VREG); laA.src1.vreg = aaA;
     laA.src2.op_type = cast(i8, d.OP_IMM);  laA.src2.imm = 0; laA.line = ln;
     ip2 = emit(ip2, laA);
-    let is i32 as abA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_b, iv, ln, &abA);
-    let is i32 as vlbA = new_vreg(func);
-    let is *d.IRInst as lbA = d.new_inst(d.IR_VLOADQ256);
-    lbA.dest.op_type = cast(i8, d.OP_VREG); lbA.dest.vreg = vlbA;
-    lbA.src1.op_type = cast(i8, d.OP_VREG); lbA.src1.vreg = abA;
-    lbA.src2.op_type = cast(i8, d.OP_IMM);  lbA.src2.imm = 0; lbA.line = ln;
-    ip2 = emit(ip2, lbA);
+    let is i32 as vlbA with mut = cast(i32, 0 - 1);
+    if (cast(i32, mp.is_bcast) == 1) {
+        vlbA = new_vreg(func);
+        let is *d.IRInst as splA = d.new_inst(d.IR_VSPLATPD256);
+        splA.dest.op_type = cast(i8, d.OP_VREG); splA.dest.vreg = vlbA;
+        splA.src1.op_type = cast(i8, d.OP_VREG); splA.src1.vreg = mp.kvreg; splA.line = ln;
+        ip2 = emit(ip2, splA);
+    } else {
+        let is i32 as abA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_b, iv, ln, &abA);
+        vlbA = new_vreg(func);
+        let is *d.IRInst as lbA = d.new_inst(d.IR_VLOADQ256);
+        lbA.dest.op_type = cast(i8, d.OP_VREG); lbA.dest.vreg = vlbA;
+        lbA.src1.op_type = cast(i8, d.OP_VREG); lbA.src1.vreg = abA;
+        lbA.src2.op_type = cast(i8, d.OP_IMM);  lbA.src2.imm = 0; lbA.line = ln;
+        ip2 = emit(ip2, lbA);
+    }
     let is i32 as vrA = new_vreg(func);
     let is *d.IRInst as voA = d.new_inst(vop256);
     voA.dest.op_type = cast(i8, d.OP_VREG); voA.dest.vreg = vrA;
@@ -492,13 +504,23 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     la.src1.op_type = cast(i8, d.OP_VREG); la.src1.vreg = aa;
     la.src2.op_type = cast(i8, d.OP_IMM);  la.src2.imm = 0; la.line = ln;
     ip2 = emit(ip2, la);
-    let is i32 as ab with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_b, iv, ln, &ab);
-    let is i32 as vlb = new_vreg(func);
-    let is *d.IRInst as lbi = d.new_inst(d.IR_VLOADQ);
-    lbi.dest.op_type = cast(i8, d.OP_VREG); lbi.dest.vreg = vlb;
-    lbi.src1.op_type = cast(i8, d.OP_VREG); lbi.src1.vreg = ab;
-    lbi.src2.op_type = cast(i8, d.OP_IMM);  lbi.src2.imm = 0; lbi.line = ln;
-    ip2 = emit(ip2, lbi);
+    let is i32 as vlb with mut = cast(i32, 0 - 1);
+    if (cast(i32, mp.is_bcast) == 1) {
+        // splat k INSIDE the loop (cheap movddup) so k stays live across the loop
+        vlb = new_vreg(func);
+        let is *d.IRInst as spl = d.new_inst(d.IR_VSPLATPD);
+        spl.dest.op_type = cast(i8, d.OP_VREG); spl.dest.vreg = vlb;
+        spl.src1.op_type = cast(i8, d.OP_VREG); spl.src1.vreg = mp.kvreg; spl.line = ln;
+        ip2 = emit(ip2, spl);
+    } else {
+        let is i32 as ab with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_b, iv, ln, &ab);
+        vlb = new_vreg(func);
+        let is *d.IRInst as lbi = d.new_inst(d.IR_VLOADQ);
+        lbi.dest.op_type = cast(i8, d.OP_VREG); lbi.dest.vreg = vlb;
+        lbi.src1.op_type = cast(i8, d.OP_VREG); lbi.src1.vreg = ab;
+        lbi.src2.op_type = cast(i8, d.OP_IMM);  lbi.src2.imm = 0; lbi.line = ln;
+        ip2 = emit(ip2, lbi);
+    }
     let is i32 as vr = new_vreg(func);
     let is *d.IRInst as vo = d.new_inst(vop);
     vo.dest.op_type = cast(i8, d.OP_VREG); vo.dest.vreg = vr;
