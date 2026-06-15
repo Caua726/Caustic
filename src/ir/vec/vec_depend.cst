@@ -1,0 +1,158 @@
+// === vec2: memory dependence test + legality gate (LAA shape) ===
+//
+// Collects the affine address of every load/store in the loop body and, for every
+// pair involving a write, returns a verdict:
+//   DEP_SAFE     no loop-carried hazard (read/read, same address, or distance >= VF)
+//   DEP_RTCHECK  distinct bases — needs a runtime alias check (loop versioning)
+//   DEP_NODEP    GCD proves the two affine sequences never coincide
+//   DEP_UNSAFE   loop-carried distance 1 / unanalyzable write — must stay scalar
+// maxSafeVF is the min distance cap over capped-safe pairs. can_vectorize folds this
+// with the structural gate (countable IV + single exit + no call/atomic barrier).
+// Detection only — no IR mutation.
+
+use "../defs.cst" as d;
+use "../cfg.cst" as cfg;
+use "vec_loops.cst" as vl;
+use "vec_scev.cst" as sc;
+
+let is i32 as DEP_SAFE    with imut = 0;
+let is i32 as DEP_RTCHECK with imut = 1;
+let is i32 as DEP_NODEP   with imut = 2;
+let is i32 as DEP_UNSAFE  with imut = 3;
+
+// can_vectorize result codes
+let is i32 as CV_OK            with imut = 0;
+let is i32 as CV_NOT_COUNTABLE with imut = 1;
+let is i32 as CV_HAS_BARRIER   with imut = 2;
+let is i32 as CV_UNSAFE_DEP    with imut = 3;
+
+let is i32 as VF_BIG with imut = 1000000;
+let is i32 as MAX_ACC with imut = 64;
+
+struct MemAcc {
+    base as i32; base_imm as i64; step as i64; kind as i8; is_write as i8;
+}
+
+fn gcd_i64(a as i64, b as i64) as i64 {
+    let is i64 as x with mut = a; if (x < 0) { x = 0 - x; }
+    let is i64 as y with mut = b; if (y < 0) { y = 0 - y; }
+    while (y != 0) { let is i64 as t = x % y; x = y; y = t; }
+    return x;
+}
+
+// a real side-effect barrier (NOT the loop's own labels/jumps)
+fn is_hard_barrier(op as i32) as i32 {
+    if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+        || op == d.IR_ASM || op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
+        || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) {
+        return 1;
+    }
+    return 0;
+}
+
+fn acc_at(accs as *MemAcc, i as i32) as *MemAcc {
+    return cast(*MemAcc, cast(i64, accs) + cast(i64, i) * sizeof(MemAcc));
+}
+
+// Collect load/store addresses (as affine exprs) from the loop body. Returns count,
+// or -1 if a hard barrier is present (caller treats as non-vectorizable).
+fn collect_accesses(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                    iv as i32, iv_step as i64, def_inst as *i64, def_count as *i32, vc as i32,
+                    accs as *MemAcc, has_barrier as *i32) as i32 {
+    *has_barrier = 0;
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as guard with mut = 0;
+    while (cast(i64, p) != 0 && guard < 100000) {
+        if (p.is_dead == 0) {
+            if (is_hard_barrier(p.op) == 1) { *has_barrier = 1; }
+            let is i32 as addr_vreg with mut = cast(i32, 0 - 1);
+            let is i32 as is_w with mut = 0;
+            if (p.op == d.IR_LOAD && p.src1.op_type == d.OP_VREG) { addr_vreg = p.src1.vreg; is_w = 0; }
+            else if (p.op == d.IR_STORE && p.dest.op_type == d.OP_VREG) { addr_vreg = p.dest.vreg; is_w = 1; }
+            if (addr_vreg >= 0 && n < MAX_ACC) {
+                let is sc.AffineExpr as ae;
+                sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, addr_vreg, &ae, 0);
+                let is *MemAcc as m = acc_at(accs, n);
+                m.base = ae.base; m.base_imm = ae.base_imm; m.step = ae.step; m.kind = ae.kind; m.is_write = cast(i8, is_w);
+                n = n + 1;
+            }
+        }
+        if (cast(i64, p) == cast(i64, lb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+        guard = guard + 1;
+    }
+    return n;
+}
+
+// Dependence verdict for one ordered pair. *out_cap = VF ceiling (VF_BIG = none).
+fn dep_pair_verdict(ai as *MemAcc, aj as *MemAcc, out_cap as *i64) as i32 {
+    *out_cap = cast(i64, VF_BIG);
+    if (cast(i32, ai.is_write) == 0 && cast(i32, aj.is_write) == 0) { return DEP_SAFE; }
+    if (cast(i32, ai.kind) == sc.AE_UNKNOWN || cast(i32, aj.kind) == sc.AE_UNKNOWN) { return DEP_UNSAFE; }
+    if (ai.base == aj.base) {
+        if (ai.step == aj.step) {
+            let is i64 as dist = aj.base_imm - ai.base_imm;
+            if (dist == 0) { return DEP_SAFE; }
+            if (ai.step != 0 && (dist % ai.step) == 0) {
+                let is i64 as dd with mut = dist / ai.step; if (dd < 0) { dd = 0 - dd; }
+                if (dd >= 2) { *out_cap = dd; return DEP_SAFE; }
+                return DEP_UNSAFE;   // distance 1 → loop-carried, cannot widen
+            }
+            // same stride s, but s does not divide the offset → the two sequences
+            // never land on the same address (e.g. a[2*i] vs a[2*i+1]) → no dependence.
+            return DEP_NODEP;
+        }
+        // different strides, same base: GCD disproof
+        let is i64 as g = gcd_i64(ai.step, aj.step);
+        let is i64 as dist = aj.base_imm - ai.base_imm;
+        if (g != 0 && (dist % g) != 0) { return DEP_NODEP; }
+        return DEP_UNSAFE;
+    }
+    return DEP_RTCHECK;   // distinct base → runtime alias check
+}
+
+// Fold all write-involving pairs. Returns maxSafeVF (0 = not vectorizable); sets
+// *needs_rt if any pair needs a runtime alias check.
+fn dep_loop_maxsafevf(accs as *MemAcc, n as i32, needs_rt as *i32) as i64 {
+    *needs_rt = 0;
+    let is i64 as cap with mut = cast(i64, VF_BIG);
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is i32 as j with mut = i;
+        while (j < n) {
+            let is *MemAcc as ai = acc_at(accs, i);
+            let is *MemAcc as aj = acc_at(accs, j);
+            if (cast(i32, ai.is_write) == 1 || cast(i32, aj.is_write) == 1) {
+                let is i64 as pc with mut = cast(i64, VF_BIG);
+                let is i32 as v = dep_pair_verdict(ai, aj, &pc);
+                if (v == DEP_UNSAFE) { return 0; }
+                if (v == DEP_RTCHECK) { *needs_rt = 1; }
+                if (pc < cap) { cap = pc; }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return cap;
+}
+
+// Full legality gate. iv_found = did find_loop_iv succeed. Returns CV_OK + sets
+// *out_maxvf/*out_rt, or a CV_* rejection reason.
+fn can_vectorize(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                 iv_found as i32, iv as i32, iv_step as i64, def_inst as *i64, def_count as *i32, vc as i32,
+                 out_maxvf as *i64, out_rt as *i32) as i32 {
+    *out_maxvf = 0; *out_rt = 0;
+    if (iv_found == 0) { return CV_NOT_COUNTABLE; }
+    let is *MemAcc as accs = cast(*MemAcc, d.opt_alloc(cast(i64, MAX_ACC) * sizeof(MemAcc)));
+    let is i32 as has_barrier with mut = 0;
+    let is i32 as n = collect_accesses(func, blocks, L, iv, iv_step, def_inst, def_count, vc, accs, &has_barrier);
+    if (has_barrier == 1) { d.opt_free(cast(*u8, accs)); return CV_HAS_BARRIER; }
+    let is i32 as rt with mut = 0;
+    let is i64 as maxvf = dep_loop_maxsafevf(accs, n, &rt);
+    d.opt_free(cast(*u8, accs));
+    if (maxvf <= 0) { return CV_UNSAFE_DEP; }
+    *out_maxvf = maxvf; *out_rt = rt;
+    return CV_OK;
+}
