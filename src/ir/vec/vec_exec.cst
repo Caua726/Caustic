@@ -371,6 +371,92 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     let is *d.IRInst as lblv = d.new_inst(d.IR_LABEL);
     lblv.dest.op_type = cast(i8, d.OP_LABEL); lblv.dest.label = Lvec; lblv.line = ln;
     ip2 = emit(ip2, lblv);
+
+    // --- AVX2 dispatch: 256-bit map loop (2x wider) when the CPU has AVX2; else the
+    //     SSE2 loop below. Both exit to .Lhdr (the scalar remainder). ---
+    let is i32 as wideA = wide * 2;
+    let is i32 as vop256 with mut = d.IR_VADDQ256;
+    if (isf == 1) {
+        if (opk == 1) { vop256 = d.IR_VSUBPD256; } else if (opk == 2) { vop256 = d.IR_VMULPD256; }
+        else if (opk == 3) { vop256 = d.IR_VDIVPD256; } else { vop256 = d.IR_VADDPD256; }
+    } else if (elem == 8) { if (opk == 1) { vop256 = d.IR_VSUBQ256; } else { vop256 = d.IR_VADDQ256; } }
+    else { if (opk == 1) { vop256 = d.IR_VSUBD256; } else { vop256 = d.IR_VADDD256; } }
+    let is i32 as flagm = new_vreg(func);
+    let is *d.IRInst as havm = d.new_inst(d.IR_HASAVX2);
+    havm.dest.op_type = cast(i8, d.OP_VREG); havm.dest.vreg = flagm; havm.line = ln;
+    ip2 = emit(ip2, havm);
+    let is i32 as LsseM = new_label(func);
+    let is *d.IRInst as jzfm = d.new_inst(d.IR_JZ);
+    jzfm.src1.op_type = cast(i8, d.OP_VREG); jzfm.src1.vreg = flagm;
+    jzfm.dest.op_type = cast(i8, d.OP_LABEL); jzfm.dest.label = LsseM; jzfm.line = ln;
+    ip2 = emit(ip2, jzfm);
+    let is i32 as limAm_is_imm with mut = 0;
+    let is i64 as limAm_imm with mut = 0;
+    let is i32 as limAm_vreg with mut = cast(i32, 0 - 1);
+    if (n_is_imm == 1) { limAm_is_imm = 1; limAm_imm = n_imm - cast(i64, wideA - 1); }
+    else {
+        limAm_vreg = new_vreg(func);
+        let is *d.IRInst as subAm = d.new_inst(d.IR_SUB);
+        subAm.dest.op_type = cast(i8, d.OP_VREG); subAm.dest.vreg = limAm_vreg;
+        subAm.src1.op_type = cast(i8, d.OP_VREG); subAm.src1.vreg = n_vreg;
+        subAm.src2.op_type = cast(i8, d.OP_IMM);  subAm.src2.imm = cast(i64, wideA - 1); subAm.line = ln;
+        ip2 = emit(ip2, subAm);
+    }
+    let is i32 as LvAm = new_label(func);
+    let is *d.IRInst as lblvAm = d.new_inst(d.IR_LABEL);
+    lblvAm.dest.op_type = cast(i8, d.OP_LABEL); lblvAm.dest.label = LvAm; lblvAm.line = ln;
+    ip2 = emit(ip2, lblvAm);
+    let is i32 as vcondAm = new_vreg(func);
+    let is *d.IRInst as ltAm = d.new_inst(d.IR_LT);
+    ltAm.dest.op_type = cast(i8, d.OP_VREG); ltAm.dest.vreg = vcondAm;
+    ltAm.src1.op_type = cast(i8, d.OP_VREG); ltAm.src1.vreg = iv;
+    if (limAm_is_imm == 1) { ltAm.src2.op_type = cast(i8, d.OP_IMM); ltAm.src2.imm = limAm_imm; }
+    else { ltAm.src2.op_type = cast(i8, d.OP_VREG); ltAm.src2.vreg = limAm_vreg; }
+    ltAm.line = ln;
+    ip2 = emit(ip2, ltAm);
+    let is *d.IRInst as jzAm = d.new_inst(d.IR_JZ);
+    jzAm.src1.op_type = cast(i8, d.OP_VREG); jzAm.src1.vreg = vcondAm;
+    jzAm.dest.op_type = cast(i8, d.OP_LABEL); jzAm.dest.label = hlabel; jzAm.line = ln;
+    ip2 = emit(ip2, jzAm);
+    let is i32 as aaA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_a, iv, ln, &aaA);
+    let is i32 as vlaA = new_vreg(func);
+    let is *d.IRInst as laA = d.new_inst(d.IR_VLOADQ256);
+    laA.dest.op_type = cast(i8, d.OP_VREG); laA.dest.vreg = vlaA;
+    laA.src1.op_type = cast(i8, d.OP_VREG); laA.src1.vreg = aaA;
+    laA.src2.op_type = cast(i8, d.OP_IMM);  laA.src2.imm = 0; laA.line = ln;
+    ip2 = emit(ip2, laA);
+    let is i32 as abA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_b, iv, ln, &abA);
+    let is i32 as vlbA = new_vreg(func);
+    let is *d.IRInst as lbA = d.new_inst(d.IR_VLOADQ256);
+    lbA.dest.op_type = cast(i8, d.OP_VREG); lbA.dest.vreg = vlbA;
+    lbA.src1.op_type = cast(i8, d.OP_VREG); lbA.src1.vreg = abA;
+    lbA.src2.op_type = cast(i8, d.OP_IMM);  lbA.src2.imm = 0; lbA.line = ln;
+    ip2 = emit(ip2, lbA);
+    let is i32 as vrA = new_vreg(func);
+    let is *d.IRInst as voA = d.new_inst(vop256);
+    voA.dest.op_type = cast(i8, d.OP_VREG); voA.dest.vreg = vrA;
+    voA.src1.op_type = cast(i8, d.OP_VREG); voA.src1.vreg = vlaA;
+    voA.src2.op_type = cast(i8, d.OP_VREG); voA.src2.vreg = vlbA; voA.line = ln;
+    ip2 = emit(ip2, voA);
+    let is i32 as acA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_c, iv, ln, &acA);
+    let is *d.IRInst as vsA = d.new_inst(d.IR_VSTOREQ256);
+    vsA.src1.op_type = cast(i8, d.OP_VREG); vsA.src1.vreg = acA;
+    vsA.src2.op_type = cast(i8, d.OP_VREG); vsA.src2.vreg = vrA;
+    vsA.dest.op_type = cast(i8, d.OP_IMM);  vsA.dest.imm = 0; vsA.line = ln;
+    ip2 = emit(ip2, vsA);
+    let is *d.IRInst as ivaddAm = d.new_inst(d.IR_ADD);
+    ivaddAm.dest.op_type = cast(i8, d.OP_VREG); ivaddAm.dest.vreg = iv;
+    ivaddAm.src1.op_type = cast(i8, d.OP_VREG); ivaddAm.src1.vreg = iv;
+    ivaddAm.src2.op_type = cast(i8, d.OP_IMM);  ivaddAm.src2.imm = cast(i64, wideA); ivaddAm.line = ln;
+    ip2 = emit(ip2, ivaddAm);
+    let is *d.IRInst as jmpAm = d.new_inst(d.IR_JMP);
+    jmpAm.dest.op_type = cast(i8, d.OP_LABEL); jmpAm.dest.label = LvAm; jmpAm.line = ln;
+    ip2 = emit(ip2, jmpAm);
+    let is *d.IRInst as lblSseM = d.new_inst(d.IR_LABEL);
+    lblSseM.dest.op_type = cast(i8, d.OP_LABEL); lblSseM.dest.label = LsseM; lblSseM.line = ln;
+    ip2 = emit(ip2, lblSseM);
+
+    // --- SSE2 map loop ---
     let is i32 as lim_is_imm with mut = 0;
     let is i64 as lim_imm with mut = 0;
     let is i32 as lim_vreg with mut = cast(i32, 0 - 1);
