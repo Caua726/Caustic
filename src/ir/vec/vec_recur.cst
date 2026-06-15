@@ -31,6 +31,64 @@ struct RecurrenceDescriptor {
     load_addr as i32;   // address vreg of the reduction's input load (s += a[i]), or -1
 }
 
+// Elementwise map: c[i] = a[i] OP b[i]. opk: 0=add 1=sub 2=mul 3=div.
+struct MapDescriptor {
+    base_c as i32; base_a as i32; base_b as i32;
+    elem as i64; opk as i8; is_float as i8;
+}
+
+// Detect a two-array map: exactly one store c[i] whose value is OP(load a[i],
+// load b[i]); all three addresses affine, unit stride, same elem. Detection only.
+fn detect_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+              iv as i32, iv_step as i64, def_inst as *i64, def_count as *i32, vc as i32,
+              out as *MapDescriptor) as i32 {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is *d.IRInst as store with mut = cast(*d.IRInst, 0);
+    let is i32 as nstores with mut = 0;
+    let is *d.IRInst as b with mut = hb.first;
+    let is i32 as guard with mut = 0;
+    while (cast(i64, b) != 0 && guard < 100000) {
+        if (b.is_dead == 0 && b.op == d.IR_STORE && b.dest.op_type == d.OP_VREG) { store = b; nstores = nstores + 1; }
+        if (cast(i64, b) == cast(i64, lb.last)) { b = cast(*d.IRInst, 0); } else { b = b.next; }
+        guard = guard + 1;
+    }
+    if (nstores != 1) { return 0; }
+    if (cast(i64, store) == 0 || store.src1.op_type != d.OP_VREG) { return 0; }
+    let is sc.AffineExpr as aec;
+    sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, store.dest.vreg, &aec, 0);
+    if (cast(i32, aec.kind) != sc.AE_AFFINE || aec.base < 0 || aec.step == 0) { return 0; }
+    let is i64 as elem with mut = aec.step; if (elem < 0) { elem = 0 - elem; }
+    let is i32 as val = sc.scev_resolve(def_inst, def_count, vc, store.src1.vreg);
+    let is *d.IRInst as od = sc.scev_sdef(def_inst, def_count, vc, val);
+    if (cast(i64, od) == 0) { return 0; }
+    if (od.src1.op_type != d.OP_VREG || od.src2.op_type != d.OP_VREG) { return 0; }
+    let is i32 as opk with mut = 0; let is i32 as isf with mut = 0;
+    if (od.op == d.IR_ADD) { opk = 0; isf = 0; }
+    else if (od.op == d.IR_SUB) { opk = 1; isf = 0; }
+    else if (od.op == d.IR_FADD) { opk = 0; isf = 1; }
+    else if (od.op == d.IR_FSUB) { opk = 1; isf = 1; }
+    else if (od.op == d.IR_FMUL) { opk = 2; isf = 1; }
+    else if (od.op == d.IR_FDIV) { opk = 3; isf = 1; }
+    else { return 0; }
+    let is *d.IRInst as xd = sc.scev_sdef(def_inst, def_count, vc, sc.scev_resolve(def_inst, def_count, vc, od.src1.vreg));
+    let is *d.IRInst as yd = sc.scev_sdef(def_inst, def_count, vc, sc.scev_resolve(def_inst, def_count, vc, od.src2.vreg));
+    if (cast(i64, xd) == 0 || cast(i64, yd) == 0) { return 0; }
+    if (xd.op != d.IR_LOAD || yd.op != d.IR_LOAD) { return 0; }
+    if (xd.src1.op_type != d.OP_VREG || yd.src1.op_type != d.OP_VREG) { return 0; }
+    let is sc.AffineExpr as aea; let is sc.AffineExpr as aeb;
+    sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, xd.src1.vreg, &aea, 0);
+    sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, yd.src1.vreg, &aeb, 0);
+    if (cast(i32, aea.kind) != sc.AE_AFFINE || cast(i32, aeb.kind) != sc.AE_AFFINE) { return 0; }
+    if (aea.base < 0 || aeb.base < 0 || aea.step != elem || aeb.step != elem) { return 0; }
+    if (isf == 1 && elem != 8) { return 0; }
+    if (isf == 0 && opk != 0 && opk != 1) { return 0; }
+    if (elem != 8 && elem != 4) { return 0; }
+    out.base_c = aec.base; out.base_a = aea.base; out.base_b = aeb.base;
+    out.elem = elem; out.opk = cast(i8, opk); out.is_float = cast(i8, isf);
+    return 1;
+}
+
 // is vreg `v` used as a src by a live body inst strictly before `stop`?
 fn used_before(body_first as *d.IRInst, stop as *d.IRInst, v as i32) as i32 {
     let is *d.IRInst as p with mut = body_first;
