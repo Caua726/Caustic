@@ -127,6 +127,27 @@ fn fast_slot_index(off_map as *i32, off as i64) as i32 {
     return *p;
 }
 
+// Exact offset -> promotable-slot-index lookup over a (offset, idx) array kept
+// sorted by offset. Unlike the direct-mapped off_map this handles any offset
+// (including frames > OFF_MAP_MAX), so it matches the old exact `imm == offset`
+// comparison for every slot. Returns -1 if no promotable slot owns `off`.
+fn core_memzero_ssa(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+fn slot_bsearch(srt_off as *i64, srt_idx as *i32, np as i32, off as i64) as i32 {
+    let is i32 as lo with mut = 0;
+    let is i32 as hi with mut = np - 1;
+    while (lo <= hi) {
+        let is i32 as mid = lo + (hi - lo) / 2;
+        let is i64 as mo = *(cast(*i64, cast(i64, srt_off) + cast(i64, mid) * 8));
+        if (mo == off) { return *(cast(*i32, cast(i64, srt_idx) + cast(i64, mid) * 4)); }
+        if (mo < off) { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return cast(i32, 0 - 1);
+}
+
 // === Step 4: Insert phi nodes ===
 // Returns count of phis inserted. phi_block[i] = block of phi i, phi_slot[i] = slot index,
 // phi_vreg[i] = dest vreg of phi, phi_args[i * max_preds + j] = arg vreg from pred j
@@ -152,25 +173,66 @@ fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
         hi = hi + 1;
     }
 
+    // Invert the old O(nslots * ninsts) "for each slot, scan every block for a
+    // store" into ONE instruction walk. Build a sorted offset->slot map, then a
+    // block_def[bi*nslots+si] matrix marking which block stores which slot. The
+    // per-slot worklist below seeds from the matrix column (blocks ascending,
+    // same as before) — identical worklist order ⇒ identical phi vreg numbering.
+    let is *i64 as srt_off = cast(*i64, d.opt_alloc(cast(i64, nslots + 1) * 8));
+    let is *i32 as srt_idx = cast(*i32, d.opt_alloc(cast(i64, nslots + 1) * 4));
+    let is i32 as np with mut = 0;
+    let is i32 as psi with mut = 0;
+    while (psi < nslots) {
+        let is *SlotInfo as ps = cast(*SlotInfo, cast(i64, slots) + cast(i64, psi) * sizeof(SlotInfo));
+        if (ps.promotable == 1) {
+            // insertion sort by offset (np <= MAX_SLOTS = 256)
+            let is i32 as b with mut = np - 1;
+            while (b >= 0 && *(cast(*i64, cast(i64, srt_off) + cast(i64, b) * 8)) > ps.offset) {
+                let is *i64 as do2 = cast(*i64, cast(i64, srt_off) + cast(i64, b + 1) * 8);
+                let is *i64 as so2 = cast(*i64, cast(i64, srt_off) + cast(i64, b) * 8);
+                *do2 = *so2;
+                let is *i32 as di2 = cast(*i32, cast(i64, srt_idx) + cast(i64, b + 1) * 4);
+                let is *i32 as si2 = cast(*i32, cast(i64, srt_idx) + cast(i64, b) * 4);
+                *di2 = *si2;
+                b = b - 1;
+            }
+            let is *i64 as ko = cast(*i64, cast(i64, srt_off) + cast(i64, b + 1) * 8); *ko = ps.offset;
+            let is *i32 as ki = cast(*i32, cast(i64, srt_idx) + cast(i64, b + 1) * 4); *ki = psi;
+            np = np + 1;
+        }
+        psi = psi + 1;
+    }
+    let is *u8 as block_def = cast(*u8, d.opt_alloc(cast(i64, nblocks) * cast(i64, nslots)));
+    core_memzero_ssa(block_def, cast(i64, nblocks) * cast(i64, nslots));
+    let is i32 as mbi with mut = 0;
+    while (mbi < nblocks) {
+        let is *cfg.BasicBlock as mbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, mbi) * sizeof(cfg.BasicBlock));
+        let is *d.IRInst as minst with mut = mbb.first;
+        let is i32 as mdone with mut = 0;
+        while (cast(i64, minst) != 0 && mdone == 0) {
+            if (minst.is_dead == 0 && minst.op == d.IR_STORE && minst.dest.op_type == d.OP_IMM) {
+                let is i32 as ms = slot_bsearch(srt_off, srt_idx, np, minst.dest.imm);
+                if (ms >= 0) {
+                    let is *u8 as bd = cast(*u8, cast(i64, block_def) + cast(i64, mbi) * cast(i64, nslots) + cast(i64, ms));
+                    *bd = cast(u8, 1);
+                }
+            }
+            if (cast(i64, minst) == cast(i64, mbb.last)) { mdone = 1; }
+            else { minst = minst.next; }
+        }
+        mbi = mbi + 1;
+    }
+
     let is i32 as si with mut = 0;
     while (si < nslots) {
         let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, si) * sizeof(SlotInfo));
         if (s.promotable == 1) {
-            // Collect def blocks (blocks with IR_STORE to this offset)
+            // Collect def blocks from the matrix column (blocks ascending).
             let is i32 as wl_count with mut = 0;
             let is i32 as bi with mut = 0;
             while (bi < nblocks) {
-                let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
-                let is *d.IRInst as inst with mut = bb.first;
-                let is i32 as found with mut = 0;
-                while (cast(i64, inst) != 0 && found == 0) {
-                    if (inst.is_dead == 0 && inst.op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) {
-                        if (inst.dest.imm == s.offset) { found = 1; }
-                    }
-                    if (cast(i64, inst) == cast(i64, bb.last)) { inst = cast(*d.IRInst, 0); }
-                    else { inst = inst.next; }
-                }
-                if (found == 1 && wl_count < 256) {
+                let is *u8 as bd = cast(*u8, cast(i64, block_def) + cast(i64, bi) * cast(i64, nslots) + cast(i64, si));
+                if (*bd == cast(u8, 1) && wl_count < 256) {
                     worklist[wl_count] = bi;
                     wl_count = wl_count + 1;
                 }
@@ -224,6 +286,9 @@ fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
     func.vreg_count = next_vreg;
     *out_nphi = nphi;
     d.opt_free(cast(*u8, has_phi));
+    d.opt_free(cast(*u8, srt_off));
+    d.opt_free(cast(*u8, srt_idx));
+    d.opt_free(cast(*u8, block_def));
 }
 
 // === Step 5: SSA Rename ===

@@ -363,7 +363,12 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         tinst = tinst.next;
     }
 
-    // Find back-edges and mark loop depth
+    // Find back-edges and mark loop depth. A back-edge [target, pos] adds 1 to
+    // the depth of every instruction in that range; nested back-edges stack.
+    // Instead of the O(back-edges * span) range fill, record each range as a
+    // +1/-1 pair in a difference array (inst_depth, already zeroed) and recover
+    // the per-instruction depth with one prefix-sum pass — O(back-edges + inst),
+    // identical depths.
     pos = 0;
     tinst = func.instructions;
     while (cast(i64, tinst) != 0) {
@@ -371,17 +376,22 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             let is *i32 as lp = cast(*i32, cast(i64, label_pos2) + cast(i64, tinst.dest.label) * 4);
             let is i32 as target = *lp;
             if (target <= pos) {
-                // Back-edge: loop range [target, pos]
-                let is i32 as lp2 with mut = target;
-                while (lp2 <= pos) {
-                    let is *i32 as dp2 = cast(*i32, cast(i64, inst_depth) + cast(i64, lp2) * 4);
-                    *dp2 = *dp2 + 1;
-                    lp2 = lp2 + 1;
-                }
+                let is *i32 as d_lo = cast(*i32, cast(i64, inst_depth) + cast(i64, target) * 4);
+                *d_lo = *d_lo + 1;
+                let is *i32 as d_hi = cast(*i32, cast(i64, inst_depth) + cast(i64, pos + 1) * 4);
+                *d_hi = *d_hi - 1;
             }
         }
         pos = pos + 1;
         tinst = tinst.next;
+    }
+    // Prefix-sum the difference array into actual per-instruction depths.
+    let is i32 as dpfx with mut = 1;
+    while (dpfx <= inst_count) {
+        let is *i32 as dcur = cast(*i32, cast(i64, inst_depth) + cast(i64, dpfx) * 4);
+        let is *i32 as dprev = cast(*i32, cast(i64, inst_depth) + cast(i64, dpfx - 1) * 4);
+        *dcur = *dcur + *dprev;
+        dpfx = dpfx + 1;
     }
     d.opt_free(cast(*u8, label_pos2));
 
@@ -807,6 +817,62 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         }
     }
 
+    // === Precompute the coalesce-hint partner index ===
+    // The SELECT loop biases each vreg's color toward a move partner that's
+    // already coloured. Naively it rescans all `mov_count` moves per popped vreg
+    // — O(n * mov_count). Coalescing is final here (alias frozen), so build a
+    // per-representative list of partners ONCE via counting sort, in ascending
+    // move-index order. SELECT then walks only v's own partners → O(n + moves),
+    // and "first usable partner" stays identical (same set, same order).
+    let is *i32 as mh_off = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    core.memzero(cast(*u8, mh_off), cast(i64, n + 1) * 4);
+    let is i32 as mq with mut = 0;
+    while (mq < mov_count) {
+        let is *GCMove as qmv = cast(*GCMove, cast(i64, moves) + cast(i64, mq) * sizeof(GCMove));
+        let is i32 as qa = gc2_resolve(alias, qmv.src);
+        let is i32 as qb = gc2_resolve(alias, qmv.dst);
+        if (qa != qb) {
+            let is *i32 as ca = cast(*i32, cast(i64, mh_off) + cast(i64, qa) * 4); *ca = *ca + 1;
+            let is *i32 as cb = cast(*i32, cast(i64, mh_off) + cast(i64, qb) * 4); *cb = *cb + 1;
+        }
+        mq = mq + 1;
+    }
+    // Exclusive prefix sum: mh_off[i] = start of i's segment, mh_off[n] = total.
+    let is i32 as macc with mut = 0;
+    let is i32 as mi2 with mut = 0;
+    while (mi2 < n) {
+        let is *i32 as op = cast(*i32, cast(i64, mh_off) + cast(i64, mi2) * 4);
+        let is i32 as c = *op;
+        *op = macc;
+        macc = macc + c;
+        mi2 = mi2 + 1;
+    }
+    let is *i32 as op_n = cast(*i32, cast(i64, mh_off) + cast(i64, n) * 4); *op_n = macc;
+    // Running cursors (copy of segment starts) and the partner pool.
+    let is *i32 as mh_cur = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    mi2 = 0;
+    while (mi2 < n) {
+        let is *i32 as cur = cast(*i32, cast(i64, mh_cur) + cast(i64, mi2) * 4);
+        let is *i32 as op = cast(*i32, cast(i64, mh_off) + cast(i64, mi2) * 4);
+        *cur = *op;
+        mi2 = mi2 + 1;
+    }
+    let is *i32 as mh_par = cast(*i32, d.opt_alloc(cast(i64, macc + 1) * 4));
+    mq = 0;
+    while (mq < mov_count) {
+        let is *GCMove as qmv = cast(*GCMove, cast(i64, moves) + cast(i64, mq) * sizeof(GCMove));
+        let is i32 as qa = gc2_resolve(alias, qmv.src);
+        let is i32 as qb = gc2_resolve(alias, qmv.dst);
+        if (qa != qb) {
+            let is *i32 as curA = cast(*i32, cast(i64, mh_cur) + cast(i64, qa) * 4);
+            let is *i32 as slotA = cast(*i32, cast(i64, mh_par) + cast(i64, *curA) * 4); *slotA = qb; *curA = *curA + 1;
+            let is *i32 as curB = cast(*i32, cast(i64, mh_cur) + cast(i64, qb) * 4);
+            let is *i32 as slotB = cast(*i32, cast(i64, mh_par) + cast(i64, *curB) * 4); *slotB = qa; *curB = *curB + 1;
+        }
+        mq = mq + 1;
+    }
+    d.opt_free(cast(*u8, mh_cur));
+
     // === SELECT: pop stack LIFO, assign colors ===
     while (stack_top > 0) {
         stack_top = stack_top - 1;
@@ -907,22 +973,18 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                 }
             }
 
-            // Try coalesce hint: check if v has alias partner with color
-            let is i32 as mh with mut = 0;
-            while (mh < mov_count && chosen < 0) {
-                let is *GCMove as hmv = cast(*GCMove, cast(i64, moves) + cast(i64, mh) * sizeof(GCMove));
-                let is i32 as ha = gc2_resolve(alias, hmv.src);
-                let is i32 as hb = gc2_resolve(alias, hmv.dst);
-                if (ha == v || hb == v) {
-                    let is i32 as partner with mut = ha;
-                    if (ha == v) { partner = hb; }
-                    let is *i32 as cp2 = cast(*i32, cast(i64, color) + cast(i64, partner) * 4);
-                    if (*cp2 >= 0) {
-                        let is i32 as ps = core.reg_to_slot(*cp2);
-                        if (ps >= 0 && used[ps] == 0) { chosen = *cp2; }
-                    }
+            // Try coalesce hint: walk v's precomputed move partners (ascending
+            // move-index order) and take the first whose colour is slot-usable.
+            let is i32 as hk with mut = *(cast(*i32, cast(i64, mh_off) + cast(i64, v) * 4));
+            let is i32 as hend = *(cast(*i32, cast(i64, mh_off) + cast(i64, v + 1) * 4));
+            while (hk < hend && chosen < 0) {
+                let is i32 as partner = *(cast(*i32, cast(i64, mh_par) + cast(i64, hk) * 4));
+                let is *i32 as cp2 = cast(*i32, cast(i64, color) + cast(i64, partner) * 4);
+                if (*cp2 >= 0) {
+                    let is i32 as ps = core.reg_to_slot(*cp2);
+                    if (ps >= 0 && used[ps] == 0) { chosen = *cp2; }
                 }
-                mh = mh + 1;
+                hk = hk + 1;
             }
 
             if (chosen < 0) {
@@ -971,6 +1033,31 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
 
     ctx.stack_slots = ctx.next_spill - 1;
 
+    // next_same_loc[v] = the next vreg index > v that shares v's *current*
+    // (post-SELECT) register, or -1. Built once over the final loc map. The
+    // VERIFY inner scan walks this chain instead of all vj > vi: it visits
+    // exactly the same-register vregs the old O(n) scan would have matched, in
+    // the same ascending order, so the spill decisions are byte-identical — but
+    // the n^2 "iterate-and-skip-different-loc" cost is gone. A spill only ever
+    // drives a loc negative (never reassigns a register), so a stale chain link
+    // is filtered by the live `loc_vj == my_loc` re-read below.
+    let is *i32 as nsl = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    let is [40]i32 as last_loc;
+    let is i32 as li with mut = 0;
+    while (li < 40) { last_loc[li] = cast(i32, 0 - 1); li = li + 1; }
+    let is i32 as bv with mut = n - 1;
+    while (bv >= 0) {
+        let is *i32 as np = cast(*i32, cast(i64, nsl) + cast(i64, bv) * 4);
+        let is i32 as lc = *(cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, bv) * 4));
+        if (lc >= 0 && lc < 40) {
+            *np = last_loc[lc];
+            last_loc[lc] = bv;
+        } else {
+            *np = cast(i32, 0 - 1);
+        }
+        bv = bv - 1;
+    }
+
     // === VERIFY: safety net ===
     let is i32 as vi with mut = 0;
     while (vi < n) {
@@ -989,21 +1076,27 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         *loc_vi = 0 - sp2;
                         ctx.stack_slots = ctx.next_spill - 1;
                     }
-                    // Check interference conflicts (skip spilled vregs early)
+                    // Check interference conflicts (walk only same-register vregs
+                    // via the precomputed chain; spilled vregs fall out via the
+                    // live loc_vj re-read). my_loc may be negative here if the
+                    // call-cross fix above just spilled vi — then the chain is
+                    // skipped, exactly as the old scan's `loc_vj == my_loc(<0)`.
                     let is i32 as my_loc = *loc_vi;
-                    let is i32 as vj with mut = vi + 1;
-                    while (vj < n) {
-                        let is *i32 as loc_vj = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, vj) * 4);
-                        if (*loc_vj >= 0 && *loc_vj == my_loc) {
-                            let is *i32 as vj_p = cast(*i32, cast(i64, v2iv) + cast(i64, vj) * 4);
-                            if (*vj_p >= 0 && bm_test(matrix, n, vi, vj) == 1) {
-                                let is i32 as sp3 = ctx.next_spill;
-                                ctx.next_spill = ctx.next_spill + 1;
-                                *loc_vj = 0 - sp3;
-                                ctx.stack_slots = ctx.next_spill - 1;
+                    if (my_loc >= 0) {
+                        let is i32 as vj with mut = *(cast(*i32, cast(i64, nsl) + cast(i64, vi) * 4));
+                        while (vj >= 0) {
+                            let is *i32 as loc_vj = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, vj) * 4);
+                            if (*loc_vj == my_loc) {
+                                let is *i32 as vj_p = cast(*i32, cast(i64, v2iv) + cast(i64, vj) * 4);
+                                if (*vj_p >= 0 && bm_test(matrix, n, vi, vj) == 1) {
+                                    let is i32 as sp3 = ctx.next_spill;
+                                    ctx.next_spill = ctx.next_spill + 1;
+                                    *loc_vj = 0 - sp3;
+                                    ctx.stack_slots = ctx.next_spill - 1;
+                                }
                             }
+                            vj = *(cast(*i32, cast(i64, nsl) + cast(i64, vj) * 4));
                         }
-                        vj = vj + 1;
                     }
                 }
             }
@@ -1027,6 +1120,9 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     d.opt_free(cast(*u8, spill_wl));
     d.opt_free(cast(*u8, ga_param));
     d.opt_free(cast(*u8, stack));
+    d.opt_free(cast(*u8, mh_off));
+    d.opt_free(cast(*u8, mh_par));
+    d.opt_free(cast(*u8, nsl));
     // Adjacency index (guard on the pointer: overflow can clear gadj_on while the
     // arrays are still allocated). Null them so the next function starts clean.
     if (cast(i64, gadj_head) != 0) {
