@@ -1,6 +1,9 @@
 # Instruction Emission
 
-This document describes how each IR opcode is translated to x86_64 assembly instructions by the `gen_inst` function in `src/codegen/emit.cst`.
+This document describes the x86_64 backend: how each IR opcode is translated
+to assembly by `gen_inst` in `src/codegen/emit.cst`. Caustic also has a scalar
+AArch64 emitter in `src/codegen/aarch64/driver.cst`, documented in
+[Linux AArch64 Backend](../aarch64-backend.md).
 
 ## General Pattern
 

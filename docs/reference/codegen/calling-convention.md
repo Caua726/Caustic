@@ -1,9 +1,12 @@
 # Calling Convention
 
-Caustic follows the System V AMD64 ABI for all function calls. This ensures compatibility with
-`extern fn` declarations and with C libraries when linking dynamically.
+Calling conventions are target-specific. Linux x86_64 uses the System V AMD64
+ABI; Linux AArch64 uses AAPCS64 with eight integer argument registers and eight
+scalar floating-point argument registers. The detailed register tables below
+describe the x86_64 path. See
+[Linux AArch64 Backend](../aarch64-backend.md) for AArch64.
 
-## Integer Argument Registers
+## x86_64 Integer Argument Registers
 
 The first six integer/pointer arguments are passed in registers, in this order:
 

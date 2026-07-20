@@ -1,14 +1,23 @@
 # caustic-as Overview
 
-caustic-as is a native x86_64 assembler written entirely in Caustic. It translates Intel-syntax assembly (`.s` files) into ELF64 relocatable object files (`.o`), with no dependency on GNU as, NASM, or any external tool. It is part of the Caustic toolchain and is designed to assemble the output of the Caustic compiler's codegen phase.
+caustic-as is a native x86_64/AArch64 assembler written entirely in Caustic. It translates the compiler's Intel-syntax x86_64 or GNU-like AArch64 assembly (`.s` files) into ELF64 relocatable objects (`.o`), with no dependency on GNU as, NASM, LLVM, or another external assembler in production.
+
+The AArch64 path is selected with `--target=linux-aarch64` and lives in
+`caustic-assembler/aarch64/assembler.cst`. It uses fixed-width instruction
+encoding and emits AArch64 RELA relocations directly.
 
 ## Pipeline
 
-The assembler operates as a four-stage pipeline:
+At a high level, both architecture paths use a two-pass pipeline:
 
 ```
-.s file --> Tokenize --> Pass 1 (symbols/sizes) --> Pass 2 (encode) --> ELF .o
+.s file --> Parse --> Pass 1 (symbols/sizes) --> Pass 2 (encode) --> ELF64 .o
 ```
+
+The staged tokenizer/`ParsedLine` implementation described below is the x86_64
+path. AArch64 performs line-oriented parsing and both passes in
+`aarch64/assembler.cst`, then hands the resulting sections, symbols, and
+relocations to the same target-aware ELF writer.
 
 1. **Tokenize** (`lexer.cst`): The raw assembly source is scanned into a flat array of tokens -- registers, instructions, immediates, labels, directives, and punctuation.
 
@@ -27,7 +36,8 @@ The assembler operates as a four-stage pipeline:
 | `main.cst` | Entry point, CLI parsing, `ParsedLine` struct, `parse_all()`, `pass1()`, `pass2()`, string decoding, I/O helpers |
 | `lexer.cst` | Tokenizer: `Token` and `TokenList` structs, `tokenize()` function, register/instruction keyword recognition |
 | `encoder.cst` | x86_64 instruction encoding: register IDs, instruction IDs, operand types, `encode()` function, ModR/M/SIB/REX helpers |
-| `elf.cst` | ELF object file generation: `Symbol`/`SymbolTable`, `Reloc`/`RelocList`, `write_elf()` function |
+| `aarch64/assembler.cst` | AArch64 line parser, instruction encoder, two-pass symbol handling and relocation generation |
+| `output/elf.cst` | Target-aware ELF object generation: symbols, relocations, sections and `e_machine` |
 
 ## Two-Pass Assembly
 
@@ -67,6 +77,7 @@ The heap is initialized via `mem.gheapinit()` using Linux `mmap` syscalls -- the
 ```bash
 # Assemble a single file
 ./caustic-as input.s          # produces input.s.o
+./caustic-as --target=linux-aarch64 input.s
 
 # Full pipeline from Caustic source to executable
 ./caustic program.cst         # produces program.cst.s

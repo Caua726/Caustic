@@ -2,9 +2,10 @@
 
 A step-by-step guide to learning Caustic, from first program to advanced features.
 
-Caustic is a systems programming language that compiles directly to x86_64 Linux
-executables. No runtime, no garbage collector, no hidden magic. You write code,
-the compiler turns it into machine instructions, and Linux runs them. That is it.
+Caustic is a systems programming language that compiles directly to native Linux
+x86_64 or AArch64 executables. No runtime, no garbage collector, no hidden magic.
+You write code, the compiler turns it into machine instructions, and Linux runs
+them. That is it.
 
 If you know Python or JavaScript but have never touched C or assembly, this
 tutorial will get you comfortable with Caustic and systems programming concepts

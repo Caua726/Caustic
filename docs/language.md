@@ -3,9 +3,9 @@ Caustic Language Reference
 
 Complete guide to the Caustic programming language syntax and features.
 
-Caustic is a systems programming language that compiles directly to x86_64
-Linux executables. No libc, no runtime, no garbage collector. Just your code
-and the kernel.
+Caustic is a systems programming language that compiles directly to native
+x86_64 or AArch64 Linux executables. No libc, no runtime, no garbage collector.
+Just your code and the kernel.
 ---
 ## let
 let — Declare a variable
@@ -389,7 +389,9 @@ Syntax:
   syscall(NUMBER, arg1, arg2, ...);
 
 Invokes a Linux kernel system call directly. Up to 6 arguments.
-Returns the syscall result in rax.
+Returns the syscall result in the architecture's return register (`rax` on
+x86_64 or `x0` on AArch64). Syscall numbers are architecture-specific; prefer
+the target-aware wrappers in `std/os/linux.cst`.
 
 Example:
   // write(1, "hello\n", 6)
@@ -401,8 +403,10 @@ asm — Inline assembly
 Syntax:
   asm("instruction\n");
 
-Inserts raw x86_64 assembly into the output. Use \n to separate
-multiple instructions.
+Inserts raw target-architecture assembly into the output. Use \n to separate
+multiple instructions. Inline assembly is not portable between x86_64 and
+AArch64; use the `__target_is_x86_64` and `__target_is_aarch64` compile-time
+builtins when different instruction sequences are required.
 
 Example:
   asm("mov rax, 1\n");

@@ -1,6 +1,8 @@
 # Contributing to Caustic
 
-First off — thanks for being here. Caustic is a self-hosted compiler that goes from source to native x86_64 Linux binary with zero external dependencies. If that sounds interesting, you're in the right place.
+First off — thanks for being here. Caustic is a self-hosted compiler that goes
+from source to native x86_64 or AArch64 Linux binaries with zero external
+toolchain dependencies. If that sounds interesting, you're in the right place.
 
 ## Philosophy
 
@@ -35,7 +37,8 @@ If your contribution aligns with these, it's probably welcome.
 
 ### Prerequisites
 
-- Linux x86_64 (the only supported platform)
+- Linux x86_64 for running the distributed bootstrap tools; AArch64 output can
+  be run on native hardware or through `qemu-aarch64`
 - The Caustic toolchain installed (compiler + assembler + linker)
 
 See [docs/getting-started.md](docs/getting-started.md) for installation instructions.
@@ -76,7 +79,7 @@ src/
   parser/      — recursive descent → AST
   semantic/    — type checking, symbol tables
   ir/          — virtual register IR, optimization
-  codegen/     — register allocation, x86_64 assembly output
+  codegen/     — architecture dispatch and x86_64/AArch64 assembly output
 
 caustic-assembler/  — .s → .o (ELF relocatable)
 caustic-linker/     — .o → executable (ELF static/dynamic)

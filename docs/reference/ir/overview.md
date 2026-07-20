@@ -6,7 +6,11 @@ The Caustic intermediate representation (IR) sits between the semantic analysis 
 
 The IR follows a register-transfer model with unlimited virtual registers (vregs). Each expression evaluation produces a result in a fresh vreg, and vregs are never reused. This simplifies IR generation because the front-end does not need to worry about register pressure or liveness -- that responsibility falls entirely on the register allocator in codegen.
 
-The IR is intentionally simple. There is no SSA phi-node insertion (IR_PHI exists as a constant but is unused), no dominance-based optimizations, and no complex control-flow graph construction. Instead, control flow is expressed through labels and conditional/unconditional jumps, which the codegen phase translates directly to x86_64 branch instructions.
+The IR is intentionally simple. There is no SSA phi-node insertion (IR_PHI
+exists as a constant but is unused), no dominance-based optimizations, and no
+complex control-flow graph construction. Instead, control flow is expressed
+through labels and conditional/unconditional jumps, which the selected codegen
+backend translates to x86_64 or AArch64 branch instructions.
 
 ## Unlimited Virtual Registers
 

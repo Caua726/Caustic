@@ -33,7 +33,13 @@ struct Thread {
 // Child (rax==0) pops [fn][arg][&t] off its own stack, runs the worker, stores
 // the result at &t+16, and exits THIS thread (syscall 60). Parent returns the tid.
 fn _clone_thread(flags as i64, newsp as i64, ptid as i64, ctid as i64, tls as i64) as i64 with naked {
-    asm("mov r10, rcx\nmov eax, 56\nsyscall\ntest rax, rax\njz .Lcaustic_clone_child\nret\n.Lcaustic_clone_child:\nxor ebp, ebp\npop rax\npop rdi\npop rbx\ncall rax\nmov QWORD PTR [rbx+16], rax\nxor edi, edi\nmov eax, 60\nsyscall\nint 3\n");
+    if (__target_is_aarch64 == 1) {
+        // Caustic args: x0=flags x1=newsp x2=ptid x3=ctid x4=tls.
+        // clone(AArch64): x0=flags x1=newsp x2=ptid x3=tls x4=ctid.
+        asm("mov x5, x3\nmov x3, x4\nmov x4, x5\nmovz x8, 220\nsvc 0\ncbz x0, .Lcaustic_clone_child\nret\n.Lcaustic_clone_child:\nmov x29, xzr\nldr x16, [sp]\nldr x0, [sp, 8]\nldr x19, [sp, 16]\nadd sp, sp, 24\nblr x16\nstr x0, [x19, 16]\nmovz x0, 0\nmovz x8, 93\nsvc 0\nbrk 0\n");
+    } else {
+        asm("mov r10, rcx\nmov eax, 56\nsyscall\ntest rax, rax\njz .Lcaustic_clone_child\nret\n.Lcaustic_clone_child:\nxor ebp, ebp\npop rax\npop rdi\npop rbx\ncall rax\nmov QWORD PTR [rbx+16], rax\nxor edi, edi\nmov eax, 60\nsyscall\nint 3\n");
+    }
 }
 
 // --- Windows entry shim (naked: MS x64 -> SysV). CreateThread passes param in
@@ -41,7 +47,10 @@ fn _clone_thread(flags as i64, newsp as i64, ptid as i64, ctid as i64, tls as i6
 // the SysV worker with arg in rdi, store result at +16. 3 pushes align rsp so
 // the worker sees rsp%16==8 at entry.
 fn _entry_shim(p as i64) as i64 with naked {
-    asm("push rsi\npush rdi\npush rbx\nmov rbx, rcx\nmov rax, QWORD PTR [rbx]\nmov rdi, QWORD PTR [rbx+8]\ncall rax\nmov QWORD PTR [rbx+16], rax\npop rbx\npop rdi\npop rsi\nret\n");
+    if (__target_is_aarch64 == 1) { asm("brk 0"); }
+    else {
+        asm("push rsi\npush rdi\npush rbx\nmov rbx, rcx\nmov rax, QWORD PTR [rbx]\nmov rdi, QWORD PTR [rbx+8]\ncall rax\nmov QWORD PTR [rbx+16], rax\npop rbx\npop rdi\npop rsi\nret\n");
+    }
 }
 
 // === Public API ===
@@ -143,7 +152,10 @@ fn yield_now() as void {
 
 // CPU spin-loop hint (x86 `pause`) — yields the pipeline in a busy-wait, cutting
 // power and easing the memory-order machinery during lock spins.
-fn spin_hint() as void with naked { asm("pause\nret\n"); }
+fn spin_hint() as void with naked {
+    if (__target_is_aarch64 == 1) { asm("yield\nret\n"); }
+    else { asm("pause\nret\n"); }
+}
 
 // Cache line size for padding shared/per-slot data against false sharing.
 let is i64 as CACHE_LINE with imut = 64;

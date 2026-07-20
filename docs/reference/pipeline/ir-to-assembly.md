@@ -1,25 +1,35 @@
 # IR to Assembly
 
-The code generation phase is the fifth phase of the Caustic compiler. It takes the virtual-register IR and produces x86_64 assembly text in Intel syntax, performing register allocation to map unlimited virtual registers to physical hardware registers.
+The code generation phase is the fifth phase of the Caustic compiler. It takes
+the architecture-independent virtual-register IR and dispatches to the selected
+x86_64 or AArch64 backend.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
+| `src/codegen/backend.cst` | Target-architecture dispatch |
 | `src/codegen/alloc.cst` | Linear scan register allocator: builds live intervals, assigns physical registers or spill slots |
 | `src/codegen/emit.cst` | x86_64 assembly emitter: translates each IR instruction to one or more assembly instructions, manages output buffering |
+| `src/codegen/aarch64/driver.cst` | Scalar AArch64 instruction selection, stack homes, AAPCS64 calls and assembly emission |
 
 ## Input and Output
 
 **Input**: `*IRProgram` containing functions, globals, and string literals.
 
-**Output**: x86_64 assembly text written to a file descriptor, structured with `.intel_syntax noprefix`, `.text`, `.data`, and `.rodata` sections.
+**Output**: target assembly text written to a file descriptor, with `.text`,
+`.data`, `.bss`, and `.rodata` sections. x86_64 uses Intel syntax; AArch64 uses
+the internal assembler's GNU-like scalar syntax.
 
 ```cst
 cg.codegen(cast(*u8, prog), cast(i32, out_fd));
 ```
 
-## Register Allocation
+The rest of this page documents the x86_64 register-allocating backend. The
+AArch64 backend is documented separately in
+[Linux AArch64 Backend](../aarch64-backend.md).
+
+## x86_64 Register Allocation
 
 ### Overview
 

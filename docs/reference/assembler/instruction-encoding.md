@@ -2,6 +2,10 @@
 
 The `encoder.cst` file contains the core x86_64 instruction encoder. It translates parsed instructions (identified by instruction ID and operand types) into raw machine code bytes. The encoder handles REX prefixes, opcode selection, ModR/M bytes, SIB bytes, displacements, and immediates.
 
+This is the x86_64 encoding reference. The fixed-width AArch64 encoder lives in
+`caustic-assembler/aarch64/assembler.cst`; see
+[Linux AArch64 Backend](../aarch64-backend.md).
+
 ## x86_64 Instruction Format
 
 An x86_64 instruction can contain up to six components, all optional except the opcode:

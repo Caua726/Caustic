@@ -157,7 +157,8 @@ Parses as:
 3. Consume `TK_RPAREN`
 4. Create `NK_SYSCALL` node with `args` list
 
-Up to 6 arguments are supported (matching the Linux syscall convention for x86_64).
+Up to 6 arguments are supported, matching both Linux x86_64 and AArch64 syscall
+interfaces.
 
 ### Inline Assembly
 Syntax: `asm("assembly string")`

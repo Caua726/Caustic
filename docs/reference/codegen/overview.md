@@ -1,8 +1,9 @@
 # Codegen Overview
 
-The codegen phase is the final stage of the Caustic compiler pipeline. It takes an `IRProgram`
-(containing functions, globals, and string constants) and produces x86_64 assembly text in Intel
-syntax, written to an output file descriptor.
+The codegen phase is the final stage of the Caustic compiler pipeline. It takes
+an `IRProgram` (containing functions, globals, and string constants), selects a
+backend from the active target, and writes x86_64 or AArch64 assembly to an
+output file descriptor.
 
 ## Position in the Pipeline
 
@@ -19,10 +20,10 @@ Source (.cst)
 ## Input and Output
 
 - **Input**: A pointer to an `IRProgram` struct, a file descriptor for output, and the source filename (for debug info emission).
-- **Output**: x86_64 assembly text (Intel syntax with `noprefix`) suitable for assembly by
-  `caustic-as`.
+- **Output**: x86_64 Intel-syntax or GNU-like AArch64 assembly suitable for the
+  matching internal `caustic-as` backend.
 
-The assembly file begins with `.intel_syntax noprefix` and contains four sections:
+Both output forms contain four principal sections:
 
 1. `.rodata` -- string literal constants (`.LC0:`, `.LC1:`, etc.)
 2. `.data` -- initialized global variables
@@ -35,10 +36,16 @@ Codegen lives under `src/codegen/`:
 
 | File | Responsibility |
 |------|----------------|
+| `backend.cst` | Dispatch to the code generator selected by the target architecture |
 | `alloc.cst` | Live interval computation, linear scan register allocation, spill logic |
 | `emit.cst` | IR opcode -> x86_64 instruction emission, prologue/epilogue, data sections |
+| `aarch64/driver.cst` | Scalar AArch64 codegen, stack homes, AAPCS64 calls and target assembly emission |
 
-## Code Generation Flow
+The detailed flow below describes the mature x86_64 allocator/emitter. The
+AArch64 implementation and its deliberate scalar-only limits are covered in
+[Linux AArch64 Backend](../aarch64-backend.md).
+
+## x86_64 Code Generation Flow
 
 The entry point is `codegen(prog, fd, filename, filename_len)`:
 

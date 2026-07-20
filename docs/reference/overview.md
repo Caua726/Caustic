@@ -1,6 +1,6 @@
 # Compiler Overview
 
-Caustic is a self-hosted native x86_64 Linux compiler. The entire toolchain -- compiler, assembler, and linker -- is written in Caustic itself, with zero dependencies on libc, LLVM, or any external runtime. Programs execute via direct Linux syscalls.
+Caustic is a self-hosted native x86_64/AArch64 compiler. The entire toolchain -- compiler, assembler, and linker -- is written in Caustic itself, with zero dependencies on libc, LLVM, or any external runtime. Linux programs execute via direct syscalls.
 
 ## Toolchain Components
 
@@ -8,9 +8,9 @@ The full toolchain consists of four binaries:
 
 | Tool | Binary | Input | Output | Description |
 |------|--------|-------|--------|-------------|
-| Compiler | `caustic` | `.cst` source | `.s` assembly | Compiles Caustic source to x86_64 assembly (with `-o`: full pipeline to executable) |
-| Assembler | `caustic-as` | `.s` assembly | `.o` ELF object | Assembles x86_64 into relocatable ELF objects |
-| Linker | `caustic-ld` | `.o` object(s) | ELF executable | Links objects into a static or dynamic executable |
+| Compiler | `caustic` | `.cst` source | `.s` assembly | Compiles Caustic source to x86_64 or AArch64 assembly (with `-o`: full pipeline to executable) |
+| Assembler | `caustic-as` | `.s` assembly | `.o` ELF object | Assembles x86_64 or AArch64 into relocatable ELF64 objects |
+| Linker | `caustic-ld` | `.o` object(s) | ELF executable | Links objects into an executable; AArch64 currently uses the static path |
 | Build System | `caustic-mk` | `Causticfile` | executables | Orchestrates compilation via declarative project files |
 
 A typical build invocation:
@@ -36,7 +36,7 @@ The compiler (`caustic`) transforms `.cst` source through six sequential phases:
 | 2 | **Parser** | `src/parser/` | `top.cst`, `stmt.cst`, `expr.cst`, `type.cst`, `ast.cst`, `dump.cst`, `util.cst` | `TokenList` | AST (linked list of `Node`) |
 | 3 | **Semantic** | `src/semantic/` | `walk.cst`, `types.cst`, `scope.cst`, `modules.cst`, `generics.cst`, `defs.cst` | Untyped AST | Typed AST (nodes annotated with `*Type`) |
 | 4 | **IR** | `src/ir/` | `gen.cst`, `defs.cst` | Typed AST | `IRProgram` (virtual-register IR) |
-| 5 | **Codegen** | `src/codegen/` | `alloc.cst`, `emit.cst` | `IRProgram` | x86_64 assembly text |
+| 5 | **Codegen** | `src/codegen/` | `backend.cst`, `emit.cst`, `aarch64/driver.cst` | `IRProgram` | x86_64 or AArch64 assembly text |
 | 6 | **Output** | `src/main.cst` | `main.cst`, `io.cst` | Assembly text | `.s` file written to disk |
 
 ### Phase 1: Lexer (`src/lexer/`)
@@ -89,13 +89,15 @@ The compiler (`caustic`) transforms `.cst` source through six sequential phases:
 
 | File | Responsibility |
 |------|----------------|
+| `backend.cst` | Selects the x86_64 or AArch64 code generator from the active target. |
 | `alloc_core.cst` | Register allocator core. At -O0: linear scan with 10 allocatable registers, merge sort, MOV coalescing hints, active set tracking. At -O1: graph coloring (Iterative Register Coalescing, George & Appel 1996). Uses `AllocCtx` to track allocation state per function. |
 | `alloc_gc.cst` | Graph coloring register allocator for -O1. Bit matrix interference graph, George coalescing criterion, optimistic Briggs coloring, loop-depth-weighted spill costs. |
 | `emit.cst` | x86_64 instruction selection. Load/store with register cache (16-entry, targeted invalidation). IMM+STORE fusion, stack increment fusion, addressing mode matching ([base + index*scale]). |
 | `emit_inst.cst` | x86_64 instruction emission for each IR opcode. |
-| `emit_driver.cst` | Codegen orchestration: build intervals, allocate registers, compute stack layout, emit prologue/epilogue, iterate instructions. Entry function: `codegen()`. |
+| `emit_driver.cst` | x86_64 orchestration: build intervals, allocate registers, compute stack layout, emit prologue/epilogue, iterate instructions. |
 | `emit_output.cst` | Buffered assembly output writer (4MB buffer). Register name tables (64/32/16/8-bit). |
 | `peephole.cst` | Post-emission peephole optimizer: MOV+movsxd fusion, MOV chain bypass, dead MOV elimination. |
+| `aarch64/driver.cst` | Scalar AArch64 codegen: fixed stack homes, AAPCS64 calls, integer/FP operations, syscalls and exclusive atomics. |
 
 ### Entry Point (`src/main.cst`)
 
@@ -109,14 +111,16 @@ Orchestrates the full pipeline:
 
 ## Assembler (`caustic-as`)
 
-Located in `caustic-assembler/`. Transforms x86_64 assembly (`.s`) into ELF relocatable object files (`.o`).
+Located in `caustic-assembler/`. Transforms x86_64 or AArch64 assembly (`.s`)
+into ELF64 relocatable object files (`.o`).
 
 | File | Responsibility |
 |------|----------------|
 | `lexer.cst` | Assembly tokenizer. Recognizes instructions, registers, labels, directives, immediates, and memory operands. |
 | `encoder.cst` | x86_64 instruction encoder. Handles REX prefixes, ModR/M bytes, SIB bytes, immediates, and displacement encoding. Two-pass design: pass 1 collects symbol addresses, pass 2 encodes final machine code. |
-| `elf.cst` | ELF object file writer. Produces `.text`, `.data`, `.rodata`, `.bss`, `.symtab`, `.strtab`, and `.rela.text` sections with proper ELF64 headers. |
-| `main.cst` | CLI entry point. Reads input `.s` file, runs the assembly pipeline, writes the `.o` output. |
+| `aarch64/assembler.cst` | AArch64 line parser, fixed-width instruction encoder, symbols and relocations. |
+| `output/elf.cst` | Target-aware ELF object writer. Produces `.text`, `.data`, `.rodata`, `.bss`, `.symtab`, `.strtab`, and relocation sections. |
+| `main.cst` | CLI entry point and architecture dispatch. Reads input `.s`, runs the selected assembly pipeline, and writes `.o`. |
 
 ## Linker (`caustic-ld`)
 
@@ -124,9 +128,9 @@ Located in `caustic-linker/`. Combines one or more `.o` files into a final ELF e
 
 | File | Responsibility |
 |------|----------------|
-| `elf_reader.cst` | ELF object file reader. Parses ELF64 headers, section headers, symbol tables, and relocation entries from `.o` inputs. |
-| `linker.cst` | Core linking logic. Merges `.text`, `.data`, `.rodata`, and `.bss` sections from multiple objects. Resolves global symbols across objects. Applies relocations (R_X86_64_PC32, R_X86_64_32S, R_X86_64_PLT32, etc.). |
-| `elf_writer.cst` | ELF executable writer. Produces static executables (2 PT_LOAD segments: R+X for code, R+W for data) or dynamic executables (4 program headers with PT_INTERP, PT_DYNAMIC, PLT/GOT). Generates the `_start` entry stub. |
+| `elf_reader.cst` | ELF object reader. Validates and parses matching x86_64 or AArch64 ELF64 inputs. |
+| `linker.cst` | Core linking logic. Merges sections, resolves cross-object symbols, applies x86_64/AArch64 relocations and emits the target `_start` stub. |
+| `elf_writer.cst` | Target-aware ELF executable writer. Both architectures support static output; dynamic ELF remains x86_64-only. |
 | `main.cst` | CLI entry point. Parses arguments (`-o output`, `-lc` for dynamic linking), reads input objects, runs linking, writes the executable. |
 
 ## Standard Library (`std/`)
@@ -167,7 +171,7 @@ Source (.cst)
 [IR Gen] -- IRProgram { functions: IRFunction*, globals: IRGlobal*, strings: StringEntry* }
     |           Each IRFunction has a chain of IRInst with virtual register operands
     v
-[Codegen] -- x86_64 assembly text (Intel syntax, buffered write)
+[Codegen] -- x86_64 Intel syntax or AArch64 GNU-like assembly
     |
     v
 [caustic-as] -- ELF .o (relocatable object with .text, .data, .rodata, .symtab, .rela.text)

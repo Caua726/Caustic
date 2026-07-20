@@ -71,7 +71,8 @@ Parsing:
 2. Recursively parse the base type `T`.
 3. Create a `Type` with `kind=TY_PTR`, `base=T`, `size=8`.
 
-Pointer types are always 8 bytes on x86_64. Multiple levels of indirection are supported by recursive parsing.
+Pointer types are 8 bytes on the supported x86_64 and AArch64 targets. Multiple
+levels of indirection are supported by recursive parsing.
 
 ## Array Types
 

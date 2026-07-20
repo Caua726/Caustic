@@ -30,6 +30,7 @@ This overrides any default commit-attribution behavior.
 ./caustic -c <source.cst>                    # Compile only (no main required, for libraries)
 ./caustic -O1 <source.cst> -o p              # Optimized build
 ./caustic --target=linux-x86_64 ... (default)
+./caustic --target=linux-aarch64 src.cst -o p-aarch64  # Static AArch64 ELF
 ./caustic --target=windows-x86_64 src.cst -o p.exe   # Cross-compile PE/COFF for Windows
 ./caustic -debuglexer <file>                 # Debug tokenization
 ./caustic -debugparser <file>                # Debug AST
@@ -56,7 +57,10 @@ This overrides any default commit-attribution behavior.
 
 ## Architecture
 
-Caustic is a self-hosted native x86_64 compiler targeting **Linux (ELF) and Windows (PE)** with no LLVM or runtime dependencies. Linux builds use direct syscalls; Windows builds use kernel32/ws2_32/bcrypt DLL imports via the MS x64 ABI (System V internally, trampolined at FFI boundary).
+Caustic is a self-hosted native x86_64/AArch64 compiler targeting **Linux
+(ELF)**, **Windows (PE)** and Caustic's CSE format with no LLVM or runtime
+dependencies. Linux builds use direct architecture-specific syscalls; Windows
+builds use kernel32/ws2_32/bcrypt DLL imports via the MS x64 ABI.
 
 ### Compiler Pipeline (6 phases)
 
@@ -72,7 +76,7 @@ Source (.cst) → Lexer → Parser → Semantic → IR → Codegen → Assembly 
 | Parser | `src/parser/` | Recursive descent → AST (53 node kinds) |
 | Semantic | `src/semantic/` | Type checking, symbol tables, module resolution, generic instantiation |
 | IR | `src/ir/` | Virtual register IR (48 opcodes, unlimited vregs), optimization passes |
-| Codegen | `src/codegen/` | Register allocation (linear scan -O0, graph coloring -O1) + x86_64 assembly output |
+| Codegen | `src/codegen/` | Target dispatch; register-allocated x86_64 or scalar stack-home AArch64 assembly output |
 
 ### Type System
 
@@ -204,10 +208,12 @@ keyword.
 
 ### Parser builtins (low-level)
 
-The compiler injects two integer literals at parse time:
+The compiler injects target literals at parse time:
 
-- `__target_is_linux` — `1` on `--target=linux-x86_64`, `0` otherwise
+- `__target_is_linux` — `1` on either Linux target
 - `__target_is_windows` — `1` on `--target=windows-x86_64`, `0` otherwise
+- `__target_is_x86_64` — `1` on an x86_64 target
+- `__target_is_aarch64` — `1` on `--target=linux-aarch64`
 
 User code should generally **not** touch these directly — they exist as
 implementation primitives for `os.cst`'s `current` computation. Same
@@ -342,7 +348,9 @@ fn work() as i32 {
 
 - **Stdlib resolution**: The compiler tries paths relative to the source file first, then falls back to `<binary_dir>/../lib/caustic/`, then `/usr/local/lib/caustic/`
 - **No libc**: Programs use raw Linux syscalls, not C library functions
-- **Syscall numbers**: x86_64 Linux (e.g., write=1, exit=60, mmap=9)
+- **Syscall numbers**: x86_64 and AArch64 use different tables. Prefer
+  `std/os/linux.cst`, whose wrappers select the correct number and translate
+  legacy calls to AArch64 `*at` forms where required.
 - **Float literals**: Must match variable type (`10.0` for f64, not `10`). f32 literal narrowing is automatic.
 - **Char literals**: Now properly typed, no cast needed for `let is char as c = 'A'`
 - **Return via exit code**: `return N` from main becomes process exit code (0-255)

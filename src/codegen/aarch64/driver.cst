@@ -1,0 +1,657 @@
+// AArch64/Linux backend.
+//
+// The first AArch64 allocator is intentionally conservative: every virtual
+// register has an eight-byte home in the frame and instruction selection uses
+// x9..x17/d0..d2 as scratch.  This is a real (all-spill) allocation strategy,
+// keeps values correct across calls, and gives the optimized allocator a clean
+// future replacement point without coupling it to the x86 register tables.
+
+use "../../../std/io.cst" as io;
+use "../../parser/ast.cst" as ast;
+use "../../ir/defs.cst" as d;
+use "../../ir/opt.cst" as opt;
+use "../../ir/gen_program.cst" as irp;
+use "../emit_output.cst" as eo;
+use "../emit_driver.cst" as x64;
+use "../target.cst" as tgt;
+
+let is i32 as a64_opt_level with mut = 0;
+let is i32 as a64_dyn_stdlib with mut = 0;
+let is i32 as a64_snapshot_inline with mut = 0;
+let is i32 as a64_label_base with mut = 0;
+let is i32 as a64_tmp_label with mut = 1000000;
+
+let is i32 as frame_local with mut = 0;
+let is i32 as frame_vregs with mut = 0;
+let is i32 as frame_alloc with mut = 0;
+let is i32 as frame_total with mut = 0;
+let is i32 as frame_va_off with mut = 0;
+let is i32 as outgoing_bytes with mut = 0;
+let is *d.IRFunction as active_func with mut = cast(*d.IRFunction, 0);
+
+fn set_dyn_stdlib(v as i32) as void { a64_dyn_stdlib = v; }
+fn set_snapshot_inline(v as i32) as void { a64_snapshot_inline = v; }
+fn set_opt_level(level as i32) as void { a64_opt_level = level; }
+
+fn xreg(idx as i32) as *u8 {
+    if (idx == 0) { return "x0"; }
+    if (idx == 1) { return "x1"; }
+    if (idx == 2) { return "x2"; }
+    if (idx == 3) { return "x3"; }
+    if (idx == 4) { return "x4"; }
+    if (idx == 5) { return "x5"; }
+    if (idx == 6) { return "x6"; }
+    if (idx == 7) { return "x7"; }
+    if (idx == 8) { return "x8"; }
+    if (idx == 9) { return "x9"; }
+    if (idx == 10) { return "x10"; }
+    if (idx == 11) { return "x11"; }
+    if (idx == 12) { return "x12"; }
+    if (idx == 13) { return "x13"; }
+    if (idx == 14) { return "x14"; }
+    if (idx == 15) { return "x15"; }
+    if (idx == 16) { return "x16"; }
+    return "x17";
+}
+
+fn wreg(idx as i32) as *u8 {
+    if (idx == 0) { return "w0"; }
+    if (idx == 1) { return "w1"; }
+    if (idx == 2) { return "w2"; }
+    if (idx == 3) { return "w3"; }
+    if (idx == 4) { return "w4"; }
+    if (idx == 5) { return "w5"; }
+    if (idx == 6) { return "w6"; }
+    if (idx == 7) { return "w7"; }
+    if (idx == 8) { return "w8"; }
+    if (idx == 9) { return "w9"; }
+    if (idx == 10) { return "w10"; }
+    if (idx == 11) { return "w11"; }
+    if (idx == 12) { return "w12"; }
+    if (idx == 13) { return "w13"; }
+    if (idx == 14) { return "w14"; }
+    if (idx == 15) { return "w15"; }
+    if (idx == 16) { return "w16"; }
+    return "w17";
+}
+
+fn dreg(idx as i32) as *u8 {
+    if (idx == 0) { return "d0"; }
+    if (idx == 1) { return "d1"; }
+    if (idx == 2) { return "d2"; }
+    if (idx == 3) { return "d3"; }
+    if (idx == 4) { return "d4"; }
+    if (idx == 5) { return "d5"; }
+    if (idx == 6) { return "d6"; }
+    return "d7";
+}
+
+fn out3(op as *u8, a as *u8, b as *u8, c as *u8) as void {
+    eo.out_str("  ", 2); eo.out_cstr(op); eo.out_char(32);
+    eo.out_cstr(a); eo.out_str(", ", 2); eo.out_cstr(b);
+    eo.out_str(", ", 2); eo.out_cstr(c); eo.out_char(10);
+}
+
+fn out2(op as *u8, a as *u8, b as *u8) as void {
+    eo.out_str("  ", 2); eo.out_cstr(op); eo.out_char(32);
+    eo.out_cstr(a); eo.out_str(", ", 2); eo.out_cstr(b); eo.out_char(10);
+}
+
+fn emit_mov_imm(reg as *u8, val as i64) as void {
+    let is u64 as u = cast(u64, val);
+    eo.out_str("  movz ", 7); eo.out_cstr(reg); eo.out_str(", ", 2);
+    eo.out_int(cast(i64, u & cast(u64, 65535))); eo.out_char(10);
+    eo.out_str("  movk ", 7); eo.out_cstr(reg); eo.out_str(", ", 2);
+    eo.out_int(cast(i64, (u >> cast(u64, 16)) & cast(u64, 65535))); eo.out_str(", lsl 16\n", 9);
+    eo.out_str("  movk ", 7); eo.out_cstr(reg); eo.out_str(", ", 2);
+    eo.out_int(cast(i64, (u >> cast(u64, 32)) & cast(u64, 65535))); eo.out_str(", lsl 32\n", 9);
+    eo.out_str("  movk ", 7); eo.out_cstr(reg); eo.out_str(", ", 2);
+    eo.out_int(cast(i64, (u >> cast(u64, 48)) & cast(u64, 65535))); eo.out_str(", lsl 48\n", 9);
+}
+
+fn emit_stack_addr(reg as *u8, off as i64) as void {
+    emit_mov_imm("x17", off);
+    out3("sub", reg, "x29", "x17");
+}
+
+fn vreg_off(v as i32) as i64 {
+    return cast(i64, frame_local) + cast(i64, v + 1) * 8;
+}
+
+fn load_v(v as i32, reg as *u8) as void {
+    emit_stack_addr("x17", vreg_off(v));
+    eo.out_str("  ldr ", 6); eo.out_cstr(reg); eo.out_str(", [x17]\n", 8);
+}
+
+fn store_v(v as i32, reg as *u8) as void {
+    emit_stack_addr("x17", vreg_off(v));
+    eo.out_str("  str ", 6); eo.out_cstr(reg); eo.out_str(", [x17]\n", 8);
+}
+
+fn type_size(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 8; }
+    return cast(*ast.Type, tp).size;
+}
+
+fn type_float(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 0; }
+    let is i32 as k = cast(*ast.Type, tp).kind;
+    if (k == ast.TY_F32 || k == ast.TY_F64) { return 1; }
+    return 0;
+}
+
+fn type_signed(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 1; }
+    let is i32 as k = cast(*ast.Type, tp).kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    return 0;
+}
+
+fn narrow_x11(tp as *u8) as void {
+    let is i32 as sz = type_size(tp);
+    if (sz == 4) {
+        if (type_signed(tp) == 1) { out2("sxtw", "x11", "w11"); }
+        else { out2("mov", "w11", "w11"); }
+    } else if (sz == 2) {
+        if (type_signed(tp) == 1) { out2("sxth", "x11", "w11"); }
+        else { out2("uxth", "w11", "w11"); }
+    } else if (sz == 1) {
+        if (type_signed(tp) == 1) { out2("sxtb", "x11", "w11"); }
+        else { out2("uxtb", "w11", "w11"); }
+    }
+}
+
+fn load_src2(i as *d.IRInst) as void {
+    if (i.src2.op_type == d.OP_IMM) { emit_mov_imm("x10", i.src2.imm); }
+    else { load_v(i.src2.vreg, "x10"); }
+}
+
+fn emit_epilogue() as void {
+    out2("mov", "sp", "x29");
+    eo.out_line("ldr x29, [sp]");
+    eo.out_line("ldr x30, [sp, 8]");
+    eo.out_line("add sp, sp, 16");
+    eo.out_line("ret");
+}
+
+fn emit_compile_error(i as *d.IRInst) as i32 {
+    if (i.asm_str_len >= 1 && i.asm_str_ptr[0] == cast(u8, 1)) {
+        if (tgt.allow_unsupported_get() == 0) {
+            io.eprint_str("error: ");
+            io._write_fd(io.STDERR, cast(*u8, cast(i64, i.asm_str_ptr) + 1), cast(i64, i.asm_str_len - 1));
+            io.eprint_str("\n");
+            io.exit(1);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn emit_arith(i as *d.IRInst) as void {
+    load_v(i.src1.vreg, "x9");
+    load_src2(i);
+    let is i32 as op = i.op;
+    if (op == d.IR_ADD) { out3("add", "x11", "x9", "x10"); }
+    else if (op == d.IR_SUB) { out3("sub", "x11", "x9", "x10"); }
+    else if (op == d.IR_MUL) { out3("mul", "x11", "x9", "x10"); }
+    else if (op == d.IR_DIV) {
+        if (type_signed(i.cast_to) == 1) { out3("sdiv", "x11", "x9", "x10"); }
+        else { out3("udiv", "x11", "x9", "x10"); }
+    } else if (op == d.IR_MOD) {
+        if (type_signed(i.cast_to) == 1) { out3("sdiv", "x12", "x9", "x10"); }
+        else { out3("udiv", "x12", "x9", "x10"); }
+        eo.out_line("msub x11, x12, x10, x9");
+    } else {
+        out2("neg", "x11", "x9");
+    }
+    narrow_x11(i.cast_to);
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_float(i as *d.IRInst) as void {
+    load_v(i.src1.vreg, "x9");
+    out2("fmov", "d0", "x9");
+    if (i.op == d.IR_FNEG) { out2("fneg", "d0", "d0"); }
+    else if (i.op == d.IR_FSQRT) { out2("fsqrt", "d0", "d0"); }
+    else {
+        load_v(i.src2.vreg, "x10");
+        out2("fmov", "d1", "x10");
+        if (i.op == d.IR_FADD) { out3("fadd", "d0", "d0", "d1"); }
+        else if (i.op == d.IR_FSUB) { out3("fsub", "d0", "d0", "d1"); }
+        else if (i.op == d.IR_FMUL) { out3("fmul", "d0", "d0", "d1"); }
+        else { out3("fdiv", "d0", "d0", "d1"); }
+    }
+    out2("fmov", "x11", "d0");
+    store_v(i.dest.vreg, "x11");
+}
+
+fn cond_name(op as i32, sgn as i32, flt as i32) as *u8 {
+    if (op == d.IR_EQ) { return "eq"; }
+    if (op == d.IR_NE) { return "ne"; }
+    if (flt == 1) {
+        if (op == d.IR_LT) { return "mi"; }
+        if (op == d.IR_LE) { return "le"; }
+        if (op == d.IR_GT) { return "gt"; }
+        return "ge";
+    }
+    if (sgn == 1) {
+        if (op == d.IR_LT) { return "lt"; }
+        if (op == d.IR_LE) { return "le"; }
+        if (op == d.IR_GT) { return "gt"; }
+        return "ge";
+    }
+    if (op == d.IR_LT) { return "lo"; }
+    if (op == d.IR_LE) { return "ls"; }
+    if (op == d.IR_GT) { return "hi"; }
+    return "hs";
+}
+
+fn emit_compare(i as *d.IRInst) as void {
+    load_v(i.src1.vreg, "x9");
+    load_src2(i);
+    let is i32 as flt = type_float(i.cast_to);
+    if (flt == 1) {
+        out2("fmov", "d0", "x9"); out2("fmov", "d1", "x10");
+        out2("fcmp", "d0", "d1");
+    } else {
+        out2("cmp", "x9", "x10");
+    }
+    eo.out_str("  cset x11, ", 12);
+    eo.out_cstr(cond_name(i.op, type_signed(i.cast_to), flt)); eo.out_char(10);
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_bits(i as *d.IRInst) as void {
+    load_v(i.src1.vreg, "x9");
+    if (i.op == d.IR_NOT) {
+        out2("mvn", "x11", "x9");
+    } else {
+        load_src2(i);
+        if (i.op == d.IR_SHL) { out3("lslv", "x11", "x9", "x10"); }
+        else if (i.op == d.IR_SHR) {
+            if (type_signed(i.cast_to) == 1) { out3("asrv", "x11", "x9", "x10"); }
+            else { out3("lsrv", "x11", "x9", "x10"); }
+        } else if (i.op == d.IR_AND) { out3("and", "x11", "x9", "x10"); }
+        else if (i.op == d.IR_OR) { out3("orr", "x11", "x9", "x10"); }
+        else { out3("eor", "x11", "x9", "x10"); }
+    }
+    narrow_x11(i.cast_to);
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_control(i as *d.IRInst) as void {
+    if (i.op == d.IR_RET) {
+        if (active_func.is_naked == 1) { return; }
+        if (i.src1.op_type != d.OP_NONE) { load_v(i.src1.vreg, "x0"); }
+        emit_epilogue();
+        return;
+    }
+    if (i.op == d.IR_LABEL) {
+        eo.out_str(".L", 2); eo.out_int(cast(i64, i.dest.label + a64_label_base)); eo.out_str(":\n", 2);
+        return;
+    }
+    if (i.op == d.IR_JMP) {
+        eo.out_str("  b .L", 6); eo.out_int(cast(i64, i.dest.label + a64_label_base)); eo.out_char(10);
+        return;
+    }
+    load_v(i.src1.vreg, "x9");
+    if (i.op == d.IR_JZ) { eo.out_str("  cbz x9, .L", 12); }
+    else { eo.out_str("  cbnz x9, .L", 13); }
+    eo.out_int(cast(i64, i.dest.label + a64_label_base)); eo.out_char(10);
+}
+
+fn emit_load_mem(i as *d.IRInst) as void {
+    if (i.src1.op_type == d.OP_VREG) { load_v(i.src1.vreg, "x9"); }
+    else { emit_stack_addr("x9", i.src1.imm); }
+    let is i32 as sz = type_size(i.cast_to);
+    if (sz == 8) { eo.out_line("ldr x11, [x9]"); }
+    else if (sz == 4) {
+        if (type_float(i.cast_to) == 1) {
+            eo.out_line("ldr s0, [x9]"); eo.out_line("fcvt d0, s0"); out2("fmov", "x11", "d0");
+        } else if (type_signed(i.cast_to) == 1) { eo.out_line("ldrsw x11, [x9]"); }
+        else { eo.out_line("ldr w11, [x9]"); }
+    } else if (sz == 2) {
+        if (type_signed(i.cast_to) == 1) { eo.out_line("ldrsh x11, [x9]"); }
+        else { eo.out_line("ldrh w11, [x9]"); }
+    } else {
+        if (type_signed(i.cast_to) == 1) { eo.out_line("ldrsb x11, [x9]"); }
+        else { eo.out_line("ldrb w11, [x9]"); }
+    }
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_store_mem(i as *d.IRInst) as void {
+    load_v(i.src1.vreg, "x11");
+    if (i.dest.op_type == d.OP_VREG) { load_v(i.dest.vreg, "x9"); }
+    else { emit_stack_addr("x9", i.dest.imm); }
+    let is i32 as sz = type_size(i.cast_to);
+    if (sz == 8) { eo.out_line("str x11, [x9]"); }
+    else if (sz == 4) {
+        if (type_float(i.cast_to) == 1) {
+            out2("fmov", "d0", "x11"); eo.out_line("fcvt s0, d0"); eo.out_line("str s0, [x9]");
+        } else { eo.out_line("str w11, [x9]"); }
+    } else if (sz == 2) { eo.out_line("strh w11, [x9]"); }
+    else if (sz == 1) { eo.out_line("strb w11, [x9]"); }
+    else {
+        // Large value: src is its address. Copy exactly sz bytes.
+        emit_mov_imm("x12", cast(i64, sz));
+        let is i32 as lid = a64_tmp_label; a64_tmp_label = a64_tmp_label + 1;
+        eo.out_str(".L", 2); eo.out_int(cast(i64, lid)); eo.out_str(":\n", 2);
+        eo.out_line("ldrb w13, [x11]");
+        eo.out_line("strb w13, [x9]");
+        eo.out_line("add x11, x11, 1");
+        eo.out_line("add x9, x9, 1");
+        eo.out_line("sub x12, x12, 1");
+        eo.out_str("  cbnz x12, .L", 14); eo.out_int(cast(i64, lid)); eo.out_char(10);
+    }
+}
+
+fn mark_string_ref(i as *d.IRInst) as void {
+    if (i.global_name_len > 3 && i.global_name_ptr[0] == 46
+        && i.global_name_ptr[1] == 76 && i.global_name_ptr[2] == 67) {
+        let is i32 as sid with mut = 0;
+        let is i32 as k with mut = 3;
+        while (k < i.global_name_len) {
+            sid = sid * 10 + cast(i32, i.global_name_ptr[k]) - 48;
+            k = k + 1;
+        }
+        eo.str_mark(sid);
+    }
+}
+
+fn emit_cast(i as *d.IRInst) as void {
+    load_v(i.src1.vreg, "x11");
+    let is i32 as from_f = type_float(i.cast_from);
+    let is i32 as to_f = type_float(i.cast_to);
+    if (from_f == 1 && to_f == 0) {
+        out2("fmov", "d0", "x11");
+        if (type_signed(i.cast_to) == 1) { out2("fcvtzs", "x11", "d0"); }
+        else { out2("fcvtzu", "x11", "d0"); }
+    } else if (from_f == 0 && to_f == 1) {
+        if (type_signed(i.cast_from) == 1) { out2("scvtf", "d0", "x11"); }
+        else { out2("ucvtf", "d0", "x11"); }
+        out2("fmov", "x11", "d0");
+    } else if (from_f == 1 && to_f == 1 && type_size(i.cast_to) == 4 && type_size(i.cast_from) == 8) {
+        out2("fmov", "d0", "x11"); eo.out_line("fcvt s0, d0"); eo.out_line("fcvt d0, s0"); out2("fmov", "x11", "d0");
+    } else if (to_f == 0) {
+        narrow_x11(i.cast_to);
+    }
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_copy(i as *d.IRInst) as void {
+    load_v(i.dest.vreg, "x9");
+    load_v(i.src1.vreg, "x10");
+    emit_mov_imm("x11", i.src2.imm);
+    let is i32 as done = a64_tmp_label; a64_tmp_label = a64_tmp_label + 1;
+    let is i32 as loop = a64_tmp_label; a64_tmp_label = a64_tmp_label + 1;
+    eo.out_str("  cbz x11, .L", 13); eo.out_int(cast(i64, done)); eo.out_char(10);
+    eo.out_str(".L", 2); eo.out_int(cast(i64, loop)); eo.out_str(":\n", 2);
+    eo.out_line("ldrb w12, [x10]");
+    eo.out_line("strb w12, [x9]");
+    eo.out_line("add x10, x10, 1");
+    eo.out_line("add x9, x9, 1");
+    eo.out_line("sub x11, x11, 1");
+    eo.out_str("  cbnz x11, .L", 14); eo.out_int(cast(i64, loop)); eo.out_char(10);
+    eo.out_str(".L", 2); eo.out_int(cast(i64, done)); eo.out_str(":\n", 2);
+}
+
+fn emit_memory(i as *d.IRInst) as void {
+    if (i.op == d.IR_ADDR) {
+        emit_stack_addr("x11", i.src1.imm); store_v(i.dest.vreg, "x11"); return;
+    }
+    if (i.op == d.IR_ADDR_GLOBAL || i.op == d.IR_FN_ADDR) {
+        mark_string_ref(i);
+        eo.out_str("  adrp x11, ", 12); eo.out_str(i.global_name_ptr, i.global_name_len); eo.out_char(10);
+        eo.out_str("  addlo x11, x11, ", 18); eo.out_str(i.global_name_ptr, i.global_name_len); eo.out_char(10);
+        if (i.op == d.IR_ADDR_GLOBAL && i.is_extern_global == 1) { eo.out_line("ldr x11, [x11]"); }
+        store_v(i.dest.vreg, "x11"); return;
+    }
+    if (i.op == d.IR_GET_ALLOC_ADDR) {
+        let is i64 as off = cast(i64, frame_local) + cast(i64, frame_vregs) * 8 + i.src1.imm;
+        emit_stack_addr("x11", off); store_v(i.dest.vreg, "x11"); return;
+    }
+    if (i.op == d.IR_SET_CTX) {
+        if (i.src1.op_type == d.OP_IMM) { emit_mov_imm("x15", 0); }
+        else { load_v(i.src1.vreg, "x15"); }
+        return;
+    }
+    if (i.op == d.IR_LOAD) { emit_load_mem(i); return; }
+    if (i.op == d.IR_STORE) { emit_store_mem(i); return; }
+    if (i.op == d.IR_COPY) { emit_copy(i); return; }
+    if (i.op == d.IR_ASM) {
+        if (emit_compile_error(i) == 1) { return; }
+        eo.out_str("  ", 2); eo.out_str(i.asm_str_ptr, i.asm_str_len); eo.out_char(10); return;
+    }
+    emit_cast(i);
+}
+
+fn emit_calls(i as *d.IRInst) as void {
+    if (i.op == d.IR_SET_ARG) {
+        let is i32 as idx = cast(i32, i.dest.imm);
+        load_v(i.src1.vreg, "x9");
+        if (type_float(i.cast_to) == 1 && idx < 8) {
+            out2("fmov", dreg(idx), "x9");
+            if (type_size(i.cast_to) == 4) {
+                eo.out_str("  fcvt s", 8); eo.out_int(cast(i64, idx)); eo.out_str(", d", 3); eo.out_int(cast(i64, idx)); eo.out_char(10);
+            }
+        } else if (idx < 8) {
+            out2("mov", xreg(idx), "x9");
+        } else {
+            let is i32 as need = (idx - 7) * 8;
+            let is i32 as aligned with mut = need;
+            if (aligned % 16 != 0) { aligned = aligned + 8; }
+            if (outgoing_bytes == 0) {
+                emit_mov_imm("x17", cast(i64, aligned));
+                out3("sub", "sp", "sp", "x17");
+                outgoing_bytes = aligned;
+            }
+            let is i32 as off = (idx - 8) * 8;
+            eo.out_str("  str x9, [sp, ", 15); eo.out_int(cast(i64, off)); eo.out_str("]\n", 2);
+        }
+        return;
+    }
+    if (i.op == d.IR_GET_ARG) {
+        let is i32 as idx = cast(i32, i.src1.imm);
+        if (idx < 8) { store_v(i.dest.vreg, xreg(idx)); }
+        else {
+            eo.out_str("  ldr x11, [x29, ", 17); eo.out_int(16 + cast(i64, idx - 8) * 8); eo.out_str("]\n", 2);
+            store_v(i.dest.vreg, "x11");
+        }
+        return;
+    }
+    if (i.op == d.IR_SET_SYS_ARG) {
+        let is i32 as idx = cast(i32, i.dest.imm);
+        load_v(i.src1.vreg, "x9");
+        if (idx == 0) { out2("mov", "x8", "x9"); }
+        else { out2("mov", xreg(idx - 1), "x9"); }
+        return;
+    }
+    if (i.op == d.IR_SYSCALL) {
+        eo.out_line("svc 0"); store_v(i.dest.vreg, "x0"); return;
+    }
+    if (i.op == d.IR_FFI_CALL) {
+        io.eprint_str("error: Windows FFI is unavailable on linux-aarch64\n"); io.exit(1); return;
+    }
+    if (i.op == d.IR_CALL) {
+        eo.out_str("  bl ", 5); eo.out_str(i.call_name_ptr, i.call_name_len); eo.out_char(10);
+        if (i.is_extern_call == 1 && type_float(i.cast_to) == 1) {
+            if (type_size(i.cast_to) == 4) { eo.out_line("fcvt d0, s0"); }
+            out2("fmov", "x0", "d0");
+        }
+        store_v(i.dest.vreg, "x0");
+        outgoing_bytes = 0;
+        return;
+    }
+    if (i.op == d.IR_CALL_INDIRECT) {
+        load_v(i.src2.vreg, "x16"); eo.out_line("blr x16");
+        if (type_float(i.cast_to) == 1) { out2("fmov", "x0", "d0"); }
+        store_v(i.dest.vreg, "x0"); outgoing_bytes = 0; return;
+    }
+    // Preserve Caustic's VaList shape, extended to the eight AAPCS64 GPRs.
+    let is i32 as n = cast(i32, i.src2.imm);
+    load_v(i.src1.vreg, "x9");
+    emit_mov_imm("x10", cast(i64, n) * 8); eo.out_line("str w10, [x9]");
+    emit_mov_imm("x10", 64); eo.out_line("str w10, [x9, 4]");
+    let is i64 as over with mut = 16;
+    if (n > 8) { over = 16 + cast(i64, n - 8) * 8; }
+    emit_mov_imm("x17", over); out3("add", "x10", "x29", "x17"); eo.out_line("str x10, [x9, 8]");
+    emit_stack_addr("x10", cast(i64, frame_va_off)); eo.out_line("str x10, [x9, 16]");
+}
+
+fn emit_atomic(i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    let is i32 as sz = type_size(i.cast_to);
+    if (op == d.IR_FENCE) { eo.out_line("dmb ish"); return; }
+    if (op == d.IR_ATOMIC_LOAD) {
+        load_v(i.src1.vreg, "x9");
+        if (sz == 4) { eo.out_line("ldar w11, [x9]"); } else { eo.out_line("ldar x11, [x9]"); }
+        store_v(i.dest.vreg, "x11"); return;
+    }
+    if (op == d.IR_CAS_EXPECTED) { load_v(i.src1.vreg, "x13"); return; }
+    load_v(i.src1.vreg, "x9");
+    load_v(i.src2.vreg, "x10");
+    if (op == d.IR_ATOMIC_STORE) {
+        eo.out_line("dmb ish");
+        if (sz == 4) { eo.out_line("stlr w10, [x9]"); } else { eo.out_line("stlr x10, [x9]"); }
+        eo.out_line("dmb ish"); return;
+    }
+    let is i32 as loop = a64_tmp_label; a64_tmp_label = a64_tmp_label + 1;
+    let is i32 as done = a64_tmp_label; a64_tmp_label = a64_tmp_label + 1;
+    let is i32 as mismatch with mut = done;
+    if (op == d.IR_ATOMIC_CAS) { mismatch = a64_tmp_label; a64_tmp_label = a64_tmp_label + 1; }
+    eo.out_str(".L", 2); eo.out_int(cast(i64, loop)); eo.out_str(":\n", 2);
+    if (sz == 4) { eo.out_line("ldaxr w11, [x9]"); } else { eo.out_line("ldaxr x11, [x9]"); }
+    if (op == d.IR_ATOMIC_ADD) {
+        if (sz == 4) { eo.out_line("add w14, w11, w10"); eo.out_line("stlxr w12, w14, [x9]"); }
+        else { eo.out_line("add x14, x11, x10"); eo.out_line("stlxr w12, x14, [x9]"); }
+    } else if (op == d.IR_ATOMIC_XCHG) {
+        if (sz == 4) { eo.out_line("stlxr w12, w10, [x9]"); }
+        else { eo.out_line("stlxr w12, x10, [x9]"); }
+    } else {
+        if (sz == 4) { eo.out_line("cmp w11, w13"); } else { eo.out_line("cmp x11, x13"); }
+        eo.out_str("  b.ne .L", 9); eo.out_int(cast(i64, mismatch)); eo.out_char(10);
+        if (sz == 4) { eo.out_line("stlxr w12, w10, [x9]"); }
+        else { eo.out_line("stlxr w12, x10, [x9]"); }
+    }
+    eo.out_str("  cbnz w12, .L", 14); eo.out_int(cast(i64, loop)); eo.out_char(10);
+    if (op == d.IR_ATOMIC_CAS) {
+        eo.out_str("  b .L", 6); eo.out_int(cast(i64, done)); eo.out_char(10);
+        eo.out_str(".L", 2); eo.out_int(cast(i64, mismatch)); eo.out_str(":\n", 2);
+        eo.out_line("clrex");
+    }
+    eo.out_str(".L", 2); eo.out_int(cast(i64, done)); eo.out_str(":\n", 2);
+    eo.out_line("dmb ish");
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_cmov(i as *d.IRInst) as void {
+    load_v(i.dest.vreg, "x11");
+    load_v(i.src1.vreg, "x9");
+    load_v(i.src2.vreg, "x10");
+    eo.out_line("cmp x9, 0");
+    eo.out_line("csel x11, x10, x11, ne");
+    store_v(i.dest.vreg, "x11");
+}
+
+fn emit_inst(i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    if (op == d.IR_IMM) { emit_mov_imm("x11", i.src1.imm); store_v(i.dest.vreg, "x11"); return; }
+    if (op == d.IR_MOV) { load_v(i.src1.vreg, "x11"); store_v(i.dest.vreg, "x11"); return; }
+    if (op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) {
+        load_v(i.src1.vreg, "x9"); load_v(i.src2.vreg, "x10");
+        let is i32 as sh with mut = 2; if (op == d.IR_LEA2) { sh = 1; } else if (op == d.IR_LEA8) { sh = 3; }
+        eo.out_str("  addlsl x11, x9, x10, ", 23); eo.out_int(cast(i64, sh)); eo.out_char(10);
+        store_v(i.dest.vreg, "x11"); return;
+    }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV || op == d.IR_MOD || op == d.IR_NEG) { emit_arith(i); return; }
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT) { emit_float(i); return; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { emit_compare(i); return; }
+    if (op == d.IR_SHL || op == d.IR_SHR || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_NOT) { emit_bits(i); return; }
+    if (op == d.IR_RET || op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { emit_control(i); return; }
+    if (op == d.IR_SET_ARG || op == d.IR_GET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_SYSCALL
+        || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_VA_START || op == d.IR_FFI_CALL) { emit_calls(i); return; }
+    if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD || op == d.IR_ATOMIC_XCHG
+        || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) { emit_atomic(i); return; }
+    if (op == d.IR_CMOV) { emit_cmov(i); return; }
+    if (op >= d.IR_VZERO) {
+        io.eprint_str("error: SIMD IR is not supported by linux-aarch64 yet\n"); io.exit(1); return;
+    }
+    emit_memory(i);
+}
+
+fn emit_func(f as *d.IRFunction) as void {
+    active_func = f;
+    outgoing_bytes = 0;
+    frame_local = f.stack_size;
+    frame_vregs = f.vreg_count;
+    frame_alloc = f.alloc_stack_size;
+    let is i32 as va_size with mut = 0;
+    if (f.is_variadic == 1) { va_size = 64; }
+    frame_total = frame_local + frame_vregs * 8 + frame_alloc + va_size;
+    if (frame_total < 16) { frame_total = 16; }
+    if (frame_total % 16 != 0) { frame_total = frame_total + 16 - (frame_total % 16); }
+    frame_va_off = frame_local + frame_vregs * 8 + frame_alloc + va_size;
+
+    eo.out_str(f.asm_name_ptr, f.asm_name_len); eo.out_str(":\n", 2);
+    if (f.is_naked == 0) {
+        eo.out_line("sub sp, sp, 16");
+        eo.out_line("str x29, [sp]");
+        eo.out_line("str x30, [sp, 8]");
+        out2("mov", "x29", "sp");
+        emit_mov_imm("x17", cast(i64, frame_total));
+        out3("sub", "sp", "sp", "x17");
+        if (f.is_variadic == 1) {
+            let is i32 as ai with mut = 0;
+            while (ai < 8) {
+                emit_stack_addr("x17", cast(i64, frame_va_off - ai * 8));
+                eo.out_str("  str ", 6); eo.out_cstr(xreg(ai)); eo.out_str(", [x17]\n", 8);
+                ai = ai + 1;
+            }
+        }
+    }
+
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead != 1) { emit_inst(i); }
+        i = i.next;
+    }
+}
+
+fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    d.opt_bins_init();
+    eo.out_init(fd);
+    eo.str_filter_reset(tgt.module_only_get());
+    eo.cg_filename = filename_ptr;
+    eo.cg_filename_len = filename_len;
+
+    x64.emit_data(p);
+    eo.out_str(".text\n", 6);
+
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && x64._is_dyn_extern(f) == 0) {
+            eo.out_str(".globl ", 7); eo.out_str(f.asm_name_ptr, f.asm_name_len); eo.out_char(10);
+        }
+        f = f.next;
+    }
+
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && x64._is_dyn_extern(f) == 0) {
+            if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+                irp.regen_func_ir(f);
+                if (a64_opt_level >= 1) { opt.optimize_func(f); }
+            }
+            emit_func(f);
+            d.free_func_insts(f);
+            a64_label_base = a64_label_base + f.label_count + 1;
+        }
+        f = f.next;
+    }
+
+    p.strings = cast(*d.StringEntry, cast(i64, irp.get_string_head()));
+    x64.emit_rodata(p);
+    eo.out_flush();
+}

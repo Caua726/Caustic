@@ -4,6 +4,9 @@ Dynamic linking allows caustic-ld to produce executables that call functions fro
 libraries (e.g., libc.so.6) resolved at runtime. The dynamic linker (ld-linux-x86-64.so.2)
 loads required libraries and fills in function addresses before main executes.
 
+This page describes the x86_64 Linux linker path. AArch64 currently supports
+static executables only and rejects dynamic/shared requests.
+
 ## Activating Dynamic Mode
 
 Pass a -l flag to caustic-ld:

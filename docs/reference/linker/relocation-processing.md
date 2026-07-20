@@ -31,6 +31,8 @@ r_addend : i64 — constant value added to the symbol address
 
 ## Supported Relocation Types
 
+### x86_64 relocations
+
 ### R_X86_64_PC32 (type 2)
 
 PC-relative 32-bit relocation. Used for direct calls and jumps to nearby symbols.
@@ -71,6 +73,20 @@ patch_value = symbol_address + r_addend
 The 4 bytes at r_offset are replaced with this value. The linker verifies that the result fits
 in a signed 32-bit integer; if not, it is a fatal error (address out of range).
 
+### AArch64 relocations
+
+The static AArch64 path applies the relocations emitted by the internal
+assembler:
+
+| Type | Purpose |
+|------|---------|
+| `R_AARCH64_ABS64` | Full 64-bit symbol address in data |
+| `R_AARCH64_ADR_PREL_PG_HI21` | Page-relative `adrp` immediate |
+| `R_AARCH64_ADD_ABS_LO12_NC` | Low 12 bits used by the following `add` |
+| `R_AARCH64_CONDBR19` | Conditional branch displacement |
+| `R_AARCH64_JUMP26` | Unconditional branch displacement |
+| `R_AARCH64_CALL26` | Direct-call displacement |
+
 ## Application Process
 
 For each relocation in the merged relocation list:
@@ -78,8 +94,10 @@ For each relocation in the merged relocation list:
 1. Look up the symbol name in the global symbol table to get its virtual address.
 2. Compute the patch address: `section_load_address + r_offset`.
 3. Compute the patch value using the type-specific formula.
-4. Write the patch value as a little-endian 32-bit integer at the patch address in the
-   output buffer.
+4. Patch either the x86_64 immediate/data field or the relevant AArch64
+   instruction bitfield.
+
+The following formulas illustrate the x86_64 cases:
 
 ```
 patch_address = load_address(.text) + adjusted_r_offset
@@ -96,9 +114,9 @@ Write 4 bytes little-endian at patch_address in output buffer.
 
 ## Relocation of .data References
 
-If .data contains a pointer to a function or another data symbol (e.g., a function pointer
-stored as a global), a relocation of type R_X86_64_64 (absolute 64-bit) may be emitted.
-caustic-ld handles this by writing the full 8-byte virtual address at the specified offset.
+If `.data` contains a pointer to a function or another data symbol, the
+assembler emits `R_X86_64_64` or `R_AARCH64_ABS64`. caustic-ld handles either
+form by writing the full 8-byte virtual address at the specified offset.
 
 ## Relocation Errors
 

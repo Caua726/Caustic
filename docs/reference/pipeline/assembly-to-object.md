@@ -1,6 +1,9 @@
 # Assembly to Object (caustic-as)
 
-The assembler (`caustic-as`) is a standalone tool that transforms x86_64 assembly text (`.s` files) into ELF64 relocatable object files (`.o` files). It is written entirely in Caustic and has no external dependencies.
+The assembler (`caustic-as`) is a standalone tool that transforms x86_64 or
+AArch64 assembly text (`.s` files) into ELF64 relocatable object files (`.o`
+files). It is written entirely in Caustic and has no external production
+dependencies.
 
 ## Files
 
@@ -9,15 +12,21 @@ The assembler (`caustic-as`) is a standalone tool that transforms x86_64 assembl
 | `caustic-assembler/main.cst` | CLI entry point, section management, orchestration of the assembly pipeline |
 | `caustic-assembler/lexer.cst` | Assembly tokenizer: recognizes instructions, registers, labels, directives, immediates, and memory operands |
 | `caustic-assembler/encoder.cst` | x86_64 instruction encoder: REX prefixes, ModR/M, SIB, immediates, displacement encoding; two-pass architecture |
-| `caustic-assembler/elf.cst` | ELF64 object writer: generates section headers, symbol tables, relocation entries |
+| `caustic-assembler/aarch64/assembler.cst` | AArch64 parser, fixed-width encoder and relocation generator |
+| `caustic-assembler/output/elf.cst` | Target-aware ELF64 object writer: generates section headers, symbol tables, relocation entries |
 
 ## Usage
 
 ```bash
 ./caustic-as input.s          # produces input.s.o
+./caustic-as --target=linux-aarch64 input-aarch64.s
 ```
 
 The output filename is always the input filename with `.o` appended.
+
+The detailed tokenizer, REX, ModR/M and SIB discussion below documents the
+x86_64 path. See [Linux AArch64 Backend](../aarch64-backend.md) for the
+fixed-width AArch64 path and its relocation set.
 
 ## Pipeline
 

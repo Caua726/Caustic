@@ -1,8 +1,10 @@
 # _start Entry Stub
 
-Every executable produced by caustic-ld begins with a 28-byte _start stub. The stub bridges
-the kernel's process entry convention to the Caustic main function calling convention, then
-performs a clean process exit.
+Every non-freestanding static executable produced by caustic-ld begins with a
+28-byte, target-specific `_start` stub. The stub bridges the kernel's process
+entry convention to the Caustic `main` convention, then performs a clean
+process exit. Both the x86_64 and AArch64 variants deliberately have the same
+size so the shared linker layout stays architecture-independent.
 
 ## Why _start Exists
 
@@ -15,9 +17,28 @@ address on the stack.
 _start reads argc and argv from the stack, sets up a proper call frame, calls main(), and
 then exits the process using the return value as the exit code.
 
-## Machine Code
+## AArch64 Machine Code
 
-The stub is 28 bytes of x86_64 machine code, emitted directly by caustic-ld into the output:
+The AArch64 stub reads `argc` and `argv` without changing the initial stack,
+branches to `main`, and invokes Linux `exit` through syscall 93:
+
+```asm
+_start:
+    ldr  x0, [sp]          // argc
+    add  x1, sp, #8        // argv
+    bl   main
+    movz x8, #93
+    svc  #0
+    brk  #0
+    brk  #0                // padding; total size remains 28 bytes
+```
+
+The linker patches the immediate in `bl main` after final symbol addresses are
+known.
+
+## x86_64 Machine Code
+
+The x86_64 variant is emitted directly by caustic-ld:
 
 ```asm
 _start:

@@ -64,7 +64,7 @@ Source (.cst)
     |
   IR         -- generate virtual-register IR
     |
-  Codegen    -- emit x86_64 assembly
+  Codegen    -- emit x86_64 or AArch64 assembly
     |
   Assembly (.s)
 ```

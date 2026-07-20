@@ -1,8 +1,9 @@
 ## _module
 linux — Direct Linux System Calls
 
-Caustic programs run without libc. linux.cst provides typed wrappers
-around raw x86_64 Linux syscalls so you don't have to use syscall() directly.
+Caustic programs run without libc. linux.cst provides typed, target-aware
+wrappers around raw x86_64 and AArch64 Linux syscalls so you don't have to use
+syscall() directly.
 
 This is the lowest level of the stdlib. Most programs use io.cst for
 output and mem.cst for allocation, which internally call linux functions.

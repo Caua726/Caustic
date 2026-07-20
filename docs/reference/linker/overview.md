@@ -5,6 +5,12 @@ object files (.o), merges their sections, resolves symbol references, applies re
 writes an executable ELF binary. It is written entirely in the Caustic language with no libc or
 external library dependencies.
 
+Both x86_64 and AArch64 ELF64 objects are accepted when the matching
+`--target=` is selected. The AArch64 path supports static multi-object linking,
+an AArch64 `_start` stub, and `ABS64`, `ADRP`, low-12, conditional-branch and
+26-bit call/jump relocations. Dynamic/shared AArch64 output is intentionally
+rejected for now.
+
 ## Pipeline
 
 ```
@@ -39,13 +45,14 @@ resolved at link time from the provided .o files.
 ```
 caustic-ld main.o -o program
 caustic-ld lib.o main.o -o program
+caustic-ld --target=linux-aarch64 lib.o main.o -o program-aarch64
 ```
 
 Output has two PT_LOAD segments:
 - R+X: executable code (.text)
 - R+W: read-write data (.data, .rodata, .bss)
 
-### Dynamic linking
+### Dynamic linking (x86_64 only)
 
 Produces an ELF binary that links against shared libraries at runtime. Uses PLT/GOT stubs for
 external function calls. The dynamic linker (ld-linux) is invoked by the kernel at startup.

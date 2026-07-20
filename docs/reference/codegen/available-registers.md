@@ -1,6 +1,9 @@
 # Available Registers
 
 This document describes the x86_64 register usage in Caustic's code generator.
+It is an architecture-specific reference, not a list of every register used by
+the compiler. See [Linux AArch64 Backend](../aarch64-backend.md) for the
+AArch64 stack-home and scratch-register strategy.
 
 ## Allocatable Registers (10)
 

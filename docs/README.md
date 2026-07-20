@@ -1,6 +1,6 @@
 # Caustic Documentation
 
-Caustic is a self-hosted native x86_64 Linux compiler. The entire toolchain — compiler, assembler, linker, build system — is written in Caustic itself. No LLVM, no libc, no runtime dependencies.
+Caustic is a self-hosted native x86_64/AArch64 compiler. The entire toolchain — compiler, assembler, linker, build system — is written in Caustic itself. No LLVM, no libc, no runtime dependencies.
 
 ## Guide
 
@@ -27,6 +27,7 @@ Learn the language from scratch. Each page covers a topic with examples.
 Deep dive into the compiler internals.
 
 - [Overview](reference/overview.md) — compiler map, files, responsibilities
+- [Linux AArch64 Backend](reference/aarch64-backend.md) — AAPCS64 codegen, assembler, relocations, static linker, tests and limits
 
 ### Compilation Pipeline
 

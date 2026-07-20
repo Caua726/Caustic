@@ -2,6 +2,10 @@
 
 Relocations are entries in the `.rela.text` section that tell the linker where and how to patch machine code bytes. They are generated during pass 2 whenever the assembler encounters a reference that cannot be fully resolved at assembly time -- either because the target is in a different section or because the target symbol is undefined (external).
 
+The detailed entries below document the x86_64 encoder. The AArch64 assembler
+emits `ABS64`, `ADRP` page-high, low-12, conditional-branch, jump and call
+relocations as listed in [Linux AArch64 Backend](../aarch64-backend.md).
+
 ## Relocation Entry Format
 
 Each relocation is a 24-byte `Elf64_Rela` entry:

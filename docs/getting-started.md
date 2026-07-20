@@ -2,16 +2,19 @@
 
 ## What is Caustic?
 
-Caustic is a self-hosted native programming language and compiler for x86_64 Linux.
-It compiles directly to assembly, assembles to ELF object files, and links into
-executables — all without LLVM, libc, or any runtime dependencies. Programs run
-through raw Linux syscalls, giving you full control over what your code does with
-nothing hidden underneath.
+Caustic is a self-hosted native programming language and compiler for Linux
+x86_64 and AArch64. It compiles directly to assembly, assembles ELF object files,
+and links executables — all without LLVM, libc, or external production-toolchain
+dependencies. Programs use raw Linux syscalls, giving you full control over what
+your code does with nothing hidden underneath.
 
 ## Requirements
 
-- **Linux x86_64** — Caustic only targets x86_64 Linux. No other OS or architecture
-  is supported.
+- **Linux x86_64 host** — used to run the distributed bootstrap tools. The
+  compiler targets `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, and
+  `caustic-x86_64`.
+- **Optional AArch64 runner** — use native AArch64 Linux or `qemu-aarch64` to
+  execute `linux-aarch64` output on an x86_64 development host.
 - **No dependencies** — No C compiler, no linker, no libraries. The entire toolchain
   is self-contained: `caustic` (compiler), `caustic-as` (assembler), and `caustic-ld`
   (linker).
@@ -83,7 +86,7 @@ fn main() as i32 {
 }
 ```
 
-Compile and run it:
+Compile and run it for the default x86_64 Linux target:
 
 ```bash
 caustic hello.cst -o hello
@@ -91,6 +94,13 @@ caustic hello.cst -o hello
 ```
 
 You should see `Hello, world!` printed to your terminal.
+
+To cross-compile the same source to a static AArch64 Linux executable:
+
+```bash
+caustic --target=linux-aarch64 hello.cst -o hello-aarch64
+qemu-aarch64 ./hello-aarch64
+```
 
 ### What is happening here?
 
@@ -117,8 +127,8 @@ hello.cst  ──caustic──>  hello.cst.s  ──caustic-as──>  hello.cst
 ```
 
 1. **`caustic`** — The compiler reads your `.cst` source, runs it through lexing,
-   parsing, semantic analysis, IR generation, and code generation to produce x86_64
-   assembly (`.s` file).
+   parsing, semantic analysis, IR generation, and target-specific code generation
+   to produce x86_64 or AArch64 assembly (`.s` file).
 
 2. **`caustic-as`** — The assembler converts the assembly into an ELF relocatable
    object file (`.o` file).
@@ -138,6 +148,9 @@ caustic-as hello.cst.s
 # Link to executable
 caustic-ld hello.cst.s.o -o hello
 ```
+
+For the AArch64 manual pipeline, pass `--target=linux-aarch64` consistently to
+all three tools.
 
 No gcc, no ld, no external tools. The entire pipeline is written in Caustic itself.
 

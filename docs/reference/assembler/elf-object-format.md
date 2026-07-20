@@ -1,6 +1,9 @@
 # ELF Object Format
 
-The assembler (`elf.cst`) generates ELF64 relocatable object files conforming to the System V ABI for x86_64. Each `.o` file contains machine code, data, symbols, and relocations that the linker later combines into an executable.
+The target-aware assembler writer (`output/elf.cst`) generates little-endian
+ELF64 relocatable objects for x86_64 and AArch64. Each `.o` contains target
+machine code, data, symbols, and relocations that the linker later combines
+into an executable.
 
 ## File Layout
 
@@ -37,7 +40,7 @@ The 64-byte ELF header contains:
 | 0x07 | 1 | OS/ABI | 0 (System V) |
 | 0x08 | 8 | Padding | 0 |
 | 0x10 | 2 | e_type | 1 (ET_REL -- relocatable) |
-| 0x12 | 2 | e_machine | 62 (EM_X86_64) |
+| 0x12 | 2 | e_machine | 62 (`EM_X86_64`) or 183 (`EM_AARCH64`) |
 | 0x14 | 4 | e_version | 1 |
 | 0x18 | 8 | e_entry | 0 (not an executable) |
 | 0x20 | 8 | e_phoff | 0 (no program headers) |

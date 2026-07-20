@@ -104,7 +104,7 @@ sizeof(f32)   // 4
 sizeof(f64)   // 8
 sizeof(bool)  // 1
 sizeof(char)  // 1
-sizeof(*u8)   // 8 (all pointers are 8 bytes on x86_64)
+sizeof(*u8)   // 8 (both supported Linux architectures are 64-bit)
 ```
 
 ### Struct Sizes
@@ -174,7 +174,10 @@ struct CCompat {
 
 ## Inline Assembly
 
-`asm("instructions\n")` emits raw x86_64 assembly directly into the compiler output.
+`asm("instructions\n")` emits raw assembly for the selected target directly
+into the compiler output. Inline assembly is architecture-specific: x86_64 uses
+Intel syntax and AArch64 uses the scalar syntax accepted by the internal
+assembler.
 
 ### Syntax
 

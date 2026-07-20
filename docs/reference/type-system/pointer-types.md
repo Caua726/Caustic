@@ -1,6 +1,8 @@
 # Pointer Types
 
-Pointer types represent memory addresses pointing to a value of a specific type. All pointers are 8 bytes on x86_64.
+Pointer types represent memory addresses pointing to a value of a specific
+type. Pointers are 8 bytes on both supported 64-bit architectures, x86_64 and
+AArch64.
 
 ## Type Kind
 

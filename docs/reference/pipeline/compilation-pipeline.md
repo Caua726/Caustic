@@ -1,6 +1,8 @@
 # Compilation Pipeline
 
-This document describes the complete path from Caustic source code to a running executable. The pipeline consists of six compiler phases followed by two external tools (assembler and linker).
+This document describes the complete path from Caustic source code to a running
+executable. The pipeline consists of six compiler phases followed by the
+toolchain's own assembler and linker stages.
 
 ## Full Pipeline Diagram
 
@@ -55,8 +57,9 @@ This document describes the complete path from Caustic source code to a running 
   | Codegen |  src/codegen/
   +---------+
       |
-      | x86_64 assembly text (Intel syntax)
-      |   .intel_syntax noprefix
+      | target assembly text
+      |   x86_64: Intel syntax
+      |   AArch64: GNU-like scalar syntax
       |   .text / .data / .rodata sections
       |   function labels, instructions, directives
       v
@@ -134,7 +137,10 @@ The `no_main` flag (set by `-c`) allows compilation of library modules that have
 
 ### IR to Assembly
 
-Code generation takes the `IRProgram` and an output file descriptor. For each `IRFunction`, it runs register allocation (linear scan) to map virtual registers to physical x86_64 registers or stack spill slots, then emits Intel-syntax assembly instructions to the output buffer.
+Code generation takes the `IRProgram` and an output file descriptor, then
+dispatches through `src/codegen/backend.cst`. The x86_64 backend uses register
+allocation and Intel-syntax emission. The initial AArch64 backend uses fixed
+8-byte stack homes for scalar vregs and emits GNU-like AArch64 assembly.
 
 ```cst
 cg.codegen(cast(*u8, prog), cast(i32, out_fd));
@@ -147,7 +153,8 @@ Output is buffered (4MB buffer) and flushed via `write` syscalls.
 The assembler (`caustic-as`) is a separate binary. It reads the `.s` file, tokenizes assembly syntax, runs a two-pass algorithm (symbol collection, then instruction encoding), and writes an ELF64 `.o` file.
 
 ```bash
-./caustic-as source.cst.s    # produces source.cst.s.o
+./caustic-as source.cst.s    # default x86_64; produces source.cst.s.o
+./caustic-as --target=linux-aarch64 source.cst.s
 ```
 
 ### Object to Executable
@@ -158,7 +165,11 @@ The linker (`caustic-ld`) reads one or more `.o` files, merges their sections, r
 ./caustic-ld source.cst.s.o -o program    # static executable
 ./caustic-ld main.o lib.o -o program       # multi-object
 ./caustic-ld main.o -lc -o program         # dynamic linking with libc
+./caustic-ld --target=linux-aarch64 main.o lib.o -o program-aarch64
 ```
+
+Dynamic/shared linking remains specific to the x86_64 Linux path; AArch64
+currently supports static single- and multi-object executables.
 
 ## Key Data Structures Between Phases
 

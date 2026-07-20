@@ -1,6 +1,9 @@
 # std/linux.cst -- Syscall Wrappers
 
-Thin wrappers around Linux x86_64 system calls. No libc dependency -- each function uses the `syscall` builtin to invoke the kernel directly.
+Thin, target-aware wrappers around Linux x86_64 and AArch64 system calls. No
+libc dependency -- each function selects the architecture's syscall number and
+uses the `syscall` builtin to invoke the kernel directly. Where AArch64 omits a
+legacy syscall, the wrapper translates it to the corresponding `*at` form.
 
 ## Constants
 
@@ -179,7 +182,11 @@ linux.exit(cast(i32, 1)); // failure
 
 ---
 
-## Syscall Numbers Reference
+## x86_64 Syscall Numbers Reference
+
+The numbers shown in the function descriptions and table below are the x86_64
+values. AArch64 values are selected internally by `std/os/linux.cst`; callers
+should use the same wrapper API on both targets.
 
 | Number | Name | Signature |
 |--------|------|-----------|
@@ -195,7 +202,9 @@ linux.exit(cast(i32, 1)); // failure
 
 ## Notes
 
-- All functions use the Caustic `syscall` builtin, which maps directly to the `syscall` x86_64 instruction. Arguments follow the System V ABI register order: `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`.
+- All functions use the Caustic `syscall` builtin. It emits `syscall` with the
+  x86_64 Linux register convention or `svc #0` with the AArch64 convention
+  (`x8` syscall number, arguments in `x0` through `x5`).
 - Error codes are returned as negative values (e.g., `-2` = `ENOENT`, `-13` = `EACCES`).
 - There is no `errno` -- check the return value directly.
 - Caustic has no negative integer literals. Use `0 - N` to express negative values (e.g., `0 - 1` for `-1`).

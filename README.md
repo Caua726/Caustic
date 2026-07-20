@@ -1,12 +1,12 @@
 # Caustic
 
-**A self-hosted, native x86_64 compiler — no LLVM, no libc, no runtime.**
+**A self-hosted native x86_64/AArch64 compiler — no LLVM, no libc, no runtime.**
 
 ![version](https://img.shields.io/badge/version-0.0.14-blue)
 ![self-hosted](https://img.shields.io/badge/self--hosted-yes-success)
 ![targets](https://img.shields.io/badge/targets-Linux%20%C2%B7%20Windows%20%C2%B7%20CausticOS-orange)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![arch](https://img.shields.io/badge/arch-x86__64-lightgrey)
+![arch](https://img.shields.io/badge/arch-x86__64%20%C2%B7%20AArch64-lightgrey)
 
 Caustic is a systems programming language whose **entire toolchain — compiler,
 assembler, linker, and build system — is written in Caustic itself.** It
@@ -26,6 +26,7 @@ fn main() as i32 {
 
 ```sh
 ./caustic hello.cst -o hello && ./hello                       # Linux  (ELF)
+./caustic --target=linux-aarch64 hello.cst -o hello-aarch64   # Linux AArch64 (static ELF64)
 ./caustic --target=windows-x86_64 hello.cst -o hello.exe      # Windows (PE32+)
 ./caustic --target=caustic-x86_64  hello.cst -o hello.cse     # Universal CSE: one binary for Linux + Windows + CausticOS
 ```
@@ -69,12 +70,13 @@ fn main() as i32 {
 
 ## Compilation targets
 
-A single source tree builds three different executable formats. Select one with
+A single source tree builds multiple architectures and executable formats. Select one with
 `--target=` (Linux is the default):
 
 | Target | Flag | Output | Runs on | Status |
 |--------|------|--------|---------|--------|
-| **Linux** | `--target=linux-x86_64` *(default)* | static **ELF64**, raw `syscall` | Linux | Stable |
+| **Linux x86_64** | `--target=linux-x86_64` *(default)* | static/dynamic **ELF64**, raw `syscall` | Linux x86_64 | Stable |
+| **Linux AArch64** | `--target=linux-aarch64` | static **ELF64**, AAPCS64, raw `svc` | Linux AArch64 | Scalar backend; atomics and threads supported |
 | **Windows** | `--target=windows-x86_64` | **PE32+** `.exe` (+ `.pdb`), DLL imports via IAT | Windows | Stable — **cross-compiles from Linux** |
 | **Universal** | `--target=caustic-x86_64` | **CSE** (Caustic Standard Executable) | **Linux · Windows · CausticOS** | Experimental |
 
@@ -138,6 +140,8 @@ git clone --recursive https://github.com/Caua726/Caustic.git && cd Caustic
 
 # Cross-target:
 ./caustic --target=windows-x86_64 program.cst -o program.exe
+./caustic --target=linux-aarch64 program.cst -o program-aarch64
+qemu-aarch64 ./program-aarch64
 
 # Step-by-step pipeline:
 ./caustic    program.cst             # -> program.cst.s   (assembly)
@@ -152,7 +156,7 @@ git clone --recursive https://github.com/Caua726/Caustic.git && cd Caustic
 | `-o <file>` | Output executable |
 | `-c` | Compile only — no `main` required (for libraries) |
 | `-O0` / `-O1` | Optimization level |
-| `--target=<triple>` | `linux-x86_64`, `windows-x86_64`, `caustic-x86_64` |
+| `--target=<triple>` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `caustic-x86_64` |
 | `-l<name>` | Link a dynamic library |
 | `--profile` | Per-phase timing |
 | `--cache <dir>` | Incremental build cache |
@@ -164,6 +168,7 @@ git clone --recursive https://github.com/Caua726/Caustic.git && cd Caustic
 ```sh
 ./caustic-mk build caustic    # build a target from the Causticfile
 ./caustic-mk test             # run the test suite
+./caustic-mk run test-aarch64 # build and run the AArch64 suite with qemu-aarch64
 ./caustic-mk clean            # remove .caustic/ and build/
 ```
 
@@ -250,7 +255,7 @@ portable-facade architecture across `io`, `net`, `time`, `env`, `random`, and
 | Tool | Role |
 |------|------|
 | **`caustic`** | The compiler — 6-phase pipeline: lex → parse → semantic → IR → optimize → codegen (~23K lines) |
-| **`caustic-as`** | Two-pass x86_64 assembler emitting **ELF** *and* **COFF/PE** objects (~6.6K lines) |
+| **`caustic-as`** | Internal x86_64/AArch64 assembler emitting ELF64 relocatable objects (~7K lines) |
 | **`caustic-ld`** | Linker — static & dynamic ELF (PLT/GOT), PE import tables + IAT + CodeView `.pdb`, multi-object, custom sections (~8K lines) |
 | **`caustic-mk`** | `Causticfile`-driven build system: targets, scripts, git/system dependencies (~1.2K lines) |
 
@@ -343,7 +348,7 @@ have):
 
 ```
 src/                compiler — lexer, parser, semantic, ir, codegen   (~23K)
-caustic-assembler/  caustic-as — x86_64 → ELF / COFF-PE objects        (~6.6K)   [submodule]
+caustic-assembler/  caustic-as — x86_64/AArch64 → ELF64 objects       (~7K)     [submodule]
 caustic-linker/     caustic-ld — ELF / PE linking, .pdb, multi-object  (~8K)     [submodule]
 caustic-maker/      caustic-mk — Causticfile build system              (~1.2K)   [submodule]
 std/                standard library — facades + per-OS backends       (~9K)

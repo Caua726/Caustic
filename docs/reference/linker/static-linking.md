@@ -2,7 +2,8 @@
 
 Static linking produces a fully self-contained ELF executable. All symbol references are
 resolved from the provided .o files at link time. The output binary has no runtime library
-dependencies and can run on any compatible x86_64 Linux system.
+dependencies and can run on a compatible x86_64 or AArch64 Linux system,
+matching the selected target.
 
 ## Output ELF Structure
 
@@ -82,7 +83,7 @@ e_ident[EI_CLASS]   = ELFCLASS64 (2)
 e_ident[EI_DATA]    = ELFDATA2LSB (1)       — little-endian
 e_ident[EI_OSABI]   = ELFOSABI_NONE (0)
 e_type              = ET_EXEC (2)            — executable
-e_machine           = EM_X86_64 (62)
+e_machine           = EM_X86_64 (62) or EM_AARCH64 (183)
 e_entry             = virtual address of _start
 e_phoff             = 64                     — program headers right after ELF header
 e_shoff             = 0                      — no section headers in output
@@ -101,6 +102,9 @@ debugging and relinking; executables work without them.
 
 # Multiple objects
 ./caustic-ld lib.cst.s.o main.cst.s.o -o program
+
+# AArch64
+./caustic-ld --target=linux-aarch64 lib.o main.o -o program-aarch64
 
 # Run
 ./program

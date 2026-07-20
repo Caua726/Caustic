@@ -23,7 +23,7 @@ string table.
 |-------------|------|----------------------------------------------|
 | e_ident     | 16   | Magic number, class (64-bit), endianness      |
 | e_type      | 2    | ET_REL (1) for relocatable object             |
-| e_machine   | 2    | EM_X86_64 (62)                               |
+| e_machine   | 2    | `EM_X86_64` (62) or `EM_AARCH64` (183)       |
 | e_shoff     | 8    | Offset to section header table               |
 | e_shentsize | 2    | Size of one section header entry (64)        |
 | e_shnum     | 2    | Number of section headers                    |
@@ -48,7 +48,7 @@ Each section header entry describes one section:
 
 ### .text
 
-Raw x86_64 machine code. Loaded at the executable's code segment. Relocations reference
+Raw target machine code. Loaded at the executable's code segment. Relocations reference
 symbols whose addresses are not yet known at assemble time.
 
 ### .data and .rodata
@@ -106,5 +106,5 @@ the merger and relocation stages to reference them by (object_index, symbol_inde
 
 - Magic number mismatch: not an ELF file
 - e_type != ET_REL: not a relocatable object (caustic-ld does not accept shared libraries as input)
-- e_machine != EM_X86_64: wrong architecture
+- `e_machine` does not match the selected target: wrong architecture
 - Truncated file: section data extends beyond file size

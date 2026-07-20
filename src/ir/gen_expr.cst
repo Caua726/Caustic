@@ -5,6 +5,7 @@ use "../semantic/scope.cst" as sc;
 use "../semantic/defs.cst" as sd;
 use "defs.cst" as d;
 use "gen.cst" as g;
+use "../codegen/target.cst" as tgt;
 
 fn emit_deferred_calls() as void {
     let is i32 as i with mut = g.defer_count - 1;
@@ -200,6 +201,10 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
     let is i32 as padding with mut = 0;
     let is i32 as j with mut = 0;
     let is i32 as xmm_total with mut = 0;
+    let is i32 as a64 with mut = 0;
+    if (tgt.target_get().arch == tgt.ARCH_AARCH64) { a64 = 1; }
+    let is i32 as gpr_limit with mut = 6;
+    if (a64 == 1) { gpr_limit = 8; }
 
     if (node.is_extern == 1) {
         // System V ABI: floats → xmm0-xmm7, ints → rdi/rsi/rdx/rcx/r8/r9
@@ -212,11 +217,11 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         }
         let is i32 as stack_gpr with mut = 0;
         let is i32 as stack_xmm with mut = 0;
-        if (gpr_total > 6) { stack_gpr = gpr_total - 6; }
+        if (gpr_total > gpr_limit) { stack_gpr = gpr_total - gpr_limit; }
         if (xmm_total > 8) { stack_xmm = xmm_total - 8; }
         stack_args = stack_gpr + stack_xmm;
         if (stack_args % 2 != 0) { padding = 1; }
-        if (padding == 1) {
+        if (padding == 1 && a64 == 0) {
             let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
             pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
             pa.asm_str_len = 10;
@@ -225,15 +230,19 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         }
         // Classify each arg: on_stack or register
         let is [64]u8 as arg_on_stk;
+        let is [64]i32 as arg_stack_slot;
         let is i32 as gi with mut = 0;
         let is i32 as xi with mut = 0;
+        let is i32 as stack_slot with mut = 0;
         j = 0;
         while (j < arg_count) {
             if (arg_is_flt[j] == 1) {
-                if (xi < 8) { arg_on_stk[j] = 0; } else { arg_on_stk[j] = 1; }
+                if (xi < 8) { arg_on_stk[j] = 0; }
+                else { arg_on_stk[j] = 1; arg_stack_slot[j] = stack_slot; stack_slot = stack_slot + 1; }
                 xi = xi + 1;
             } else {
-                if (gi < 6) { arg_on_stk[j] = 0; } else { arg_on_stk[j] = 1; }
+                if (gi < gpr_limit) { arg_on_stk[j] = 0; }
+                else { arg_on_stk[j] = 1; arg_stack_slot[j] = stack_slot; stack_slot = stack_slot + 1; }
                 gi = gi + 1;
             }
             j = j + 1;
@@ -243,7 +252,8 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         while (j >= 0) {
             if (arg_on_stk[j] == 1) {
                 let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-                g.emit_set_arg(6, *av, cast(*u8, 0), line);
+                if (a64 == 1) { g.emit_set_arg(8 + arg_stack_slot[j], *av, cast(*u8, 0), line); }
+                else { g.emit_set_arg(6, *av, cast(*u8, 0), line); }
             }
             j = j - 1;
         }
@@ -269,9 +279,9 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         }
     } else {
         // Internal Caustic ABI: all args in GPRs
-        if (arg_count > 6) { stack_args = arg_count - 6; }
+        if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
         if (stack_args % 2 != 0) { padding = 1; }
-        if (padding == 1) {
+        if (padding == 1 && a64 == 0) {
             let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
             pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
             pa.asm_str_len = 10;
@@ -280,14 +290,14 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         }
         // Stack args in reverse
         j = arg_count - 1;
-        while (j >= 6) {
+        while (j >= gpr_limit) {
             let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j - 1;
         }
         // Register args
         j = 0;
-        while (j < arg_count && j < 6) {
+        while (j < arg_count && j < gpr_limit) {
             let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j + 1;
@@ -314,10 +324,14 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         let is i32 as pad2 with mut = 0;
         if (stack_args % 2 != 0) { pad2 = 1; }
         let is i32 as cleanup_bytes = (stack_args + pad2) * 8;
-        // Build "add rsp, N" string
+        // Restore the outgoing stack area using the selected ABI's stack name.
         let is [32]u8 as cbuf;
-        mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
         let is i32 as cpos with mut = 9;
+        mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
+        if (a64 == 1) {
+            mem.memcpy(cast(*u8, &cbuf), "add sp, sp, ", 12);
+            cpos = 12;
+        }
         let is i32 as cv with mut = cleanup_bytes;
         let is [10]u8 as nbuf;
         let is i32 as ni with mut = 0;
@@ -938,9 +952,13 @@ fn gen_expr(node as *ast.Node) as i32 {
         // Stack args in reverse (internal ABI: all GPR)
         let is i32 as stack_args with mut = 0;
         let is i32 as padding with mut = 0;
-        if (arg_count > 6) { stack_args = arg_count - 6; }
+        let is i32 as a64 with mut = 0;
+        if (tgt.target_get().arch == tgt.ARCH_AARCH64) { a64 = 1; }
+        let is i32 as gpr_limit with mut = 6;
+        if (a64 == 1) { gpr_limit = 8; }
+        if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
         if (stack_args % 2 != 0) { padding = 1; }
-        if (padding == 1) {
+        if (padding == 1 && a64 == 0) {
             let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
             pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
             pa.asm_str_len = 10;
@@ -948,13 +966,13 @@ fn gen_expr(node as *ast.Node) as i32 {
             g.emit(pa);
         }
         let is i32 as j with mut = arg_count - 1;
-        while (j >= 6) {
+        while (j >= gpr_limit) {
             let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j - 1;
         }
         j = 0;
-        while (j < arg_count && j < 6) {
+        while (j < arg_count && j < gpr_limit) {
             let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j + 1;
@@ -971,6 +989,10 @@ fn gen_expr(node as *ast.Node) as i32 {
             let is [32]u8 as cbuf;
             mem.memcpy(cast(*u8, &cbuf), "add rsp, ", 9);
             let is i32 as cpos with mut = 9;
+            if (a64 == 1) {
+                mem.memcpy(cast(*u8, &cbuf), "add sp, sp, ", 12);
+                cpos = 12;
+            }
             let is i32 as cv with mut = cleanup_bytes;
             let is [10]u8 as nbuf;
             let is i32 as ni with mut = 0;

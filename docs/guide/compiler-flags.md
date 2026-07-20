@@ -32,6 +32,19 @@ Full optimization pipeline:
 
 Slower compilation (~9x for self-compile), but generated code runs ~3.4x faster.
 
+### `--target=<triple>`
+
+Selects the code generator, object architecture, linker output, target builtins,
+and standard-library syscall ABI.
+
+- `linux-x86_64` — default Linux target
+- `linux-aarch64` — static Linux AArch64 ELF64; scalar codegen, atomics and threads
+- `windows-x86_64` — PE32+ output
+- `caustic-x86_64` — CSE output
+
+The AArch64 production pipeline is internal: it does not invoke GNU `as`, GCC,
+LLVM, or the system linker.
+
 ### `-l<name>`
 
 Link a system library dynamically. Passed to the linker. Example: `-lc` links libc.

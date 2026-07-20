@@ -19,7 +19,7 @@ use "std/mem.cst" as mem;   // required: must call mem.gheapinit before using cf
 
 ## C Type Size Constants
 
-All sizes are for x86_64 Linux:
+These sizes apply to the supported LP64 Linux targets, x86_64 and AArch64:
 
 ```cst
 let is i64 as C_CHAR_SIZE   with imut = 1;
@@ -32,7 +32,9 @@ let is i64 as C_DOUBLE_SIZE with imut = 8;
 let is i64 as C_SIZE_T_SIZE with imut = 8;
 ```
 
-Corresponding alignment constants (`C_CHAR_ALIGN`, `C_INT_ALIGN`, etc.) follow the same pattern: alignment equals size for all primitive C types on x86_64.
+Corresponding alignment constants (`C_CHAR_ALIGN`, `C_INT_ALIGN`, etc.) follow
+the same pattern: alignment equals size for these primitive C types on the
+supported LP64 targets.
 
 ---
 

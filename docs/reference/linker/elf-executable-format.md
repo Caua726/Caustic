@@ -1,7 +1,8 @@
 # ELF Executable Format
 
-This document describes the structure of ELF executables produced by caustic-ld. The output
-is a standard ELF64 executable for x86_64 Linux, compatible with the kernel's exec() loader.
+This document describes the structure of ELF executables produced by
+caustic-ld. Static output is standard little-endian ELF64 for x86_64 or
+AArch64 Linux. Dynamic ELF output is currently x86_64-only.
 
 ## ELF Header (64 bytes, offset 0)
 
@@ -15,7 +16,7 @@ e_ident[16]:
   [8-15]  00...           — padding
 
 e_type     : 2 bytes = ET_EXEC (2)          — executable file
-e_machine  : 2 bytes = EM_X86_64 (62)
+e_machine  : 2 bytes = EM_X86_64 (62) or EM_AARCH64 (183)
 e_version  : 4 bytes = EV_CURRENT (1)
 e_entry    : 8 bytes = virtual address of _start
 e_phoff    : 8 bytes = 64 (program headers immediately follow)

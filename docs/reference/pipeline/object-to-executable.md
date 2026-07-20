@@ -1,6 +1,9 @@
 # Object to Executable (caustic-ld)
 
-The linker (`caustic-ld`) is a standalone tool that combines one or more ELF64 relocatable object files (`.o`) into a final executable. It supports both static and dynamic linking and is written entirely in Caustic with no external dependencies.
+The linker (`caustic-ld`) is a standalone tool that combines one or more ELF64
+relocatable objects into a final x86_64 or AArch64 executable. Both targets
+support static multi-object linking; dynamic linking is currently x86_64-only.
+The linker is written entirely in Caustic with no external dependencies.
 
 ## Files
 
@@ -22,6 +25,9 @@ The linker (`caustic-ld`) is a standalone tool that combines one or more ELF64 r
 
 # Dynamic linking with libc
 ./caustic-ld program.cst.s.o -lc -o program
+
+# Static AArch64 multi-object link
+./caustic-ld --target=linux-aarch64 main.o lib.o -o program-aarch64
 ```
 
 ### CLI Arguments
@@ -57,7 +63,7 @@ The linker (`caustic-ld`) is a standalone tool that combines one or more ELF64 r
       v
   [Relocation Application]  linker.cst
       |
-      | Apply R_X86_64_PC32, R_X86_64_32S, R_X86_64_PLT32
+      | Apply the selected target's x86_64 or AArch64 relocations
       | Patch machine code with resolved addresses
       v
   [ELF Writer]  elf_writer.cst
@@ -108,6 +114,11 @@ After section merging and symbol resolution, the linker patches the machine code
 | `R_X86_64_PC32` | 32-bit PC-relative | `S + A - P` (symbol + addend - patch location) |
 | `R_X86_64_32S` | 32-bit signed absolute | `S + A` |
 | `R_X86_64_PLT32` | 32-bit PC-relative to PLT | `S + A - P` (static) or PLT entry (dynamic) |
+| `R_AARCH64_ABS64` | 64-bit absolute data address | `S + A` |
+| `R_AARCH64_ADR_PREL_PG_HI21` | Page-relative address | `page(S + A) - page(P)` |
+| `R_AARCH64_ADD_ABS_LO12_NC` | Low 12 address bits | `(S + A) & 0xfff` |
+| `R_AARCH64_CONDBR19` | Conditional branch | `(S + A - P) >> 2` |
+| `R_AARCH64_JUMP26` / `R_AARCH64_CALL26` | Branch/call | `(S + A - P) >> 2` |
 
 Where:
 - `S` = final address of the referenced symbol
