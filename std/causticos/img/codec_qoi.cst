@@ -1,0 +1,97 @@
+// std/causticos/img/codec_qoi.cst — CSIF codec 1 (QOI), decode side.
+//
+// Byte-oriented run + 64-entry colour cache + delta scheme (§5.2 of
+// docs/CSIF_FORMAT.md). Exactly mirrors the reference encoder scripts/png2csif.py
+// so a round-trip is bit-exact. Pure byte ops, no syscalls — portable.
+//
+// Seed: prev pixel px = {0,0,0,255}; index[64] all-zero {0,0,0,0}. Pixels are
+// packed into one i64 as (r<<24)|(g<<16)|(b<<8)|a for the cache.
+//
+// decode(src, src_len, out, w, h, nchan) — writes w*h*nchan bytes to out.
+// Returns 0 on success; 0-1 truncated stream; 0-2 pixel overrun;
+// 0-3 trailing bytes; 0-4 invalid dimensions/overflow.
+fn decode(src as *u8, src_len as i64, out as *u8, w as i64, h as i64, nchan as i64) as i64 {
+    if (w <= 0 || h <= 0 || (nchan != 3 && nchan != 4)) { return 0 - 4; }
+    if (w > 0x7FFFFFFFFFFFFFFF / h) { return 0 - 4; }
+    let is [64]i64 as index;
+    let is i64 as k with mut = 0;
+    while (k < 64) { index[k] = 0; k = k + 1; }
+
+    let is i64 as r with mut = 0;
+    let is i64 as g with mut = 0;
+    let is i64 as b with mut = 0;
+    let is i64 as a with mut = 255;
+
+    let is i64 as si with mut = 0;        // source byte cursor
+    let is i64 as po with mut = 0;        // output byte cursor
+    let is i64 as done with mut = 0;      // pixels emitted
+    let is i64 as total = w * h;
+
+    while (done < total) {
+        if (si >= src_len) { return 0 - 1; }
+        let is i64 as byte = cast(i64, src[si]);
+        let is i64 as run with mut = 1;    // pixels this step (1, or a run count)
+
+        if (byte == 0xFE) {                            // QOI_OP_RGB
+            if (si + 4 > src_len) { return 0 - 1; }
+            r = cast(i64, src[si + 1]);
+            g = cast(i64, src[si + 2]);
+            b = cast(i64, src[si + 3]);
+            si = si + 4;
+        }
+        else if (byte == 0xFF) {                       // QOI_OP_RGBA
+            if (si + 5 > src_len) { return 0 - 1; }
+            r = cast(i64, src[si + 1]);
+            g = cast(i64, src[si + 2]);
+            b = cast(i64, src[si + 3]);
+            a = cast(i64, src[si + 4]);
+            si = si + 5;
+        }
+        else {
+            let is i64 as tag = byte >> 6;
+            if (tag == 0) {                            // QOI_OP_INDEX
+                let is i64 as v = index[byte & 63];
+                r = (v >> 24) & 0xFF;
+                g = (v >> 16) & 0xFF;
+                b = (v >> 8) & 0xFF;
+                a = v & 0xFF;
+                si = si + 1;
+            }
+            else if (tag == 1) {                       // QOI_OP_DIFF
+                r = (r + ((byte >> 4) & 3) - 2) & 0xFF;
+                g = (g + ((byte >> 2) & 3) - 2) & 0xFF;
+                b = (b + (byte & 3) - 2) & 0xFF;
+                si = si + 1;
+            }
+            else if (tag == 2) {                       // QOI_OP_LUMA
+                if (si + 2 > src_len) { return 0 - 1; }
+                let is i64 as b1 = cast(i64, src[si + 1]);
+                let is i64 as vg = (byte & 0x3F) - 32;
+                r = (r + vg + ((b1 >> 4) & 0x0F) - 8) & 0xFF;
+                g = (g + vg) & 0xFF;
+                b = (b + vg + (b1 & 0x0F) - 8) & 0xFF;
+                si = si + 2;
+            }
+            else {                                     // QOI_OP_RUN
+                run = (byte & 0x3F) + 1;
+                si = si + 1;
+            }
+        }
+
+        let is i64 as e with mut = 0;
+        while (e < run) {
+            if (done >= total) { return 0 - 2; }       // overrun past declared pixels
+            out[po] = cast(u8, r);
+            out[po + 1] = cast(u8, g);
+            out[po + 2] = cast(u8, b);
+            if (nchan == 4) { out[po + 3] = cast(u8, a); }
+            po = po + nchan;
+            done = done + 1;
+            e = e + 1;
+        }
+        // running-array update once per chunk (px unchanged across a run)
+        index[(r * 3 + g * 5 + b * 7 + a * 11) & 63] = (r << 24) | (g << 16) | (b << 8) | a;
+    }
+    if (si != src_len) { return 0 - 3; }
+    return 0;
+}

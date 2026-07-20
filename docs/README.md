@@ -149,3 +149,4 @@ Deep dive into the compiler internals.
 - [env.cst](reference/stdlib/env.md) — argc/argv, getenv
 - [arena.cst](reference/stdlib/arena.md) — bump allocator
 - [compatcffi.cst](reference/stdlib/compatcffi.md) — C interop types
+- [causticos/img](reference/stdlib/causticos-img.md) — strict CSIF BASELINE image decoder

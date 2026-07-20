@@ -239,6 +239,7 @@ the right backend at compile time. Pure modules have no OS dependency at all.
 | `errors.cst` | `__compile_error` aborts + runtime panic/assert | pure |
 | `arena.cst` | Standalone bump allocator | pure |
 | `compatcffi.cst` | C-ABI struct/union layout & errno helpers | pure |
+| `causticos/img/csif.cst` | Strict CSIF BASELINE validation and RAW/QOI decoding | CausticOS VFS + pure decode core |
 
 *New since the last release:* `os`, `errors`, `path`, `process`, `term`, and the
 portable-facade architecture across `io`, `net`, `time`, `env`, `random`, and

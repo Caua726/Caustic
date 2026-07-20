@@ -1,0 +1,505 @@
+// std/causticos/img/csif.cst — strict CSIF BASELINE decoder.
+//
+// Implements the single-image subset emitted by causticos/scripts/png2csif.py:
+// LAYOUT_RANDOM, CRC32-IEEE, ILIM/IHDR/ICOL/ICOD/IDAT/IEND, 8-bit RGB/RGBA,
+// one whole-image RAW or QOI stream. The normative format lives in the sibling
+// causticos repository at docs/CSIF_FORMAT.md.
+//
+// Container data is untrusted. The parser validates the complete directory,
+// ranges, flags, ordering, CRCs, resource ceilings, enums, and size products
+// before allocating or invoking a codec. Unsupported profiles/codecs fail loud;
+// there is no partial/best-effort decode.
+//
+// CausticOS-only allocation/VFS entry points:
+//
+//   let is csif.Image as im = csif.load(cast(*u8, "/etc/wallpaper.csif"));
+//   if (im.ok == 1) { /* im.pixels is RGB/RGBA */ csif.free(&im); }
+//
+// Cross-target callers and tests can use decode_into() with caller-owned storage.
+use "../../os/causticos.cst" as cos;
+use "codec_raw.cst" as raw;
+use "codec_qoi.cst" as qoi;
+
+struct Image {
+    ok          as i64;
+    err         as i64;
+    width       as i64;
+    height      as i64;
+    nchan       as i64;
+    pixels      as *u8;
+    pix_map_len as i64; // >0 only when this module owns an mmap
+}
+
+// Container errors match docs/CSIF_FORMAT.md §1.5 (stored positive in Image.err).
+let is i64 as ERR_TOO_SMALL        with imut = 1;
+let is i64 as ERR_MAGIC            with imut = 2;
+let is i64 as ERR_TRANSMISSION     with imut = 3;
+let is i64 as ERR_VERSION          with imut = 4;
+let is i64 as ERR_ENDIAN           with imut = 5;
+let is i64 as ERR_HEADER_CRC       with imut = 6;
+let is i64 as ERR_TRUNCATED        with imut = 7;
+let is i64 as ERR_DIR_RANGE        with imut = 8;
+let is i64 as ERR_OVERLAP          with imut = 9;
+let is i64 as ERR_FLAG_MISMATCH    with imut = 10;
+let is i64 as ERR_CRC_CRITICAL     with imut = 11;
+let is i64 as ERR_UNKNOWN_CRITICAL with imut = 12;
+let is i64 as ERR_ORDER            with imut = 13;
+let is i64 as ERR_RANGE            with imut = 14;
+let is i64 as ERR_DIMS             with imut = 15;
+let is i64 as ERR_LIMIT            with imut = 16;
+let is i64 as ERR_PROFILE          with imut = 17;
+let is i64 as ERR_LEVEL            with imut = 18;
+let is i64 as ERR_CYCLE            with imut = 19;
+let is i64 as ERR_GEOM             with imut = 20;
+let is i64 as ERR_NO_PRIMARY       with imut = 21;
+let is i64 as ERR_ENUM             with imut = 22;
+let is i64 as ERR_DEN_ZERO         with imut = 23;
+let is i64 as ERR_NO_IEND          with imut = 24;
+let is i64 as ERR_UNKNOWN_CODEC    with imut = 25;
+
+// API/I/O errors live after the normative container range.
+let is i64 as ERR_OPEN   with imut = 26;
+let is i64 as ERR_READ   with imut = 27;
+let is i64 as ERR_NOMEM  with imut = 28;
+let is i64 as ERR_DECODE with imut = 29;
+let is i64 as ERR_OUTPUT with imut = 30;
+
+// This implementation's BASELINE level-1 resource caps. The reference encoder's
+// ILIM values fit these ceilings; larger profiles must use a fuller decoder.
+let is i64 as MAX_CHUNKS     with imut = 4096;
+let is i64 as MAX_WIDTH      with imut = 65536;
+let is i64 as MAX_HEIGHT     with imut = 65536;
+let is i64 as MAX_PIXELS     with imut = 1073741824; // 1 Gi-pixel declared cap
+let is i64 as MAX_ALLOC      with imut = 1073741824; // 1 GiB single buffer
+let is i64 as MAX_COMPONENTS with imut = 16;
+let is i64 as MAX_CHUNK_SIZE with imut = 1073741824;
+let is i64 as MAX_FILE_SIZE  with imut = 1073741824;
+
+struct Parsed {
+    err        as i64;
+    width      as i64;
+    height     as i64;
+    nchan      as i64;
+    need       as i64;
+    codec      as i64;
+    cbytes     as *u8;
+    cbytes_len as i64;
+}
+
+fn rd_u16(p as *u8, o as i64) as i64 {
+    return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8);
+}
+
+fn rd_u32(p as *u8, o as i64) as i64 {
+    return cast(i64, p[o]) | (cast(i64, p[o + 1]) << 8)
+         | (cast(i64, p[o + 2]) << 16) | (cast(i64, p[o + 3]) << 24);
+}
+
+fn rd_u64(p as *u8, o as i64) as i64 {
+    return rd_u32(p, o) | (rd_u32(p, o + 4) << 32);
+}
+
+fn type_eq(p as *u8, o as i64, c0 as i64, c1 as i64, c2 as i64, c3 as i64) as i64 {
+    if (cast(i64, p[o]) == c0 && cast(i64, p[o + 1]) == c1
+        && cast(i64, p[o + 2]) == c2 && cast(i64, p[o + 3]) == c3) { return 1; }
+    return 0;
+}
+
+fn range_ok(off as i64, n as i64, total as i64) as i64 {
+    if (off < 0 || n < 0 || total < 0 || off > total) { return 0; }
+    if (n > total - off) { return 0; }
+    return 1;
+}
+
+// CRC32-IEEE (poly 0xEDB88320, init/final 0xFFFFFFFF).
+fn crc32(p as *u8, off as i64, len as i64) as i64 {
+    let is i64 as crc with mut = 0xFFFFFFFF;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        crc = crc ^ cast(i64, p[off + i]);
+        let is i64 as k with mut = 0;
+        while (k < 8) {
+            let is i64 as mask = 0 - (crc & 1);
+            crc = (crc >> 1) ^ (0xEDB88320 & mask);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+fn page_round(n as i64) as i64 {
+    if (n <= 0 || n > 0x7FFFFFFFFFFFFFFF - 4095) { return 0; }
+    return ((n + 4095) / 4096) * 4096;
+}
+
+fn fail(err as i64) as Image {
+    let is Image as im;
+    im.ok = 0; im.err = err; im.width = 0; im.height = 0; im.nchan = 0;
+    im.pixels = cast(*u8, 0); im.pix_map_len = 0;
+    return im;
+}
+
+fn parsed_fail(err as i64) as Parsed {
+    let is Parsed as p;
+    p.err = err; p.width = 0; p.height = 0; p.nchan = 0; p.need = 0;
+    p.codec = 0; p.cbytes = cast(*u8, 0); p.cbytes_len = 0;
+    return p;
+}
+
+// Validate the complete BASELINE container and return pointers into buf.
+// No allocation and no syscalls; buf remains owned by the caller.
+fn parse(buf as *u8, len as i64) as Parsed {
+    if (len < 64) { return parsed_fail(ERR_TOO_SMALL); }
+    if (type_eq(buf, 0, 67, 83, 73, 70) == 0) { return parsed_fail(ERR_MAGIC); } // CSIF
+    if (cast(i64, buf[4]) != 0x89 || cast(i64, buf[5]) != 0x0D
+        || cast(i64, buf[6]) != 0x0A || cast(i64, buf[7]) != 0x1A
+        || cast(i64, buf[8]) != 0x0A || cast(i64, buf[9]) != 0x00) {
+        return parsed_fail(ERR_TRANSMISSION);
+    }
+    if (rd_u16(buf, 0x0A) != 1) { return parsed_fail(ERR_VERSION); }
+    if (cast(i64, buf[0x0C]) != 0) { return parsed_fail(ERR_ENDIAN); }
+
+    // BASELINE implementation: random-access layout, CRC32-IEEE, profile 0,
+    // level 1, single item, and no optional header features.
+    if (cast(i64, buf[0x0E]) != 0 || cast(i64, buf[0x0F]) != 1
+        || cast(i64, buf[0x10]) != 0) { return parsed_fail(ERR_PROFILE); }
+    if (cast(i64, buf[0x11]) != 1) { return parsed_fail(ERR_LEVEL); }
+    if (rd_u16(buf, 0x12) != 0) { return parsed_fail(ERR_ENUM); }
+
+    let is i64 as chunk_count = rd_u32(buf, 0x14);
+    let is i64 as dir_off = rd_u64(buf, 0x18);
+    if (rd_u64(buf, 0x20) != len) { return parsed_fail(ERR_TRUNCATED); }
+    if (rd_u64(buf, 0x28) != 0) { return parsed_fail(ERR_NO_PRIMARY); }
+    if (rd_u64(buf, 0x30) != 0) { return parsed_fail(ERR_PROFILE); }
+    if (crc32(buf, 0, 0x38) != (rd_u64(buf, 0x38) & 0xFFFFFFFF)) {
+        return parsed_fail(ERR_HEADER_CRC);
+    }
+
+    if (chunk_count < 1 || chunk_count > MAX_CHUNKS) { return parsed_fail(ERR_LIMIT); }
+    let is i64 as dir_len = chunk_count * 32;
+    if (dir_off < 64 || range_ok(dir_off, dir_len, len) == 0) {
+        return parsed_fail(ERR_DIR_RANGE);
+    }
+    let is i64 as dir_end = dir_off + dir_len;
+
+    let is i64 as ilim_off with mut = 0 - 1;
+    let is i64 as ilim_len with mut = 0;
+    let is i64 as ihdr_off with mut = 0 - 1;
+    let is i64 as ihdr_len with mut = 0;
+    let is i64 as icol_off with mut = 0 - 1;
+    let is i64 as icol_len with mut = 0;
+    let is i64 as icod_off with mut = 0 - 1;
+    let is i64 as icod_len with mut = 0;
+    let is i64 as idat_off with mut = 0 - 1;
+    let is i64 as idat_len with mut = 0;
+    let is i64 as iend_off with mut = 0 - 1;
+    let is i64 as iend_len with mut = 0;
+
+    let is i64 as stage with mut = 0;
+    let is i64 as prev_end with mut = dir_end;
+    let is i64 as max_seen_chunk with mut = 0;
+    let is i64 as ci with mut = 0;
+    while (ci < chunk_count) {
+        let is i64 as rec = dir_off + ci * 32;
+        let is i64 as flags = rd_u32(buf, rec + 4);
+        let is i64 as coff = rd_u64(buf, rec + 8);
+        let is i64 as clen = rd_u64(buf, rec + 16);
+        let is i64 as seq = rd_u32(buf, rec + 24);
+        if (rd_u32(buf, rec + 28) != 0 || seq != ci) { return parsed_fail(ERR_ORDER); }
+        if ((coff & 7) != 0 || clen < 20 || range_ok(coff, clen, len) == 0) {
+            return parsed_fail(ERR_RANGE);
+        }
+        if (coff < dir_end || coff < prev_end) { return parsed_fail(ERR_OVERLAP); }
+        let is i64 as gap = coff - prev_end;
+        if (gap > 7) { return parsed_fail(ERR_ORDER); }
+        let is i64 as gi with mut = 0;
+        while (gi < gap) {
+            if (cast(i64, buf[prev_end + gi]) != 0) { return parsed_fail(ERR_ORDER); }
+            gi = gi + 1;
+        }
+        prev_end = coff + clen;
+        if (clen > max_seen_chunk) { max_seen_chunk = clen; }
+
+        let is i64 as ti with mut = 0;
+        while (ti < 4) {
+            if (buf[rec + ti] != buf[coff + ti]) { return parsed_fail(ERR_FLAG_MISMATCH); }
+            ti = ti + 1;
+        }
+        if (flags != rd_u32(buf, coff + 4)) { return parsed_fail(ERR_FLAG_MISMATCH); }
+        if ((flags & 0xFFFFFFC0) != 0) { return parsed_fail(ERR_ENUM); }
+        let is i64 as plen = rd_u64(buf, coff + 8);
+        if (plen < 0 || plen != clen - 20) { return parsed_fail(ERR_RANGE); }
+        if (crc32(buf, coff, 16 + plen) != rd_u32(buf, coff + 16 + plen)) {
+            return parsed_fail(ERR_CRC_CRITICAL);
+        }
+
+        let is i64 as kind with mut = 0;
+        if (type_eq(buf, coff, 73, 76, 73, 77) == 1) { kind = 1; }      // ILIM
+        else if (type_eq(buf, coff, 73, 72, 68, 82) == 1) { kind = 2; } // IHDR
+        else if (type_eq(buf, coff, 73, 67, 79, 76) == 1) { kind = 3; } // ICOL
+        else if (type_eq(buf, coff, 73, 67, 79, 68) == 1) { kind = 4; } // ICOD
+        else if (type_eq(buf, coff, 73, 68, 65, 84) == 1) { kind = 5; } // IDAT
+        else if (type_eq(buf, coff, 73, 69, 78, 68) == 1) { kind = 6; } // IEND
+
+        if (kind == 0) {
+            if (stage == 0) { return parsed_fail(ERR_ORDER); }
+            if ((flags & 1) != 0) { return parsed_fail(ERR_UNKNOWN_CRITICAL); }
+        } else {
+            if (kind != stage + 1) { return parsed_fail(ERR_ORDER); }
+            stage = kind;
+            let is i64 as expected with mut = 27; // critical|public|per-item|singleton
+            if (kind == 1 || kind == 6) { expected = 11; } // critical|public|singleton
+            if (kind == 5) { expected = 51; }              // critical|public|per-item|payload
+            if (flags != expected) { return parsed_fail(ERR_FLAG_MISMATCH); }
+
+            if (kind == 1) { ilim_off = coff + 16; ilim_len = plen; }
+            if (kind == 2) { ihdr_off = coff + 16; ihdr_len = plen; }
+            if (kind == 3) { icol_off = coff + 16; icol_len = plen; }
+            if (kind == 4) { icod_off = coff + 16; icod_len = plen; }
+            if (kind == 5) { idat_off = coff + 16; idat_len = plen; }
+            if (kind == 6) {
+                if (ci != chunk_count - 1) { return parsed_fail(ERR_ORDER); }
+                iend_off = coff + 16; iend_len = plen;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    let is i64 as tail = len - prev_end;
+    if (tail < 0 || tail > 7) { return parsed_fail(ERR_ORDER); }
+    let is i64 as zi with mut = 0;
+    while (zi < tail) {
+        if (cast(i64, buf[prev_end + zi]) != 0) { return parsed_fail(ERR_ORDER); }
+        zi = zi + 1;
+    }
+
+    if (stage != 6 || ilim_off < 0 || ihdr_off < 0 || icol_off < 0
+        || icod_off < 0 || idat_off < 0 || iend_off < 0) {
+        return parsed_fail(ERR_NO_IEND);
+    }
+
+    // ILIM: all 23 u64 ceilings must be representable; enforce the ceilings
+    // this BASELINE implementation consumes.
+    if (ilim_len != 0xB8) { return parsed_fail(ERR_LIMIT); }
+    let is i64 as li with mut = 0;
+    while (li < 23) {
+        if (rd_u64(buf, ilim_off + li * 8) < 0) { return parsed_fail(ERR_LIMIT); }
+        li = li + 1;
+    }
+    let is i64 as lim_w = rd_u64(buf, ilim_off);
+    let is i64 as lim_h = rd_u64(buf, ilim_off + 8);
+    let is i64 as lim_pixels = rd_u64(buf, ilim_off + 16);
+    let is i64 as lim_alloc = rd_u64(buf, ilim_off + 32);
+    let is i64 as lim_components = rd_u64(buf, ilim_off + 40);
+    let is i64 as lim_chunk = rd_u64(buf, ilim_off + 56);
+    if (lim_w <= 0 || lim_w > MAX_WIDTH || lim_h <= 0 || lim_h > MAX_HEIGHT
+        || lim_pixels <= 0 || lim_pixels > MAX_PIXELS
+        || lim_alloc <= 0 || lim_alloc > MAX_ALLOC
+        || lim_components < 4 || lim_components > MAX_COMPONENTS
+        || lim_chunk <= 0 || lim_chunk > MAX_CHUNK_SIZE
+        || max_seen_chunk > lim_chunk) { return parsed_fail(ERR_LIMIT); }
+
+    // IHDR: BASELINE flat UINT8 RGB/RGBA with one full-image data window.
+    if (ihdr_len != 0x4C || rd_u64(buf, ihdr_off) != 0) {
+        return parsed_fail(ERR_NO_PRIMARY);
+    }
+    let is i64 as w = rd_u32(buf, ihdr_off + 0x08);
+    let is i64 as h = rd_u32(buf, ihdr_off + 0x0C);
+    let is i64 as nchan = cast(i64, buf[ihdr_off + 0x19]);
+    let is i64 as color_model = cast(i64, buf[ihdr_off + 0x18]);
+    let is i64 as alpha_mode = cast(i64, buf[ihdr_off + 0x1D]);
+    if (w <= 0 || h <= 0 || w > lim_w || h > lim_h) {
+        return parsed_fail(ERR_DIMS);
+    }
+    if (rd_u32(buf, ihdr_off + 0x10) != 1
+        || cast(i64, buf[ihdr_off + 0x14]) != 0
+        || cast(i64, buf[ihdr_off + 0x15]) != 0
+        || cast(i64, buf[ihdr_off + 0x16]) != 8
+        || cast(i64, buf[ihdr_off + 0x17]) != 0
+        || (nchan != 3 && nchan != 4)
+        || (nchan == 3 && (color_model != 2 || alpha_mode != 0))
+        || (nchan == 4 && (color_model != 3 || alpha_mode != 1))
+        || cast(i64, buf[ihdr_off + 0x1A]) != 1
+        || cast(i64, buf[ihdr_off + 0x1B]) != 1
+        || cast(i64, buf[ihdr_off + 0x1C]) != 0
+        || cast(i64, buf[ihdr_off + 0x1E]) > 7
+        || cast(i64, buf[ihdr_off + 0x1F]) != 0) {
+        return parsed_fail(ERR_ENUM);
+    }
+    if (rd_u32(buf, ihdr_off + 0x20) != 0 || rd_u32(buf, ihdr_off + 0x24) != 0
+        || rd_u32(buf, ihdr_off + 0x28) != w || rd_u32(buf, ihdr_off + 0x2C) != h
+        || rd_u32(buf, ihdr_off + 0x30) != 0 || rd_u32(buf, ihdr_off + 0x34) != 0
+        || rd_u32(buf, ihdr_off + 0x38) != w || rd_u32(buf, ihdr_off + 0x3C) != h) {
+        return parsed_fail(ERR_GEOM);
+    }
+    if (rd_u32(buf, ihdr_off + 0x44) == 0) { return parsed_fail(ERR_DEN_ZERO); }
+    if (nchan > lim_components || w > lim_pixels / h) { return parsed_fail(ERR_DIMS); }
+    let is i64 as pixels = w * h;
+    if (pixels > lim_pixels || pixels > lim_alloc / nchan) { return parsed_fail(ERR_DIMS); }
+    let is i64 as need = pixels * nchan;
+
+    // ICOL: this decoder returns display-ready interleaved RGB bytes, so accept
+    // only the reference encoder's explicit sRGB/BT.709 identity description.
+    if (icol_len != 16 || rd_u64(buf, icol_off) != 0
+        || cast(i64, buf[icol_off + 8]) != 0
+        || cast(i64, buf[icol_off + 9]) != 1
+        || cast(i64, buf[icol_off + 10]) != 13
+        || cast(i64, buf[icol_off + 11]) != 0
+        || cast(i64, buf[icol_off + 12]) != 1
+        || cast(i64, buf[icol_off + 13]) != 0
+        || cast(i64, buf[icol_off + 14]) != 1
+        || cast(i64, buf[icol_off + 15]) != 1) {
+        return parsed_fail(ERR_ENUM);
+    }
+
+    // ICOD: one untiled, whole-image RAW/QOI stream, no transforms.
+    if (icod_len < 0x34 || rd_u64(buf, icod_off) != 0) {
+        return parsed_fail(ERR_NO_PRIMARY);
+    }
+    let is i64 as codec = rd_u16(buf, icod_off + 8);
+    if (codec != 0 && codec != 1) { return parsed_fail(ERR_UNKNOWN_CODEC); }
+    if (rd_u16(buf, icod_off + 0x0A) != 1
+        || cast(i64, buf[icod_off + 0x0C]) != 1
+        || cast(i64, buf[icod_off + 0x0D]) != 0
+        || cast(i64, buf[icod_off + 0x0E]) != 0
+        || cast(i64, buf[icod_off + 0x0F]) != 0
+        || rd_u32(buf, icod_off + 0x10) != 0
+        || rd_u32(buf, icod_off + 0x14) != 0
+        || rd_u32(buf, icod_off + 0x18) != 1
+        || rd_u32(buf, icod_off + 0x1C) != 1
+        || rd_u32(buf, icod_off + 0x20) != 1
+        || rd_u32(buf, icod_off + 0x24) != 1
+        || rd_u32(buf, icod_off + 0x28) != 0
+        || rd_u16(buf, icod_off + 0x2C) != 3
+        || cast(i64, buf[icod_off + 0x2E]) != 0
+        || cast(i64, buf[icod_off + 0x2F]) != 0) {
+        return parsed_fail(ERR_PROFILE);
+    }
+    let is i64 as params_len = rd_u32(buf, icod_off + 0x30);
+    if (params_len != icod_len - 0x34) { return parsed_fail(ERR_RANGE); }
+    let is i64 as params = icod_off + 0x34;
+    if (codec == 0) {
+        if (params_len != 8 || cast(i64, buf[params]) != 1
+            || cast(i64, buf[params + 1]) != 0 || cast(i64, buf[params + 2]) != 1) {
+            return parsed_fail(ERR_PROFILE);
+        }
+        let is i64 as ri with mut = 3;
+        while (ri < 8) {
+            if (cast(i64, buf[params + ri]) != 0) { return parsed_fail(ERR_ENUM); }
+            ri = ri + 1;
+        }
+    } else {
+        let is i64 as has_alpha with mut = 0;
+        if (nchan == 4) { has_alpha = 1; }
+        if (params_len != 4 || cast(i64, buf[params]) != has_alpha
+            || cast(i64, buf[params + 1]) != 0 || rd_u16(buf, params + 2) != 0) {
+            return parsed_fail(ERR_PROFILE);
+        }
+    }
+
+    // IDAT: implicit item 0, whole image, zero coordinates.
+    if (idat_len < 32 || rd_u64(buf, idat_off) != 0
+        || rd_u32(buf, idat_off + 8) != 0 || rd_u32(buf, idat_off + 12) != 0) {
+        return parsed_fail(ERR_RANGE);
+    }
+    let is i64 as co with mut = 0;
+    while (co < 4) {
+        if (rd_u32(buf, idat_off + 16 + co * 4) != 0) { return parsed_fail(ERR_RANGE); }
+        co = co + 1;
+    }
+    let is i64 as cbytes_len = idat_len - 32;
+    if (cbytes_len <= 0) { return parsed_fail(ERR_DECODE); }
+
+    // IEND must be structurally complete and terminal. The chunk CRC above is
+    // authoritative; the reference encoder currently leaves whole_file_checksum
+    // informational, so this BASELINE reader does not consume that field.
+    if (iend_len != 24 || rd_u64(buf, iend_off + 4) != 0
+        || rd_u32(buf, iend_off + 12) != 0 || rd_u64(buf, iend_off + 16) != 0) {
+        return parsed_fail(ERR_NO_IEND);
+    }
+
+    let is Parsed as out;
+    out.err = 0; out.width = w; out.height = h; out.nchan = nchan; out.need = need;
+    out.codec = codec;
+    out.cbytes = cast(*u8, cast(i64, buf) + idat_off + 32);
+    out.cbytes_len = cbytes_len;
+    return out;
+}
+
+fn decode_parsed(p as *Parsed, out as *u8, out_cap as i64, map_len as i64) as Image {
+    if (cast(i64, out) == 0 || out_cap < p.need) { return fail(ERR_OUTPUT); }
+    let is i64 as rc with mut = 0;
+    if (p.codec == 0) {
+        rc = raw.decode(p.cbytes, p.cbytes_len, out, p.width, p.height, p.nchan);
+    } else {
+        rc = qoi.decode(p.cbytes, p.cbytes_len, out, p.width, p.height, p.nchan);
+    }
+    if (rc != 0) { return fail(ERR_DECODE); }
+
+    let is Image as im;
+    im.ok = 1; im.err = 0; im.width = p.width; im.height = p.height; im.nchan = p.nchan;
+    im.pixels = out; im.pix_map_len = map_len;
+    return im;
+}
+
+// Decode into caller-owned storage. Image.pix_map_len is 0, so free() will not
+// release out. This entry point is pure/portable and useful for conformance tests.
+fn decode_into(buf as *u8, len as i64, out as *u8, out_cap as i64) as Image {
+    let is Parsed as p = parse(buf, len);
+    if (p.err != 0) { return fail(p.err); }
+    return decode_parsed(&p, out, out_cap, 0);
+}
+
+// Decode into a CausticOS mmap owned by the returned Image.
+fn decode_bytes(buf as *u8, len as i64) as Image {
+    let is Parsed as p = parse(buf, len);
+    if (p.err != 0) { return fail(p.err); }
+    let is i64 as map_len = page_round(p.need);
+    if (map_len == 0) { return fail(ERR_LIMIT); }
+    let is i64 as va = cos.mmap(0, map_len, cos.PROT_READ | cos.PROT_WRITE);
+    if (va < 0) { return fail(ERR_NOMEM); }
+    let is Image as im = decode_parsed(&p, cast(*u8, va), p.need, map_len);
+    if (im.ok == 0) { cos.munmap(va, map_len); }
+    return im;
+}
+
+// Read, validate, and decode one CSIF file from the CausticOS VFS.
+fn load(path as *u8) as Image {
+    let is i64 as fd = cos.open_read(path);
+    if (fd < 0) { return fail(ERR_OPEN); }
+    let is i64 as size = cos.lseek(fd, 0, cast(i32, cos.SEEK_END));
+    cos.lseek(fd, 0, cast(i32, cos.SEEK_SET));
+    if (size <= 0) { cos.close(fd); return fail(ERR_OPEN); }
+    if (size > MAX_FILE_SIZE) { cos.close(fd); return fail(ERR_LIMIT); }
+
+    let is i64 as fmap = page_round(size);
+    if (fmap == 0) { cos.close(fd); return fail(ERR_LIMIT); }
+    let is i64 as fva = cos.mmap(0, fmap, cos.PROT_READ | cos.PROT_WRITE);
+    if (fva < 0) { cos.close(fd); return fail(ERR_NOMEM); }
+
+    let is i64 as got with mut = 0;
+    while (got < size) {
+        let is i64 as n = cos.read(fd, cast(*u8, fva + got), size - got);
+        if (n <= 0) {
+            cos.close(fd); cos.munmap(fva, fmap); return fail(ERR_READ);
+        }
+        got = got + n;
+    }
+    cos.close(fd);
+
+    let is Image as im = decode_bytes(cast(*u8, fva), size);
+    cos.munmap(fva, fmap);
+    return im;
+}
+
+// CausticOS ownership release. decode_into() callers own their output buffer and
+// do not need this function; on CausticOS it is also a no-op for such buffers.
+fn free(img as *Image) as void {
+    if (cast(i64, img.pixels) != 0 && img.pix_map_len > 0) {
+        cos.munmap(cast(i64, img.pixels), img.pix_map_len);
+    }
+    img.pixels = cast(*u8, 0);
+    img.pix_map_len = 0;
+    img.ok = 0;
+}
