@@ -44,8 +44,25 @@ if [ "${PRECOMMIT_FULL:-0}" != "1" ]; then
     fi
 fi
 
-CC="$ROOT/caustic"
-[ -x "$CC" ] || die "./caustic not found — build it first ( ./caustic-mk build caustic )"
+# ---- host guard --------------------------------------------------------------
+# The gate self-hosts the toolchain, which needs it to run NATIVELY on this host.
+# Caustic is developed and self-hosts on Linux; Windows/macOS are cross-compile
+# *targets* (validated as targets by tools/check-cross.sh under wine, not by
+# self-hosting here). So on a non-Linux host — e.g. running this hook under Git
+# Bash on Windows — skip cleanly with a clear message instead of failing
+# cryptically or wrongly blocking a commit.
+HOST="$(uname -s 2>/dev/null || echo unknown)"
+if [ "$HOST" != "Linux" ]; then
+    echo "${Y}pre-commit: native self-host gate only runs on Linux (host is ${HOST}).${N}"
+    echo "${D}  Caustic self-hosts on Linux; Windows/macOS are cross-compile targets.${N}"
+    echo "${D}  Validate them with tools/check-cross.sh (wine/qemu) or run this gate on Linux.${N}"
+    exit 0
+fi
+
+# Resolve the compiler (tolerate a .exe suffix if one is ever present).
+CC=""
+for c in "$ROOT/caustic" "$ROOT/caustic.exe"; do [ -x "$c" ] && { CC="$c"; break; }; done
+[ -n "$CC" ] || die "caustic binary not found — build it first ( ./caustic-mk build caustic )"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/caustic-precommit.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
