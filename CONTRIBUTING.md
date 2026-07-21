@@ -59,17 +59,49 @@ If you don't have `caustic` installed yet, download a release first from [GitHub
 
 ### Running tests
 
+The unit/integration suite (built and run by the compiler itself):
+
 ```bash
-bash tests/run_tests.sh
+./caustic-mk test          # builds + runs tests/run_tests.cst
 ```
 
-This runs:
-1. All unit tests in `tests/*.cst`
-2. 4-generation bootstrap of the compiler (gen3 must equal gen4)
-3. Bootstrap of the assembler and linker
-4. Full toolchain rebuild and verification
+The full self-check — the same thing the pre-commit hook runs:
 
-Everything runs in a temp directory and cleans up after itself. All tests must pass before merging.
+```bash
+tools/precommit.sh         # (or: PRECOMMIT_FULL=1 tools/precommit.sh)
+```
+
+`tools/precommit.sh` is native-only (x86_64) so its verdict is identical on every
+machine. It:
+1. builds the assembler, linker and maker from source
+2. **self-hosts the compiler to a 4-generation fixpoint at `-O0`, `-O1` AND
+   `-O2`** (gen2==gen3==gen4 byte-identical, and gen4 must compile correctly) —
+   testing every optimization level is what catches a codegen bug that only
+   shows up in an optimized *build* of the compiler
+3. checks every example produces identical output across `-O0/-O1/-O2`
+4. runs the unit suite and an assembler+linker smoke test
+
+Everything runs in a temp directory and cleans up after itself; it never mutates
+tracked files or `./caustic`.
+
+**Enable it as a git hook** (the hook lives in `.git/hooks/`, which isn't tracked):
+
+```bash
+printf '#!/bin/sh\nexec "$(git rev-parse --show-toplevel)/tools/precommit.sh"\n' \
+  > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+Skip a run with `PRECOMMIT_SKIP=1 git commit …` or `git commit --no-verify`.
+
+**Cross-target checks** (aarch64/qemu, windows/wine, C-interop/gcc) need external
+tools, so they are *not* part of the gate — run them explicitly when you have the
+tools (missing tools are skipped, never failed):
+
+```bash
+tools/check-cross.sh
+```
+
+All checks must pass before merging.
 
 ### Project structure
 
