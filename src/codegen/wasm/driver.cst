@@ -67,6 +67,13 @@ let is *u8 as g_glob_addr with mut = cast(*u8, 0);   // i64 addr per global
 let is *u8 as g_glob_ptr  with mut = cast(*u8, 0);   // *IRGlobal per global
 let is i32 as g_num_globals with mut = 0;
 
+// Function table for fn-pointers / indirect calls. Slot 0 is reserved as null
+// (an uninitialized fn-ptr traps on call); real functions get slots 1..count.
+let is *u8 as g_tbl_name_ptr with mut = cast(*u8, 0);  // asm name per slot
+let is *u8 as g_tbl_name_len with mut = cast(*u8, 0);  // i32 per slot
+let is *u8 as g_tbl_funcidx  with mut = cast(*u8, 0);  // i32 funcidx per slot
+let is i32 as g_tbl_count with mut = 0;
+
 // Per-function emission context.
 let is *d.IRFunction as cur_func with mut = cast(*d.IRFunction, 0);
 let is i32 as cur_param_count with mut = 0;   // fixed params + (variadic ? 1 va-buf ptr : 0)
@@ -106,6 +113,10 @@ fn wasi_hasres(idx as i32) as i32 { if (idx == IMP_PROC_EXIT) { return 0; } retu
 // Growable byte buffer
 // =====================================================================
 struct WBuf { data as *u8; len as i64; cap as i64; }
+
+// Code section body (count + entries), built before the section order is
+// assembled so the funcref table it populates is known when Table/Element emit.
+let is WBuf as g_code with mut;
 
 fn wb_new(cap as i64) as WBuf {
     let is WBuf as b;
@@ -545,6 +556,27 @@ fn emit_call(c as *WBuf, i as *d.IRInst) as void {
     else { op_set(c, L_vreg(i.dest.vreg)); }
 }
 
+// Function pointer = its 1-based table slot (an i64 handle).
+fn emit_fn_addr(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as slot = tbl_slot(i.global_name_ptr, cast(i32, i.global_name_len));
+    op_i64const(c, cast(i64, slot));
+    op_set(c, L_vreg(i.dest.vreg));
+}
+// Indirect call: args (positional scratch) + the table index (src2 handle),
+// then call_indirect with the uniform (i64^n)->i64 type of the callee.
+fn emit_call_indirect(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as n = cur_argc;
+    let is i32 as k with mut = 0;
+    while (k < n) { op_get(c, cur_scratch_base + k); k = k + 1; }
+    op_get(c, L_vreg(i.src2.vreg)); wb_u8(c, 0xA7);       // i32.wrap_i64 (table index)
+    wb_u8(c, 0x11);                                       // call_indirect
+    wb_uleb(c, cast(i64, WASI_NTYPES + intern_type(n)));  // type index
+    wb_uleb(c, 0);                                        // table 0
+    cur_argc = 0;
+    if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }
+    else { op_set(c, L_vreg(i.dest.vreg)); }
+}
+
 // VA_START: fill the caller-visible SysV VaList so va_arg reads the packed
 // buffer contiguously. We set gp_offset/fp_offset above their limits so every
 // va_arg takes the overflow_arg_area path (which points at the contiguous
@@ -607,10 +639,8 @@ fn emit_value_inst(c as *WBuf, i as *d.IRInst) as void {
     if (op == d.IR_STORE) { emit_store(c, i); return; }
     if (op == d.IR_ADDR) { emit_addr(c, i); return; }
     if (op == d.IR_GET_ALLOC_ADDR) { emit_alloc_addr(c, i); return; }
-    if (op == d.IR_ADDR_GLOBAL || op == d.IR_FN_ADDR) {
-        if (op == d.IR_FN_ADDR) { wasm_err("function pointers not yet supported"); return; }
-        emit_addr_global(c, i); return;
-    }
+    if (op == d.IR_FN_ADDR) { emit_fn_addr(c, i); return; }
+    if (op == d.IR_ADDR_GLOBAL) { emit_addr_global(c, i); return; }
     if (op == d.IR_COPY) { emit_memcopy(c, &i.dest, &i.src1, i.src2.imm); return; }
     if (op == d.IR_SET_ARG) { emit_set_arg(c, i); return; }
     if (op == d.IR_GET_ARG) { emit_get_arg(c, i); return; }
@@ -620,7 +650,7 @@ fn emit_value_inst(c as *WBuf, i as *d.IRInst) as void {
     // Unsupported opcodes (syscall, indirect call, va_start, closures, SIMD).
     if (op == d.IR_SYSCALL || op == d.IR_SET_SYS_ARG) { wasm_err("syscall(...) is not available on wasm (use WASI)"); return; }
     if (op == d.IR_VA_START) { emit_va_start(c, i); return; }
-    if (op == d.IR_CALL_INDIRECT) { wasm_err("indirect calls not yet supported"); return; }
+    if (op == d.IR_CALL_INDIRECT) { emit_call_indirect(c, i); return; }
     // SET_CTX sets the closure context register (r10 on x86) — emitted before
     // every `let x = call()` to clear it to 0. WASM has no context register and
     // uses positional args, so the common clear-to-0 case is a no-op. (A real
@@ -854,6 +884,25 @@ fn bytes_eq(a as *u8, b as *u8, n as i32) as i32 {
     while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
     return 1;
 }
+// Intern a function into the funcref table; returns its 1-based table slot
+// (0 = reserved null). Returns 0 if the function is undefined.
+fn tbl_slot(name as *u8, nlen as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < g_tbl_count) {
+        if (arr_geti32(g_tbl_name_len, k) == nlen
+            && bytes_eq(cast(*u8, arr_geti64(g_tbl_name_ptr, k)), name, nlen) == 1) {
+            return k + 1;
+        }
+        k = k + 1;
+    }
+    let is i32 as fidx = lookup_func(name, nlen);
+    if (fidx < 0) { return 0; }
+    arr_seti64(g_tbl_name_ptr, g_tbl_count, cast(i64, name));
+    arr_seti32(g_tbl_name_len, g_tbl_count, nlen);
+    arr_seti32(g_tbl_funcidx, g_tbl_count, fidx);
+    g_tbl_count = g_tbl_count + 1;
+    return g_tbl_count;   // 1-based slot
+}
 fn intern_type(nargs as i32) as i32 {
     let is i32 as k with mut = 0;
     while (k < g_num_types) {
@@ -978,7 +1027,7 @@ fn emit_global_bytes(gg as *d.IRGlobal) as void {
         // init_value holds the string id in these builds' convention; fall back to 0.
         g_data_i64(0);   // conservative: filled below if we can resolve
     } else if (gg.is_fn_ptr_init == 1) {
-        g_data_i64(0);   // function pointers not yet supported; store 0
+        g_data_i64(cast(i64, tbl_slot(gg.init_fn_name_ptr, gg.init_fn_name_len)));
     } else if (gg.is_struct_lit_init == 1) {
         // struct literal: emit `size` zero bytes (best-effort until full support).
         let is i32 as k with mut = 0;
@@ -1113,23 +1162,47 @@ fn emit_export_section(m as *WBuf) as void {
     wb_section(m, 7, &b);
     d.opt_free(b.data);
 }
-fn emit_code_section(m as *WBuf, p as *d.IRProgram) as void {
-    let is WBuf as b = wb_new(4096);
+// Build the Code section body into g_code. Regens/emits/frees IR per function.
+// Side effects: populates the funcref table (FN_ADDR) and interns indirect-call
+// types — so this must run BEFORE the Type/Table/Element sections are emitted.
+fn build_code_body(p as *d.IRProgram) as void {
+    g_code = wb_new(4096);
     let is i32 as total with mut = g_num_funcs;
     if (g_has_main == 1) { total = total + 1; }
-    wb_uleb(&b, cast(i64, total));
+    wb_uleb(&g_code, cast(i64, total));
     let is i32 as k with mut = 0;
     while (k < g_num_funcs) {
         let is *d.IRFunction as f = cast(*d.IRFunction, arr_geti64(g_fn_ptr, k));
         if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
             irp.regen_func_ir(f);
         }
-        emit_func_body(&b, f);
+        emit_func_body(&g_code, f);
         d.free_func_insts(f);
         k = k + 1;
     }
-    if (g_has_main == 1) { emit_start_body(&b); }
-    wb_section(m, 10, &b);
+    if (g_has_main == 1) { emit_start_body(&g_code); }
+}
+fn emit_table_section(m as *WBuf) as void {
+    if (g_tbl_count == 0) { return; }
+    let is WBuf as b = wb_new(16);
+    wb_uleb(&b, 1);                            // one table
+    wb_u8(&b, 0x70);                           // funcref
+    wb_u8(&b, 0x01);                           // limits: min == max
+    wb_uleb(&b, cast(i64, g_tbl_count + 1));   // + slot 0 (null)
+    wb_uleb(&b, cast(i64, g_tbl_count + 1));
+    wb_section(m, 4, &b);
+    d.opt_free(b.data);
+}
+fn emit_element_section(m as *WBuf) as void {
+    if (g_tbl_count == 0) { return; }
+    let is WBuf as b = wb_new(64);
+    wb_uleb(&b, 1);                            // one segment
+    wb_u8(&b, 0x00);                           // active, table 0, funcref
+    op_i32const(&b, 1); wb_u8(&b, 0x0B);       // offset expr: start at slot 1
+    wb_uleb(&b, cast(i64, g_tbl_count));
+    let is i32 as k with mut = 0;
+    while (k < g_tbl_count) { wb_uleb(&b, cast(i64, arr_geti32(g_tbl_funcidx, k))); k = k + 1; }
+    wb_section(m, 9, &b);
     d.opt_free(b.data);
 }
 // Synthesized WASI entry: call main, wrap the i64 result to i32, call proc_exit.
@@ -1186,7 +1259,13 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     w_error = 0;
 
     collect_functions(p);
-    layout_data(p);
+    // funcref table: at most one slot per defined function (+ null slot 0).
+    g_tbl_name_ptr = d.opt_alloc(cast(i64, g_num_funcs + 1) * 8);
+    g_tbl_name_len = d.opt_alloc(cast(i64, g_num_funcs + 1) * 4);
+    g_tbl_funcidx  = d.opt_alloc(cast(i64, g_num_funcs + 1) * 4);
+    g_tbl_count = 0;
+
+    layout_data(p);                            // may add fn-ptr globals to the table
 
     // Resolve the entry point for the synthesized _start.
     g_has_main = 0;
@@ -1200,18 +1279,24 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
         }
     }
 
+    // Build the code body first: this populates the funcref table (FN_ADDR) and
+    // interns indirect-call types, both needed before the earlier sections emit.
+    build_code_body(p);
+
     let is WBuf as m = wb_new(8192);
     // header: \0asm + version 1
     wb_u8(&m, 0x00); wb_u8(&m, 0x61); wb_u8(&m, 0x73); wb_u8(&m, 0x6D);
     wb_u8(&m, 0x01); wb_u8(&m, 0x00); wb_u8(&m, 0x00); wb_u8(&m, 0x00);
 
-    emit_type_section(&m);
+    emit_type_section(&m);                     // section order is mandatory
     emit_import_section(&m);
     emit_function_section(&m);
+    emit_table_section(&m);
     emit_memory_section(&m);
     emit_global_section(&m);
     emit_export_section(&m);
-    emit_code_section(&m, p);
+    emit_element_section(&m);
+    wb_section(&m, 10, &g_code);               // code (pre-built)
     emit_data_section(&m);
 
     if (w_error == 1) {
@@ -1222,4 +1307,5 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     wb_flush_to_eo(&m);
     eo.out_flush();
     d.opt_free(m.data);
+    d.opt_free(g_code.data);
 }
