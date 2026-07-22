@@ -400,8 +400,15 @@ Key model (see the driver's header comment + the plan doc):
   array `main` reads), calls `main`, then `proc_exit(result)`. **Filesystem** is
   wired: `os/wasm.cst` opens paths relative to the **fd-3 preopen** (strip a
   leading `./` or `/`) and requests only FD_* file rights (`0xE001FF` — asking
-  for PATH_* rights makes uvwasi return `ENOTCAPABLE`); `path_unlink_file`/
-  `path_rename`/`path_create_directory` are still stubbed.
+  for PATH_* rights makes uvwasi return `ENOTCAPABLE`). Mutators
+  unlink/rename/mkdir/rmdir go through `path_*`; exists/mtime through
+  `path_filestat_get` (mtim at filestat+48).
+- **Full OS stdlib on WASI**: `std/time/wasm.cst` (clock_time_get; sleep
+  busy-waits the monotonic clock), `random.cst` entropy (`random_get`), and
+  `env.cst` getenv (`environ_get`, widening wasm32's 4-byte pointers) all
+  dispatch `OS_WASM`. `os/wasm.cst` also carries error-returning stubs for the
+  WASI-impossible primitives (fork/execve/wait4, sockets, mmap/mprotect,
+  pipe/dup/ioctl/fcntl, getcwd/chdir, …) so it mirrors `os/linux.cst`.
 - **Heap** via the `memory.grow` opcode: `std/mem/wasm.cst` `page_alloc` grows
   linear memory in 64 KiB pages (append-only; `page_free` = no-op / bump). The
   backend recognizes the `__wasm_memory_grow`/`__wasm_memory_size` externs by
