@@ -14,16 +14,42 @@
 
 use "../os/wasm.cst" as wasi;
 
-let is i64 as PAGE with imut = 65536;
+let is i64 as PAGE  with imut = 65536;
+let is i64 as CHUNK with imut = 16777216;   // grow the linear memory 16 MiB at a time
 
-// Grow linear memory by enough pages to cover `size`. Returns the base address
-// of the new region, or 0 (null) if the host refused to grow.
+// Bump allocator over the linear memory. Since page_free never returns pages
+// (wasm memory only ever grows) and this is the sole caller of memory.grow, the
+// grown memory is one contiguous run: [_bump, _end) is memory we already grew but
+// have not handed out yet, so we can satisfy most allocations without growing.
+// Growing in 16 MiB chunks keeps `memory.grow` calls rare — each one reallocates
+// the host-side backing store (detaching the old ArrayBuffer), so batching cuts
+// both syscalls and buffer churn. (It does NOT work around node's experimental
+// node:wasi GC crash — that reproduces even with a single grow; use the pure-JS
+// runner tests/wasm/wasi_run.mjs instead. See caustic-wasm-backend memory note.)
+let is i64 as _bump with mut = 0;
+let is i64 as _end  with mut = 0;
+
+// Return `size` bytes (4 KiB-aligned, matching native mmap granularity), or 0 if
+// the host refuses to grow the memory.
 fn page_alloc(size as i64) as *u8 {
     if (size <= 0) { return cast(*u8, 0); }
-    let is i64 as pages = (size + PAGE - 1) / PAGE;
-    let is i64 as prev = wasi.__wasm_memory_grow(pages);
-    if (prev < 0) { return cast(*u8, 0); }        // memory.grow returns -1 on failure
-    return cast(*u8, prev * PAGE);
+    let is i64 as need = (size + 4095) / 4096 * 4096;    // round up to 4 KiB
+    if (_bump + need > _end) {
+        // Grow enough to cover the shortfall, at least CHUNK. The new pages append
+        // at the current memory end (== _end after the first grow), so the run
+        // stays contiguous and any leftover [_bump, _end) is not wasted.
+        let is i64 as shortfall = need - (_end - _bump);
+        let is i64 as grow_bytes with mut = shortfall;
+        if (grow_bytes < CHUNK) { grow_bytes = CHUNK; }
+        let is i64 as pages = (grow_bytes + PAGE - 1) / PAGE;
+        let is i64 as prev = wasi.__wasm_memory_grow(pages);
+        if (prev < 0) { return cast(*u8, 0); }           // memory.grow returned -1
+        if (_bump == 0) { _bump = prev * PAGE; }         // first grow: anchor the bump ptr
+        _end = prev * PAGE + pages * PAGE;
+    }
+    let is i64 as r = _bump;
+    _bump = _bump + need;
+    return cast(*u8, r);
 }
 
 // No unmap in wasm linear memory — pages are only ever appended. The higher-level
