@@ -36,6 +36,17 @@ let is i64 as PAGE        with imut = 65536;      // wasm page = 64 KiB
 let is i32 as MAX_CALL_ARGS with imut = 32;
 let is i32 as VA_PACK_BYTES with imut = 256;   // per-frame packed-varargs buffer (32 slots)
 
+// argv bootstrap region (reserved BSS, filled by _start via WASI args_get).
+// Layout: [argc i32][bufsize i32][wasi_ptrs MAX_ARGS*4][env_ptrs MAX_ARGS*8][argv_buf ...]
+let is i64 as ARGV_REGION with imut = 65536;   // 64 KiB reserved for argc/argv
+let is i32 as MAX_ARGS     with imut = 256;
+let is i64 as ARGV_ARGC_OFF  with imut = 0;
+let is i64 as ARGV_BUFSZ_OFF with imut = 4;
+let is i64 as ARGV_WPTRS_OFF with imut = 8;         // WASI 4-byte ptr array
+let is i64 as ARGV_EPTRS_OFF with imut = 1032;      // 8 + 256*4 : widened 8-byte ptr array
+let is i64 as ARGV_BUF_OFF   with imut = 3080;      // 1032 + 256*8 : string storage
+let is i64 as g_argv_base with mut = 0;             // linear address of the argv region
+
 // ── Module state ──────────────────────────────────────────────────────
 let is i32 as g_ptr64 with mut = 0;              // 1 = wasm64 (memory64)
 
@@ -86,14 +97,24 @@ let is i32 as cur_argc with mut = 0;
 let is i32 as w_error with mut = 0;
 
 // WASI imports (fixed, low funcidx space). Type indices are also fixed:
-//   type 0 = proc_exit  (i32) -> ()
-//   type 1 = fd_write   (i32,i32,i32,i32) -> (i32)
-//   type 2 = _start     () -> ()
+//   type 0 = proc_exit       (i32) -> ()
+//   type 1 = fd_write/fd_read (i32,i32,i32,i32) -> (i32)
+//   type 2 = _start          () -> ()
+//   type 3 = fd_close        (i32) -> (i32)
+//   type 4 = fd_seek         (i32,i64,i32,i32) -> (i32)
+//   type 5 = path_open       (i32,i32,i32,i32,i32,i64,i64,i32,i32) -> (i32)
+//   type 6 = args_*_get      (i32,i32) -> (i32)
 // Uniform defined-function types (i64^n)->i64 follow at index WASI_NTYPES + k.
-let is i32 as WASI_NTYPES with imut = 3;
-let is i32 as IMP_PROC_EXIT with imut = 0;   // funcidx 0, type 0
-let is i32 as IMP_FD_WRITE  with imut = 1;   // funcidx 1, type 1
-let is i32 as IMP_FD_READ   with imut = 2;   // funcidx 2, type 1 (same sig as fd_write)
+let is i32 as WASI_NTYPES with imut = 7;
+let is i32 as IMP_PROC_EXIT  with imut = 0;   // funcidx 0, type 0
+let is i32 as IMP_FD_WRITE   with imut = 1;   // funcidx 1, type 1
+let is i32 as IMP_FD_READ    with imut = 2;   // funcidx 2, type 1
+let is i32 as IMP_FD_CLOSE   with imut = 3;   // funcidx 3, type 3
+let is i32 as IMP_FD_SEEK    with imut = 4;   // funcidx 4, type 4
+let is i32 as IMP_PATH_OPEN  with imut = 5;   // funcidx 5, type 5
+let is i32 as IMP_ARGS_SIZES with imut = 6;   // funcidx 6, type 6
+let is i32 as IMP_ARGS_GET   with imut = 7;   // funcidx 7, type 6
+let is i32 as NUM_IMPORTS    with imut = 8;
 
 let is i32 as g_has_main with mut = 0;
 let is i32 as g_main_funcidx with mut = 0;
@@ -104,10 +125,25 @@ fn wasi_idx(name as *u8, nlen as i32) as i32 {
     if (nlen == 9 && bytes_eq(name, "proc_exit", 9) == 1) { return IMP_PROC_EXIT; }
     if (nlen == 8 && bytes_eq(name, "fd_write", 8) == 1) { return IMP_FD_WRITE; }
     if (nlen == 7 && bytes_eq(name, "fd_read", 7) == 1) { return IMP_FD_READ; }
+    if (nlen == 8 && bytes_eq(name, "fd_close", 8) == 1) { return IMP_FD_CLOSE; }
+    if (nlen == 7 && bytes_eq(name, "fd_seek", 7) == 1) { return IMP_FD_SEEK; }
+    if (nlen == 9 && bytes_eq(name, "path_open", 9) == 1) { return IMP_PATH_OPEN; }
     return cast(i32, 0 - 1);
 }
-fn wasi_nargs(idx as i32) as i32 { if (idx == IMP_PROC_EXIT) { return 1; } return 4; }
+fn wasi_nargs(idx as i32) as i32 {
+    if (idx == IMP_PROC_EXIT || idx == IMP_FD_CLOSE) { return 1; }
+    if (idx == IMP_ARGS_SIZES || idx == IMP_ARGS_GET) { return 2; }
+    if (idx == IMP_PATH_OPEN) { return 9; }
+    return 4;                                  // fd_write, fd_read, fd_seek
+}
 fn wasi_hasres(idx as i32) as i32 { if (idx == IMP_PROC_EXIT) { return 0; } return 1; }
+// Which args are i64 (passed straight through); the rest are i32 (i32.wrap_i64).
+//   fd_seek arg1 = offset (i64); path_open args 5,6 = rights masks (i64).
+fn wasi_arg_is_i64(idx as i32, k as i32) as i32 {
+    if (idx == IMP_FD_SEEK && k == 1) { return 1; }
+    if (idx == IMP_PATH_OPEN && (k == 5 || k == 6)) { return 1; }
+    return 0;
+}
 
 // =====================================================================
 // Growable byte buffer
@@ -639,12 +675,40 @@ fn emit_va_start(c as *WBuf, i as *d.IRInst) as void {
 // name; call_name is the field. Args arrive in the arg-scratch locals (i64) and
 // are wrapped to i32 (WASI signatures are all i32). fd_write returns an i32
 // errno (widened back to i64); proc_exit has no result and never returns.
+// memory.grow / memory.size intrinsics: emitted inline (no host import). The
+// arg/result page counts are i32 on wasm32 (wrap in, sign-extend out so -1
+// failure survives) and i64 on wasm64.
+fn emit_mem_intrinsic(c as *WBuf, i as *d.IRInst, is_grow as i32) as void {
+    if (is_grow == 1) {
+        op_get(c, cur_scratch_base + 0);                   // delta (i64 vreg)
+        if (g_ptr64 == 0) { wb_u8(c, 0xA7); }              // i32.wrap_i64
+        wb_u8(c, 0x40); wb_u8(c, 0x00);                    // memory.grow (mem 0)
+    } else {
+        wb_u8(c, 0x3F); wb_u8(c, 0x00);                    // memory.size (mem 0)
+    }
+    if (g_ptr64 == 0) { wb_u8(c, 0xAC); }                  // i64.extend_i32_s
+    cur_argc = 0;
+    if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }   // drop
+    else { op_set(c, L_vreg(i.dest.vreg)); }
+}
+
 fn emit_ffi(c as *WBuf, i as *d.IRInst) as void {
+    // wasm memory intrinsics are recognized by name and lowered to opcodes.
+    if (i.call_name_len == 18 && bytes_eq(i.call_name_ptr, "__wasm_memory_grow", 18) == 1) {
+        emit_mem_intrinsic(c, i, 1); return;
+    }
+    if (i.call_name_len == 18 && bytes_eq(i.call_name_ptr, "__wasm_memory_size", 18) == 1) {
+        emit_mem_intrinsic(c, i, 0); return;
+    }
     let is i32 as idx = wasi_idx(i.call_name_ptr, cast(i32, i.call_name_len));
     if (idx < 0) { wasm_err("call to unknown host/WASI import"); cur_argc = 0; return; }
     let is i32 as n = wasi_nargs(idx);
     let is i32 as k with mut = 0;
-    while (k < n) { op_get(c, cur_scratch_base + k); wb_u8(c, 0xA7); k = k + 1; }  // i32.wrap_i64
+    while (k < n) {
+        op_get(c, cur_scratch_base + k);
+        if (wasi_arg_is_i64(idx, k) == 0) { wb_u8(c, 0xA7); }   // i32.wrap_i64 (i32 args only)
+        k = k + 1;
+    }
     wb_u8(c, 0x10); wb_uleb(c, cast(i64, idx));   // call <import>
     cur_argc = 0;
     if (wasi_hasres(idx) == 1) {
@@ -1066,7 +1130,11 @@ fn layout_data(p as *d.IRProgram) as void {
     }
 
     data_align(16);
-    let is i64 as data_end = g_data_base + g_data_len;
+    // Reserve the argv bootstrap region as BSS: bump the address accounting past
+    // it WITHOUT emitting zero bytes (wasm zero-inits all of linear memory), so
+    // the data segment stays compact but the shadow stack starts above it.
+    g_argv_base = g_data_base + g_data_len;
+    let is i64 as data_end = g_argv_base + ARGV_REGION;
     let is i64 as shadow_top = data_end + STACK_SIZE;
     g_sp_init = shadow_top;                    // grows down
     g_heap_base = shadow_top;
@@ -1130,6 +1198,19 @@ fn emit_type_section(m as *WBuf) as void {
     wb_uleb(&b, 1); wb_u8(&b, 0x7F);
     // type 2: _start () -> ()
     wb_u8(&b, 0x60); wb_uleb(&b, 0); wb_uleb(&b, 0);
+    // type 3: fd_close (i32) -> (i32)
+    wb_u8(&b, 0x60); wb_uleb(&b, 1); wb_u8(&b, 0x7F); wb_uleb(&b, 1); wb_u8(&b, 0x7F);
+    // type 4: fd_seek (i32,i64,i32,i32) -> (i32)
+    wb_u8(&b, 0x60); wb_uleb(&b, 4);
+    wb_u8(&b, 0x7F); wb_u8(&b, 0x7E); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F);
+    wb_uleb(&b, 1); wb_u8(&b, 0x7F);
+    // type 5: path_open (i32,i32,i32,i32,i32,i64,i64,i32,i32) -> (i32)
+    wb_u8(&b, 0x60); wb_uleb(&b, 9);
+    wb_u8(&b, 0x7F); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F);
+    wb_u8(&b, 0x7E); wb_u8(&b, 0x7E); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F);
+    wb_uleb(&b, 1); wb_u8(&b, 0x7F);
+    // type 6: args_sizes_get / args_get (i32,i32) -> (i32)
+    wb_u8(&b, 0x60); wb_uleb(&b, 2); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F); wb_uleb(&b, 1); wb_u8(&b, 0x7F);
     // uniform defined-function types (i64^n) -> i64
     let is i32 as t with mut = 0;
     while (t < g_num_types) {
@@ -1145,14 +1226,24 @@ fn emit_type_section(m as *WBuf) as void {
     d.opt_free(b.data);
 }
 fn emit_import_section(m as *WBuf) as void {
-    let is WBuf as b = wb_new(64);
-    wb_uleb(&b, 3);                            // three imports
+    let is WBuf as b = wb_new(128);
+    wb_uleb(&b, cast(i64, NUM_IMPORTS));       // eight imports
     wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "proc_exit", 9);
     wb_u8(&b, 0x00); wb_uleb(&b, 0);           // type 0
     wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_write", 8);
     wb_u8(&b, 0x00); wb_uleb(&b, 1);           // type 1
     wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_read", 7);
     wb_u8(&b, 0x00); wb_uleb(&b, 1);           // type 1 (same signature)
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_close", 8);
+    wb_u8(&b, 0x00); wb_uleb(&b, 3);           // type 3
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_seek", 7);
+    wb_u8(&b, 0x00); wb_uleb(&b, 4);           // type 4
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "path_open", 9);
+    wb_u8(&b, 0x00); wb_uleb(&b, 5);           // type 5
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "args_sizes_get", 14);
+    wb_u8(&b, 0x00); wb_uleb(&b, 6);           // type 6
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "args_get", 8);
+    wb_u8(&b, 0x00); wb_uleb(&b, 6);           // type 6
     wb_section(m, 2, &b);
     d.opt_free(b.data);
 }
@@ -1256,19 +1347,82 @@ fn emit_element_section(m as *WBuf) as void {
     wb_section(m, 9, &b);
     d.opt_free(b.data);
 }
-// Synthesized WASI entry: call main, wrap the i64 result to i32, call proc_exit.
+// Synthesized WASI entry: fetch argv via WASI, then call main(argc, argv), wrap
+// the i64 result to i32, and proc_exit.
+//
+// WASI has no argv on the stack: the guest calls args_sizes_get to learn the
+// count + total string bytes, then args_get to fill a pointer array + string
+// buffer. On wasm32 those pointers are 4 bytes, but the compiler's `main` reads
+// argv as an array of 8-byte pointers, so we widen each into a second array
+// (env_ptrs) before the call. Everything lands in the reserved argv BSS region.
 fn emit_start_body(c as *WBuf) as void {
-    let is WBuf as body = wb_new(32);
-    let is i32 as k with mut = 0;
-    while (k < g_main_nargs) { op_i64const(&body, 0); k = k + 1; }   // argc/argv = 0
+    let is WBuf as body = wb_new(160);
+    let is i32 as do_boot with mut = 0;
+    if (g_ptr64 == 0 && g_main_nargs >= 2) { do_boot = 1; }
+
+    if (do_boot == 1) {
+        // args_sizes_get(&argc, &bufsize)
+        op_i32const(&body, g_argv_base + ARGV_ARGC_OFF);
+        op_i32const(&body, g_argv_base + ARGV_BUFSZ_OFF);
+        wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_ARGS_SIZES));
+        wb_u8(&body, 0x1A);                                        // drop errno
+        // args_get(wasi_ptrs, argv_buf)
+        op_i32const(&body, g_argv_base + ARGV_WPTRS_OFF);
+        op_i32const(&body, g_argv_base + ARGV_BUF_OFF);
+        wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_ARGS_GET));
+        wb_u8(&body, 0x1A);                                        // drop errno
+        // for ($i = 0; $i < argc; $i++) env_ptrs[$i] = (i64)(u32)wasi_ptrs[$i]
+        op_i32const(&body, 0); wb_u8(&body, 0x21); wb_uleb(&body, 0);   // local.set $i
+        wb_u8(&body, 0x02); wb_u8(&body, 0x40);                    // block   (done)
+        wb_u8(&body, 0x03); wb_u8(&body, 0x40);                    // loop    (lp)
+        wb_u8(&body, 0x20); wb_uleb(&body, 0);                     // local.get $i
+        op_i32const(&body, g_argv_base + ARGV_ARGC_OFF);
+        wb_u8(&body, 0x28); wb_uleb(&body, 2); wb_uleb(&body, 0);  // i32.load argc
+        wb_u8(&body, 0x4E);                                        // i32.ge_s
+        wb_u8(&body, 0x0D); wb_uleb(&body, 1);                     // br_if done
+        //   dest = env_ptrs + $i*8
+        op_i32const(&body, g_argv_base + ARGV_EPTRS_OFF);
+        wb_u8(&body, 0x20); wb_uleb(&body, 0);
+        op_i32const(&body, 8); wb_u8(&body, 0x6C);                 // i32.mul
+        wb_u8(&body, 0x6A);                                        // i32.add
+        //   value = (i64)(u32) load(wasi_ptrs + $i*4)
+        op_i32const(&body, g_argv_base + ARGV_WPTRS_OFF);
+        wb_u8(&body, 0x20); wb_uleb(&body, 0);
+        op_i32const(&body, 4); wb_u8(&body, 0x6C);                 // i32.mul
+        wb_u8(&body, 0x6A);                                        // i32.add
+        wb_u8(&body, 0x28); wb_uleb(&body, 2); wb_uleb(&body, 0);  // i32.load
+        wb_u8(&body, 0xAD);                                        // i64.extend_i32_u
+        wb_u8(&body, 0x37); wb_uleb(&body, 3); wb_uleb(&body, 0);  // i64.store
+        wb_u8(&body, 0x20); wb_uleb(&body, 0);                     // local.get $i
+        op_i32const(&body, 1); wb_u8(&body, 0x6A);                 // i32.add
+        wb_u8(&body, 0x21); wb_uleb(&body, 0);                     // local.set $i
+        wb_u8(&body, 0x0C); wb_uleb(&body, 0);                     // br lp
+        wb_u8(&body, 0x0B);                                        // end loop
+        wb_u8(&body, 0x0B);                                        // end block
+        // main(argc, env_ptrs [, 0 ...])
+        op_i32const(&body, g_argv_base + ARGV_ARGC_OFF);
+        wb_u8(&body, 0x28); wb_uleb(&body, 2); wb_uleb(&body, 0);  // i32.load argc
+        wb_u8(&body, 0xAD);                                        // -> i64 (param 0)
+        op_i64const(&body, g_argv_base + ARGV_EPTRS_OFF);          // env_ptrs (param 1)
+        let is i32 as extra with mut = 2;
+        while (extra < g_main_nargs) { op_i64const(&body, 0); extra = extra + 1; }
+    } else {
+        let is i32 as k with mut = 0;
+        while (k < g_main_nargs) { op_i64const(&body, 0); k = k + 1; }   // argc/argv = 0
+    }
     wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, g_main_funcidx));   // call main
     wb_u8(&body, 0xA7);                        // i32.wrap_i64 (exit code)
     wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_PROC_EXIT));    // call proc_exit
     wb_u8(&body, 0x00);                        // unreachable
     wb_u8(&body, 0x0B);                        // end
-    // code entry: uleb(size) + locals(0) + body
-    wb_uleb(c, 1 + body.len);
-    wb_u8(c, 0x00);                            // 0 local groups
+    // code entry: uleb(size) + locals decl + body ($i:i32 local when bootstrapping)
+    if (do_boot == 1) {
+        wb_uleb(c, 3 + body.len);
+        wb_u8(c, 0x01); wb_u8(c, 0x01); wb_u8(c, 0x7F);   // 1 group: 1 × i32
+    } else {
+        wb_uleb(c, 1 + body.len);
+        wb_u8(c, 0x00);                        // 0 local groups
+    }
     wb_buf(c, &body);
     d.opt_free(body.data);
 }
@@ -1306,7 +1460,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
 
     g_ptr64 = 0;
     if (tgt.target_get().arch == tgt.ARCH_WASM64) { g_ptr64 = 1; }
-    g_num_imports = 3;                         // proc_exit(0), fd_write(1), fd_read(2)
+    g_num_imports = NUM_IMPORTS;               // proc_exit,fd_write,fd_read,fd_close,fd_seek,path_open,args_sizes_get,args_get
     w_error = 0;
 
     collect_functions(p);
