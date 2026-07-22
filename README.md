@@ -2,9 +2,9 @@
 
 **A self-hosted native x86_64/AArch64 compiler — no LLVM, no libc, no runtime.**
 
-![version](https://img.shields.io/badge/version-0.0.14-blue)
+![version](https://img.shields.io/github/v/release/Caua726/Caustic?include_prereleases&sort=semver&label=version&color=blue)
 ![self-hosted](https://img.shields.io/badge/self--hosted-yes-success)
-![targets](https://img.shields.io/badge/targets-Linux%20%C2%B7%20Windows%20%C2%B7%20CausticOS-orange)
+![targets](https://img.shields.io/badge/targets-Linux%20%C2%B7%20Windows%20%C2%B7%20CausticOS%20%C2%B7%20WebAssembly-orange)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![arch](https://img.shields.io/badge/arch-x86__64%20%C2%B7%20AArch64-lightgrey)
 
@@ -79,6 +79,7 @@ A single source tree builds multiple architectures and executable formats. Selec
 | **Linux AArch64** | `--target=linux-aarch64` | static **ELF64**, AAPCS64, raw `svc` | Linux AArch64 | Scalar backend; atomics and threads supported |
 | **Windows** | `--target=windows-x86_64` | **PE32+** `.exe` (+ `.pdb`), DLL imports via IAT | Windows | Stable — **cross-compiles from Linux** |
 | **Universal** | `--target=caustic-x86_64` | **CSE** (Caustic Standard Executable) | **Linux · Windows · CausticOS** | Experimental |
+| **WebAssembly** | `--target=wasm32-wasi` / `wasm64-wasi` | **`.wasm`** module (emitted directly, WASI preview1) | Node · Deno · any WASM runtime | Experimental — **self-hosts on wasm** |
 
 **Cross-compilation works today.** A Windows `.exe` built on Linux runs under
 Wine (and on Windows) with no changes to the source — the FFI layer reorders
@@ -246,9 +247,9 @@ the right backend at compile time. Pure modules have no OS dependency at all.
 | `compatcffi.cst` | C-ABI struct/union layout & errno helpers | pure |
 | `causticos/img/csif.cst` | Strict CSIF BASELINE validation and RAW/QOI decoding | CausticOS VFS + pure decode core |
 
-*New since the last release:* `os`, `errors`, `path`, `process`, `term`, and the
-portable-facade architecture across `io`, `net`, `time`, `env`, `random`, and
-`mem`.
+*New since the last release:* `thread` and `sync` — atomics, 1:1 OS threads, and
+the full sync toolkit (mutex, cond, rwlock, `WaitGroup`, bounded MPSC channel) —
+plus WebAssembly/WASI support wired through every portable facade.
 
 ## Toolchain
 
