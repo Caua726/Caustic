@@ -390,20 +390,38 @@ Key model (see the driver's header comment + the plan doc):
   each access + 32-bit memtype; wasm64 uses i64 addresses directly + the 0x04
   memtype index-type flag. wasm32 runs unflagged everywhere; wasm64 needs
   `node --experimental-wasm-memory64`.
-- **WASI I/O.** `os.current()` folds to `OS_WASM` (parser builtin
+- **WASI I/O + FS.** `os.current()` folds to `OS_WASM` (parser builtin
   `__target_is_wasm`, os == "wasm"); the io.cst facade dispatches to
   `std/io/wasm.cst` → `std/os/wasm.cst`, whose `extern "wasi_snapshot_preview1"`
-  decls lower to `IR_FFI_CALL` → `call <import>`. The backend hardcodes imports
-  `proc_exit`(0)/`fd_write`(1)/`fd_read`(2) and synthesizes an exported `_start`
-  that calls `main` and `proc_exit(result)`. Filesystem ops are stubbed (WASI
-  `path_*` over preopened dirs is not wired yet).
-- **Not yet supported** (rejected with a diagnostic): variadic functions
-  (so `io.printf` doesn't work — use `write_str`/`write_int`), function pointers
-  (`IR_FN_ADDR`/`IR_CALL_INDIRECT`), closures, SIMD, and non-WASI extern calls.
+  decls lower to `IR_FFI_CALL` → `call <import>`. The backend imports 8 WASI
+  funcs (`proc_exit`,`fd_write`,`fd_read`,`fd_close`,`fd_seek`,`path_open`,
+  `args_sizes_get`,`args_get`) and synthesizes an exported `_start` that fetches
+  argv via `args_*_get` (widening the 4-byte wasm32 pointers into the 8-byte
+  array `main` reads), calls `main`, then `proc_exit(result)`. **Filesystem** is
+  wired: `os/wasm.cst` opens paths relative to the **fd-3 preopen** (strip a
+  leading `./` or `/`) and requests only FD_* file rights (`0xE001FF` — asking
+  for PATH_* rights makes uvwasi return `ENOTCAPABLE`); `path_unlink_file`/
+  `path_rename`/`path_create_directory` are still stubbed.
+- **Heap** via the `memory.grow` opcode: `std/mem/wasm.cst` `page_alloc` grows
+  linear memory in 64 KiB pages (append-only; `page_free` = no-op / bump). The
+  backend recognizes the `__wasm_memory_grow`/`__wasm_memory_size` externs by
+  name in `emit_ffi` and emits `memory.grow`(0x40)/`memory.size`(0x3F) inline.
+- **Self-hosts on wasm**: `caustic.wasm` (the compiler built with
+  `--target=wasm32-wasi src/main.cst`) runs under `node:wasi` and compiles a
+  `.cst` (+ its `std/*` imports, read through `path_open`) to a valid runnable
+  `.wasm` — byte-identical to native for import-free programs. Compiling the
+  *whole compiler* to a fixpoint on wasm is blocked only by V8's wasm-stack
+  limit (the recursive module loader over-deepens on the largest files;
+  SIGSEGVs node rather than trapping) — needs a runtime with a bigger wasm stack
+  (wasmtime `--max-wasm-stack`) or an iterative module loader.
+- **Not yet supported** (rejected with a diagnostic): closures (captured-context
+  calls), SIMD (only at -O2), and non-WASI extern C calls. Variadics
+  (`io.printf`), function pointers (`IR_CALL_INDIRECT`), and atomics DO work.
   `IR_SET_CTX` (context-register clear before every `let x = call()`) is a no-op.
 
 Verify with Node: instantiate the `.wasm` and call an export directly, or run
-`_start` under `node:wasi` (`WASI` class, preview1). No wasmtime/wabt needed.
+`_start` under `node:wasi` (`WASI` class, preview1) — for filesystem access pass
+`preopens: { '/': <dir> }`. No wasmtime/wabt needed.
 
 ## Future work (not implemented)
 
