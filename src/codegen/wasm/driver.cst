@@ -50,6 +50,18 @@ let is i64 as g_argv_base with mut = 0;             // linear address of the arg
 // ── Module state ──────────────────────────────────────────────────────
 let is i32 as g_ptr64 with mut = 0;              // 1 = wasm64 (memory64)
 
+// Custom (non-WASI) host imports discovered from extern "<module>" fn calls.
+// They occupy funcidx NUM_IMPORTS .. NUM_IMPORTS+g_cimp_count-1, ahead of the
+// defined functions. Signature is (i64^nargs) -> i64 (or -> () when void).
+let is i32 as CIMP_MAX with imut = 512;
+let is *u8 as g_cimp_name_ptr with mut = cast(*u8, 0);   // 8B each
+let is *u8 as g_cimp_name_len with mut = cast(*u8, 0);   // 4B each
+let is *u8 as g_cimp_mod_ptr  with mut = cast(*u8, 0);   // 8B each
+let is *u8 as g_cimp_mod_len  with mut = cast(*u8, 0);   // 4B each
+let is *u8 as g_cimp_nargs    with mut = cast(*u8, 0);   // 4B each
+let is *u8 as g_cimp_hasres   with mut = cast(*u8, 0);   // 4B each
+let is i32 as g_cimp_count with mut = 0;
+
 // Defined-function table (parallel arrays, indexed by funcidx).
 let is *u8 as g_fn_ptr  with mut = cast(*u8, 0); // *IRFunction per idx (8B each)
 let is *u8 as g_fn_args with mut = cast(*u8, 0); // num_args per idx (4B each)
@@ -743,6 +755,51 @@ fn emit_mem_intrinsic(c as *WBuf, i as *d.IRInst, is_grow as i32) as void {
     else { op_set(c, L_vreg(i.dest.vreg)); }
 }
 
+// Is this FFI-call name a custom host import (not a WASI call, not a wasm intrinsic)?
+fn is_custom_ffi(name as *u8, nlen as i32) as i32 {
+    if (nlen == 18 && bytes_eq(name, "__wasm_memory_grow", 18) == 1) { return 0; }
+    if (nlen == 18 && bytes_eq(name, "__wasm_memory_size", 18) == 1) { return 0; }
+    if (wasi_idx(name, nlen) >= 0) { return 0; }
+    return 1;
+}
+fn cimp_find(name as *u8, nlen as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < g_cimp_count) {
+        if (arr_geti32(g_cimp_name_len, k) == nlen
+            && bytes_eq(cast(*u8, arr_geti64(g_cimp_name_ptr, k)), name, nlen) == 1) { return k; }
+        k = k + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+fn cimp_add(name as *u8, nlen as i32, modp as *u8, modl as i32, nargs as i32, hasres as i32) as i32 {
+    let is i32 as ex = cimp_find(name, nlen);
+    if (ex >= 0) { return ex; }
+    if (g_cimp_count >= CIMP_MAX) { return cast(i32, 0 - 1); }
+    let is i32 as k = g_cimp_count;
+    arr_seti64(g_cimp_name_ptr, k, cast(i64, name)); arr_seti32(g_cimp_name_len, k, nlen);
+    arr_seti64(g_cimp_mod_ptr, k, cast(i64, modp));  arr_seti32(g_cimp_mod_len, k, modl);
+    arr_seti32(g_cimp_nargs, k, nargs);              arr_seti32(g_cimp_hasres, k, hasres);
+    g_cimp_count = k + 1;
+    return k;
+}
+// Scan one function's IR for non-WASI extern calls, registering each as a
+// custom import. name/module strings are interned (owned by the IR), and the
+// IR must stay live until code emission — the caller keeps it (no free here).
+fn scan_func_customs(f as *d.IRFunction) as void {
+    let is *d.IRInst as ins with mut = f.instructions;
+    while (cast(i64, ins) != 0) {
+        if (ins.op == d.IR_FFI_CALL
+            && is_custom_ffi(ins.call_name_ptr, cast(i32, ins.call_name_len)) == 1) {
+            let is i32 as hasres with mut = 1;
+            if (cast(i64, ins.cast_to) == cast(i64, ast.type_void)) { hasres = 0; }
+            cimp_add(ins.call_name_ptr, cast(i32, ins.call_name_len),
+                     ins.asm_str_ptr, ins.asm_str_len,
+                     cast(i32, ins.src2.imm), hasres);
+        }
+        ins = ins.next;
+    }
+}
+
 fn emit_ffi(c as *WBuf, i as *d.IRInst) as void {
     // wasm memory intrinsics are recognized by name and lowered to opcodes.
     if (i.call_name_len == 18 && bytes_eq(i.call_name_ptr, "__wasm_memory_grow", 18) == 1) {
@@ -752,20 +809,39 @@ fn emit_ffi(c as *WBuf, i as *d.IRInst) as void {
         emit_mem_intrinsic(c, i, 0); return;
     }
     let is i32 as idx = wasi_idx(i.call_name_ptr, cast(i32, i.call_name_len));
-    if (idx < 0) { wasm_err("call to unknown host/WASI import"); cur_argc = 0; return; }
-    let is i32 as n = wasi_nargs(idx);
-    let is i32 as k with mut = 0;
-    while (k < n) {
-        op_get(c, cur_scratch_base + k);
-        if (wasi_arg_is_i64(idx, k) == 0) { wb_u8(c, 0xA7); }   // i32.wrap_i64 (i32 args only)
-        k = k + 1;
+    if (idx >= 0) {
+        let is i32 as n = wasi_nargs(idx);
+        let is i32 as k with mut = 0;
+        while (k < n) {
+            op_get(c, cur_scratch_base + k);
+            if (wasi_arg_is_i64(idx, k) == 0) { wb_u8(c, 0xA7); }   // i32.wrap_i64 (i32 args only)
+            k = k + 1;
+        }
+        wb_u8(c, 0x10); wb_uleb(c, cast(i64, idx));   // call <import>
+        cur_argc = 0;
+        if (wasi_hasres(idx) == 1) {
+            if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }   // drop
+            else { wb_u8(c, 0xAD); op_set(c, L_vreg(i.dest.vreg)); }  // i64.extend_i32_u
+        }
+        return;
     }
-    wb_u8(c, 0x10); wb_uleb(c, cast(i64, idx));   // call <import>
-    cur_argc = 0;
-    if (wasi_hasres(idx) == 1) {
-        if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }   // drop
-        else { wb_u8(c, 0xAD); op_set(c, L_vreg(i.dest.vreg)); }  // i64.extend_i32_u
+    // Custom host import (extern "<module>" fn ...): (i64^nargs) -> i64/(). Args
+    // pass straight through as i64 (pointers arrive as linear-memory offsets).
+    let is i32 as cidx = cimp_find(i.call_name_ptr, cast(i32, i.call_name_len));
+    if (cidx >= 0) {
+        let is i32 as cn = arr_geti32(g_cimp_nargs, cidx);
+        let is i32 as ck with mut = 0;
+        while (ck < cn) { op_get(c, cur_scratch_base + ck); ck = ck + 1; }
+        wb_u8(c, 0x10); wb_uleb(c, cast(i64, NUM_IMPORTS + cidx));   // call custom import
+        cur_argc = 0;
+        if (arr_geti32(g_cimp_hasres, cidx) == 1 && i.dest.op_type != d.OP_NONE) {
+            op_set(c, L_vreg(i.dest.vreg));           // i64 result
+        } else if (arr_geti32(g_cimp_hasres, cidx) == 1) {
+            wb_u8(c, 0x1A);                           // drop unused result
+        }
+        return;
     }
+    wasm_err("call to unknown host/WASI import"); cur_argc = 0;
 }
 
 fn emit_ret(c as *WBuf, i as *d.IRInst) as void {
@@ -1246,7 +1322,7 @@ fn resolve_global_addr(name as *u8, nlen as i32) as i64 {
 // =====================================================================
 fn emit_type_section(m as *WBuf) as void {
     let is WBuf as b = wb_new(64);
-    wb_uleb(&b, cast(i64, WASI_NTYPES + g_num_types));
+    wb_uleb(&b, cast(i64, WASI_NTYPES + g_num_types + g_cimp_count));
     // type 0: proc_exit (i32) -> ()
     wb_u8(&b, 0x60); wb_uleb(&b, 1); wb_u8(&b, 0x7F); wb_uleb(&b, 0);
     // type 1: fd_write (i32,i32,i32,i32) -> (i32)
@@ -1291,12 +1367,24 @@ fn emit_type_section(m as *WBuf) as void {
         wb_uleb(&b, 1); wb_u8(&b, 0x7E);
         t = t + 1;
     }
+    // custom host-import types (i64^nargs) -> i64 | ()
+    let is i32 as ci with mut = 0;
+    while (ci < g_cimp_count) {
+        let is i32 as cna = arr_geti32(g_cimp_nargs, ci);
+        wb_u8(&b, 0x60);
+        wb_uleb(&b, cast(i64, cna));
+        let is i32 as ck with mut = 0;
+        while (ck < cna) { wb_u8(&b, 0x7E); ck = ck + 1; }
+        if (arr_geti32(g_cimp_hasres, ci) == 1) { wb_uleb(&b, 1); wb_u8(&b, 0x7E); }
+        else { wb_uleb(&b, 0); }
+        ci = ci + 1;
+    }
     wb_section(m, 1, &b);
     d.opt_free(b.data);
 }
 fn emit_import_section(m as *WBuf) as void {
     let is WBuf as b = wb_new(256);
-    wb_uleb(&b, cast(i64, NUM_IMPORTS));       // 17 imports
+    wb_uleb(&b, cast(i64, g_num_imports));     // 17 WASI + custom host imports
     wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "proc_exit", 9);
     wb_u8(&b, 0x00); wb_uleb(&b, 0);           // type 0
     wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_write", 8);
@@ -1331,6 +1419,16 @@ fn emit_import_section(m as *WBuf) as void {
     wb_u8(&b, 0x00); wb_uleb(&b, 6);           // type 6
     wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "environ_get", 11);
     wb_u8(&b, 0x00); wb_uleb(&b, 6);           // type 6
+    // custom host imports: module "<extern-string>", field "<fn-name>", their
+    // own types right after the uniform defined-function types.
+    let is i32 as ci with mut = 0;
+    while (ci < g_cimp_count) {
+        wb_name(&b, cast(*u8, arr_geti64(g_cimp_mod_ptr, ci)), arr_geti32(g_cimp_mod_len, ci));
+        wb_name(&b, cast(*u8, arr_geti64(g_cimp_name_ptr, ci)), arr_geti32(g_cimp_name_len, ci));
+        wb_u8(&b, 0x00);
+        wb_uleb(&b, cast(i64, WASI_NTYPES + g_num_types + ci));
+        ci = ci + 1;
+    }
     wb_section(m, 2, &b);
     d.opt_free(b.data);
 }
@@ -1403,7 +1501,35 @@ fn emit_export_section(m as *WBuf) as void {
 // Build the Code section body into g_code. Regens/emits/frees IR per function.
 // Side effects: populates the funcref table (FN_ADDR) and interns indirect-call
 // types — so this must run BEFORE the Type/Table/Element sections are emitted.
+// Pass A (runs before funcidx resolution): regen each function's IR and register
+// any non-WASI extern calls as custom host imports. The IR is KEPT (not freed) so
+// build_code_body can emit it without a second regen. Custom imports occupy
+// funcidx just below the defined functions, so counting them here (and bumping
+// g_num_imports) shifts every defined funcidx (= g_num_imports + index) up before
+// g_main_funcidx / call sites are resolved.
+fn scan_custom_imports(p as *d.IRProgram) as void {
+    g_cimp_name_ptr = d.opt_alloc(cast(i64, CIMP_MAX) * 8);
+    g_cimp_name_len = d.opt_alloc(cast(i64, CIMP_MAX) * 4);
+    g_cimp_mod_ptr  = d.opt_alloc(cast(i64, CIMP_MAX) * 8);
+    g_cimp_mod_len  = d.opt_alloc(cast(i64, CIMP_MAX) * 4);
+    g_cimp_nargs    = d.opt_alloc(cast(i64, CIMP_MAX) * 4);
+    g_cimp_hasres   = d.opt_alloc(cast(i64, CIMP_MAX) * 4);
+    g_cimp_count = 0;
+    let is i32 as sk with mut = 0;
+    while (sk < g_num_funcs) {
+        let is *d.IRFunction as sf = cast(*d.IRFunction, arr_geti64(g_fn_ptr, sk));
+        if (cast(i64, sf.instructions) == 0 && cast(i64, sf.ast_node) != 0) {
+            irp.regen_func_ir(sf);
+        }
+        scan_func_customs(sf);
+        sk = sk + 1;
+    }
+    g_num_imports = NUM_IMPORTS + g_cimp_count;
+}
+
 fn build_code_body(p as *d.IRProgram) as void {
+    // Emit each function body (IR already regen'd + kept live by scan_custom_imports)
+    // and free it.
     g_code = wb_new(4096);
     let is i32 as total with mut = g_num_funcs;
     if (g_has_main == 1) { total = total + 1; }
@@ -1567,6 +1693,10 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     g_tbl_count = 0;
 
     layout_data(p);                            // may add fn-ptr globals to the table
+
+    // Discover custom (non-WASI) host imports and finalize g_num_imports BEFORE
+    // any funcidx is resolved (g_main_funcidx below, and all call sites).
+    scan_custom_imports(p);
 
     // Resolve the entry point for the synthesized _start.
     g_has_main = 0;
