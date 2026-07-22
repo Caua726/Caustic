@@ -20,8 +20,11 @@
 // fd_close, fd_seek, path_open (relative to a single preopen at fd 3),
 // args_sizes_get, args_get. Paths are sandboxed to the preopen directory.
 
-import { readFileSync, openSync, readSync, writeSync, closeSync, fstatSync } from 'node:fs';
+import { readFileSync, openSync, readSync, writeSync, closeSync, fstatSync,
+         statSync, unlinkSync, mkdirSync, rmdirSync, renameSync } from 'node:fs';
 import { resolve, normalize } from 'node:path';
+import { randomFillSync } from 'node:crypto';
+import { hrtime } from 'node:process';
 
 const [modPath, preopen, ...guestArgs] = process.argv.slice(2);
 if (!modPath || !preopen) {
@@ -99,6 +102,50 @@ const wasi = {
   args_get(argvP, bufP) {
     refresh(); let bp = bufP;
     for (let i = 0; i < ARGS.length; i++) { wr32(argvP + i * 4, bp); const b = enc.encode(ARGS[i]); u8.set(b, bp); bp += b.length; u8[bp++] = 0; }
+    return 0;
+  },
+  // --- filesystem mutators (relative to the preopen) ---
+  path_unlink_file(fd, pathP, pathL) {
+    try { unlinkSync(relResolve(str(pathP, pathL))); return 0; } catch { return 44; }
+  },
+  path_create_directory(fd, pathP, pathL) {
+    try { mkdirSync(relResolve(str(pathP, pathL))); return 0; } catch { return 44; }
+  },
+  path_remove_directory(fd, pathP, pathL) {
+    try { rmdirSync(relResolve(str(pathP, pathL))); return 0; } catch { return 44; }
+  },
+  path_rename(oldFd, oldP, oldL, newFd, newP, newL) {
+    try { renameSync(relResolve(str(oldP, oldL)), relResolve(str(newP, newL))); return 0; } catch { return 44; }
+  },
+  path_filestat_get(fd, flags, pathP, pathL, bufP) {
+    let st; try { st = statSync(relResolve(str(pathP, pathL))); } catch { return 44; }
+    refresh();
+    // WASI filestat: dev(0) ino(8) filetype(16) nlink(24) size(32) atim(40) mtim(48) ctim(56)
+    for (let i = 0; i < 64; i++) u8[bufP + i] = 0;
+    wr64(bufP + 32, BigInt(Math.floor(st.size)));
+    wr64(bufP + 40, BigInt(Math.round(st.atimeMs * 1e6)));
+    wr64(bufP + 48, BigInt(Math.round(st.mtimeMs * 1e6)));
+    wr64(bufP + 56, BigInt(Math.round(st.ctimeMs * 1e6)));
+    return 0;
+  },
+  // --- clocks --- 0 = realtime, 1 = monotonic; result is nanoseconds
+  clock_time_get(clockId, precision, timeP) {
+    const ns = clockId === 0 ? BigInt(Date.now()) * 1000000n : hrtime.bigint();
+    wr64(timeP, ns); return 0;
+  },
+  // --- entropy ---
+  random_get(bufP, bufL) {
+    refresh(); randomFillSync(u8, bufP, bufL); return 0;
+  },
+  // --- environment ---
+  environ_sizes_get(countP, bufP) {
+    const e = Object.entries(process.env);
+    let bytes = 0; for (const [k, v] of e) bytes += enc.encode(`${k}=${v}`).length + 1;
+    wr32(countP, e.length); wr32(bufP, bytes); return 0;
+  },
+  environ_get(environP, bufP) {
+    refresh(); const e = Object.entries(process.env); let bp = bufP;
+    for (let i = 0; i < e.length; i++) { wr32(environP + i * 4, bp); const b = enc.encode(`${e[i][0]}=${e[i][1]}`); u8.set(b, bp); bp += b.length; u8[bp++] = 0; }
     return 0;
   },
 };

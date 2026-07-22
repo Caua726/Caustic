@@ -15,6 +15,15 @@ extern "wasi_snapshot_preview1" fn proc_exit(code as i32) as void;
 extern "wasi_snapshot_preview1" fn fd_close(fd as i32) as i32;
 extern "wasi_snapshot_preview1" fn fd_seek(fd as i32, offset as i64, whence as i32, newoffset as *u8) as i32;
 extern "wasi_snapshot_preview1" fn path_open(dirfd as i32, dirflags as i32, path as *u8, path_len as i32, oflags as i32, rights_base as i64, rights_inh as i64, fdflags as i32, opened_fd as *u8) as i32;
+extern "wasi_snapshot_preview1" fn path_unlink_file(dirfd as i32, path as *u8, path_len as i32) as i32;
+extern "wasi_snapshot_preview1" fn path_create_directory(dirfd as i32, path as *u8, path_len as i32) as i32;
+extern "wasi_snapshot_preview1" fn path_remove_directory(dirfd as i32, path as *u8, path_len as i32) as i32;
+extern "wasi_snapshot_preview1" fn path_rename(old_dirfd as i32, old_path as *u8, old_len as i32, new_dirfd as i32, new_path as *u8, new_len as i32) as i32;
+extern "wasi_snapshot_preview1" fn path_filestat_get(dirfd as i32, flags as i32, path as *u8, path_len as i32, buf as *u8) as i32;
+extern "wasi_snapshot_preview1" fn clock_time_get(clock_id as i32, precision as i64, time_out as *u8) as i32;
+extern "wasi_snapshot_preview1" fn random_get(buf as *u8, buf_len as i32) as i32;
+extern "wasi_snapshot_preview1" fn environ_sizes_get(count as *u8, bufsize as *u8) as i32;
+extern "wasi_snapshot_preview1" fn environ_get(environ as *u8, buf as *u8) as i32;
 
 // wasm memory intrinsics: the backend intercepts these by name in emit_ffi and
 // emits the `memory.grow` / `memory.size` opcodes inline (no host import). Both
@@ -127,3 +136,130 @@ fn seek(fd as i64, offset as i64, whence as i32) as i64 {
     if (rc != 0) { return cast(i64, 0 - 1); }
     return *pnew;
 }
+
+// --- Filesystem mutators (relative to the fd-3 preopen) ---
+// All return 0 on success, -1 on error.
+fn unlink(path as *u8) as i32 {
+    let is *u8 as rel = _rel_path(path);
+    if (path_unlink_file(PREOPEN_FD, rel, cast(i32, cstr_len(rel))) != 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+fn mkdir(path as *u8) as i32 {
+    let is *u8 as rel = _rel_path(path);
+    if (path_create_directory(PREOPEN_FD, rel, cast(i32, cstr_len(rel))) != 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+fn rmdir(path as *u8) as i32 {
+    let is *u8 as rel = _rel_path(path);
+    if (path_remove_directory(PREOPEN_FD, rel, cast(i32, cstr_len(rel))) != 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+fn rename(oldp as *u8, newp as *u8) as i32 {
+    let is *u8 as ro = _rel_path(oldp);
+    let is *u8 as rn = _rel_path(newp);
+    if (path_rename(PREOPEN_FD, ro, cast(i32, cstr_len(ro)),
+                    PREOPEN_FD, rn, cast(i32, cstr_len(rn))) != 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+
+// WASI filestat is 64 bytes; mtim (last-modification, nanoseconds) is at offset 48.
+let is i32 as _FILESTAT_MTIM_OFF with imut = 48;
+// Last-modification time of `path` in nanoseconds, or 0 if the file is missing.
+fn mtime(path as *u8) as i64 {
+    let is [64]u8 as st;
+    let is *u8 as rel = _rel_path(path);
+    // flags bit 0 = symlink_follow
+    if (path_filestat_get(PREOPEN_FD, 1, rel, cast(i32, cstr_len(rel)), cast(*u8, &st)) != 0) { return 0; }
+    return *cast(*i64, cast(i64, &st) + cast(i64, _FILESTAT_MTIM_OFF));
+}
+// Existence check: try to stat; 1 if present, 0 if not.
+fn exists(path as *u8) as i32 {
+    let is [64]u8 as st;
+    let is *u8 as rel = _rel_path(path);
+    if (path_filestat_get(PREOPEN_FD, 1, rel, cast(i32, cstr_len(rel)), cast(*u8, &st)) != 0) { return 0; }
+    return 1;
+}
+
+// --- Clocks ---  WASI clock ids: 0 = realtime, 1 = monotonic.
+let is i32 as CLOCK_REALTIME  with imut = 0;
+let is i32 as CLOCK_MONOTONIC with imut = 1;
+fn _clock_ns(clock_id as i32) as i64 {
+    let is [8]u8 as slot;
+    let is *i64 as p = cast(*i64, &slot);
+    *p = 0;
+    if (clock_time_get(clock_id, 0, cast(*u8, &slot)) != 0) { return 0; }
+    return *p;                                   // WASI returns nanoseconds
+}
+fn now_ns() as i64 { return _clock_ns(CLOCK_MONOTONIC); }
+fn unix_time_ms() as i64 { return _clock_ns(CLOCK_REALTIME) / 1000000; }
+
+// --- Entropy ---  Fills buf with buf_len random bytes; returns bytes filled or -1.
+fn getrandom(buf as *u8, buf_len as i64) as i64 {
+    if (random_get(buf, cast(i32, buf_len)) != 0) { return cast(i64, 0 - 1); }
+    return buf_len;
+}
+
+// --- Environment ---  environ_sizes_get + environ_get. Pointers are 4 bytes on
+// wasm32; callers that want the C-string array should widen (see env.cst).
+fn env_sizes(count_out as *i32, bufsize_out as *i32) as i32 {
+    return environ_sizes_get(cast(*u8, count_out), cast(*u8, bufsize_out));
+}
+fn env_read(ptr_array as *u8, buf as *u8) as i32 {
+    return environ_get(ptr_array, buf);
+}
+
+// =======================================================
+// Primitives WASI preview1 cannot express — provided for os.linux surface
+// parity so portable/compat code compiles. Each returns an error (or a benign
+// default). WASI is a capability sandbox: no process spawning, no raw sockets,
+// no arbitrary mmap, no ambient cwd/uid/tty. Programs needing these must guard
+// with os.current() and take a non-wasm path.
+// =======================================================
+
+// Memory — the heap comes from memory.grow via std/mem/wasm.cst; there is no
+// arbitrary mapping. brk/mprotect/mremap are meaningless here.
+fn mmap(addr as *u8, len as i64, prot as i64, flags as i64, fd as i64, off as i64) as *u8 { return cast(*u8, 0); }
+fn munmap(addr as *u8, len as i64) as i64 { return 0; }
+fn brk(addr as *u8) as *u8 { return cast(*u8, 0); }
+fn mprotect(addr as *u8, len as i64, prot as i64) as i64 { return cast(i64, 0 - 1); }
+fn mremap(old_addr as *u8, old_size as i64, new_size as i64, flags as i64, new_addr as *u8) as *u8 { return cast(*u8, 0); }
+
+// Process / signals — no process model in WASI preview1.
+fn getpid() as i64 { return 1; }
+fn getppid() as i64 { return 0; }
+fn fork() as i64 { return cast(i64, 0 - 1); }
+fn execve(path as *u8, argv as *u8, envp as *u8) as i64 { return cast(i64, 0 - 1); }
+fn wait4(pid as i64, status as *i32, options as i64, rusage as *u8) as i64 { return cast(i64, 0 - 1); }
+
+// Descriptors — no pipe/dup/ioctl/fcntl in the preview1 subset we bind.
+fn pipe(pipefd as *i32) as i64 { return cast(i64, 0 - 1); }
+fn pipe2(pipefd as *i32, flags as i64) as i64 { return cast(i64, 0 - 1); }
+fn dup2(oldfd as i64, newfd as i64) as i64 { return cast(i64, 0 - 1); }
+fn dup3(oldfd as i64, newfd as i64, flags as i64) as i64 { return cast(i64, 0 - 1); }
+fn ioctl(fd as i64, request as i64, arg as *u8) as i64 { return cast(i64, 0 - 1); }
+fn fcntl(fd as i64, cmd as i64, arg as i64) as i64 { return cast(i64, 0 - 1); }
+
+// Filesystem extras not wired to path_* yet.
+fn readlink(path as *u8, buf as *u8, bufsiz as i64) as i64 { return cast(i64, 0 - 1); }
+fn symlink(target as *u8, linkpath as *u8) as i64 { return cast(i64, 0 - 1); }
+fn link(oldpath as *u8, newpath as *u8) as i64 { return cast(i64, 0 - 1); }
+fn ftruncate(fd as i64, length as i64) as i64 { return cast(i64, 0 - 1); }
+fn getcwd(buf as *u8, size as i64) as i64 { return cast(i64, 0 - 1); }
+fn chdir(path as *u8) as i64 { return cast(i64, 0 - 1); }
+fn chmod(path as *u8, mode as i64) as i64 { return 0; }   // no exec/mode bits under WASI
+fn access(path as *u8, mode as i64) as i64 { if (exists(path) == 1) { return 0; } return cast(i64, 0 - 1); }
+
+// Sockets — WASI preview1 cannot create/bind/connect sockets.
+fn socket(domain as i64, sock_type as i64, protocol as i64) as i64 { return cast(i64, 0 - 1); }
+fn connect(sockfd as i64, addr as *u8, addrlen as i64) as i64 { return cast(i64, 0 - 1); }
+fn accept(sockfd as i64, addr as *u8, addrlen as *u32) as i64 { return cast(i64, 0 - 1); }
+fn sendto(sockfd as i64, buf as *u8, len as i64, flags as i64, dest_addr as *u8, addrlen as i64) as i64 { return cast(i64, 0 - 1); }
+fn recvfrom(sockfd as i64, buf as *u8, len as i64, flags as i64, src_addr as *u8, addrlen as *u32) as i64 { return cast(i64, 0 - 1); }
+fn bind(sockfd as i64, addr as *u8, addrlen as i64) as i64 { return cast(i64, 0 - 1); }
+fn listen(sockfd as i64, backlog as i64) as i64 { return cast(i64, 0 - 1); }
+fn setsockopt(sockfd as i64, level as i64, optname as i64, optval as *u8, optlen as i64) as i64 { return cast(i64, 0 - 1); }
+
+// Threading / scheduling — single-threaded model.
+fn sched_yield() as i64 { return 0; }
+fn gettid() as i64 { return 1; }
+fn getdents64(fd as i64, dirp as *u8, count as i64) as i64 { return cast(i64, 0 - 1); }
