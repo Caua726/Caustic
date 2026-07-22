@@ -406,27 +406,26 @@ Key model (see the driver's header comment + the plan doc):
   linear memory in 64 KiB pages (append-only; `page_free` = no-op / bump). The
   backend recognizes the `__wasm_memory_grow`/`__wasm_memory_size` externs by
   name in `emit_ffi` and emits `memory.grow`(0x40)/`memory.size`(0x3F) inline.
+- **Shared memory**: the linear memory is emitted `shared` (SharedArrayBuffer-backed,
+  flag `0x03`/`0x07`, 2 GiB max). A plain memory grows by *detaching* and
+  reallocating its backing store, which invalidates any view a host cached over it
+  (node:wasi does this and then crashes in V8's GC); a shared memory grows in place.
 - **Self-hosts on wasm (full fixpoint)**: `caustic.wasm` (built with
   `--target=wasm32-wasi src/main.cst`) compiles the *entire compiler* to a
   **byte-identical** wasm compiler, and that one compiles itself again —
-  gen1==gen2==gen3 identical (2,526,829 bytes). It also cross-compiles a program
-  to a native x86_64 ELF via its embedded assembler+linker. Run it with the
-  pure-JS WASI shim `tests/wasm/wasi_run.mjs`, NOT node's built-in `node:wasi`:
-  ```
-  node tests/wasm/wasi_run.mjs caustic.wasm <repo> --target=wasm32-wasi /src/main.cst -o /caustic.self.wasm
-  ```
-  (node:wasi is experimental and SIGSEGVs inside V8's GC when it scans the stack
-  across a WASI host-call under a large workload — a node bug, not a backend one;
-  a real WASI runtime like wasmtime works too.)
+  gen1==gen2==gen3 identical. It also cross-compiles a program to a native x86_64
+  ELF via its embedded assembler+linker. Runs under node's built-in `node:wasi`
+  (`WASI` class, preopen the repo at `/`), under Deno, and under the small pure-JS
+  runner `tests/wasm/wasi_run.mjs` — all reliably and with byte-identical output.
 - **Not yet supported** (rejected with a diagnostic): closures (captured-context
   calls), SIMD (only at -O2), and non-WASI extern C calls. Variadics
   (`io.printf`), function pointers (`IR_CALL_INDIRECT`), and atomics DO work.
   `IR_SET_CTX` (context-register clear before every `let x = call()`) is a no-op.
 
-Verify with Node: instantiate the `.wasm` and call an export directly, or run
-`_start` via the pure-JS WASI shim `tests/wasm/wasi_run.mjs <module.wasm> <preopen-dir>
-[args...]` (preferred — avoids the `node:wasi` GC bug and sandboxes fs to the preopen).
-No wasmtime/wabt needed.
+Verify with Node: instantiate the `.wasm` and call an export directly, run `_start`
+under `node:wasi` (`WASI` class, preview1; `preopens: { '/': <dir> }` for fs), or use
+the small pure-JS runner `tests/wasm/wasi_run.mjs <module.wasm> <preopen-dir> [args...]`
+(handy for scripting + sandboxes fs to the preopen). No wasmtime/wabt needed.
 
 ## Future work (not implemented)
 

@@ -11,11 +11,10 @@
 //   node wasi_run.mjs caustic.wasm /path/to/Caustic \
 //        --target=wasm32-wasi /src/main.cst -o /caustic.self.wasm
 //
-// Why not node:wasi? Node's built-in `WASI` class (still experimental in v22)
-// SIGSEGVs during GC when it scans the stack across a host-call transition under
-// a large workload (e.g. the compiler compiling itself). Implementing the handful
-// of WASI calls we use directly in JS over node:fs avoids that runtime bug — the
-// Caustic backend and its .wasm output are correct; only node:wasi is the problem.
+// The compiler's .wasm also runs under node's built-in `node:wasi` (the memory is
+// emitted `shared`, so memory.grow never detaches the buffer node:wasi caches).
+// This tiny runner is just a dependency-free, easily-scriptable alternative that
+// sandboxes fs to the preopen and is handy in CI.
 //
 // Implements exactly what the Caustic stdlib calls: proc_exit, fd_write, fd_read,
 // fd_close, fd_seek, path_open (relative to a single preopen at fd 3),
