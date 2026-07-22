@@ -1,0 +1,1161 @@
+// WebAssembly backend (wasm32 / wasm64).
+//
+// Emits a complete `.wasm` binary module directly — no assembler/linker step
+// (object_format == 4 short-circuits the pipeline in main.cst). Mirrors the
+// AArch64 driver's shape (codegen -> per-function walk -> emit_inst switch) but
+// assembles a length-prefixed binary instead of streaming assembly text.
+//
+// Design invariants (see the plan doc):
+//   * Every vreg is an i64 WASM local; float ops reinterpret i64<->f64 around
+//     the operation (func.vreg_class is null on the -O0 path this runs on).
+//   * Locals / address-taken storage live in a shadow stack in linear memory,
+//     addressed via a per-function $fp local off a global $sp (mirrors rbp).
+//   * Control flow is structured via a dispatch loop (relooper-lite): one loop
+//     wrapping N nested blocks + a br_table on an i32 $state local.
+//   * Pointers are held in i64 locals; on wasm32 the address is `i32.wrap_i64`'d
+//     at each memory access; on wasm64 (memory64) it is used directly.
+
+use "../../../std/io.cst" as io;
+use "../../parser/ast.cst" as ast;
+use "../../ir/defs.cst" as d;
+use "../../ir/cfg.cst" as cfg;
+use "../../ir/gen_program.cst" as irp;
+use "../emit_output.cst" as eo;
+use "../target.cst" as tgt;
+
+// ── Config (set by backend.cst fan-out) ───────────────────────────────
+let is i32 as w_opt_level with mut = 0;
+fn set_dyn_stdlib(v as i32) as void { }
+fn set_snapshot_inline(v as i32) as void { }
+fn set_opt_level(level as i32) as void { w_opt_level = level; }
+
+// ── Memory layout constants ───────────────────────────────────────────
+let is i64 as NULL_GUARD  with imut = 1024;      // low reserve so *0 stays unused
+let is i64 as STACK_SIZE  with imut = 8388608;   // 8 MiB shadow stack
+let is i64 as PAGE        with imut = 65536;      // wasm page = 64 KiB
+let is i32 as MAX_CALL_ARGS with imut = 32;
+
+// ── Module state ──────────────────────────────────────────────────────
+let is i32 as g_ptr64 with mut = 0;              // 1 = wasm64 (memory64)
+
+// Defined-function table (parallel arrays, indexed by funcidx).
+let is *u8 as g_fn_ptr  with mut = cast(*u8, 0); // *IRFunction per idx (8B each)
+let is *u8 as g_fn_args with mut = cast(*u8, 0); // num_args per idx (4B each)
+let is *u8 as g_fn_type with mut = cast(*u8, 0); // functype index per idx (4B each)
+let is i32 as g_num_funcs with mut = 0;          // # defined functions
+let is i32 as g_num_imports with mut = 0;        // # imported functions (funcidx 0..K-1)
+
+// Distinct functypes, keyed by param count (uniform (i64^n)->i64).
+let is *u8 as g_ft_nargs with mut = cast(*u8, 0);
+let is i32 as g_num_types with mut = 0;
+
+// Data image (static globals + string literals), based at NULL_GUARD.
+let is *u8 as g_data with mut = cast(*u8, 0);
+let is i64 as g_data_len with mut = 0;
+let is i64 as g_data_cap with mut = 0;
+let is i64 as g_data_base with mut = 0;          // linear address of g_data[0]
+let is i64 as g_heap_base with mut = 0;
+let is i64 as g_sp_init with mut = 0;
+
+// String address map, indexed by string id.
+let is *u8 as g_str_addr with mut = cast(*u8, 0);
+let is i32 as g_str_max with mut = 0;
+
+// Global address map (parallel to walk order over p.globals).
+let is *u8 as g_glob_addr with mut = cast(*u8, 0);   // i64 addr per global
+let is *u8 as g_glob_ptr  with mut = cast(*u8, 0);   // *IRGlobal per global
+let is i32 as g_num_globals with mut = 0;
+
+// Per-function emission context.
+let is *d.IRFunction as cur_func with mut = cast(*d.IRFunction, 0);
+let is i32 as cur_fp_local with mut = 0;
+let is i32 as cur_state_local with mut = 0;
+let is i32 as cur_scratch_base with mut = 0;
+let is i32 as cur_frame with mut = 0;
+let is i32 as cur_argc with mut = 0;
+let is i32 as w_error with mut = 0;
+
+// WASI imports (fixed, low funcidx space). Type indices are also fixed:
+//   type 0 = proc_exit  (i32) -> ()
+//   type 1 = fd_write   (i32,i32,i32,i32) -> (i32)
+//   type 2 = _start     () -> ()
+// Uniform defined-function types (i64^n)->i64 follow at index WASI_NTYPES + k.
+let is i32 as WASI_NTYPES with imut = 3;
+let is i32 as IMP_PROC_EXIT with imut = 0;   // funcidx 0, type 0
+let is i32 as IMP_FD_WRITE  with imut = 1;   // funcidx 1, type 1
+let is i32 as IMP_FD_READ   with imut = 2;   // funcidx 2, type 1 (same sig as fd_write)
+
+let is i32 as g_has_main with mut = 0;
+let is i32 as g_main_funcidx with mut = 0;
+let is i32 as g_main_nargs with mut = 0;
+
+// Map a WASI import name -> (funcidx). Returns -1 if unknown.
+fn wasi_idx(name as *u8, nlen as i32) as i32 {
+    if (nlen == 9 && bytes_eq(name, "proc_exit", 9) == 1) { return IMP_PROC_EXIT; }
+    if (nlen == 8 && bytes_eq(name, "fd_write", 8) == 1) { return IMP_FD_WRITE; }
+    if (nlen == 7 && bytes_eq(name, "fd_read", 7) == 1) { return IMP_FD_READ; }
+    return cast(i32, 0 - 1);
+}
+fn wasi_nargs(idx as i32) as i32 { if (idx == IMP_PROC_EXIT) { return 1; } return 4; }
+fn wasi_hasres(idx as i32) as i32 { if (idx == IMP_PROC_EXIT) { return 0; } return 1; }
+
+// =====================================================================
+// Growable byte buffer
+// =====================================================================
+struct WBuf { data as *u8; len as i64; cap as i64; }
+
+fn wb_new(cap as i64) as WBuf {
+    let is WBuf as b;
+    b.data = d.opt_alloc(cap);
+    b.len = 0;
+    b.cap = cap;
+    return b;
+}
+fn wb_ensure(b as *WBuf, n as i64) as void {
+    if (b.len + n > b.cap) {
+        let is i64 as nc with mut = b.cap * 2;
+        if (nc < b.len + n) { nc = b.len + n + 1024; }
+        let is *u8 as nd = d.opt_alloc(nc);
+        mem_copy(nd, b.data, b.len);
+        d.opt_free(b.data);
+        b.data = nd;
+        b.cap = nc;
+    }
+}
+fn wb_u8(b as *WBuf, v as i32) as void {
+    wb_ensure(b, 1);
+    b.data[b.len] = cast(u8, v & 255);
+    b.len = b.len + 1;
+}
+fn wb_bytes(b as *WBuf, p as *u8, n as i64) as void {
+    wb_ensure(b, n);
+    mem_copy(cast(*u8, cast(i64, b.data) + b.len), p, n);
+    b.len = b.len + n;
+}
+fn wb_buf(dst as *WBuf, src as *WBuf) as void { wb_bytes(dst, src.data, src.len); }
+
+fn mem_copy(dst as *u8, src as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[i] = src[i]; i = i + 1; }
+}
+
+// Unsigned LEB128 (indices / sizes / counts).
+fn wb_uleb(b as *WBuf, val as i64) as void {
+    let is u64 as v with mut = cast(u64, val);
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        let is i32 as byte with mut = cast(i32, v & cast(u64, 127));
+        v = v >> cast(u64, 7);
+        if (v == cast(u64, 0)) { more = 0; } else { byte = byte | 128; }
+        wb_u8(b, byte);
+    }
+}
+// Signed LEB128 (i32.const / i64.const immediates).
+fn wb_sleb(b as *WBuf, val as i64) as void {
+    let is i64 as v with mut = val;
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        let is i32 as byte with mut = cast(i32, v & 127);
+        v = v >> 7;                       // arithmetic shift (sign-extends)
+        let is i32 as sign = byte & 64;
+        if ((v == 0 && sign == 0) || (v == cast(i64, 0 - 1) && sign != 0)) {
+            more = 0;
+        } else {
+            byte = byte | 128;
+        }
+        wb_u8(b, byte);
+    }
+}
+// name = uleb(len) + raw bytes.
+fn wb_name(b as *WBuf, p as *u8, n as i32) as void {
+    wb_uleb(b, cast(i64, n));
+    wb_bytes(b, p, cast(i64, n));
+}
+// section = id + uleb(len) + body.
+fn wb_section(m as *WBuf, id as i32, body as *WBuf) as void {
+    wb_u8(m, id);
+    wb_uleb(m, body.len);
+    wb_buf(m, body);
+}
+
+// ── i64 array helpers ─────────────────────────────────────────────────
+fn arr_seti64(base as *u8, idx as i32, val as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, base) + cast(i64, idx) * 8);
+    *p = val;
+}
+fn arr_geti64(base as *u8, idx as i32) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, base) + cast(i64, idx) * 8);
+    return *p;
+}
+fn arr_seti32(base as *u8, idx as i32, val as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, base) + cast(i64, idx) * 4);
+    *p = val;
+}
+fn arr_geti32(base as *u8, idx as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, base) + cast(i64, idx) * 4);
+    return *p;
+}
+
+// =====================================================================
+// Type helpers (read *ast.Type carried on cast_to / cast_from)
+// =====================================================================
+fn ty_size(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 8; }
+    return cast(*ast.Type, tp).size;
+}
+fn ty_float(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 0; }
+    let is i32 as k = cast(*ast.Type, tp).kind;
+    if (k == ast.TY_F32 || k == ast.TY_F64) { return 1; }
+    return 0;
+}
+fn ty_signed(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 1; }
+    let is i32 as k = cast(*ast.Type, tp).kind;
+    if (k == ast.TY_I8 || k == ast.TY_I16 || k == ast.TY_I32 || k == ast.TY_I64) { return 1; }
+    return 0;
+}
+
+// =====================================================================
+// WASM opcode helpers (all values are i64 locals unless noted)
+// =====================================================================
+fn op_get(c as *WBuf, local as i32) as void { wb_u8(c, 0x20); wb_uleb(c, cast(i64, local)); }
+fn op_set(c as *WBuf, local as i32) as void { wb_u8(c, 0x21); wb_uleb(c, cast(i64, local)); }
+fn op_tee(c as *WBuf, local as i32) as void { wb_u8(c, 0x22); wb_uleb(c, cast(i64, local)); }
+fn op_i64const(c as *WBuf, v as i64) as void { wb_u8(c, 0x42); wb_sleb(c, v); }
+fn op_i32const(c as *WBuf, v as i64) as void { wb_u8(c, 0x41); wb_sleb(c, v); }
+
+fn L_vreg(v as i32) as i32 { return cur_func.num_args + v; }
+
+// Push an IR operand as an i64 value.
+fn push_operand(c as *WBuf, o as *d.Operand) as void {
+    if (o.op_type == d.OP_IMM) { op_i64const(c, o.imm); return; }
+    op_get(c, L_vreg(o.vreg));               // OP_VREG
+}
+
+// Push a memory address (index-typed: i32 on wasm32, i64 on wasm64).
+// stack-slot operand (OP_IMM) => $fp - imm ; pointer vreg (OP_VREG) => value.
+fn push_addr(c as *WBuf, o as *d.Operand) as void {
+    if (o.op_type == d.OP_IMM) {
+        op_get(c, cur_fp_local);
+        if (g_ptr64 == 1) { op_i64const(c, o.imm); wb_u8(c, 0x7D); } // i64.sub
+        else { op_i32const(c, o.imm); wb_u8(c, 0x6B); }             // i32.sub
+        return;
+    }
+    op_get(c, L_vreg(o.vreg));
+    if (g_ptr64 == 0) { wb_u8(c, 0xA7); }    // i32.wrap_i64
+}
+// memarg: align(log2, 0 = byte, always valid) + offset 0.
+fn memarg(c as *WBuf) as void { wb_u8(c, 0x00); wb_u8(c, 0x00); }
+
+// Truncate the top-of-stack i64 to `cast_to`'s width (canonicalise sub-64 ints).
+fn narrow(c as *WBuf, cast_to as *u8) as void {
+    if (ty_float(cast_to) == 1) { return; }
+    let is i32 as sz = ty_size(cast_to);
+    if (sz >= 8) { return; }
+    if (sz == 4) {
+        if (ty_signed(cast_to) == 1) {
+            wb_u8(c, 0xA7);                  // i32.wrap_i64
+            wb_u8(c, 0xAC);                  // i64.extend_i32_s
+        } else {
+            op_i64const(c, 4294967295);      // & 0xFFFFFFFF
+            wb_u8(c, 0x83);                  // i64.and
+        }
+    } else if (sz == 2) {
+        if (ty_signed(cast_to) == 1) { wb_u8(c, 0xC3); }  // i64.extend16_s
+        else { op_i64const(c, 65535); wb_u8(c, 0x83); }
+    } else {
+        if (ty_signed(cast_to) == 1) { wb_u8(c, 0xC2); }  // i64.extend8_s
+        else { op_i64const(c, 255); wb_u8(c, 0x83); }
+    }
+}
+
+fn wasm_err(msg as *u8) as void {
+    io.eprint_str("error: wasm backend: ");
+    io.eprint_str(msg);
+    io.eprint_str("\n");
+    w_error = 1;
+}
+
+// =====================================================================
+// Per-opcode lowering
+// =====================================================================
+fn emit_arith(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    if (op == d.IR_NEG) {
+        op_i64const(c, 0); push_operand(c, &i.src1); wb_u8(c, 0x7D);  // i64.sub
+        narrow(c, i.cast_to); op_set(c, L_vreg(i.dest.vreg)); return;
+    }
+    push_operand(c, &i.src1);
+    push_operand(c, &i.src2);
+    if (op == d.IR_ADD) { wb_u8(c, 0x7C); }
+    else if (op == d.IR_SUB) { wb_u8(c, 0x7D); }
+    else if (op == d.IR_MUL) { wb_u8(c, 0x7E); }
+    else if (op == d.IR_DIV) { if (ty_signed(i.cast_to) == 1) { wb_u8(c, 0x7F); } else { wb_u8(c, 0x80); } }
+    else { if (ty_signed(i.cast_to) == 1) { wb_u8(c, 0x81); } else { wb_u8(c, 0x82); } }  // MOD
+    narrow(c, i.cast_to);
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+fn emit_bits(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    if (op == d.IR_NOT) {
+        push_operand(c, &i.src1); op_i64const(c, 0 - 1); wb_u8(c, 0x85); // i64.xor
+        narrow(c, i.cast_to); op_set(c, L_vreg(i.dest.vreg)); return;
+    }
+    push_operand(c, &i.src1);
+    push_operand(c, &i.src2);
+    if (op == d.IR_SHL) { wb_u8(c, 0x86); }
+    else if (op == d.IR_SHR) { if (ty_signed(i.cast_to) == 1) { wb_u8(c, 0x87); } else { wb_u8(c, 0x88); } }
+    else if (op == d.IR_AND) { wb_u8(c, 0x83); }
+    else if (op == d.IR_OR) { wb_u8(c, 0x84); }
+    else { wb_u8(c, 0x85); }  // XOR
+    narrow(c, i.cast_to);
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+fn emit_compare(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    let is i32 as sgn = ty_signed(i.cast_to);
+    let is i32 as flt = ty_float(i.cast_to);
+    if (flt == 1) {
+        push_operand(c, &i.src1); wb_u8(c, 0xBF);   // f64.reinterpret_i64
+        push_operand(c, &i.src2); wb_u8(c, 0xBF);
+        if (op == d.IR_EQ) { wb_u8(c, 0x61); }
+        else if (op == d.IR_NE) { wb_u8(c, 0x62); }
+        else if (op == d.IR_LT) { wb_u8(c, 0x63); }
+        else if (op == d.IR_LE) { wb_u8(c, 0x65); }
+        else if (op == d.IR_GT) { wb_u8(c, 0x64); }
+        else { wb_u8(c, 0x66); }   // GE
+    } else {
+        push_operand(c, &i.src1);
+        push_operand(c, &i.src2);
+        if (op == d.IR_EQ) { wb_u8(c, 0x51); }
+        else if (op == d.IR_NE) { wb_u8(c, 0x52); }
+        else if (op == d.IR_LT) { if (sgn == 1) { wb_u8(c, 0x53); } else { wb_u8(c, 0x54); } }
+        else if (op == d.IR_LE) { if (sgn == 1) { wb_u8(c, 0x57); } else { wb_u8(c, 0x58); } }
+        else if (op == d.IR_GT) { if (sgn == 1) { wb_u8(c, 0x55); } else { wb_u8(c, 0x56); } }
+        else { if (sgn == 1) { wb_u8(c, 0x59); } else { wb_u8(c, 0x5A); } }  // GE
+    }
+    wb_u8(c, 0xAD);                            // i64.extend_i32_u (i32 bool -> i64)
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+fn emit_float(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    push_operand(c, &i.src1); wb_u8(c, 0xBF);  // f64.reinterpret_i64
+    if (op == d.IR_FNEG) { wb_u8(c, 0x9A); }
+    else if (op == d.IR_FSQRT) { wb_u8(c, 0x9F); }
+    else {
+        push_operand(c, &i.src2); wb_u8(c, 0xBF);
+        if (op == d.IR_FADD) { wb_u8(c, 0xA0); }
+        else if (op == d.IR_FSUB) { wb_u8(c, 0xA1); }
+        else if (op == d.IR_FMUL) { wb_u8(c, 0xA2); }
+        else { wb_u8(c, 0xA3); }   // FDIV
+    }
+    wb_u8(c, 0xBD);                            // i64.reinterpret_f64
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+fn emit_cast(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as ff = ty_float(i.cast_from);
+    let is i32 as tf = ty_float(i.cast_to);
+    push_operand(c, &i.src1);
+    if (ff == 1 && tf == 0) {
+        wb_u8(c, 0xBF);                        // f64.reinterpret_i64
+        if (ty_signed(i.cast_to) == 1) { wb_u8(c, 0xB0); } else { wb_u8(c, 0xB1); } // i64.trunc_f64_s/u
+        narrow(c, i.cast_to);
+    } else if (ff == 0 && tf == 1) {
+        if (ty_signed(i.cast_from) == 1) { wb_u8(c, 0xB9); } else { wb_u8(c, 0xBA); } // f64.convert_i64_s/u
+        if (ty_size(i.cast_to) == 4) { wb_u8(c, 0xB6); wb_u8(c, 0xBB); }              // f32.demote;f64.promote
+        wb_u8(c, 0xBD);                        // i64.reinterpret_f64
+    } else if (ff == 1 && tf == 1) {
+        if (ty_size(i.cast_to) == 4 && ty_size(i.cast_from) == 8) {
+            wb_u8(c, 0xBF); wb_u8(c, 0xB6); wb_u8(c, 0xBB); wb_u8(c, 0xBD);
+        }
+        // f32->f64 / same width: value already the i64 bit pattern, nothing to do.
+    } else {
+        narrow(c, i.cast_to);                  // int -> int
+    }
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+fn emit_load(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as sz = ty_size(i.cast_to);
+    let is i32 as sgn = ty_signed(i.cast_to);
+    let is i32 as flt = ty_float(i.cast_to);
+    push_addr(c, &i.src1);
+    if (sz >= 8) {
+        wb_u8(c, 0x29); memarg(c);             // i64.load
+    } else if (sz == 4) {
+        if (flt == 1) { wb_u8(c, 0x2A); memarg(c); wb_u8(c, 0xBB); wb_u8(c, 0xBD); } // f32.load;f64.promote;reinterpret
+        else if (sgn == 1) { wb_u8(c, 0x34); memarg(c); }   // i64.load32_s
+        else { wb_u8(c, 0x35); memarg(c); }                 // i64.load32_u
+    } else if (sz == 2) {
+        if (sgn == 1) { wb_u8(c, 0x32); memarg(c); } else { wb_u8(c, 0x33); memarg(c); }
+    } else {
+        if (sgn == 1) { wb_u8(c, 0x30); memarg(c); } else { wb_u8(c, 0x31); memarg(c); }
+    }
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+fn emit_store(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as sz = ty_size(i.cast_to);
+    let is i32 as flt = ty_float(i.cast_to);
+    if (sz > 8) { emit_memcopy(c, &i.dest, &i.src1, cast(i64, sz)); return; }
+    push_addr(c, &i.dest);
+    push_operand(c, &i.src1);
+    if (sz >= 8) {
+        wb_u8(c, 0x37); memarg(c);             // i64.store
+    } else if (sz == 4) {
+        if (flt == 1) { wb_u8(c, 0xBF); wb_u8(c, 0xB6); wb_u8(c, 0x38); memarg(c); } // reinterpret;demote;f32.store
+        else { wb_u8(c, 0xA7); wb_u8(c, 0x36); memarg(c); }  // i32.wrap;i32.store
+    } else if (sz == 2) {
+        wb_u8(c, 0xA7); wb_u8(c, 0x3B); memarg(c);           // i32.wrap;i32.store16
+    } else {
+        wb_u8(c, 0xA7); wb_u8(c, 0x3A); memarg(c);           // i32.wrap;i32.store8
+    }
+}
+
+// Byte-copy `n` bytes: dst/src operands hold addresses. Uses a br_if loop.
+fn emit_memcopy(c as *WBuf, dst as *d.Operand, src as *d.Operand, n as i64) as void {
+    // scratch locals: reuse the two highest arg-scratch slots as counters.
+    let is i32 as ld = cur_scratch_base + MAX_CALL_ARGS - 1;   // dst cursor
+    let is i32 as ls = cur_scratch_base + MAX_CALL_ARGS - 2;   // src cursor
+    let is i32 as lc = cur_scratch_base + MAX_CALL_ARGS - 3;   // count
+    push_addr_as_i64(c, dst); op_set(c, ld);
+    push_addr_as_i64(c, src); op_set(c, ls);
+    op_i64const(c, n); op_set(c, lc);
+    wb_u8(c, 0x02); wb_u8(c, 0x40);            // block (void)
+    wb_u8(c, 0x03); wb_u8(c, 0x40);            //   loop (void)
+    op_get(c, lc); wb_u8(c, 0x50);             //   i64.eqz
+    wb_u8(c, 0x0D); wb_uleb(c, 1);             //   br_if 1 (exit block)
+    // store byte: push dst addr, then load an i32 byte from src, then store8.
+    addr_from_i64(c, ld);
+    addr_from_i64(c, ls); wb_u8(c, 0x2D); memarg(c);   // i32.load8_u -> i32
+    wb_u8(c, 0x3A); memarg(c);                 //   i32.store8 (pops i32 val, addr)
+    op_get(c, ld); op_i64const(c, 1); wb_u8(c, 0x7C); op_set(c, ld);
+    op_get(c, ls); op_i64const(c, 1); wb_u8(c, 0x7C); op_set(c, ls);
+    op_get(c, lc); op_i64const(c, 1); wb_u8(c, 0x7D); op_set(c, lc);
+    wb_u8(c, 0x0C); wb_uleb(c, 0);             //   br 0 (loop)
+    wb_u8(c, 0x0B);                            //   end loop
+    wb_u8(c, 0x0B);                            // end block
+}
+// Compute an operand's address and leave it as an i64 (for the copy cursors).
+fn push_addr_as_i64(c as *WBuf, o as *d.Operand) as void {
+    if (o.op_type == d.OP_IMM) {
+        op_get(c, cur_fp_local);
+        if (g_ptr64 == 1) { op_i64const(c, o.imm); wb_u8(c, 0x7D); }
+        else { op_i32const(c, o.imm); wb_u8(c, 0x6B); wb_u8(c, 0xAD); } // i32.sub;i64.extend_i32_u
+        return;
+    }
+    op_get(c, L_vreg(o.vreg));
+}
+// Materialise a linear address held as i64 in local `l` as a memory index.
+fn addr_from_i64(c as *WBuf, l as i32) as void {
+    op_get(c, l);
+    if (g_ptr64 == 0) { wb_u8(c, 0xA7); }      // i32.wrap_i64
+}
+
+fn emit_addr(c as *WBuf, i as *d.IRInst) as void {
+    // $fp - imm, widened to i64 for the destination vreg.
+    op_get(c, cur_fp_local);
+    if (g_ptr64 == 1) { op_i64const(c, i.src1.imm); wb_u8(c, 0x7D); }
+    else { op_i32const(c, i.src1.imm); wb_u8(c, 0x6B); wb_u8(c, 0xAD); }
+    op_set(c, L_vreg(i.dest.vreg));
+}
+fn emit_alloc_addr(c as *WBuf, i as *d.IRInst) as void {
+    // $fp - (stack_size + imm)
+    op_get(c, cur_fp_local);
+    let is i64 as off = cast(i64, cur_func.stack_size) + i.src1.imm;
+    if (g_ptr64 == 1) { op_i64const(c, off); wb_u8(c, 0x7D); }
+    else { op_i32const(c, off); wb_u8(c, 0x6B); wb_u8(c, 0xAD); }
+    op_set(c, L_vreg(i.dest.vreg));
+}
+fn emit_addr_global(c as *WBuf, i as *d.IRInst) as void {
+    let is i64 as addr = resolve_global_addr(i.global_name_ptr, i.global_name_len);
+    op_i64const(c, addr);
+    if (i.op == d.IR_ADDR_GLOBAL && i.is_extern_global == 1) {
+        // extern global: the symbol holds a pointer; load it.
+        if (g_ptr64 == 0) { wb_u8(c, 0xA7); wb_u8(c, 0x29); memarg(c); }
+        else { wb_u8(c, 0x29); memarg(c); }
+    }
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+// ── Calls ─────────────────────────────────────────────────────────────
+fn emit_set_arg(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as idx = cast(i32, i.dest.imm);
+    if (idx >= MAX_CALL_ARGS) { wasm_err("call has too many arguments"); return; }
+    push_operand(c, &i.src1);
+    op_set(c, cur_scratch_base + idx);
+    if (idx + 1 > cur_argc) { cur_argc = idx + 1; }
+}
+fn emit_get_arg(c as *WBuf, i as *d.IRInst) as void {
+    op_get(c, cast(i32, i.src1.imm));          // param local
+    op_set(c, L_vreg(i.dest.vreg));
+}
+fn emit_call(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as fidx = lookup_func(i.call_name_ptr, cast(i32, i.call_name_len));
+    if (fidx < 0) {
+        wasm_err("call to undefined function (extern/host not yet supported)");
+        return;
+    }
+    let is i32 as n = cur_argc;
+    let is i32 as k with mut = 0;
+    while (k < n) { op_get(c, cur_scratch_base + k); k = k + 1; }
+    wb_u8(c, 0x10); wb_uleb(c, cast(i64, fidx));   // call
+    cur_argc = 0;
+    if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }   // drop
+    else { op_set(c, L_vreg(i.dest.vreg)); }
+}
+
+// FFI call = a WASI host import. The extern's impl string is the WASI module
+// name; call_name is the field. Args arrive in the arg-scratch locals (i64) and
+// are wrapped to i32 (WASI signatures are all i32). fd_write returns an i32
+// errno (widened back to i64); proc_exit has no result and never returns.
+fn emit_ffi(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as idx = wasi_idx(i.call_name_ptr, cast(i32, i.call_name_len));
+    if (idx < 0) { wasm_err("call to unknown host/WASI import"); cur_argc = 0; return; }
+    let is i32 as n = wasi_nargs(idx);
+    let is i32 as k with mut = 0;
+    while (k < n) { op_get(c, cur_scratch_base + k); wb_u8(c, 0xA7); k = k + 1; }  // i32.wrap_i64
+    wb_u8(c, 0x10); wb_uleb(c, cast(i64, idx));   // call <import>
+    cur_argc = 0;
+    if (wasi_hasres(idx) == 1) {
+        if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }   // drop
+        else { wb_u8(c, 0xAD); op_set(c, L_vreg(i.dest.vreg)); }  // i64.extend_i32_u
+    }
+}
+
+fn emit_ret(c as *WBuf, i as *d.IRInst) as void {
+    if (cur_func.is_naked == 1) { return; }
+    // epilogue: restore sp from fp (only if a frame was pushed)
+    if (cur_frame > 0) {
+        op_get(c, cur_fp_local);
+        if (g_ptr64 == 1) { wb_u8(c, 0x24); wb_uleb(c, 0); }  // global.set $sp
+        else { wb_u8(c, 0x24); wb_uleb(c, 0); }
+    }
+    if (i.src1.op_type != d.OP_NONE) { push_operand(c, &i.src1); }
+    else { op_i64const(c, 0); }
+    wb_u8(c, 0x0F);                            // return
+}
+
+// emit a single non-control instruction. Returns 1 if handled.
+fn emit_value_inst(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    if (op == d.IR_IMM) { op_i64const(c, i.src1.imm); op_set(c, L_vreg(i.dest.vreg)); return; }
+    if (op == d.IR_MOV) { push_operand(c, &i.src1); op_set(c, L_vreg(i.dest.vreg)); return; }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV
+        || op == d.IR_MOD || op == d.IR_NEG) { emit_arith(c, i); return; }
+    if (op == d.IR_SHL || op == d.IR_SHR || op == d.IR_AND || op == d.IR_OR
+        || op == d.IR_XOR || op == d.IR_NOT) { emit_bits(c, i); return; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE
+        || op == d.IR_GT || op == d.IR_GE) { emit_compare(c, i); return; }
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV
+        || op == d.IR_FNEG || op == d.IR_FSQRT) { emit_float(c, i); return; }
+    if (op == d.IR_CAST) { emit_cast(c, i); return; }
+    if (op == d.IR_LOAD) { emit_load(c, i); return; }
+    if (op == d.IR_STORE) { emit_store(c, i); return; }
+    if (op == d.IR_ADDR) { emit_addr(c, i); return; }
+    if (op == d.IR_GET_ALLOC_ADDR) { emit_alloc_addr(c, i); return; }
+    if (op == d.IR_ADDR_GLOBAL || op == d.IR_FN_ADDR) {
+        if (op == d.IR_FN_ADDR) { wasm_err("function pointers not yet supported"); return; }
+        emit_addr_global(c, i); return;
+    }
+    if (op == d.IR_COPY) { emit_memcopy(c, &i.dest, &i.src1, i.src2.imm); return; }
+    if (op == d.IR_SET_ARG) { emit_set_arg(c, i); return; }
+    if (op == d.IR_GET_ARG) { emit_get_arg(c, i); return; }
+    if (op == d.IR_CALL) { emit_call(c, i); return; }
+    if (op == d.IR_ASM) { emit_asm(c, i); return; }
+    if (op == d.IR_FFI_CALL) { emit_ffi(c, i); return; }
+    // Unsupported opcodes (syscall, indirect call, va_start, closures, SIMD).
+    if (op == d.IR_SYSCALL || op == d.IR_SET_SYS_ARG) { wasm_err("syscall(...) is not available on wasm (use WASI)"); return; }
+    if (op == d.IR_CALL_INDIRECT) { wasm_err("indirect calls not yet supported"); return; }
+    if (op == d.IR_VA_START) { wasm_err("variadic functions not yet supported"); return; }
+    // SET_CTX sets the closure context register (r10 on x86) — emitted before
+    // every `let x = call()` to clear it to 0. WASM has no context register and
+    // uses positional args, so the common clear-to-0 case is a no-op. (A real
+    // captured-closure call would additionally need CALL_INDIRECT, which is
+    // still rejected below, so ignoring this here cannot mask a closure.)
+    if (op == d.IR_SET_CTX) { return; }
+    wasm_err("unsupported IR opcode for wasm target");
+}
+
+fn emit_asm(c as *WBuf, i as *d.IRInst) as void {
+    // Compile-error marker (asm_str[0] == 1): honour like the other backends.
+    if (i.asm_str_len >= 1 && i.asm_str_ptr[0] == cast(u8, 1)) {
+        if (tgt.allow_unsupported_get() == 0) {
+            io.eprint_str("error: ");
+            io._write_fd(io.STDERR, cast(*u8, cast(i64, i.asm_str_ptr) + 1), cast(i64, i.asm_str_len - 1));
+            io.eprint_str("\n");
+            io.exit(1);
+        }
+        return;
+    }
+    // Stack-management no-ops leaked by the SysV internal ABI (sub rsp,N /
+    // add rsp,N / add sp,sp,N) are meaningless on wasm — silently ignore.
+    if (is_stack_noop(i.asm_str_ptr, i.asm_str_len) == 1) { return; }
+    wasm_err("inline asm is not supported on wasm");
+}
+fn is_stack_noop(p as *u8, n as i32) as i32 {
+    // match "sub rsp" / "add rsp" / "add sp"
+    if (n < 6) { return 0; }
+    let is i32 as a = cast(i32, p[0]);
+    if ((a == 115 || a == 97) && p[3] == 32) {   // 's'ub / 'a'dd, space at 3
+        if ((p[4] == 114 && p[5] == 115) || (p[4] == 115 && p[5] == 112)) { return 1; } // rs / sp
+    }
+    return 0;
+}
+
+// =====================================================================
+// Function body: dispatch-loop control flow
+// =====================================================================
+fn emit_prologue(c as *WBuf) as void {
+    if (cur_frame <= 0) { return; }
+    wb_u8(c, 0x23); wb_uleb(c, 0);             // global.get $sp
+    op_tee(c, cur_fp_local);                   // $fp = old sp
+    if (g_ptr64 == 1) { op_i64const(c, cast(i64, cur_frame)); wb_u8(c, 0x7D); }
+    else { op_i32const(c, cast(i64, cur_frame)); wb_u8(c, 0x6B); }
+    wb_u8(c, 0x24); wb_uleb(c, 0);             // global.set $sp
+}
+
+// Emit the instructions of one basic block (up to and excluding its terminator).
+fn emit_bb_body(c as *WBuf, bb as *cfg.BasicBlock) as void {
+    let is *d.IRInst as inst with mut = bb.first;
+    let is *d.IRInst as stop = bb.last;
+    let is i32 as go with mut = 1;
+    while (go == 1) {
+        if (inst.is_dead != 1 && inst.op != d.IR_LABEL) {
+            let is i32 as op = inst.op;
+            if (op != d.IR_JMP && op != d.IR_JZ && op != d.IR_JNZ && op != d.IR_RET) {
+                emit_value_inst(c, inst);
+            }
+        }
+        if (cast(i64, inst) == cast(i64, stop)) { go = 0; }
+        else { inst = inst.next; }
+    }
+}
+
+// state-set + br to the dispatch loop from block index `bi`.
+fn emit_goto(c as *WBuf, nblocks as i32, bi as i32, target as i32) as void {
+    op_i32const(c, cast(i64, target));
+    op_set(c, cur_state_local);
+    wb_u8(c, 0x0C); wb_uleb(c, cast(i64, nblocks - 1 - bi));  // br $dispatch
+}
+
+fn emit_terminator(c as *WBuf, nblocks as i32, bi as i32, bb as *cfg.BasicBlock, label_to_bb as *u8) as void {
+    let is *d.IRInst as t = bb.last;
+    let is i32 as op = t.op;
+    if (op == d.IR_RET) { emit_ret(c, t); return; }
+    if (op == d.IR_JMP) {
+        emit_goto(c, nblocks, bi, arr_geti32(label_to_bb, t.dest.label)); return;
+    }
+    if (op == d.IR_JZ || op == d.IR_JNZ) {
+        // succ0 = fallthrough, succ1 = branch target (dest.label's block).
+        // select(val1, val2, cond) => cond ? val1 : val2. Stack order must be
+        // val1, val2, cond — so push the two state consts first, cond last.
+        let is i32 as sfall = bb.succ0;
+        let is i32 as sbranch = bb.succ1;
+        if (op == d.IR_JZ) {
+            // taken when src1 == 0; eqz is 1 in that case => val1 = branch.
+            op_i32const(c, cast(i64, sbranch));     // val1
+            op_i32const(c, cast(i64, sfall));       // val2
+        } else {
+            // JNZ: taken when src1 != 0; eqz is 0 then => val2 = branch.
+            op_i32const(c, cast(i64, sfall));       // val1 (eqz true => src1==0 => fall)
+            op_i32const(c, cast(i64, sbranch));     // val2
+        }
+        push_operand(c, &t.src1); wb_u8(c, 0x50);   // i64.eqz -> i32 cond
+        wb_u8(c, 0x1B);                             // select
+        op_set(c, cur_state_local);
+        wb_u8(c, 0x0C); wb_uleb(c, cast(i64, nblocks - 1 - bi));  // br $dispatch
+        return;
+    }
+    // no terminator: fall through to succ0
+    if (bb.succ0 >= 0) { emit_goto(c, nblocks, bi, bb.succ0); }
+    else { emit_ret_void(c); }
+}
+fn emit_ret_void(c as *WBuf) as void {
+    if (cur_frame > 0) { op_get(c, cur_fp_local); wb_u8(c, 0x24); wb_uleb(c, 0); }
+    op_i64const(c, 0); wb_u8(c, 0x0F);
+}
+
+fn emit_func_body(c as *WBuf, f as *d.IRFunction) as void {
+    cur_func = f;
+    cur_argc = 0;
+    // frame size
+    let is i32 as frame with mut = f.stack_size + f.alloc_stack_size;
+    if (frame > 0) { if (frame % 16 != 0) { frame = frame + 16 - (frame % 16); } }
+    cur_frame = frame;
+    // local index layout
+    cur_scratch_base = f.num_args + f.vreg_count;
+    cur_fp_local = cur_scratch_base + MAX_CALL_ARGS;
+    cur_state_local = cur_fp_local + 1;
+
+    // --- locals declaration ---
+    // group A: (vreg_count + MAX_CALL_ARGS) i64  [+ $fp if wasm64]
+    // group B: $fp (i32, wasm32 only), $state (i32)
+    let is i64 as i64count with mut = cast(i64, f.vreg_count) + cast(i64, MAX_CALL_ARGS);
+    if (g_ptr64 == 1) { i64count = i64count + 1; }        // $fp joins the i64 group
+    let is WBuf as decls = wb_new(16);
+    let is i32 as ngroups with mut = 0;
+    if (i64count > 0) { ngroups = ngroups + 1; }
+    // i32 group: $state always; $fp too on wasm32
+    let is i32 as i32count with mut = 1;
+    if (g_ptr64 == 0) { i32count = 2; }
+    ngroups = ngroups + 1;
+    wb_uleb(&decls, cast(i64, ngroups));
+    if (i64count > 0) { wb_uleb(&decls, i64count); wb_u8(&decls, 0x7E); }  // i64
+    wb_uleb(&decls, cast(i64, i32count)); wb_u8(&decls, 0x7F);            // i32
+
+    // --- body into a temp buffer ---
+    let is WBuf as body = wb_new(256);
+    emit_prologue(&body);
+
+    // CFG
+    let is *u8 as blocks = d.opt_alloc(cast(i64, cfg.MAX_BLOCKS) * sizeof(cfg.BasicBlock));
+    let is *u8 as label_to_bb = d.opt_alloc(cast(i64, f.label_count + 2) * 4);
+    let is i32 as j with mut = 0;
+    while (j < f.label_count + 2) { arr_seti32(label_to_bb, j, 0); j = j + 1; }
+    let is i32 as nblocks with mut = 0;
+    cfg.build_cfg(f, cast(*cfg.BasicBlock, blocks), &nblocks, cast(*i32, label_to_bb));
+
+    if (nblocks <= 1) {
+        // single block: straight-line, no dispatch loop
+        let is *cfg.BasicBlock as bb0 = cast(*cfg.BasicBlock, blocks);
+        emit_bb_body(&body, bb0);
+        emit_terminator_linear(&body, bb0);
+    } else {
+        // init $state = 0 (entry block)
+        op_i32const(&body, 0); op_set(&body, cur_state_local);
+        // block $exit ; loop $L ; N nested blocks ; br_table
+        wb_u8(&body, 0x02); wb_u8(&body, 0x40);   // block $exit
+        wb_u8(&body, 0x03); wb_u8(&body, 0x40);   // loop $L
+        let is i32 as b with mut = 0;
+        while (b < nblocks) { wb_u8(&body, 0x02); wb_u8(&body, 0x40); b = b + 1; }
+        // br_table: get $state; table[0..N-1]=i, default=exit(depth N+1)
+        op_get(&body, cur_state_local);
+        wb_u8(&body, 0x0E); wb_uleb(&body, cast(i64, nblocks));
+        b = 0;
+        while (b < nblocks) { wb_uleb(&body, cast(i64, b)); b = b + 1; }
+        wb_uleb(&body, cast(i64, nblocks + 1));   // default -> $exit
+        // per-block: end (close $b_i) ; body ; terminator
+        b = 0;
+        while (b < nblocks) {
+            wb_u8(&body, 0x0B);                   // end $b_b
+            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+            emit_bb_body(&body, bb);
+            emit_terminator(&body, nblocks, b, bb, label_to_bb);
+            b = b + 1;
+        }
+        wb_u8(&body, 0x0B);                        // end $L
+        wb_u8(&body, 0x0B);                        // end $exit
+    }
+    wb_u8(&body, 0x00);                            // unreachable (final)
+    wb_u8(&body, 0x0B);                            // end (function)
+
+    d.opt_free(blocks);
+    d.opt_free(label_to_bb);
+
+    // --- code entry = uleb(size) + decls + body ---
+    let is i64 as entry_size = decls.len + body.len;
+    wb_uleb(c, entry_size);
+    wb_buf(c, &decls);
+    wb_buf(c, &body);
+    d.opt_free(decls.data);
+    d.opt_free(body.data);
+}
+// terminator for the single-block (no dispatch loop) case.
+fn emit_terminator_linear(c as *WBuf, bb as *cfg.BasicBlock) as void {
+    let is *d.IRInst as t = bb.last;
+    if (t.op == d.IR_RET) { emit_ret(c, t); return; }
+    emit_ret_void(c);
+}
+
+// =====================================================================
+// Pass 1: collect functions, functypes, data layout
+// =====================================================================
+fn lookup_func(name as *u8, nlen as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < g_num_funcs) {
+        let is *d.IRFunction as f = cast(*d.IRFunction, arr_geti64(g_fn_ptr, k));
+        if (f.asm_name_len == nlen && bytes_eq(f.asm_name_ptr, name, nlen) == 1) {
+            return g_num_imports + k;
+        }
+        k = k + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+fn bytes_eq(a as *u8, b as *u8, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+fn intern_type(nargs as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < g_num_types) {
+        if (arr_geti32(g_ft_nargs, k) == nargs) { return k; }
+        k = k + 1;
+    }
+    arr_seti32(g_ft_nargs, g_num_types, nargs);
+    g_num_types = g_num_types + 1;
+    return g_num_types - 1;
+}
+
+fn is_defined(f as *d.IRFunction) as i32 {
+    if (cast(i64, f.instructions) != 0) { return 1; }
+    if (cast(i64, f.ast_node) != 0) { return 1; }
+    return 0;
+}
+
+fn collect_functions(p as *d.IRProgram) as void {
+    // count
+    let is i32 as n with mut = 0;
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && is_defined(f) == 1) { n = n + 1; }
+        f = f.next;
+    }
+    g_fn_ptr  = d.opt_alloc(cast(i64, n + 1) * 8);
+    g_fn_args = d.opt_alloc(cast(i64, n + 1) * 4);
+    g_fn_type = d.opt_alloc(cast(i64, n + 1) * 4);
+    g_ft_nargs = d.opt_alloc(cast(i64, n + 1) * 4);
+    g_num_funcs = 0;
+    g_num_types = 0;
+    f = p.functions;
+    while (cast(i64, f) != 0) {
+        if (f.is_reachable == 1 && is_defined(f) == 1) {
+            arr_seti64(g_fn_ptr, g_num_funcs, cast(i64, f));
+            arr_seti32(g_fn_args, g_num_funcs, f.num_args);
+            arr_seti32(g_fn_type, g_num_funcs, intern_type(f.num_args));
+            g_num_funcs = g_num_funcs + 1;
+        }
+        f = f.next;
+    }
+}
+
+// ── Data layout ───────────────────────────────────────────────────────
+fn data_align(a as i64) as void {
+    while (g_data_len % a != 0) { g_data_u8(0); }
+}
+fn g_data_u8(v as i32) as void {
+    if (g_data_len + 1 > g_data_cap) {
+        let is i64 as nc with mut = g_data_cap * 2;
+        if (nc < g_data_len + 1) { nc = g_data_len + 1024; }
+        if (nc < 4096) { nc = 4096; }
+        let is *u8 as nd = d.opt_alloc(nc);
+        mem_copy(nd, g_data, g_data_len);
+        if (cast(i64, g_data) != 0) { d.opt_free(g_data); }
+        g_data = nd; g_data_cap = nc;
+    }
+    g_data[g_data_len] = cast(u8, v & 255);
+    g_data_len = g_data_len + 1;
+}
+fn g_data_i64(v as i64) as void {
+    let is i32 as k with mut = 0;
+    let is i64 as x with mut = v;
+    while (k < 8) { g_data_u8(cast(i32, x & 255)); x = x >> 8; k = k + 1; }
+}
+
+fn layout_data(p as *d.IRProgram) as void {
+    g_data_base = NULL_GUARD;
+    g_data = cast(*u8, 0); g_data_len = 0; g_data_cap = 0;
+
+    // strings: assign addresses by id.
+    let is i32 as maxid with mut = 0;
+    let is *d.StringEntry as s with mut = p.strings;
+    while (cast(i64, s) != 0) { if (s.id > maxid) { maxid = s.id; } s = s.next; }
+    g_str_max = maxid;
+    g_str_addr = d.opt_alloc(cast(i64, maxid + 1) * 8);
+    let is i32 as z with mut = 0;
+    while (z <= maxid) { arr_seti64(g_str_addr, z, 0); z = z + 1; }
+
+    s = p.strings;
+    while (cast(i64, s) != 0) {
+        data_align(8);
+        arr_seti64(g_str_addr, s.id, g_data_base + g_data_len);
+        let is i32 as k with mut = 0;
+        while (k < s.len) { g_data_u8(cast(i32, s.ptr[k])); k = k + 1; }
+        g_data_u8(0);                          // NUL terminator
+        s = s.next;
+    }
+
+    // globals
+    let is i32 as ng with mut = 0;
+    let is *d.IRGlobal as gg with mut = p.globals;
+    while (cast(i64, gg) != 0) { if (gg.is_reachable == 1) { ng = ng + 1; } gg = gg.next; }
+    g_glob_addr = d.opt_alloc(cast(i64, ng + 1) * 8);
+    g_glob_ptr  = d.opt_alloc(cast(i64, ng + 1) * 8);
+    g_num_globals = 0;
+    gg = p.globals;
+    while (cast(i64, gg) != 0) {
+        if (gg.is_reachable == 1) {
+            data_align(8);
+            let is i64 as addr = g_data_base + g_data_len;
+            arr_seti64(g_glob_addr, g_num_globals, addr);
+            arr_seti64(g_glob_ptr, g_num_globals, cast(i64, gg));
+            g_num_globals = g_num_globals + 1;
+            emit_global_bytes(gg);
+        }
+        gg = gg.next;
+    }
+
+    data_align(16);
+    let is i64 as data_end = g_data_base + g_data_len;
+    let is i64 as shadow_top = data_end + STACK_SIZE;
+    g_sp_init = shadow_top;                    // grows down
+    g_heap_base = shadow_top;
+}
+
+fn emit_global_bytes(gg as *d.IRGlobal) as void {
+    if (gg.is_string_init == 1) {
+        // pointer to the referenced string; resolved after strings are laid out.
+        // init_value holds the string id in these builds' convention; fall back to 0.
+        g_data_i64(0);   // conservative: filled below if we can resolve
+    } else if (gg.is_fn_ptr_init == 1) {
+        g_data_i64(0);   // function pointers not yet supported; store 0
+    } else if (gg.is_struct_lit_init == 1) {
+        // struct literal: emit `size` zero bytes (best-effort until full support).
+        let is i32 as k with mut = 0;
+        while (k < gg.size) { g_data_u8(0); k = k + 1; }
+    } else if (gg.is_initialized == 1) {
+        let is i32 as sz = gg.size;
+        let is i64 as v with mut = gg.init_value;
+        let is i32 as k with mut = 0;
+        while (k < sz) { g_data_u8(cast(i32, v & 255)); v = v >> 8; k = k + 1; }
+    } else {
+        // BSS: zero bytes (memory is zero-initialised, but keep layout contiguous).
+        let is i32 as k with mut = 0;
+        while (k < gg.size) { g_data_u8(0); k = k + 1; }
+    }
+}
+
+fn resolve_global_addr(name as *u8, nlen as i32) as i64 {
+    // string ref ".LC<id>"
+    if (nlen > 3 && name[0] == 46 && name[1] == 76 && name[2] == 67) {
+        let is i32 as sid with mut = 0;
+        let is i32 as k with mut = 3;
+        while (k < nlen) { sid = sid * 10 + cast(i32, name[k]) - 48; k = k + 1; }
+        if (sid >= 0 && sid <= g_str_max) { return arr_geti64(g_str_addr, sid); }
+        return 0;
+    }
+    // named global
+    let is i32 as g with mut = 0;
+    while (g < g_num_globals) {
+        let is *d.IRGlobal as gg = cast(*d.IRGlobal, arr_geti64(g_glob_ptr, g));
+        if (gg.name_len == nlen && bytes_eq(gg.name_ptr, name, nlen) == 1) {
+            return arr_geti64(g_glob_addr, g);
+        }
+        g = g + 1;
+    }
+    return 0;
+}
+
+// =====================================================================
+// Section emitters
+// =====================================================================
+fn emit_type_section(m as *WBuf) as void {
+    let is WBuf as b = wb_new(64);
+    wb_uleb(&b, cast(i64, WASI_NTYPES + g_num_types));
+    // type 0: proc_exit (i32) -> ()
+    wb_u8(&b, 0x60); wb_uleb(&b, 1); wb_u8(&b, 0x7F); wb_uleb(&b, 0);
+    // type 1: fd_write (i32,i32,i32,i32) -> (i32)
+    wb_u8(&b, 0x60); wb_uleb(&b, 4);
+    wb_u8(&b, 0x7F); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F); wb_u8(&b, 0x7F);
+    wb_uleb(&b, 1); wb_u8(&b, 0x7F);
+    // type 2: _start () -> ()
+    wb_u8(&b, 0x60); wb_uleb(&b, 0); wb_uleb(&b, 0);
+    // uniform defined-function types (i64^n) -> i64
+    let is i32 as t with mut = 0;
+    while (t < g_num_types) {
+        let is i32 as np = arr_geti32(g_ft_nargs, t);
+        wb_u8(&b, 0x60);
+        wb_uleb(&b, cast(i64, np));
+        let is i32 as k with mut = 0;
+        while (k < np) { wb_u8(&b, 0x7E); k = k + 1; }
+        wb_uleb(&b, 1); wb_u8(&b, 0x7E);
+        t = t + 1;
+    }
+    wb_section(m, 1, &b);
+    d.opt_free(b.data);
+}
+fn emit_import_section(m as *WBuf) as void {
+    let is WBuf as b = wb_new(64);
+    wb_uleb(&b, 3);                            // three imports
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "proc_exit", 9);
+    wb_u8(&b, 0x00); wb_uleb(&b, 0);           // type 0
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_write", 8);
+    wb_u8(&b, 0x00); wb_uleb(&b, 1);           // type 1
+    wb_name(&b, "wasi_snapshot_preview1", 22); wb_name(&b, "fd_read", 7);
+    wb_u8(&b, 0x00); wb_uleb(&b, 1);           // type 1 (same signature)
+    wb_section(m, 2, &b);
+    d.opt_free(b.data);
+}
+fn emit_function_section(m as *WBuf) as void {
+    let is WBuf as b = wb_new(64);
+    let is i32 as total with mut = g_num_funcs;
+    if (g_has_main == 1) { total = total + 1; }   // + _start
+    wb_uleb(&b, cast(i64, total));
+    let is i32 as k with mut = 0;
+    while (k < g_num_funcs) {
+        wb_uleb(&b, cast(i64, WASI_NTYPES + arr_geti32(g_fn_type, k)));
+        k = k + 1;
+    }
+    if (g_has_main == 1) { wb_uleb(&b, 2); }       // _start : type 2
+    wb_section(m, 3, &b);
+    d.opt_free(b.data);
+}
+fn emit_memory_section(m as *WBuf) as void {
+    let is WBuf as b = wb_new(16);
+    let is i64 as min_pages = (g_heap_base + PAGE - 1) / PAGE;
+    wb_uleb(&b, 1);                            // one memory
+    if (g_ptr64 == 1) { wb_u8(&b, 0x04); }     // limits flag: min only, 64-bit
+    else { wb_u8(&b, 0x00); }                  // limits flag: min only, 32-bit
+    wb_uleb(&b, min_pages);
+    wb_section(m, 5, &b);
+    d.opt_free(b.data);
+}
+fn emit_global_section(m as *WBuf) as void {
+    // one mutable global: $sp (index 0)
+    let is WBuf as b = wb_new(16);
+    wb_uleb(&b, 1);
+    if (g_ptr64 == 1) { wb_u8(&b, 0x7E); } else { wb_u8(&b, 0x7F); }  // valtype
+    wb_u8(&b, 0x01);                           // mutable
+    if (g_ptr64 == 1) { op_i64const(&b, g_sp_init); } else { op_i32const(&b, g_sp_init); }
+    wb_u8(&b, 0x0B);                           // end (init expr)
+    wb_section(m, 6, &b);
+    d.opt_free(b.data);
+}
+fn emit_export_section(m as *WBuf) as void {
+    let is WBuf as b = wb_new(128);
+    let is i32 as count with mut = g_num_funcs + 1;   // functions + memory
+    if (g_has_main == 1) { count = count + 1; }        // + _start
+    wb_uleb(&b, cast(i64, count));
+    let is i32 as k with mut = 0;
+    while (k < g_num_funcs) {
+        let is *d.IRFunction as f = cast(*d.IRFunction, arr_geti64(g_fn_ptr, k));
+        wb_name(&b, f.asm_name_ptr, f.asm_name_len);
+        wb_u8(&b, 0x00);                       // func export
+        wb_uleb(&b, cast(i64, g_num_imports + k));
+        k = k + 1;
+    }
+    if (g_has_main == 1) {
+        wb_name(&b, "_start", 6);
+        wb_u8(&b, 0x00); wb_uleb(&b, cast(i64, g_num_imports + g_num_funcs));
+    }
+    wb_name(&b, "memory", 6);
+    wb_u8(&b, 0x02); wb_uleb(&b, 0);           // memory 0
+    wb_section(m, 7, &b);
+    d.opt_free(b.data);
+}
+fn emit_code_section(m as *WBuf, p as *d.IRProgram) as void {
+    let is WBuf as b = wb_new(4096);
+    let is i32 as total with mut = g_num_funcs;
+    if (g_has_main == 1) { total = total + 1; }
+    wb_uleb(&b, cast(i64, total));
+    let is i32 as k with mut = 0;
+    while (k < g_num_funcs) {
+        let is *d.IRFunction as f = cast(*d.IRFunction, arr_geti64(g_fn_ptr, k));
+        if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
+            irp.regen_func_ir(f);
+        }
+        emit_func_body(&b, f);
+        d.free_func_insts(f);
+        k = k + 1;
+    }
+    if (g_has_main == 1) { emit_start_body(&b); }
+    wb_section(m, 10, &b);
+    d.opt_free(b.data);
+}
+// Synthesized WASI entry: call main, wrap the i64 result to i32, call proc_exit.
+fn emit_start_body(c as *WBuf) as void {
+    let is WBuf as body = wb_new(32);
+    let is i32 as k with mut = 0;
+    while (k < g_main_nargs) { op_i64const(&body, 0); k = k + 1; }   // argc/argv = 0
+    wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, g_main_funcidx));   // call main
+    wb_u8(&body, 0xA7);                        // i32.wrap_i64 (exit code)
+    wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_PROC_EXIT));    // call proc_exit
+    wb_u8(&body, 0x00);                        // unreachable
+    wb_u8(&body, 0x0B);                        // end
+    // code entry: uleb(size) + locals(0) + body
+    wb_uleb(c, 1 + body.len);
+    wb_u8(c, 0x00);                            // 0 local groups
+    wb_buf(c, &body);
+    d.opt_free(body.data);
+}
+fn emit_data_section(m as *WBuf) as void {
+    if (g_data_len == 0) { return; }
+    let is WBuf as b = wb_new(g_data_len + 32);
+    wb_uleb(&b, 1);                            // one segment
+    wb_u8(&b, 0x00);                           // active, memory 0
+    if (g_ptr64 == 1) { op_i64const(&b, g_data_base); } else { op_i32const(&b, g_data_base); }
+    wb_u8(&b, 0x0B);                           // end (offset expr)
+    wb_uleb(&b, g_data_len);
+    wb_bytes(&b, g_data, g_data_len);
+    wb_section(m, 11, &b);
+    d.opt_free(b.data);
+}
+
+fn wb_flush_to_eo(b as *WBuf) as void {
+    let is i64 as off with mut = 0;
+    while (off < b.len) {
+        let is i64 as n with mut = b.len - off;
+        if (n > 65536) { n = 65536; }
+        eo.out_str(cast(*u8, cast(i64, b.data) + off), cast(i32, n));
+        off = off + n;
+    }
+}
+
+// =====================================================================
+// Entry
+// =====================================================================
+fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    d.opt_bins_init();
+    eo.out_init(fd);
+    eo.peep_set_enabled(0);
+
+    g_ptr64 = 0;
+    if (tgt.target_get().arch == tgt.ARCH_WASM64) { g_ptr64 = 1; }
+    g_num_imports = 3;                         // proc_exit(0), fd_write(1), fd_read(2)
+    w_error = 0;
+
+    collect_functions(p);
+    layout_data(p);
+
+    // Resolve the entry point for the synthesized _start.
+    g_has_main = 0;
+    if (cast(i64, p.main_func) != 0) {
+        let is *d.IRFunction as mf = p.main_func;
+        let is i32 as fidx = lookup_func(mf.asm_name_ptr, mf.asm_name_len);
+        if (fidx >= 0) {
+            g_has_main = 1;
+            g_main_funcidx = fidx;
+            g_main_nargs = mf.num_args;
+        }
+    }
+
+    let is WBuf as m = wb_new(8192);
+    // header: \0asm + version 1
+    wb_u8(&m, 0x00); wb_u8(&m, 0x61); wb_u8(&m, 0x73); wb_u8(&m, 0x6D);
+    wb_u8(&m, 0x01); wb_u8(&m, 0x00); wb_u8(&m, 0x00); wb_u8(&m, 0x00);
+
+    emit_type_section(&m);
+    emit_import_section(&m);
+    emit_function_section(&m);
+    emit_memory_section(&m);
+    emit_global_section(&m);
+    emit_export_section(&m);
+    emit_code_section(&m, p);
+    emit_data_section(&m);
+
+    if (w_error == 1) {
+        io.eprint_str("error: wasm backend hit unsupported constructs; output not written\n");
+        io.exit(1);
+    }
+
+    wb_flush_to_eo(&m);
+    eo.out_flush();
+    d.opt_free(m.data);
+}

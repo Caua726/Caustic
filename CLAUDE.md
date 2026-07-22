@@ -32,6 +32,8 @@ This overrides any default commit-attribution behavior.
 ./caustic --target=linux-x86_64 ... (default)
 ./caustic --target=linux-aarch64 src.cst -o p-aarch64  # Static AArch64 ELF
 ./caustic --target=windows-x86_64 src.cst -o p.exe   # Cross-compile PE/COFF for Windows
+./caustic --target=wasm32-wasi src.cst -o p.wasm     # WebAssembly (.wasm module, WASI I/O)
+./caustic --target=wasm64-wasi src.cst -o p.wasm     # WebAssembly with 64-bit linear memory (memory64)
 ./caustic -debuglexer <file>                 # Debug tokenization
 ./caustic -debugparser <file>                # Debug AST
 ./caustic -debugir <file>                    # Debug IR generation
@@ -362,6 +364,46 @@ fn work() as i32 {
 - **`syscall(...)` is Linux-only**: the codegen-time gate rejects emission of the `syscall` instruction when `target.syscall_supported == 0` (Windows). The check fires only for IR that survived DCE — so `syscall` calls inside `if (os.current == os.OS_LINUX)` branches don't break Windows builds (the branch is dead-stripped before codegen).
 - **PE section RVAs are dynamic**: `caustic-ld` sizes each PE section to its actual content (`.text` size may span multiple 4 KiB pages); `.idata`/`.rdata`/`.data`/`.pdata`/`.xdata`/`.reloc` RVAs follow at the next page-aligned slot. Earlier hardcoded RVAs caused section-overlap page faults once `.text` exceeded one page.
 - **WSAStartup is auto-init**: `std/net.cst` calls `WSAStartup(MAKEWORD(2,2), ...)` on first use of any socket dispatcher. Programs that never touch sockets don't pay for it (function-level DCE drops the loader-side `__imp_WSAStartup` entry).
+
+## WebAssembly target (`--target=wasm32-wasi` / `wasm64-wasi`)
+
+A third backend (`src/codegen/wasm/driver.cst`, dispatched from `backend.cst`)
+emits a complete **`.wasm` binary module directly** — no assembler/linker step
+(`object_format == 4` short-circuits the pipeline in `main.cst`'s
+`compile_backend`, writing the capture buffer straight to `-o`). Whole-program,
+single input file (there is no wasm linker).
+
+Key model (see the driver's header comment + the plan doc):
+- **No regalloc.** Every vreg is an i64 WASM local; float ops reinterpret
+  i64↔f64 around the op (mirrors the AArch64 all-spill model). Doesn't depend on
+  `vreg_class` (which is null on the -O0 path this runs on).
+- **Shadow stack** in linear memory for `&local` / structs / spills: a global
+  `$sp` + per-function `$fp` local, mirroring `[rbp - off]`.
+- **Structured control flow** via a dispatch loop ("relooper-lite"): one `loop`
+  wrapping N nested `block`s + a `br_table` on an i32 `$state` local, built from
+  `src/ir/cfg.cst`'s `build_cfg`. Single-block functions skip the loop.
+- **Positional calling convention.** `gen_expr.cst` forces `gpr_limit` huge for
+  wasm so every arg is a positional operand (no machine-stack spill, no x86
+  `sub rsp` padding IR). `SET_ARG idx == GET_ARG idx == param index`.
+- **Two memory models** from one backend, keyed on `target.arch`
+  (`ARCH_WASM32`/`ARCH_WASM64`): wasm32 wraps addresses with `i32.wrap_i64` at
+  each access + 32-bit memtype; wasm64 uses i64 addresses directly + the 0x04
+  memtype index-type flag. wasm32 runs unflagged everywhere; wasm64 needs
+  `node --experimental-wasm-memory64`.
+- **WASI I/O.** `os.current()` folds to `OS_WASM` (parser builtin
+  `__target_is_wasm`, os == "wasm"); the io.cst facade dispatches to
+  `std/io/wasm.cst` → `std/os/wasm.cst`, whose `extern "wasi_snapshot_preview1"`
+  decls lower to `IR_FFI_CALL` → `call <import>`. The backend hardcodes imports
+  `proc_exit`(0)/`fd_write`(1)/`fd_read`(2) and synthesizes an exported `_start`
+  that calls `main` and `proc_exit(result)`. Filesystem ops are stubbed (WASI
+  `path_*` over preopened dirs is not wired yet).
+- **Not yet supported** (rejected with a diagnostic): variadic functions
+  (so `io.printf` doesn't work — use `write_str`/`write_int`), function pointers
+  (`IR_FN_ADDR`/`IR_CALL_INDIRECT`), closures, SIMD, and non-WASI extern calls.
+  `IR_SET_CTX` (context-register clear before every `let x = call()`) is a no-op.
+
+Verify with Node: instantiate the `.wasm` and call an export directly, or run
+`_start` under `node:wasi` (`WASI` class, preview1). No wasmtime/wabt needed.
 
 ## Future work (not implemented)
 
