@@ -126,6 +126,12 @@ curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | s
 curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --system
 ```
 
+**Windows** (PowerShell) — installs the native toolchain into `%LOCALAPPDATA%\caustic` and adds it to your `PATH`:
+
+```powershell
+irm https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 | iex
+```
+
 **From source** (needs an existing `caustic` to bootstrap):
 
 ```sh
