@@ -406,22 +406,27 @@ Key model (see the driver's header comment + the plan doc):
   linear memory in 64 KiB pages (append-only; `page_free` = no-op / bump). The
   backend recognizes the `__wasm_memory_grow`/`__wasm_memory_size` externs by
   name in `emit_ffi` and emits `memory.grow`(0x40)/`memory.size`(0x3F) inline.
-- **Self-hosts on wasm**: `caustic.wasm` (the compiler built with
-  `--target=wasm32-wasi src/main.cst`) runs under `node:wasi` and compiles a
-  `.cst` (+ its `std/*` imports, read through `path_open`) to a valid runnable
-  `.wasm` — byte-identical to native for import-free programs. Compiling the
-  *whole compiler* to a fixpoint on wasm is blocked only by V8's wasm-stack
-  limit (the recursive module loader over-deepens on the largest files;
-  SIGSEGVs node rather than trapping) — needs a runtime with a bigger wasm stack
-  (wasmtime `--max-wasm-stack`) or an iterative module loader.
+- **Self-hosts on wasm (full fixpoint)**: `caustic.wasm` (built with
+  `--target=wasm32-wasi src/main.cst`) compiles the *entire compiler* to a
+  **byte-identical** wasm compiler, and that one compiles itself again —
+  gen1==gen2==gen3 identical (2,526,829 bytes). It also cross-compiles a program
+  to a native x86_64 ELF via its embedded assembler+linker. Run it with the
+  pure-JS WASI shim `tests/wasm/wasi_run.mjs`, NOT node's built-in `node:wasi`:
+  ```
+  node tests/wasm/wasi_run.mjs caustic.wasm <repo> --target=wasm32-wasi /src/main.cst -o /caustic.self.wasm
+  ```
+  (node:wasi is experimental and SIGSEGVs inside V8's GC when it scans the stack
+  across a WASI host-call under a large workload — a node bug, not a backend one;
+  a real WASI runtime like wasmtime works too.)
 - **Not yet supported** (rejected with a diagnostic): closures (captured-context
   calls), SIMD (only at -O2), and non-WASI extern C calls. Variadics
   (`io.printf`), function pointers (`IR_CALL_INDIRECT`), and atomics DO work.
   `IR_SET_CTX` (context-register clear before every `let x = call()`) is a no-op.
 
 Verify with Node: instantiate the `.wasm` and call an export directly, or run
-`_start` under `node:wasi` (`WASI` class, preview1) — for filesystem access pass
-`preopens: { '/': <dir> }`. No wasmtime/wabt needed.
+`_start` via the pure-JS WASI shim `tests/wasm/wasi_run.mjs <module.wasm> <preopen-dir>
+[args...]` (preferred — avoids the `node:wasi` GC bug and sandboxes fs to the preopen).
+No wasmtime/wabt needed.
 
 ## Future work (not implemented)
 
