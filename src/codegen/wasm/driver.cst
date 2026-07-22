@@ -556,6 +556,51 @@ fn emit_call(c as *WBuf, i as *d.IRInst) as void {
     else { op_set(c, L_vreg(i.dest.vreg)); }
 }
 
+// Atomics, lowered for SINGLE-THREADED execution (the wasm compiler never
+// spawns threads): plain load / store / read-modify-write, no lock prefix or
+// fence. Correct while uncontended; a multi-threaded wasm build would need the
+// wasm atomics (threads) proposal instead.
+fn atomic_store_op(c as *WBuf, sz as i32) as void {
+    if (sz >= 8) { wb_u8(c, 0x37); } else { wb_u8(c, 0x3E); }   // i64.store / i64.store32
+    memarg(c);
+}
+fn atomic_load_op(c as *WBuf, sz as i32) as void {
+    if (sz >= 8) { wb_u8(c, 0x29); } else { wb_u8(c, 0x35); }   // i64.load / i64.load32_u
+    memarg(c);
+}
+fn emit_atomic(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as op = i.op;
+    let is i32 as sz = ty_size(i.cast_to);
+    let is i32 as l_old = cur_scratch_base + MAX_CALL_ARGS - 4;
+    let is i32 as l_exp = cur_scratch_base + MAX_CALL_ARGS - 5;
+    if (op == d.IR_FENCE) { return; }
+    if (op == d.IR_CAS_EXPECTED) {
+        op_get(c, L_vreg(i.src1.vreg)); op_set(c, l_exp); return;
+    }
+    if (op == d.IR_ATOMIC_LOAD) {
+        push_addr(c, &i.src1); atomic_load_op(c, sz); op_set(c, L_vreg(i.dest.vreg)); return;
+    }
+    if (op == d.IR_ATOMIC_STORE) {
+        push_addr(c, &i.src1); op_get(c, L_vreg(i.src2.vreg)); atomic_store_op(c, sz); return;
+    }
+    // read-modify-write: capture old first
+    push_addr(c, &i.src1); atomic_load_op(c, sz); op_set(c, l_old);
+    if (op == d.IR_ATOMIC_ADD) {
+        push_addr(c, &i.src1);
+        op_get(c, l_old); op_get(c, L_vreg(i.src2.vreg)); wb_u8(c, 0x7C);   // i64.add
+        atomic_store_op(c, sz);
+    } else if (op == d.IR_ATOMIC_XCHG) {
+        push_addr(c, &i.src1); op_get(c, L_vreg(i.src2.vreg)); atomic_store_op(c, sz);
+    } else {
+        // IR_ATOMIC_CAS: if (*ptr == expected) *ptr = val
+        op_get(c, l_old); op_get(c, l_exp); wb_u8(c, 0x51);   // i64.eq -> i32
+        wb_u8(c, 0x04); wb_u8(c, 0x40);                        // if (void)
+        push_addr(c, &i.src1); op_get(c, L_vreg(i.src2.vreg)); atomic_store_op(c, sz);
+        wb_u8(c, 0x0B);                                        // end
+    }
+    op_get(c, l_old); op_set(c, L_vreg(i.dest.vreg));          // dest = old
+}
+
 // Function pointer = its 1-based table slot (an i64 handle).
 fn emit_fn_addr(c as *WBuf, i as *d.IRInst) as void {
     let is i32 as slot = tbl_slot(i.global_name_ptr, cast(i32, i.global_name_len));
@@ -651,13 +696,19 @@ fn emit_value_inst(c as *WBuf, i as *d.IRInst) as void {
     if (op == d.IR_SYSCALL || op == d.IR_SET_SYS_ARG) { wasm_err("syscall(...) is not available on wasm (use WASI)"); return; }
     if (op == d.IR_VA_START) { emit_va_start(c, i); return; }
     if (op == d.IR_CALL_INDIRECT) { emit_call_indirect(c, i); return; }
+    if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
+        || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS
+        || op == d.IR_FENCE) { emit_atomic(c, i); return; }
     // SET_CTX sets the closure context register (r10 on x86) — emitted before
     // every `let x = call()` to clear it to 0. WASM has no context register and
     // uses positional args, so the common clear-to-0 case is a no-op. (A real
     // captured-closure call would additionally need CALL_INDIRECT, which is
     // still rejected below, so ignoring this here cannot mask a closure.)
     if (op == d.IR_SET_CTX) { return; }
-    wasm_err("unsupported IR opcode for wasm target");
+    io.eprint_str("error: wasm backend: unsupported IR opcode ");
+    io.write_int(io.STDERR, cast(i64, op));
+    io.eprint_str(" for wasm target\n");
+    w_error = 1;
 }
 
 fn emit_asm(c as *WBuf, i as *d.IRInst) as void {
