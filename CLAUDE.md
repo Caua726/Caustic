@@ -424,10 +424,21 @@ Key model (see the driver's header comment + the plan doc):
   ELF via its embedded assembler+linker. Runs under node's built-in `node:wasi`
   (`WASI` class, preopen the repo at `/`), under Deno, and under the small pure-JS
   runner `tests/wasm/wasi_run.mjs` — all reliably and with byte-identical output.
-- **Not yet supported** (rejected with a diagnostic): closures (captured-context
-  calls), SIMD (only at -O2), and non-WASI extern C calls. Variadics
-  (`io.printf`), function pointers (`IR_CALL_INDIRECT`), and atomics DO work.
-  `IR_SET_CTX` (context-register clear before every `let x = call()`) is a no-op.
+- **Optimization levels**: `-O0/-O1/-O2` all produce correct wasm. `-O1`'s
+  `IR_LEA2/4/8` (base+index*scale) and `IR_CMOV` are handled; the compiler
+  self-hosts to wasm at `-O2`. The x86 auto-vectorizer stays x86-only (its
+  runtime AVX2 dispatch + 256-bit ops don't map to wasm's 128-bit v128), so
+  `-O2` wasm is correct SCALAR code — the wasm engine vectorizes it.
+- **Extern FFI**: `extern "wasi_snapshot_preview1"` decls are the WASI imports;
+  any OTHER `extern "<module>"` fn becomes a host import from `<module>`,
+  provided by the host at instantiation (i64 args/result; pointers = memory
+  offsets). See `tests/wasm/extern_host.cst`.
+- **Work now**: variadics (`io.printf`), function pointers (`IR_CALL_INDIRECT`),
+  atomics, custom host imports, and `-O0/-O1/-O2`.
+- **Not supported**: SIMD as native wasm v128 (produces scalar instead — see
+  above), and closures — Caustic has no closure/lambda syntax on ANY target, so
+  this is a language-level non-feature, not a wasm gap. (`IR_SET_CTX` — the
+  struct-return context set, misnamed "closure ctx" — is a harmless no-op here.)
 
 Verify with Node: instantiate the `.wasm` and call an export directly, run `_start`
 under `node:wasi` (`WASI` class, preview1; `preopens: { '/': <dir> }` for fs), or use
