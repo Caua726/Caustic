@@ -1115,31 +1115,39 @@ fn _fork_emit(prog as *u8, dir as *u8, filename as *u8, flen as i32,
         if (_emit_mo_slice(prog, dir, filename, flen, tp, tl, ntask, 0, 1) != 0) { status = 1; }
         return status;
     }
-    // Shared task counter: MAP_SHARED so atomic_add is visible across the fork
-    // (a private/COW page would give each process its own copy). mmap zero-fills,
-    // so the counter starts at 0 = the root task.
-    let is *u8 as ctrp = os.linux.mmap(cast(*u8, 0), 4096,
-        os.linux.PROT_READ | os.linux.PROT_WRITE,
-        os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0);
-    let is *i64 as ctr = cast(*i64, ctrp);
-    let is i32 as w with mut = 1;
-    while (w < ws) {
-        let is i64 as pid = os.linux.fork();
-        if (pid == 0) {
-            let is i32 as cst = _emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr);
-            os.linux.exit(cast(i64, cst));   // child exits with its status
+    // The parallel fork path is Linux-only. Wrapping it in a foldable
+    // `os.current() == os.OS_LINUX` guard makes the whole block dead-strip on
+    // non-Linux targets (wasm/windows) before codegen — so the raw fork/mmap/
+    // wait4/exit syscalls never reach a backend that cannot emit them. The
+    // runtime early-return above (line ~1113) already routes those targets to
+    // the serial path; this guard is what removes the dead syscalls from IR.
+    if (os.current() == os.OS_LINUX) {
+        // Shared task counter: MAP_SHARED so atomic_add is visible across the fork
+        // (a private/COW page would give each process its own copy). mmap zero-fills,
+        // so the counter starts at 0 = the root task.
+        let is *u8 as ctrp = os.linux.mmap(cast(*u8, 0), 4096,
+            os.linux.PROT_READ | os.linux.PROT_WRITE,
+            os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0);
+        let is *i64 as ctr = cast(*i64, ctrp);
+        let is i32 as w with mut = 1;
+        while (w < ws) {
+            let is i64 as pid = os.linux.fork();
+            if (pid == 0) {
+                let is i32 as cst = _emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr);
+                os.linux.exit(cast(i64, cst));   // child exits with its status
+            }
+            w = w + 1;
         }
-        w = w + 1;
+        if (_emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr) != 0) { status = 1; }
+        let is i32 as c with mut = 1;
+        while (c < ws) {
+            let is i32 as wstatus with mut = 0;
+            os.linux.wait4(0 - 1, cast(*i32, &wstatus), 0, cast(*u8, 0));
+            if (((wstatus >> 8) & 255) != 0) { status = 1; }
+            c = c + 1;
+        }
+        os.linux.munmap(ctrp, 4096);
     }
-    if (_emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr) != 0) { status = 1; }
-    let is i32 as c with mut = 1;
-    while (c < ws) {
-        let is i32 as wstatus with mut = 0;
-        os.linux.wait4(0 - 1, cast(*i32, &wstatus), 0, cast(*u8, 0));
-        if (((wstatus >> 8) & 255) != 0) { status = 1; }
-        c = c + 1;
-    }
-    os.linux.munmap(ctrp, 4096);
     return status;
 }
 
@@ -1267,11 +1275,16 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     // visible to the parent after wait4). The per-function codegen breakdown
     // (cg_prof) lives in a per-process buffer and only aggregates when emission
     // is sequential (ws<=1, e.g. -j 1), so gate it on that.
-    if (prof.prof_enabled == 1) {
-        prof.emit_acc = cast(i64, os.linux.mmap(cast(*u8, 0), 4096,
-            os.linux.PROT_READ | os.linux.PROT_WRITE,
-            os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0));
-        if (ws <= 1) { cg.cg_prof_init(8192); }
+    // MAP_SHARED accumulator is Linux-only (needs mmap + fork). The outer
+    // os.current() guard folds to `if(0)` on non-Linux targets, dead-stripping
+    // the raw mmap before it reaches a backend that cannot emit syscalls.
+    if (os.current() == os.OS_LINUX) {
+        if (prof.prof_enabled == 1) {
+            prof.emit_acc = cast(i64, os.linux.mmap(cast(*u8, 0), 4096,
+                os.linux.PROT_READ | os.linux.PROT_WRITE,
+                os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0));
+            if (ws <= 1) { cg.cg_prof_init(8192); }
+        }
     }
 
     let is i32 as st = _fork_emit(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, root_pp, root_pl, ws);
@@ -1321,11 +1334,15 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     // _emit_one_obj never writes them.)
     ti = 0;
     while (ti < nobj) { io.unlink(cast(*u8, obj_arr[ti])); ti = ti + 1; }
-    os.linux.rmdir(dir);
+    // rmdir has no portable io facade yet; gate the raw syscall so it dead-strips
+    // on non-Linux targets (this whole parallel path is Linux-only anyway).
+    if (os.current() == os.OS_LINUX) { os.linux.rmdir(dir); }
 
-    if (prof.prof_enabled == 1 && prof.emit_acc != 0) {
-        os.linux.munmap(cast(*u8, prof.emit_acc), 4096);
-        prof.emit_acc = 0;
+    if (os.current() == os.OS_LINUX) {
+        if (prof.prof_enabled == 1 && prof.emit_acc != 0) {
+            os.linux.munmap(cast(*u8, prof.emit_acc), 4096);
+            prof.emit_acc = 0;
+        }
     }
 
     if (g_quiet == 0) { io.write_str(io.STDOUT, "caustic: "); io.write_str(io.STDOUT, cast(*u8, g_output_path)); io.write_str(io.STDOUT, "\n"); }
