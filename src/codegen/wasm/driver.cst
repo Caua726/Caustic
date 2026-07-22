@@ -376,6 +376,29 @@ fn emit_arith(c as *WBuf, i as *d.IRInst) as void {
     op_set(c, L_vreg(i.dest.vreg));
 }
 
+// dest = src1(base) + src2(index) * scale, then narrow (mirrors x86 lea).
+fn emit_lea(c as *WBuf, i as *d.IRInst, scale as i64) as void {
+    push_operand(c, &i.src1);
+    push_operand(c, &i.src2);
+    op_i64const(c, scale);
+    wb_u8(c, 0x7E);                            // i64.mul
+    wb_u8(c, 0x7C);                            // i64.add
+    narrow(c, i.cast_to);
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
+// dest = (src1 != 0) ? src2 : dest.  dest already holds the false value (from a
+// preceding MOV), matching the x86 `cmovne dest, vtrue`. wasm select(a,b,c) picks
+// a when c != 0, so a=vtrue, b=current dest, c=(cond != 0).
+fn emit_cmov(c as *WBuf, i as *d.IRInst) as void {
+    push_operand(c, &i.src2);                  // a = vtrue
+    op_get(c, L_vreg(i.dest.vreg));            // b = current dest (false value)
+    push_operand(c, &i.src1);                  // cond (i64)
+    op_i64const(c, 0); wb_u8(c, 0x52);         // i64.ne -> i32 (cond != 0)
+    wb_u8(c, 0x1B);                            // select
+    op_set(c, L_vreg(i.dest.vreg));
+}
+
 fn emit_bits(c as *WBuf, i as *d.IRInst) as void {
     let is i32 as op = i.op;
     if (op == d.IR_NOT) {
@@ -791,6 +814,12 @@ fn emit_value_inst(c as *WBuf, i as *d.IRInst) as void {
     if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
         || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS
         || op == d.IR_FENCE) { emit_atomic(c, i); return; }
+    // -O1 address folding: dest = base + index*scale (x86 lea). Scale in the opcode.
+    if (op == d.IR_LEA2) { emit_lea(c, i, 2); return; }
+    if (op == d.IR_LEA4) { emit_lea(c, i, 4); return; }
+    if (op == d.IR_LEA8) { emit_lea(c, i, 8); return; }
+    // -O1 if-conversion: dest = (cond != 0) ? vtrue : dest (false preloaded).
+    if (op == d.IR_CMOV) { emit_cmov(c, i); return; }
     // SET_CTX sets the closure context register (r10 on x86) — emitted before
     // every `let x = call()` to clear it to 0. WASM has no context register and
     // uses positional args, so the common clear-to-0 case is a no-op. (A real
