@@ -422,8 +422,8 @@ Key model (see the driver's header comment + the plan doc):
   **byte-identical** wasm compiler, and that one compiles itself again —
   gen1==gen2==gen3 identical. It also cross-compiles a program to a native x86_64
   ELF via its embedded assembler+linker. Runs under node's built-in `node:wasi`
-  (`WASI` class, preopen the repo at `/`), under Deno, and under the small pure-JS
-  runner `tests/wasm/wasi_run.mjs` — all reliably and with byte-identical output.
+  (`WASI` class, preopen the repo at `/`) and under Deno — reliably and with
+  byte-identical output.
 - **Optimization levels**: `-O0/-O1/-O2` all produce correct wasm. `-O1`'s
   `IR_LEA2/4/8` (base+index*scale) and `IR_CMOV` are handled; the compiler
   self-hosts to wasm at `-O2`. The x86 auto-vectorizer stays x86-only (its
@@ -440,10 +440,9 @@ Key model (see the driver's header comment + the plan doc):
   this is a language-level non-feature, not a wasm gap. (`IR_SET_CTX` — the
   struct-return context set, misnamed "closure ctx" — is a harmless no-op here.)
 
-Verify with Node: instantiate the `.wasm` and call an export directly, run `_start`
-under `node:wasi` (`WASI` class, preview1; `preopens: { '/': <dir> }` for fs), or use
-the small pure-JS runner `tests/wasm/wasi_run.mjs <module.wasm> <preopen-dir> [args...]`
-(handy for scripting + sandboxes fs to the preopen). No wasmtime/wabt needed.
+Verify with Node: instantiate the `.wasm` and call an export directly, or run `_start`
+under `node:wasi` (`WASI` class, preview1; `preopens: { '/': <dir> }` for fs). Deno's
+WASI works too. No wasmtime/wabt needed.
 
 ## Future work (not implemented)
 
