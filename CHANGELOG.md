@@ -6,6 +6,23 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.1](https://github.com/Caua726/Caustic/releases/tag/v0.1.1) — 2026-07-22
+
+### Added
+- Windows installer `install.ps1` (PowerShell one-liner).
+- `caustic-x86_64-windows.zip` release artifact — native PE toolchain (`caustic.exe`, `caustic-as.exe`, `caustic-ld.exe`, `caustic-mk.exe`) + stdlib.
+- `dist-windows` Causticfile script — cross-builds the Windows toolchain from Linux.
+- Windows install instructions in the README.
+- Windows install instructions in `docs/getting-started.md`.
+
+### Fixed
+- Windows cross-build regression — `--target=windows-x86_64` single-file builds failed with "parallel emission failed" because the parallel-by-default guard did not exclude PE (object_format 2); PE now routes through the serial path.
+
+### Changed
+- Assembler README — build via `caustic-mk`, link via `caustic-ld`; dropped stale gcc/make/ld references and no-longer-true limitations.
+- Linker README — build via `caustic-mk`, not `make`.
+- Maker README — added.
+
 ## [v0.1.0](https://github.com/Caua726/Caustic/releases/tag/v0.1.0) — 2026-07-22
 
 ### Added

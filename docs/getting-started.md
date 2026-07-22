@@ -43,6 +43,19 @@ sudo cp -r std/ /usr/local/lib/caustic/std/
 After this, `caustic`, `caustic-as`, and `caustic-ld` should be available from
 anywhere on your system.
 
+On **Linux** you can also install in one line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh
+```
+
+On **Windows** (PowerShell) — installs the native toolchain into
+`%LOCALAPPDATA%\caustic` and adds it to your `PATH`:
+
+```powershell
+irm https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 | iex
+```
+
 ### Option 2: Build from Source
 
 Since Caustic is self-hosted, you need an existing `caustic` binary to compile it.
