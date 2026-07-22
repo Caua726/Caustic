@@ -34,6 +34,7 @@ let is i64 as NULL_GUARD  with imut = 1024;      // low reserve so *0 stays unus
 let is i64 as STACK_SIZE  with imut = 8388608;   // 8 MiB shadow stack
 let is i64 as PAGE        with imut = 65536;      // wasm page = 64 KiB
 let is i32 as MAX_CALL_ARGS with imut = 32;
+let is i32 as VA_PACK_BYTES with imut = 256;   // per-frame packed-varargs buffer (32 slots)
 
 // ── Module state ──────────────────────────────────────────────────────
 let is i32 as g_ptr64 with mut = 0;              // 1 = wasm64 (memory64)
@@ -68,10 +69,12 @@ let is i32 as g_num_globals with mut = 0;
 
 // Per-function emission context.
 let is *d.IRFunction as cur_func with mut = cast(*d.IRFunction, 0);
+let is i32 as cur_param_count with mut = 0;   // fixed params + (variadic ? 1 va-buf ptr : 0)
 let is i32 as cur_fp_local with mut = 0;
 let is i32 as cur_state_local with mut = 0;
 let is i32 as cur_scratch_base with mut = 0;
 let is i32 as cur_frame with mut = 0;
+let is i32 as cur_va_pack_off with mut = 0;   // distance below $fp to the packed-varargs buffer
 let is i32 as cur_argc with mut = 0;
 let is i32 as w_error with mut = 0;
 
@@ -225,7 +228,7 @@ fn op_tee(c as *WBuf, local as i32) as void { wb_u8(c, 0x22); wb_uleb(c, cast(i6
 fn op_i64const(c as *WBuf, v as i64) as void { wb_u8(c, 0x42); wb_sleb(c, v); }
 fn op_i32const(c as *WBuf, v as i64) as void { wb_u8(c, 0x41); wb_sleb(c, v); }
 
-fn L_vreg(v as i32) as i32 { return cur_func.num_args + v; }
+fn L_vreg(v as i32) as i32 { return cur_param_count + v; }
 
 // Push an IR operand as an i64 value.
 fn push_operand(c as *WBuf, o as *d.Operand) as void {
@@ -247,6 +250,7 @@ fn push_addr(c as *WBuf, o as *d.Operand) as void {
 }
 // memarg: align(log2, 0 = byte, always valid) + offset 0.
 fn memarg(c as *WBuf) as void { wb_u8(c, 0x00); wb_u8(c, 0x00); }
+fn memarg_off(c as *WBuf, off as i64) as void { wb_u8(c, 0x00); wb_uleb(c, off); }
 
 // Truncate the top-of-stack i64 to `cast_to`'s width (canonicalise sub-64 ints).
 fn narrow(c as *WBuf, cast_to as *u8) as void {
@@ -495,19 +499,63 @@ fn emit_get_arg(c as *WBuf, i as *d.IRInst) as void {
     op_get(c, cast(i32, i.src1.imm));          // param local
     op_set(c, L_vreg(i.dest.vreg));
 }
+// Packed-varargs buffer base = $fp - cur_va_pack_off.
+fn push_va_buf_index(c as *WBuf) as void {
+    op_get(c, cur_fp_local);
+    if (g_ptr64 == 1) { op_i64const(c, cast(i64, cur_va_pack_off)); wb_u8(c, 0x7D); }
+    else { op_i32const(c, cast(i64, cur_va_pack_off)); wb_u8(c, 0x6B); }
+}
+fn push_va_buf_value(c as *WBuf) as void {
+    op_get(c, cur_fp_local);
+    if (g_ptr64 == 1) { op_i64const(c, cast(i64, cur_va_pack_off)); wb_u8(c, 0x7D); }
+    else { op_i32const(c, cast(i64, cur_va_pack_off)); wb_u8(c, 0x6B); wb_u8(c, 0xAD); }
+}
+
 fn emit_call(c as *WBuf, i as *d.IRInst) as void {
     let is i32 as fidx = lookup_func(i.call_name_ptr, cast(i32, i.call_name_len));
     if (fidx < 0) {
         wasm_err("call to undefined function (extern/host not yet supported)");
+        cur_argc = 0;
         return;
     }
-    let is i32 as n = cur_argc;
+    let is i32 as num_fixed = arr_geti32(g_fn_args, fidx - g_num_imports);
     let is i32 as k with mut = 0;
-    while (k < n) { op_get(c, cur_scratch_base + k); k = k + 1; }
+    if (i.is_variadic_call == 1) {
+        // Pack the variadic args (scratch[num_fixed..cur_argc-1]) contiguously
+        // into the frame's va buffer, 8 bytes each.
+        let is i32 as nvar with mut = cur_argc - num_fixed;
+        if (nvar < 0) { nvar = 0; }
+        k = 0;
+        while (k < nvar) {
+            push_va_buf_index(c);
+            op_get(c, cur_scratch_base + num_fixed + k);
+            wb_u8(c, 0x37); memarg_off(c, cast(i64, k) * 8);   // i64.store @ k*8
+            k = k + 1;
+        }
+        k = 0;
+        while (k < num_fixed) { op_get(c, cur_scratch_base + k); k = k + 1; }
+        push_va_buf_value(c);                                  // hidden va-buf ptr arg
+    } else {
+        k = 0;
+        while (k < num_fixed) { op_get(c, cur_scratch_base + k); k = k + 1; }
+    }
     wb_u8(c, 0x10); wb_uleb(c, cast(i64, fidx));   // call
     cur_argc = 0;
     if (i.dest.op_type == d.OP_NONE) { wb_u8(c, 0x1A); }   // drop
     else { op_set(c, L_vreg(i.dest.vreg)); }
+}
+
+// VA_START: fill the caller-visible SysV VaList so va_arg reads the packed
+// buffer contiguously. We set gp_offset/fp_offset above their limits so every
+// va_arg takes the overflow_arg_area path (which points at the contiguous
+// buffer) regardless of int/float. src1 = &va ; the va-buf ptr is the last
+// param (index cur_param_count-1).
+fn emit_va_start(c as *WBuf, i as *d.IRInst) as void {
+    let is i32 as vabuf = cur_param_count - 1;
+    push_addr(c, &i.src1); op_i32const(c, 48);  wb_u8(c, 0x36); memarg_off(c, 0);   // gp_offset
+    push_addr(c, &i.src1); op_i32const(c, 176); wb_u8(c, 0x36); memarg_off(c, 4);   // fp_offset
+    push_addr(c, &i.src1); op_get(c, vabuf);    wb_u8(c, 0x37); memarg_off(c, 8);   // overflow_arg_area
+    push_addr(c, &i.src1); op_get(c, vabuf);    wb_u8(c, 0x37); memarg_off(c, 16);  // reg_save_area
 }
 
 // FFI call = a WASI host import. The extern's impl string is the WASI module
@@ -571,8 +619,8 @@ fn emit_value_inst(c as *WBuf, i as *d.IRInst) as void {
     if (op == d.IR_FFI_CALL) { emit_ffi(c, i); return; }
     // Unsupported opcodes (syscall, indirect call, va_start, closures, SIMD).
     if (op == d.IR_SYSCALL || op == d.IR_SET_SYS_ARG) { wasm_err("syscall(...) is not available on wasm (use WASI)"); return; }
+    if (op == d.IR_VA_START) { emit_va_start(c, i); return; }
     if (op == d.IR_CALL_INDIRECT) { wasm_err("indirect calls not yet supported"); return; }
-    if (op == d.IR_VA_START) { wasm_err("variadic functions not yet supported"); return; }
     // SET_CTX sets the closure context register (r10 on x86) — emitted before
     // every `let x = call()` to clear it to 0. WASM has no context register and
     // uses positional args, so the common clear-to-0 case is a no-op. (A real
@@ -681,15 +729,29 @@ fn emit_ret_void(c as *WBuf) as void {
     op_i64const(c, 0); wb_u8(c, 0x0F);
 }
 
+fn func_makes_vararg_call(f as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = f.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_CALL && inst.is_variadic_call == 1) { return 1; }
+        inst = inst.next;
+    }
+    return 0;
+}
+
 fn emit_func_body(c as *WBuf, f as *d.IRFunction) as void {
     cur_func = f;
     cur_argc = 0;
-    // frame size
+    // A variadic function takes one extra param: a pointer to the packed varargs.
+    cur_param_count = f.num_args;
+    if (f.is_variadic == 1) { cur_param_count = cur_param_count + 1; }
+    // frame size (+ a packed-varargs buffer if this function makes variadic calls)
     let is i32 as frame with mut = f.stack_size + f.alloc_stack_size;
+    if (func_makes_vararg_call(f) == 1) { frame = frame + VA_PACK_BYTES; }
+    cur_va_pack_off = frame;                    // buffer starts at $fp - frame
     if (frame > 0) { if (frame % 16 != 0) { frame = frame + 16 - (frame % 16); } }
     cur_frame = frame;
-    // local index layout
-    cur_scratch_base = f.num_args + f.vreg_count;
+    // local index layout (params include the hidden va-buf on variadic fns)
+    cur_scratch_base = cur_param_count + f.vreg_count;
     cur_fp_local = cur_scratch_base + MAX_CALL_ARGS;
     cur_state_local = cur_fp_local + 1;
 
@@ -826,9 +888,11 @@ fn collect_functions(p as *d.IRProgram) as void {
     f = p.functions;
     while (cast(i64, f) != 0) {
         if (f.is_reachable == 1 && is_defined(f) == 1) {
+            let is i32 as pc with mut = f.num_args;
+            if (f.is_variadic == 1) { pc = pc + 1; }   // hidden packed-varargs ptr param
             arr_seti64(g_fn_ptr, g_num_funcs, cast(i64, f));
-            arr_seti32(g_fn_args, g_num_funcs, f.num_args);
-            arr_seti32(g_fn_type, g_num_funcs, intern_type(f.num_args));
+            arr_seti32(g_fn_args, g_num_funcs, f.num_args);   // fixed arg count
+            arr_seti32(g_fn_type, g_num_funcs, intern_type(pc));
             g_num_funcs = g_num_funcs + 1;
         }
         f = f.next;
