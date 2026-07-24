@@ -65,6 +65,12 @@ struct Term {
     want_size as i64;     // CSI 18t sets this; the holder reports size + clears
     def_fg   as i64;      // default fg/bg — SGR 0/39/49 restore these
     def_bg   as i64;
+    // -- appended (all i64): xterm mouse tracking. A TUI enables it by writing
+    //    CSI ?1000h (button events) / ?1003h (any-event = motion too), and
+    //    CSI ?1006h to get SGR-encoded reports. The holder reads these fields to
+    //    decide whether/how to encode a mouse event into the child's stdin. --
+    mouse_mode as i64;    // 0 = off, 1 = button (1000/1002), 3 = any-event (1003)
+    mouse_sgr  as i64;    // 1 = SGR encoding (?1006): CSI < b;x;y M/m
 }
 
 // The grid is a ring of grid_rows text lines. The live view occupies
@@ -264,6 +270,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
     t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.mouse_mode = 0; t.mouse_sgr = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -292,6 +299,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
     t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.mouse_mode = 0; t.mouse_sgr = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -320,6 +328,7 @@ fn init_text(width as i64, height as i64) as Term {
     t.grid = 0; t.grid_stride = 0; t.grid_rows = 0;
     t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
+    t.mouse_mode = 0; t.mouse_sgr = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -522,8 +531,23 @@ fn _csi_dispatch(t as *Term, final as i64) as void {
     if (final == 0x4A) { _cursor(t, 0); _erase_display(t, p0); return; }   // 'J'
     if (final == 0x4B) { _cursor(t, 0); _erase_line(t, p0); return; }      // 'K'
     if (final == 0x6D) { _sgr(t); return; }                               // 'm' SGR
-    if (final == 0x6C) { if (t.csi_q == 1 && p0 == 25) { _cursor(t, 0); t.cur_vis = 0; } return; }  // 'l' ?25l: erase, then hide
-    if (final == 0x68) { if (t.csi_q == 1 && p0 == 25) { t.cur_vis = 1; } return; }  // 'h' ?25h
+    if (final == 0x6C) {                                                  // 'l' reset private mode
+        if (t.csi_q == 1) {
+            if (p0 == 25) { _cursor(t, 0); t.cur_vis = 0; }               // ?25l: erase, then hide
+            else if (p0 == 1000 || p0 == 1002 || p0 == 1003) { t.mouse_mode = 0; }
+            else if (p0 == 1006) { t.mouse_sgr = 0; }
+        }
+        return;
+    }
+    if (final == 0x68) {                                                  // 'h' set private mode
+        if (t.csi_q == 1) {
+            if (p0 == 25) { t.cur_vis = 1; }                             // ?25h
+            else if (p0 == 1000 || p0 == 1002) { t.mouse_mode = 1; }     // button (+drag) tracking
+            else if (p0 == 1003) { t.mouse_mode = 3; }                   // any-event (motion) tracking
+            else if (p0 == 1006) { t.mouse_sgr = 1; }                    // SGR-encoded reports
+        }
+        return;
+    }
     if (final == 0x74) { if (p0 == 18) { t.want_size = 1; } return; }      // 't' 18t size report
 }
 
