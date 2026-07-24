@@ -68,7 +68,18 @@ let is i64 as SYS_PROC_KILL       with imut = 35;
 let is i64 as SYS_PROC_LIST       with imut = 36;
 let is i64 as SYS_MEM_INFO        with imut = 37;
 let is i64 as SYS_STATFS          with imut = 38;
-let is i64 as SYS_COUNT           with imut = 39;
+let is i64 as SYS_CPU_STAT        with imut = 39;
+let is i64 as SYS_TIME_WALL       with imut = 40;
+let is i64 as SYS_POWEROFF        with imut = 41;
+let is i64 as SYS_REBOOT          with imut = 42;
+let is i64 as SYS_POWER_PENDING   with imut = 43;
+let is i64 as SYS_STATX           with imut = 44;
+let is i64 as SYS_EVENT_SUBSCRIBE with imut = 45;
+let is i64 as SYS_THREAD_SPAWN    with imut = 46;
+let is i64 as SYS_THREAD_EXIT     with imut = 47;
+let is i64 as SYS_QUERY_DEVS      with imut = 48;
+let is i64 as SYS_DEV_INFO        with imut = 49;
+let is i64 as SYS_COUNT           with imut = 50;
 
 // Errno values the kernel returns (negative in rax).
 let is i64 as E_OK    with imut = 0;
@@ -263,6 +274,10 @@ fn exists(path as *u8) as i32 {
     return 0;
 }
 fn readdir(fd as i64, out as *u8) as i64 { return syscall(21, fd, out); }
+// statx — stat plus the FAT32 write-time. Fills 5 x i64 = 40 bytes:
+//   [0] size  [1] first_cluster  [2] attr  [3] is_dir  [4] mtime (epoch s)
+// mtime 0 means the kernel has no stamp for that entry, not "epoch".
+fn statx(path as *u8, out as *u8) as i32 { return cast(i32, syscall(44, path, _slen(path), out)); }
 
 // --- display / surface (dev_open DEV_FB → a surface fd) ---
 fn dev_open(class as i64, index as i64, flags as i64) as i64 { return syscall(22, class, index, flags); }
@@ -293,6 +308,45 @@ fn channel_create(out as *i64) as i64 { return syscall(24, out); }
 // fresh fd. E_AGAIN = slot busy / nothing pending. The SCM_RIGHTS analogue.
 fn fd_send(chan_fd as i64, fd as i64) as i64 { return syscall(32, chan_fd, fd); }
 fn fd_recv(chan_fd as i64) as i64 { return syscall(33, chan_fd); }
+
+// --- lifecycle events: the signal replacement. Subscribe to your OWN children
+//     (pid must be the caller's — the spawn tree is the authority, there is no
+//     ambient namespace) and get back a readable, pollable fd. Reads yield whole
+//     {pid, kind, code} records of EVENT_REC_BYTES each; a 0-byte read means
+//     "nothing queued now", NOT end-of-stream, so multiplex it with poll().
+//     mask 0 = every kind. ---
+let is i64 as EVENT_REC_BYTES with imut = 24;   // 3 x i64 per record
+let is i64 as EVENT_EXIT      with imut = 1;    // kind: a child exited; code = its exit code
+fn event_subscribe(pid as i64, mask as i64) as i64 { return syscall(45, pid, mask); }
+
+// --- threads over one address space. thread_spawn starts a ring-3 thread in
+//     the CALLER's aspace at `entry`, with `arg` in rdi, running on `stack_top`
+//     (the caller mmap'd that stack — the kernel supplies mechanism, the stack
+//     is policy). thread_exit ends the calling thread only; exit() still ends
+//     the whole process. A CPU-bound worker lives here without stalling the
+//     parent's poll loop. ---
+fn thread_spawn(entry as i64, arg as i64, stack_top as i64) as i64 {
+    return syscall(46, entry, arg, stack_top);
+}
+fn thread_exit(code as i64) as void { syscall(47, code); }
+
+// --- device enumeration: the read-all counterpart of dev_count. Writes
+//     {class, index} pairs (2 x i64) for every registered instance, up to
+//     `max` pairs, and returns the TOTAL — a return above `max` means the
+//     snapshot was truncated. ---
+fn query_devs(out as *i64, max as i64) as i64 { return syscall(48, cast(i64, out), max); }
+
+// --- identity of ONE instance the caller already located. Fills DevInfo,
+//     DEV_INFO_WORDS i64:
+//       [0] class  [1] index  [2] vendor  [3] product  [4..7] name (32 B, NUL-padded)
+//     vendor/product are the bus's own ids, 0 when the bus has no such notion
+//     (PS/2, platform, the boot framebuffer) — PCI vendor 0 is not valid, so 0
+//     is unambiguous. E_NOENT when there is no index-th instance of the class:
+//     the index is honest, never an alias of 0. ---
+let is i64 as DEV_INFO_WORDS with imut = 8;
+fn dev_info(class as i64, index as i64, out as *i64) as i64 {
+    return syscall(49, class, index, cast(i64, out));
+}
 
 // --- wait-many readiness: block until any watched fd is ready, the deadline
 //     passes, or (timeout 0) after one non-blocking sweep. `entries` is an
