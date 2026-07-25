@@ -1,0 +1,78 @@
+// tests/call_addr_test.cst — taking a field or element off a call result.
+//
+// `f().field` used to abort IR generation with "gen_addr: unsupported node
+// kind". A call result is an rvalue with no storage of its own, so there was
+// no address to compute the member offset from, and gen_addr fell through to
+// its error path. Chaining like this is the natural way to write vector and
+// matrix code, so the gap showed up immediately in anything mathematical.
+//
+// Both return paths matter and are covered here: a struct over 8 bytes travels
+// through a slot the caller allocates, so its address already exists, while a
+// smaller one arrives in a register and has to be spilled to reach memory.
+//
+// Exit code is the number of failures.
+use "../std/io.cst" as io;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+// 24 bytes — returned through a caller-provided slot.
+struct Big { a as f64; b as f64; c as f64; }
+
+// 8 bytes — returned in a register.
+struct Small { x as i32; y as i32; }
+
+// Nested, to check the offset still composes when the base is a temporary.
+struct Outer { head as i64; inner as Small; }
+
+fn mk_big() as Big {
+    let is Big as r; r.a = 1.5; r.b = 2.5; r.c = 3.5; return r;
+}
+
+fn mk_small() as Small {
+    let is Small as r; r.x = 7; r.y = 9; return r;
+}
+
+fn mk_outer() as Outer {
+    let is Outer as r; r.head = 100; r.inner.x = 11; r.inner.y = 13; return r;
+}
+
+fn scaled(k as f64) as Big {
+    let is Big as r; r.a = k; r.b = k * 2.0; r.c = k * 3.0; return r;
+}
+
+fn main() as i32 {
+    // Large return: the address is the slot the call already wrote into.
+    chk("big.a", cast(i64, mk_big().a * 10.0), 15);
+    chk("big.b", cast(i64, mk_big().b * 10.0), 25);
+    chk("big.c", cast(i64, mk_big().c * 10.0), 35);
+
+    // Small return: spilled to a fresh slot before the offset applies.
+    chk("small.x", cast(i64, mk_small().x), 7);
+    chk("small.y", cast(i64, mk_small().y), 9);
+
+    // A field of a field, where the base of the whole chain is a temporary.
+    chk("outer.head", mk_outer().head, 100);
+    chk("outer.inner.x", cast(i64, mk_outer().inner.x), 11);
+    chk("outer.inner.y", cast(i64, mk_outer().inner.y), 13);
+
+    // Several calls in one expression, each needing its own temporary — they
+    // must not share a slot and overwrite one another.
+    chk("two calls in one expression",
+        cast(i64, (mk_big().a + mk_big().c) * 10.0), 50);
+    chk("distinct temporaries",
+        cast(i64, (scaled(1.0).b + scaled(10.0).b) * 10.0), 220);
+
+    // With arguments, so the temporary is allocated after the call's own
+    // argument setup rather than before it.
+    chk("call with args", cast(i64, scaled(4.0).c * 10.0), 120);
+
+    if (fails != 0) { io.printf("  call_addr_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}
