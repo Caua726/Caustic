@@ -13,8 +13,17 @@ use "defs.cst" as d;
 // memory. Labels and jumps end the block.
 
 let is i32 as CSE_BUCKETS with imut = 256;
-// Per-entry: op(i32) + s1t(i32) + s1v(i64) + s2t(i32) + s2v(i64) + vreg(i32) = 32 bytes
-let is i32 as CSE_ENTRY_BYTES with imut = 32;
+// Per-entry: op(i32) + s1t(i32) + s1v(i64) + s2t(i32) + s2v(i64) + vreg(i32)
+//          + cast_to(*u8) = 40 bytes
+//
+// cast_to is part of the key because codegen reads it: IR_SHR picks `sar` vs
+// `shr` from is_signed_type(cast_to), and MUL/SHL/SHR/LEA run
+// emit_narrow_truncate(cast_to) on the result. Two instructions with identical
+// (op, src1, src2) but different cast_to are therefore NOT the same value.
+// Nothing in gen_expr guarantees they can't meet here — the array-index path
+// emits IR_SHL with cast_to = 0 while gen_bitwise sets it from node.ty — so the
+// key carries it rather than relying on that.
+let is i32 as CSE_ENTRY_BYTES with imut = 40;
 let is *u8 as cse_table with mut;
 let is i32 as cse_count with mut = 0;
 
@@ -35,20 +44,21 @@ fn cse_reset() as void {
     cse_count = 0;
 }
 
-fn cse_hash(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i64) as i32 {
+fn cse_hash(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i64, ct as i64) as i32 {
     let is i64 as h with mut = cast(i64, op) * 2654435761;
     h = h + s1v * 1597334677;
     h = h + cast(i64, s1t) * 1357676777;
     h = h + s2v * 2147483647;
     h = h + cast(i64, s2t) * 16777619;
+    h = h + ct * 2246822519;
     h = h & 9223372036854775807;
     return cast(i32, h & cast(i64, CSE_BUCKETS - 1));
 }
 
 // Returns the vreg of the prior identical expression, or -1 if new.
 // On miss, stores the new entry.
-fn cse_lookup_or_insert(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i64, vreg as i32) as i32 {
-    let is i32 as h with mut = cse_hash(op, s1t, s1v, s2t, s2v);
+fn cse_lookup_or_insert(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i64, vreg as i32, ct as i64) as i32 {
+    let is i32 as h with mut = cse_hash(op, s1t, s1v, s2t, s2v, ct);
     let is i32 as tries with mut = 0;
     while (tries < CSE_BUCKETS) {
         let is i64 as off = cast(i64, cse_table) + cast(i64, h) * cast(i64, CSE_ENTRY_BYTES);
@@ -61,6 +71,7 @@ fn cse_lookup_or_insert(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i6
             let is *i32 as s2t_p = cast(*i32, off + 16); *s2t_p = s2t;
             let is *i64 as s2v_p = cast(*i64, off + 20); *s2v_p = s2v;
             let is *i32 as vp = cast(*i32, off + 28);    *vp = vreg;
+            let is *i64 as ct_p = cast(*i64, off + 32);  *ct_p = ct;
             return cast(i32, 0 - 1);
         }
         if (*op_p == op) {
@@ -68,7 +79,8 @@ fn cse_lookup_or_insert(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i6
             let is *i64 as s1v_p = cast(*i64, off + 8);
             let is *i32 as s2t_p = cast(*i32, off + 16);
             let is *i64 as s2v_p = cast(*i64, off + 20);
-            if (*s1t_p == s1t && *s1v_p == s1v && *s2t_p == s2t && *s2v_p == s2v) {
+            let is *i64 as ct_p = cast(*i64, off + 32);
+            if (*s1t_p == s1t && *s1v_p == s1v && *s2t_p == s2t && *s2v_p == s2v && *ct_p == ct) {
                 let is *i32 as vp = cast(*i32, off + 28);
                 return *vp;
             }
@@ -156,7 +168,8 @@ fn pass_cse_local(func as *d.IRFunction) as void {
                 let is i64 as s2v with mut = 0;
                 if (s2t == d.OP_VREG) { s2v = cast(i64, inst.src2.vreg); }
                 else if (s2t == d.OP_IMM) { s2v = inst.src2.imm; }
-                let is i32 as prior = cse_lookup_or_insert(inst.op, s1t, s1v, s2t, s2v, inst.dest.vreg);
+                let is i32 as prior = cse_lookup_or_insert(inst.op, s1t, s1v, s2t, s2v, inst.dest.vreg,
+                                                           cast(i64, inst.cast_to));
                 if (prior >= 0 && prior != inst.dest.vreg) {
                     // Redundant — kill this inst and remap dest → prior.
                     let is *i32 as rp = cast(*i32, cast(i64, remap) + cast(i64, inst.dest.vreg) * 4);
