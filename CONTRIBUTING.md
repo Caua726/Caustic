@@ -151,6 +151,16 @@ Follow the checklist below.
 - Link the issue if there is one
 - PRs are reviewed by maintainers
 
+### Licensing of contributions
+
+Caustic is [MIT licensed](LICENSE). By opening a pull request you agree that
+your contribution is licensed under the same terms — inbound = outbound. You
+keep the copyright on what you wrote; you're just granting everyone downstream
+the same MIT rights the rest of the project already carries.
+
+Only submit code you have the right to license this way. Don't paste in code
+from another project unless its license permits it and you say so in the PR.
+
 ## Pre-merge checklist
 
 Every PR must satisfy all applicable items. If something doesn't apply, say why.

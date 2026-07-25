@@ -403,7 +403,14 @@ bug fixes come with a test, performance changes come with a benchmark, and new
 stdlib functionality should be generally useful. Caustic values explicitness,
 speed, and zero dependencies.
 
----
+## License
 
-*Caustic does not yet ship a formal license file. Until one is added, please
-contact the author before redistributing.*
+Caustic is released under the [MIT License](LICENSE) — use it, modify it, ship
+it in closed-source products, no strings attached beyond keeping the copyright
+notice. The same license covers the three toolchain submodules
+(`caustic-assembler`, `caustic-linker`, `caustic-maker`).
+
+This applies to the compiler *and* the standard library. Since `std/` is
+statically linked into every binary Caustic produces, MIT was chosen so that
+programs written in Caustic carry the lightest possible obligation — a single
+copyright notice — and stay compatible with GPLv2 code.
