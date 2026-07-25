@@ -6,6 +6,25 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.3](https://github.com/Caua726/Caustic/releases/tag/v0.1.3) — 2026-07-25
+
+### Added
+- **`libcaustic.dll`** — the Windows shared stdlib is producible. A `--shared` build keeps every symbol, so `std/os/linux.cst`'s wrappers are emitted whatever the target; `--allow-unsupported` now stubs their `syscall` as `-ENOSYS` instead of aborting the build. Verified under wine: 784 exports, a real kernel32/ntdll/bcrypt/ws2_32 import table, and I/O through the DLL's own imports. Packaged in `caustic-x86_64-windows.zip`.
+- **Configurable installers** on both systems — `--format=elf,cse,exe` / `-Format`, `--tools=` / `-Tools`, `--lib=so,csl,dll` / `-Lib`, `--root=pkexec|sudo|doas`, `-System` with UAC elevation, `--dry-run` / `-DryRun`.
+- **`update.sh` / `update.ps1` and `uninstall.sh` / `uninstall.ps1`** — the installer records its choices and every path it wrote, so update replays your configuration and uninstall removes only what it created.
+- **`--extension=<s>`** actually applies now. A CSE output always ends in `.cse`, plus `.<s>` unless `<s>` is `cse`; the default is `exe`, since the polyglot's offset 0 is MZ.
+
+### Changed
+- **Pre-commit builds every target** (linux/windows/caustic × x86_64/aarch64) and all three `libcaustic` flavours, and fails when a link leaves a relocation unapplied. It also round-trips a `.csl` through `csl_loader` and checks the container's slices. Both bugs fixed below shipped through a green gate because nothing built the target that broke.
+- **`release-build.sh` produces all three assets** and refuses one that does not run; **`prerelease.sh` warns** when an asset the previous release shipped is missing. v0.1.2 went out with one download where v0.1.1 had two.
+- The PE export directory names the output file instead of a fixed `caustic.dll`.
+
+### Fixed
+- **`mfence` was emitted unconditionally** by `std/os/causticos.cst`, so that module could not be assembled for AArch64 at all. Gated per architecture; AArch64 gets `dmb ish`.
+- **ARM64 COFF relocations went through the AMD64 table**, so `PAGEBASE_REL21` (4) arrived as `R_X86_64_PC32` (2) and a `windows-aarch64` PE linked with unrelocated call sites. Mapped in both directions; `CONDBR19` no longer falls through to `ADDR64`.
+- The COFF reader did not allocate the custom-section exec bits added in v0.1.2, so `merge_sections` dereferenced null for every COFF input.
+- The ARM64 sub-build's `.pdb` was left beside every polyglot; only the x64 one was cleaned up.
+
 ## [v0.1.2](https://github.com/Caua726/Caustic/releases/tag/v0.1.2) — 2026-07-25
 
 ### Added

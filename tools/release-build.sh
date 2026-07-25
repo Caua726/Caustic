@@ -105,6 +105,31 @@ BAD="$(tar tzf caustic-x86_64-linux.tar.gz | grep -Ec '\.(s|o)$' || true)"
 [ "$BAD" = "0" ] || die "tarball contains $BAD build artifacts (.s/.o) — std not clean"
 ok "caustic-x86_64-linux.tar.gz — $(tar tzf caustic-x86_64-linux.tar.gz | wc -l) files, 0 artifacts"
 
+# ---- the other two release assets ------------------------------------------
+# A release shipping fewer artifacts than the one before it is a silent
+# regression nobody notices until someone goes looking for the download that
+# used to be there — v0.1.2 went out with only the tarball that way. Build all
+# three here so the set cannot drift.
+step "Package caustic-x86_64-windows.zip"
+./caustic-mk run dist-windows >/dev/null 2>&1 || die "windows packaging failed"
+[ -f caustic-x86_64-windows.zip ] || die "dist-windows did not produce the zip"
+unzip -l caustic-x86_64-windows.zip | grep -q "libcaustic.dll" \
+    || die "the windows zip carries no libcaustic.dll"
+ok "caustic-x86_64-windows.zip — $(unzip -l caustic-x86_64-windows.zip | tail -1 | awk '{print $2}') files"
+
+step "Package caustic-universal.cse.exe"
+# One file with a native body for every OS and architecture. --mode=bundle runs
+# five single-target links and welds them, so this is the slowest step by far.
+./caustic -O2 --target=caustic --mode=bundle src/main.cst -o caustic-universal >/dev/null 2>&1 \
+    || die "universal build failed"
+[ -f caustic-universal.cse.exe ] || die "the universal build produced no .cse.exe"
+# It must at least answer on this machine, through the shell stub that picks the
+# Linux body — a body that cannot run is worse than no asset.
+UV="$(sh ./caustic-universal.cse.exe --version 2>/dev/null | head -1)"
+case "$UV" in caustic\ *) ;; *) die "the universal build does not run here (said: ${UV:-nothing})" ;; esac
+ok "caustic-universal.cse.exe — $(du -h caustic-universal.cse.exe | cut -f1), runs: $UV"
+
 printf "\n${G}${B}release build OK${N} — gen4 $OPT toolchain packaged (4-phase sequence).\n"
 printf "  shipped compiler (phase 4): ${B}$(sha256sum caustic | cut -c1-16)…${N}\n"
-printf "${D}Next: git tag v<version> && gh release create v<version> caustic-x86_64-linux.tar.gz${N}\n"
+printf "${D}Next: git tag v<version> && gh release create v<version> \\\n"
+printf "        caustic-x86_64-linux.tar.gz caustic-x86_64-windows.zip caustic-universal.cse.exe${N}\n"

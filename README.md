@@ -246,7 +246,9 @@ qemu-aarch64 ./program-aarch64
 | `-o <file>` | Output executable |
 | `-c` | Compile only — no `main` required (for libraries) |
 | `-O0` / `-O1` | Optimization level |
-| `--target=<triple>` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `caustic`, `caustic-x86_64`, `caustic-aarch64` |
+| `--target=<triple>` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `caustic`, `caustic-x86_64`, `caustic-aarch64`, `wasm32-wasi`, `wasm64-wasi` |
+| `--mode=<m>` | `pure` · `compat` / `bundle` (the six-body polyglot) — CSE targets only |
+| `--extension=<s>` | suffix a CSE output carries: always `.cse`, plus `.<s>` unless `<s>` is `cse` (default `exe`) |
 | `-l<name>` | Link a dynamic library |
 | `--profile` | Per-phase timing |
 | `--cache <dir>` | Incremental build cache |

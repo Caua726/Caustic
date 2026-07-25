@@ -30,6 +30,7 @@ else B=; G=; R=; Y=; D=; N=; fi
 step() { printf "%s\n" "${B}▸ $*${N}"; }
 ok()   { printf "  ${G}✓${N} %s\n" "$*"; }
 info() { printf "  ${D}%s${N}\n" "$*"; }
+warn() { printf "  ${Y}! %s${N}\n" "$*"; }
 die()  { printf "  ${R}✗ %s${N}\n" "$*"; printf "\n${R}${B}pre-release NOT ready${N} — %s\n" "${1:-fix the above before releasing}"; exit 1; }
 
 if [ "${PRERELEASE_SKIP:-0}" = "1" ]; then echo "${Y}pre-release check skipped (PRERELEASE_SKIP=1)${N}"; exit 0; fi
@@ -93,6 +94,28 @@ if [ -n "$LAST_TAG" ]; then
     step "Release scope"
     info "$NCOMMITS commits since $LAST_TAG"
     info "changelog:  git log --oneline $LAST_TAG..HEAD"
+fi
+
+# ---- 4. asset parity with the previous release -----------------------------
+# A release that ships fewer downloads than the one before it is a regression
+# nobody notices until someone looks for a file that used to be there. This
+# names them rather than guessing, and warns instead of blocking: dropping an
+# asset can be deliberate, but it should never be a surprise.
+if [ -n "${LAST_TAG:-}" ] && command -v gh >/dev/null 2>&1; then
+    step "Assets carried by $LAST_TAG"
+    PREV_ASSETS="$(gh release view "$LAST_TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+    if [ -n "$PREV_ASSETS" ]; then
+        MISSING=""
+        for a in $PREV_ASSETS; do
+            [ -f "$a" ] || MISSING="$MISSING $a"
+        done
+        if [ -n "$MISSING" ]; then
+            warn "not built yet:$MISSING"
+            info "tools/release-build.sh produces all three"
+        else
+            ok "every asset $LAST_TAG shipped is present"
+        fi
+    fi
 fi
 
 printf "\n${G}${B}pre-release ready${N} — version ${B}v$VER${N}.\n"
