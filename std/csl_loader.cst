@@ -29,29 +29,61 @@ fn _seq(a as *u8, b as *u8) as i32 {
     return 1;
 }
 
-let is i64 as _csl_base with mut = 0;
-let is i64 as _csl_file with mut = 0;
-let is i64 as _csl_eoff with mut = 0;
-let is i32 as _csl_ecount with mut = 0;
+// CSL_ v2 header, as emitted by cse_writer.cst:cse_emit_csl_image:
+//   0x00 4 "CSL_"  0x04 2 version  0x06 1 arch  0x07 1 flags
+//   0x08 8 base_addr  0x10 4 seg_count  0x14 4 export_count  0x18 8 export_off
+//   0x20 8 kimport_off  0x28 4 kimport_count          -> 44 bytes
+// The segment table follows at CSL_HDR_SIZE. v1 had a 32-byte header (no
+// kimport fields); reading a v2 image at the v1 offset lands on kimport_off
+// and yields a zero-sized image, so the version gate below is load-bearing.
+let is i64 as CSL_HDR_SIZE with imut = 44;
+let is i64 as CSL_VERSION with imut = 2;
+// Arch this loader build can execute, matching the writer's ARCH_* codes.
+let is i64 as CSL_ARCH_NATIVE with imut = 1 * __target_is_x86_64 + 2 * __target_is_aarch64;
+
+// One slot per loaded image. These were single globals, so a second csl_open
+// silently replaced the first and csl_resolve could only ever see the newest
+// library. Resolution now walks every open image, newest first.
+let is i32 as CSL_MAX_OPEN with imut = 8;
+let is [8]i64 as _csl_bases with mut;
+let is [8]i64 as _csl_files with mut;
+let is [8]i64 as _csl_eoffs with mut;
+let is [8]i32 as _csl_ecounts with mut;
+let is i32 as _csl_n with mut = 0;
 
 fn csl_open(path as *u8) as i64 {
+    if (_csl_n >= CSL_MAX_OPEN) { return 0; }
     let is i64 as fd = io._open_read(path);
     if (fd < 0) { return 0; }
     let is i64 as sz = io._lseek(fd, 0, 2);          // SEEK_END
     io._lseek(fd, 0, 0);                              // SEEK_SET
+    if (sz < CSL_HDR_SIZE) { io._close_fd(fd); return 0; }
     let is i64 as fbuf = _csl_alloc(sz, 0);                     // RW buffer for the file
     if (fbuf <= 0) { io._close_fd(fd); return 0; }
-    io._read_fd(fd, cast(*u8, fbuf), sz);
+    // read() may return short on a regular file; loop until the whole image is in.
+    let is i64 as got with mut = 0;
+    while (got < sz) {
+        let is i64 as n = io._read_fd(fd, cast(*u8, fbuf + got), sz - got);
+        if (n <= 0) { io._close_fd(fd); return 0; }
+        got = got + n;
+    }
     io._close_fd(fd);
     let is *u8 as f = cast(*u8, fbuf);
     if (f[0] != 67 || f[1] != 83 || f[2] != 76 || f[3] != 95) { return 0; }   // "CSL_"
+    let is i64 as ver = cast(i64, f[4]) + (cast(i64, f[5]) << 8);
+    if (ver != CSL_VERSION) { return 0; }
+    // Arch byte at 0x06 (1 = x86_64, 2 = aarch64). Nothing used to read it, so a
+    // foreign-arch image would be mapped and jumped into.
+    if (cast(i64, f[6]) != CSL_ARCH_NATIVE) { return 0; }
     let is i32 as segc = cast(i32, _rd_u32(f, 16));
-    _csl_ecount = cast(i32, _rd_u32(f, 20));
-    _csl_eoff = _rd_u64(f, 24);
+    let is i32 as ecount = cast(i32, _rd_u32(f, 20));
+    let is i64 as eoff = _rd_u64(f, 24);
+    if (CSL_HDR_SIZE + cast(i64, segc) * 24 > sz) { return 0; }
+    if (eoff + cast(i64, ecount) * 12 > sz) { return 0; }
     let is i64 as imgsz with mut = 0;
     let is i32 as i with mut = 0;
     while (i < segc) {
-        let is i64 as so = 32 + cast(i64, i) * 24;
+        let is i64 as so = CSL_HDR_SIZE + cast(i64, i) * 24;
         let is i64 as va = _rd_u64(f, so);
         let is i64 as ms = _rd_u32(f, so + 16);
         if (va + ms > imgsz) { imgsz = va + ms; }
@@ -61,14 +93,20 @@ fn csl_open(path as *u8) as i64 {
     if (base <= 0) { return 0; }
     i = 0;
     while (i < segc) {
-        let is i64 as so = 32 + cast(i64, i) * 24;
+        let is i64 as so = CSL_HDR_SIZE + cast(i64, i) * 24;
         let is i64 as va = _rd_u64(f, so);
         let is i64 as fo = _rd_u32(f, so + 8);
         let is i64 as fs = _rd_u32(f, so + 12);
+        if (fs > 0 && fo + fs > sz) { return 0; }
         if (fs > 0) { mem.memcpy(cast(*u8, base + va), cast(*u8, fbuf + fo), fs); }
         i = i + 1;
     }
-    _csl_base = base; _csl_file = fbuf;
+    let is i32 as slot = _csl_n;
+    _csl_bases[slot] = base;
+    _csl_files[slot] = fbuf;
+    _csl_eoffs[slot] = eoff;
+    _csl_ecounts[slot] = ecount;
+    _csl_n = _csl_n + 1;
     // compat: tell the loaded lib which OS we're on. The loader is built per-OS,
     // so os.current() folds to a literal at compile time — this is a single
     // store of a known value, NOT runtime OS detection. A compat .csl's
@@ -78,15 +116,23 @@ fn csl_open(path as *u8) as i64 {
     return base;
 }
 
+// Search every open image, newest first, so a later library can shadow an
+// earlier one (the usual dynamic-loader convention).
 fn csl_resolve(name as *u8) as i64 {
-    let is *u8 as f = cast(*u8, _csl_file);
-    let is i32 as i with mut = 0;
-    while (i < _csl_ecount) {
-        let is i64 as eo = _csl_eoff + cast(i64, i) * 12;
-        let is i64 as noff = _rd_u32(f, eo);
-        let is i64 as va = _rd_u64(f, eo + 4);
-        if (_seq(cast(*u8, cast(i64, f) + noff), name) == 1) { return _csl_base + va; }
-        i = i + 1;
+    let is i32 as s with mut = _csl_n - 1;
+    while (s >= 0) {
+        let is *u8 as f = cast(*u8, _csl_files[s]);
+        let is i64 as eoff = _csl_eoffs[s];
+        let is i32 as ecount = _csl_ecounts[s];
+        let is i32 as i with mut = 0;
+        while (i < ecount) {
+            let is i64 as eo = eoff + cast(i64, i) * 12;
+            let is i64 as noff = _rd_u32(f, eo);
+            let is i64 as va = _rd_u64(f, eo + 4);
+            if (_seq(cast(*u8, cast(i64, f) + noff), name) == 1) { return _csl_bases[s] + va; }
+            i = i + 1;
+        }
+        s = s - 1;
     }
     return 0;
 }
