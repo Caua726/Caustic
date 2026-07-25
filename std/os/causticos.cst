@@ -82,7 +82,8 @@ let is i64 as SYS_DEV_INFO        with imut = 49;
 let is i64 as SYS_NET_INFO        with imut = 50;
 let is i64 as SYS_GET_RANDOM      with imut = 51;
 let is i64 as SYS_RANDOM_QUALITY  with imut = 52;
-let is i64 as SYS_COUNT           with imut = 53;
+let is i64 as SYS_AUDIO_INFO      with imut = 53;
+let is i64 as SYS_COUNT           with imut = 54;
 
 // Errno values the kernel returns (negative in rax).
 let is i64 as E_OK    with imut = 0;
@@ -146,6 +147,24 @@ let is i64 as DEV_TABLET           with imut = 3;
 // rather than a stream because the frame boundary is a fact of the hardware —
 // the PHY builds and strips the framing, so what arrives already is a record.
 let is i64 as DEV_NET              with imut = 4;
+// DEV_AUDIO_OUT / DEV_AUDIO_IN are a RING OF PCM plus a control page, mapped
+// with mmap_fd(). audio_info() reports the geometry the kernel opened the
+// stream with — the rate and the format are reported, never requested.
+//
+// The stream runs from acquire to close. There is no start, no stop, no
+// drain and no volume: silence is what you get by not feeding it, finishing
+// is polling until hw_ptr reaches your app_ptr, and gain is your business.
+//
+// One fd has ONE mode, fixed by its first data operation: mmap first and you
+// publish app_ptr yourself, write() first and the kernel advances it for you.
+// The other one is E_INVAL from then on, because two writers on app_ptr is a
+// race with no lock a program could take.
+//
+// poll() is how an mmap-mode program waits for the next period: WRITABLE on
+// playback means a period of room, READABLE on capture means a period of
+// samples.
+let is i64 as DEV_AUDIO_OUT        with imut = 5;
+let is i64 as DEV_AUDIO_IN         with imut = 6;
 let is i64 as MMAP_FD              with imut = 0x10;
 let is i64 as MMAP_RESERVE         with imut = 0x20;   // reserve-only (back no pages)
 let is i64 as SURFACE_FMT_XRGB8888 with imut = 0;
@@ -418,6 +437,82 @@ fn random_u64() as i64 {
     let is i64 as i with mut = 0;
     while (i < 8) { v = v | (cast(i64, b[i]) << (8 * i)); i = i + 1; }
     return v;
+}
+
+// --- audio stream geometry: what the kernel opened the stream with ---
+// Takes the fd, like net_info, and for the same reason. Fills
+// AUDIO_INFO_WORDS words:
+//   [0] rate_hz       [1] channels      [2] format (AUDIO_FMT_*)
+//   [3] frame_bytes   [4] period_frames [5] period_count
+//   [6] buffer_frames [7] data_offset   [8] direction (AUDIO_DIR_*)
+//   [9] ctl_bytes     [10] map_bytes    [11] flags (AUDIO_FLAG_*)
+//   [12..15] driver name, 32 bytes NUL-padded ("hda", "vsnd")
+let is i64 as AUDIO_INFO_WORDS with imut = 16;
+let is i64 as AUDIO_FMT_S16_LE with imut = 0;
+let is i64 as AUDIO_DIR_OUT    with imut = 0;
+let is i64 as AUDIO_DIR_IN     with imut = 1;
+let is i64 as AUDIO_FLAG_MODE_MMAP   with imut = 1;
+let is i64 as AUDIO_FLAG_MODE_STREAM with imut = 2;
+let is i64 as AUDIO_FLAG_ACTIVE      with imut = 4;
+
+fn audio_info(fd as i64, out as *i64) as i64 {
+    return syscall(53, fd, cast(i64, out));
+}
+
+// --- the control page, which is shared memory and therefore ABI ---
+// Every field is an i64 with EXACTLY ONE writer, which is the whole of the
+// synchronisation design. The facts at 0x000 are written once at acquire; the
+// kernel owns the line at 0x080; the program owns the line at 0x100. Three
+// cache lines so the two cursors do not bounce each other.
+//
+// hw_ptr and app_ptr are MONOTONIC 64-BIT FRAME COUNTS, not ring indices: at
+// 48 kHz a 63-bit count lasts six million years, so there is no wraparound
+// case and no full-versus-empty ambiguity. Frames available = hw_ptr -
+// app_ptr; room = buffer_frames - (app_ptr - hw_ptr); the byte offset of a
+// frame is data_offset + (ptr % buffer_frames) * frame_bytes.
+//
+// Read them through audio_ctl_get and publish through audio_ctl_publish:
+// those derive a fresh pointer per access, which is what keeps the compiler
+// from caching a word that another party is writing.
+let is i64 as AUDIO_CTL_BYTES   with imut = 4096;
+let is i64 as AUDIO_CTL_MAGIC   with imut = 0x43415544;   // "CAUD"
+let is i64 as AUDIO_CTL_VERSION with imut = 1;
+
+let is i64 as AUDIO_W_MAGIC         with imut = 0;
+let is i64 as AUDIO_W_VERSION       with imut = 1;
+let is i64 as AUDIO_W_RATE          with imut = 2;
+let is i64 as AUDIO_W_CHANNELS      with imut = 3;
+let is i64 as AUDIO_W_FORMAT        with imut = 4;
+let is i64 as AUDIO_W_FRAME_BYTES   with imut = 5;
+let is i64 as AUDIO_W_PERIOD_FRAMES with imut = 6;
+let is i64 as AUDIO_W_PERIOD_COUNT  with imut = 7;
+let is i64 as AUDIO_W_BUFFER_FRAMES with imut = 8;
+let is i64 as AUDIO_W_DATA_OFFSET   with imut = 9;
+let is i64 as AUDIO_W_DIRECTION     with imut = 10;
+let is i64 as AUDIO_W_HW_PTR        with imut = 16;
+let is i64 as AUDIO_W_XRUNS         with imut = 17;
+let is i64 as AUDIO_W_IRQ_SEQ       with imut = 18;
+let is i64 as AUDIO_W_RUNNING       with imut = 19;
+let is i64 as AUDIO_W_APP_PTR       with imut = 32;
+let is i64 as AUDIO_W_APP_FLAGS     with imut = 33;
+let is i64 as AUDIO_APP_DRAINING    with imut = 1;
+
+// One word of the control page, read fresh. Never hoist these into a local
+// and reuse it across a wait — the other side is writing.
+fn audio_ctl_get(base as i64, word as i64) as i64 {
+    let is *i64 as p = cast(*i64, base + word * 8);
+    return p[0];
+}
+
+// Publish a word the PROGRAM owns (app_ptr, app_flags). The fence is what
+// orders the samples you just stored ahead of the pointer that advertises
+// them: without it the compiler is free to move the store, and the hardware
+// would read frames you had not written yet.
+fn audio_ctl_publish(base as i64, word as i64, v as i64) as void {
+    asm("mfence\n");
+    let is *i64 as p = cast(*i64, base + word * 8);
+    p[0] = v;
+    return;
 }
 
 // Unpack one byte of the MAC from word [4] of net_info's output.
