@@ -348,10 +348,14 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
                 tgt.cse_mode_set(1);
             } else if (str_eq(mval, mlen, "bundle", 6) == 1) {
                 tgt.cse_mode_set(2);
+            } else if (str_eq(mval, mlen, "fat", 3) == 1) {
+                // Multi-architecture container: build one pure image per
+                // architecture and fuse them into a single CST_ v4 file.
+                tgt.cse_mode_set(3);
             } else {
                 io.write_str(io.STDERR, "Error: unknown --mode '");
                 io.write_bytes(io.STDERR, mval, cast(i64, mlen));
-                io.write_str(io.STDERR, "'. Supported: pure, compat, bundle\n");
+                io.write_str(io.STDERR, "'. Supported: pure, compat, bundle, fat\n");
                 return 1;
             }
         } else if (str_eq(arg, arglen, "--allow-unsupported", 19) == 1) {
@@ -1489,6 +1493,36 @@ fn cse_subexec(self_path as *u8, targflag as *u8, modeflag as *u8,
     return cse_spawn_wait(self_path, cast(*u8, &cargv), envp);
 }
 
+// --mode=fat: build one pure .cse per CausticOS architecture and fuse them into
+// a single CST_ v4 container. Each slice is exactly what a single-target link
+// emits, so the loader reuses its validated per-image path after picking one.
+fn cse_orchestrate_fat(self_path as *u8, envp as *u8) as i32 {
+    let is *u8 as out = cast(*u8, g_output_path);
+    let is [512]u8 as x64_buf;
+    let is [512]u8 as a64_buf;
+    let is *u8 as x64 = cse_path_with_suffix(cast(*u8, &x64_buf), out, ".__cse_x64.tmp");
+    let is *u8 as a64 = cse_path_with_suffix(cast(*u8, &a64_buf), out, ".__cse_a64.tmp");
+
+    if (cse_subexec(self_path, "--target=caustic-x86_64", "--mode=pure", x64, envp) != 0) {
+        io.write_str(io.STDERR, "caustic: CSE fat: x86_64 build failed\n");
+        return 1;
+    }
+    if (cse_subexec(self_path, "--target=caustic-aarch64", "--mode=pure", a64, envp) != 0) {
+        io.write_str(io.STDERR, "caustic: CSE fat: aarch64 build failed\n");
+        return 1;
+    }
+    let is i32 as ferr = ldmod.cse_fat_files(x64, a64, out);
+    io.unlink(x64);
+    io.unlink(a64);
+    if (ferr != 0) { return 1; }
+    if (g_quiet == 0) {
+        io.write_str(io.STDOUT, "caustic: ");
+        io.write_str(io.STDOUT, out);
+        io.write_str(io.STDOUT, " (CSE fat: x86_64 + aarch64)\n");
+    }
+    return 0;
+}
+
 fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
     let is *u8 as out = cast(*u8, g_output_path);
     let is [512]u8 as pe_buf;
@@ -1588,6 +1622,9 @@ fn main(argc as i64, argv as i64) as i32 {
         // (--shared skips polyglot-exe orchestration → builds a single compat .csl)
         // envp follows argv on the stack: argv[0..argc-1], NULL, envp[0..].
         let is *u8 as envp = cast(*u8, cast(i64, argv) + (argc + 1) * 8);
+        if (tgt.cse_mode_get() == 3) {
+            return cse_orchestrate_fat(cast(*u8, argv_arr[0]), envp);
+        }
         return cse_orchestrate(cast(*u8, argv_arr[0]), envp);
     }
 
