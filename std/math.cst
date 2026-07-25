@@ -158,3 +158,445 @@ fn sqrt(x as f64) as f64 {
 fn sqrtf(x as f32) as f32 {
     return cast(f32, __builtin_sqrt(cast(f64, x)));
 }
+
+// =======================================================
+// Floating point
+//
+// Everything below is computed here, in Caustic: there is no libm to call
+// and sqrt is the only float operation the hardware gives us outright. The
+// transcendentals follow the usual shape — reduce the argument to a small
+// interval, evaluate a truncated series on it by Horner's method, then undo
+// the reduction. Series lengths are chosen so the truncation error lands
+// below the last bit of an f64 over the reduced interval.
+//
+// Two constraints from the compiler shape this code, and both are deliberate
+// rather than stylistic:
+//
+//   - The lexer has no exponent notation, so 1e-17 is spelled out in full.
+//   - Float comparison ignores the parity flag, so every comparison against
+//     a NaN answers as though NaN were an ordinary number (`x != x` is
+//     false). Nothing here may test for NaN that way; is_nan reads the bit
+//     pattern, and callers that care are expected to do the same.
+// =======================================================
+
+// --- Constants ---
+
+let is f64 as PI      = 3.141592653589793;
+let is f64 as TAU     = 6.283185307179586;
+let is f64 as PI_2    = 1.5707963267948966;
+let is f64 as PI_4    = 0.7853981633974483;
+let is f64 as E       = 2.718281828459045;
+let is f64 as LN2     = 0.6931471805599453;
+let is f64 as LN10    = 2.302585092994046;
+let is f64 as LOG2E   = 1.4426950408889634;
+let is f64 as SQRT2   = 1.4142135623730951;
+let is f64 as DEG2RAD = 0.017453292519943295;
+let is f64 as RAD2DEG = 57.29577951308232;
+
+// Cody-Waite splits. Subtracting n*PI_2 in one step would lose the low bits
+// of the product for large n; splitting the constant so the high half is
+// exact in binary keeps the reduced argument accurate.
+let is f64 as PI_2_HI = 1.5707963267948966;
+let is f64 as PI_2_LO = 0.00000000000000006123233995736766;
+let is f64 as LN2_HI  = 0.6931471803691238;
+let is f64 as LN2_LO  = 0.0000000001908214929270588;
+
+// --- Bit-level access ---
+//
+// cast() between f64 and i64 converts the value (cvttsd2si); reinterpreting
+// the bits needs a pointer round-trip.
+
+fn f64_bits(x as f64) as i64 {
+    return *cast(*i64, &x);
+}
+
+fn bits_f64(b as i64) as f64 {
+    return *cast(*f64, &b);
+}
+
+fn inf() as f64 {
+    return bits_f64(9218868437227405312);   // 0x7FF0000000000000
+}
+
+fn neg_inf() as f64 {
+    return bits_f64(0 - 4503599627370496);  // 0xFFF0000000000000
+}
+
+fn nan() as f64 {
+    return bits_f64(9221120237041090560);   // 0x7FF8000000000000
+}
+
+// exponent all ones and a non-zero mantissa. Read from the bits because
+// comparison operators cannot see NaN (see the header).
+fn is_nan(x as f64) as i32 {
+    let is i64 as b = f64_bits(x);
+    let is i64 as exp = (b >> 52) & 2047;
+    let is i64 as frac = b & 4503599627370495;
+    if (exp == 2047 && frac != 0) { return 1; }
+    return 0;
+}
+
+fn is_inf(x as f64) as i32 {
+    let is i64 as b = f64_bits(x);
+    let is i64 as exp = (b >> 52) & 2047;
+    let is i64 as frac = b & 4503599627370495;
+    if (exp == 2047 && frac == 0) { return 1; }
+    return 0;
+}
+
+fn is_finite(x as f64) as i32 {
+    let is i64 as exp = (f64_bits(x) >> 52) & 2047;
+    if (exp == 2047) { return 0; }
+    return 1;
+}
+
+// --- Basic ---
+
+fn abs_f64(x as f64) as f64 {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+fn min_f64(a as f64, b as f64) as f64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn max_f64(a as f64, b as f64) as f64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+fn clamp_f64(v as f64, lo as f64, hi as f64) as f64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn sign_f64(x as f64) as f64 {
+    if (x > 0.0) { return 1.0; }
+    if (x < 0.0) { return 0.0 - 1.0; }
+    return 0.0;
+}
+
+fn lerp(a as f64, b as f64, t as f64) as f64 {
+    return a + (b - a) * t;
+}
+
+// 2^n as a power of two built straight from the exponent field. Used to undo
+// the range reduction in exp() without a multiply loop.
+fn exp2i(n as i64) as f64 {
+    if (n > 1023) { return inf(); }
+    if (n < 0 - 1022) { return 0.0; }
+    return bits_f64((n + 1023) << 52);
+}
+
+// --- Rounding ---
+
+// Anything at or above 2^52 has no fractional bits left, so it is already
+// integral and must be returned untouched — converting it through i64 would
+// overflow rather than round.
+fn trunc(x as f64) as f64 {
+    if (is_finite(x) == 0) { return x; }
+    if (abs_f64(x) >= 4503599627370496.0) { return x; }
+    return cast(f64, cast(i64, x));
+}
+
+fn floor(x as f64) as f64 {
+    let is f64 as t = trunc(x);
+    if (x < 0.0 && t != x) { return t - 1.0; }
+    return t;
+}
+
+fn ceil(x as f64) as f64 {
+    let is f64 as t = trunc(x);
+    if (x > 0.0 && t != x) { return t + 1.0; }
+    return t;
+}
+
+// Half away from zero, matching C's round() rather than banker's rounding.
+fn round(x as f64) as f64 {
+    if (x >= 0.0) { return floor(x + 0.5); }
+    return ceil(x - 0.5);
+}
+
+// Remainder with the sign of x. Subtracting y scaled by powers of two is
+// exact in binary floating point, so this loses nothing the way
+// x - trunc(x/y)*y does once x/y grows large.
+fn fmod(x as f64, y as f64) as f64 {
+    if (is_nan(x) == 1 || is_nan(y) == 1 || y == 0.0 || is_inf(x) == 1) { return nan(); }
+    if (is_inf(y) == 1) { return x; }
+    let is f64 as ax with mut = abs_f64(x);
+    let is f64 as ay = abs_f64(y);
+    if (ax < ay) { return x; }
+    while (ax >= ay) {
+        let is f64 as d with mut = ay;
+        while (d + d <= ax) { d = d + d; }
+        ax = ax - d;
+    }
+    if (x < 0.0) { return 0.0 - ax; }
+    return ax;
+}
+
+// --- Exponential and logarithm ---
+
+// exp(x) = 2^n * exp(r), with n = round(x/ln2) and r = x - n*ln2 landing in
+// [-ln2/2, ln2/2]. The Taylor series for exp is accurate to the last bit
+// there by the r^14 term.
+fn exp(x as f64) as f64 {
+    if (is_nan(x) == 1) { return x; }
+    if (is_inf(x) == 1) {
+        if (x > 0.0) { return x; }
+        return 0.0;
+    }
+    if (x > 709.782712893384) { return inf(); }
+    if (x < 0.0 - 745.1332191019411) { return 0.0; }
+
+    let is f64 as nf = round(x * LOG2E);
+    let is i64 as n = cast(i64, nf);
+    let is f64 as r = (x - nf * LN2_HI) - nf * LN2_LO;
+
+    let is f64 as p with mut = 0.000000000011470745597729725;   // 1/14!
+    p = 0.00000000016059043836821613 + r * p;                   // 1/13!
+    p = 0.0000000020876756987868098 + r * p;                    // 1/12!
+    p = 0.000000025052108385441718 + r * p;                     // 1/11!
+    p = 0.00000027557319223985893 + r * p;                      // 1/10!
+    p = 0.0000027557319223985893 + r * p;                       // 1/9!
+    p = 0.0000248015873015873 + r * p;                          // 1/8!
+    p = 0.0001984126984126984 + r * p;                          // 1/7!
+    p = 0.001388888888888889 + r * p;                           // 1/6!
+    p = 0.008333333333333333 + r * p;                           // 1/5!
+    p = 0.041666666666666664 + r * p;                           // 1/4!
+    p = 0.16666666666666666 + r * p;                            // 1/3!
+    p = 0.5 + r * p;                                            // 1/2!
+    p = 1.0 + r * p;
+    p = 1.0 + r * p;
+
+    return p * exp2i(n);
+}
+
+// log(x) = e*ln2 + log(m), splitting x into m * 2^e with m in
+// [sqrt(2)/2, sqrt(2)). On that interval s = (m-1)/(m+1) stays under 0.172
+// in magnitude, where the atanh series converges quickly.
+fn log(x as f64) as f64 {
+    if (is_nan(x) == 1) { return x; }
+    if (x < 0.0) { return nan(); }
+    if (x == 0.0) { return neg_inf(); }
+    if (is_inf(x) == 1) { return x; }
+
+    let is i64 as b with mut = f64_bits(x);
+    let is i64 as e with mut = ((b >> 52) & 2047) - 1023;
+    // Subnormals carry no implicit leading 1; scale into the normal range
+    // first and pay for it in the exponent.
+    if (((b >> 52) & 2047) == 0) {
+        let is f64 as scaled = x * 18014398509481984.0;   // 2^54
+        let is i64 as sb = f64_bits(scaled);
+        e = ((sb >> 52) & 2047) - 1023 - 54;
+        b = sb;
+    }
+    // Clear the exponent to 1023, leaving the mantissa as m in [1, 2).
+    let is f64 as m with mut = bits_f64((b & 4503599627370495) + 4607182418800017408);
+    if (m > SQRT2) {
+        m = m * 0.5;
+        e = e + 1;
+    }
+
+    let is f64 as s = (m - 1.0) / (m + 1.0);
+    let is f64 as z = s * s;
+    let is f64 as p with mut = 0.047619047619047616;   // 1/21
+    p = 0.05263157894736842 + z * p;                   // 1/19
+    p = 0.058823529411764705 + z * p;                  // 1/17
+    p = 0.06666666666666667 + z * p;                   // 1/15
+    p = 0.07692307692307693 + z * p;                   // 1/13
+    p = 0.09090909090909091 + z * p;                   // 1/11
+    p = 0.1111111111111111 + z * p;                    // 1/9
+    p = 0.14285714285714285 + z * p;                   // 1/7
+    p = 0.2 + z * p;                                   // 1/5
+    p = 0.3333333333333333 + z * p;                    // 1/3
+    p = 1.0 + z * p;
+
+    return cast(f64, e) * LN2 + 2.0 * s * p;
+}
+
+fn log2(x as f64) as f64 {
+    return log(x) * LOG2E;
+}
+
+fn log10(x as f64) as f64 {
+    return log(x) / LN10;
+}
+
+// pow(b, e). Integer exponents go through repeated squaring, which is exact
+// for exactly representable results and is the only way to reach a negative
+// base at all — exp(e*log(b)) has no answer there.
+fn pow(b as f64, e as f64) as f64 {
+    if (e == 0.0) { return 1.0; }
+    if (is_nan(b) == 1) { return b; }
+    if (is_nan(e) == 1) { return e; }
+    if (b == 1.0) { return 1.0; }
+
+    if (e == trunc(e) && abs_f64(e) <= 4503599627370496.0) {
+        let is i64 as n with mut = cast(i64, abs_f64(e));
+        let is f64 as acc with mut = 1.0;
+        let is f64 as base with mut = b;
+        while (n > 0) {
+            if ((n & 1) == 1) { acc = acc * base; }
+            base = base * base;
+            n = n >> 1;
+        }
+        if (e < 0.0) {
+            if (acc == 0.0) { return inf(); }
+            return 1.0 / acc;
+        }
+        return acc;
+    }
+
+    if (b < 0.0) { return nan(); }   // non-integer power of a negative base
+    if (b == 0.0) {
+        if (e > 0.0) { return 0.0; }
+        return inf();
+    }
+    return exp(e * log(b));
+}
+
+// --- Trigonometry ---
+
+// Reduce x to r in [-pi/4, pi/4] plus a quadrant, then read sin and cos off
+// the same reduction. Returns the quadrant; writes the reduced argument.
+fn _trig_reduce(x as f64, r_out as *f64) as i64 {
+    let is f64 as nf = round(x * 0.6366197723675814);   // x / (pi/2)
+    *r_out = (x - nf * PI_2_HI) - nf * PI_2_LO;
+    let is i64 as q = cast(i64, nf) & 3;
+    if (q < 0) { return q + 4; }
+    return q;
+}
+
+// sin on [-pi/4, pi/4]: r * (1 - z/3! + z^2/5! - ...), z = r^2.
+fn _sin_poly(r as f64) as f64 {
+    let is f64 as z = r * r;
+    let is f64 as p with mut = 0.00000000016059043836821613;   // 1/13!
+    p = z * p - 0.000000025052108385441718;                    // 1/11!
+    p = z * p + 0.0000027557319223985893;                      // 1/9!
+    p = z * p - 0.0001984126984126984;                         // 1/7!
+    p = z * p + 0.008333333333333333;                          // 1/5!
+    p = z * p - 0.16666666666666666;                           // 1/3!
+    p = z * p + 1.0;
+    return r * p;
+}
+
+// cos on [-pi/4, pi/4]: 1 - z/2! + z^2/4! - ...
+fn _cos_poly(r as f64) as f64 {
+    let is f64 as z = r * r;
+    let is f64 as p with mut = 0.0000000020876756987868098;   // 1/12!
+    p = z * p - 0.00000027557319223985893;                    // 1/10!
+    p = z * p + 0.0000248015873015873;                        // 1/8!
+    p = z * p - 0.001388888888888889;                         // 1/6!
+    p = z * p + 0.041666666666666664;                         // 1/4!
+    p = z * p - 0.5;                                          // 1/2!
+    p = z * p + 1.0;
+    return p;
+}
+
+fn sin(x as f64) as f64 {
+    if (is_finite(x) == 0) { return nan(); }
+    let is f64 as r with mut = 0.0;
+    let is i64 as q = _trig_reduce(x, &r);
+    if (q == 0) { return _sin_poly(r); }
+    if (q == 1) { return _cos_poly(r); }
+    if (q == 2) { return 0.0 - _sin_poly(r); }
+    return 0.0 - _cos_poly(r);
+}
+
+fn cos(x as f64) as f64 {
+    if (is_finite(x) == 0) { return nan(); }
+    let is f64 as r with mut = 0.0;
+    let is i64 as q = _trig_reduce(x, &r);
+    if (q == 0) { return _cos_poly(r); }
+    if (q == 1) { return 0.0 - _sin_poly(r); }
+    if (q == 2) { return 0.0 - _cos_poly(r); }
+    return _sin_poly(r);
+}
+
+fn tan(x as f64) as f64 {
+    let is f64 as c = cos(x);
+    if (c == 0.0) { return inf(); }
+    return sin(x) / c;
+}
+
+// atan via the halving identity atan(a) = 2*atan(a / (1 + sqrt(1 + a^2))).
+// Four applications pull a below 0.05, where the series is exact to the last
+// bit by the a^13 term — cheaper in constants than a minimax rational, and
+// each step costs one hardware sqrt.
+fn atan(x as f64) as f64 {
+    if (is_nan(x) == 1) { return x; }
+    if (is_inf(x) == 1) {
+        if (x > 0.0) { return PI_2; }
+        return 0.0 - PI_2;
+    }
+    let is i32 as neg with mut = 0;
+    let is f64 as a with mut = x;
+    if (a < 0.0) { a = 0.0 - a; neg = 1; }
+
+    let is i32 as inv with mut = 0;
+    if (a > 1.0) { a = 1.0 / a; inv = 1; }
+
+    let is i32 as k with mut = 0;
+    while (k < 4) {
+        a = a / (1.0 + sqrt(1.0 + a * a));
+        k = k + 1;
+    }
+
+    let is f64 as z = a * a;
+    let is f64 as p with mut = 0.07692307692307693;   // 1/13
+    p = z * p - 0.09090909090909091;                  // 1/11
+    p = z * p + 0.1111111111111111;                   // 1/9
+    p = z * p - 0.14285714285714285;                  // 1/7
+    p = z * p + 0.2;                                  // 1/5
+    p = z * p - 0.3333333333333333;                   // 1/3
+    p = z * p + 1.0;
+    let is f64 as r with mut = a * p * 16.0;          // undo the four halvings
+
+    if (inv == 1) { r = PI_2 - r; }
+    if (neg == 1) { r = 0.0 - r; }
+    return r;
+}
+
+fn atan2(y as f64, x as f64) as f64 {
+    if (is_nan(x) == 1) { return x; }
+    if (is_nan(y) == 1) { return y; }
+    if (x == 0.0) {
+        if (y > 0.0) { return PI_2; }
+        if (y < 0.0) { return 0.0 - PI_2; }
+        return 0.0;
+    }
+    let is f64 as a = atan(y / x);
+    if (x > 0.0) { return a; }
+    if (y >= 0.0) { return a + PI; }
+    return a - PI;
+}
+
+fn asin(x as f64) as f64 {
+    if (is_nan(x) == 1) { return x; }
+    if (x > 1.0 || x < 0.0 - 1.0) { return nan(); }
+    if (x == 1.0) { return PI_2; }
+    if (x == 0.0 - 1.0) { return 0.0 - PI_2; }
+    return atan(x / sqrt(1.0 - x * x));
+}
+
+fn acos(x as f64) as f64 {
+    if (is_nan(x) == 1) { return x; }
+    if (x > 1.0 || x < 0.0 - 1.0) { return nan(); }
+    return PI_2 - asin(x);
+}
+
+// sqrt(x^2 + y^2) without letting the intermediate square overflow or flush
+// to zero when the operands are extreme.
+fn hypot(x as f64, y as f64) as f64 {
+    let is f64 as ax = abs_f64(x);
+    let is f64 as ay = abs_f64(y);
+    let is f64 as hi = max_f64(ax, ay);
+    let is f64 as lo = min_f64(ax, ay);
+    if (hi == 0.0) { return 0.0; }
+    let is f64 as t = lo / hi;
+    return hi * sqrt(1.0 + t * t);
+}
