@@ -124,32 +124,102 @@ it as a preview.
 
 ### Install
 
-One line — installs `caustic` + the stdlib (source + `libcaustic.so`) into `~/.local`, no sudo:
+One line — `caustic` plus the stdlib into `~/.local`, no root:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh
 ```
 
-Then make sure `~/.local/bin` is on your `PATH`. Other modes:
-
-```sh
-# interactive — pick the prefix, which tools (caustic-as/ld), and which stdlib pieces (source/.so/.csl)
-curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --custom
-# system-wide into /usr/local (uses sudo)
-curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --system
-```
-
-**Windows** (PowerShell) — installs the native toolchain into `%LOCALAPPDATA%\caustic` and adds it to your `PATH`:
-
 ```powershell
+# Windows (PowerShell) — the native toolchain into %LOCALAPPDATA%\caustic
 irm https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 | iex
 ```
 
-**From source** (needs an existing `caustic` to bootstrap):
+Then make sure the `bin` directory is on your `PATH` — the installer says so if
+it is not.
+
+<details>
+<summary><b>Choosing what gets installed</b></summary>
+
+Both installers take the same three decisions, and `--custom` / `-Custom` walks
+you through them:
+
+| | Linux | Windows |
+|---|---|---|
+| **Where** | `--user` · `--system` · `--prefix=DIR` | `-Prefix DIR` · `-System` (all users, elevates) |
+| **Compiler** | `--format=elf,cse,exe` | `-Format exe,cse` |
+| **Tools** | `--tools=as,ld,mk,lsp` · `all` · `none` | `-Tools as,ld,mk` · `all` · `none` |
+| **Shared stdlib** | `--lib=so,csl,dll` · `none` | `-Lib dll,csl` · `none` |
+
+The **compiler format** is the interesting one:
+
+- `elf` / `exe` — the native binary for that OS.
+- `cse` — the universal build: *one file* carrying a native body for Linux,
+  Windows and CausticOS, on x86_64 and ARM64. It installs under its own name and
+  answers to plain `caustic` as well.
+
+The first format listed is the one `caustic` runs, so `--format=elf,cse`
+installs both and leaves the native one in charge.
+
+```sh
+# interactive
+curl -fsSL .../install.sh | sh -s -- --custom
+# system-wide, escalating with pkexec instead of sudo
+curl -fsSL .../install.sh | sh -s -- --system --root=pkexec
+# the universal compiler, every tool, all three stdlib flavours
+curl -fsSL .../install.sh | sh -s -- --format=cse --tools=all --lib=so,csl,dll
+# see the plan without touching anything
+./install.sh --dry-run --system --format=cse
+```
+
+```powershell
+.\install.ps1 -Custom
+.\install.ps1 -System -Format exe,cse -Lib dll,csl   # all users, elevates
+.\install.ps1 -DryRun -Format cse
+```
+</details>
+
+### Update
+
+Reinstalls the latest release **with the choices you made the first time** — the
+installer records them, so the flavour you picked survives the update instead of
+reverting to the defaults.
+
+```sh
+./update.sh              # update in place
+./update.sh --check      # compare installed vs latest, change nothing
+```
+
+```powershell
+.\update.ps1
+.\update.ps1 -Check
+```
+
+### Uninstall
+
+Removes exactly the files the installer created — it reads the same record, so a
+shared prefix like `/usr/local` keeps everything that is not Caustic.
+
+```sh
+./uninstall.sh                # find it and remove it
+./uninstall.sh --dry-run      # list what would go
+```
+
+```powershell
+.\uninstall.ps1
+.\uninstall.ps1 -DryRun
+```
+
+### From source
+
+Needs an existing `caustic` to bootstrap:
 
 ```sh
 git clone --recursive https://github.com/Caua726/Caustic.git && cd Caustic
 ./caustic-mk build caustic && ./caustic-mk build caustic-as && ./caustic-mk build caustic-ld
+
+# or let the installer build and install it for you
+./install.sh --from-source
 ```
 
 ### Compile and run

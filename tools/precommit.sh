@@ -154,5 +154,81 @@ step "toolchain smoke (caustic-as + caustic-ld)"
 rm -f "$TMP/probe.cst.s" "$TMP/probe.cst.s.o"
 ok "caustic-as + caustic-ld assemble/link/run a program"
 
+
+# ─── 7. every target still builds ──────────────────────────────────────────
+# Compiling for another architecture or OS needs no external tool — only
+# RUNNING the result does, which is why check-cross.sh stays opt-in. Building
+# them, though, gives the same verdict on every machine, so it belongs here.
+#
+# This exists because two real bugs shipped through a green gate: std/os/
+# causticos.cst emitted a bare `mfence` and so could not be assembled for
+# AArch64 at all, and ARM64 COFF relocations were translated through the AMD64
+# table, linking a windows-aarch64 PE with unrelocated call sites. Nothing
+# compiled either target, so nothing noticed.
+step "cross-target builds (no external tools needed)"
+CROSS_PROBE="$TMP/cross_probe.cst"
+cat > "$CROSS_PROBE" <<'EOF'
+use "std/io.cst" as io;
+use "std/os.cst" as os;
+fn main() as i32 { io.printf("%d\n", cast(i64, os.current)); return 0; }
+EOF
+for T in linux-x86_64 linux-aarch64 windows-x86_64 windows-aarch64 \
+         caustic-x86_64 caustic-aarch64 caustic; do
+    OUT="$TMP/cross_$T"
+    if ! "$CUR" -q --target="$T" "$CROSS_PROBE" -o "$OUT" >"$TMP/cross.log" 2>&1; then
+        tail -5 "$TMP/cross.log"; die "--target=$T failed to build"
+    fi
+    # A relocation the linker could not apply leaves the binary quietly wrong.
+    if grep -q "unhandled .* relocation" "$TMP/cross.log"; then
+        grep -m3 "unhandled .* relocation" "$TMP/cross.log"
+        die "--target=$T left relocations unapplied"
+    fi
+done
+# The shared stdlib is a shipped artifact in three flavours, and each one takes
+# a different path through the backend. libcaustic.dll was impossible to produce
+# at all until the syscall gate learned to honour --allow-unsupported: a shared
+# build keeps every symbol, so std/os/linux.cst's wrappers are emitted whether or
+# not the target has syscalls.
+for SHARED in "linux-x86_64:so" "windows-x86_64:dll" "caustic-x86_64:csl"; do
+    ST="${SHARED%%:*}"; SX="${SHARED##*:}"
+    if ! "$CUR" -q --target="$ST" --shared --allow-unsupported \
+            std/libcaustic.cst -o "$TMP/libcaustic.$SX" >"$TMP/shared.log" 2>&1; then
+        tail -5 "$TMP/shared.log"; die "libcaustic.$SX ($ST) failed to build"
+    fi
+done
+ok "linux/windows/caustic × x86_64/aarch64 all build clean; libcaustic.so/.dll/.csl too"
+
+# ─── 8. CSE containers and the shared-library loader ───────────────────────
+# The .csl form was broken in main for a whole release: its header grew and the
+# loader kept reading the old offset, so csl_open failed for every library the
+# writer produced. Nothing exercised it. This does.
+step "CSE container + .csl round-trip"
+cat > "$TMP/csl_lib.cst" <<'EOF'
+fn cst_add(a as i64, b as i64) as i64 { return a + b; }
+EOF
+"$CUR" -q --target=caustic-x86_64 --shared --mode=pure "$TMP/csl_lib.cst" -o "$TMP/lib.csl" >/dev/null 2>&1 \
+    || die "could not build a .csl"
+cat > "$TMP/csl_use.cst" <<EOF
+use "$ROOT/std/csl_loader.cst" as csl;
+fn main() as i32 {
+    if (csl.csl_open("$TMP/lib.csl") == 0) { return 10; }
+    let is i64 as f = csl.csl_resolve("cst_add");
+    if (f == 0) { return 11; }
+    return cast(i32, call(cast(*u8, f), 40, 2));
+}
+EOF
+"$CUR" -q "$TMP/csl_use.cst" -o "$TMP/csl_use" >/dev/null 2>&1 || die "could not build the .csl loader probe"
+CSLRC="$(runrc "$TMP/csl_use")"
+[ "$CSLRC" = "42" ] || die ".csl round-trip returned $CSLRC (10 = open failed, 11 = symbol missing)"
+
+# The multi-arch container must carry one slice per architecture, each a
+# complete image — a single-arch build wrapping one slice has the same shape.
+"$CUR" -q --target=caustic "$CROSS_PROBE" -o "$TMP/fat" >/dev/null 2>&1 || die "multi-arch .cse failed to build"
+FATOUT="$TMP/fat.cse.exe"
+[ -f "$FATOUT" ] || FATOUT="$TMP/fat"
+NIMG=$(od -An -tu1 -j6 -N1 "$FATOUT" | tr -d ' ')
+[ "$NIMG" = "2" ] || die "multi-arch .cse declares $NIMG images, expected 2"
+ok ".csl resolves through csl_loader; container carries 2 slices"
+
 printf "\n${G}${B}pre-commit OK${N} — toolchain builds and self-hosts correctly at -O0/-O1/-O2.\n"
 exit 0
