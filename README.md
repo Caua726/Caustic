@@ -78,7 +78,7 @@ A single source tree builds multiple architectures and executable formats. Selec
 | **Linux x86_64** | `--target=linux-x86_64` *(default)* | static/dynamic **ELF64**, raw `syscall` | Linux x86_64 | Stable |
 | **Linux AArch64** | `--target=linux-aarch64` | static **ELF64**, AAPCS64, raw `svc` | Linux AArch64 | Scalar backend; atomics and threads supported |
 | **Windows** | `--target=windows-x86_64` | **PE32+** `.exe` (+ `.pdb`), DLL imports via IAT | Windows | Stable — **cross-compiles from Linux** |
-| **Universal** | `--target=caustic-x86_64` | **CSE** (Caustic Standard Executable) | **Linux · Windows · CausticOS** | Experimental |
+| **Universal** | `--target=caustic` | **CSE** (Caustic Standard Executable) | **Linux · Windows · CausticOS**, x86_64 + ARM64 | Experimental |
 | **WebAssembly** | `--target=wasm32-wasi` / `wasm64-wasi` | **`.wasm`** module (emitted directly, WASI preview1) | Node · Deno · any WASM runtime | Experimental — **self-hosts on wasm** |
 
 **Cross-compilation works today.** A Windows `.exe` built on Linux runs under
@@ -89,15 +89,28 @@ assembler, and linker all ship as native Windows binaries too (`caustic.exe`,
 `caustic-as.exe`, `caustic-ld.exe`).
 
 **CSE is a *portable* executable, not a CausticOS-only one.** The Caustic
-Standard Executable is the project's universal binary format: in `--mode=compat`
-(or `--mode=bundle`) the driver emits a **PE + ELF + CSE polyglot** — *one* file
-that is at the same time a valid Windows PE, a valid Linux ELF, **and** a valid
-CausticOS executable. The exact same binary runs natively on all three operating
-systems; OS detection happens at startup and the program dispatches to the right
-backend. `--mode=pure` instead targets CausticOS alone — a from-scratch OS whose
-kernel exposes a minimal 7-call ABI (serial write, time, sleep, exit, getpid,
-yield). CSE is the newest target and parts of its linker path are still landing,
-so treat it as a preview.
+Standard Executable is the project's universal binary format. `--target=caustic`
+builds one image per architecture and fuses them into a single container;
+`caustic-x86_64` and `caustic-aarch64` each name one. Adding `--mode=compat`
+(or `--mode=bundle`) welds in the other formats too — one file holding a Windows
+PE, a Linux ELF per architecture, and the CausticOS container.
+
+Three caveats worth knowing before you rely on it:
+
+- **Linux runs the native ELF, but not through `execve`.** `MZ` sits at offset 0
+  for Windows, so the kernel does not recognise the file and it runs because a
+  shell re-reads it as a script, extracting the body matching `uname -m`. Callers
+  that are not shells (`make`, `systemd`, `subprocess` without `shell=True`)
+  cannot launch it. Registering the format with `binfmt_misc` removes the caveat
+  without changing the binary.
+- **Windows on ARM64 runs the x64 body under emulation.** The native ARM64 PE is
+  carried in the file, but the PE loader reads one COFF Machine — reaching it
+  needs an entry stub that detects the host and relaunches, which is not written.
+- `--mode=pure` targets CausticOS alone — a from-scratch OS whose kernel exposes
+  a minimal 7-call ABI (serial write, time, sleep, exit, getpid, yield).
+
+CSE is the newest target and parts of its linker path are still landing, so treat
+it as a preview.
 
 > Behind the scenes, target dispatch is driven by `os.current`. On single-OS
 > builds it folds to a compile-time literal (`1` Linux, `2` Windows, `3`
@@ -163,7 +176,7 @@ qemu-aarch64 ./program-aarch64
 | `-o <file>` | Output executable |
 | `-c` | Compile only — no `main` required (for libraries) |
 | `-O0` / `-O1` | Optimization level |
-| `--target=<triple>` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `caustic-x86_64` |
+| `--target=<triple>` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `caustic`, `caustic-x86_64`, `caustic-aarch64` |
 | `-l<name>` | Link a dynamic library |
 | `--profile` | Per-phase timing |
 | `--cache <dir>` | Incremental build cache |

@@ -6,6 +6,31 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.2](https://github.com/Caua726/Caustic/releases/tag/v0.1.2) — 2026-07-25
+
+### Added
+- **Multi-architecture CSE.** `--target=caustic` (or `caustic-x86_64-aarch64`) builds one image per architecture and fuses them into a `CST_ 3.1` container — a thin index over complete, unmodified `3.0` images. `caustic-x86_64` and `caustic-aarch64` each name one architecture, matching how `linux-x86_64` and `windows-x86_64` read. Replaces `--mode=fat`.
+- **Six-body polyglot.** `--mode=compat` carries PE x64, ELF x86_64, ELF AArch64, PE ARM64, and both CausticOS slices in one file; a shell stub picks the Linux body from `uname -m`.
+- **AArch64 Windows FFI** — `IR_FFI_CALL` reaches the IAT via `adrp`/`add`/`ldr`; AAPCS64 means no argument reshuffle and no shadow space.
+- **`--target=windows-aarch64`** — PE stamped ARM64, with an AArch64 entry stub, argv parser and 8-byte packed-unwind `.pdata`.
+- **`--target=caustic-aarch64`** — CausticOS on ARM.
+- **COFF object writer** — `caustic-as` on a Windows target emits real `.obj` files for AMD64 and ARM64; previously it printed "not yet implemented" and exited.
+- **`with section(...)` on functions** now works end to end. It was documented from the start but only globals ever got a `.section` directive.
+
+### Fixed
+- **`.csl` did not load at all** — the CSL header grew from 32 to 44 bytes in v2 and the loader was never updated.
+- **A polyglot could be broken by its own size** — the `CST*` mini-header stored offsets as raw u64 inside the shell-quoted region, so a body offset in `[0x2700,0x27FF]` (and every 64 KiB after) planted a `0x27`, closed the quote and made `/bin/sh` execute the payload.
+- **CodeView debug directory** in a polyglot pointed 512 bytes short — the APE combiner shifted the PE without patching `IMAGE_DEBUG_DIRECTORY`.
+- **Segment ceiling** — the writer allowed 39 segments where the loader accepts 16, so a build could succeed and fail at load.
+- **Silent truncation** replaced with errors for imports past 1024 and sections past the segment limit.
+- **`opt_cse`** carries `cast_to` in its key; codegen reads it to pick `sar` vs `shr` and to truncate narrow results.
+- **`csl_loader`** validates version and architecture, bounds offsets, loops its read, and holds one slot per open image.
+
+### Known limits
+- Windows ARM64 runs the x64 body under emulation; the native body is carried but the `IsWow64Process2` re-exec stub is not written.
+- AArch64 unwind describes every function as saving nothing — correct for execution, insufficient for a stack walk.
+- A polyglot's Linux path is not kernel-level: with `MZ` at offset 0, `execve` returns `ENOEXEC` and a shell re-reads the file as a script.
+
 ## [v0.1.1](https://github.com/Caua726/Caustic/releases/tag/v0.1.1) — 2026-07-22
 
 ### Added
