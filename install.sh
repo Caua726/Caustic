@@ -8,9 +8,15 @@
 # Custom (interactive — pick prefix, tools and stdlib pieces):
 #   curl -fsSL .../install.sh | sh -s -- --custom
 #
+# Build and install the current source instead of the last release:
+#   ./install.sh --from-source                 (from inside a checkout)
+#   ./install.sh --from-source --source-dir=DIR
+#   curl -fsSL .../install.sh | sh -s -- --from-source   (clones first)
+#
 # Non-interactive flags: --system | --user | --prefix=DIR
 #                        --with-tools  (caustic-as, caustic-ld, caustic-mk, caustic-lsp)
 #                        --with-csl    (universal libcaustic.csl)  --no-so  --no-source
+#                        --from-source [--source-dir=DIR] [--ref=BRANCH]
 set -eu
 
 REPO="Caua726/Caustic"
@@ -19,8 +25,10 @@ TARBALL="caustic-x86_64-linux.tar.gz"
 ARCH=$(uname -m 2>/dev/null || echo unknown)
 [ "$ARCH" = "x86_64" ] || { echo "error: unsupported architecture '$ARCH' (x86_64 only)"; exit 1; }
 [ "$(uname -s 2>/dev/null)" = "Linux" ] || { echo "error: this installer targets Linux"; exit 1; }
-command -v curl >/dev/null 2>&1 || { echo "error: 'curl' is required"; exit 1; }
 command -v tar  >/dev/null 2>&1 || { echo "error: 'tar' is required"; exit 1; }
+# curl is only needed when something is downloaded, which --from-source inside a
+# checkout with a seed compiler never does.
+need_curl() { command -v curl >/dev/null 2>&1 || { echo "error: 'curl' is required"; exit 1; }; }
 
 # --- options ---
 MODE="default"
@@ -29,6 +37,9 @@ WITH_TOOLS=0      # caustic-as / caustic-ld / caustic-mk / caustic-lsp
 WITH_CSL=0        # universal libcaustic.csl
 WITH_SO=1         # libcaustic.so
 WITH_SRC=1        # stdlib source (.cst) — required to compile against the stdlib
+FROM_SRC=0        # build the checkout instead of downloading the release
+SOURCE_DIR=""     # where that checkout is (default: cwd, else clone)
+REF="main"
 for arg in "$@"; do
     case "$arg" in
         --custom|--interactive) MODE="custom" ;;
@@ -39,7 +50,11 @@ for arg in "$@"; do
         --with-csl)   WITH_CSL=1 ;;
         --no-so)      WITH_SO=0 ;;
         --no-source)  WITH_SRC=0 ;;
-        -h|--help) echo "usage: install.sh [--custom] [--system|--user|--prefix=DIR] [--with-tools] [--with-csl]"; exit 0 ;;
+        --from-source|--source) FROM_SRC=1 ;;
+        --source-dir=*) FROM_SRC=1; SOURCE_DIR="${arg#*=}" ;;
+        --ref=*)     REF="${arg#*=}" ;;
+        -h|--help) echo "usage: install.sh [--custom] [--system|--user|--prefix=DIR] [--with-tools] [--with-csl]"
+                   echo "       install.sh --from-source [--source-dir=DIR] [--ref=BRANCH]"; exit 0 ;;
         *) echo "warning: ignoring '$arg'" >&2 ;;
     esac
 done
@@ -70,13 +85,76 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 BIN_DIR="$PREFIX/bin"; LIB_DIR="$PREFIX/lib/caustic"; STD_DIR="$LIB_DIR/std"
 
-# --- download + extract ---
+# --- obtain the tree to install ---
 TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT INT TERM
-echo "downloading latest release ..."
-curl -fsSL "https://github.com/$REPO/releases/latest/download/$TARBALL" -o "$TMPDIR/$TARBALL" \
-    || { echo "error: download failed"; exit 1; }
-tar xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
-SRC="$TMPDIR/caustic-x86_64-linux"
+
+is_checkout() { [ -f "$1/Causticfile" ] && [ -f "$1/src/main.cst" ]; }
+
+if [ "$FROM_SRC" = 1 ]; then
+    # Locate the checkout: an explicit --source-dir, the current directory if it
+    # is one, or a fresh clone.
+    if [ -n "$SOURCE_DIR" ]; then
+        is_checkout "$SOURCE_DIR" || { echo "error: $SOURCE_DIR is not a Caustic checkout"; exit 1; }
+    elif is_checkout "$PWD"; then
+        SOURCE_DIR="$PWD"
+    else
+        command -v git >/dev/null 2>&1 || { echo "error: 'git' is required to clone (or use --source-dir=DIR)"; exit 1; }
+        echo "cloning $REPO ($REF) ..."
+        git clone --depth 1 --branch "$REF" --recurse-submodules \
+            "https://github.com/$REPO.git" "$TMPDIR/src" >/dev/null 2>&1 \
+            || { echo "error: clone failed"; exit 1; }
+        SOURCE_DIR="$TMPDIR/src"
+    fi
+    echo "building from $SOURCE_DIR ..."
+
+    # Caustic compiles itself, so building it needs a compiler to start from.
+    # Prefer one already in the checkout, then one on PATH, and fall back to
+    # the released binaries — which is what the bootstrap is for.
+    SEED_BIN=""
+    if [ -x "$SOURCE_DIR/caustic" ] && [ -x "$SOURCE_DIR/caustic-mk" ]; then
+        SEED_BIN="$SOURCE_DIR"
+    elif command -v caustic >/dev/null 2>&1 && command -v caustic-mk >/dev/null 2>&1; then
+        SEED_BIN=$(dirname "$(command -v caustic-mk)")
+    else
+        echo "  no seed compiler — fetching the release to bootstrap with ..."
+        need_curl
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/$TARBALL" -o "$TMPDIR/$TARBALL" \
+            || { echo "error: download failed"; exit 1; }
+        tar xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
+        SEED_BIN="$TMPDIR/caustic-x86_64-linux/bin"
+    fi
+    PATH="$SEED_BIN:$PATH"; export PATH
+
+    # Build the toolchain, then let the Causticfile's own dist script stage it.
+    # caustic-lsp is optional: it is Linux-only and not needed to compile.
+    #
+    # Output goes to a log rather than the terminal — packaging libcaustic warns
+    # about the Windows symbols that a Linux .so cannot resolve, every time, and
+    # that is expected noise. The log is printed if a step actually fails.
+    LOG="$TMPDIR/build.log"
+    ( cd "$SOURCE_DIR" \
+      && for t in caustic caustic-as caustic-ld caustic-mk; do
+             echo "  building $t"
+             caustic-mk build "$t" >>"$LOG" 2>&1 || exit 1
+         done \
+      && caustic-mk build caustic-lsp >>"$LOG" 2>&1 || true ) \
+      || { echo "error: build failed"; tail -20 "$LOG"; exit 1; }
+    echo "  packaging"
+    ( cd "$SOURCE_DIR" && caustic-mk run dist >>"$LOG" 2>&1 ) \
+      || { echo "error: packaging failed"; tail -20 "$LOG"; exit 1; }
+
+    [ -f "$SOURCE_DIR/$TARBALL" ] || { echo "error: build produced no $TARBALL"; exit 1; }
+    rm -rf "$TMPDIR/pkg"; mkdir -p "$TMPDIR/pkg"
+    tar xzf "$SOURCE_DIR/$TARBALL" -C "$TMPDIR/pkg"
+    SRC="$TMPDIR/pkg/caustic-x86_64-linux"
+else
+    need_curl
+    echo "downloading latest release ..."
+    curl -fsSL "https://github.com/$REPO/releases/latest/download/$TARBALL" -o "$TMPDIR/$TARBALL" \
+        || { echo "error: download failed"; exit 1; }
+    tar xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
+    SRC="$TMPDIR/caustic-x86_64-linux"
+fi
 
 echo "installing to $PREFIX ..."
 $SUDO mkdir -p "$BIN_DIR" "$STD_DIR"
