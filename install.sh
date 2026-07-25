@@ -16,11 +16,15 @@
 # Non-interactive flags: --system | --user | --prefix=DIR
 #                        --with-tools  (caustic-as, caustic-ld, caustic-mk, caustic-lsp)
 #                        --with-csl    (universal libcaustic.csl)  --no-so  --no-source
+#                        --cse         install the universal .cse.exe compiler instead
+#                                      of the native one (one file: Linux + Windows +
+#                                      CausticOS, x86_64 + ARM64)
 #                        --from-source [--source-dir=DIR] [--ref=BRANCH]
 set -eu
 
 REPO="Caua726/Caustic"
 TARBALL="caustic-x86_64-linux.tar.gz"
+UNIVERSAL="caustic-universal.cse.exe"
 
 ARCH=$(uname -m 2>/dev/null || echo unknown)
 [ "$ARCH" = "x86_64" ] || { echo "error: unsupported architecture '$ARCH' (x86_64 only)"; exit 1; }
@@ -35,6 +39,7 @@ MODE="default"
 PREFIX=""
 WITH_TOOLS=0      # caustic-as / caustic-ld / caustic-mk / caustic-lsp
 WITH_CSL=0        # universal libcaustic.csl
+WITH_CSE=0        # install the universal .cse.exe compiler instead of the native binary
 WITH_SO=1         # libcaustic.so
 WITH_SRC=1        # stdlib source (.cst) — required to compile against the stdlib
 FROM_SRC=0        # build the checkout instead of downloading the release
@@ -48,12 +53,13 @@ for arg in "$@"; do
         --prefix=*) PREFIX="${arg#*=}" ;;
         --with-tools) WITH_TOOLS=1 ;;
         --with-csl)   WITH_CSL=1 ;;
+        --cse|--universal) WITH_CSE=1 ;;
         --no-so)      WITH_SO=0 ;;
         --no-source)  WITH_SRC=0 ;;
         --from-source|--source) FROM_SRC=1 ;;
         --source-dir=*) FROM_SRC=1; SOURCE_DIR="${arg#*=}" ;;
         --ref=*)     REF="${arg#*=}" ;;
-        -h|--help) echo "usage: install.sh [--custom] [--system|--user|--prefix=DIR] [--with-tools] [--with-csl]"
+        -h|--help) echo "usage: install.sh [--custom] [--system|--user|--prefix=DIR] [--with-tools] [--with-csl] [--cse]"
                    echo "       install.sh --from-source [--source-dir=DIR] [--ref=BRANCH]"; exit 0 ;;
         *) echo "warning: ignoring '$arg'" >&2 ;;
     esac
@@ -68,6 +74,8 @@ if [ "$MODE" = "custom" ] && [ -e /dev/tty ]; then
     ask "Tools — [1] caustic only  [2] + caustic-as + caustic-ld  [3] everything  (default 1): "
     case "$REPLY" in 2|3) WITH_TOOLS=1 ;; *) WITH_TOOLS=0 ;; esac
     WITH_ALL_TOOLS=0; [ "$REPLY" = 3 ] && WITH_ALL_TOOLS=1
+    ask "Compiler — [1] native x86_64 Linux  [2] universal .cse.exe (Linux+Windows+CausticOS, x86_64+ARM64)  (default 1): "
+    case "$REPLY" in 2) WITH_CSE=1 ;; *) WITH_CSE=0 ;; esac
     ask "Stdlib — [1] source only  [2] source + libcaustic.so  [3] + libcaustic.csl  (default 2): "
     case "$REPLY" in 1) WITH_SO=0; WITH_CSL=0 ;; 3) WITH_SO=1; WITH_CSL=1 ;; *) WITH_SO=1; WITH_CSL=0 ;; esac
 fi
@@ -160,7 +168,11 @@ echo "installing to $PREFIX ..."
 $SUDO mkdir -p "$BIN_DIR" "$STD_DIR"
 
 # caustic (always — it has the assembler + linker built in)
-$SUDO cp "$SRC/bin/caustic" "$BIN_DIR/"; $SUDO chmod +x "$BIN_DIR/caustic"
+# The universal build replaces this one; installing both would leave the native
+# binary shadowed by a symlink a moment later.
+if [ "$WITH_CSE" = 0 ]; then
+    $SUDO cp "$SRC/bin/caustic" "$BIN_DIR/"; $SUDO chmod +x "$BIN_DIR/caustic"
+fi
 if [ "$WITH_TOOLS" = 1 ]; then
     for t in caustic-as caustic-ld; do
         [ -f "$SRC/bin/$t" ] && { $SUDO cp "$SRC/bin/$t" "$BIN_DIR/"; $SUDO chmod +x "$BIN_DIR/$t"; }
@@ -172,10 +184,33 @@ if [ "$WITH_TOOLS" = 1 ]; then
     fi
 fi
 
+# Universal compiler. It is one file carrying a native body per OS/architecture;
+# on Linux a shell stub picks the right ELF, which is why it needs the exec bit
+# and keeps its .cse.exe name — the .exe is what lets the same file run on
+# Windows, whose loader reads the MZ at offset 0.
+if [ "$WITH_CSE" = 1 ]; then
+    if [ -f "$SRC/bin/$UNIVERSAL" ]; then
+        $SUDO cp "$SRC/bin/$UNIVERSAL" "$BIN_DIR/$UNIVERSAL"
+    else
+        need_curl
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/$UNIVERSAL" \
+             -o "$TMPDIR/$UNIVERSAL" \
+            || { echo "error: could not download $UNIVERSAL"; exit 1; }
+        $SUDO cp "$TMPDIR/$UNIVERSAL" "$BIN_DIR/$UNIVERSAL"
+    fi
+    $SUDO chmod +x "$BIN_DIR/$UNIVERSAL"
+    # `caustic` stays the name you type; the universal build answers to it.
+    $SUDO ln -sf "$UNIVERSAL" "$BIN_DIR/caustic"
+fi
+
 # stdlib pieces
 [ "$WITH_SRC" = 1 ] && $SUDO cp -R "$SRC"/lib/caustic/std/. "$STD_DIR/"
 [ "$WITH_SO" = 1 ]  && [ -f "$SRC/lib/caustic/libcaustic.so" ]  && $SUDO cp "$SRC/lib/caustic/libcaustic.so"  "$LIB_DIR/"
 [ "$WITH_CSL" = 1 ] && [ -f "$SRC/lib/caustic/libcaustic.csl" ] && $SUDO cp "$SRC/lib/caustic/libcaustic.csl" "$LIB_DIR/"
 
-echo "caustic installed → $BIN_DIR/caustic"
+if [ "$WITH_CSE" = 1 ]; then
+    echo "caustic installed → $BIN_DIR/caustic → $UNIVERSAL (universal)"
+else
+    echo "caustic installed → $BIN_DIR/caustic"
+fi
 command -v caustic >/dev/null 2>&1 || echo "  (add to PATH:  export PATH=\"$BIN_DIR:\$PATH\")"
