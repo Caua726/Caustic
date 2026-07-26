@@ -85,6 +85,44 @@ if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64" -and $env:PROCESSOR_ARCHITEW6432 -ne
     Write-Warning "Caustic ships x86_64 (AMD64) binaries; your architecture is $env:PROCESSOR_ARCHITECTURE. The universal build (-Format cse) carries an ARM64 body, but reaching it natively is not wired up yet, so it runs emulated."
 }
 
+# --- arrow-key menu ---
+# Up/Down move, Enter picks; returns the 1-based index. A host without a raw
+# console — a CI log, a redirected stream — cannot read single keys, so it
+# falls back to typing the number rather than throwing.
+function Show-Menu {
+    param([string]$Title, [string[]]$Options)
+    Write-Host $Title
+    $raw = $true
+    try { $null = $Host.UI.RawUI.KeyAvailable } catch { $raw = $false }
+    if (-not $raw -or [Console]::IsInputRedirected) {
+        for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $Options[$i]) }
+        $r = Read-Host "  choice [1-$($Options.Count)]"
+        $n = 0
+        if ([int]::TryParse($r, [ref]$n) -and $n -ge 1 -and $n -le $Options.Count) { return $n }
+        return 1
+    }
+    $sel = 0
+    $first = $true
+    while ($true) {
+        if (-not $first) { [Console]::SetCursorPosition(0, [Console]::CursorTop - $Options.Count) }
+        $first = $false
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $line = if ($i -eq $sel) { "  > " + $Options[$i] } else { "    " + $Options[$i] }
+            $w = [Math]::Max(1, [Console]::WindowWidth - 1)
+            if ($line.Length -gt $w) { $line = $line.Substring(0, $w) } else { $line = $line.PadRight($w) }
+            if ($i -eq $sel) { Write-Host $line -ForegroundColor Cyan } else { Write-Host $line }
+        }
+        $k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        switch ($k.VirtualKeyCode) {
+            38 { $sel = ($sel - 1 + $Options.Count) % $Options.Count }   # Up
+            40 { $sel = ($sel + 1) % $Options.Count }                    # Down
+            75 { $sel = ($sel - 1 + $Options.Count) % $Options.Count }   # k
+            74 { $sel = ($sel + 1) % $Options.Count }                    # j
+            13 { return $sel + 1 }                                       # Enter
+        }
+    }
+}
+
 # --- elevation ---
 # A machine-wide prefix and the machine PATH both need administrator. Rather
 # than failing halfway through with a copy denied, relaunch the whole script
@@ -109,39 +147,51 @@ if ($System -and -not $IsAdmin -and -not $DryRun) {
 }
 
 # --- interactive ---
-if ($Custom) {
-    function Ask([string]$q, [string]$def) {
-        $r = Read-Host $q
-        if ([string]::IsNullOrWhiteSpace($r)) { return $def } else { return $r }
+# A function rather than a block: choosing "change them" at the already-
+# installed prompt below needs to ask the same questions, and that prompt
+# cannot run until the prefix is known.
+function Invoke-Setup {
+
+    Write-Host "=== Caustic ==="
+
+    if ((Show-Menu "Install from" @("the latest release (fast)", "source - clones and builds (needs git)")) -eq 2) {
+        $FromSource = $true
+        $r = Read-Host "  branch or tag (default main)"
+        if ($r) { $Ref = $r }
     }
-    Write-Host "=== Caustic custom install ==="
-    switch (Ask "Source - [1] latest release (fast)  [2] build from source (needs git; slower) (default 1)" "1") {
-        "2" { $FromSource = $true; $Ref = Ask "  branch or tag (default main)" "main" }
-        default { $FromSource = $false }
-    }
-    switch (Ask "Scope - [1] this user (%LOCALAPPDATA%)  [2] every user (%ProgramFiles%, needs admin) (default 1)" "1") {
-        "2" { $System = $true; $Prefix = Join-Path $env:ProgramFiles "caustic" }
+
+    switch (Show-Menu "Where" @("just me (%LOCALAPPDATA%)", "everyone (%ProgramFiles%, needs admin)", "somewhere else")) {
+        2 { $System = $true; $Prefix = Join-Path $env:ProgramFiles "caustic" }
+        3 { $Prefix = Read-Host "  path" }
         default { $System = $false }
     }
-    $Prefix = Ask "Prefix (default $Prefix)" $Prefix
-    switch (Ask "Compiler - [1] exe (native Windows)  [2] cse (universal: Windows+Linux+CausticOS, x86_64+ARM64)  [3] both (default 1)" "1") {
-        "2" { $Format = "cse" }
-        "3" { $Format = "exe,cse" }
+
+    switch (Show-Menu "Compiler" @(
+        "native Windows .exe",
+        "universal - one file for Windows, Linux and CausticOS, x86_64 and ARM64",
+        "both")) {
+        2 { $Format = "cse" }
+        3 { $Format = "exe,cse" }
         default { $Format = "exe" }
     }
-    switch (Ask "Tools - [1] all (as, ld, mk)  [2] as + ld  [3] none (default 1)" "1") {
-        "2" { $Tools = "as,ld" }
-        "3" { $Tools = "none" }
+
+    switch (Show-Menu "Tools alongside the compiler" @("everything (as, ld, mk)", "assembler + linker", "none")) {
+        2 { $Tools = "as,ld" }
+        3 { $Tools = "none" }
         default { $Tools = "all" }
     }
-    switch (Ask "Shared stdlib - [1] libcaustic.dll  [2] .dll + .csl  [3] .csl only  [4] none (default 1)" "1") {
-        "2" { $Lib = "dll,csl" }
-        "3" { $Lib = "csl" }
-        "4" { $Lib = "none" }
+
+    switch (Show-Menu "Shared standard library" @("libcaustic.dll", "+ libcaustic.csl (universal)", "just libcaustic.csl", "none")) {
+        2 { $Lib = "dll,csl" }
+        3 { $Lib = "csl" }
+        4 { $Lib = "none" }
         default { $Lib = "dll" }
     }
-    $NoSource = ((Ask "Install the stdlib sources (.cst)? Required to compile anything [Y/n]" "Y") -match "^[Nn]")
+
+    $NoSource = ((Show-Menu "Standard library sources (.cst) - you compile against these" @("install them", "skip them")) -eq 2)
 }
+
+if ($Custom) { Invoke-Setup }
 
 if ($Tools -eq "all")  { $Tools = "as,ld,mk" }
 if ($Tools -eq "none") { $Tools = "" }
@@ -176,8 +226,23 @@ if (Test-Path $existing) {
     if (-not $PSBoundParameters.ContainsKey('Lib')    -and (Old 'lib')   -ne 'none') { $LibList  = @((Old 'lib')   -split ',' | Where-Object { $_ }) }
 
     if (-not $Reinstall -and -not $Custom -and -not $DryRun -and [Environment]::UserInteractive) {
-        $a = Read-Host "Reinstall it, keeping these choices? [Y/n]"
-        if ($a -match '^[Nn]') { Write-Host "nothing done - use update.ps1 to move to the latest release"; exit 0 }
+        switch (Show-Menu "Already installed - what now?" @("reinstall with the same choices", "reinstall, choosing again", "cancel")) {
+            2 {
+                # Ask the same questions -Custom asks, then recompute everything
+                # derived from the answers — the prefix is among them.
+                Invoke-Setup
+                if ($Tools -eq "all")  { $Tools = "as,ld,mk" }
+                if ($Tools -eq "none") { $Tools = "" }
+                if ($Lib   -eq "none") { $Lib = "" }
+                $Formats  = @($Format -split ',' | Where-Object { $_ })
+                $ToolList = @($Tools  -split ',' | Where-Object { $_ })
+                $LibList  = @($Lib    -split ',' | Where-Object { $_ })
+                $Primary  = $Formats[0]
+                $Bin      = Join-Path $Prefix "bin"
+                $LibDir   = Join-Path $Prefix "lib\caustic"
+            }
+            3 { Write-Host "nothing done"; exit 0 }
+        }
     }
 }
 

@@ -95,36 +95,107 @@ for arg in "$@"; do
     esac
 done
 
+# --- arrow-key menu ---
+# Reads raw bytes from /dev/tty so it works through `curl | sh`, where stdin is
+# the script itself. Up/Down move, Enter picks; the answer lands in MENU_CHOICE
+# as a 1-based index. If the terminal cannot be put in raw mode — no tty, a
+# dumb terminal, a CI log — it falls back to typing the number, so the script
+# never becomes unusable just because it cannot draw.
+MENU_CHOICE=1
+menu() {
+    _title="$1"; shift
+    _n=$#; _sel=1
+    printf "%s\n" "$_title" >/dev/tty
+
+    _saved=""
+    if [ -z "${NO_TTY_MENU:-}" ]; then _saved=$(stty -g </dev/tty 2>/dev/null || echo ""); fi
+    if [ -z "$_saved" ]; then
+        _i=1; for _o in "$@"; do printf "  %d) %s\n" "$_i" "$_o" >/dev/tty; _i=$((_i+1)); done
+        printf "  choice [1-%d]: " "$_n" >/dev/tty
+        read _r </dev/tty || _r=""
+        case "$_r" in ''|*[!0-9]*) _r=1 ;; esac
+        [ "$_r" -ge 1 ] 2>/dev/null && [ "$_r" -le "$_n" ] 2>/dev/null || _r=1
+        MENU_CHOICE=$_r
+        return 0
+    fi
+
+    stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null
+    _first=1
+    while :; do
+        [ "$_first" = 1 ] || printf "\033[%dA" "$_n" >/dev/tty
+        _first=0
+        _i=1
+        for _o in "$@"; do
+            if [ "$_i" -eq "$_sel" ]; then printf "\033[2K  \033[1;36m> %s\033[0m\n" "$_o" >/dev/tty
+            else                            printf "\033[2K    %s\n" "$_o" >/dev/tty; fi
+            _i=$((_i+1))
+        done
+        _b=$(dd bs=1 count=1 2>/dev/null </dev/tty | od -An -tu1 | tr -d ' ')
+        case "$_b" in
+            27) dd bs=1 count=1 2>/dev/null </dev/tty >/dev/null
+                _b2=$(dd bs=1 count=1 2>/dev/null </dev/tty | od -An -tu1 | tr -d ' ')
+                case "$_b2" in
+                    65) _sel=$((_sel-1)); [ "$_sel" -lt 1 ] && _sel=$_n ;;
+                    66) _sel=$((_sel+1)); [ "$_sel" -gt "$_n" ] && _sel=1 ;;
+                esac ;;
+            107) _sel=$((_sel-1)); [ "$_sel" -lt 1 ] && _sel=$_n ;;   # k
+            106) _sel=$((_sel+1)); [ "$_sel" -gt "$_n" ] && _sel=1 ;; # j
+            10|13|"") break ;;
+        esac
+    done
+    stty "$_saved" </dev/tty 2>/dev/null
+    MENU_CHOICE=$_sel
+}
+
 # --- interactive (reads /dev/tty so it works through a curl|sh pipe) ---
-if [ "$MODE" = "custom" ] && [ -e /dev/tty ]; then
-    ask() { printf "%s" "$1" >/dev/tty; read REPLY </dev/tty || REPLY=""; }
-    echo "=== Caustic custom install ==="
-    ask "Source — [1] latest release (fast)  [2] build from source (needs git; slower)  (default 1): "
-    case "$REPLY" in 2) FROM_SRC=1 ;; *) FROM_SRC=0 ;; esac
-    if [ "$FROM_SRC" = 1 ]; then
-        ask "  branch or tag (default main): "
+# A function rather than a block: the "change them" branch of the already-
+# installed prompt further down needs to ask the same questions, and that
+# prompt cannot run until the prefix is known.
+ask() { printf "%s" "$1" >/dev/tty; read REPLY </dev/tty || REPLY=""; }
+ASKED=0
+interactive_setup() {
+    ASKED=1
+    echo "=== Caustic ==="
+
+    menu "Install from" "the latest release (fast)" "source — clones and builds (needs git)"
+    if [ "$MENU_CHOICE" = 2 ]; then
+        FROM_SRC=1
+        printf "  branch or tag (default main): " >/dev/tty
+        read REPLY </dev/tty || REPLY=""
         [ -n "$REPLY" ] && REF="$REPLY"
+    else FROM_SRC=0; fi
+
+    menu "Where" "\$HOME/.local — just me, no root" "/usr/local — everyone, needs root" "somewhere else"
+    case "$MENU_CHOICE" in
+        2) PREFIX="/usr/local" ;;
+        3) printf "  path: " >/dev/tty; read REPLY </dev/tty || REPLY=""; PREFIX="$REPLY" ;;
+        *) PREFIX="$HOME/.local" ;;
+    esac
+
+    if [ "${PREFIX#$HOME}" = "$PREFIX" ]; then
+        menu "Become root with" "whatever is available" "pkexec" "sudo" "doas"
+        case "$MENU_CHOICE" in 2) ROOT_METHOD="pkexec" ;; 3) ROOT_METHOD="sudo" ;; 4) ROOT_METHOD="doas" ;; *) ROOT_METHOD="auto" ;; esac
     fi
 
-    ask "Prefix — [1] \$HOME/.local  [2] /usr/local  [3] custom  (default 1): "
-    case "$REPLY" in 2) PREFIX="/usr/local" ;; 3) ask "  path: "; PREFIX="$REPLY" ;; *) PREFIX="$HOME/.local" ;; esac
+    menu "Compiler" \
+         "native Linux binary" \
+         "universal — one file for Linux, Windows and CausticOS, x86_64 and ARM64" \
+         "Windows .exe" \
+         "native + universal"
+    case "$MENU_CHOICE" in 2) FORMATS="cse" ;; 3) FORMATS="exe" ;; 4) FORMATS="elf,cse" ;; *) FORMATS="elf" ;; esac
 
-    if [ "$PREFIX" = "/usr/local" ] || [ "${PREFIX#$HOME}" = "$PREFIX" ]; then
-        ask "Escalate with — [1] auto  [2] pkexec  [3] sudo  [4] doas  (default 1): "
-        case "$REPLY" in 2) ROOT_METHOD="pkexec" ;; 3) ROOT_METHOD="sudo" ;; 4) ROOT_METHOD="doas" ;; *) ROOT_METHOD="auto" ;; esac
-    fi
+    menu "Tools alongside the compiler" "none" "assembler + linker" "everything (as, ld, mk, lsp)"
+    case "$MENU_CHOICE" in 2) TOOLS="as,ld" ;; 3) TOOLS="all" ;; *) TOOLS="none" ;; esac
 
-    ask "Compiler — [1] elf (native Linux)  [2] cse (universal: Linux+Windows+CausticOS, x86_64+ARM64)  [3] exe (Windows PE)  [4] elf + cse  (default 1): "
-    case "$REPLY" in 2) FORMATS="cse" ;; 3) FORMATS="exe" ;; 4) FORMATS="elf,cse" ;; *) FORMATS="elf" ;; esac
+    menu "Shared standard library" "libcaustic.so" "+ libcaustic.csl (universal)" "all three, with the Windows .dll" "none"
+    case "$MENU_CHOICE" in 2) LIBS="so,csl" ;; 3) LIBS="so,csl,dll" ;; 4) LIBS="none" ;; *) LIBS="so" ;; esac
 
-    ask "Tools — [1] none  [2] as + ld  [3] everything (as, ld, mk, lsp)  (default 1): "
-    case "$REPLY" in 2) TOOLS="as,ld" ;; 3) TOOLS="all" ;; *) TOOLS="none" ;; esac
+    menu "Standard library sources (.cst) — you compile against these" "install them" "skip them"
+    case "$MENU_CHOICE" in 2) WITH_SRC=0 ;; *) WITH_SRC=1 ;; esac
+}
 
-    ask "Shared stdlib — [1] libcaustic.so  [2] + libcaustic.csl  [3] .so + .csl + .dll  [4] none  (default 1): "
-    case "$REPLY" in 2) LIBS="so,csl" ;; 3) LIBS="so,csl,dll" ;; 4) LIBS="none" ;; *) LIBS="so" ;; esac
-
-    ask "Install the stdlib sources (.cst)? — required to compile anything [Y/n]: "
-    case "$REPLY" in [Nn]*) WITH_SRC=0 ;; *) WITH_SRC=1 ;; esac
+if [ "$MODE" = "custom" ] && { : </dev/tty; } 2>/dev/null; then
+    interactive_setup
 fi
 
 # Normalise the tool list so the copy loop below reads one shape.
@@ -188,9 +259,22 @@ if [ -f "$EXISTING" ]; then
     # /dev/tty can exist and still not be openable (cron, a container, a pipe
     # with no controlling terminal), so try it rather than test for it.
     if [ -z "$REINSTALL" ] && [ "$MODE" != "custom" ] && { : </dev/tty; } 2>/dev/null; then
-        printf "Reinstall it, keeping these choices? [Y/n] " >/dev/tty
-        read REPLY </dev/tty || REPLY=""
-        case "$REPLY" in [Nn]*) echo "nothing done — use update.sh to move to the latest release"; exit 0 ;; esac
+        menu "Already installed — what now?" "reinstall with the same choices" "reinstall, choosing again" "cancel"
+        case "$MENU_CHOICE" in
+            2) MODE="custom" ;;
+            3) echo "nothing done"; exit 0 ;;
+        esac
+    fi
+
+    # "change them": ask the same questions the --custom flag asks. The prefix
+    # is among them, so the directories derived from it are recomputed after.
+    if [ "$MODE" = "custom" ] && [ "$ASKED" = 0 ]; then
+        interactive_setup
+        [ "$TOOLS" = "all" ] && TOOLS="as,ld,mk,lsp"
+        [ "$TOOLS" = "none" ] && TOOLS=""
+        [ "$LIBS" = "none" ] && LIBS=""
+        PRIMARY=$(echo "$FORMATS" | cut -d, -f1)
+        BIN_DIR="$PREFIX/bin"; LIB_DIR="$PREFIX/lib/caustic"; STD_DIR="$LIB_DIR/std"
     fi
 fi
 

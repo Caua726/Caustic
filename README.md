@@ -135,24 +135,29 @@ irm https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 | iex
 That is `caustic` plus the standard library, into your home directory, no root.
 Add the `bin` directory it names to your `PATH` and you are done.
 
-**Want to choose?** Add `--custom` and it asks — where to install, which
-compiler, which tools, which shared stdlib:
+**Want to choose?** Add `--custom` (`-Custom`) and it asks — arrow keys to move,
+Enter to pick:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --custom
+```
+Compiler
+    native Linux binary
+  > universal — one file for Linux, Windows and CausticOS, x86_64 and ARM64
+    Windows .exe
+    native + universal
 ```
 
-```powershell
-iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 -OutFile i.ps1; .\i.ps1 -Custom
-```
+It asks where to install, whether to download the release or build from source,
+which compiler, which tools, and which shared standard library. The one worth
+knowing about is the compiler: **native** is an ordinary binary for your system,
+**universal** is a single file carrying native code for all three systems on both
+architectures — the same file runs everywhere.
 
-The question worth knowing about is the compiler: the normal one is a native
-binary for your system, and the other is the **universal** build — a single file
-carrying native code for Linux, Windows and CausticOS, on x86_64 and ARM64. The
-same file runs on all of them.
+Every answer is also a flag if you would rather not be asked; `install.sh --help`
+lists them.
 
-Every answer is also a flag, if you would rather not be asked — `install.sh
---help` lists them.
+Run the installer again and it tells you what is already there and offers to
+reinstall with the same choices, reinstall choosing again, or stop — it will not
+quietly put you back on the defaults.
 
 ### Update
 
@@ -164,10 +169,9 @@ curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/update.sh | sh
 iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/update.ps1 -OutFile u.ps1; .\u.ps1
 ```
 
-It reinstalls the latest release the way *you* installed it — the choices you
-made the first time are remembered, so an update never quietly puts you back on
-the defaults. Add `--check` (`-Check`) to compare versions without changing
-anything.
+Reinstalls the latest release the way *you* installed it — your choices are
+remembered, so an update never reverts them. Add `--check` (`-Check`) to compare
+versions without changing anything.
 
 ### Uninstall
 
@@ -179,16 +183,15 @@ curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.sh |
 iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.ps1 -OutFile r.ps1; .\r.ps1
 ```
 
-It removes the files it installed and nothing else, so a shared location like
+Removes the files it installed and nothing else, so a shared location like
 `/usr/local` keeps whatever else lives there. Add `--dry-run` (`-DryRun`) to see
 the list first.
 
 ### Building it yourself
 
-Pick **build from source** when the installer asks, and it clones and builds
-before installing — no separate steps, and the same choices apply. Caustic is
-written in itself, so the installer takes a seed compiler from your `PATH` or
-from the last release.
+Pick **build from source** when the installer asks and it clones and builds
+before installing — same choices, no separate steps. Caustic is written in
+itself, so a seed compiler is taken from your `PATH` or from the last release.
 
 ### Compile and run
 
