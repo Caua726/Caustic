@@ -36,6 +36,8 @@
 #
 # OTHER
 #   --dry-run              print what would happen, touch nothing
+#   -y, --yes              never ask anything, whatever the terminal looks like
+#                          (implied by --dry-run and by naming any choice above)
 set -eu
 
 REPO="Caua726/Caustic"
@@ -63,37 +65,71 @@ LIBS="so";     SET_LIBS=0
 REINSTALL=""
 WITH_SRC=1
 DRY=0
+ASSUME_YES=0
+# 1 once the caller has named any install decision. A run that says what it
+# wants has nothing left to be asked about.
+SPECIFIED=0
 FROM_SRC=0
 SOURCE_DIR=""
 REF="main"
 for arg in "$@"; do
     case "$arg" in
         --custom|--interactive) MODE="custom" ;;
-        --system)     PREFIX="/usr/local" ;;
-        --user)       PREFIX="$HOME/.local" ;;
-        --prefix=*)   PREFIX="${arg#*=}" ;;
-        --root=*)     ROOT_METHOD="${arg#*=}" ;;
-        --format=*)   FORMATS="${arg#*=}"; SET_FORMAT=1 ;;
-        --tools=*)    TOOLS="${arg#*=}"; SET_TOOLS=1 ;;
-        --lib=*|--libs=*) LIBS="${arg#*=}"; SET_LIBS=1 ;;
-        --reinstall|--force) REINSTALL=yes ;;
-        --no-source)  WITH_SRC=0 ;;
-        --source)     WITH_SRC=1 ;;
+        -y|--yes|--non-interactive) ASSUME_YES=1 ;;
+        --system)     PREFIX="/usr/local"; SPECIFIED=1 ;;
+        --user)       PREFIX="$HOME/.local"; SPECIFIED=1 ;;
+        --prefix=*)   PREFIX="${arg#*=}"; SPECIFIED=1 ;;
+        --root=*)     ROOT_METHOD="${arg#*=}"; SPECIFIED=1 ;;
+        --format=*)   FORMATS="${arg#*=}"; SET_FORMAT=1; SPECIFIED=1 ;;
+        --tools=*)    TOOLS="${arg#*=}"; SET_TOOLS=1; SPECIFIED=1 ;;
+        --lib=*|--libs=*) LIBS="${arg#*=}"; SET_LIBS=1; SPECIFIED=1 ;;
+        --reinstall|--force) REINSTALL=yes; SPECIFIED=1 ;;
+        --no-source)  WITH_SRC=0; SPECIFIED=1 ;;
+        --source)     WITH_SRC=1; SPECIFIED=1 ;;
         --dry-run)    DRY=1 ;;
-        --from-source) FROM_SRC=1 ;;
-        --source-dir=*) FROM_SRC=1; SOURCE_DIR="${arg#*=}" ;;
-        --ref=*)      REF="${arg#*=}" ;;
+        --from-source) FROM_SRC=1; SPECIFIED=1 ;;
+        --source-dir=*) FROM_SRC=1; SOURCE_DIR="${arg#*=}"; SPECIFIED=1 ;;
+        --ref=*)      REF="${arg#*=}"; SPECIFIED=1 ;;
         # Kept so older one-liners keep working.
-        --with-tools) TOOLS="as,ld" ;;
-        --with-csl)   LIBS="$LIBS,csl" ;;
-        --no-so)      LIBS=$(echo "$LIBS" | sed 's/\bso\b//; s/,,/,/g; s/^,//; s/,$//'); [ -n "$LIBS" ] || LIBS="none" ;;
-        --cse|--universal) FORMATS="cse" ;;
+        --with-tools) TOOLS="as,ld"; SPECIFIED=1 ;;
+        --with-csl)   LIBS="$LIBS,csl"; SPECIFIED=1 ;;
+        --no-so)      LIBS=$(echo "$LIBS" | sed 's/\bso\b//; s/,,/,/g; s/^,//; s/,$//'); [ -n "$LIBS" ] || LIBS="none"; SPECIFIED=1 ;;
+        --cse|--universal) FORMATS="cse"; SPECIFIED=1 ;;
         -h|--help)
             sed -n '2,/^set -eu/p' "$0" | sed 's/^# \{0,1\}//; $d'
             exit 0 ;;
         *) echo "warning: ignoring '$arg'" >&2 ;;
     esac
 done
+
+# --- may we block on a question? ---
+# ONE rule, in one place. Every prompt used to test /dev/tty for itself, which
+# made "is this interactive" mean "does a terminal happen to be attached" —
+# and that is not the same question. A fully specified run in a terminal
+# (`install.sh --user --format=elf`) has already said what it wants, and a
+# --dry-run promises to touch nothing, yet both sat waiting on a menu until
+# somebody pressed a key. In a Makefile, a container with a controlling
+# terminal, or a provisioning script, that is a hang with no output to explain
+# it.
+#
+# So asking requires BOTH a terminal to ask on and a decision that is genuinely
+# still open:
+#
+#   --custom     always ask (and fall back to defaults with no terminal)
+#   -y/--yes     never ask
+#   --dry-run    never ask — it changes nothing, so there is nothing to confirm
+#   any choice named on the command line → never ask
+#   otherwise    ask if there is a terminal
+#
+# /dev/tty can exist and still not be openable (cron, a container, a pipe with
+# no controlling terminal), so it is opened rather than tested for.
+may_ask() {
+    [ "$ASSUME_YES" = 1 ] && return 1
+    [ "$DRY" = 1 ] && return 1
+    if [ "$MODE" = "custom" ]; then { : </dev/tty; } 2>/dev/null; return $?; fi
+    [ "$SPECIFIED" = 1 ] && return 1
+    { : </dev/tty; } 2>/dev/null
+}
 
 # --- arrow-key menu ---
 # Reads raw bytes from /dev/tty so it works through `curl | sh`, where stdin is
@@ -194,7 +230,7 @@ interactive_setup() {
     case "$MENU_CHOICE" in 2) WITH_SRC=0 ;; *) WITH_SRC=1 ;; esac
 }
 
-if [ "$MODE" = "custom" ] && { : </dev/tty; } 2>/dev/null; then
+if [ "$MODE" = "custom" ] && may_ask; then
     interactive_setup
 fi
 
@@ -256,9 +292,7 @@ if [ -f "$EXISTING" ]; then
     [ "$TOOLS" = "none" ] && TOOLS=""
     [ "$LIBS" = "none" ] && LIBS=""
 
-    # /dev/tty can exist and still not be openable (cron, a container, a pipe
-    # with no controlling terminal), so try it rather than test for it.
-    if [ -z "$REINSTALL" ] && [ "$MODE" != "custom" ] && { : </dev/tty; } 2>/dev/null; then
+    if [ -z "$REINSTALL" ] && [ "$MODE" != "custom" ] && may_ask; then
         menu "Already installed — what now?" "reinstall with the same choices" "reinstall, choosing again" "cancel"
         case "$MENU_CHOICE" in
             2) MODE="custom" ;;

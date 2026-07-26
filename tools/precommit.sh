@@ -42,6 +42,24 @@ check_installers() {
     for f in install.sh update.sh uninstall.sh; do
         sh -n "$ROOT/$f" || die "$f is not valid POSIX shell"
     done
+    # Parsing says nothing about whether the thing BLOCKS. install.sh grew
+    # arrow-key menus that were reached whenever a terminal happened to be
+    # attached, so `install.sh --user --format=elf` and even `--dry-run` sat
+    # waiting on a keypress — a hang in any Makefile or provisioning script
+    # that runs with a controlling terminal, with no output to explain it.
+    #
+    # The check needs a real pty, because without one the bug cannot happen.
+    # `script` is how a shell gets one; where it is absent this is skipped
+    # rather than quietly passed.
+    if command -v script >/dev/null 2>&1; then
+        for args in "--dry-run" "--yes --dry-run" "--user --format=elf --dry-run"; do
+            if ! timeout 20 script -qec "sh '$ROOT/install.sh' $args" /dev/null \
+                    </dev/null >/dev/null 2>&1; then
+                die "install.sh $args did not finish on a terminal (blocked on a prompt?)"
+            fi
+        done
+        ok "install.sh runs to completion on a tty when told what to do"
+    fi
     # Non-ASCII would arrive mangled on Windows PowerShell 5.1, which reads a
     # BOM-less .ps1 with the system ANSI codepage.
     for f in install.ps1 update.ps1 uninstall.ps1; do
