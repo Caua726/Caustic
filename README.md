@@ -135,8 +135,19 @@ irm https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 | iex
 That is `caustic` plus the standard library, into your home directory, no root.
 Add the `bin` directory it names to your `PATH` and you are done.
 
-**Want to choose?** Add `--custom` (`-Custom`) and it asks — arrow keys to move,
-Enter to pick:
+Either installer does the whole job on either system — the PowerShell one runs on
+Linux too, on PowerShell 5.1 through 7, and installs the Linux build there. Pick
+whichever shell you are already in.
+
+**Want to choose?** It asks — arrow keys to move, Enter to pick:
+
+```sh
+curl -fsSL .../install.sh | sh -s -- --custom
+```
+
+```powershell
+$env:CAUSTIC_CUSTOM=1; irm .../install.ps1 | iex
+```
 
 ```
 Compiler
@@ -152,8 +163,10 @@ knowing about is the compiler: **native** is an ordinary binary for your system,
 **universal** is a single file carrying native code for all three systems on both
 architectures — the same file runs everywhere.
 
-Every answer is also a flag if you would rather not be asked; `install.sh --help`
-lists them.
+Every answer is also a flag if you would rather not be asked — `install.sh --help`
+and `install.ps1 -Help` list them. A piped one-liner cannot take flags, so the
+PowerShell one reads `$env:CAUSTIC_*` instead (`CAUSTIC_FORMAT`, `CAUSTIC_TOOLS`,
+`CAUSTIC_LIB`, `CAUSTIC_PREFIX`, …).
 
 Run the installer again and it tells you what is already there and offers to
 reinstall with the same choices, reinstall choosing again, or stop — it will not
@@ -166,12 +179,12 @@ curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/update.sh | sh
 ```
 
 ```powershell
-iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/update.ps1 -OutFile u.ps1; .\u.ps1
+irm https://raw.githubusercontent.com/Caua726/Caustic/main/update.ps1 | iex
 ```
 
 Reinstalls the latest release the way *you* installed it — your choices are
-remembered, so an update never reverts them. Add `--check` (`-Check`) to compare
-versions without changing anything.
+remembered, so an update never reverts them. To compare versions without
+changing anything, add `--check`, or set `$env:CAUSTIC_CHECK=1` first.
 
 ### Uninstall
 
@@ -180,12 +193,12 @@ curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.sh |
 ```
 
 ```powershell
-iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.ps1 -OutFile r.ps1; .\r.ps1
+irm https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.ps1 | iex
 ```
 
 Removes the files it installed and nothing else, so a shared location like
-`/usr/local` keeps whatever else lives there. Add `--dry-run` (`-DryRun`) to see
-the list first.
+`/usr/local` keeps whatever else lives there. To see the list first, add
+`--dry-run`, or set `$env:CAUSTIC_DRYRUN=1`.
 
 ### Building it yourself
 
