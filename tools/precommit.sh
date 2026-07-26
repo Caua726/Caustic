@@ -67,6 +67,19 @@ check_installers() {
             die "$f contains non-ASCII — Windows PowerShell 5.1 will mangle it"
         fi
     done
+    # The shell completions are shipped like the installers are, and break the
+    # same way: silently, in someone else's shell. selftest.sh runs the bash
+    # functions for real and drives a zsh completion widget on a pty.
+    if [ -x "$ROOT/tools/completions/selftest.sh" ]; then
+        if "$ROOT/tools/completions/selftest.sh" >"${TMPDIR:-/tmp}/caustic-comp-selftest.$$" 2>&1; then
+            ok "shell completions answer what the toolchain accepts"
+        else
+            cat "${TMPDIR:-/tmp}/caustic-comp-selftest.$$"
+            rm -f "${TMPDIR:-/tmp}/caustic-comp-selftest.$$"
+            die "tools/completions/selftest.sh failed"
+        fi
+        rm -f "${TMPDIR:-/tmp}/caustic-comp-selftest.$$"
+    fi
     if command -v pwsh >/dev/null 2>&1; then
         # Parsing catches the syntax; the compatibility rules catch the constructs
         # that parse here on 7 but do not exist on 5.1. Both classes of bug have
@@ -100,8 +113,13 @@ check_installers() {
 #  PRECOMMIT_FULL=1 always runs the full check.)
 if [ "${PRECOMMIT_FULL:-0}" != "1" ]; then
     STAGED="$(git diff --cached --name-only 2>/dev/null)"
-    if [ -n "$STAGED" ] && ! printf "%s\n" "$STAGED" | grep -qE '\.(cst|s)$|Causticfile|^tools/'; then
-        if printf "%s\n" "$STAGED" | grep -qE '^(install|update|uninstall)\.(sh|ps1)$'; then
+    # The completion scripts are shell, not compiler input: they cannot change
+    # what the toolchain emits, and check_installers already tests them
+    # thoroughly. Sending them down the full self-host path would cost minutes
+    # to prove something they cannot break.
+    RELEVANT="$(printf "%s\n" "$STAGED" | grep -v '^tools/completions/')"
+    if [ -n "$STAGED" ] && ! printf "%s\n" "$RELEVANT" | grep -qE '\.(cst|s)$|Causticfile|^tools/'; then
+        if printf "%s\n" "$STAGED" | grep -qE '^(install|update|uninstall)\.(sh|ps1)$|^tools/completions/'; then
             check_installers
         fi
         echo "${D}pre-commit: no .cst/.s/Causticfile/tools changes staged — skipping self-check${N}"

@@ -31,6 +31,9 @@
 #   --no-source            skip the stdlib .cst sources (they are what you
 #                          compile against; only skip if you know why)
 #
+# SHELL COMPLETIONS        --completions=LIST  (bash,zsh | auto | none)
+#                          default auto = whichever of bash and zsh is installed
+#
 # FROM SOURCE
 #   --from-source [--source-dir=DIR] [--ref=BRANCH]
 #
@@ -62,6 +65,7 @@ ROOT_METHOD="auto"
 FORMATS="elf"; SET_FORMAT=0
 TOOLS="none";  SET_TOOLS=0
 LIBS="so";     SET_LIBS=0
+COMPLETIONS="auto"; SET_COMP=0
 REINSTALL=""
 WITH_SRC=1
 DRY=0
@@ -83,6 +87,8 @@ for arg in "$@"; do
         --format=*)   FORMATS="${arg#*=}"; SET_FORMAT=1; SPECIFIED=1 ;;
         --tools=*)    TOOLS="${arg#*=}"; SET_TOOLS=1; SPECIFIED=1 ;;
         --lib=*|--libs=*) LIBS="${arg#*=}"; SET_LIBS=1; SPECIFIED=1 ;;
+        --completions=*) COMPLETIONS="${arg#*=}"; SET_COMP=1; SPECIFIED=1 ;;
+        --no-completions) COMPLETIONS="none"; SET_COMP=1; SPECIFIED=1 ;;
         --reinstall|--force) REINSTALL=yes; SPECIFIED=1 ;;
         --no-source)  WITH_SRC=0; SPECIFIED=1 ;;
         --source)     WITH_SRC=1; SPECIFIED=1 ;;
@@ -228,6 +234,10 @@ interactive_setup() {
 
     menu "Standard library sources (.cst) — you compile against these" "install them" "skip them"
     case "$MENU_CHOICE" in 2) WITH_SRC=0 ;; *) WITH_SRC=1 ;; esac
+
+    menu "Shell completions (TAB expands targets, triples, flags)" \
+         "for whichever of bash and zsh is installed" "bash only" "zsh only" "none"
+    case "$MENU_CHOICE" in 2) COMPLETIONS="bash" ;; 3) COMPLETIONS="zsh" ;; 4) COMPLETIONS="none" ;; *) COMPLETIONS="auto" ;; esac
 }
 
 if [ "$MODE" = "custom" ] && may_ask; then
@@ -238,6 +248,20 @@ fi
 [ "$TOOLS" = "all" ] && TOOLS="as,ld,mk,lsp"
 [ "$TOOLS" = "none" ] && TOOLS=""
 [ "$LIBS" = "none" ] && LIBS=""
+# `auto` means the shells this machine actually has. Installing a zsh function
+# on a box with no zsh is harmless but dishonest in the plan we print.
+# Ends in `return 0` deliberately: a function whose last command is a failing
+# test returns non-zero, and under `set -e` that ends the install.
+normalise_completions() {
+    if [ "$COMPLETIONS" = "auto" ]; then
+        COMPLETIONS=""
+        command -v bash >/dev/null 2>&1 && COMPLETIONS="bash"
+        command -v zsh  >/dev/null 2>&1 && COMPLETIONS="${COMPLETIONS:+$COMPLETIONS,}zsh"
+    fi
+    [ "$COMPLETIONS" = "none" ] && COMPLETIONS=""
+    return 0
+}
+normalise_completions
 
 # The first format named owns the plain `caustic` name.
 PRIMARY=$(echo "$FORMATS" | cut -d, -f1)
@@ -246,6 +270,9 @@ for f in $(echo "$FORMATS" | tr ',' ' '); do
 done
 for l in $(echo "$LIBS" | tr ',' ' '); do
     case "$l" in so|csl|dll) ;; *) echo "error: unknown --lib '$l' (so|csl|dll|none)"; exit 1 ;; esac
+done
+for s in $(echo "$COMPLETIONS" | tr ',' ' '); do
+    case "$s" in bash|zsh) ;; *) echo "error: unknown --completions '$s' (bash|zsh|auto|none)"; exit 1 ;; esac
 done
 
 # --- prefix + privilege escalation ---
@@ -282,6 +309,7 @@ if [ -f "$EXISTING" ]; then
     E_FORMAT=$(sed -n 's/^format=//p' "$EXISTING")
     E_TOOLS=$(sed -n 's/^tools=//p' "$EXISTING")
     E_LIBS=$(sed -n 's/^lib=//p' "$EXISTING")
+    E_COMP=$(sed -n 's/^completions=//p' "$EXISTING")
     echo "caustic ${HAVE:-(unknown version)} is already installed at $PREFIX"
     echo "  compiler: $E_FORMAT   tools: $E_TOOLS   stdlib: $E_LIBS"
 
@@ -289,6 +317,7 @@ if [ -f "$EXISTING" ]; then
     [ "$SET_FORMAT" = 0 ] && [ -n "$E_FORMAT" ] && FORMATS="$E_FORMAT"
     [ "$SET_TOOLS" = 0 ]  && [ -n "$E_TOOLS" ]  && TOOLS="$E_TOOLS"
     [ "$SET_LIBS" = 0 ]   && [ -n "$E_LIBS" ]   && LIBS="$E_LIBS"
+    [ "$SET_COMP" = 0 ]   && [ -n "$E_COMP" ]   && { COMPLETIONS="$E_COMP"; normalise_completions; }
     [ "$TOOLS" = "none" ] && TOOLS=""
     [ "$LIBS" = "none" ] && LIBS=""
 
@@ -307,6 +336,7 @@ if [ -f "$EXISTING" ]; then
         [ "$TOOLS" = "all" ] && TOOLS="as,ld,mk,lsp"
         [ "$TOOLS" = "none" ] && TOOLS=""
         [ "$LIBS" = "none" ] && LIBS=""
+        normalise_completions
         PRIMARY=$(echo "$FORMATS" | cut -d, -f1)
         BIN_DIR="$PREFIX/bin"; LIB_DIR="$PREFIX/lib/caustic"; STD_DIR="$LIB_DIR/std"
     fi
@@ -328,6 +358,7 @@ echo "  prefix:   $PREFIX${SUDO:+  (via $SUDO)}"
 echo "  compiler: $FORMATS   (\`caustic\` → $PRIMARY)"
 echo "  tools:    ${TOOLS:-none}"
 echo "  stdlib:   ${LIBS:-no shared lib}$([ "$WITH_SRC" = 1 ] && echo ' + sources')"
+echo "  complete: ${COMPLETIONS:-none}"
 [ "$DRY" = 1 ] && echo "  (dry run — nothing will be written)"
 
 # A dry run answers "what would you do", so it must not reach the network or
@@ -502,6 +533,62 @@ for l in $(echo "$LIBS" | tr ',' ' '); do
     esac
 done
 
+# --- shell completions ---
+# One file per tool, in the directory each shell already searches:
+#   bash  <prefix>/share/bash-completion/completions/<command>
+#   zsh   <prefix>/share/zsh/site-functions/_<command>
+# With --user that is $XDG_DATA_HOME/bash-completion/completions, which
+# bash-completion loads on demand with no configuration at all.
+BASH_COMP_DIR="$PREFIX/share/bash-completion/completions"
+ZSH_COMP_DIR="$PREFIX/share/zsh/site-functions"
+COMPSRC="$SRC/share/caustic/completions"
+INSTALLED_COMP=""
+if [ -n "$COMPLETIONS" ]; then
+    if [ ! -d "$COMPSRC" ]; then
+        echo "  note: this release carries no completion scripts, skipped"
+        COMPLETIONS=""
+    else
+        # Only for the commands that were actually installed.
+        COMP_NAMES="caustic"
+        for t in $(echo "$TOOLS" | tr ',' ' '); do
+            [ -z "$t" ] && continue
+            [ -f "$BIN_DIR/caustic-$t" ] && COMP_NAMES="$COMP_NAMES caustic-$t"
+        done
+        # The compiler also answers to the name of the flavour that was
+        # installed. bash-completion looks its file up by the exact command
+        # name, so those need a link; zsh reads every name off the #compdef
+        # line in the file itself and needs none.
+        COMP_ALIASES=""
+        for f in $(echo "$FORMATS" | tr ',' ' '); do
+            case "$f" in
+                elf) COMP_ALIASES="$COMP_ALIASES caustic-elf" ;;
+                exe) COMP_ALIASES="$COMP_ALIASES caustic.exe" ;;
+                cse) COMP_ALIASES="$COMP_ALIASES $UNIVERSAL" ;;
+            esac
+        done
+    fi
+fi
+if [ -n "$COMPLETIONS" ] && has bash "$COMPLETIONS"; then
+    run mkdir -p "$BASH_COMP_DIR"
+    for n in $COMP_NAMES; do
+        [ -f "$COMPSRC/$n.bash" ] || continue
+        run cp "$COMPSRC/$n.bash" "$BASH_COMP_DIR/$n"; track "$BASH_COMP_DIR/$n"
+    done
+    for a in $COMP_ALIASES; do
+        [ "$a" = "caustic" ] && continue
+        run ln -sf caustic "$BASH_COMP_DIR/$a"; track "$BASH_COMP_DIR/$a"
+    done
+    INSTALLED_COMP="bash"
+fi
+if [ -n "$COMPLETIONS" ] && has zsh "$COMPLETIONS"; then
+    run mkdir -p "$ZSH_COMP_DIR"
+    for n in $COMP_NAMES; do
+        [ -f "$COMPSRC/_$n" ] || continue
+        run cp "$COMPSRC/_$n" "$ZSH_COMP_DIR/_$n"; track "$ZSH_COMP_DIR/_$n"
+    done
+    INSTALLED_COMP="${INSTALLED_COMP:+$INSTALLED_COMP,}zsh"
+fi
+
 # --- manifest ---
 # update.sh replays these choices; uninstall.sh removes these paths. Written
 # last so a failed install leaves no manifest claiming success.
@@ -512,6 +599,7 @@ MANIFEST="$LIB_DIR/install-manifest"
     echo "format=$FORMATS"
     echo "tools=${TOOLS:-none}"
     echo "lib=${LIBS:-none}"
+    echo "completions=${COMPLETIONS:-none}"
     echo "source=$WITH_SRC"
     echo "root=$ROOT_METHOD"
     [ "$WITH_SRC" = 1 ] && echo "stddir=$STD_DIR"
@@ -525,3 +613,34 @@ else
     echo "caustic installed → $BIN_DIR/caustic → $PRIMARY_NAME"
 fi
 command -v caustic >/dev/null 2>&1 || echo "  (add to PATH:  export PATH=\"$BIN_DIR:\$PATH\")"
+
+# A completion file in a directory the shell never reads is the same as no
+# completion at all, and the failure is silent — so say what is missing rather
+# than leaving TAB quietly doing nothing.
+if [ -n "$INSTALLED_COMP" ]; then
+    echo "completions installed → $INSTALLED_COMP"
+    if has bash "$INSTALLED_COMP"; then
+        if [ ! -r /usr/share/bash-completion/bash_completion ] \
+           && [ ! -r /etc/bash_completion ] && [ ! -r /usr/local/share/bash-completion/bash_completion ]; then
+            echo "  bash: the bash-completion package is not installed, so nothing loads them."
+            echo "        Install it, or add to ~/.bashrc:"
+            echo "          for f in \"$BASH_COMP_DIR\"/*; do [ -r \"\$f\" ] && . \"\$f\"; done"
+        else
+            case ":${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:$HOME/.local/share:" in
+                *":$PREFIX/share:"*) ;;
+                *) echo "  bash: $PREFIX/share is outside XDG_DATA_DIRS, so bash-completion will not"
+                   echo "        find them. Add to ~/.bashrc:"
+                   echo "          export XDG_DATA_DIRS=\"$PREFIX/share:\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}\"" ;;
+            esac
+        fi
+    fi
+    if has zsh "$INSTALLED_COMP"; then
+        # Ask zsh itself rather than guessing: distributions disagree about
+        # which site-functions directories are compiled into the default fpath.
+        if ! zsh -fc 'print -l $fpath' 2>/dev/null | grep -qx "$ZSH_COMP_DIR"; then
+            echo "  zsh: $ZSH_COMP_DIR is not on your \$fpath. Add to ~/.zshrc, BEFORE compinit:"
+            echo "         fpath=($ZSH_COMP_DIR \$fpath)"
+            echo "       then:  rm -f ~/.zcompdump*; compinit"
+        fi
+    fi
+fi

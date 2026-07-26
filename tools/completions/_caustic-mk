@@ -1,0 +1,223 @@
+#compdef caustic-mk caustic-mk.exe caustic-mk.cse caustic-mk.cse.exe caustic-mk-universal.cse caustic-mk-universal.cse.exe
+# caustic-mk — zsh completion.  Commands/flags mirror caustic-maker/main.cst.
+#
+# Target, script and profile names come LIVE from `caustic-mk list` — and, when
+# no usable binary is around, straight out of the nearest Causticfile — so
+# completion always describes the project you are standing in, never a snapshot
+# baked in when the script was written.
+#
+# install:  <prefix>/share/zsh/site-functions/_caustic-mk
+#     or:   ln -s .../tools/completions/_caustic-mk  <a dir on your $fpath>
+
+# The nearest Causticfile, searched upward the way caustic-mk looks for it.
+(( $+functions[_caustic_mk_file] )) || _caustic_mk_file() {
+    local d=$PWD
+    repeat 32; do
+        [[ -f $d/Causticfile ]] && { print -r -- $d/Causticfile; return 0 }
+        [[ $d == / ]] && return 1
+        d=${d:h}
+    done
+    return 1
+}
+
+# The binary being completed, if it can actually be run: `./caustic-mk build
+# <TAB>` inside a checkout must describe that checkout, not whichever caustic-mk
+# happens to be first on PATH.
+(( $+functions[_caustic_mk_bin] )) || _caustic_mk_bin() {
+    local b=${words[1]}
+    if [[ $b == */* ]]; then
+        [[ -x $b ]] && { print -r -- $b; return 0 }
+    else
+        (( $+commands[$b] )) && { print -r -- $commands[$b]; return 0 }
+    fi
+    return 1
+}
+
+# `caustic-mk list`, run at most once per completion attempt.
+(( $+functions[_caustic_mk_raw] )) || _caustic_mk_raw() {
+    if [[ -z ${_caustic_mk_raw_out-} ]]; then
+        local bin out=""
+        if bin=$(_caustic_mk_bin); then
+            out="$(_call_program caustic-mk-list ${(q)bin} list 2>/dev/null)"
+        fi
+        typeset -g _caustic_mk_raw_out=${out:- }
+    fi
+    print -r -- $_caustic_mk_raw_out
+}
+
+# $1 = target | script | profile, straight out of the manifest. This is the
+# answer for a fresh checkout with nothing built yet, or any time the binary
+# cannot run.
+(( $+functions[_caustic_mk_from_file] )) || _caustic_mk_from_file() {
+    local f
+    f=$(_caustic_mk_file) || return 1
+    sed -n "s/^[[:space:]]*$1[[:space:]]\{1,\}\"\([^\"]*\)\".*/\1/p" $f
+}
+
+(( $+functions[_caustic_mk_targets] )) || _caustic_mk_targets() {
+    # `  name  src -> out` becomes `name:src -> out`, so the list shows what
+    # each target actually builds.
+    local -a t
+    t=( ${(f)"$(_caustic_mk_raw | awk '
+        /^targets \(/           { intargets = 1; next }
+        intargets && /^  +[^ ]/ { name = $1; $1 = ""; sub(/^ +/, "", $0); print name ":" $0; next }
+        /^[^ ]/                 { intargets = 0 }
+    ')"} )
+    t=( ${t:#} )
+    (( $#t )) || t=( ${(f)"$(_caustic_mk_from_file target)"} )
+    t=( ${t:#} )
+    (( $#t )) || return 1
+    _describe -t targets 'target' t
+}
+
+(( $+functions[_caustic_mk_build_targets] )) || _caustic_mk_build_targets() {
+    _alternative \
+        'all:pseudo-target:((all\:"build every target in the manifest"))' \
+        'targets:target:_caustic_mk_targets'
+}
+
+(( $+functions[_caustic_mk_scripts] )) || _caustic_mk_scripts() {
+    local -a s
+    s=( ${(f)"$(_caustic_mk_raw | awk '/^scripts:/ { for (i = 2; i <= NF; i++) print $i }')"} )
+    s=( ${s:#} )
+    (( $#s )) || s=( ${(f)"$(_caustic_mk_from_file script)"} )
+    s=( ${s:#} )
+    (( $#s )) || return 1
+    _describe -t scripts 'script' s
+}
+
+(( $+functions[_caustic_mk_profiles] )) || _caustic_mk_profiles() {
+    local -a p
+    p=( ${(f)"$(_caustic_mk_raw | awk '/^profiles:/ { for (i = 2; i <= NF; i++) print $i }')"} )
+    p=( ${p:#} )
+    (( $#p )) || p=( ${(f)"$(_caustic_mk_from_file profile)"} )
+    p=( ${p:#} )
+    (( $#p )) || return 1
+    _describe -t profiles 'profile' p
+}
+
+# `run` takes either a script's name or a target's.
+(( $+functions[_caustic_mk_runnable] )) || _caustic_mk_runnable() {
+    _alternative \
+        'scripts:script:_caustic_mk_scripts' \
+        'targets:target:_caustic_mk_targets'
+}
+
+# `set NAME "..."` keys, offered as NAME= — and, once the '=' is typed, the
+# value the manifest gives that key today.
+(( $+functions[_caustic_mk_defines] )) || _caustic_mk_defines() {
+    local f
+    f=$(_caustic_mk_file) || return 1
+    if [[ $PREFIX == *=* ]]; then
+        local name=${PREFIX%%=*} val
+        val=$(sed -n "s/^[[:space:]]*set[[:space:]]\{1,\}$name[[:space:]]\{1,\}\"\([^\"]*\)\".*/\1/p" $f)
+        [[ -n $val ]] && _wanted values expl 'value in the manifest' compadd -- "$name=$val"
+        return
+    fi
+    local -a names
+    names=( ${(f)"$(sed -n 's/^[[:space:]]*set[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' $f)"} )
+    names=( ${names:#} )
+    (( $#names )) || return 1
+    _wanted defines expl 'manifest variable' compadd -S '=' -- $names
+}
+
+_caustic_mk() {
+    typeset -g _caustic_mk_raw_out=""      # one `caustic-mk list` per attempt
+    local cmd="" ret=1
+    local curcontext=$curcontext state line
+    integer i
+
+    # The subcommand is the first word that is neither a flag nor a flag's
+    # value. Skipping the values matters: without it, `caustic-mk --profile
+    # release build <TAB>` would take "release" for the command.
+    for (( i = 2; i < CURRENT; i++ )); do
+        case $words[i] in
+            -j|--parallel|--profile|--prefix|--interval|--define|-D) (( i++ )) ;;
+            -*) ;;
+            *) cmd=$words[i]; break ;;
+        esac
+    done
+
+    local -a commands=(
+        'build:build a target (all = every target)'
+        'run:run a script or a target, forwarding the rest'
+        'test:run the `test` script'
+        'list:show targets, scripts and profiles'
+        'info:print the commands a build would run'
+        'why:explain the up-to-date decision'
+        'graph:dependency tree (--dot for graphviz)'
+        'watch:rebuild whenever an input changes'
+        'install:copy the outputs to their install path'
+        'clean:remove build artifacts'
+        'init:write a new Causticfile here'
+        'doctor:check the toolchain, the manifest and its inputs'
+        'completions:emit a bash or zsh completion script'
+        'help:show usage'
+        'version:show the version'
+    )
+    local cmdnames='(build run test list info why graph watch install clean init doctor completions help version)'
+
+    # Flags every command parses. The three that belong to one command each are
+    # added in that command's branch.
+    local -a common=(
+        '(-j --parallel)'{-j,--parallel}'[build N targets at once]:jobs:(1 2 4 8 16 32)'
+        '--incremental[separate compilation, reuse unchanged objects]'
+        '--continue[keep going when a target fails]'
+        '--force[rebuild even if the outputs look up to date]'
+        '--no-deps[skip git dependency resolution]'
+        '(-n --dry-run)'{-n,--dry-run}'[print the commands without running them]'
+        '--time[report per-target and total time]'
+        '(-q --quiet -v --verbose)'{-q,--quiet}'[only errors]'
+        '(-q --quiet -v --verbose)'{-v,--verbose}'[show the environment and full commands]'
+        '--profile[apply a profile block from the Causticfile]:profile:_caustic_mk_profiles'
+        '--prefix[install destination]:directory:_files -/'
+        '*'{--define,-D}'[override a Causticfile `set`]:NAME=VALUE:_caustic_mk_defines'
+        '--target=[override the target triple]:triple:((linux-x86_64\:"static ELF, no libc" linux-aarch64\:"static ARM64 ELF" windows-x86_64\:"PE/COFF .exe" windows-aarch64\:"ARM64 PE — not implemented yet" caustic\:"CSE container, both architectures" caustic-x86_64\:"CSE image, x86_64" caustic-aarch64\:"CSE image, ARM64" caustic-x86_64-aarch64\:"CSE container, both architectures" wasm32-wasi\:"WebAssembly, 32-bit memory" wasm32\:"alias of wasm32-wasi" wasm64-wasi\:"WebAssembly with memory64" wasm64\:"alias of wasm64-wasi"))'
+    )
+
+    if [[ -z $cmd ]]; then
+        # -h/--help/-V/--version are read off argv[1]; anywhere later,
+        # _parse_opts rejects them as unknown flags.
+        _arguments -C -S \
+            '(- *)'{-h,--help}'[show usage and exit]' \
+            '(- *)'{-V,--version}'[show the version and exit]' \
+            '1:command:->cmds' && ret=0
+        if [[ $state == cmds ]]; then
+            _describe -t commands 'caustic-mk command' commands && ret=0
+        fi
+        return ret
+    fi
+
+    case $cmd in
+        build)
+            _arguments -S $common "1:command:$cmdnames" \
+                '2:target:_caustic_mk_build_targets' && ret=0 ;;
+        run)
+            _arguments -S $common "1:command:$cmdnames" \
+                '2:name:_caustic_mk_runnable' \
+                '*::argument:_files' && ret=0 ;;
+        test)
+            _arguments -S $common "1:command:$cmdnames" '*::argument:_files' && ret=0 ;;
+        info|why|install)
+            _arguments -S $common "1:command:$cmdnames" \
+                '2:target:_caustic_mk_targets' && ret=0 ;;
+        graph)
+            _arguments -S $common '--dot[emit graphviz instead of a tree]' \
+                "1:command:$cmdnames" '2:target:_caustic_mk_targets' && ret=0 ;;
+        watch)
+            _arguments -S $common '--interval[poll interval in ms]:ms:(50 100 200 400 1000 2000)' \
+                "1:command:$cmdnames" '2:target:_caustic_mk_targets' && ret=0 ;;
+        clean)
+            _arguments -S $common '--cache[remove only the cache]' \
+                "1:command:$cmdnames" && ret=0 ;;
+        completions)
+            _arguments -S "1:command:$cmdnames" \
+                '2:shell:((bash\:"a bash completion script" zsh\:"a zsh completion script"))' && ret=0 ;;
+        *)
+            # list, init, doctor, help and version take no positional.
+            _arguments -S $common "1:command:$cmdnames" && ret=0 ;;
+    esac
+    return ret
+}
+
+_caustic_mk "$@"

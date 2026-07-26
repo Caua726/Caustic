@@ -40,7 +40,7 @@ MANIFEST="$PREFIX/lib/caustic/install-manifest"
 get() { sed -n "s/^$1=//p" "$MANIFEST"; }
 
 M_FORMAT=$(get format); M_TOOLS=$(get tools); M_LIB=$(get lib)
-M_SOURCE=$(get source); M_ROOT=$(get root)
+M_SOURCE=$(get source); M_ROOT=$(get root); M_COMP=$(get completions)
 
 HAVE=""
 [ -x "$PREFIX/bin/caustic" ] && HAVE=$("$PREFIX/bin/caustic" --version 2>/dev/null | head -1 | awk '{print $2}')
@@ -56,7 +56,7 @@ echo "caustic update"
 echo "  prefix:    $PREFIX"
 echo "  installed: ${HAVE:-unknown}"
 echo "  latest:    ${LATEST:-unknown}"
-echo "  replaying: format=$M_FORMAT tools=$M_TOOLS lib=$M_LIB source=$M_SOURCE root=$M_ROOT"
+echo "  replaying: format=$M_FORMAT tools=$M_TOOLS lib=$M_LIB source=$M_SOURCE root=$M_ROOT completions=${M_COMP:-auto}"
 
 if [ "$CHECK" = 1 ]; then
     if [ -n "$HAVE" ] && [ -n "$LATEST" ] && [ "$HAVE" = "$LATEST" ]; then
@@ -85,6 +85,11 @@ fi
 
 SRCFLAG=""
 [ "$M_SOURCE" = "0" ] && SRCFLAG="--no-source"
+# An install that predates shell completions has no `completions=` line. Leaving
+# the flag off then means "auto", so the update adds them — which is the point of
+# updating; passing an empty value would instead mean "none" forever.
+COMPFLAG=""
+[ -n "$M_COMP" ] && COMPFLAG="--completions=$M_COMP"
 # shellcheck disable=SC2086
 sh "$INSTALLER" --prefix="$PREFIX" --format="$M_FORMAT" --tools="$M_TOOLS" \
-                --lib="$M_LIB" --root="$M_ROOT" $SRCFLAG $PASSTHRU
+                --lib="$M_LIB" --root="$M_ROOT" $SRCFLAG $COMPFLAG $PASSTHRU

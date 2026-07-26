@@ -172,6 +172,28 @@ Run the installer again and it tells you what is already there and offers to
 reinstall with the same choices, reinstall choosing again, or stop — it will not
 quietly put you back on the defaults.
 
+### Shell completions
+
+The installer sets up TAB completion for `caustic`, `caustic-as`, `caustic-ld`,
+`caustic-mk` and `caustic-lsp` in whichever of **bash** and **zsh** you have —
+`--completions=bash,zsh`, `--completions=none` to skip. They complete every flag
+each tool actually parses, every target triple, the CSE modes and extensions,
+and, for `caustic-mk`, the targets, scripts, profiles and `set` variables of the
+project you are standing in — read live from `caustic-mk list`, or from the
+nearest `Causticfile` when nothing is built yet.
+
+If the shell cannot find them the installer says so and prints the one line to
+add. Without installing anything, any shell can also get them straight from the
+build system:
+
+```sh
+caustic-mk completions bash > ~/.local/share/bash-completion/completions/caustic-mk
+caustic-mk completions zsh  > "${fpath[1]}/_caustic-mk"
+```
+
+or, from a checkout, source `tools/completions/*.bash` and put
+`tools/completions/` on your `$fpath`.
+
 ### Update
 
 ```sh

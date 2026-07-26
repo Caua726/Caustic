@@ -6,6 +6,36 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## Unreleased
+
+### Added
+- **Shell completions for the whole toolchain**, bash and zsh: `caustic`,
+  `caustic-as`, `caustic-ld`, `caustic-mk`, `caustic-lsp`. Every flag each tool
+  actually parses, every target triple with a description, the CSE modes and
+  extensions, `.cse` / `.cse.exe` images for `--image=` / `--pe=` / `--cst=`, and
+  the output name `-o` will produce for the target on the line (`hello.exe`,
+  `hello.wasm`, `libhello.csl`). `caustic-mk` completes the targets, scripts,
+  profiles and `set` variables of the project you are in — from `caustic-mk
+  list`, falling back to reading the nearest `Causticfile`, so it works in a
+  checkout with nothing built yet. Registered for every name a tool ships under,
+  including the CSE flavours (`caustic-lsp.cse`, `caustic-universal.cse.exe`, …).
+  `install.sh --completions=bash,zsh` installs them (default: whichever shells
+  are present), `update.sh` replays the choice, `uninstall.sh` removes them.
+- **`tools/completions/selftest.sh`** — runs the bash functions with the word
+  arrays readline really builds, and drives a real zsh completion widget on a
+  pty. Part of the pre-commit gate.
+
+### Fixed
+- **`--opt=value` completed nothing in bash.** `=` is in the default
+  `COMP_WORDBREAKS`, so bash delivers `--target=lin` as the three words
+  `--target`, `=`, `lin`; the scripts tested `case "$cur" in --target=*)`, which
+  therefore never matched, and TAB fell through to listing files.
+- **`caustic-mk completions <shell>` emitted a snapshot.** It wrote the current
+  manifest's target and script names into the script as a literal list — so the
+  copy you installed described one checkout and named nothing that existed in any
+  other. It now prints the shipped script, which reads the project at completion
+  time, and no longer needs a `Causticfile` to run.
+
 ## [v0.1.4](https://github.com/Caua726/Caustic/releases/tag/v0.1.4) — 2026-07-26
 
 Correctness. Full notes: [`docs/releases/v0.1.4.md`](docs/releases/v0.1.4.md).

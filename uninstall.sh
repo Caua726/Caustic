@@ -63,8 +63,12 @@ done
 run rm -f "$MANIFEST"
 
 # Only remove the directories if they are now empty — a shared prefix keeps
-# whatever else lives there.
-for d in "$PREFIX/lib/caustic" "$PREFIX/bin" "$PREFIX/lib"; do
+# whatever else lives there. The completion directories come first: they are
+# the deepest, and rmdir only takes an empty one.
+for d in "$PREFIX/share/bash-completion/completions" "$PREFIX/share/bash-completion" \
+         "$PREFIX/share/zsh/site-functions" "$PREFIX/share/zsh" \
+         "$PREFIX/share/caustic" "$PREFIX/share" \
+         "$PREFIX/lib/caustic" "$PREFIX/bin" "$PREFIX/lib"; do
     [ -d "$d" ] || continue
     if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then run rmdir "$d"; fi
 done
