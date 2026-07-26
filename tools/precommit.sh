@@ -224,11 +224,54 @@ CSLRC="$(runrc "$TMP/csl_use")"
 # The multi-arch container must carry one slice per architecture, each a
 # complete image — a single-arch build wrapping one slice has the same shape.
 "$CUR" -q --target=caustic "$CROSS_PROBE" -o "$TMP/fat" >/dev/null 2>&1 || die "multi-arch .cse failed to build"
-FATOUT="$TMP/fat.cse.exe"
+# --target=caustic is a pure multi-arch container: CST_ at offset 0, no PE
+# anywhere in it, so it is named ".cse". The other two names are kept because
+# an older compiler being tested here would have produced them.
+FATOUT="$TMP/fat.cse"
+[ -f "$FATOUT" ] || FATOUT="$TMP/fat.cse.exe"
 [ -f "$FATOUT" ] || FATOUT="$TMP/fat"
+[ -f "$FATOUT" ] || die "multi-arch .cse produced no output under any known name"
 NIMG=$(od -An -tu1 -j6 -N1 "$FATOUT" | tr -d ' ')
 [ "$NIMG" = "2" ] || die "multi-arch .cse declares $NIMG images, expected 2"
 ok ".csl resolves through csl_loader; container carries 2 slices"
+
+step "installer scripts"
+for f in install.sh update.sh uninstall.sh; do
+    sh -n "$ROOT/$f" || die "$f is not valid POSIX shell"
+done
+# Non-ASCII would arrive mangled on Windows PowerShell 5.1, which reads a
+# BOM-less .ps1 with the system ANSI codepage.
+for f in install.ps1 update.ps1 uninstall.ps1; do
+    if LC_ALL=C grep -qP '[^\x00-\x7F]' "$ROOT/$f" 2>/dev/null; then
+        die "$f contains non-ASCII — Windows PowerShell 5.1 will mangle it"
+    fi
+done
+if command -v pwsh >/dev/null 2>&1; then
+    # Parsing catches the syntax; the compatibility rules catch the constructs
+    # that parse here on 7 but do not exist on 5.1. Both classes of bug have
+    # shipped before.
+    ROOT="$ROOT" pwsh -NoProfile -Command '
+        $bad = 0
+        foreach ($f in @("install.ps1","update.ps1","uninstall.ps1")) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $env:ROOT $f), [ref]$null, [ref]$errs)
+            if ($errs) { $bad = 1; $errs | ForEach-Object { "  $f`:$($_.Extent.StartLineNumber): $($_.Message)" } }
+        }
+        if (Get-Module -ListAvailable PSScriptAnalyzer) {
+            $s = @{ IncludeRules = @("PSUseCompatibleSyntax")
+                    Rules = @{ PSUseCompatibleSyntax = @{ Enable = $true; TargetVersions = @("5.1","7.0") } } }
+            foreach ($f in @("install.ps1","update.ps1","uninstall.ps1")) {
+                $r = Invoke-ScriptAnalyzer -Path (Join-Path $env:ROOT $f) -Settings $s
+                if ($r) { $bad = 1; $r | ForEach-Object { "  $f`:$($_.Line): $($_.Message)" } }
+            }
+        }
+        exit $bad' \
+        || die "PowerShell installer scripts have syntax or 5.1-compatibility errors"
+    ok "install/update/uninstall parse as POSIX sh and as PowerShell 5.1 + 7"
+else
+    ok "install/update/uninstall parse as POSIX sh (pwsh absent, .ps1 checked for ASCII only)"
+fi
 
 printf "\n${G}${B}pre-commit OK${N} — toolchain builds and self-hosts correctly at -O0/-O1/-O2.\n"
 exit 0
