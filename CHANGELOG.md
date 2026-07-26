@@ -6,7 +6,9 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
-## Unreleased
+## [v0.1.5](https://github.com/Caua726/Caustic/releases/tag/v0.1.5) — 2026-07-26
+
+Shell completions. Full notes: [`docs/releases/v0.1.5.md`](docs/releases/v0.1.5.md).
 
 ### Added
 - **Shell completions for the whole toolchain**, bash and zsh: `caustic`,
