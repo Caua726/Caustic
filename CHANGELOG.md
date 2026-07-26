@@ -6,6 +6,21 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.4](https://github.com/Caua726/Caustic/releases/tag/v0.1.4) — 2026-07-26
+
+Correctness. Full notes: [`docs/releases/v0.1.4.md`](docs/releases/v0.1.4.md).
+
+### Fixed
+- **A function type's parameters were read as struct fields.** `Type.fields` is a linked list of `*Node` for a struct or enum, but a packed array of `*Type` — the parameter types — for a `TY_FN`. The AST cache read it as a node list in all three places that touch it, reinterpreting a `*Type` as a `*Node` and recursing into whatever landed where `ty` would be. `struct S { op as fn(*u8) as i64; next as *S; }` segfaults the compiler in nine lines. Only under `--cache`, because nothing else walks that field generically — so it surfaced on exactly one file out of ninety-nine, the first whose types reached a vtable-shaped struct. **Cache format 5 → 6**; stale caches invalidate themselves.
+- **A child killed by a signal was reported as a clean exit.** `std/process.wait_pid` used a bare `(status >> 8) & 255` — `WEXITSTATUS`, valid only when the child *exited*. A signal death leaves zero in the high byte, so every crash decoded to `0`. That is what kept the bug above quiet: the compiler crashed, the build system was told it succeeded, and a binary went missing in silence. New `exit_code_of` reports signal deaths as `128 + signal`.
+
+### Added
+- **`SYS_CHAN_INFO`** — how much a channel will accept right now, so a writer can ask instead of finding out by failing.
+- **Installers** — arrow-key menus on Linux and Windows, an existing install is detected, building from source is part of the same flow, and the PowerShell scripts run under 5.1 and on Linux. Prompting is now an explicit decision rather than a consequence of stdin being a terminal.
+
+### Changed
+- `--mode=pure` output is named `.cse`, not `.cse.exe`.
+
 ## [v0.1.3](https://github.com/Caua726/Caustic/releases/tag/v0.1.3) — 2026-07-25
 
 ### Added
