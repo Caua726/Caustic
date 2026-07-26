@@ -124,103 +124,71 @@ it as a preview.
 
 ### Install
 
-One line — `caustic` plus the stdlib into `~/.local`, no root:
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh
 ```
 
 ```powershell
-# Windows (PowerShell) — the native toolchain into %LOCALAPPDATA%\caustic
 irm https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 | iex
 ```
 
-Then make sure the `bin` directory is on your `PATH` — the installer says so if
-it is not.
+That is `caustic` plus the standard library, into your home directory, no root.
+Add the `bin` directory it names to your `PATH` and you are done.
 
-<details>
-<summary><b>Choosing what gets installed</b></summary>
-
-Both installers take the same three decisions, and `--custom` / `-Custom` walks
-you through them:
-
-| | Linux | Windows |
-|---|---|---|
-| **Where** | `--user` · `--system` · `--prefix=DIR` | `-Prefix DIR` · `-System` (all users, elevates) |
-| **Compiler** | `--format=elf,cse,exe` | `-Format exe,cse` |
-| **Tools** | `--tools=as,ld,mk,lsp` · `all` · `none` | `-Tools as,ld,mk` · `all` · `none` |
-| **Shared stdlib** | `--lib=so,csl,dll` · `none` | `-Lib dll,csl` · `none` |
-
-The **compiler format** is the interesting one:
-
-- `elf` / `exe` — the native binary for that OS.
-- `cse` — the universal build: *one file* carrying a native body for Linux,
-  Windows and CausticOS, on x86_64 and ARM64. It installs under its own name and
-  answers to plain `caustic` as well.
-
-The first format listed is the one `caustic` runs, so `--format=elf,cse`
-installs both and leaves the native one in charge.
+**Want to choose?** Add `--custom` and it asks — where to install, which
+compiler, which tools, which shared stdlib:
 
 ```sh
-# interactive
-curl -fsSL .../install.sh | sh -s -- --custom
-# system-wide, escalating with pkexec instead of sudo
-curl -fsSL .../install.sh | sh -s -- --system --root=pkexec
-# the universal compiler, every tool, all three stdlib flavours
-curl -fsSL .../install.sh | sh -s -- --format=cse --tools=all --lib=so,csl,dll
-# see the plan without touching anything
-./install.sh --dry-run --system --format=cse
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/install.sh | sh -s -- --custom
 ```
 
 ```powershell
-.\install.ps1 -Custom
-.\install.ps1 -System -Format exe,cse -Lib dll,csl   # all users, elevates
-.\install.ps1 -DryRun -Format cse
+iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/install.ps1 -OutFile i.ps1; .\i.ps1 -Custom
 ```
-</details>
+
+The question worth knowing about is the compiler: the normal one is a native
+binary for your system, and the other is the **universal** build — a single file
+carrying native code for Linux, Windows and CausticOS, on x86_64 and ARM64. The
+same file runs on all of them.
+
+Every answer is also a flag, if you would rather not be asked — `install.sh
+--help` lists them.
 
 ### Update
 
-Reinstalls the latest release **with the choices you made the first time** — the
-installer records them, so the flavour you picked survives the update instead of
-reverting to the defaults.
-
 ```sh
-./update.sh              # update in place
-./update.sh --check      # compare installed vs latest, change nothing
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/update.sh | sh
 ```
 
 ```powershell
-.\update.ps1
-.\update.ps1 -Check
+iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/update.ps1 -OutFile u.ps1; .\u.ps1
 ```
+
+It reinstalls the latest release the way *you* installed it — the choices you
+made the first time are remembered, so an update never quietly puts you back on
+the defaults. Add `--check` (`-Check`) to compare versions without changing
+anything.
 
 ### Uninstall
 
-Removes exactly the files the installer created — it reads the same record, so a
-shared prefix like `/usr/local` keeps everything that is not Caustic.
-
 ```sh
-./uninstall.sh                # find it and remove it
-./uninstall.sh --dry-run      # list what would go
+curl -fsSL https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.sh | sh
 ```
 
 ```powershell
-.\uninstall.ps1
-.\uninstall.ps1 -DryRun
+iwr -useb https://raw.githubusercontent.com/Caua726/Caustic/main/uninstall.ps1 -OutFile r.ps1; .\r.ps1
 ```
 
-### From source
+It removes the files it installed and nothing else, so a shared location like
+`/usr/local` keeps whatever else lives there. Add `--dry-run` (`-DryRun`) to see
+the list first.
 
-Needs an existing `caustic` to bootstrap:
+### Building it yourself
 
-```sh
-git clone --recursive https://github.com/Caua726/Caustic.git && cd Caustic
-./caustic-mk build caustic && ./caustic-mk build caustic-as && ./caustic-mk build caustic-ld
-
-# or let the installer build and install it for you
-./install.sh --from-source
-```
+Pick **build from source** when the installer asks, and it clones and builds
+before installing — no separate steps, and the same choices apply. Caustic is
+written in itself, so the installer takes a seed compiler from your `PATH` or
+from the last release.
 
 ### Compile and run
 

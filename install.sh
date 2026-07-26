@@ -57,9 +57,10 @@ has() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 MODE="default"
 PREFIX=""
 ROOT_METHOD="auto"
-FORMATS="elf"
-TOOLS="none"
-LIBS="so"
+FORMATS="elf"; SET_FORMAT=0
+TOOLS="none";  SET_TOOLS=0
+LIBS="so";     SET_LIBS=0
+REINSTALL=""
 WITH_SRC=1
 DRY=0
 FROM_SRC=0
@@ -72,9 +73,10 @@ for arg in "$@"; do
         --user)       PREFIX="$HOME/.local" ;;
         --prefix=*)   PREFIX="${arg#*=}" ;;
         --root=*)     ROOT_METHOD="${arg#*=}" ;;
-        --format=*)   FORMATS="${arg#*=}" ;;
-        --tools=*)    TOOLS="${arg#*=}" ;;
-        --lib=*|--libs=*) LIBS="${arg#*=}" ;;
+        --format=*)   FORMATS="${arg#*=}"; SET_FORMAT=1 ;;
+        --tools=*)    TOOLS="${arg#*=}"; SET_TOOLS=1 ;;
+        --lib=*|--libs=*) LIBS="${arg#*=}"; SET_LIBS=1 ;;
+        --reinstall|--force) REINSTALL=yes ;;
         --no-source)  WITH_SRC=0 ;;
         --source)     WITH_SRC=1 ;;
         --dry-run)    DRY=1 ;;
@@ -97,6 +99,13 @@ done
 if [ "$MODE" = "custom" ] && [ -e /dev/tty ]; then
     ask() { printf "%s" "$1" >/dev/tty; read REPLY </dev/tty || REPLY=""; }
     echo "=== Caustic custom install ==="
+    ask "Source — [1] latest release (fast)  [2] build from source (needs git; slower)  (default 1): "
+    case "$REPLY" in 2) FROM_SRC=1 ;; *) FROM_SRC=0 ;; esac
+    if [ "$FROM_SRC" = 1 ]; then
+        ask "  branch or tag (default main): "
+        [ -n "$REPLY" ] && REF="$REPLY"
+    fi
+
     ask "Prefix — [1] \$HOME/.local  [2] /usr/local  [3] custom  (default 1): "
     case "$REPLY" in 2) PREFIX="/usr/local" ;; 3) ask "  path: "; PREFIX="$REPLY" ;; *) PREFIX="$HOME/.local" ;; esac
 
@@ -153,6 +162,37 @@ if [ "$(id -u)" -ne 0 ]; then
     fi
 fi
 BIN_DIR="$PREFIX/bin"; LIB_DIR="$PREFIX/lib/caustic"; STD_DIR="$LIB_DIR/std"
+
+# --- already installed? ---
+# Re-running the one-liner used to overwrite an existing install with the
+# defaults, quietly discarding whichever compiler and libraries had been chosen.
+# Now the recorded choices carry over unless this run names its own, and an
+# interactive session is asked first.
+EXISTING="$LIB_DIR/install-manifest"
+if [ -f "$EXISTING" ]; then
+    HAVE=""
+    [ -x "$BIN_DIR/caustic" ] && HAVE=$("$BIN_DIR/caustic" --version 2>/dev/null | head -1 | awk '{print $2}')
+    E_FORMAT=$(sed -n 's/^format=//p' "$EXISTING")
+    E_TOOLS=$(sed -n 's/^tools=//p' "$EXISTING")
+    E_LIBS=$(sed -n 's/^lib=//p' "$EXISTING")
+    echo "caustic ${HAVE:-(unknown version)} is already installed at $PREFIX"
+    echo "  compiler: $E_FORMAT   tools: $E_TOOLS   stdlib: $E_LIBS"
+
+    # Anything this run did not name keeps what is already there.
+    [ "$SET_FORMAT" = 0 ] && [ -n "$E_FORMAT" ] && FORMATS="$E_FORMAT"
+    [ "$SET_TOOLS" = 0 ]  && [ -n "$E_TOOLS" ]  && TOOLS="$E_TOOLS"
+    [ "$SET_LIBS" = 0 ]   && [ -n "$E_LIBS" ]   && LIBS="$E_LIBS"
+    [ "$TOOLS" = "none" ] && TOOLS=""
+    [ "$LIBS" = "none" ] && LIBS=""
+
+    # /dev/tty can exist and still not be openable (cron, a container, a pipe
+    # with no controlling terminal), so try it rather than test for it.
+    if [ -z "$REINSTALL" ] && [ "$MODE" != "custom" ] && { : </dev/tty; } 2>/dev/null; then
+        printf "Reinstall it, keeping these choices? [Y/n] " >/dev/tty
+        read REPLY </dev/tty || REPLY=""
+        case "$REPLY" in [Nn]*) echo "nothing done — use update.sh to move to the latest release"; exit 0 ;; esac
+    fi
+fi
 
 # pkexec drops the environment and runs from /, so a relative path or a $HOME
 # reference would resolve differently than intended. Everything below is passed

@@ -28,6 +28,12 @@
 #   -NoSource              skip the stdlib .cst sources (they are what you
 #                          compile against; only skip if you know why)
 #
+# FROM SOURCE
+#   -FromSource [-Ref BRANCH]
+#                          clone and build instead of downloading the release.
+#                          Needs git; the compiler is written in itself, so a
+#                          seed is taken from PATH or from the latest release.
+#
 # OTHER
 #   -DryRun                print what would happen, touch nothing
 #
@@ -45,6 +51,9 @@ param(
     [switch]$System,
     [switch]$NoPath,
     [switch]$NoSource,
+    [switch]$FromSource,
+    [string]$Ref,
+    [switch]$Reinstall,
     [switch]$DryRun,
     [switch]$Custom
 )
@@ -67,6 +76,8 @@ if (-not $Prefix) {
 if (-not $Format) { $Format = if ($env:CAUSTIC_FORMAT) { $env:CAUSTIC_FORMAT } else { "exe" } }
 if (-not $Tools)  { $Tools  = if ($env:CAUSTIC_TOOLS)  { $env:CAUSTIC_TOOLS }  else { "all" } }
 if (-not $Lib)    { $Lib    = if ($env:CAUSTIC_LIB)    { $env:CAUSTIC_LIB }    else { "dll" } }
+if (-not $Ref)    { $Ref    = if ($env:CAUSTIC_REF)    { $env:CAUSTIC_REF }    else { "main" } }
+if (-not $FromSource) { $FromSource = ($env:CAUSTIC_FROMSOURCE -eq "1") }
 if (-not $NoPath)   { $NoPath   = ($env:CAUSTIC_NOPATH -eq "1") }
 if (-not $NoSource) { $NoSource = ($env:CAUSTIC_NOSOURCE -eq "1") }
 
@@ -104,6 +115,10 @@ if ($Custom) {
         if ([string]::IsNullOrWhiteSpace($r)) { return $def } else { return $r }
     }
     Write-Host "=== Caustic custom install ==="
+    switch (Ask "Source - [1] latest release (fast)  [2] build from source (needs git; slower) (default 1)" "1") {
+        "2" { $FromSource = $true; $Ref = Ask "  branch or tag (default main)" "main" }
+        default { $FromSource = $false }
+    }
     switch (Ask "Scope - [1] this user (%LOCALAPPDATA%)  [2] every user (%ProgramFiles%, needs admin) (default 1)" "1") {
         "2" { $System = $true; $Prefix = Join-Path $env:ProgramFiles "caustic" }
         default { $System = $false }
@@ -142,6 +157,30 @@ $Primary = $Formats[0]
 $Bin    = Join-Path $Prefix "bin"
 $LibDir = Join-Path $Prefix "lib\caustic"
 
+# --- already installed? ---
+# Re-running the one-liner used to overwrite an existing install with the
+# defaults, quietly discarding whichever compiler and libraries had been chosen.
+# The recorded choices carry over unless this run named its own.
+$existing = Join-Path $LibDir "install-manifest"
+if (Test-Path $existing) {
+    $el = Get-Content $existing
+    function Old([string]$k) { ($el | Where-Object { $_ -like "$k=*" } | Select-Object -First 1) -replace "^$k=", "" }
+    $have = $null
+    $exe = Join-Path $Bin "caustic.exe"
+    if (Test-Path $exe) { $have = (& $exe --version 2>$null | Select-Object -First 1) -replace '^caustic\s+', '' }
+    Write-Host "caustic $(if ($have) { $have } else { '(unknown version)' }) is already installed at $Prefix"
+    Write-Host "  compiler: $(Old 'format')   tools: $(Old 'tools')   stdlib: $(Old 'lib')"
+
+    if (-not $PSBoundParameters.ContainsKey('Format') -and (Old 'format')) { $Formats  = @((Old 'format') -split ',' | Where-Object { $_ }) ; $Primary = $Formats[0] }
+    if (-not $PSBoundParameters.ContainsKey('Tools')  -and (Old 'tools') -ne 'none') { $ToolList = @((Old 'tools') -split ',' | Where-Object { $_ }) }
+    if (-not $PSBoundParameters.ContainsKey('Lib')    -and (Old 'lib')   -ne 'none') { $LibList  = @((Old 'lib')   -split ',' | Where-Object { $_ }) }
+
+    if (-not $Reinstall -and -not $Custom -and -not $DryRun -and [Environment]::UserInteractive) {
+        $a = Read-Host "Reinstall it, keeping these choices? [Y/n]"
+        if ($a -match '^[Nn]') { Write-Host "nothing done - use update.ps1 to move to the latest release"; exit 0 }
+    }
+}
+
 Write-Host "install plan"
 Write-Host "  prefix:   $Prefix$(if ($System) { '  (all users, elevated)' })"
 Write-Host "  compiler: $($Formats -join ',')   (caustic.exe -> $Primary)"
@@ -171,7 +210,42 @@ try {
     # .dll, so it is fetched unless the install is a bare universal compiler.
     $src = $null
     $needZip = ($Primary -eq "exe") -or $ToolList -or ("dll" -in $LibList) -or (-not $NoSource)
-    if ($needZip) {
+    if ($FromSource) {
+        # Caustic compiles itself, so building it needs a compiler to start
+        # from: one already on PATH, or the released one downloaded to bootstrap.
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "-FromSource needs git on PATH" }
+        $work = Join-Path $tmp "src"
+        Write-Host "cloning $Repo ($Ref) ..."
+        & git clone --depth 1 --branch $Ref --recurse-submodules "https://github.com/$Repo.git" $work 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "clone failed" }
+
+        $seed = $null
+        if (Get-Command caustic-mk -ErrorAction SilentlyContinue) { $seed = Split-Path (Get-Command caustic-mk).Source }
+        else {
+            Write-Host "  no seed compiler - fetching the release to bootstrap with ..."
+            Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest/download/$Zip" `
+                              -OutFile (Join-Path $tmp $Zip) -UseBasicParsing
+            Expand-Archive -Path (Join-Path $tmp $Zip) -DestinationPath (Join-Path $tmp "seed") -Force
+            $seed = Join-Path $tmp "seed\caustic-x86_64-windows\bin"
+        }
+        $env:PATH = "$seed;$env:PATH"
+
+        Push-Location $work
+        try {
+            foreach ($t in @("caustic","caustic-as","caustic-ld","caustic-mk")) {
+                Write-Host "  building $t"
+                & caustic-mk build $t 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "build of $t failed" }
+            }
+            Write-Host "  packaging"
+            & caustic-mk run dist-windows 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "windows packaging failed" }
+        } finally { Pop-Location }
+
+        Expand-Archive -Path (Join-Path $work $Zip) -DestinationPath (Join-Path $tmp "built") -Force
+        $src = Join-Path $tmp "built\caustic-x86_64-windows"
+    }
+    elseif ($needZip) {
         Write-Host "downloading $Zip ..."
         Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest/download/$Zip" `
                           -OutFile (Join-Path $tmp $Zip) -UseBasicParsing
