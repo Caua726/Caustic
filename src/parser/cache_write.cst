@@ -9,7 +9,11 @@ use "ast.cst" as ast;
 
 let is i32 as MAGIC   with imut = 1128354883; // 0x43415354 = "CAST"
 let is i32 as MAGIC_CSTI with imut = 1230263107; // 0x49545343 = "CSTI" (interface image)
-let is i32 as VERSION with imut = 5;
+// v6: a TY_FN keeps its parameter TYPES in `fields`, so offset 24 of a type
+// record now holds a GA-table start index for that kind instead of a node
+// index. A v5 image read as v6 would resolve parameter types against the node
+// table and hand back nonsense, so this bump is mandatory, not cosmetic.
+let is i32 as VERSION with imut = 6;
 
 // Serialized sizes per entry (v3 adds generic side-tables + is_imut/base_name;
 // v4 adds only_start/only_count for `use ... only ...` submodule filters)
@@ -246,12 +250,31 @@ fn collect_type(t as *ast.Type) as void {
     register_type(t);
     // Recurse into base type (for ptr, array)
     collect_type(t.base);
-    // Collect field nodes (struct/enum fields are a linked list via *u8 cast)
+    // `fields` means two different things depending on the kind, and reading it
+    // the wrong way is not a wrong answer — it is a wild pointer:
+    //
+    //   struct / enum  ->  linked list of *Node, cast through *u8
+    //   TY_FN          ->  PACKED ARRAY OF *Type, the parameter types
+    //                      (src/parser/type.cst:92, src/semantic/walk.cst:1539)
+    //
+    // Walking a TY_FN's parameter array as a node list reinterprets a *Type as a
+    // *Node, reads whatever happens to sit where `ty` / `return_type` would be,
+    // and recurses into it. `struct S { op as fn(*u8) as i64; next as *S; }` was
+    // enough to segfault the compiler — but only under --cache, because nothing
+    // else in the pipeline walks this field generically.
     if (t.field_count > 0 && cast(i64, t.fields) != 0) {
-        let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
-        while (cast(i64, f) != 0) {
-            collect_node(f);
-            f = f.next;
+        if (t.kind == ast.TY_FN) {
+            let is i32 as pi with mut = 0;
+            while (pi < t.field_count) {
+                collect_type(ast.ga_get(t.fields, pi));
+                pi = pi + 1;
+            }
+        } else {
+            let is *ast.Node as f with mut = cast(*ast.Node, t.fields);
+            while (cast(i64, f) != 0) {
+                collect_node(f);
+                f = f.next;
+            }
         }
     }
     // Collect generic args (array of *Type)
@@ -358,9 +381,23 @@ fn serialize_type(buf as *u8, off as i32, t as *ast.Type) as void {
     write_i32(b, 16, t.name_len);
     write_i32(b, 20, t.size);
 
-    // fields_idx: index of first field node (linked list head)
+    // Offset 24 carries whichever of the two `fields` meanings this kind uses,
+    // and `kind` at offset 0 says which — so the reader can never guess wrong:
+    //
+    //   TY_FN  ->  start index into the GA table, holding field_count type
+    //              indices (the parameter types)
+    //   else   ->  index of the first field NODE (linked-list head)
     if (t.field_count > 0 && cast(i64, t.fields) != 0) {
-        write_i32(b, 24, node_to_idx(cast(*ast.Node, t.fields)));
+        if (t.kind == ast.TY_FN) {
+            write_i32(b, 24, ga_count);
+            let is i32 as pi with mut = 0;
+            while (pi < t.field_count) {
+                ga_tab_add(type_to_idx(ast.ga_get(t.fields, pi)));
+                pi = pi + 1;
+            }
+        } else {
+            write_i32(b, 24, node_to_idx(cast(*ast.Node, t.fields)));
+        }
     } else {
         write_i32(b, 24, 0 - 1);
     }

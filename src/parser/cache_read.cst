@@ -9,7 +9,11 @@ use "ast.cst" as ast;
 
 let is i32 as MAGIC   with imut = 1128354883; // 0x43415354 = "CAST"
 let is i32 as MAGIC_CSTI with imut = 1230263107; // 0x49545343 = "CSTI" (interface image)
-let is i32 as VERSION with imut = 5;
+// v6: a TY_FN keeps its parameter TYPES in `fields`, so offset 24 of a type
+// record now holds a GA-table start index for that kind instead of a node
+// index. A v5 image read as v6 would resolve parameter types against the node
+// table and hand back nonsense, so this bump is mandatory, not cosmetic.
+let is i32 as VERSION with imut = 6;
 
 // Serialized sizes per entry (v3 adds generic side-tables + is_imut/base_name;
 // v4 adds only_start/only_count for `use ... only ...` submodule filters)
@@ -197,14 +201,33 @@ fn deserialize_node(src as *u8, off as i32, n as *ast.Node, strtab as *u8,
 // ============================================================
 
 fn fixup_type_fields(type_src as *u8, types_base as *u8, nodes_base as *u8,
-                     tc as i32) as void {
+                     ga_base as *u8, tc as i32) as void {
     let is i32 as i with mut = 0;
     while (i < tc) {
         let is i32 as foff = i * SER_TYPE_SIZE + 24;
         let is i32 as fields_idx = read_i32(type_src, foff);
         let is *ast.Type as t = idx_to_type(types_base, i);
         if (fields_idx >= 0) {
-            t.fields = cast(*u8, idx_to_node(nodes_base, fields_idx));
+            // `fields` carries the parameter TYPES for a TY_FN and a field NODE
+            // list for everything else — see serialize_type. The kind decides,
+            // so the two can share offset 24 without ambiguity.
+            if (t.kind == ast.TY_FN) {
+                let is i32 as pc = read_i32(type_src, i * SER_TYPE_SIZE + 28);
+                if (pc > 0) {
+                    let is *u8 as pbuf = ast.ga_alloc(pc);
+                    let is i32 as pk with mut = 0;
+                    while (pk < pc) {
+                        let is i32 as pidx = read_i32(ga_base, (fields_idx + pk) * 4);
+                        ast.ga_set(pbuf, pk, ast.canon_type(idx_to_type(types_base, pidx)));
+                        pk = pk + 1;
+                    }
+                    t.fields = pbuf;
+                } else {
+                    t.fields = cast(*u8, 0);
+                }
+            } else {
+                t.fields = cast(*u8, idx_to_node(nodes_base, fields_idx));
+            }
         } else {
             t.fields = cast(*u8, 0);
         }
@@ -418,7 +441,7 @@ fn read_image(path as *u8, expected_hash as i64, expect_magic as i32, check_hash
     }
 
     // Second pass: fixup type.fields pointers (needs nodes)
-    fixup_type_fields(type_src, types_base, nodes_base, tc);
+    fixup_type_fields(type_src, types_base, nodes_base, ga_base, tc);
 
     // Second pass (v3): rebuild packed generic arrays from the GP/GA side-tables.
     fixup_generics(type_src, node_src, gp_base, ga_base, types_base, nodes_base, strtab, tc, nc);
