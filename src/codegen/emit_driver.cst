@@ -13,11 +13,18 @@ use "emit_output.cst" as eo;
 use "emit.cst" as e;
 use "emit_inst.cst" as ei;
 use "target.cst" as tgt;
+use "dynsyms.cst" as dyns;
 
-// Dynamic-stdlib mode (-lcaustic): functions whose mangled name starts with
-// "_std_" are provided by libcaustic.so at runtime, so we DON'T emit their
-// bodies — the call sites become undefined externals that the linker resolves
-// dynamically (NEEDED libcaustic.so). User code is emitted normally.
+// Dynamic-stdlib mode (-lcaustic on an ELF/PE target): functions whose mangled
+// name starts with "_std_" are provided by libcaustic.so at runtime, so we
+// DON'T emit their bodies — the call sites become undefined externals that the
+// linker resolves dynamically (NEEDED libcaustic.so). User code is emitted
+// normally.
+//
+// The prefix is a FALLBACK for the platforms whose libraries we cannot read: an
+// .so's exports are the system loader's business. Where a .csl was actually
+// read (the CausticOS target), dynsyms answers instead and this prefix is never
+// consulted — see _is_dyn_extern.
 let is i32 as g_dyn_stdlib with mut = 0;
 fn set_dyn_stdlib(v as i32) as void { g_dyn_stdlib = v; }
 
@@ -60,6 +67,22 @@ fn _is_dyn_extern(f as *d.IRFunction) as i32 {
     // in another .o), so don't emit their bodies — call sites stay undefined
     // and the linker resolves them.
     if (tgt.module_only_get() == 1 && _belongs_to_target_module(f) == 0) { return 1; }
+
+    // A library we READ answers for itself, and it is the only authority worth
+    // having: it says which symbols it exports, so a symbol it does not export
+    // gets its body emitted here even if the name looks like somebody else's.
+    // This is also the ONLY rule that works with more than one library — the
+    // prefix below cannot say WHICH of them a symbol came from.
+    //
+    // Note the exclusivity: once any .csl is registered, the prefix rule is
+    // skipped entirely. Applying both would externalize a _std_* symbol that no
+    // registered library actually exports, and the failure would surface as an
+    // unresolvable import at load time rather than as a missing body here.
+    if (dyns.dynsyms_count() > 0) {
+        if (dyns.dynsyms_lookup(f.asm_name_ptr, cast(i64, f.asm_name_len)) >= 0) { return 1; }
+        return 0;
+    }
+
     if (g_dyn_stdlib == 0) { return 0; }
     if (f.asm_name_len < 5) { return 0; }
     let is *u8 as n = f.asm_name_ptr;

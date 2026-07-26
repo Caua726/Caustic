@@ -15,6 +15,7 @@ use "ir/opt.cst" as iropt;
 use "ir/debug.cst" as irdebug;
 use "codegen/emit_output.cst" as cg;
 use "codegen/backend.cst" as cgd;
+use "codegen/dynsyms.cst" as dyns;
 use "codegen/peephole.cst" as ph;
 use "codegen/target.cst" as tgt;
 use "interface.cst" as iface;
@@ -61,6 +62,102 @@ fn str_eq(a as *u8, alen as i32, b as *u8, blen as i32) as i32 {
 
 fn starts_with_dash_l(s as *u8) as i32 {
     if (s[0] == 45 && s[1] == 108 && s[2] != 0) { return 1; }
+    return 0;
+}
+
+// -L<dir>. 76 = 'L', distinct from the 108 = 'l' above, so the two branches
+// cannot be confused whichever order they are tested in.
+fn starts_with_dash_L(s as *u8) as i32 {
+    if (s[0] == 45 && s[1] == 76 && s[2] != 0) { return 1; }
+    return 0;
+}
+
+fn _cstrlen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Build "<dir>/lib<name>.csl", or just "lib<name>.csl" when dir is 0 — which is
+// also the name the loader resolves at run time, so the caller uses the dirless
+// form for what it records and the full one for what it opens.
+fn _csl_path(dir as *u8, name as *u8) as *u8 {
+    let is i64 as dl with mut = 0;
+    if (cast(i64, dir) != 0) { dl = _cstrlen(dir); }
+    let is i64 as nl = _cstrlen(name);
+    let is *u8 as p = ird.opt_alloc(dl + nl + 10);
+    let is i64 as o with mut = 0;
+    if (dl > 0) {
+        mem.memcpy(p, dir, dl);
+        o = dl;
+        p[o] = cast(u8, 47);            // '/'
+        o = o + 1;
+    }
+    mem.memcpy(cast(*u8, cast(i64, p) + o), "lib", 3);   o = o + 3;
+    mem.memcpy(cast(*u8, cast(i64, p) + o), name, nl);   o = o + nl;
+    mem.memcpy(cast(*u8, cast(i64, p) + o), ".csl", 4);  o = o + 4;
+    p[o] = cast(u8, 0);
+    return p;
+}
+
+// register_csl_libs — resolve every -l<name> to a lib<name>.csl and read its
+// export table, so codegen can tell which bodies not to emit and the linker
+// which library each import belongs to.
+//
+// This runs AFTER argument parsing rather than inside it, and that is not a
+// style choice: --target may appear after the -l flags on the command line, so
+// mid-loop we do not yet know whether -lfoo names a .csl we can read or an .so
+// the system loader will find. Only object_format 3 (CausticOS) has a library
+// we are allowed to open.
+//
+// A -l naming a file that is not there is an ERROR here. The alternative —
+// carry on and let every symbol resolve statically — produces a program that
+// links, runs, and silently contains the copy the flag asked to avoid.
+fn register_csl_libs() as i32 {
+    let is *tgt.Target as t = tgt.target_get();
+    if (t.object_format != 3) { return 0; }
+    if (g_lib_count == 0) { return 0; }
+    let is i64 as arch = cast(i64, t.arch);
+    let is i32 as li with mut = 0;
+    while (li < g_lib_count) {
+        let is *u8 as nm = cast(*u8, g_lib_names[li]);
+        let is *u8 as found with mut = cast(*u8, 0);
+        let is i32 as di with mut = 0;
+        while (di < g_libdir_count) {
+            if (cast(i64, found) == 0) {
+                let is *u8 as cand = _csl_path(cast(*u8, g_libdirs[di]), nm);
+                let is i64 as fd = io._open_read(cand);
+                if (fd >= 0) { io._close_fd(fd); found = cand; }
+            }
+            di = di + 1;
+        }
+        if (cast(i64, found) == 0) {
+            let is *u8 as cwdcand = _csl_path(cast(*u8, 0), nm);
+            let is i64 as fd2 = io._open_read(cwdcand);
+            if (fd2 >= 0) { io._close_fd(fd2); found = cwdcand; }
+        }
+        if (cast(i64, found) == 0) {
+            io.write_str(io.STDERR, "error: -l");
+            io.write_str(io.STDERR, nm);
+            io.write_str(io.STDERR, ": no lib");
+            io.write_str(io.STDERR, nm);
+            io.write_str(io.STDERR, ".csl in any -L directory or the working directory\n");
+            return 1;
+        }
+        // What gets recorded is the bare file name: the run-time loader looks
+        // it up on the target's own filesystem, where the host's -L path means
+        // nothing.
+        let is i64 as rc = dyns.dynsyms_add(found, _csl_path(cast(*u8, 0), nm), arch);
+        if (rc < 0) {
+            io.write_str(io.STDERR, "error: ");
+            io.write_str(io.STDERR, found);
+            io.write_str(io.STDERR, ": not a usable .csl (rc=");
+            io.write_int(io.STDERR, rc);
+            io.write_str(io.STDERR, ")\n");
+            return 1;
+        }
+        li = li + 1;
+    }
     return 0;
 }
 
@@ -191,6 +288,11 @@ let is i32 as IR_CACHE_ENABLED with imut = 0;
 let is i64 as g_max_ram with mut = 0;
 let is [32]i64 as g_lib_names with mut;
 let is i32 as g_lib_count with mut = 0;
+// -L<dir>: where to look for the lib<name>.csl that a -l<name> names. Only the
+// CausticOS target reads its libraries at compile time — an .so or .dll is the
+// system loader's to find, not ours — so this is unused on the other targets.
+let is [8]i64 as g_libdirs with mut;
+let is i32 as g_libdir_count with mut = 0;
 let is i32 as g_opt_level with mut = 0;
 let is i32 as g_debug_ir with mut = 0;
 let is i32 as g_debug_parser with mut = 0;
@@ -228,6 +330,11 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
                 let is i64 as mb = parse_int_arg(cast(*u8, argv_arr[ai]));
                 if (mb == 0) { g_max_ram = 0; }
                 else { g_max_ram = mb * 1048576; }
+            }
+        } else if (starts_with_dash_L(arg) == 1) {
+            if (g_libdir_count < 8) {
+                g_libdirs[g_libdir_count] = cast(i64, cast(*u8, cast(i64, arg) + 2));
+                g_libdir_count = g_libdir_count + 1;
             }
         } else if (starts_with_dash_l(arg) == 1) {
             if (g_lib_count < 32) {
@@ -406,6 +513,7 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         io.write_str(io.STDERR, "Error: no input file\n");
         return 1;
     }
+    if (register_csl_libs() != 0) { return 1; }
     mem.core.set_mem_limit(g_max_ram);
     return 0;
 }

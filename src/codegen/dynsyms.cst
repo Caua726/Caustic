@@ -1,0 +1,73 @@
+// =======================================================
+// dynsyms.cst — which symbols come from a shared library, and from WHICH one.
+//
+// The compiler has to decide, per function, whether to emit its body or leave
+// the call undefined for the loader to resolve. With one library that question
+// had a shortcut: -lcaustic set a flag and every symbol starting with "_std_"
+// was assumed to live there. The prefix was never the real rule — it was a
+// stand-in for "the only library there is" — and it cannot answer the question
+// at all once a program links against several.
+//
+// The real rule is the one each library states in its own export table, so
+// that is what gets read: -l<name> on the CausticOS target opens lib<name>.csl
+// and registers everything it exports. A symbol is external iff some library
+// exports it, and the index recorded here is the same index the linker writes
+// into the .cse import table, so the loader knows where to look.
+//
+// Registration happens once, after argument parsing (the target may be named
+// after the -l flags on the command line, so this cannot run while parsing).
+// =======================================================
+
+use "../../caustic-linker/readers/csl_reader.cst" as cslr;
+
+let is i64 as DYN_MAX_LIBS with imut = 8;
+
+let is [8]cslr.CslLib as _libs;
+let is [8]i64 as _lib_names;        // *u8, the "libfoo.csl" the loader will open
+let is i64 as _lib_count with mut = 0;
+
+fn dynsyms_count() as i64 { return _lib_count; }
+
+fn dynsyms_lib_name(i as i64) as *u8 {
+    if (i < 0 || i >= _lib_count) { return cast(*u8, 0); }
+    return cast(*u8, _lib_names[i]);
+}
+
+// dynsyms_add — read `path` as a .csl and register its exports under `name`
+// (the file name the loader will resolve at run time). Returns the library
+// index, or a negative csl_read code.
+fn dynsyms_add(path as *u8, name as *u8, arch as i64) as i64 {
+    if (_lib_count >= DYN_MAX_LIBS) { return 0 - 7; }
+    let is i32 as rc = cslr.csl_read(path, arch, &_libs[_lib_count]);
+    if (rc != 0) { return cast(i64, rc); }
+    _lib_names[_lib_count] = cast(i64, name);
+    _lib_count = _lib_count + 1;
+    return _lib_count - 1;
+}
+
+// dynsyms_lookup — the index of the library exporting `name`, or -1.
+//
+// First match wins, in the order the -l flags were given: the same rule a
+// linker uses everywhere, and the only one that makes a duplicate symbol
+// resolvable rather than an error the user cannot act on.
+fn dynsyms_lookup(name as *u8, name_len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < _lib_count) {
+        if (cslr.csl_find(&_libs[i], name, name_len) >= 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The vaddr `name` sits at inside library `lib_idx`, or -1. The linker needs
+// this to decide nothing at all — the loader relocates — but the map file and
+// any diagnostics are far more useful with it than without.
+fn dynsyms_vaddr(lib_idx as i64, name as *u8, name_len as i64) as i64 {
+    if (lib_idx < 0 || lib_idx >= _lib_count) { return 0 - 1; }
+    return cslr.csl_find(&_libs[lib_idx], name, name_len);
+}
+
+fn dynsyms_exports(lib_idx as i64) as i64 {
+    if (lib_idx < 0 || lib_idx >= _lib_count) { return 0; }
+    return _libs[lib_idx].export_count;
+}
