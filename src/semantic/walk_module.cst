@@ -27,6 +27,85 @@ fn is_in_only_list(name_ptr as *u8, name_len as i32, only_names as *u8, only_cou
     return 0;
 }
 
+// Append one SubModule to `target` for each nested `use` in `body` that passes
+// `only`. Pass only_count == 0 to build the COMPLETE list.
+fn build_submodules(target as *d.Module, body as *u8, only_names as *u8, only_count as i32) as void {
+    let is *u8 as prev_only = current_only_names;
+    let is i32 as prev_oc = current_only_count;
+    current_only_names = only_names;
+    current_only_count = only_count;
+    let is *ast.Node as child with mut = cast(*ast.Node, body);
+    while (cast(i64, child) != 0) {
+        if (child.kind == ast.NK_USE && child.member_len > 0) {
+            if (is_in_only_list(child.member_ptr, child.member_len, current_only_names, current_only_count) == 1) {
+                let is i32 as crl with mut = 0;
+                let is *u8 as crp = mod.strip_quotes(child.name_ptr, child.name_len, &crl);
+                let is i32 as cnl with mut = 0;
+                let is *u8 as cn = sc.resolve_module_path(crp, crl, &cnl);
+                let is *u8 as cp = sc.get_mod_prefix(cn, cnl);
+                let is i32 as cpl = sc.get_mod_prefix_len(cn, cnl);
+                // find_module only ever returns the COMPLETE record — alias
+                // records are kept out of the prefix hash for exactly this.
+                let is *d.Module as cm = mod.find_module(cp, cpl);
+                if (cast(i64, cm) != 0) {
+                    let is *d.SubModule as sm = d.new_submodule();
+                    sm.alias_ptr = d.str_dup(child.member_ptr, child.member_len);
+                    sm.alias_len = child.member_len;
+                    sm.module_ref = cast(*u8, cm);
+                    sm.next = target.submodules;
+                    target.submodules = cast(*u8, sm);
+                    target.submodule_count = target.submodule_count + 1;
+                }
+            }
+        }
+        child = child.next;
+    }
+    current_only_names = prev_only;
+    current_only_count = prev_oc;
+}
+
+// The record an `only` import site binds to: its own filtered view of a module
+// everybody else still sees whole. Shares the module's body, source and SCOPE
+// with the complete record — `only` narrows what the IMPORTER can reach through
+// the alias, it does not change the module's own contents.
+fn ensure_alias_module(n as *ast.Node, prefix as *u8, plen as i32) as *d.Module {
+    let is *u8 as onames = ast.nx_only_names(n);
+    let is i32 as ocount = ast.nx_only_count(n);
+    let is *d.Module as found = mod.find_alias_module(prefix, plen, onames, ocount);
+    if (cast(i64, found) != 0) { return found; }
+    let is *d.Module as base = mod.find_module(prefix, plen);
+    if (cast(i64, base) == 0) { return cast(*d.Module, 0); }
+
+    let is *d.Module as am = d.new_module();
+    am.name_ptr = d.str_dup(n.member_ptr, n.member_len);
+    am.name_len = n.member_len;
+    am.prefix_ptr = d.str_dup(prefix, plen);
+    am.prefix_len = plen;
+    am.body = base.body;
+    am.src_ptr = base.src_ptr;
+    am.src_size = base.src_size;
+    am.token_list = base.token_list;
+    am.source_dir_ptr = base.source_dir_ptr;
+    am.source_dir_len = base.source_dir_len;
+    am.only_names = onames;
+    am.only_count = ocount;
+    // Deliberately NOT _mod_ht_insert: the prefix hash must keep resolving to
+    // the complete record. An alias record inserted there would shadow it (the
+    // table prepends and find_module returns the first match), handing every
+    // later lookup a narrowed view of a module it never asked to narrow.
+    am.next = mod.module_list;
+    mod.module_list = am;
+
+    let is *u8 as old_dir = sc.current_source_dir_ptr;
+    let is i32 as old_dir_len = sc.current_source_dir_len;
+    sc.current_source_dir_ptr = base.source_dir_ptr;
+    sc.current_source_dir_len = base.source_dir_len;
+    build_submodules(am, base.body, onames, ocount);
+    sc.current_source_dir_ptr = old_dir;
+    sc.current_source_dir_len = old_dir_len;
+    return am;
+}
+
 fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
     let is i32 as raw_len with mut = 0;
     let is *u8 as raw_path with mut = cast(*u8, 0);
@@ -81,39 +160,13 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
                 sc.current_source_dir_len = mm.source_dir_len;
             }
             register_structs(body);
-            // Build submodule list from nested use statements
+            // Build the COMPLETE submodule list. This record lives in the
+            // prefix hash and is shared by every importer, so this import
+            // site's `only` must not touch it — the filter is applied to a
+            // per-site record below instead.
             let is *d.Module as parent_mm = mod.find_module(prefix, plen);
             if (cast(i64, parent_mm) != 0) {
-                let is *u8 as prev_only = current_only_names;
-                let is i32 as prev_oc = current_only_count;
-                current_only_names = ast.nx_only_names(n);
-                current_only_count = ast.nx_only_count(n);
-                let is *ast.Node as child with mut = cast(*ast.Node, body);
-                while (cast(i64, child) != 0) {
-                    if (child.kind == ast.NK_USE && child.member_len > 0) {
-                        if (is_in_only_list(child.member_ptr, child.member_len, current_only_names, current_only_count) == 1) {
-                            let is i32 as crl with mut = 0;
-                            let is *u8 as crp = mod.strip_quotes(child.name_ptr, child.name_len, &crl);
-                            let is i32 as cnl with mut = 0;
-                            let is *u8 as cn = sc.resolve_module_path(crp, crl, &cnl);
-                            let is *u8 as cp = sc.get_mod_prefix(cn, cnl);
-                            let is i32 as cpl = sc.get_mod_prefix_len(cn, cnl);
-                            let is *d.Module as cm = mod.find_module(cp, cpl);
-                            if (cast(i64, cm) != 0) {
-                                let is *d.SubModule as sm = d.new_submodule();
-                                sm.alias_ptr = d.str_dup(child.member_ptr, child.member_len);
-                                sm.alias_len = child.member_len;
-                                sm.module_ref = cast(*u8, cm);
-                                sm.next = parent_mm.submodules;
-                                parent_mm.submodules = cast(*u8, sm);
-                                parent_mm.submodule_count = parent_mm.submodule_count + 1;
-                            }
-                        }
-                    }
-                    child = child.next;
-                }
-                current_only_names = prev_only;
-                current_only_count = prev_oc;
+                build_submodules(parent_mm, body, cast(*u8, 0), 0);
             }
             // POST-order: this module is fully loaded and all its own imports +
             // submodules were recorded above → record it now, after its deps.
@@ -122,55 +175,15 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
             n.body = cast(*ast.Node, cached.body);
             sc.current_source_dir_ptr = cached.source_dir_ptr;
             sc.current_source_dir_len = cached.source_dir_len;
-            // For 'only' re-imports: build submodule list for this alias
-            if (ast.nx_only_count(n) > 0 && n.member_len > 0) {
-                // Create a new Module entry for this alias
-                let is *d.Module as mm2 = d.new_module();
-                mm2.name_ptr = d.str_dup(n.member_ptr, n.member_len);
-                mm2.name_len = n.member_len;
-                mm2.prefix_ptr = d.str_dup(prefix, plen);
-                mm2.prefix_len = plen;
-                mm2.body = cached.body;
-                mm2.src_ptr = cached.src_ptr;
-                mm2.src_size = cached.src_size;
-                mm2.token_list = cached.token_list;
-                mm2.source_dir_ptr = cached.source_dir_ptr;
-                mm2.source_dir_len = cached.source_dir_len;
-                mm2.next = mod.module_list;
-                mod.module_list = mm2;
-                mod._mod_ht_insert(mm2);
-                // Build submodule list with this import's only filter
-                let is *u8 as prev_only2 = current_only_names;
-                let is i32 as prev_oc2 = current_only_count;
-                current_only_names = ast.nx_only_names(n);
-                current_only_count = ast.nx_only_count(n);
-                let is *ast.Node as child2 with mut = cast(*ast.Node, cached.body);
-                while (cast(i64, child2) != 0) {
-                    if (child2.kind == ast.NK_USE && child2.member_len > 0) {
-                        if (is_in_only_list(child2.member_ptr, child2.member_len, current_only_names, current_only_count) == 1) {
-                            let is i32 as crl2 with mut = 0;
-                            let is *u8 as crp2 = mod.strip_quotes(child2.name_ptr, child2.name_len, &crl2);
-                            let is i32 as cnl2 with mut = 0;
-                            let is *u8 as cn2 = sc.resolve_module_path(crp2, crl2, &cnl2);
-                            let is *u8 as cp2 = sc.get_mod_prefix(cn2, cnl2);
-                            let is i32 as cpl2 = sc.get_mod_prefix_len(cn2, cnl2);
-                            let is *d.Module as cm2 = mod.find_module(cp2, cpl2);
-                            if (cast(i64, cm2) != 0) {
-                                let is *d.SubModule as sm2 = d.new_submodule();
-                                sm2.alias_ptr = d.str_dup(child2.member_ptr, child2.member_len);
-                                sm2.alias_len = child2.member_len;
-                                sm2.module_ref = cast(*u8, cm2);
-                                sm2.next = mm2.submodules;
-                                mm2.submodules = cast(*u8, sm2);
-                                mm2.submodule_count = mm2.submodule_count + 1;
-                            }
-                        }
-                    }
-                    child2 = child2.next;
-                }
-                current_only_names = prev_only2;
-                current_only_count = prev_oc2;
-            }
+        }
+        // Whether this is the first import of the module or a re-import, an
+        // `only` site binds to its own filtered record. Doing it on BOTH paths
+        // is the fix: it used to happen only on re-import, so the very first
+        // importer's filter was written straight onto the shared record and
+        // every other file inherited a module narrowed by a clause it never
+        // wrote.
+        if (ast.nx_only_count(n) > 0 && n.member_len > 0) {
+            ensure_alias_module(n, prefix, plen);
         }
         sc.current_mod_prefix_ptr = old_prefix;
         sc.current_mod_prefix_len = old_plen;
@@ -186,24 +199,34 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
         let is *d.Module as existing with mut = cast(*d.Module, 0);
 
         if (n.member_len > 0) {
-            // For 'only' imports, find by alias name (different aliases = different Modules)
+            // The binding: an `only` site gets its filtered record, keyed by
+            // (prefix, only list). Keying by ALIAS NAME — as this did — made two
+            // files that import the same module under the same name with
+            // different `only` lists share one record, so whichever the
+            // compiler reached first decided what the other could see.
             if (ast.nx_only_count(n) > 0) {
-                existing = mod.find_module_by_name(n.member_ptr, n.member_len);
+                existing = mod.find_alias_module(prefix, plen, ast.nx_only_names(n), ast.nx_only_count(n));
             } else {
                 existing = mod.find_module(prefix, plen);
             }
-            if (cast(i64, existing) != 0 && cast(i64, existing.scope) != 0) {
-                mod_scope = existing.scope;
+            // The SCOPE always comes from the complete record: one module has
+            // one set of declarations. `only` narrows what this importer can
+            // reach through the alias, not what the module itself contains.
+            let is *d.Module as scope_owner with mut = mod.find_module(prefix, plen);
+            if (cast(i64, scope_owner) == 0) { scope_owner = existing; }
+            if (cast(i64, scope_owner) != 0 && cast(i64, scope_owner.scope) != 0) {
+                mod_scope = scope_owner.scope;
             } else {
                 mod_scope = d.new_scope();
                 mod_scope.next_all = sc.all_scopes;
                 sc.all_scopes = mod_scope;
                 mod_scope.parent = sc.global_scope;
                 mod_scope.is_global = 1;
-                if (cast(i64, existing) != 0) {
-                    existing.scope = mod_scope;
+                if (cast(i64, scope_owner) != 0) {
+                    scope_owner.scope = mod_scope;
                 }
             }
+            if (cast(i64, existing) != 0) { existing.scope = mod_scope; }
             sc.current_scope = mod_scope;
         }
 
@@ -236,6 +259,16 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
             modd.next = mod.module_list;
             mod.module_list = modd;
             existing = modd;
+            // What went into the hash table is the COMPLETE record. If this site
+            // carries `only`, it binds to a filtered record layered on top —
+            // never to the one everyone else resolves through.
+            if (ast.nx_only_count(n) > 0) {
+                let is *d.Module as am = ensure_alias_module(n, prefix, plen);
+                if (cast(i64, am) != 0) {
+                    am.scope = mod_scope;
+                    existing = am;
+                }
+            }
         }
         // Gate by aliases_done — each module's aliases need to register
         // exactly once even if N modules import it.
@@ -367,20 +400,32 @@ fn register_structs(node as *u8) as void {
     }
 }
 
+// The key an alias is filed under: mangled with the importing module's prefix
+// when we are inside one, bare at the whole-program root. register_aliases (pass
+// 2) and resolve_fields (pass 3) MUST agree on it, so both go through here.
+fn alias_key(n as *ast.Node, out_len as *i32) as *u8 {
+    if (sc.current_mod_prefix_len > 0) {
+        return d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.name_ptr, n.name_len, out_len);
+    }
+    *out_len = n.name_len;
+    return n.name_ptr;
+}
+
 fn register_aliases(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_USE) {
             visit_use_module(n, 2);
         } else if (n.kind == ast.NK_TYPE_ALIAS) {
-            wt.resolve_type(cast(*u8, n.ty));
-            if (sc.current_mod_prefix_len > 0) {
-                let is i32 as mlen with mut = 0;
-                let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, n.name_ptr, n.name_len, &mlen);
-                ty.declare_type_alias(mangled, mlen, cast(*u8, n.ty));
-            } else {
-                ty.declare_type_alias(n.name_ptr, n.name_len, cast(*u8, n.ty));
-            }
+            // Publish the NAME only. The right-hand side is deliberately left
+            // unresolved: resolving here would copy the target struct's size
+            // BEFORE resolve_fields computes it, freezing the alias at zero
+            // bytes (and `fields != 0` then blocks every later re-resolution).
+            // Pass 3 resolves it in place — the table holds this same node, so
+            // the fix is visible to everyone that looks the alias up.
+            let is i32 as klen with mut = 0;
+            let is *u8 as key = alias_key(n, &klen);
+            ty.declare_type_alias(key, klen, cast(*u8, n.ty));
         }
         n = n.next;
     }
@@ -405,6 +450,16 @@ fn resolve_fields(node as *u8) as void {
             }
         } else if (n.kind == ast.NK_BLOCK && cast(i64, n.ty) != 0 && n.ty.kind == ast.TY_ENUM) {
             // Enum layout computed in declare_enum
+        } else if (n.kind == ast.NK_TYPE_ALIAS) {
+            // Now — not in pass 2 — because only here does the target have a
+            // size. `visit_use_module(n, 3)` above recursed into every import
+            // before reaching this node, so a module named on the right-hand
+            // side is already fully laid out; that also makes chained aliases
+            // (`type C = h.C` where h itself aliases) resolve in one sweep.
+            wt.resolve_type(cast(*u8, n.ty));
+            let is i32 as klen with mut = 0;
+            let is *u8 as key = alias_key(n, &klen);
+            ty.update_type_alias(key, klen, cast(*u8, n.ty));
         }
         n = n.next;
     }

@@ -113,16 +113,18 @@ fn _sock_recv(s as i64, buf as *u8, len as i64, flags as i64) as i64 {
 fn _sock_sendto(s as i64, buf as *u8, len as i64, flags as i64, to as *u8, tolen as i64) as i64 {
     if (os.current() == os.OS_LINUX)   { return linux.sendto(s, buf, len, flags, to, tolen); }
     if (os.current() == os.OS_WINDOWS) {
-        // Win has WSASendTo with WSABUF; for simplicity emulate via sendto-style
-        // call: ws2_32 export 'sendto' exists with the same signature.
-        return cast(i64, win.send(s, buf, cast(i32, len), cast(i32, flags)));
+        return cast(i64, win.sendto(s, buf, cast(i32, len), cast(i32, flags),
+                                    to, cast(i32, tolen)));
     }
     return 0 - 1;
 }
 
 fn _sock_recvfrom(s as i64, buf as *u8, len as i64, flags as i64, from as *u8, fromlen as *u32) as i64 {
     if (os.current() == os.OS_LINUX)   { return linux.recvfrom(s, buf, len, flags, from, fromlen); }
-    if (os.current() == os.OS_WINDOWS) { return cast(i64, win.recv(s, buf, cast(i32, len), cast(i32, flags))); }
+    if (os.current() == os.OS_WINDOWS) {
+        return cast(i64, win.recvfrom(s, buf, cast(i32, len), cast(i32, flags),
+                                      from, cast(*i32, fromlen)));
+    }
     return 0 - 1;
 }
 
@@ -186,6 +188,14 @@ let is i64 as INADDR_LOOPBACK  with imut = 2130706433;
 
 // MSG flags
 let is i64 as MSG_DONTWAIT with imut = 64;
+
+// A signal arrived before ANY data moved, so the call transferred nothing and
+// is meant to be retried — it is not a transfer error. Linux syscalls report it
+// as the negated errno, which is what the loops below compare against. The
+// Windows path returns SOCKET_ERROR (-1) with the code behind WSAGetLastError,
+// so this value never matches there; WSAEINTR only arises from the legacy
+// WSACancelBlockingCall, which this stdlib never issues.
+let is i64 as EINTR with imut = 4;
 
 // Backlog
 let is i64 as DEFAULT_BACKLOG with imut = 128;
@@ -311,6 +321,247 @@ fn ip4_parse(s as *u8) as i64 {
     return result;
 }
 
+// --- Section 2b: IPv6 ---
+//
+// A parallel type rather than a wider Addr. sockaddr_in6 is 28 bytes and
+// carries a scope id that has no analogue in sockaddr_in, so folding both into
+// one struct would either grow every IPv4 buffer in existing code or hide a
+// family tag behind accessors that currently just read fixed offsets. Addr
+// stays exactly what it was; code that wants v6 asks for v6.
+//
+// The cost is a doubled entry-point set (tcp_connect6, tcp_listen6, ...) and an
+// `if` in callers that must handle both families. That is the deliberate trade:
+// nothing existing changes behaviour.
+
+// AF_INET6 is one of the few socket constants the two targets disagree on.
+let is i64 as AF_INET6 with imut = (__target_is_linux * 10) + (__target_is_windows * 23);
+
+// sockaddr_in6: sin6_family(2) + sin6_port(2) + sin6_flowinfo(4)
+//             + sin6_addr(16) + sin6_scope_id(4) = 28 bytes
+let is i64 as SOCKADDR_IN6_SIZE with imut = 28;
+
+struct Addr6 {
+    data as *u8;
+}
+
+// Build an Addr6 over a 28-byte buffer. `ip` is 16 raw bytes in network order —
+// use ip6_parse to get them from text, or ip6_any / ip6_loopback.
+// Usage: let is [28]u8 as buf; let is Addr6 as a = addr6_init(&buf[0], ip, 8443);
+fn addr6_init(buf as *u8, ip as *u8, port as i64) as Addr6 {
+    mem.core.memset(buf, cast(i32, 0), 28);
+    buf[0] = cast(u8, AF_INET6 & 255);
+    buf[1] = cast(u8, (AF_INET6 >> 8) & 255);
+    // sin6_port at offset 2, network byte order
+    buf[2] = cast(u8, (port >> 8) & 255);
+    buf[3] = cast(u8, port & 255);
+    // sin6_flowinfo (offset 4) stays zero; sin6_addr at offset 8
+    if (cast(i64, ip) != 0) {
+        mem.core.memcpy(cast(*u8, cast(i64, buf) + 8), ip, 16);
+    }
+    let is Addr6 as a;
+    a.data = buf;
+    return a;
+}
+
+// The unspecified address, "::" — bind to every v6 interface.
+fn addr6_any(buf as *u8, port as i64) as Addr6 {
+    return addr6_init(buf, cast(*u8, 0), port);
+}
+
+// "::1"
+fn addr6_loopback(buf as *u8, port as i64) as Addr6 {
+    let is [16]u8 as ip;
+    mem.core.memset(&ip[0], cast(i32, 0), 16);
+    ip[15] = 1;
+    return addr6_init(buf, &ip[0], port);
+}
+
+fn addr6_port(a as Addr6) as i64 {
+    return cast(i64, a.data[2]) * 256 + cast(i64, a.data[3]);
+}
+
+// Pointer to the 16 raw address bytes inside the sockaddr — not a copy.
+fn addr6_ip(a as Addr6) as *u8 {
+    return cast(*u8, cast(i64, a.data) + 8);
+}
+
+// sin6_scope_id: the interface index a link-local address ("fe80::1%eth0") is
+// scoped to. Zero for global addresses; a link-local one will not connect
+// without it, which is the part that has no IPv4 analogue.
+fn addr6_scope(a as Addr6) as i64 {
+    let is *u8 as p = cast(*u8, cast(i64, a.data) + 24);
+    return cast(i64, p[0]) + cast(i64, p[1]) * 256 + cast(i64, p[2]) * 65536 + cast(i64, p[3]) * 16777216;
+}
+
+fn addr6_set_scope(a as Addr6, scope_id as i64) as void {
+    let is *u8 as p = cast(*u8, cast(i64, a.data) + 24);
+    p[0] = cast(u8, scope_id & 255);
+    p[1] = cast(u8, (scope_id >> 8) & 255);
+    p[2] = cast(u8, (scope_id >> 16) & 255);
+    p[3] = cast(u8, (scope_id >> 24) & 255);
+}
+
+fn _hexval(c as u8) as i64 {
+    if (c >= 48 && c <= 57)  { return cast(i64, c) - 48; }
+    if (c >= 97 && c <= 102) { return cast(i64, c) - 87; }
+    if (c >= 65 && c <= 70)  { return cast(i64, c) - 55; }
+    return 0 - 1;
+}
+
+// Parse the textual form into 16 network-order bytes at `out`. Handles all
+// three RFC 4291 shapes: eight groups, "::" zero compression, and a trailing
+// dotted-quad ("::ffff:1.2.3.4"). Returns 0, or -1 when the text is not an
+// address. `out` is untouched on failure.
+fn ip6_parse(s as *u8, out as *u8) as i64 {
+    let is [8]i64 as g;
+    let is i64 as z with mut = 0;
+    while (z < 8) { g[z] = 0; z = z + 1; }
+
+    let is i64 as gi with mut = 0;
+    let is i64 as dcolon with mut = 0 - 1;  // group index the "::" stood at
+    let is i64 as i with mut = 0;
+
+    if (s[0] == 58) {                      // leading ':'
+        if (s[1] != 58) { return 0 - 1; }  // a lone leading ':' is invalid
+        dcolon = 0;
+        i = 2;
+    }
+
+    while (s[i] != 0) {
+        if (gi >= 8) { return 0 - 1; }
+        // A '.' before the next ':' means the tail is a dotted quad, which
+        // occupies the final two groups.
+        let is i64 as j with mut = i;
+        let is i32 as is_v4 with mut = 0;
+        while (s[j] != 0 && s[j] != 58) {
+            if (s[j] == 46) { is_v4 = 1; }
+            j = j + 1;
+        }
+        if (is_v4 == 1) {
+            let is i64 as v4 = ip_parse(cast(*u8, cast(i64, s) + i));
+            if (v4 < 0) { return 0 - 1; }
+            if (gi + 2 > 8) { return 0 - 1; }
+            g[gi] = (v4 >> 16) & 65535;
+            g[gi + 1] = v4 & 65535;
+            gi = gi + 2;
+            i = j;
+        } else {
+            let is i64 as val with mut = 0;
+            let is i64 as digits with mut = 0;
+            while (s[i] != 0 && s[i] != 58) {
+                let is i64 as h = _hexval(s[i]);
+                if (h < 0) { return 0 - 1; }
+                val = val * 16 + h;
+                digits = digits + 1;
+                if (digits > 4) { return 0 - 1; }
+                i = i + 1;
+            }
+            if (digits == 0) { return 0 - 1; }
+            g[gi] = val;
+            gi = gi + 1;
+        }
+        if (s[i] == 58) {
+            if (s[i + 1] == 58) {
+                if (dcolon >= 0) { return 0 - 1; }  // only one "::" allowed
+                dcolon = gi;
+                i = i + 2;
+            } else {
+                if (s[i + 1] == 0) { return 0 - 1; }  // trailing single ':'
+                i = i + 1;
+            }
+        }
+    }
+
+    if (dcolon < 0) {
+        if (gi != 8) { return 0 - 1; }
+    } else {
+        if (gi >= 8) { return 0 - 1; }  // "::" has to stand for at least one group
+        // Slide the groups written after the "::" down to the end.
+        let is i64 as move_count = gi - dcolon;
+        let is i64 as k with mut = 0;
+        while (k < move_count) {
+            g[7 - k] = g[gi - 1 - k];
+            k = k + 1;
+        }
+        k = dcolon;
+        while (k < 8 - move_count) { g[k] = 0; k = k + 1; }
+    }
+
+    let is i64 as w with mut = 0;
+    while (w < 8) {
+        out[w * 2]     = cast(u8, (g[w] >> 8) & 255);
+        out[w * 2 + 1] = cast(u8, g[w] & 255);
+        w = w + 1;
+    }
+    return 0;
+}
+
+fn _write_hex_group(buf as *u8, offset as i64, val as i64) as i64 {
+    let is [4]u8 as digs;
+    let is i64 as n with mut = 0;
+    let is i64 as v with mut = val;
+    if (v == 0) { buf[offset] = 48; return 1; }
+    while (v > 0) {
+        let is i64 as d = v & 15;
+        if (d < 10) { digs[n] = cast(u8, d + 48); } else { digs[n] = cast(u8, d + 87); }
+        v = v >> 4;
+        n = n + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < n) { buf[offset + k] = digs[n - 1 - k]; k = k + 1; }
+    return n;
+}
+
+// Format 16 network-order bytes into `out` (needs 46 bytes) as the RFC 5952
+// canonical form: lowercase, no leading zeros, and the LONGEST run of zero
+// groups collapsed to "::" (leftmost wins on a tie, and a run of one is never
+// collapsed). Writes a null terminator. Returns the length.
+fn ip6_format(ip as *u8, out as *u8) as i64 {
+    let is [8]i64 as g;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        g[i] = cast(i64, ip[i * 2]) * 256 + cast(i64, ip[i * 2 + 1]);
+        i = i + 1;
+    }
+
+    let is i64 as best_start with mut = 0 - 1;
+    let is i64 as best_len with mut = 0;
+    let is i64 as cur_start with mut = 0 - 1;
+    let is i64 as cur_len with mut = 0;
+    i = 0;
+    while (i < 8) {
+        if (g[i] == 0) {
+            if (cur_start < 0) { cur_start = i; cur_len = 0; }
+            cur_len = cur_len + 1;
+            if (cur_len > best_len) { best_len = cur_len; best_start = cur_start; }
+        } else {
+            cur_start = 0 - 1;
+            cur_len = 0;
+        }
+        i = i + 1;
+    }
+    if (best_len < 2) { best_start = 0 - 1; }
+
+    let is i64 as n with mut = 0;
+    i = 0;
+    while (i < 8) {
+        if (best_start >= 0 && i == best_start) {
+            // Both colons, always: the run standing at the start or reaching
+            // the end still needs exactly "::", and the separator rule below
+            // then suppresses the one it would otherwise add.
+            out[n] = 58; n = n + 1;
+            out[n] = 58; n = n + 1;
+            i = best_start + best_len;
+        } else {
+            if (n > 0 && out[n - 1] != 58) { out[n] = 58; n = n + 1; }
+            n = n + _write_hex_group(out, n, g[i]);
+            i = i + 1;
+        }
+    }
+    out[n] = cast(u8, 0);
+    return n;
+}
+
 // --- Section 3: Socket creation and options ---
 
 // Create a TCP socket, returns fd or negative error
@@ -321,6 +572,15 @@ fn tcp_socket() as i64 {
 // Create a UDP socket, returns fd or negative error
 fn udp_socket() as i64 {
     return _sock_create(2, 2, 0);
+}
+
+// IPv6 counterparts. Same socket types, AF_INET6 domain.
+fn tcp_socket6() as i64 {
+    return _sock_create(AF_INET6, 1, 0);
+}
+
+fn udp_socket6() as i64 {
+    return _sock_create(AF_INET6, 2, 0);
 }
 
 // Close socket
@@ -426,21 +686,92 @@ fn tcp_connect(a as Addr) as i64 {
     return fd;
 }
 
-// Send data. Returns bytes sent or negative error.
+// --- IPv6 entry points ---
+//
+// Same shapes as the IPv4 ones above, over AF_INET6 and a 28-byte sockaddr.
+// Everything after the handshake — send/recv/send_all/recv_all/poller — is
+// family-agnostic and works on these fds unchanged.
+
+fn tcp_listen6(a as Addr6) as i64 {
+    let is i64 as fd = tcp_socket6();
+    if (fd < 0) { return fd; }
+
+    set_reuseaddr(fd);
+
+    let is i64 as r with mut = _sock_bind(fd, a.data, SOCKADDR_IN6_SIZE);
+    if (r < 0) { _sock_close(fd); return r; }
+
+    r = _sock_listen(fd, DEFAULT_BACKLOG);
+    if (r < 0) { _sock_close(fd); return r; }
+
+    return fd;
+}
+
+// Fills client_buf (28 bytes sockaddr_in6) if not null.
+fn tcp_accept6(server_fd as i64, client_buf as *u8) as i64 {
+    let is u32 as addrlen with mut = cast(u32, SOCKADDR_IN6_SIZE);
+    if (cast(i64, client_buf) != 0) {
+        return _sock_accept(server_fd, client_buf, &addrlen);
+    }
+    return _sock_accept(server_fd, cast(*u8, 0), cast(*u32, 0));
+}
+
+fn tcp_connect6(a as Addr6) as i64 {
+    let is i64 as fd = tcp_socket6();
+    if (fd < 0) { return fd; }
+
+    let is i64 as r = _sock_connect(fd, a.data, SOCKADDR_IN6_SIZE);
+    if (r < 0) { _sock_close(fd); return r; }
+
+    return fd;
+}
+
+fn udp_bind6(a as Addr6) as i64 {
+    let is i64 as fd = udp_socket6();
+    if (fd < 0) { return fd; }
+
+    let is i64 as r = _sock_bind(fd, a.data, SOCKADDR_IN6_SIZE);
+    if (r < 0) { _sock_close(fd); return r; }
+
+    return fd;
+}
+
+fn udp_send6(fd as i64, buf as *u8, len as i64, a as Addr6) as i64 {
+    return _sock_sendto(fd, buf, len, 0, a.data, SOCKADDR_IN6_SIZE);
+}
+
+// Fills sender_buf (28 bytes sockaddr_in6) if not null.
+fn udp_recv6(fd as i64, buf as *u8, len as i64, sender_buf as *u8) as i64 {
+    let is u32 as addrlen with mut = cast(u32, SOCKADDR_IN6_SIZE);
+    if (cast(i64, sender_buf) != 0) {
+        return _sock_recvfrom(fd, buf, len, 0, sender_buf, &addrlen);
+    }
+    return _sock_recv(fd, buf, len, 0);
+}
+
+// Send data. Returns bytes sent or negative error. This is one call, not a
+// loop: -EINTR reaches the caller and means "retry", nothing was sent. Use
+// send_all when you want that handled for you.
 fn send(fd as i64, buf as *u8, len as i64) as i64 {
     return _sock_send(fd, buf, len, 0);
 }
 
-// Receive data. Returns bytes received, 0 for EOF, or negative error.
+// Receive data. Returns bytes received, 0 for EOF, or negative error. Like
+// send, this is one call: -EINTR means retry, not failure. recv_all handles it.
 fn recv(fd as i64, buf as *u8, len as i64) as i64 {
     return _sock_recv(fd, buf, len, 0);
 }
 
-// Send all data (loop until all bytes sent). Returns total sent or negative on first error.
+// Send all data (loop until all bytes sent). Returns total sent or negative on
+// first error. A signal that interrupts the call before anything moved is
+// retried, not reported: these `_all` functions exist to own the loop, so
+// surfacing -EINTR here would push the retry back onto every caller and let a
+// single stray signal abort a whole transfer.
 fn send_all(fd as i64, buf as *u8, len as i64) as i64 {
     let is i64 as sent with mut = 0;
     while (sent < len) {
         let is i64 as n = send(fd, cast(*u8, cast(i64, buf) + sent), len - sent);
+        if (n == 0 - EINTR) { continue; }
         if (n < 0) { return n; }
         if (n == 0) {
             if (sent > 0) { return sent; }
@@ -451,11 +782,13 @@ fn send_all(fd as i64, buf as *u8, len as i64) as i64 {
     return sent;
 }
 
-// Receive exactly len bytes (loop). Returns total received or negative on error.
+// Receive exactly len bytes (loop). Returns total received or negative on
+// error. Retries on -EINTR for the same reason as send_all.
 fn recv_all(fd as i64, buf as *u8, len as i64) as i64 {
     let is i64 as received with mut = 0;
     while (received < len) {
         let is i64 as n = recv(fd, cast(*u8, cast(i64, buf) + received), len - received);
+        if (n == 0 - EINTR) { continue; }
         if (n < 0) { return n; }
         if (n == 0) { return cast(i64, 0 - 1); }
         received = received + n;
@@ -576,6 +909,197 @@ fn wait_writable(fd as i64, timeout_ms as i64) as i64 {
     }
     if (r == 0) { return 0; }
     return 0 - 1;
+}
+
+// --- Section 7b: Poller (readiness set) ---
+//
+// net_poll hands the kernel the entire descriptor set on every call and the
+// kernel walks all of it, so a server holding N connections pays O(N) per
+// iteration no matter how few are active. A Poller registers the set once and
+// asks only for what fired.
+//
+// Portable by dispatch, not by pretending: on Linux this is epoll and the cost
+// is O(ready); on Windows and wasm it falls back to the same poll(2)/WSAPoll
+// this module already used, so the cost is unchanged there but the code that
+// uses it does not have to change. The event flags are POLLIN_FLAG/POLLOUT_FLAG
+// on both paths — EPOLLIN/EPOLLOUT share those bit values on Linux, so no
+// translation is needed.
+//
+// Callers wanting raw epoll (edge-triggered, EPOLLONESHOT, foreign fds) go
+// straight to std/os/linux.cst and accept being Linux-only.
+struct Poller {
+    epfd as i64;         // Linux: the epoll fd. Elsewhere: -1
+    fds as *u8;          // PollFd[cap] — the registered set (fallback path)
+    count as i64;
+    cap as i64;
+    evbuf as *u8;        // epoll_event[max_events] (Linux)
+    ready_fd as *i64;    // fd of each ready slot, both paths
+    ready_ev as *i64;    // event mask of each ready slot, both paths
+    max_events as i64;
+    nready as i64;
+}
+
+fn _poller_grow(p as *Poller, want as i64) as i64 {
+    if (want <= p.cap) { return 0; }
+    let is i64 as ncap with mut = p.cap * 2;
+    if (ncap < want) { ncap = want; }
+    if (ncap < 8) { ncap = 8; }
+    let is *u8 as nfds = _alloc(ncap * 8);
+    if (cast(i64, nfds) == 0) { return 0 - 1; }
+    if (cast(i64, p.fds) != 0) {
+        mem.memcpy(nfds, p.fds, p.count * 8);
+        _free(p.fds);
+    }
+    p.fds = nfds;
+    p.cap = ncap;
+    return 0;
+}
+
+// max_events caps how many ready descriptors one wait can report. Extra ready
+// descriptors are not lost — they surface on the next wait.
+fn poller_new(max_events as i64) as Poller {
+    let is Poller as p with mut;
+    let is i64 as me with mut = max_events;
+    if (me < 1) { me = 64; }
+    p.epfd = 0 - 1;
+    p.fds = cast(*u8, 0);
+    p.count = 0;
+    p.cap = 0;
+    p.evbuf = cast(*u8, 0);
+    p.max_events = me;
+    p.nready = 0;
+    p.ready_fd = cast(*i64, _alloc(me * 8));
+    p.ready_ev = cast(*i64, _alloc(me * 8));
+    if (os.current() == os.OS_LINUX) {
+        p.epfd = linux.epoll_create1(0);
+        p.evbuf = _alloc(me * linux.EPOLL_EVENT_SIZE);
+    }
+    return p;
+}
+
+// Register fd for `events` (POLLIN_FLAG / POLLOUT_FLAG, OR-ed).
+fn poller_add(p as *Poller, fd as i64, events as i64) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is [2]i64 as ev;
+        linux.epoll_event_set(cast(*u8, &ev[0]), events, fd);
+        return linux.epoll_ctl(p.epfd, linux.EPOLL_CTL_ADD, fd, cast(*u8, &ev[0]));
+    }
+    if (_poller_grow(p, p.count + 1) < 0) { return 0 - 1; }
+    let is *PollFd as slot = cast(*PollFd, cast(i64, p.fds) + p.count * 8);
+    pollfd_init(slot, fd, events);
+    p.count = p.count + 1;
+    return 0;
+}
+
+// Change what fd is watched for.
+fn poller_mod(p as *Poller, fd as i64, events as i64) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is [2]i64 as ev;
+        linux.epoll_event_set(cast(*u8, &ev[0]), events, fd);
+        return linux.epoll_ctl(p.epfd, linux.EPOLL_CTL_MOD, fd, cast(*u8, &ev[0]));
+    }
+    let is i64 as i with mut = 0;
+    while (i < p.count) {
+        let is *PollFd as slot = cast(*PollFd, cast(i64, p.fds) + i * 8);
+        if (cast(i64, slot.fd) == fd) { pollfd_init(slot, fd, events); return 0; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn poller_del(p as *Poller, fd as i64) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is [2]i64 as ev;
+        linux.epoll_event_set(cast(*u8, &ev[0]), 0, fd);
+        return linux.epoll_ctl(p.epfd, linux.EPOLL_CTL_DEL, fd, cast(*u8, &ev[0]));
+    }
+    let is i64 as i with mut = 0;
+    while (i < p.count) {
+        let is *PollFd as slot = cast(*PollFd, cast(i64, p.fds) + i * 8);
+        if (cast(i64, slot.fd) == fd) {
+            // Compact: move the last entry into this hole.
+            let is *PollFd as last = cast(*PollFd, cast(i64, p.fds) + (p.count - 1) * 8);
+            slot.fd = last.fd;
+            slot.events = last.events;
+            slot.revents = last.revents;
+            p.count = p.count - 1;
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Wait for readiness. timeout_ms = -1 blocks, 0 polls. Returns the number of
+// ready descriptors (0 on timeout, negative on error); read them back with
+// poller_fd / poller_events. Retries on -EINTR for the same reason send_all
+// does: this call owns the wait, so a stray signal is not the caller's problem.
+fn poller_wait(p as *Poller, timeout_ms as i64) as i64 {
+    p.nready = 0;
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as n with mut = 0 - EINTR;
+        while (n == 0 - EINTR) {
+            n = linux.epoll_wait(p.epfd, p.evbuf, p.max_events, timeout_ms);
+        }
+        if (n <= 0) { return n; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            p.ready_fd[i] = linux.epoll_event_data(p.evbuf, i);
+            p.ready_ev[i] = linux.epoll_event_events(p.evbuf, i);
+            i = i + 1;
+        }
+        p.nready = n;
+        return n;
+    }
+    let is i64 as r with mut = 0 - EINTR;
+    while (r == 0 - EINTR) {
+        r = _sock_poll(p.fds, p.count, timeout_ms);
+    }
+    if (r <= 0) { return r; }
+    // poll marks revents in place; compact the ready ones so the accessors
+    // below read the same way they do on the epoll path.
+    let is i64 as i with mut = 0;
+    let is i64 as k with mut = 0;
+    while (i < p.count && k < p.max_events) {
+        let is *PollFd as slot = cast(*PollFd, cast(i64, p.fds) + i * 8);
+        if (slot.revents != 0) {
+            p.ready_fd[k] = cast(i64, slot.fd);
+            p.ready_ev[k] = cast(i64, slot.revents);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    p.nready = k;
+    return k;
+}
+
+fn poller_fd(p as *Poller, idx as i64) as i64 {
+    if (idx < 0 || idx >= p.nready) { return 0 - 1; }
+    return p.ready_fd[idx];
+}
+
+fn poller_events(p as *Poller, idx as i64) as i64 {
+    if (idx < 0 || idx >= p.nready) { return 0; }
+    return p.ready_ev[idx];
+}
+
+// Did slot `idx` fire for `event` (POLLIN_FLAG / POLLOUT_FLAG)?
+fn poller_ready(p as *Poller, idx as i64, event as i64) as i64 {
+    if ((poller_events(p, idx) & event) != 0) { return 1; }
+    return 0;
+}
+
+fn poller_close(p as *Poller) as void {
+    if (os.current() == os.OS_LINUX) {
+        if (p.epfd >= 0) { _sock_close(p.epfd); p.epfd = 0 - 1; }
+        if (cast(i64, p.evbuf) != 0) { _free(p.evbuf); p.evbuf = cast(*u8, 0); }
+    }
+    if (cast(i64, p.fds) != 0) { _free(p.fds); p.fds = cast(*u8, 0); }
+    if (cast(i64, p.ready_fd) != 0) { _free(cast(*u8, p.ready_fd)); p.ready_fd = cast(*i64, 0); }
+    if (cast(i64, p.ready_ev) != 0) { _free(cast(*u8, p.ready_ev)); p.ready_ev = cast(*i64, 0); }
+    p.count = 0;
+    p.cap = 0;
+    p.nready = 0;
 }
 
 // --- Section 8: Convenience helpers ---

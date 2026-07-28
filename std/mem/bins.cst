@@ -52,9 +52,18 @@ struct Bins {
 // --- Internal: slab ---
 
 fn _slab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
-    if (alloc_size > page_size) { return cast(*Slab, 0); }
+    // A slot is its size class PLUS HEADER_SIZE, so the largest classes do not
+    // fit a page-sized slab: the 65536 bin needs 65544 and the slab has 65536.
+    // Refusing here left that bin unable to ever carve a slot — a size class
+    // declared in the table that served nobody, and the request failed with no
+    // message at all. Grow the region to hold at least one slot instead, so the
+    // declared table is the table you actually get.
+    let is i64 as region_size with mut = page_size;
+    if (alloc_size > region_size) {
+        region_size = ((alloc_size + 4095) / 4096) * 4096;
+    }
 
-    let is i64 as total_slots = page_size / alloc_size;
+    let is i64 as total_slots = region_size / alloc_size;
     if (total_slots == 0) { return cast(*Slab, 0); }
 
     let is i64 as bitmap_bytes = (total_slots + 7) >> 3;
@@ -63,7 +72,7 @@ fn _slab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
     let is *u8 as meta = core.mmap_anon(meta_size);
     if (cast(i64, meta) < 0) { return cast(*Slab, 0); }
 
-    let is *u8 as region = core.mmap_anon(page_size);
+    let is *u8 as region = core.mmap_anon(region_size);
     if (cast(i64, region) < 0) {
         core.munmap(meta, meta_size);
         return cast(*Slab, 0);
@@ -72,7 +81,7 @@ fn _slab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
     let is *Slab as slab = cast(*Slab, meta);
     slab.region = region;
     slab.bitmap = cast(*u8, cast(i64, meta) + sizeof(Slab));
-    slab.region_size = page_size;
+    slab.region_size = region_size;
     slab.total_slots = total_slots;
     slab.used_slots = 0;
     slab.next = cast(*u8, 0);
@@ -285,13 +294,13 @@ fn _bins_alloc_inner(b as *Bins, size as i64) as *u8 {
         b.lock = saved_lock;
     }
 
+    // Over the largest size class. Signalled by the null return and nothing
+    // else: a library has no business writing to the host program's stderr on a
+    // failure the caller is already required to check, and there was no way to
+    // turn it off. (The number it printed was wrong anyway — it named 65536
+    // while the top bin could not serve a single allocation.)
     let is i64 as idx = _lookup_bin(b, size);
-    if (idx < 0) {
-        core.write_str(2, "bins_alloc: size ");
-        core.write_int(2, size);
-        core.write_str(2, " exceeds max bin 65536\n");
-        return cast(*u8, 0);
-    }
+    if (idx < 0) { return cast(*u8, 0); }
 
     let is *Bin as bin = _bin_at(b, idx);
 

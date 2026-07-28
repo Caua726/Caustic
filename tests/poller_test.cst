@@ -1,0 +1,59 @@
+// tests/poller_test.cst — the readiness set registers once instead of handing
+// the kernel the whole descriptor set on every wait.
+//
+// Driven over a pipe rather than a socket on purpose: the stdlib has no
+// getsockname, so a socket test would need a hardcoded port and would go flaky
+// the moment something else on the machine held it. A pipe exercises the same
+// machinery — epoll_create1/epoll_ctl/epoll_wait on Linux, poll(2) on the
+// fallback — with nothing to collide with.
+use "../std/io.cst" as io;
+use "../std/os.cst" as os;
+use "../std/net.cst" as net;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+fn main() as i32 {
+    // The pipe primitive is POSIX; on other targets there is nothing to drive
+    // the poller with here and the test reports success without asserting.
+    if (os.current() != os.OS_LINUX) { return 0; }
+
+    let is [2]i32 as pfd;
+    if (os.linux.pipe(&pfd[0]) < 0) { io.printf("  FAIL pipe\n"); return 1; }
+    let is i64 as rd = cast(i64, pfd[0]);
+    let is i64 as wr = cast(i64, pfd[1]);
+
+    let is net.Poller as p = net.poller_new(8);
+    chk("add", net.poller_add(&p, rd, net.POLLIN_FLAG), 0);
+
+    // Nothing written yet: a 0ms wait must report nobody ready.
+    chk("wait ocioso", net.poller_wait(&p, 0), 0);
+    chk("nready ocioso", net.poller_fd(&p, 0), 0 - 1);
+
+    os.linux.write(wr, "x", 1);
+    chk("wait com dado", net.poller_wait(&p, 1000), 1);
+    chk("fd pronto", net.poller_fd(&p, 0), rd);
+    chk("legivel", net.poller_ready(&p, 0, net.POLLIN_FLAG), 1);
+    chk("nao gravavel", net.poller_ready(&p, 0, net.POLLOUT_FLAG), 0);
+
+    // Drain, and readiness must go away.
+    let is [8]u8 as buf;
+    os.linux.read(rd, &buf[0], 1);
+    chk("wait apos drenar", net.poller_wait(&p, 0), 0);
+
+    // Deregistering is what lets a server drop a closed connection.
+    chk("del", net.poller_del(&p, rd), 0);
+    os.linux.write(wr, "y", 1);
+    chk("wait apos del", net.poller_wait(&p, 0), 0);
+
+    net.poller_close(&p);
+    os.linux.close(rd);
+    os.linux.close(wr);
+    return fails;
+}

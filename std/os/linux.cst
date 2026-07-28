@@ -390,6 +390,65 @@ fn poll(fds as *u8, nfds as i64, timeout as i64) as i64 {
     return syscall(7, fds, nfds, timeout);
 }
 
+// --- epoll ---
+//
+// poll(2) hands the kernel the whole descriptor set on every call and the
+// kernel walks all of it; epoll registers the set once and returns only what
+// fired. Linux-only: there is no kqueue or IOCP wrapper here, so code calling
+// these directly is Linux-only by construction. `net.cst` wraps them in a
+// portable poller that falls back to poll(2) elsewhere.
+//
+// struct epoll_event is `packed` on x86_64 (u32 events + u64 data = 12) but
+// naturally aligned on aarch64 (u32 + 4 pad + u64 = 16). Callers must use
+// EPOLL_EVENT_SIZE / EPOLL_DATA_OFF instead of assuming a layout.
+let is i64 as EPOLL_EVENT_SIZE with imut = (__target_is_x86_64 * 12) + (__target_is_aarch64 * 16);
+let is i64 as EPOLL_DATA_OFF   with imut = (__target_is_x86_64 * 4)  + (__target_is_aarch64 * 8);
+
+let is i64 as EPOLL_CTL_ADD with imut = 1;
+let is i64 as EPOLL_CTL_DEL with imut = 2;
+let is i64 as EPOLL_CTL_MOD with imut = 3;
+
+let is i64 as EPOLLIN    with imut = 1;
+let is i64 as EPOLLOUT   with imut = 4;
+let is i64 as EPOLLERR   with imut = 8;
+let is i64 as EPOLLHUP   with imut = 16;
+let is i64 as EPOLLRDHUP with imut = 8192;
+
+// 291 / 20: EPOLL_CREATE1
+fn epoll_create1(flags as i64) as i64 {
+    return syscall(_nr(291, 20), flags);
+}
+
+// 233 / 21: EPOLL_CTL
+fn epoll_ctl(epfd as i64, op as i64, fd as i64, event as *u8) as i64 {
+    return syscall(_nr(233, 21), epfd, op, fd, event);
+}
+
+// 281 / 22: EPOLL_PWAIT. aarch64 has no plain epoll_wait, so both arches go
+// through pwait with a null sigmask — same semantics, one code path.
+fn epoll_wait(epfd as i64, events as *u8, maxevents as i64, timeout as i64) as i64 {
+    return syscall(_nr(281, 22), epfd, events, maxevents, timeout, cast(*u8, 0), 0);
+}
+
+// Write one epoll_event into `buf` at the arch's layout. `data` is the value
+// epoll_wait hands back for this registration — this stdlib stores the fd.
+fn epoll_event_set(buf as *u8, events as i64, data as i64) as void {
+    let is *u32 as ev = cast(*u32, buf);
+    *ev = cast(u32, events);
+    let is *i64 as dp = cast(*i64, cast(i64, buf) + EPOLL_DATA_OFF);
+    *dp = data;
+}
+
+fn epoll_event_events(buf as *u8, idx as i64) as i64 {
+    let is *u32 as ev = cast(*u32, cast(i64, buf) + idx * EPOLL_EVENT_SIZE);
+    return cast(i64, *ev);
+}
+
+fn epoll_event_data(buf as *u8, idx as i64) as i64 {
+    let is *i64 as dp = cast(*i64, cast(i64, buf) + idx * EPOLL_EVENT_SIZE + EPOLL_DATA_OFF);
+    return *dp;
+}
+
 // --- Threads (B3) ---
 //
 // clone() itself is NOT wrapped here: invoking it via syscall() would let

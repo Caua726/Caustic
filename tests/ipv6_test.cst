@@ -1,0 +1,98 @@
+// tests/ipv6_test.cst — the address representation actually carries IPv6.
+//
+// Addr6 is a parallel type to Addr: sockaddr_in6 is 28 bytes and has a scope
+// id with no IPv4 analogue, so widening Addr would have changed every existing
+// buffer. These check the textual forms round-trip (RFC 4291 shapes in, RFC
+// 5952 canonical form out) and that a socket actually carries traffic over v6.
+use "../std/io.cst" as io;
+use "../std/net.cst" as net;
+use "../std/string.cst" as str;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+// Parse `text`, format it back, and compare against `want`.
+fn chk_round(text as *u8, want as *u8) as void {
+    let is [16]u8 as ip;
+    if (net.ip6_parse(text, &ip[0]) != 0) {
+        fails = fails + 1;
+        io.printf("  FAIL parse recusou '%s'\n", text);
+        return;
+    }
+    let is [46]u8 as outb;
+    net.ip6_format(&ip[0], &outb[0]);
+    if (str.streq(&outb[0], want) == false) {
+        fails = fails + 1;
+        io.printf("  FAIL '%s' -> '%s', esperado '%s'\n", text, &outb[0], want);
+    }
+}
+
+fn chk_reject(text as *u8) as void {
+    let is [16]u8 as ip;
+    if (net.ip6_parse(text, &ip[0]) == 0) {
+        fails = fails + 1;
+        io.printf("  FAIL parse aceitou lixo: '%s'\n", text);
+    }
+}
+
+fn main() as i32 {
+    // Canonical forms survive a round trip unchanged.
+    chk_round("::", "::");
+    chk_round("::1", "::1");
+    chk_round("2001:db8::1", "2001:db8::1");
+    chk_round("fe80::1", "fe80::1");
+    chk_round("2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1");
+    // Eight explicit groups, no compression possible.
+    chk_round("2001:db8:1:2:3:4:5:6", "2001:db8:1:2:3:4:5:6");
+    // Leading zeros are dropped and hex is lowercased on the way out.
+    chk_round("2001:0DB8::0001", "2001:db8::1");
+    // Trailing dotted quad occupies the last two groups.
+    chk_round("::ffff:1.2.3.4", "::ffff:102:304");
+    // A single zero group is never collapsed.
+    chk_round("1:2:3:4:5:6:0:8", "1:2:3:4:5:6:0:8");
+
+    chk_reject("");
+    chk_reject("1:2:3:4:5:6:7");        // grupos de menos, sem ::
+    chk_reject("1:2:3:4:5:6:7:8:9");    // grupos demais
+    chk_reject("::1::2");               // dois ::
+    chk_reject("2001:db8::z");          // digito nao-hex
+    chk_reject("12345::");              // grupo de 5 digitos
+    chk_reject("1:2:3:4:5:6:7:");       // ':' solto no fim
+
+    // The scope id is the field sockaddr_in has nowhere to put.
+    let is [28]u8 as ab;
+    let is [16]u8 as lo;
+    net.ip6_parse("::1", &lo[0]);
+    let is net.Addr6 as a = net.addr6_init(&ab[0], &lo[0], 8443);
+    chk("porta", net.addr6_port(a), 8443);
+    chk("escopo padrao", net.addr6_scope(a), 0);
+    net.addr6_set_scope(a, 7);
+    chk("escopo gravado", net.addr6_scope(a), 7);
+
+    // And a datagram really crosses a v6 socket.
+    let is [28]u8 as sb;
+    let is net.Addr6 as ba = net.addr6_loopback(&sb[0], 34573);
+    let is i64 as srv = net.udp_bind6(ba);
+    if (srv < 0) {
+        // No v6 loopback on this machine — not a failure of the code here.
+        io.printf("  SKIP udp v6: bind devolveu %d\n", srv);
+        return fails;
+    }
+    let is [28]u8 as cbf;
+    let is net.Addr6 as dst = net.addr6_loopback(&cbf[0], 34573);
+    let is i64 as cli = net.udp_socket6();
+    chk("envio v6", net.udp_send6(cli, "v6", 2, dst), 2);
+    let is [16]u8 as rbuf;
+    let is [28]u8 as fromb;
+    chk("recebe v6", net.udp_recv6(srv, &rbuf[0], 16, &fromb[0]), 2);
+    chk("payload v6", cast(i64, rbuf[0]), 118);
+    net.close(cli);
+    net.close(srv);
+    return fails;
+}
