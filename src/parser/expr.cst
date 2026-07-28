@@ -70,9 +70,27 @@ fn parse_primary() as *ast.Node {
         n.tok_idx = tidx; n.name_ptr = nt.ptr; n.name_len = nt.len;
         pu.advance();
         if (pu.cur().kind == tok.TK_DOT) {
+            // `fn_ptr(mod.f)`, `fn_ptr(mod.sub.f)`, ... The head alias stays in
+            // name_ptr; everything after it keeps its dots in member_ptr, and
+            // the semantic pass walks that submodule chain.
             pu.advance();
-            n.member_ptr = pu.cur().ptr; n.member_len = pu.cur().len;
-            pu.advance(); pu.expect(tok.TK_RPAREN); return n;
+            let is *u8 as tail with mut = pu.cur().ptr;
+            let is i32 as tlen with mut = pu.cur().len;
+            pu.advance();
+            while (pu.cur().kind == tok.TK_DOT) {
+                pu.advance();
+                let is *tok.Token as ct = pu.cur();
+                let is i32 as nl = tlen + 1 + ct.len;
+                let is *u8 as nb = ast.ast_alloc(cast(i64, nl) + 1);
+                mem.memcpy(nb, tail, cast(i64, tlen));
+                nb[tlen] = 46; // '.'
+                mem.memcpy(cast(*u8, cast(i64, nb) + cast(i64, tlen) + 1), ct.ptr, cast(i64, ct.len));
+                nb[nl] = cast(u8, 0);
+                tail = nb; tlen = nl;
+                pu.advance();
+            }
+            n.member_ptr = tail; n.member_len = tlen;
+            pu.expect(tok.TK_RPAREN); return n;
         }
         if (pu.cur().kind == tok.TK_GEN) {
             pu.advance();
@@ -400,6 +418,28 @@ fn parse_primary() as *ast.Node {
     return ast.new_node(ast.NK_NUM);
 }
 
+// Flatten a pure identifier chain (`a`, `a.b`, `a.b.c`) into the dotted name
+// "a.b.c". Returns 0 for anything else — an index, a call, a field access on a
+// value — since only an alias chain can qualify a generic name.
+fn flatten_dotted(n as *ast.Node, out_len as *i32) as *u8 {
+    if (n.kind == ast.NK_IDENT) {
+        *out_len = n.name_len;
+        return n.name_ptr;
+    }
+    if (n.kind != ast.NK_MEMBER) { return cast(*u8, 0); }
+    let is i32 as hl with mut = 0;
+    let is *u8 as head = flatten_dotted(n.lhs, &hl);
+    if (cast(i64, head) == 0) { return cast(*u8, 0); }
+    let is i32 as total = hl + 1 + n.member_len;
+    let is *u8 as buf = ast.ast_alloc(cast(i64, total) + 1);
+    mem.memcpy(buf, head, cast(i64, hl));
+    buf[hl] = 46; // '.'
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, hl) + 1), n.member_ptr, cast(i64, n.member_len));
+    buf[total] = cast(u8, 0);
+    *out_len = total;
+    return buf;
+}
+
 fn parse_postfix() as *ast.Node {
     let is *ast.Node as node with mut = parse_primary();
     while (1) {
@@ -414,18 +454,27 @@ fn parse_postfix() as *ast.Node {
         } else if (pu.cur().kind == tok.TK_DOT) {
             let is i32 as tidx = pu.p_pos;
             pu.advance();
-            if (node.kind == ast.NK_IDENT && pu.cur().kind == tok.TK_IDENT && pu.peek().kind == tok.TK_GEN) {
+            // `mod.f gen T`, `hub.mod.f gen T`, ... — collapse the whole alias
+            // chain into one dotted name so the generic machinery sees a
+            // single qualified template name regardless of nesting depth.
+            let is i32 as pl with mut = 0;
+            let is *u8 as pref with mut = cast(*u8, 0);
+            if (pu.cur().kind == tok.TK_IDENT && pu.peek().kind == tok.TK_GEN) {
+                pref = flatten_dotted(node, &pl);
+            }
+            if (cast(i64, pref) != 0) {
                 let is *tok.Token as ft = pu.cur();
                 pu.advance(); pu.advance();
                 let is *u8 as ga with mut; let is i32 as gc with mut;
                 parse_generic_args(&ga, &gc);
-                let is i32 as fl = node.name_len + 1 + ft.len;
+                let is i32 as fl = pl + 1 + ft.len;
                 let is *u8 as full = ast.ast_alloc(cast(i64, fl) + 1);
-                mem.memcpy(full, node.name_ptr, cast(i64, node.name_len));
-                full[node.name_len] = 46;
-                mem.memcpy(cast(*u8, cast(i64, full) + cast(i64, node.name_len) + 1), ft.ptr, cast(i64, ft.len));
+                mem.memcpy(full, pref, cast(i64, pl));
+                full[pl] = 46;
+                mem.memcpy(cast(*u8, cast(i64, full) + cast(i64, pl) + 1), ft.ptr, cast(i64, ft.len));
                 full[fl] = cast(u8, 0);
                 let is *u8 as m = pu.mangle_name(full, fl, ga, gc);
+                node.kind = ast.NK_IDENT;
                 node.name_ptr = m; node.name_len = pu.str_len(m);
                 node.generic_args = ga; node.generic_arg_count = gc;
                 node.member_ptr = full; node.member_len = fl;

@@ -834,7 +834,148 @@ fn walk(node as *ast.Node) as void {
     if (k == ast.NK_MEMBER) { walk_member(node); return; }
 }
 
+// === Module alias chains in expression position ===
+
+// A module reference written as an expression is a chain of aliases: `hub`,
+// `hub.mid`, `hub.mid.deep`, ... Each hop is one submodule lookup, so nesting
+// is unbounded. Returns 0 as soon as a link isn't a module — which is exactly
+// the signal a caller needs to fall back to struct/method resolution.
+fn resolve_module_expr(e as *ast.Node) as *d.Module {
+    if (cast(i64, e) == 0) { return cast(*d.Module, 0); }
+    if (e.kind == ast.NK_IDENT) {
+        let is *d.Variable as v = sc.lookup_var(e.name_ptr, e.name_len);
+        if (cast(i64, v) != 0 && v.is_module == 1) {
+            return cast(*d.Module, v.module_ref);
+        }
+        return cast(*d.Module, 0);
+    }
+    if (e.kind == ast.NK_MEMBER) {
+        let is *d.Module as parent = resolve_module_expr(e.lhs);
+        if (cast(i64, parent) == 0) { return cast(*d.Module, 0); }
+        return sc.find_submodule(parent, e.member_ptr, e.member_len);
+    }
+    return cast(*d.Module, 0);
+}
+
+// Whether the chain's head alias was imported with an `only` list. The filter
+// is declared at the import site, so only the head can carry one.
+fn module_chain_has_only(e as *ast.Node) as i32 {
+    let is *ast.Node as h with mut = e;
+    while (cast(i64, h) != 0 && h.kind == ast.NK_MEMBER) { h = h.lhs; }
+    if (cast(i64, h) == 0 || h.kind != ast.NK_IDENT) { return 0; }
+    let is *d.Variable as v = sc.lookup_var(h.name_ptr, h.name_len);
+    if (cast(i64, v) != 0 && v.is_module == 1) { return cast(i32, v.has_only); }
+    return 0;
+}
+
 // === FNCALL handler ===
+
+// `recv.method(args)` -> `Type_method(&recv, args)`, for any receiver
+// expression whose type names a struct or enum. Walks `recv`, resolves the
+// method (including generic methods on a generic receiver), and prepends the
+// self argument to `node.args`. Returns 0 if no method matched.
+fn resolve_method_call(node as *ast.Node, recv as *ast.Node) as *d.Function {
+    walk(recv);
+    let is *ast.Type as obj_ty = recv.ty;
+    let is *ast.Type as base_ty with mut = obj_ty;
+    if (base_ty.kind == ast.TY_PTR) { base_ty = base_ty.base; }
+    if ((base_ty.kind != ast.TY_STRUCT && base_ty.kind != ast.TY_ENUM) || base_ty.name_len == 0) {
+        sc.sem_error_at(node, "chamada de metodo em tipo nao suportado");
+        return cast(*d.Function, 0);
+    }
+
+    let is i32 as mflen with mut = 0;
+    let is *u8 as mfname = d.str_concat3(base_ty.name_ptr, base_ty.name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &mflen);
+    let is *d.Function as func with mut = sc.lookup_fn(mfname, mflen);
+
+    // A type named through a module keeps its source spelling ("d.Vec2",
+    // "hub.b.c.d.Vec2") — resolve_type_ref copies the layout in but leaves the
+    // name alone. Its methods are declared under the owning module's prefix,
+    // so strip the alias chain and look them up there.
+    if (cast(i64, func) == 0) {
+        let is i32 as tail_off with mut = 0;
+        let is i32 as chain_only with mut = 0;
+        let is *d.Module as tmod = sc.resolve_mod_path(base_ty.name_ptr, base_ty.name_len, &tail_off, &chain_only);
+        if (cast(i64, tmod) != 0) {
+            let is i32 as qflen with mut = 0;
+            let is *u8 as qfname = d.str_concat3(cast(*u8, cast(i64, base_ty.name_ptr) + cast(i64, tail_off)), base_ty.name_len - tail_off,
+                                                 "_", 1, node.lhs.member_ptr, node.lhs.member_len, &qflen);
+            func = sc.lookup_fn_qualified(qfname, qflen, tmod.prefix_ptr, tmod.prefix_len);
+        }
+    }
+
+    // Try generic method
+    if (cast(i64, func) == 0 && base_ty.gen_arg_count > 0 && base_ty.base_name_len > 0) {
+        // Resolve dot-qualified base name ("sl.Slice", "hub.sl.Slice", ...)
+        let is *u8 as real_base_ptr with mut = base_ty.base_name_ptr;
+        let is i32 as real_base_len with mut = base_ty.base_name_len;
+        let is *u8 as method_prefix_ptr with mut = cast(*u8, 0);
+        let is i32 as method_prefix_len with mut = 0;
+        let is i32 as tail_off with mut = 0;
+        let is i32 as chain_only with mut = 0;
+        let is *d.Module as bm = sc.resolve_mod_path(base_ty.base_name_ptr, base_ty.base_name_len, &tail_off, &chain_only);
+        if (cast(i64, bm) != 0) {
+            real_base_ptr = cast(*u8, cast(i64, base_ty.base_name_ptr) + cast(i64, tail_off));
+            real_base_len = base_ty.base_name_len - tail_off;
+            method_prefix_ptr = bm.prefix_ptr;
+            method_prefix_len = bm.prefix_len;
+        }
+        let is i32 as tmlen with mut = 0;
+        let is *u8 as tmname = d.str_concat3(real_base_ptr, real_base_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &tmlen);
+        let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(tmname, tmlen);
+        if (cast(i64, tmpl) == 0 && method_prefix_len > 0) {
+            tmpl = gn.lookup_template_prefixed(tmname, tmlen, method_prefix_ptr, method_prefix_len);
+        }
+        if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
+            let is *u8 as mangled = gn.mangle_generic(tmname, tmlen, base_ty.gen_args, base_ty.gen_arg_count);
+            let is i32 as mglen = gn.str_len(mangled);
+            // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+            let is *u8 as omp = sc.current_mod_prefix_ptr;
+            let is i32 as oml = sc.current_mod_prefix_len;
+            if (tmpl.mod_prefix_len > 0) {
+                sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
+                sc.current_mod_prefix_len = tmpl.mod_prefix_len;
+            }
+            let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, base_ty.gen_args, base_ty.gen_arg_count, mangled, mglen);
+            if (cast(i64, fn_clone) != 0) {
+                let is i32 as so = sc.stack_offset;
+                let is *d.Scope as ss = sc.current_scope;
+                walk(fn_clone);
+                sc.stack_offset = so;
+                sc.current_scope = ss;
+            }
+            // Lookup with template's module prefix
+            if (tmpl.mod_prefix_len > 0) {
+                func = sc.lookup_fn_qualified(mangled, mglen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
+            } else {
+                func = sc.lookup_fn(mangled, mglen);
+            }
+            sc.current_mod_prefix_ptr = omp;
+            sc.current_mod_prefix_len = oml;
+        }
+    }
+
+    if (cast(i64, func) == 0) {
+        sc.sem_error_at2(node, "metodo nao encontrado", mfname, mflen);
+        return cast(*d.Function, 0);
+    }
+
+    // Prepend &self
+    let is *ast.Node as self_arg with mut = cast(*ast.Node, 0);
+    if (obj_ty.kind == ast.TY_PTR) {
+        self_arg = recv;
+    } else {
+        self_arg = ast.new_node(ast.NK_ADDR);
+        self_arg.expr = recv;
+        let is *ast.Type as pt = ast.new_type(ast.TY_PTR);
+        pt.base = obj_ty;
+        pt.size = 8;
+        self_arg.ty = pt;
+    }
+    self_arg.next = node.args;
+    node.args = self_arg;
+    return func;
+}
 
 fn walk_fncall(node as *ast.Node) as void {
     let is *d.Function as func with mut = cast(*d.Function, 0);
@@ -870,26 +1011,22 @@ fn walk_fncall(node as *ast.Node) as void {
         }
         if (cast(i64, func) == 0 && ga_count > 0 && ga_member_len > 0) {
             let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(ga_member_ptr, ga_member_len);
-            // Handle dot-qualified names (e.g. "sl.slice_new")
+            // Handle dot-qualified names ("sl.slice_new", "hub.sl.slice_new", ...)
             if (cast(i64, tmpl) == 0) {
-                let is i32 as dp = ty.find_dot(ga_member_ptr, ga_member_len);
-                if (dp >= 0) {
-                    let is *u8 as al_ptr = ga_member_ptr;
-                    let is i32 as al_len = dp;
-                    let is *u8 as fname_ptr = cast(*u8, cast(i64, ga_member_ptr) + cast(i64, dp) + 1);
-                    let is i32 as fname_len = ga_member_len - dp - 1;
-                    let is *d.Variable as mv = sc.lookup_var(al_ptr, al_len);
-                    if (cast(i64, mv) != 0 && mv.is_module == 1 && cast(i64, mv.module_ref) != 0) {
-                        let is *d.Module as mm = cast(*d.Module, mv.module_ref);
-                        tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, mm.prefix_ptr, mm.prefix_len);
-                        // Fallback: search submodules (for 'only' imports)
-                        if (cast(i64, tmpl) == 0 && mv.has_only == 1) {
-                            let is *d.SubModule as sm with mut = cast(*d.SubModule, mm.submodules);
-                            while (cast(i64, sm) != 0 && cast(i64, tmpl) == 0) {
-                                let is *d.Module as sub = cast(*d.Module, sm.module_ref);
-                                tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, sub.prefix_ptr, sub.prefix_len);
-                                sm = cast(*d.SubModule, sm.next);
-                            }
+                let is i32 as tail_off with mut = 0;
+                let is i32 as chain_only with mut = 0;
+                let is *d.Module as mm = sc.resolve_mod_path(ga_member_ptr, ga_member_len, &tail_off, &chain_only);
+                if (cast(i64, mm) != 0) {
+                    let is *u8 as fname_ptr = cast(*u8, cast(i64, ga_member_ptr) + cast(i64, tail_off));
+                    let is i32 as fname_len = ga_member_len - tail_off;
+                    tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, mm.prefix_ptr, mm.prefix_len);
+                    // Fallback: search submodules (for 'only' imports)
+                    if (cast(i64, tmpl) == 0 && chain_only == 1) {
+                        let is *d.SubModule as sm with mut = cast(*d.SubModule, mm.submodules);
+                        while (cast(i64, sm) != 0 && cast(i64, tmpl) == 0) {
+                            let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                            tmpl = gn.lookup_template_prefixed(fname_ptr, fname_len, sub.prefix_ptr, sub.prefix_len);
+                            sm = cast(*d.SubModule, sm.next);
                         }
                     }
                 }
@@ -933,80 +1070,32 @@ fn walk_fncall(node as *ast.Node) as void {
     else if (node.lhs.kind == ast.NK_MEMBER) {
         let is *ast.Node as lhs_expr = node.lhs.lhs;
 
-        // Chained module access: mod.submod.func()
-        if (lhs_expr.kind == ast.NK_MEMBER && lhs_expr.lhs.kind == ast.NK_IDENT) {
-            let is *d.Variable as pvar = sc.lookup_var(lhs_expr.lhs.name_ptr, lhs_expr.lhs.name_len);
-            if (cast(i64, pvar) != 0 && pvar.is_module == 1) {
-                let is *d.Module as pmod = cast(*d.Module, pvar.module_ref);
-                let is i32 as found_sub with mut = 0;
-                let is *d.SubModule as sm with mut = cast(*d.SubModule, pmod.submodules);
-                while (cast(i64, sm) != 0 && found_sub == 0) {
-                    if (d.str_eq(sm.alias_ptr, sm.alias_len, lhs_expr.member_ptr, lhs_expr.member_len) == 1) {
-                        found_sub = 1;
-                        let is *d.Module as sub_mod = cast(*d.Module, sm.module_ref);
-                        func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, sub_mod.prefix_ptr, sub_mod.prefix_len);
-                        if (cast(i64, func) == 0) {
-                            sc.sem_error_at(node, "funcao nao encontrada no submodulo");
-                        }
-                    }
+        // Module-qualified call. The receiver is a chain of module aliases —
+        // `mod`, `mod.sub`, `mod.sub.sub`, ... — walked one hop at a time, so a
+        // hub can nest sub-hubs to any depth.
+        let is *d.Module as recv_mod = resolve_module_expr(lhs_expr);
+        if (cast(i64, recv_mod) != 0) {
+            // An `only` import flattens the listed submodules into the alias,
+            // so those come first; the module's own functions are the fallback.
+            if (module_chain_has_only(lhs_expr) == 1) {
+                let is *d.SubModule as sm with mut = cast(*d.SubModule, recv_mod.submodules);
+                while (cast(i64, sm) != 0 && cast(i64, func) == 0) {
+                    let is *d.Module as sub = cast(*d.Module, sm.module_ref);
+                    func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, sub.prefix_ptr, sub.prefix_len);
                     sm = cast(*d.SubModule, sm.next);
                 }
-                if (found_sub == 0) {
-                    // Not a submodule — treat as method call on module variable: mod.var.method()
-                    walk(lhs_expr);
-                    let is *ast.Type as obj_ty = lhs_expr.ty;
-                    let is *ast.Type as base_ty with mut = obj_ty;
-                    if (base_ty.kind == ast.TY_PTR) { base_ty = base_ty.base; }
-                    if ((base_ty.kind == ast.TY_STRUCT || base_ty.kind == ast.TY_ENUM) && base_ty.name_len > 0) {
-                        let is i32 as mflen with mut = 0;
-                        let is *u8 as mfname = d.str_concat3(base_ty.name_ptr, base_ty.name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &mflen);
-                        func = sc.lookup_fn(mfname, mflen);
-                        if (cast(i64, func) != 0) {
-                            let is *ast.Node as self_arg with mut = cast(*ast.Node, 0);
-                            if (obj_ty.kind == ast.TY_PTR) {
-                                self_arg = lhs_expr;
-                            } else {
-                                self_arg = ast.new_node(ast.NK_ADDR);
-                                self_arg.expr = lhs_expr;
-                                let is *ast.Type as pt = ast.new_type(ast.TY_PTR);
-                                pt.base = obj_ty;
-                                pt.size = 8;
-                                self_arg.ty = pt;
-                            }
-                            self_arg.next = node.args;
-                            node.args = self_arg;
-                        } else {
-                            sc.sem_error_at(node, "metodo nao encontrado");
-                        }
-                    } else {
-                        sc.sem_error_at(node, "chamada de metodo em tipo nao suportado");
-                    }
-                }
+            }
+            if (cast(i64, func) == 0) {
+                func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, recv_mod.prefix_ptr, recv_mod.prefix_len);
+            }
+            if (cast(i64, func) == 0) {
+                sc.sem_error_at2(node, "funcao nao encontrada no modulo", node.lhs.member_ptr, node.lhs.member_len);
             }
         }
         else if (lhs_expr.kind == ast.NK_IDENT) {
             let is *d.Variable as var = sc.lookup_var(lhs_expr.name_ptr, lhs_expr.name_len);
 
-            if (cast(i64, var) != 0 && var.is_module == 1) {
-                // Module call
-                let is *d.Module as modd = cast(*d.Module, var.module_ref);
-                // If module has submodules (only import), search submodules first
-                if (var.has_only == 1) {
-                    let is *d.SubModule as sm with mut = cast(*d.SubModule, modd.submodules);
-                    while (cast(i64, sm) != 0 && cast(i64, func) == 0) {
-                        let is *d.Module as sub = cast(*d.Module, sm.module_ref);
-                        func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, sub.prefix_ptr, sub.prefix_len);
-                        sm = cast(*d.SubModule, sm.next);
-                    }
-                }
-                // Fallback: search parent module
-                if (cast(i64, func) == 0) {
-                    func = sc.lookup_fn_qualified(node.lhs.member_ptr, node.lhs.member_len, modd.prefix_ptr, modd.prefix_len);
-                }
-                if (cast(i64, func) == 0) {
-                    sc.sem_error_at(node, "funcao nao encontrada no modulo");
-                }
-            } else if (cast(i64, var) == 0) {
+            if (cast(i64, var) == 0) {
                 // Associated function: Type.new() or Type.method()
                 let is *u8 as sty with mut = ty.lookup_struct_pf(lhs_expr.name_ptr, lhs_expr.name_len);
                 if (cast(i64, sty) == 0) {
@@ -1026,99 +1115,21 @@ fn walk_fncall(node as *ast.Node) as void {
                 }
             } else {
                 // Method call: obj.method(args) -> Type_method(&obj, args)
-                walk(lhs_expr);
-                let is *ast.Type as obj_ty = lhs_expr.ty;
-                let is *ast.Type as base_ty with mut = obj_ty;
-                if (base_ty.kind == ast.TY_PTR) { base_ty = base_ty.base; }
-
-                if ((base_ty.kind == ast.TY_STRUCT || base_ty.kind == ast.TY_ENUM) && base_ty.name_len > 0) {
-                    let is i32 as mflen with mut = 0;
-                    let is *u8 as mfname = d.str_concat3(base_ty.name_ptr, base_ty.name_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &mflen);
-                    func = sc.lookup_fn(mfname, mflen);
-
-                    // Try generic method
-                    if (cast(i64, func) == 0 && base_ty.gen_arg_count > 0 && base_ty.base_name_len > 0) {
-                        // Resolve dot-qualified base name (e.g. "sl.Slice")
-                        let is *u8 as real_base_ptr with mut = base_ty.base_name_ptr;
-                        let is i32 as real_base_len with mut = base_ty.base_name_len;
-                        let is *u8 as method_prefix_ptr with mut = cast(*u8, 0);
-                        let is i32 as method_prefix_len with mut = 0;
-                        let is i32 as bdp = ty.find_dot(base_ty.base_name_ptr, base_ty.base_name_len);
-                        if (bdp >= 0) {
-                            let is *u8 as ba_ptr = base_ty.base_name_ptr;
-                            let is i32 as ba_len = bdp;
-                            real_base_ptr = cast(*u8, cast(i64, base_ty.base_name_ptr) + cast(i64, bdp) + 1);
-                            real_base_len = base_ty.base_name_len - bdp - 1;
-                            let is *d.Variable as bv = sc.lookup_var(ba_ptr, ba_len);
-                            if (cast(i64, bv) != 0 && bv.is_module == 1 && cast(i64, bv.module_ref) != 0) {
-                                let is *d.Module as bm = cast(*d.Module, bv.module_ref);
-                                method_prefix_ptr = bm.prefix_ptr;
-                                method_prefix_len = bm.prefix_len;
-                            }
-                        }
-                        let is i32 as tmlen with mut = 0;
-                        let is *u8 as tmname = d.str_concat3(real_base_ptr, real_base_len, "_", 1, node.lhs.member_ptr, node.lhs.member_len, &tmlen);
-                        let is *d.GenericTemplate as tmpl with mut = gn.lookup_template(tmname, tmlen);
-                        if (cast(i64, tmpl) == 0 && method_prefix_len > 0) {
-                            tmpl = gn.lookup_template_prefixed(tmname, tmlen, method_prefix_ptr, method_prefix_len);
-                        }
-                        if (cast(i64, tmpl) != 0 && tmpl.is_function == 1) {
-                            let is *u8 as mangled = gn.mangle_generic(tmname, tmlen, base_ty.gen_args, base_ty.gen_arg_count);
-                            let is i32 as mglen = gn.str_len(mangled);
-                            // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
-                            let is *u8 as omp = sc.current_mod_prefix_ptr;
-                            let is i32 as oml = sc.current_mod_prefix_len;
-                            if (tmpl.mod_prefix_len > 0) {
-                                sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
-                                sc.current_mod_prefix_len = tmpl.mod_prefix_len;
-                            }
-                            let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, base_ty.gen_args, base_ty.gen_arg_count, mangled, mglen);
-                            if (cast(i64, fn_clone) != 0) {
-                                let is i32 as so = sc.stack_offset;
-                                let is *d.Scope as ss = sc.current_scope;
-                                walk(fn_clone);
-                                sc.stack_offset = so;
-                                sc.current_scope = ss;
-                            }
-                            // Lookup with template's module prefix
-                            if (tmpl.mod_prefix_len > 0) {
-                                func = sc.lookup_fn_qualified(mangled, mglen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
-                            } else {
-                                func = sc.lookup_fn(mangled, mglen);
-                            }
-                            sc.current_mod_prefix_ptr = omp;
-                            sc.current_mod_prefix_len = oml;
-                        }
-                    }
-
-                    if (cast(i64, func) != 0) {
-                        // Prepend &self
-                        let is *ast.Node as self_arg with mut = cast(*ast.Node, 0);
-                        if (obj_ty.kind == ast.TY_PTR) {
-                            self_arg = lhs_expr;
-                        } else {
-                            self_arg = ast.new_node(ast.NK_ADDR);
-                            self_arg.expr = lhs_expr;
-                            let is *ast.Type as pt = ast.new_type(ast.TY_PTR);
-                            pt.base = obj_ty;
-                            pt.size = 8;
-                            self_arg.ty = pt;
-                        }
-                        self_arg.next = node.args;
-                        node.args = self_arg;
-                    } else {
-                        sc.sem_error_at(node, "metodo nao encontrado");
-                    }
-                } else {
-                    sc.sem_error_at(node, "chamada de metodo em tipo nao suportado");
-                }
+                func = resolve_method_call(node, lhs_expr);
             }
         } else {
-            sc.sem_error_at(node, "chamada em expressao complexa nao suportada");
+            // Any other receiver expression — a field of a struct, an element
+            // of an array, a module global, the result of a call: dispatch the
+            // method on whatever type it walks to.
+            func = resolve_method_call(node, lhs_expr);
         }
     } else {
         sc.sem_error_at(node, "tipo de chamada invalido");
     }
+
+    // Only reachable in LSP mode, where sem_error_at records and returns
+    // instead of exiting. Bail out rather than dereference a null Function.
+    if (cast(i64, func) == 0) { return; }
 
     // Set return type and asm_name
     node.ty = cast(*ast.Type, func.return_type);
@@ -1332,98 +1343,50 @@ fn walk_member(node as *ast.Node) as void {
         }
     }
 
-    // Chained module variable access: mod.submod.VAR
-    if (node.lhs.kind == ast.NK_MEMBER && node.lhs.lhs.kind == ast.NK_IDENT) {
-        let is *d.Variable as pvar = sc.lookup_var(node.lhs.lhs.name_ptr, node.lhs.lhs.name_len);
-        if (cast(i64, pvar) != 0 && pvar.is_module == 1) {
-            let is *d.Module as pmod = cast(*d.Module, pvar.module_ref);
-            let is i32 as found_sub with mut = 0;
-            let is *d.SubModule as sm with mut = cast(*d.SubModule, pmod.submodules);
-            while (cast(i64, sm) != 0 && found_sub == 0) {
-                if (d.str_eq(sm.alias_ptr, sm.alias_len, node.lhs.member_ptr, node.lhs.member_len) == 1) {
-                    found_sub = 1;
-                    let is *d.Module as sub_mod = cast(*d.Module, sm.module_ref);
-                    // Try variable in submodule scope
-                    let is *d.Variable as sv with mut = sub_mod.scope.vars;
-                    while (cast(i64, sv) != 0) {
-                        if (d.str_eq(sv.name_ptr, sv.name_len, node.member_ptr, node.member_len) == 1) {
-                            if (sv.has_folded_init == 1) {
-                                node.kind = ast.NK_NUM;
-                                node.val = sv.folded_init_val;
-                                node.ty = cast(*ast.Type, sv.ty);
-                                return;
-                            }
-                            node.kind = ast.NK_IDENT;
-                            node.name_ptr = sv.asm_name_ptr;
-                            node.name_len = sv.asm_name_len;
-                            node.ty = cast(*ast.Type, sv.ty);
-                            node.var_offset = sv.offset;
-                            node.is_global = sv.is_global;
-                            node.is_string_const = sv.is_string_const;
-                            return;
-                        }
-                        sv = sv.next;
-                    }
-                    // Try function ref in submodule
-                    let is *d.Function as sfn = sc.lookup_fn_qualified(node.member_ptr, node.member_len, sub_mod.prefix_ptr, sub_mod.prefix_len);
-                    if (cast(i64, sfn) != 0) {
-                        node.kind = ast.NK_IDENT;
-                        node.name_ptr = sfn.asm_name_ptr;
-                        node.name_len = sfn.asm_name_len;
-                        node.ty = cast(*ast.Type, sfn.return_type);
-                        return;
-                    }
-                    sc.sem_error_at(node, "membro nao encontrado no submodulo");
-                }
-                sm = cast(*d.SubModule, sm.next);
-            }
-            // found_sub == 0: not a submodule, fall through to regular resolution
+    // Module member access: mod.X, mod.sub.X, mod.sub.sub.X, ... The receiver
+    // is a chain of module aliases walked one hop at a time, so a hub can nest
+    // sub-hubs to any depth. A chain that isn't all modules resolves to 0 and
+    // falls through to regular struct-field resolution below.
+    let is *d.Module as owner = resolve_module_expr(node.lhs);
+    if (cast(i64, owner) != 0) {
+        // Try function
+        let is *d.Function as fref = sc.lookup_fn_qualified(node.member_ptr, node.member_len, owner.prefix_ptr, owner.prefix_len);
+        if (cast(i64, fref) != 0) {
+            node.kind = ast.NK_IDENT;
+            node.name_ptr = fref.asm_name_ptr;
+            node.name_len = fref.asm_name_len;
+            node.ty = cast(*ast.Type, fref.return_type);
+            return;
         }
-    }
-
-    // Check if LHS is a module
-    if (node.lhs.kind == ast.NK_IDENT) {
-        let is *d.Variable as var = sc.lookup_var(node.lhs.name_ptr, node.lhs.name_len);
-        if (cast(i64, var) != 0 && var.is_module == 1) {
-            let is *d.Module as modd = cast(*d.Module, var.module_ref);
-            // Try function
-            let is *d.Function as fref = sc.lookup_fn_qualified(node.member_ptr, node.member_len, modd.prefix_ptr, modd.prefix_len);
-            if (cast(i64, fref) != 0) {
-                node.kind = ast.NK_IDENT;
-                node.name_ptr = fref.asm_name_ptr;
-                node.name_len = fref.asm_name_len;
-                node.ty = cast(*ast.Type, fref.return_type);
-                return;
-            }
-            // Try variable in module scope
-            let is *d.Variable as mv with mut = modd.scope.vars;
-            while (cast(i64, mv) != 0) {
-                if (d.str_eq(mv.name_ptr, mv.name_len, node.member_ptr, node.member_len) == 1) {
-                    // Const-prop through module access: `os.current` where
-                    // `current` is an imut global folded to a literal in
-                    // walk_let should collapse to that literal here too —
-                    // otherwise dead-branch elim in if-statements that use
-                    // `os.X == os.Y` patterns wouldn't fire for module-
-                    // qualified references.
-                    if (mv.has_folded_init == 1) {
-                        node.kind = ast.NK_NUM;
-                        node.val = mv.folded_init_val;
-                        node.ty = cast(*ast.Type, mv.ty);
-                        return;
-                    }
-                    node.kind = ast.NK_IDENT;
-                    node.name_ptr = mv.asm_name_ptr;
-                    node.name_len = mv.asm_name_len;
+        // Try variable in module scope
+        let is *d.Variable as mv with mut = owner.scope.vars;
+        while (cast(i64, mv) != 0) {
+            if (d.str_eq(mv.name_ptr, mv.name_len, node.member_ptr, node.member_len) == 1) {
+                // Const-prop through module access: `os.current` where
+                // `current` is an imut global folded to a literal in
+                // walk_let should collapse to that literal here too —
+                // otherwise dead-branch elim in if-statements that use
+                // `os.X == os.Y` patterns wouldn't fire for module-
+                // qualified references.
+                if (mv.has_folded_init == 1) {
+                    node.kind = ast.NK_NUM;
+                    node.val = mv.folded_init_val;
                     node.ty = cast(*ast.Type, mv.ty);
-                    node.var_offset = mv.offset;
-                    node.is_global = mv.is_global;
-                    node.is_string_const = mv.is_string_const;
                     return;
                 }
-                mv = mv.next;
+                node.kind = ast.NK_IDENT;
+                node.name_ptr = mv.asm_name_ptr;
+                node.name_len = mv.asm_name_len;
+                node.ty = cast(*ast.Type, mv.ty);
+                node.var_offset = mv.offset;
+                node.is_global = mv.is_global;
+                node.is_string_const = mv.is_string_const;
+                return;
             }
-            sc.sem_error_at(node, "membro nao encontrado no modulo");
+            mv = mv.next;
         }
+        sc.sem_error_at2(node, "membro nao encontrado no modulo", node.member_ptr, node.member_len);
+        return;
     }
 
     // Regular struct field access
@@ -1509,11 +1472,17 @@ fn walk_fn_ptr_node(node as *ast.Node) as void {
             }
         }
     } else if (node.member_len > 0) {
-        // Module-qualified fn_ptr
+        // Module-qualified fn_ptr: fn_ptr(mod.f), fn_ptr(mod.sub.f), ...
+        // The head alias is in name_ptr; member_ptr holds the rest of the
+        // dotted path, whose leading components name submodules.
         let is *d.Variable as var = sc.lookup_var(node.name_ptr, node.name_len);
         if (cast(i64, var) != 0 && var.is_module == 1) {
-            let is *d.Module as modd = cast(*d.Module, var.module_ref);
-            func = sc.lookup_fn_qualified(node.member_ptr, node.member_len, modd.prefix_ptr, modd.prefix_len);
+            let is i32 as tail_off with mut = 0;
+            let is *d.Module as modd = sc.descend_submodules(cast(*d.Module, var.module_ref), node.member_ptr, node.member_len, &tail_off);
+            if (cast(i64, modd) != 0) {
+                let is *u8 as fn_name = cast(*u8, cast(i64, node.member_ptr) + cast(i64, tail_off));
+                func = sc.lookup_fn_qualified(fn_name, node.member_len - tail_off, modd.prefix_ptr, modd.prefix_len);
+            }
         }
         if (cast(i64, func) != 0) {
             node.name_ptr = func.asm_name_ptr;

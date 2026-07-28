@@ -367,3 +367,26 @@ mem.freelist.alloc(heap, 32);  // explicit submodule
 ```
 
 Modules that import other modules expose them as submodules accessible via dot notation.
+
+### Nesting
+
+The chain has no depth limit -- a hub may re-export sub-hubs, and each of those
+their own, so a large binding can be split across a tree of files instead of a
+flat list under one hub:
+
+```cst
+// x11.cst           -> use "xlib.cst" as xlib;
+// x11/xlib.cst      -> use "core.cst" as core;
+// x11/xlib/core.cst -> fn XOpenDisplay(...) ...
+
+use "x11.cst" as x11;
+
+let is x11.xlib.core.Display as d = x11.xlib.core.XOpenDisplay(cast(*u8, 0));
+```
+
+Every construct resolves through the full chain: functions, globals, struct and
+enum types, type aliases, methods, generic functions and `fn_ptr`.
+
+One case still needs the type's own module in scope: an enum *variant* cannot be
+named through a module (`m.Color.Blue` does not resolve, at any depth) -- expose
+a constructor function or a constant instead.

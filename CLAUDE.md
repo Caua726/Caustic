@@ -123,7 +123,9 @@ type Size = i64;
 use "std/mem.cst" as mem;
 use "std/mem.cst" only freelist, bins as mem;  // selective import
 mem.galloc(1024);
-mem.bins.bins_new(4096);  // submodule access
+mem.bins.bins_new(4096);        // submodule access
+x11.xlib.core.XOpenDisplay(0);  // chains nest to any depth (fns, types,
+                                // globals, aliases, methods, generics, fn_ptr)
 
 // Defer — executes call before each return (LIFO)
 defer free(ptr);

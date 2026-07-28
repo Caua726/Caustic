@@ -389,6 +389,81 @@ fn lookup_fn(name_ptr as *u8, name_len as i32) as *d.Function {
     return lookup_fn_qualified(name_ptr, name_len, cast(*u8, 0), 0);
 }
 
+// === Module alias chains ===
+//
+// `hub.mid.deep.f()` names a module by walking a chain of aliases: `hub` is a
+// module variable in scope, `mid` is a submodule of `hub`, `deep` a submodule
+// of `mid`. Every hop is the same lookup, so the chain has no depth limit.
+//
+// The chain reaches the semantic layer in two shapes: as a dotted NAME the
+// parser flattened (types, generic instantiations, `fn_ptr`) and as an
+// NK_MEMBER expression tree (calls, member reads). The primitives below cover
+// the name shape; the tree shape walks `find_submodule` directly (walk.cst's
+// `resolve_module_expr`).
+
+fn find_submodule(m as *d.Module, alias_ptr as *u8, alias_len as i32) as *d.Module {
+    if (cast(i64, m) == 0) { return cast(*d.Module, 0); }
+    let is *d.SubModule as sm with mut = cast(*d.SubModule, m.submodules);
+    while (cast(i64, sm) != 0) {
+        if (d.str_eq(sm.alias_ptr, sm.alias_len, alias_ptr, alias_len) == 1) {
+            return cast(*d.Module, sm.module_ref);
+        }
+        sm = cast(*d.SubModule, sm.next);
+    }
+    return cast(*d.Module, 0);
+}
+
+// Offset of the next '.' at or after `off`, or -1 when the rest of `name` has
+// none (i.e. `off` already starts the final component).
+fn dot_from(name_ptr as *u8, off as i32, name_len as i32) as i32 {
+    let is i32 as i with mut = off;
+    while (i < name_len) {
+        if (name_ptr[i] == 46) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0) - cast(i32, 1);
+}
+
+// Consume the leading components of `name` (from *io_off) that name
+// submodules of `m`, descending one module per hop. The final component is
+// never consumed — it is the member being named. Stops early at the first
+// component that isn't a submodule alias, which leaves the remainder for the
+// caller to mangle exactly as before.
+fn descend_submodules(m as *d.Module, name_ptr as *u8, name_len as i32, io_off as *i32) as *d.Module {
+    let is *d.Module as cur with mut = m;
+    let is i32 as off with mut = *io_off;
+    while (cast(i64, cur) != 0) {
+        let is i32 as dp = dot_from(name_ptr, off, name_len);
+        if (dp < 0) { break; }
+        let is *d.Module as sub = find_submodule(cur, cast(*u8, cast(i64, name_ptr) + cast(i64, off)), dp - off);
+        if (cast(i64, sub) == 0) { break; }
+        cur = sub;
+        off = dp + 1;
+    }
+    *io_off = off;
+    return cur;
+}
+
+// `a.b.c.X` -> the module `a.b.c` names, with *out_off left at the offset of
+// `X`. Returns 0 when the name has no dot or its head isn't a module alias in
+// scope. *out_only reports whether the head was an `only` import (the filter
+// is declared at the import site, so only the head can carry one).
+fn resolve_mod_path(name_ptr as *u8, name_len as i32, out_off as *i32, out_only as *i32) as *d.Module {
+    *out_off = 0;
+    *out_only = 0;
+    let is i32 as dp = dot_from(name_ptr, 0, name_len);
+    if (dp < 0) { return cast(*d.Module, 0); }
+    let is *d.Variable as v = lookup_var(name_ptr, dp);
+    if (cast(i64, v) == 0 || v.is_module == 0 || cast(i64, v.module_ref) == 0) {
+        return cast(*d.Module, 0);
+    }
+    let is i32 as off with mut = dp + 1;
+    let is *d.Module as m = descend_submodules(cast(*d.Module, v.module_ref), name_ptr, name_len, &off);
+    *out_off = off;
+    *out_only = cast(i32, v.has_only);
+    return m;
+}
+
 // === Error helpers ===
 
 fn sem_error(msg as *u8) as void {
