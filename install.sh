@@ -444,6 +444,21 @@ if [ "$FROM_SRC" = 1 ]; then
     rm -rf "$TMPDIR/pkg"; mkdir -p "$TMPDIR/pkg"
     tar xzf "$SOURCE_DIR/$TARBALL" -C "$TMPDIR/pkg"
     SRC="$TMPDIR/pkg/caustic-x86_64-linux"
+
+    # The universal image is not in the linux tarball — `dist` does not build it,
+    # so without this the install step below falls through to downloading the
+    # released one, and --from-source would hand back a binary that is not from
+    # this source. --mode=bundle links one body per OS/architecture and welds
+    # them, so it is the slowest thing here; only build it when asked for.
+    if has cse "$FORMATS"; then
+        echo "  building $UNIVERSAL"
+        ( cd "$SOURCE_DIR" \
+          && caustic -O2 --target=caustic --mode=bundle src/main.cst -o caustic-universal >>"$LOG" 2>&1 ) \
+          || { echo "error: universal build failed"; tail -20 "$LOG"; exit 1; }
+        [ -f "$SOURCE_DIR/$UNIVERSAL" ] \
+          || { echo "error: the universal build produced no $UNIVERSAL"; exit 1; }
+        cp "$SOURCE_DIR/$UNIVERSAL" "$SRC/bin/$UNIVERSAL"
+    fi
 else
     need_curl
     echo "downloading latest release ..."
