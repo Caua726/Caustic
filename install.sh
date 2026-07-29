@@ -503,7 +503,21 @@ install_format() {
                 run cp "$TMPDIR/$UNIVERSAL" "$BIN_DIR/$UNIVERSAL"; track "$BIN_DIR/$UNIVERSAL"
             fi
             run chmod +x "$BIN_DIR/$UNIVERSAL"
-            NAME="$UNIVERSAL" ;;
+            # The image must start with MZ for the Windows loader, and on Linux
+            # that same magic is what wine and mono claim in binfmt_misc. Where
+            # either is installed the kernel hands the file to wine BEFORE the
+            # shell ever sees the stub, so running the image by name silently
+            # executes its Windows body instead of the ELF one — it compiles,
+            # and quietly produces a broken binary. Going through sh explicitly
+            # is what keeps the right body running, so the invocable name is a
+            # launcher and the image itself is only ever data. $0 is absolute
+            # here: the kernel got a resolved path to run the #! line with.
+            printf '#!/bin/sh\nexec sh "$(dirname -- "$0")/%s" "$@"\n' "$UNIVERSAL" \
+                > "$TMPDIR/caustic-cse"
+            chmod +x "$TMPDIR/caustic-cse"
+            run cp "$TMPDIR/caustic-cse" "$BIN_DIR/caustic-cse"; track "$BIN_DIR/caustic-cse"
+            run chmod +x "$BIN_DIR/caustic-cse"
+            NAME="caustic-cse" ;;
     esac
 }
 for f in $(echo "$FORMATS" | tr ',' ' '); do
