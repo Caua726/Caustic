@@ -103,7 +103,7 @@ The total size of an array type is `N * sizeof(T)`. Arrays are allocated inline 
 
 - The length is fixed at compile time. Variable-length arrays are not supported.
 - A named length must resolve to a `with imut` constant holding a non-negative integer that fits in an `i32`. A `with mut` global is rejected.
-- **A struct field cannot use a named length.** Struct layout is computed in pass 3 (`resolve_fields`) and globals are const-folded in pass 5 (`register_vars`), so the constant is not visible yet. Use a literal in a field declaration. Locals, globals, parameters, `sizeof` and `cast` all resolve after folding and accept a name.
+- A named length in a **struct field** is resolved by a pre-pass (`prefold_consts`, run between `register_aliases` and `resolve_fields`) that folds the top-level `with imut` globals whose initializer is already a compile-time integer. That pass sees literals and arithmetic over them; a constant defined in terms of *another* global does not fold that early, because the other one is not declared yet, and is an error rather than a guess. Everywhere else — locals, globals, parameters, `sizeof`, `cast` — resolution happens after pass 5 and the full folder applies.
 - No multi-dimensional array syntax. Nested arrays like `[3][4]i32` must be written as `[3][4]i32` (array of arrays), parsed recursively.
 
 ## Named Types (Struct and Enum)

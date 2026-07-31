@@ -46,13 +46,25 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   The parser defers the name — it has no symbol table — and `resolve_type_ref`
   folds it against the value `walk_let` already computes for `imut` globals,
   erroring if it is not a non-negative integer constant that fits in an `i32`.
-  Works for locals, globals, parameters, `sizeof` and `cast`. **Not** for struct
-  fields: layout is computed in pass 3 and globals fold in pass 5, so a field
-  still needs a literal — and now says so instead of sizing itself to nothing.
+  Works for locals, globals, parameters, `sizeof`, `cast`, and struct fields —
+  the last through `prefold_consts`, a pass between `register_aliases` and
+  `resolve_fields` that folds the top-level `imut` globals already holding a
+  compile-time integer. Layout runs before the general const-fold and the two
+  passes cannot swap (a global whose type is a struct needs that struct's
+  layout), so the field case needs its own early answer. A constant defined in
+  terms of another global does not fold that early and is an error, which is
+  the honest outcome.
 - `tests/array_dim_test.cst`. It checks the sizes and then writes through each
   array to confirm the neighbouring variables survive. The canaries are the real
   test: a correct `sizeof` alone would not have caught what the original bug did
   to a global.
+- `tools/precommit.sh` exports `CAUSTIC_LIB="$ROOT"`. Every compiler the gate
+  builds runs out of a scratch dir, where `<binary>/../lib/caustic` is
+  `/tmp/lib/caustic`, so the cross-target step only passed on a machine with
+  the toolchain installed under `/usr/local`; anywhere else it failed with
+  `nao foi possivel ler modulo` and read as a regression in whatever was being
+  committed. The repo's own `std/` is the right answer regardless — the gate
+  tests THIS tree.
 - **`io.write_file_atomic(path, buf, len)`** — write a whole file so a
   concurrent reader never sees a partial one. Writes to `<path>.<pid>.tmp` and
   renames over the target; returns -1 leaving the previous file untouched.

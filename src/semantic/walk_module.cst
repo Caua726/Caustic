@@ -431,6 +431,34 @@ fn register_aliases(node as *u8) as void {
     }
 }
 
+// Fold the top-level `with imut` globals that are already compile-time
+// integers, BEFORE struct layout needs them.
+//
+// A field written `[MAX]u8` is sized in resolve_fields (pass 3), and globals
+// are const-folded in register_vars (pass 5) — so without this the field
+// reaches resolve_type_ref with nothing to look up, and cannot be sized. The
+// passes cannot simply swap: a global whose TYPE is a struct needs that
+// struct's layout first.
+//
+// Cheap and narrow on purpose. One walk of the top level, keeping only what
+// try_fold_const can evaluate with no symbol table behind it — literals and
+// arithmetic over them. A constant defined in terms of another global is not
+// folded here (the other one is not declared yet) and falls through to the
+// error, which is the honest outcome and better than a size nobody chose.
+fn prefold_consts(node as *u8) as void {
+    ty.dim_reg_reset();
+    let is *ast.Node as n with mut = cast(*ast.Node, node);
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_LET && n.flags == ast.VF_IMUT && cast(i64, n.init_expr) != 0) {
+            let is i64 as v with mut = 0;
+            if (w.try_fold_const(n.init_expr, &v, 0) == 1) {
+                ty.dim_reg_add(n.name_ptr, n.name_len, v);
+            }
+        }
+        n = n.next;
+    }
+}
+
 fn resolve_fields(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
@@ -595,10 +623,12 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
         }
     }
 
-    // 6 passes. register_fns runs before register_vars so globals can
-    // reference functions via fn_ptr() in their initializers.
+    // register_fns runs before register_vars so globals can reference
+    // functions via fn_ptr() in their initializers, and prefold_consts runs
+    // before resolve_fields so a struct field can be `[MAX]u8`.
     register_structs(root);
     register_aliases(root);
+    prefold_consts(root);
     resolve_fields(root);
     register_fns(root);
     register_vars(root);
