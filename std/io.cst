@@ -110,6 +110,74 @@ fn rename(src as *u8, dst as *u8) as i32 {
     return cast(i32, 0 - 1);
 }
 
+// Write a whole file so that a reader never sees a partial one.
+//
+// _open_write truncates, so the plain open/write/close sequence leaves the file
+// at zero length for as long as the write takes, and leaves it truncated
+// forever if the process dies partway. Two processes writing the same path
+// interleave into a file that is neither of theirs. Both matter for anything a
+// CONCURRENT reader consumes — a build cache written by parallel jobs is the
+// case this exists for, where the result is one process's valid-looking header
+// over another's body, which passes every check the reader makes.
+//
+// So: write the whole thing to "<path>.<pid>.tmp", then rename over the target.
+// rename(2) is atomic and replaces; MoveFileExA is given
+// MOVEFILE_REPLACE_EXISTING for the same effect. A reader sees either the
+// complete old file or the complete new one. The pid in the name is what keeps
+// two processes from colliding on the temporary as well.
+//
+// Returns 0 on success, -1 on failure — leaving the previous file untouched.
+fn write_file_atomic(path as *u8, buf as *u8, len as i64) as i32 {
+    let is i64 as plen = strlen(path);
+    let is i64 as tcap = plen + 32;                  // ".<20 digits>.tmp" and room to spare
+    let is *u8 as tmp = mem.core.mmap_anon(tcap);
+    if (cast(i64, tmp) == 0 || cast(i64, tmp) == 0 - 1) { return cast(i32, 0 - 1); }
+    mem.core.memcpy(tmp, path, plen);
+
+    let is i64 as w with mut = plen;
+    tmp[w] = cast(u8, 46); w = w + 1;                // '.'
+    let is i64 as p with mut = os.pid();
+    if (p < 0) { p = 0 - p; }
+    let is i64 as dstart = w;
+    if (p == 0) { tmp[w] = cast(u8, 48); w = w + 1; }
+    while (p > 0) { tmp[w] = cast(u8, 48 + p % 10); p = p / 10; w = w + 1; }
+    let is i64 as a with mut = dstart;               // digits came out reversed
+    let is i64 as b with mut = w - 1;
+    while (a < b) {
+        let is u8 as t = tmp[a]; tmp[a] = tmp[b]; tmp[b] = t;
+        a = a + 1; b = b - 1;
+    }
+    tmp[w] = cast(u8, 46);  w = w + 1;               // ".tmp"
+    tmp[w] = cast(u8, 116); w = w + 1;
+    tmp[w] = cast(u8, 109); w = w + 1;
+    tmp[w] = cast(u8, 112); w = w + 1;
+    tmp[w] = cast(u8, 0);
+
+    let is i64 as fd = _open_write(tmp);
+    if (fd < 0) { mem.core.munmap(tmp, tcap); return cast(i32, 0 - 1); }
+
+    let is i64 as done with mut = 0;
+    while (done < len) {
+        let is i64 as n = _write_fd(fd, cast(*u8, cast(i64, buf) + done), len - done);
+        if (n <= 0) {
+            _close_fd(fd);
+            unlink(tmp);
+            mem.core.munmap(tmp, tcap);
+            return cast(i32, 0 - 1);
+        }
+        done = done + n;
+    }
+    _close_fd(fd);
+
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        mem.core.munmap(tmp, tcap);
+        return cast(i32, 0 - 1);
+    }
+    mem.core.munmap(tmp, tcap);
+    return 0;
+}
+
 fn mkdir(path as *u8) as i32 {
     if (os.current() == os.OS_LINUX)   { return linux_io.mkdir(path); }
     if (os.current() == os.OS_WINDOWS) { return windows_io.mkdir(path); }

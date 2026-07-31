@@ -9,6 +9,28 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 ## Unreleased
 
 ### Fixed
+- **The build cache could be read back as another file's contents.** Three
+  things stacked up. The cache key was the source's BASENAME, so `tests/run.cst`
+  and `examples/run.cst` — any two files sharing a name — wrote to one cache
+  file, and `caustic-mk` runs jobs in parallel against one cache directory, so
+  that is several processes on one path. Every writer (`.tokens`, `.ast` /
+  `.csti`, `.ir`) opened the target with `O_TRUNC` and wrote in place, leaving
+  it empty for the length of the write and truncated forever if the process
+  died partway — and the token writer issued one `write` per token, widening
+  that window to the whole file. Finally `read_token_cache` checked none of the
+  header against the bytes present: it copied `source_size` out of a possibly
+  shorter buffer, walked `token_count` records past the end, and set each
+  token's `ptr` to `src + offset` with an offset nobody bounded. Since `ptr` is
+  what a diagnostic quotes, a damaged cache produced errors about text the
+  compiler had never read; the shape seen in practice was a file parsed into
+  nothing and a **linker** failure — `entry point not found` — naming a symbol
+  rather than the cache that was actually broken. The workaround was
+  `rm -f .caustic/*.ast .caustic/*.tokens`.
+
+  Now: cache keys carry 8 hex digits of djb2 over the full path, every cache
+  image is written to `<path>.<pid>.tmp` and `rename`d into place (atomic, and
+  replacing on Windows too), and the token reader rejects any file that does
+  not describe itself exactly. Covered by `tests/cache_guard_test.cst`.
 - **`[N]T` with a non-literal length silently produced a zero-sized array.**
   `parse_type` read `cur().int_val` for whatever token followed the bracket,
   with no check that it was a number. An identifier has an `int_val` of 0, so
@@ -31,6 +53,11 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   array to confirm the neighbouring variables survive. The canaries are the real
   test: a correct `sizeof` alone would not have caught what the original bug did
   to a global.
+- **`io.write_file_atomic(path, buf, len)`** — write a whole file so a
+  concurrent reader never sees a partial one. Writes to `<path>.<pid>.tmp` and
+  renames over the target; returns -1 leaving the previous file untouched.
+- **`os.pid()`** — the process id, portable across Linux, Windows and CausticOS
+  (wasm answers 1, having no processes). Added for the temporary name above.
 
 ## [v0.1.5](https://github.com/Caua726/Caustic/releases/tag/v0.1.5) — 2026-07-26
 

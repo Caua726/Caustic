@@ -258,23 +258,51 @@ fn resolve_stdlib_dir() as void {
     }
 }
 
+// <cache_dir>/<8 hex of the full path>_<basename><suffix>
+//
+// The key used to be the BASENAME alone, so tests/run.cst and examples/run.cst
+// — any two files sharing a name anywhere in a project — wrote to the same
+// cache file. The stored content hash meant the loser got a miss rather than
+// the wrong AST, so it read as "the cache just isn't helping". But caustic-mk
+// runs jobs in parallel against one cache directory, and two processes writing
+// one path is how a torn file gets made in the first place.
+//
+// The directory part is hashed rather than spelled out because a mangled deep
+// path runs past the 255-byte limit on a filename component. Eight hex digits
+// of djb2 over the full path, plus the basename to keep it readable.
 fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len as i32) as *u8 {
     if (cast(i64, cache_dir) == 0) { return cast(*u8, 0); }
     let is i32 as fname_len = strlen(filename);
     let is i32 as base_start with mut = 0;
     let is i32 as si with mut = 0;
     while (si < fname_len) {
-        if (filename[si] == 47) { base_start = si + 1; }
+        if (filename[si] == 47 || filename[si] == 92) { base_start = si + 1; }
         si = si + 1;
     }
     let is i32 as base_len = fname_len - base_start;
     let is i32 as dir_len = strlen(cache_dir);
-    let is i32 as total = dir_len + 1 + base_len + suffix_len;
+    let is i64 as h = tokcache.djb2_hash(filename, cast(i64, fname_len));
+
+    let is i32 as total = dir_len + 1 + 8 + 1 + base_len + suffix_len;
     let is *u8 as path = ird.opt_alloc(cast(i64, total) + 1);
     mem.memcpy(path, cache_dir, cast(i64, dir_len));
-    path[dir_len] = 47;
-    mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, dir_len) + 1), cast(*u8, cast(i64, filename) + cast(i64, base_start)), cast(i64, base_len));
-    mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, dir_len) + 1 + cast(i64, base_len)), suffix, cast(i64, suffix_len));
+    let is i32 as w with mut = dir_len;
+    path[w] = 47; w = w + 1;
+
+    let is i32 as d with mut = 7;
+    while (d >= 0) {
+        let is i64 as nib = (h >> cast(i64, d * 4)) & 15;
+        if (nib < 10) { path[w] = cast(u8, 48 + nib); }
+        else { path[w] = cast(u8, 87 + nib); }
+        w = w + 1;
+        d = d - 1;
+    }
+    path[w] = cast(u8, 95); w = w + 1;                        // '_'
+
+    mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, w)),
+               cast(*u8, cast(i64, filename) + cast(i64, base_start)), cast(i64, base_len));
+    w = w + base_len;
+    mem.memcpy(cast(*u8, cast(i64, path) + cast(i64, w)), suffix, cast(i64, suffix_len));
     path[total] = cast(u8, 0);
     return path;
 }

@@ -1,0 +1,158 @@
+// tests/cache_guard_test.cst
+//
+// read_token_cache used to trust three numbers out of the file header without
+// ever checking them against the bytes actually present:
+//
+//   * `source_size` — memcpy'd that many bytes out of a buffer that could be
+//     shorter, reading past the end of the file it just loaded;
+//   * `token_count` — walked that many 28-byte records from the end of the
+//     source blob, past the end of the buffer;
+//   * each token's `offset` — stored straight into `t.ptr = src + offset`,
+//     with no bound. A token could point anywhere.
+//
+// The last one is the nasty one, because `t.ptr` is what an error message
+// quotes. A cache file that had been truncated or written by two parallel jobs
+// at once produced a compiler that reported a syntax error in text it had
+// never read, or — the shape seen in practice — parsed a whole file into
+// nothing and failed in the LINKER with "entry point not found", naming a
+// symbol instead of the cache file that was actually broken.
+//
+// Every case here is a file whose header is INTACT and whose hash MATCHES, so
+// nothing before these checks can reject it. Three cases are well-formed and
+// must be ACCEPTED — a guard that refuses everything is not a guard.
+//
+// Not covered: the check that _read_fd returned as many bytes as lseek said
+// the file held. A short read on a regular local file cannot be provoked from
+// here; the check stays because the return was simply being discarded, and a
+// dropped return is how the rest of this list happened.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+
+use "../std/io.cst" as io;
+use "../std/mem.cst" as mem;
+use "../src/lexer/cache.cst" as tc;
+use "../src/lexer/tokens.cst" as tok;
+
+let is i32 as HDR with imut = 24;
+let is i32 as REC with imut = 28;
+
+let is *u8 as SRC with imut = "fn main() as i32 { return 0; }";
+let is i64 as SRC_LEN with imut = 30;
+
+let is *u8 as PATH with imut = "build/ct_cache_guard.bin";
+
+// Lay down a token cache: header, source blob, then `nrec` records whose
+// offset/len come from the caller so a single bad one can be aimed precisely.
+// `body_cut` trims that many bytes off the end, which is what a torn write
+// leaves behind.
+fn emit(ntok as i32, srcsz as i32, nrec as i32,
+        off0 as i32, len0 as i32, body_cut as i64) as i32 {
+    let is i64 as total = cast(i64, HDR) + SRC_LEN + cast(i64, nrec) * cast(i64, REC);
+    let is *u8 as buf = mem.core.mmap_anon(total + 64);
+    if (cast(i64, buf) == 0 || cast(i64, buf) == 0 - 1) { return 1; }
+
+    let is i64 as h = tc.djb2_hash(SRC, SRC_LEN);
+    tc.put_i32(buf, 0, 1397571907);          // CACHE_MAGIC "CTKS"
+    tc.put_i32(buf, 4, 1);                   // CACHE_VERSION
+    tc.put_i32(buf, 8, ntok);
+    tc.put_i32(buf, 12, srcsz);
+    tc.put_i32(buf, 16, 0);
+    tc.put_i32(buf, 20, cast(i32, h & cast(i64, 2147483647)));
+
+    mem.core.memcpy(cast(*u8, cast(i64, buf) + cast(i64, HDR)), SRC, SRC_LEN);
+
+    let is i64 as base = cast(i64, HDR) + SRC_LEN;
+    let is i32 as i with mut = 0;
+    while (i < nrec) {
+        let is i64 as at = base + cast(i64, i) * cast(i64, REC);
+        tc.put_i32(buf, at, 1);              // TK_IDENT
+        tc.put_i32(buf, at + 4, off0);
+        tc.put_i32(buf, at + 8, len0);
+        tc.put_i32(buf, at + 12, 1);
+        tc.put_i32(buf, at + 16, 1);
+        tc.put_i64(buf, at + 20, 0);
+        i = i + 1;
+    }
+
+    let is i64 as write_len with mut = total - body_cut;
+    if (write_len < 0) { write_len = 0; }
+    let is i32 as rc = io.write_file_atomic(PATH, buf, write_len);
+    mem.core.munmap(buf, total + 64);
+    return rc;
+}
+
+// 0 when read_token_cache accepted the file, 1 when it rejected it.
+fn accepted() as i32 {
+    let is tok.TokenList as tl;
+    let is i64 as srcp with mut = 0;
+    let is i64 as srcsz with mut = 0;
+    let is i64 as h = tc.djb2_hash(SRC, SRC_LEN);
+    let is i32 as want = cast(i32, h & cast(i64, 2147483647));
+    if (tc.read_token_cache(PATH, cast(*u8, &tl), cast(*u8, &srcp), &srcsz, want) == 0) { return 1; }
+    return 0;
+}
+
+fn main() as i32 {
+    // --- well formed: must be ACCEPTED, and read back what was written ---
+    if (emit(3, cast(i32, SRC_LEN), 3, 0, 2, 0) != 0) { return 1; }
+    if (accepted() != 1) { return 2; }
+
+    // --- the body is short: the records the header promises are not there ---
+    // This is a torn write, and the shape that produced "entry point not
+    // found" — every record read back as zeros, so the file parsed to nothing.
+    if (emit(3, cast(i32, SRC_LEN), 0, 0, 2, 0) != 0) { return 3; }   // 0 records on disk, header says 3
+    if (accepted() != 0) { return 4; }
+
+    // A single byte missing off the end is still not the file it claims to be.
+    if (emit(3, cast(i32, SRC_LEN), 3, 0, 2, 1) != 0) { return 5; }
+    if (accepted() != 0) { return 6; }
+
+    // --- trailing bytes: also not what the header describes ---
+    if (emit(3, cast(i32, SRC_LEN), 4, 0, 2, 0) != 0) { return 7; }   // 4 on disk, header says 3
+    if (accepted() != 0) { return 8; }
+
+    // --- source_size disagrees with the blob that follows it ---
+    if (emit(3, cast(i32, SRC_LEN) + 16, 3, 0, 2, 0) != 0) { return 9; }
+    if (accepted() != 0) { return 10; }
+
+    // --- a token that points outside the source ---
+    // Nothing about the file's SIZE is wrong here; only the offset is. This is
+    // the one that made the compiler quote text it had never read.
+    if (emit(3, cast(i32, SRC_LEN), 3, cast(i32, SRC_LEN) + 8, 2, 0) != 0) { return 11; }
+    if (accepted() != 0) { return 12; }
+
+    // Starts inside, runs off the end.
+    if (emit(3, cast(i32, SRC_LEN), 3, cast(i32, SRC_LEN) - 1, 9, 0) != 0) { return 13; }
+    if (accepted() != 0) { return 14; }
+
+    // Exactly to the last byte is legal and must still be accepted.
+    if (emit(3, cast(i32, SRC_LEN), 3, cast(i32, SRC_LEN) - 4, 4, 0) != 0) { return 15; }
+    if (accepted() != 1) { return 16; }
+
+    // --- negative counts ---
+    if (emit(0 - 1, cast(i32, SRC_LEN), 3, 0, 2, 0) != 0) { return 17; }
+    if (accepted() != 0) { return 18; }
+    if (emit(3, 0 - 1, 3, 0, 2, 0) != 0) { return 19; }
+    if (accepted() != 0) { return 20; }
+    if (emit(3, cast(i32, SRC_LEN), 3, 0 - 1, 2, 0) != 0) { return 21; }
+    if (accepted() != 0) { return 22; }
+    if (emit(3, cast(i32, SRC_LEN), 3, 0, 0 - 1, 0) != 0) { return 23; }
+    if (accepted() != 0) { return 24; }
+
+    // A negative count that CANCELS OUT against an inflated source_size, so
+    // the total-size arithmetic agrees with the file and waves it through:
+    //   24 + (SRC_LEN + 28) + (-1 * 28)  ==  24 + SRC_LEN  ==  the real size.
+    // The size check alone accepts this, and then the source blob is copied at
+    // 28 bytes longer than the file. It is the case that makes the explicit
+    // sign test earn its place instead of being redundant with the size test.
+    if (emit(0 - 1, cast(i32, SRC_LEN) + 28, 0, 0, 2, 0) != 0) { return 27; }
+    if (accepted() != 0) { return 28; }
+
+    // --- and the well-formed file still works after all of that ---
+    if (emit(3, cast(i32, SRC_LEN), 3, 0, 2, 0) != 0) { return 25; }
+    if (accepted() != 1) { return 26; }
+
+    io.unlink(PATH);
+    io.write_str(io.STDOUT, "cache_guard: ok\n");
+    return 0;
+}

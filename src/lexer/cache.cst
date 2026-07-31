@@ -42,47 +42,51 @@ fn get_i64(buf as *u8, off as i64) as i64 {
     return *p;
 }
 
-// Serialize token list to binary cache file
+// Serialize token list to binary cache file.
+//
+// Built whole in memory and written through io.write_file_atomic. It used to
+// open the file (which truncates), then issue one write for the header, one
+// for the source blob and one PER TOKEN — leaving the file incomplete on disk
+// for the whole of that, and truncated forever if the process died in the
+// middle. `caustic-mk` runs jobs in parallel against a shared cache directory,
+// so "incomplete on disk" is a file another process is reading.
 fn write_token_cache(path as *u8, tl_ptr as *u8, src as *u8, src_size as i64) as i32 {
     let is *tok.TokenList as tl = cast(*tok.TokenList, tl_ptr);
-    let is i64 as fd = io._open_write(path);
-    if (fd < 0) {
-        return 1;
-    }
+    if (src_size < 0 || tl.count < 0) { return 1; }
 
     let is i64 as hash = djb2_hash(src, src_size);
     let is i32 as hash32 = cast(i32, hash & cast(i64, 2147483647));
 
-    // Write header
-    let is [24]u8 as hdr;
-    put_i32(&hdr, 0, CACHE_MAGIC);
-    put_i32(&hdr, 4, CACHE_VERSION);
-    put_i32(&hdr, 8, tl.count);
-    put_i32(&hdr, 12, cast(i32, src_size));
-    put_i32(&hdr, 16, 0);
-    put_i32(&hdr, 20, hash32);
-    io._write_fd(fd, &hdr, cast(i64, HEADER_SIZE));
+    let is i64 as total = cast(i64, HEADER_SIZE) + src_size
+                        + cast(i64, tl.count) * cast(i64, RECORD_SIZE);
+    let is *u8 as out = tok.tok_alloc(total);
+    if (cast(i64, out) == 0) { return 1; }
 
-    // Write source blob
-    io._write_fd(fd, src, src_size);
+    put_i32(out, 0, CACHE_MAGIC);
+    put_i32(out, 4, CACHE_VERSION);
+    put_i32(out, 8, tl.count);
+    put_i32(out, 12, cast(i32, src_size));
+    put_i32(out, 16, 0);
+    put_i32(out, 20, hash32);
 
-    // Write token records
-    let is [28]u8 as rec;
+    mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, HEADER_SIZE)), src, src_size);
+
+    let is i64 as rec_base = cast(i64, HEADER_SIZE) + src_size;
     let is i32 as i with mut = 0;
     while (i < tl.count) {
         let is *tok.Token as t = cast(*tok.Token, cast(i64, tl.data) + cast(i64, i) * 32);
+        let is i64 as at = rec_base + cast(i64, i) * cast(i64, RECORD_SIZE);
         let is i32 as offset = cast(i32, cast(i64, t.ptr) - cast(i64, src));
-        put_i32(&rec, 0, t.kind);
-        put_i32(&rec, 4, offset);
-        put_i32(&rec, 8, t.len);
-        put_i32(&rec, 12, t.line);
-        put_i32(&rec, 16, t.col);
-        put_i64(&rec, 20, t.int_val);
-        io._write_fd(fd, &rec, cast(i64, RECORD_SIZE));
+        put_i32(out, at, t.kind);
+        put_i32(out, at + 4, offset);
+        put_i32(out, at + 8, t.len);
+        put_i32(out, at + 12, t.line);
+        put_i32(out, at + 16, t.col);
+        put_i64(out, at + 20, t.int_val);
         i = i + 1;
     }
 
-    io._close_fd(fd);
+    if (io.write_file_atomic(path, out, total) != 0) { return 1; }
     return 0;
 }
 
@@ -104,8 +108,12 @@ fn read_token_cache(path as *u8, tl_ptr as *u8, out_src as *u8, out_size as *i64
 
     // Read entire file
     let is *u8 as buf = tok.tok_alloc(file_size);
-    io._read_fd(fd, buf, file_size);
+    let is i64 as nread = io._read_fd(fd, buf, file_size);
     io._close_fd(fd);
+    if (nread != file_size) {
+        tok.om.opt_free(buf);
+        return 1;
+    }
 
     // Validate header
     let is i32 as magic = get_i32(buf, 0);
@@ -128,8 +136,31 @@ fn read_token_cache(path as *u8, tl_ptr as *u8, out_src as *u8, out_size as *i64
         return 1;
     }
 
-    // Copy source blob into null-terminated buffer
+    // NOTHING above this line has checked that the counts in the header
+    // describe the bytes actually on disk. They used to be taken on trust: the
+    // source blob was memcpy'd out at the header's length from a buffer that
+    // might be shorter, the token records were walked past the end of the
+    // file, and each token's `ptr` was set to src+offset with an offset the
+    // file supplied and no one bounded. A truncated or interleaved cache file
+    // therefore produced tokens pointing outside the source — which is read
+    // back when an error message quotes the offending text, so the failure
+    // surfaced as a diagnostic about some unrelated module, or as garbage.
+    //
+    // A file that does not describe itself exactly is not usable. Reparsing is
+    // cheap; guessing is not.
+    if (source_size < 0 || token_count < 0) {
+        tok.om.opt_free(buf);
+        return 1;
+    }
     let is i64 as src_len = cast(i64, source_size);
+    let is i64 as expected_size = cast(i64, HEADER_SIZE) + src_len
+                                + cast(i64, token_count) * cast(i64, RECORD_SIZE);
+    if (file_size != expected_size) {
+        tok.om.opt_free(buf);
+        return 1;
+    }
+
+    // Copy source blob into null-terminated buffer
     let is *u8 as src = tok.tok_alloc(src_len + 1);
     mem.memcpy(src, cast(*u8, cast(i64, buf) + cast(i64, HEADER_SIZE)), src_len);
     src[source_size] = cast(u8, 0);
@@ -150,8 +181,19 @@ fn read_token_cache(path as *u8, tl_ptr as *u8, out_src as *u8, out_size as *i64
         let is *tok.Token as t = cast(*tok.Token, cast(i64, tok_data) + cast(i64, i) * 32);
         t.kind = get_i32(r, 0);
         let is i32 as offset = get_i32(r, 4);
+        let is i32 as tlen = get_i32(r, 8);
+        // A token must lie inside the source it came with. Off by anything and
+        // every later read through t.ptr is someone else's memory.
+        if (offset < 0 || tlen < 0) {
+            tok.om.opt_free(buf);
+            return 1;
+        }
+        if (cast(i64, offset) + cast(i64, tlen) > src_len) {
+            tok.om.opt_free(buf);
+            return 1;
+        }
         t.ptr = cast(*u8, cast(i64, src) + cast(i64, offset));
-        t.len = get_i32(r, 8);
+        t.len = tlen;
         t.line = get_i32(r, 12);
         t.col = get_i32(r, 16);
         t.int_val = get_i64(r, 20);
