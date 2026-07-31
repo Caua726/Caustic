@@ -23,6 +23,19 @@ set -u
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 1
 
+# Every compiler this gate builds runs out of $TMP, and a compiler resolves
+# `std/` from $CAUSTIC_LIB, then <its own dir>/../lib/caustic, then
+# /usr/local/lib/caustic. From $TMP the middle one is /tmp/lib/caustic, so the
+# gate only passed where the toolchain happened to be installed under
+# /usr/local. On a ~/.local install the cross-target step died with
+#   Erro: nao foi possivel ler modulo: '<tmp>/std/io.cst'
+# and read as a regression in whatever was being committed.
+#
+# The repo's own std/ is the right answer regardless of where anything is
+# installed: this gate tests THIS tree, and should not be reading an installed
+# copy that may be a different version.
+export CAUSTIC_LIB="$ROOT"
+
 # ---- pretty output ---------------------------------------------------------
 if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; N=$'\e[0m'
 else B=; G=; R=; Y=; D=; N=; fi
