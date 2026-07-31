@@ -6,6 +6,32 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## Unreleased
+
+### Fixed
+- **`[N]T` with a non-literal length silently produced a zero-sized array.**
+  `parse_type` read `cur().int_val` for whatever token followed the bracket,
+  with no check that it was a number. An identifier has an `int_val` of 0, so
+  `let is [MAX]u8 as buf;` was accepted as an array of length 0 and size 0 — no
+  error at any stage — and every write through `buf` ran off its zero-byte slot
+  into the neighbouring variable. `sizeof([MAX]u8)` reported 0 while
+  `sizeof([256]u8)` reported 256; a global declared that way reserved no `.bss`
+  space and aliased whatever followed it. A non-numeric, non-identifier length
+  is now a parse error, and a negative literal is rejected.
+
+### Added
+- **A `with imut` constant can be used as an array length**: `[MAX_NAME]u8`.
+  The parser defers the name — it has no symbol table — and `resolve_type_ref`
+  folds it against the value `walk_let` already computes for `imut` globals,
+  erroring if it is not a non-negative integer constant that fits in an `i32`.
+  Works for locals, globals, parameters, `sizeof` and `cast`. **Not** for struct
+  fields: layout is computed in pass 3 and globals fold in pass 5, so a field
+  still needs a literal — and now says so instead of sizing itself to nothing.
+- `tests/array_dim_test.cst`. It checks the sizes and then writes through each
+  array to confirm the neighbouring variables survive. The canaries are the real
+  test: a correct `sizeof` alone would not have caught what the original bug did
+  to a global.
+
 ## [v0.1.5](https://github.com/Caua726/Caustic/releases/tag/v0.1.5) — 2026-07-26
 
 Shell completions. Full notes: [`docs/releases/v0.1.5.md`](docs/releases/v0.1.5.md).

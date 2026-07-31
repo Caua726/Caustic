@@ -340,6 +340,45 @@ fn declare_enum(name_ptr as *u8, name_len as i32, ty as *u8) as void {
 
 // === Resolve type reference ===
 
+// The length of `[NAME]T`, from a `with imut` global that walk_let already
+// const-folded.
+//
+// Returns 1 with the value in *out. On failure returns 0 and writes a reason
+// into *why, because the two failures want different advice and a single
+// message would be wrong half the time:
+//
+//   DIM_NOT_FOUND — no such variable is in scope AT THIS POINT. Usually a
+//     typo, but also the one real limitation of this feature: struct fields
+//     are laid out in pass 3 and globals are folded in pass 5, so a field
+//     written `[MAX]u8` cannot see MAX however it is declared. Locals,
+//     globals, sizeof and parameters all resolve after folding and are fine.
+//
+//   DIM_NOT_CONST — it exists and is not a foldable integer constant: a
+//     `with mut` global, or an initializer that is not a compile-time value.
+//
+// The i32 bound is not decoration: array_len is an i32 and the size product is
+// computed in i32, so a larger length would wrap to a small or negative size —
+// the same silent corruption this whole path exists to close.
+let is i32 as DIM_OK        with imut = 0;
+let is i32 as DIM_NOT_FOUND with imut = 1;
+let is i32 as DIM_NOT_CONST with imut = 2;
+
+fn fold_array_dim(name_ptr as *u8, name_len as i32, out as *i64, why as *i32) as i32 {
+    *why = DIM_NOT_FOUND;
+    if (name_len <= 0) { return 0; }
+    if (cast(i64, name_ptr) == 0) { return 0; }
+    let is *d.Variable as v = sc.lookup_var(name_ptr, name_len);
+    if (cast(i64, v) == 0) { return 0; }
+    *why = DIM_NOT_CONST;
+    if (v.has_folded_init == 0) { return 0; }
+    let is i64 as n = v.folded_init_val;
+    if (n < 0) { return 0; }
+    if (n > 2147483647) { return 0; }
+    *out = n;
+    *why = DIM_OK;
+    return 1;
+}
+
 fn resolve_type_ref(ty_ptr as *u8) as void {
     if (cast(i64, ty_ptr) == 0) { return; }
     let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
@@ -504,6 +543,29 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
             // Recompute now that the base type is fully resolved.
             if (ty.kind == ast.TY_ARRAY) {
                 let is *ast.Type as _bt = cast(*ast.Type, ty.base);
+                // `[MAX]u8` — the length was written as a constant's name. The
+                // parser left ARRAY_LEN_PENDING and the name in name_ptr,
+                // because it has no symbol table; this is the first point that
+                // does. Fold it, or say so — never fall through to a zero,
+                // which is the whole reason the marker exists.
+                if (ty.array_len == ast.ARRAY_LEN_PENDING) {
+                    let is i64 as dim with mut = 0;
+                    let is i32 as why with mut = 0;
+                    if (fold_array_dim(ty.name_ptr, ty.name_len, &dim, &why) == 1) {
+                        ty.array_len = cast(i32, dim);
+                        ty.name_ptr = cast(*u8, 0);
+                        ty.name_len = 0;
+                    } else {
+                        if (why == DIM_NOT_CONST) {
+                            sc.sem_error2("tamanho de array precisa ser uma constante `with imut` inteira e nao-negativa:",
+                                          ty.name_ptr, ty.name_len);
+                        } else {
+                            sc.sem_error2("tamanho de array: nome nao encontrado neste ponto (num campo de struct use um literal — o layout e calculado antes das globais serem dobradas):",
+                                          ty.name_ptr, ty.name_len);
+                        }
+                        ty.array_len = 0;
+                    }
+                }
                 ty.size = ty.array_len * _bt.size;
             }
         }

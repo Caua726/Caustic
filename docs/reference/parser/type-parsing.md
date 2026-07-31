@@ -76,27 +76,34 @@ levels of indirection are supported by recursive parsing.
 
 ## Array Types
 
-Syntax: `[N]T` where `N` is an integer literal and `T` is the element type.
+Syntax: `[N]T`, where `N` is an integer literal or the name of a `with imut` constant, and `T` is the element type.
 
 ```cst
 [10]i32      // array of 10 i32 values
 [256]u8      // byte buffer of 256 bytes
 [64]char     // character array
 [4]*u8       // array of 4 pointers
+
+let is i64 as MAX_NAME with imut = 255;
+[MAX_NAME]u8 // the same constant the rest of the code compares against
 ```
 
 Parsing:
 1. Consume `TK_LBRACKET`.
-2. Consume `TK_INTEGER`, store as `array_len`.
+2. If the next token is `TK_INTEGER`, store its value as `array_len`. If it is `TK_IDENT`, store `array_len = ARRAY_LEN_PENDING` (−1) and stash the identifier in the array Type's `name_ptr`/`name_len`, which an array does not otherwise use. Anything else is a parse error.
 3. Consume `TK_RBRACKET`.
 4. Parse the element type `T`.
 5. Create a `Type` with `kind=TY_ARRAY`, `base=T`, `array_len=N`.
+
+A pending length is folded in `semantic/types.cst` `resolve_type_ref`, which looks the name up with `lookup_var` and reads the `has_folded_init` value `walk_let` computed for `with imut` globals. It errors if the name is not a non-negative integer constant — it never falls back to a length of zero, because a zero-length array declares a zero-byte slot and every write through it lands on the neighbouring variable, with no diagnostic at any stage.
 
 The total size of an array type is `N * sizeof(T)`. Arrays are allocated inline (on the stack or within structs), not as heap pointers.
 
 ### Limitations
 
-- Array length must be a compile-time integer literal. Variable-length arrays are not supported.
+- The length is fixed at compile time. Variable-length arrays are not supported.
+- A named length must resolve to a `with imut` constant holding a non-negative integer that fits in an `i32`. A `with mut` global is rejected.
+- **A struct field cannot use a named length.** Struct layout is computed in pass 3 (`resolve_fields`) and globals are const-folded in pass 5 (`register_vars`), so the constant is not visible yet. Use a literal in a field declaration. Locals, globals, parameters, `sizeof` and `cast` all resolve after folding and accept a name.
 - No multi-dimensional array syntax. Nested arrays like `[3][4]i32` must be written as `[3][4]i32` (array of arrays), parsed recursively.
 
 ## Named Types (Struct and Enum)

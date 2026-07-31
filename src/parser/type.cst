@@ -40,17 +40,57 @@ fn is_primitive(ptr as *u8, len as i32) as i32 {
 
 fn parse_type() as *ast.Type {
     if (pu.p_panic_mode == 1) { return ast.type_void; }
-    // Array: [N]T
+    // Array: [N]T, where N is an integer literal or the name of a `with imut`
+    // constant.
+    //
+    // This used to read cur().int_val for whatever token followed the bracket,
+    // with no check that it was a number at all. An identifier has an int_val
+    // of 0, so `[MAX]u8` parsed cleanly into an array of length 0 and size 0 —
+    // no error, no warning — and every write through the resulting variable
+    // ran off its zero-byte slot into the neighbouring one. sizeof reported 0
+    // and the program corrupted itself.
+    //
+    // Now: a literal is taken as before, an identifier is deferred to semantic
+    // (which has the symbol table the parser does not), and anything else is
+    // an error here. There is no path left that yields a silent zero.
     if (pu.cur().kind == tok.TK_LBRACKET) {
         pu.advance();
-        let is i64 as len = pu.cur().int_val;
-        pu.advance();
+
+        let is i64 as len with mut = 0;
+        let is *u8 as dim_ptr with mut = cast(*u8, 0);
+        let is i32 as dim_len with mut = 0;
+
+        if (pu.cur().kind == tok.TK_INTEGER) {
+            len = pu.cur().int_val;
+            if (len < 0) {
+                pu.error_expected("a non-negative array length");
+                len = 0;
+            }
+            pu.advance();
+        } else if (pu.cur().kind == tok.TK_IDENT) {
+            dim_ptr = pu.str_dup(pu.cur().ptr, pu.cur().len);
+            dim_len = pu.cur().len;
+            len = cast(i64, ast.ARRAY_LEN_PENDING);
+            pu.advance();
+        } else {
+            pu.error_expected("an array length: an integer literal or a `with imut` constant");
+        }
+
         pu.expect(tok.TK_RBRACKET);
         let is *ast.Type as base = parse_type();
         let is *ast.Type as ty = ast.new_type(ast.TY_ARRAY);
         ty.base = base;
         ty.array_len = cast(i32, len);
-        ty.size = cast(i32, len) * base.size;
+        if (dim_len > 0) {
+            // Deferred: the name travels in the fields an array does not use.
+            // Size stays 0 until resolve_type_ref folds the constant, and that
+            // function errors rather than leaving it there.
+            ty.name_ptr = dim_ptr;
+            ty.name_len = dim_len;
+            ty.size = 0;
+        } else {
+            ty.size = cast(i32, len) * base.size;
+        }
         return ty;
     }
 
