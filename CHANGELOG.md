@@ -6,9 +6,45 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
-## Unreleased
+## [v0.1.7](https://github.com/Caua726/Caustic/releases/tag/v0.1.7) — 2026-08-01
+
+Threads work at `-O1`. Full notes: [`docs/releases/v0.1.7.md`](docs/releases/v0.1.7.md).
 
 ### Fixed
+- **Every threaded program segfaulted at `-O1`.** The inliner gated a callee on
+  `alloc_stack_size == 0` — "no frame whose offsets could clash with the
+  caller's" — and a `with naked` function satisfies that with any number of
+  arguments, having no prologue at all. So the pass written to inline small leaf
+  helpers treated clone trampolines as its ideal candidates, and
+  `std/thread.cst`'s `_clone_thread` (five arguments, one `asm`, two live IR
+  instructions) was inlined into `spawn`. Duplicating an asm body breaks it two
+  independent ways: a label defined in the asm text is then defined twice in the
+  `.s`, and the `ret` that was supposed to return from the callee returns from
+  the caller instead, mid-expression. The reported symptom was a `je` resolving
+  into `_start`. `pass_inline` now refuses both `is_naked` and a new `has_asm`,
+  because either shape alone is fatal — an ordinary zero-argument function with
+  a labelled asm reaches the same gate. Covered by `tests/inline_asm_test.cst`.
+- **A heap built by `bins_new` or `bins_custom` carried the stack's leftovers in
+  its lock word.** Both build into a local `Bins`; every other field is written
+  on some path, that one on none. Invisible while single-threaded, because
+  `core._lk` is a no-op until `mem.set_mt()` — and after that the first
+  allocation through such a heap finds a non-zero lock, futex-waits on a lock
+  nobody holds, and never wakes. No error, no crash: the process stops. Cleared
+  first now, ahead of the refusal paths that return before anything else is set.
+  Covered by `tests/bins_lock_test.cst`, which dirties the stack first so the
+  check fails every time rather than most times.
+- **The assembler resolved a label defined twice to whichever definition it saw
+  first, in silence** — the machinery that turned the miscompile above into a
+  segfault with no diagnostic. It is an error now. `.globl foo` before `foo:` is
+  a forward reference and still fine. Turning it on found five mmap constants
+  declared twice in `std/os/linux.cst`, 450 lines apart with matching values;
+  removed.
+- **The test suite only ever ran the default optimization level.** The bootstrap
+  was the one thing in it that passed `-O1`, which is how an `-O1`-only pass
+  broke every threaded program undetected. The seven thread tests and the new
+  asm test now run at both levels: 25 checks to 36.
+
+### Fixed (earlier in this cycle)
 - **The build cache could be read back as another file's contents.** Three
   things stacked up. The cache key was the source's BASENAME, so `tests/run.cst`
   and `examples/run.cst` — any two files sharing a name — wrote to one cache
