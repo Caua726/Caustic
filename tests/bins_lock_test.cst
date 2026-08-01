@@ -1,0 +1,108 @@
+// tests/bins_lock_test.cst — a heap arrives with its lock word clear.
+//
+// `bins_new` and `bins_custom` build their result in a LOCAL `Bins`, so the
+// struct starts as whatever was on the stack. Every other field is written on
+// every path; the lock word was written on none. That is invisible while the
+// program is single-threaded, because `core._lk` is a no-op until
+// `mem.set_mt()` — and after that, the first allocation through such a heap
+// finds a non-zero lock, futex-waits on a lock nobody holds, and never wakes.
+// The process stops with no error and no crash.
+//
+// tests/threads/t_alloc_mt.cst does the same construction and passes, which is
+// the whole problem: it passes because that stack slot happened to hold a zero.
+// The checks below read the word instead of hoping.
+//
+// ORDER MATTERS HERE. The deterministic checks come first and the threaded
+// exercise last, deliberately: on a broken build the first check fails and the
+// process exits, so it never reaches the allocation that would hang. A test
+// that hangs does not report a failure — it holds the suite open until someone
+// kills it. Do not reorder.
+//
+// Exit 0 = pass; non-zero = the numbered check.
+use "../std/thread.cst" as thread;
+use "../std/mem.cst" only bins as mem;
+use "../std/io.cst" as io;
+
+let is mem.Bins as _default with mut;
+let is mem.Bins as _custom with mut;
+
+fn _noop(arg as i64) as i64 { return 0; }
+
+// Write a non-zero pattern over the stack region the next call will use, then
+// return. Without this the test is a coin toss: an uninitialised word reads as
+// whatever the previous frame left there, and on a quiet stack that is usually
+// zero — which is exactly why the bug survived, and why t_alloc_mt.cst passes
+// on a broken build. Dirtying first makes "the constructor did not write it"
+// fail every time instead of most times.
+fn _dirty_stack() as i64 {
+    let is [512]i64 as scratch;
+    let is i64 as i with mut = 0;
+    while (i < 512) { scratch[i] = 0 - 1; i = i + 1; }
+    return scratch[0] + scratch[511];
+}
+
+fn worker(arg as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 2000) {
+        let is *u8 as p = mem.bins.bins_alloc(&_default, 64);
+        if (cast(i64, p) == 0) { return 1; }
+        p[0] = cast(u8, 7);
+        if (p[0] != 7) { return 2; }
+        mem.bins.bins_free(&_default, p);
+
+        let is *u8 as q = mem.bins.bins_alloc(&_custom, 96);
+        if (cast(i64, q) == 0) { return 3; }
+        mem.bins.bins_free(&_custom, q);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() as i32 {
+    // --- the constructors, still single-threaded --------------------------
+    let is i64 as keep with mut = 0;
+
+    keep = keep + _dirty_stack();
+    _default = mem.bins.bins_new(65536);
+    if (cast(i64, _default.lock) != 0) { return 1; }
+
+    let is [3]i64 as sizes;
+    sizes[0] = 32; sizes[1] = 128; sizes[2] = 512;
+    keep = keep + _dirty_stack();
+    _custom = mem.bins.bins_custom(65536, cast(*i64, &sizes), 3);
+    if (cast(i64, _custom.lock) != 0) { return 2; }
+
+    // The refusal paths return before a single field of the result is set, so
+    // they are where an uninitialised word survives longest.
+    keep = keep + _dirty_stack();
+    let is mem.Bins as empty = mem.bins.bins_custom(65536, cast(*i64, &sizes), 0);
+    if (cast(i64, empty.lock) != 0) { return 3; }
+
+    let is [3]i64 as bad;
+    bad[0] = 512; bad[1] = 128; bad[2] = 32;      // descending: refused
+    keep = keep + _dirty_stack();
+    let is mem.Bins as unsorted = mem.bins.bins_custom(65536, cast(*i64, &bad), 3);
+    if (cast(i64, unsorted.lock) != 0) { return 4; }
+    if (keep == 12345) { return 9; }   // keep _dirty_stack from being folded away
+
+    // --- and now with the lock actually live ------------------------------
+    // spawn() calls set_mt(), so from here every bins_alloc takes the futex
+    // path for real. Only reached when the checks above passed.
+    let is thread.Thread as first;
+    if (thread.spawn(&first, fn_ptr(_noop), 0) != 0) { return 5; }
+    if (thread.join(&first) != 0) { return 6; }
+
+    let is [4]thread.Thread as ts;
+    let is i32 as i with mut = 0;
+    while (i < 4) {
+        if (thread.spawn(&ts[i], fn_ptr(worker), 0) != 0) { return 7; }
+        i = i + 1;
+    }
+    let is i64 as bad_rc with mut = 0;
+    i = 0;
+    while (i < 4) { bad_rc = bad_rc + thread.join(&ts[i]); i = i + 1; }
+    if (bad_rc != 0) { return 8; }
+
+    io._write_fd(io.STDOUT, "bins: lock word clear on every construction path\n", 49);
+    return 0;
+}
