@@ -308,7 +308,17 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
             cached.fields_done = 1;
             sc.current_source_dir_ptr = cached.source_dir_ptr;
             sc.current_source_dir_len = cached.source_dir_len;
+            // This module's own constants, for the length of its own layout.
+            // Without this a field written `[MAX]u8` folded only in the ROOT
+            // file: every imported module reached resolve_type_ref with the
+            // importer's registry and nothing of its own to look up, and the
+            // field failed to size. Four lines reproduce it — a module that
+            // declares a constant and a struct using it compiles standalone
+            // and fails the moment somebody imports it.
+            let is i32 as dmark = ty.dim_reg_mark();
+            prefold_consts(cached.body);
             resolve_fields(cached.body);
+            ty.dim_reg_release(dmark);
         }
     }
     if (pass_id == 4) {
@@ -445,8 +455,10 @@ fn register_aliases(node as *u8) as void {
 // arithmetic over them. A constant defined in terms of another global is not
 // folded here (the other one is not declared yet) and falls through to the
 // error, which is the honest outcome and better than a size nobody chose.
+// Does NOT reset: the registry is a stack and the caller owns the frame. The
+// root resets once; each imported module pushes before its own layout and pops
+// after, so a name declared in two modules resolves to the right one.
 fn prefold_consts(node as *u8) as void {
-    ty.dim_reg_reset();
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
         if (n.kind == ast.NK_LET && n.flags == ast.VF_IMUT && cast(i64, n.init_expr) != 0) {
@@ -628,6 +640,7 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
     // before resolve_fields so a struct field can be `[MAX]u8`.
     register_structs(root);
     register_aliases(root);
+    ty.dim_reg_reset();
     prefold_consts(root);
     resolve_fields(root);
     register_fns(root);

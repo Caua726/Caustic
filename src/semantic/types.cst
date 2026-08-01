@@ -356,13 +356,25 @@ fn declare_enum(name_ptr as *u8, name_len as i32, ty as *u8) as void {
 // value it refers to has not been declared yet. That covers the shape which
 // actually appears — `let is i64 as MAX with imut = 256;` — and leaves the rest
 // to the same error as before rather than to a guess.
-let is i32 as DIM_REG_MAX with imut = 512;
-let is [512]i64 as _dimreg_name with mut;   // i64 stash of *u8
-let is [512]i32 as _dimreg_nlen with mut;
-let is [512]i64 as _dimreg_val  with mut;
+// The registry is a STACK, not a flat table. Every module pushes its own
+// top-level constants before its structs are laid out and pops them after, so
+// two modules that both declare `MAX_NAME` — proto/dns.cst has 255 and
+// proto/cookie.cst has 128 — do not see each other's. A flat table would
+// resolve to whichever module the compiler reached first and size a buffer to
+// a number nobody wrote, which is the exact failure ARRAY_LEN_PENDING exists to
+// make impossible.
+let is i32 as DIM_REG_MAX with imut = 2048;
+let is [2048]i64 as _dimreg_name with mut;   // i64 stash of *u8
+let is [2048]i32 as _dimreg_nlen with mut;
+let is [2048]i64 as _dimreg_val  with mut;
 let is i32 as _dimreg_n with mut = 0;
 
 fn dim_reg_reset() as void { _dimreg_n = 0; }
+
+// Save/restore around one module's layout. See dim_reg_find for why the order
+// of the stack matters.
+fn dim_reg_mark() as i32 { return _dimreg_n; }
+fn dim_reg_release(mark as i32) as void { if (mark >= 0 && mark <= _dimreg_n) { _dimreg_n = mark; } }
 
 fn dim_reg_add(name_ptr as *u8, name_len as i32, val as i64) as void {
     if (_dimreg_n >= DIM_REG_MAX) { return; }
@@ -374,15 +386,20 @@ fn dim_reg_add(name_ptr as *u8, name_len as i32, val as i64) as void {
     _dimreg_n = _dimreg_n + 1;
 }
 
+// BACKWARDS, and that is the whole point. The stack holds the importer's
+// constants underneath the module currently being laid out, so scanning from
+// the top finds the module's own `MAX_NAME` before an importer's — which is
+// what a reader of that file expects, and the only reading that is stable when
+// two modules pick the same name.
 fn dim_reg_find(name_ptr as *u8, name_len as i32, out as *i64) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < _dimreg_n) {
+    let is i32 as i with mut = _dimreg_n - 1;
+    while (i >= 0) {
         if (_dimreg_nlen[i] == name_len
             && d.str_eq(cast(*u8, _dimreg_name[i]), _dimreg_nlen[i], name_ptr, name_len) == 1) {
             *out = _dimreg_val[i];
             return 1;
         }
-        i = i + 1;
+        i = i - 1;
     }
     return 0;
 }

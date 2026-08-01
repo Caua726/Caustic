@@ -6,6 +6,26 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.8](https://github.com/Caua726/Caustic/releases/tag/v0.1.8) — 2026-08-01
+
+### Fixed
+- **A struct field written `[MAX]u8` only folded in the ROOT file.**
+  `prefold_consts` ran once, on the entry module's top level, so an imported
+  module reached struct layout with the importer's constant registry and
+  nothing of its own in it — the field could not be sized and the compile
+  failed. Four lines reproduce it: a module that declares a constant and a
+  struct using it compiles standalone and fails the moment anything imports it,
+  which is exactly where a single-file test would not look. v0.1.7 shipped the
+  feature working only in the one place it is least useful.
+
+  The registry is a stack now: each module pushes its own constants before its
+  layout and pops them after, and lookup scans from the top. That also settles
+  what happens when two modules pick the same name — `proto/dns.cst` has
+  `MAX_NAME` at 255 and `proto/cookie.cst` at 128 — which a flat table would
+  have resolved to whichever module the compiler reached first, sizing a buffer
+  to a number nobody wrote. Covered by `tests/modules/dim_test.cst`, at both
+  optimization levels.
+
 ## [v0.1.7](https://github.com/Caua726/Caustic/releases/tag/v0.1.7) — 2026-08-01
 
 Threads work at `-O1`. Full notes: [`docs/releases/v0.1.7.md`](docs/releases/v0.1.7.md).
