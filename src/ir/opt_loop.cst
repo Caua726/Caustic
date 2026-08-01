@@ -234,6 +234,33 @@ fn inline_has_stack_ops(func as *d.IRFunction) as i32 {
     return 0;
 }
 
+// Check if the callee's body contains inline asm.
+//
+// An `asm` body cannot be duplicated. Two reasons, and either one alone is
+// fatal:
+//
+//   * A label defined inside the asm text (`.Lhop:`) becomes a label defined
+//     TWICE in the emitted .s. The assembler's symbol table is keyed by name
+//     with no per-function scope, so the first definition wins in silence and
+//     every later jump to that name lands in the other copy — usually inside a
+//     different function entirely.
+//   * The text is written against the callee's own entry conditions: arguments
+//     in rdi/rsi/..., and a `ret` that is supposed to return from the CALLEE.
+//     Inlined, that `ret` returns from the caller, mid-expression.
+//
+// This is what made every threaded program segfault at -O1: std/thread's
+// `_clone_thread` is a `naked` asm trampoline, and `alloc_stack_size == 0`
+// below — meant to exclude functions with a frame — is precisely what a naked
+// function satisfies no matter how many arguments it takes.
+fn inline_has_asm(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_ASM) { return 1; }
+        inst = inst.next;
+    }
+    return 0;
+}
+
 fn inline_count_insts(func as *d.IRFunction) as i32 {
     let is i32 as count with mut = 0;
     let is *d.IRInst as inst with mut = func.instructions;
@@ -275,7 +302,11 @@ fn pass_inline(func as *d.IRFunction, prog as *u8) as void {
                     callee = cast(*d.IRFunction, 0);
                 } else { callee = callee.next; }
             }
-            if (cast(i64, found) != 0 && cast(i64, found) != cast(i64, func) && found.is_variadic == 0 && found.alloc_stack_size == 0 && found.num_args <= 6 && found.has_stack_ops == 0 && d.inline_callee_ok(found) == 1) {
+            // `is_naked` AND `has_asm`, not one or the other. A naked function
+            // whose asm carries no label still ends its body with a `ret` that
+            // belongs to the callee; an ordinary function with a labelled asm
+            // still duplicates the label. Both were reproduced.
+            if (cast(i64, found) != 0 && cast(i64, found) != cast(i64, func) && found.is_variadic == 0 && found.is_naked == 0 && found.has_asm == 0 && found.alloc_stack_size == 0 && found.num_args <= 6 && found.has_stack_ops == 0 && d.inline_callee_ok(found) == 1) {
                 let is i32 as callee_size = found.live_inst_count;
                 if (callee_size > 0 && callee_size <= 60) {
                     let is i32 as is_recursive = found.is_recursive;

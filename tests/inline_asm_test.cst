@@ -1,0 +1,68 @@
+// tests/inline_asm_test.cst — a function whose body is inline `asm` is never
+// inlined into its caller.
+//
+// This is a regression test for a miscompile that made EVERY threaded program
+// segfault at -O1. The -O1 inliner gated on `alloc_stack_size == 0`, meaning
+// "no frame to clash with the caller's" — and a `with naked` function satisfies
+// that no matter how many arguments it takes, because it has no prologue at
+// all. std/thread's `_clone_thread` is exactly that shape: five arguments, one
+// `asm`, no frame. So the pass that was written to inline small leaf helpers
+// ended up treating clone trampolines as its ideal candidates.
+//
+// Duplicating an asm body breaks it two independent ways:
+//
+//   * a label defined in the asm text is then defined TWICE in the .s, and the
+//     assembler's symbol table has no per-function scope — the first definition
+//     wins in silence, and the second jump to that name lands inside the other
+//     copy. In the original report the `je` resolved into `_start`.
+//   * the text is written against the callee's entry: arguments in rdi/rsi/…,
+//     and a `ret` that returns from the CALLEE. Inlined, that `ret` returns
+//     from the caller, mid-expression.
+//
+// Both are covered below, and both must hold at -O0 and -O1 — the whole point
+// is that the two levels agree. Exit 0 = pass; non-zero = the numbered check.
+use "../std/io.cst" as io;
+
+// --- naked, with an argument and a local label -----------------------------
+// The `ret` inside belongs to `pick`. Inlined, it would return from the caller.
+fn pick(x as i64) as i64 with naked {
+    asm("test rdi, rdi\njz .Lzero_case\nmov rax, 111\nret\n.Lzero_case:\nmov rax, 222\nret\n");
+}
+
+// --- ORDINARY function, no arguments, asm with a local label ---------------
+// Zero arguments is what makes this one reachable: a parameter materializes a
+// stack slot, which the inliner's `alloc_stack_size == 0` gate rejects. So the
+// two shapes that reach the inliner are `naked` and no-argument — and this is
+// the second. The asm touches no register and has no `ret`; it only jumps over
+// a nop, so ONLY the duplicated label can break it.
+fn seven() as i64 {
+    asm("jmp .Lhop\nnop\n.Lhop:\nnop\n");
+    return 7;
+}
+
+// --- naked, five arguments -------------------------------------------------
+// The shape of std/thread's clone trampoline, minus the syscall: reads the
+// 4th argument out of rcx (Caustic passes args in the SysV order) and returns
+// it. Five arguments and no frame is precisely the combination that used to
+// sail through every gate.
+fn fourth(a as i64, b as i64, c as i64, d as i64, e as i64) as i64 with naked {
+    asm("mov rax, rcx\nret\n");
+}
+
+fn main() as i32 {
+    // Called twice each, because one call site can be inlined without the
+    // duplicate-label failure ever showing up. Two is what makes it visible.
+    if (pick(1) != 111) { return 1; }
+    if (pick(0) != 222) { return 2; }
+    if (pick(1) != 111) { return 3; }
+    if (pick(0) != 222) { return 4; }
+
+    if (seven() != 7) { return 5; }
+    if (seven() != 7) { return 6; }
+
+    if (fourth(10, 20, 30, 40, 50) != 40) { return 7; }
+    if (fourth(1, 2, 3, 4, 5) != 4) { return 8; }
+
+    io._write_fd(io.STDOUT, "inline asm: bodies preserved\n", 29);
+    return 0;
+}
