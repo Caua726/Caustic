@@ -6,6 +6,31 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.9](https://github.com/Caua726/Caustic/releases/tag/v0.1.9) — 2026-08-02
+
+### Fixed
+- **A second top-level `let` of the same name was swallowed.** `declare_var`
+  answered "already declared" by handing back the first variable — the right
+  shape for a lookup, the wrong one for a declaration — so the second
+  initializer wrote into the FIRST variable. The last value won at runtime,
+  codegen emitted the definition twice, and the assembler kept the first. No
+  stage said anything. `std/os/linux.cst` carried five such pairs for months
+  and they were found only when the assembler started refusing duplicate labels
+  in v0.1.7, which is late and names a mangled symbol
+  (`_std_os_linux_cst_PROT_READ`) rather than a line of source.
+
+  It is a semantic error now, with the file, the line and the name. **Locals are
+  untouched** — shadowing in an inner scope is deliberate and stays legal.
+
+  This can reject code that used to compile. It was already broken code: the two
+  declarations shared one variable, so anything relying on the second value was
+  relying on which one the compiler happened to walk last.
+
+  Covered by `tests/reject/dup_global.cst`, paired with a twin that is the same
+  file minus the duplicate and must compile — because "it failed to compile" is
+  weak evidence on its own, and a fixture broken for an unrelated reason looks
+  identical to a working rejection.
+
 ## [v0.1.8](https://github.com/Caua726/Caustic/releases/tag/v0.1.8) — 2026-08-01
 
 ### Fixed
