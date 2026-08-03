@@ -6,6 +6,34 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.10](https://github.com/Caua726/Caustic/releases/tag/v0.1.10) — 2026-08-02
+
+Two silent ceilings on how much data a program may carry as a constant. Both
+were found by one generated table in a `.cst` file, and neither said anything.
+
+### Fixed
+- **A string literal of 32768 characters was silently truncated.**
+  caustic-assembler's `ParsedLine` narrows its fields on purpose — the whole
+  `.s` is one array of them, ~305K lines for the self-host — but
+  `dir_arg_len`, `decoded_len` and `size` went along with the rest into `i16`,
+  and those three are not low-cardinality: a `.string` carries a whole string
+  literal and a `.zero` a whole array's size. At 32768 the length wrapped
+  negative, the data landed garbled, and every offset computed after it was
+  wrong. 32767 worked. The only symptom was a program reading nonsense out of
+  its own constant. Now `i32`.
+- **`bins_alloc` refused anything over 64 KiB, returning NULL.** The caller is
+  required to check, so the silence was defensible; the refusal was not. 64 KiB
+  is an ordinary size — a generated table, a whole file read in — and each one
+  became a null nobody expected at a boundary nothing announced. The compiler
+  hit it itself: a literal of 65536 characters made the build stop after
+  `semantic: ok` with no output and no error, because `str_dup` got the null
+  and carried on. Such a request is now served straight from mmap, with the
+  same 8-byte header carrying a sentinel bin index and the mapped size, so
+  `bins_free` tells the two apart. A 2 MB literal round-trips.
+
+  `tests/bins_topbin_test.cst` asserted the old refusal and now asserts the
+  service; `tests/big_literal_test.cst` covers both ceilings at both levels.
+
 ## [v0.1.9](https://github.com/Caua726/Caustic/releases/tag/v0.1.9) — 2026-08-02
 
 ### Fixed

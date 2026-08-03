@@ -16,6 +16,12 @@ use "core.cst" as core;
 // --- Constants ---
 
 let is i64 as HEADER_SIZE with imut = 8;
+// Header byte 0 for an allocation served straight from mmap rather than from a
+// bin. 255 cannot collide: bin_count is 20 by default and the field is one
+// byte, so a real index is never near it.
+let is i64 as BIG_INDEX with imut = 255;
+
+fn _round_up(n as i64, to as i64) as i64 { return ((n + to - 1) / to) * to; }
 let is i64 as NUM_DEFAULT_BINS with imut = 20;
 let is i64 as LOOKUP_SIZE with imut = 8193;
 
@@ -305,13 +311,35 @@ fn _bins_alloc_inner(b as *Bins, size as i64) as *u8 {
         b.lock = saved_lock;
     }
 
-    // Over the largest size class. Signalled by the null return and nothing
-    // else: a library has no business writing to the host program's stderr on a
-    // failure the caller is already required to check, and there was no way to
-    // turn it off. (The number it printed was wrong anyway — it named 65536
-    // while the top bin could not serve a single allocation.)
+    // Over the largest size class: serve it straight from the OS.
+    //
+    // This used to return null, silently. The caller is required to check, so
+    // the silence was defensible; the REFUSAL was not. 64 KiB is an ordinary
+    // size — a generated table, a whole file read in, a string literal in a
+    // .s — and every one of them turned into a null nobody expected, at a
+    // boundary nothing announced. Caustic's own compiler hit it: a string
+    // literal of 65536 characters made the build stop after "semantic: ok"
+    // with no output and no error, because str_dup got a null and carried on.
+    //
+    // A direct mapping carries the same 8-byte header, with bin index
+    // BIG_INDEX and the total mapped size in the remaining seven bytes, so
+    // bins_free tells the two apart without a second table to keep in step.
     let is i64 as idx = _lookup_bin(b, size);
-    if (idx < 0) { return cast(*u8, 0); }
+    if (idx < 0) {
+        let is i64 as total = _round_up(size + HEADER_SIZE, 4096);
+        let is *u8 as big = core.mmap_anon(total);
+        if (cast(i64, big) == 0) { return cast(*u8, 0); }
+        if (cast(i64, big) == 0 - 1) { return cast(*u8, 0); }
+        big[0] = cast(u8, BIG_INDEX);
+        let is i64 as k with mut = 1;
+        let is i64 as v with mut = total;
+        while (k < HEADER_SIZE) {
+            big[k] = cast(u8, v & 255);
+            v = v >> 8;
+            k = k + 1;
+        }
+        return cast(*u8, cast(i64, big) + HEADER_SIZE);
+    }
 
     let is *Bin as bin = _bin_at(b, idx);
 
@@ -375,6 +403,18 @@ fn _bins_free_inner(b as *Bins, ptr as *u8) as void {
     // Read bin_index and slot_index from header — no division needed
     let is *u8 as hdr = cast(*u8, slot);
     let is i64 as idx = cast(i64, hdr[0]);
+
+    // A direct mapping: hand it back to the OS. Checked BEFORE the bin_count
+    // test, which would otherwise read it as an out-of-range bin and drop it —
+    // a leak of exactly the allocations big enough to matter.
+    if (idx == BIG_INDEX) {
+        let is i64 as total with mut = 0;
+        let is i64 as k with mut = HEADER_SIZE - 1;
+        while (k >= 1) { total = (total << 8) | cast(i64, hdr[k]); k = k - 1; }
+        if (total > 0) { core.munmap(slot, total); }
+        return;
+    }
+
     let is i64 as si = cast(i64, hdr[1]) + cast(i64, hdr[2]) * 256 + cast(i64, hdr[3]) * 65536;
 
     if (idx >= b.bin_count) { return; }
