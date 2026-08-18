@@ -1,7 +1,96 @@
 // =======================================================
 // std/term.cst
-// Terminal: raw mode, ANSI escapes, keyboard input
+// Terminal: raw mode, ANSI escapes, event-based input
 // =======================================================
+//
+// Output — colours, cursor, clear — writes bytes to STDOUT and touches nothing
+// else. Input is a buffered reader that owns the descriptor and hands out one
+// Event at a time; read_key() is a shell over that same reader and still
+// returns one i32, so nothing that used it had to change.
+//
+// Why the parse and the reading were separated
+// --------------------------------------------
+// The old reader read ONE byte per call and decided what it had from the third
+// byte. On a sequence it did not recognise it returned KEY_ESC having already
+// consumed three bytes, and the rest of the sequence stayed in the stream and
+// came back as loose keystrokes. A mouse report is `ESC [ < 0 ; 40 ; 12 M`:
+// byte three is `<`, no branch matched, three bytes were gone, and `0;40;12M`
+// was typed into whatever had focus. Nothing could be layered on top of that,
+// because reading and parsing were the same loop.
+//
+// They are two things now. _scan() is a pure function over a byte range that
+// either produces one event or says "these bytes are a prefix, feed me more";
+// the reader is the only code here that talks to a descriptor. A CSI sequence
+// is walked to its final byte (0x40..0x7E) and consumed as a unit whether or
+// not anything recognises it, so an unknown sequence leaves nothing behind.
+//
+// An unknown sequence is reported as nothing — EV_NONE, KEY_NONE — and not as
+// Escape. An escape sequence we do not understand is not the Escape key, and
+// answering Escape is how a terminal's unsolicited replies became menu
+// toggles. A bare ESC with nothing behind it is still KEY_ESC, which is the one
+// Escape behaviour every consumer of this module depends on.
+//
+// What read_key() still promises
+// ------------------------------
+// It reads one byte per read(2), so a burst stays in the kernel queue where a
+// level-triggered poller can still see it, and its read blocks — VMIN=0 with
+// VTIME=1 bounds that at about 100 ms, and that timeout is the only thing that
+// can tell a bare Escape from the start of an arrow key. Both halves are load
+// bearing for a caller that polls fd 0 itself and calls read_key once per
+// readiness report; see the note on input_fd below for what changes when a
+// caller moves to events instead.
+//
+// Two answers changed, both of them where the old ones were wrong. A sequence
+// that is not a key — a mouse report, a paste bracket, a reply the terminal
+// sent unasked — is consumed whole and answered KEY_NONE instead of KEY_ESC
+// plus its own tail as text. And ESC immediately followed by ESC consumes only
+// the first byte, so the second can still introduce a sequence; that is the one
+// case where a read_key call can leave a byte in this module's buffer rather
+// than in the kernel queue, and the next call delivers it.
+//
+// The numbers
+// -----------
+// IN_BUF is 4096 because that is the size of the kernel's tty line-discipline
+// buffer on Linux (N_TTY_BUF_SIZE): one read of that size empties a queue as
+// full as the kernel will ever let it get. IN_PASTE (8192) and _RK_MAX (64)
+// were chosen, not derived; each says at its declaration what it is measured
+// against.
+//
+// EV_RESIZE is not implemented
+// ----------------------------
+// The design lists it at 4. Nothing here can deliver it: a resize is SIGWINCH,
+// there is no sigaction in this stdlib at all, and the one interface built on
+// this module has no signal handler either — it re-polls TIOCGWINSZ once a
+// frame through get_size(), about ten ioctls a second, and detects resizes that
+// way. The two ways to fake the event are both worse than what already works:
+// an ioctl inside input_next() is more ioctls than the frame poll, and it would
+// only fire when a keystroke happened to arrive. So the event does not exist,
+// 4 is left unused so it can be added without renumbering, and get_size()
+// stays a standalone ioctl with no Input anywhere near it.
+//
+// Portability, honestly
+// ---------------------
+// Windows with ENABLE_VIRTUAL_TERMINAL_INPUT — which enter_raw() already sets —
+// delivers VT input sequences, so one SGR-1006 parser should serve both
+// targets, and the mode strings input_open() writes are bytes the console
+// understands once ENABLE_VIRTUAL_TERMINAL_PROCESSING is on. Should.
+//
+// NONE OF THE WINDOWS INPUT PATH HAS BEEN RUN. No Windows machine was in
+// reach, and this comment is here instead of a claim that it works. Two things
+// specifically are unverified: whether the console delivers SGR mouse reports
+// through ReadFile at all, and _pending()'s use of WaitForSingleObject on the
+// console input handle — that handle signals when an input RECORD is available,
+// and a key-up or a buffer-resize record is a record with no bytes behind it,
+// which would make _pending() answer yes and the read that follows block.
+//
+// What was run: tests/term_input_test.cst, at -O0/-O1/-O2 — the parser directly
+// and the reader over a pipe — plus a program driven through a real pty with
+// mouse reports, a wheel, a ctrl-click, a drag, arrows, a bracketed paste, a
+// focus report, an unsolicited `ESC [ ? 2 5 h` and two bare Escapes; and
+// eutimico rebuilt against this file, driven through its own pty harness, whose
+// output came back byte-identical to the same run against the old reader. All
+// of that was Linux on x86_64. The Windows and AArch64 targets are known to
+// COMPILE and nothing more.
 
 use "os.cst" as os;
 if (__target_is_linux + __compat_mode)   use "os/linux.cst"   as linux;
@@ -186,41 +275,649 @@ let is i32 as KEY_ENTER with imut = 13;
 let is i32 as KEY_TAB   with imut = 9;
 let is i32 as KEY_BKSP  with imut = 127;
 
-// Read a key from stdin. Returns KEY_* constants or ASCII char.
-fn read_key() as i32 {
-    let is [6]u8 as seq;
-    let is i64 as n = io._read_fd(io.STDIN, cast(*u8, &seq), 1);
-    if (n <= 0) { return KEY_NONE; }
+// =======================================================
+// Event-based input
+// =======================================================
 
-    // Not an escape sequence
-    if (seq[0] != 27) { return cast(i32, seq[0]); }
+let is i64 as EV_NONE  with imut = 0;
+let is i64 as EV_KEY   with imut = 1;
+let is i64 as EV_MOUSE with imut = 2;
+let is i64 as EV_PASTE with imut = 3;
+// 4 is EV_RESIZE in the design, and is left unused on purpose so that a later
+// commit can add it without renumbering. Why it is not here: see the header.
+let is i64 as EV_FOCUS with imut = 5;
 
-    // Try to read more
-    let is i64 as n2 = io._read_fd(io.STDIN, cast(*u8, cast(i64, &seq) + 1), 1);
-    if (n2 <= 0) { return KEY_ESC; }
+// Internal kinds. The paste brackets are sequences, not events: _scan reports
+// them, input_next acts on them, and neither ever reaches a caller.
+let is i64 as _EV_PASTE_ON  with imut = 100;
+let is i64 as _EV_PASTE_OFF with imut = 101;
 
-    if (seq[1] == 91) { // '['
-        let is i64 as n3 = io._read_fd(io.STDIN, cast(*u8, cast(i64, &seq) + 2), 1);
-        if (n3 <= 0) { return KEY_ESC; }
-        if (seq[2] == 65) { return KEY_UP; }
-        if (seq[2] == 66) { return KEY_DOWN; }
-        if (seq[2] == 67) { return KEY_RIGHT; }
-        if (seq[2] == 68) { return KEY_LEFT; }
-        if (seq[2] == 72) { return KEY_HOME; }
-        if (seq[2] == 70) { return KEY_END; }
-        if (seq[2] == 51) { // '3' — could be Delete (3~)
-            let is i64 as n4 = io._read_fd(io.STDIN, cast(*u8, cast(i64, &seq) + 3), 1);
-            if (n4 > 0 && seq[3] == 126) { return KEY_DEL; }
+// Event.button carries the SGR button field with the modifier and the motion
+// bit removed, so these constants ARE the wire numbers — which is why a button
+// this list does not name (8..11 on a five-button mouse) still arrives intact
+// instead of being flattened into one of the three below.
+let is i64 as MB_LEFT        with imut = 0;
+let is i64 as MB_MIDDLE      with imut = 1;
+let is i64 as MB_RIGHT       with imut = 2;
+let is i64 as MB_NONE        with imut = 3;    // motion with nothing held down
+let is i64 as MB_WHEEL_UP    with imut = 64;
+let is i64 as MB_WHEEL_DOWN  with imut = 65;
+let is i64 as MB_WHEEL_LEFT  with imut = 66;
+let is i64 as MB_WHEEL_RIGHT with imut = 67;
+
+// Event.down. EV_FOCUS reuses the field with 1 = gained, 0 = lost.
+let is i32 as EV_RELEASE with imut = 0;
+let is i32 as EV_PRESS   with imut = 1;
+let is i32 as EV_MOTION  with imut = 2;
+
+// Event.mods — xterm's modifier bits, shifted down to bit 0. A mouse report
+// carries them in bits 2..4 of the button byte; a cursor key carries them as
+// `param - 1` in its second parameter. Both land here.
+let is i64 as MOD_SHIFT with imut = 1;
+let is i64 as MOD_ALT   with imut = 2;
+let is i64 as MOD_CTRL  with imut = 4;
+
+struct Event {
+    kind   as i64;
+    key    as i32;    // EV_KEY: the same codes read_key returns
+    button as i64;    // EV_MOUSE: MB_*
+    down   as i32;    // EV_PRESS / EV_RELEASE / EV_MOTION
+    row    as i64;    // EV_MOUSE: 1-based, as the terminal reports it
+    col    as i64;
+    mods   as i64;    // MOD_* bits
+    text   as *u8;    // EV_PASTE: owned by the reader, valid until the next
+    len    as i64;    //           input_next call on the same Input
+}
+
+// 4096 is the size of the kernel's tty line-discipline buffer on Linux
+// (N_TTY_BUF_SIZE), so one read of this size empties a queue that is as full
+// as the kernel will ever let it get, and a burst never needs two syscalls.
+let is i64 as IN_BUF with imut = 4096;
+
+// Chosen, not derived: a paste longer than this arrives as more than one
+// EV_PASTE, split at the cap, with no byte lost. The design's worked example
+// is two hundred characters; this is forty times that, and it costs 8 KiB of
+// .bss in any program that imports the module.
+let is i64 as IN_PASTE with imut = 8192;
+
+// How many bytes read_key() will pull while assembling ONE keystroke before
+// giving up and dropping what it holds. The longest sequence this parser
+// recognises is an SGR mouse report at four-digit coordinates — 17 bytes — so
+// this is nearly four times the worst legitimate case. It exists only to bound
+// the call against a terminal that sends something endless; in normal use
+// read_key reads one byte, or three for an arrow key.
+let is i64 as _RK_MAX with imut = 64;
+
+// An Input must start zeroed, which a global in .bss is and a stack local is
+// not — `ready` is what says "this has been initialised", and a garbage `ready`
+// would skip the initialisation. input_open() initialises unconditionally; a
+// caller that skips input_open (read-only use of input_next on a descriptor it
+// set itself) either uses a global or zeroes the struct.
+struct Input {
+    fd      as i64;
+    ready   as i32;     // 1 once the buffer is initialised
+    active  as i32;     // 1 between input_open and input_close
+    m_mouse as i32;     // which modes are actually on, so input_close can
+    m_paste as i32;     // undo exactly those and nothing else
+    m_focus as i32;
+    head    as i64;     // first byte not yet parsed
+    tail    as i64;     // one past the last byte read
+    plen    as i64;     // bytes accumulated for the EV_PASTE being assembled
+    inpaste as i32;
+    buf     as [IN_BUF]u8;
+    text    as [IN_PASTE]u8;
+}
+
+// The reader read_key() uses when the program never opened one of its own.
+// Initialised on the first input call and never before: a program that imports
+// this module for set_color() must not find fd 0 taken from under it, and
+// examples/calculator.cst is exactly that program — it reads fd 0 itself, one
+// byte at a time, in the same file that calls clear_screen().
+let is Input as _shell with mut;
+
+// The Input most recently handed to input_open, as an address. read_key() uses
+// it in preference to _shell so that a program which adopts input_next() does
+// not end up with two buffered readers splitting the same byte stream between
+// them. It is cleared by input_close, which is therefore not optional: the
+// pointer outlives nothing.
+let is i64 as _cur with mut = 0;
+
+fn _ev_clear(ev as *Event) as void {
+    ev.kind = EV_NONE;
+    ev.key = KEY_NONE;
+    ev.button = 0;
+    ev.down = 0;
+    ev.row = 0;
+    ev.col = 0;
+    ev.mods = 0;
+    ev.text = cast(*u8, 0);
+    ev.len = 0;
+}
+
+// Read a decimal number starting at buf[*i], advancing *i past it. Returns -1
+// when there is no digit there — which is how a malformed report is refused
+// instead of being read as zero.
+fn _num(buf as *u8, n as i64, i as *i64) as i64 {
+    let is i64 as p with mut = *i;
+    if (p >= n) { return 0 - 1; }
+    let is i64 as c = cast(i64, buf[p]);
+    if (c < 48 || c > 57) { return 0 - 1; }
+    let is i64 as v with mut = 0;
+    while (p < n) {
+        let is i64 as d = cast(i64, buf[p]);
+        if (d < 48 || d > 57) { break; }
+        v = v * 10 + (d - 48);
+        p = p + 1;
+    }
+    *i = p;
+    return v;
+}
+
+// The final byte of a cursor-key sequence, for both CSI and SS3 forms.
+fn _final_key(f as i64) as i32 {
+    if (f == 65) { return KEY_UP; }
+    if (f == 66) { return KEY_DOWN; }
+    if (f == 67) { return KEY_RIGHT; }
+    if (f == 68) { return KEY_LEFT; }
+    if (f == 72) { return KEY_HOME; }
+    if (f == 70) { return KEY_END; }
+    return KEY_NONE;
+}
+
+// xterm sends `ESC [ 1 ; 5 A` for Ctrl+Up. `p` points at whatever follows the
+// first parameter; a second parameter, minus one, is the modifier bitmask.
+fn _csi_mods(buf as *u8, n as i64, p as i64) as i64 {
+    if (p >= n) { return 0; }
+    if (cast(i64, buf[p]) != 59) { return 0; }        // ';'
+    let is i64 as q with mut = p + 1;
+    let is i64 as m = _num(buf, n, &q);
+    if (m < 1) { return 0; }
+    return (m - 1) & 7;
+}
+
+// SGR 1006: ESC [ < Cb ; Cx ; Cy M|m. `buf`/`n` cover the parameter bytes only
+// (everything between the '<' and the final byte).
+//
+// Every exit before the last one leaves the event as EV_NONE with row and col
+// still zero. That is the point: a report we cannot read all three numbers out
+// of must not produce a coordinate, because a coordinate is something a caller
+// will click on.
+fn _mouse(buf as *u8, n as i64, fin as i64, ev as *Event) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as cb = _num(buf, n, &i);
+    if (cb < 0) { return; }
+    if (i >= n) { return; }
+    if (cast(i64, buf[i]) != 59) { return; }
+    i = i + 1;
+    let is i64 as cx = _num(buf, n, &i);
+    if (cx < 0) { return; }
+    if (i >= n) { return; }
+    if (cast(i64, buf[i]) != 59) { return; }
+    i = i + 1;
+    let is i64 as cy = _num(buf, n, &i);
+    if (cy < 0) { return; }
+    if (i != n) { return; }              // trailing parameters: not this shape
+    ev.kind = EV_MOUSE;
+    ev.button = (cb & 3) + (cb & 192);
+    ev.mods = (cb / 4) & 7;
+    ev.col = cx;
+    ev.row = cy;
+    if (fin == 109) { ev.down = EV_RELEASE; }         // 'm'
+    else if ((cb & 32) != 0) { ev.down = EV_MOTION; }
+    else { ev.down = EV_PRESS; }
+}
+
+// Scan one event out of buf[0..n).
+//
+// Returns the number of bytes it consumed — at least 1 — or 0 to say "these
+// bytes are the start of something longer, feed me more". `last` = 1 means no
+// more bytes are coming, so a prefix has to resolve now.
+//
+// Pure: no descriptor, no global, no allocation. That is what makes the mouse,
+// the paste brackets and every truncation case testable with no terminal in
+// reach, which is the only way any of this was checked at all.
+fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
+    _ev_clear(ev);
+    if (n <= 0) { return 0; }
+    let is i64 as b0 = cast(i64, buf[0]);
+    if (b0 != 27) {
+        // Every non-ESC byte is its own event, in order, including UTF-8
+        // continuation bytes (128..255) — a caller assembling characters needs
+        // them one at a time and unmolested.
+        ev.kind = EV_KEY;
+        ev.key = cast(i32, b0);
+        return 1;
+    }
+    // ESC with nothing behind it is the Escape key, and only `last` can say
+    // that nothing is behind it. In raw mode that answer costs VTIME=1, one
+    // read that times out at 100 ms, and it is the most-used key in the only
+    // interface built on this module — so it is deliberately paid, not avoided.
+    if (n == 1) {
+        if (last == 0) { return 0; }
+        ev.kind = EV_KEY;
+        ev.key = KEY_ESC;
+        return 1;
+    }
+    let is i64 as b1 = cast(i64, buf[1]);
+    if (b1 == 27) {
+        // ESC then ESC. The first one is the Escape key and ONLY it is
+        // consumed: the second may be the start of a real sequence, and eating
+        // a sequence introducer is the defect this rewrite exists to remove.
+        // Found by driving a pty with `ESC` followed by a bracketed paste — the
+        // old rule ate the paste's own ESC and typed `[200~` into the input.
+        //
+        // It is also the one case where a read_key() call can leave a byte in
+        // this module's buffer instead of in the kernel queue. One byte, never
+        // lost, delivered by the next call; the alternative is losing whatever
+        // the second ESC introduced.
+        ev.kind = EV_KEY;
+        ev.key = KEY_ESC;
+        return 1;
+    }
+    if (b1 == 79) {                                   // 'O' — SS3
+        if (n < 3) {
+            if (last == 0) { return 0; }
+            ev.kind = EV_KEY;
+            ev.key = KEY_ESC;
+            return 2;
         }
-        if (seq[2] == 53) { // '5~' = PgUp
-            let is i64 as n4 = io._read_fd(io.STDIN, cast(*u8, cast(i64, &seq) + 3), 1);
-            if (n4 > 0 && seq[3] == 126) { return KEY_PGUP; }
+        let is i32 as k = _final_key(cast(i64, buf[2]));
+        if (k != KEY_NONE) { ev.kind = EV_KEY; ev.key = k; }
+        return 3;
+    }
+    if (b1 != 91) {                                   // not '[': no sequence
+        // Answering Escape here and eating the byte is what read_key has
+        // always done, and it is kept: the alternative reading is Alt+key,
+        // this module does not model Alt, and a mods bit invented here would
+        // change the value read_key returns for a key that consumers already
+        // compare against KEY_*.
+        ev.kind = EV_KEY;
+        ev.key = KEY_ESC;
+        return 2;
+    }
+    // CSI. Parameter bytes are 0x30..0x3F, intermediates 0x20..0x2F, and one
+    // final byte 0x40..0x7E closes it. Walking to that final byte — instead of
+    // guessing from the third byte — is the whole of the fix: the sequence is
+    // consumed as a unit whether or not anything below recognises it.
+    let is i64 as i with mut = 2;
+    while (i < n) {
+        let is i64 as c = cast(i64, buf[i]);
+        if (c < 48 || c > 63) { break; }
+        i = i + 1;
+    }
+    while (i < n) {
+        let is i64 as c = cast(i64, buf[i]);
+        if (c < 32 || c > 47) { break; }
+        i = i + 1;
+    }
+    if (i >= n) {
+        if (last == 0) { return 0; }
+        // Truncated and nothing more is coming. `ESC [` alone is what the old
+        // reader answered KEY_ESC for, so it still does; anything longer had
+        // begun to carry parameters, and manufacturing a keystroke out of half
+        // a report is the defect this rewrite exists to remove.
+        if (n == 2) { ev.kind = EV_KEY; ev.key = KEY_ESC; }
+        return n;
+    }
+    let is i64 as f = cast(i64, buf[i]);
+    if (f < 64 || f > 126) {
+        // A byte that can be neither parameter nor final: the sequence is
+        // broken. Consume what came before it and leave the byte itself — it
+        // is most likely a real keystroke that arrived mid-sequence, and it is
+        // the one case where handing a byte back is the honest answer.
+        return i;
+    }
+    let is i64 as total = i + 1;
+    if (cast(i64, buf[2]) == 60 && (f == 77 || f == 109)) {      // '<', 'M'/'m'
+        _mouse(cast(*u8, cast(i64, buf) + 3), i - 3, f, ev);
+        return total;
+    }
+    if (f == 126) {                                              // '~'
+        let is i64 as p with mut = 2;
+        let is i64 as v = _num(buf, i, &p);
+        if (v == 1 || v == 7) { ev.kind = EV_KEY; ev.key = KEY_HOME; }
+        else if (v == 3) { ev.kind = EV_KEY; ev.key = KEY_DEL; }
+        else if (v == 4 || v == 8) { ev.kind = EV_KEY; ev.key = KEY_END; }
+        else if (v == 5) { ev.kind = EV_KEY; ev.key = KEY_PGUP; }
+        else if (v == 6) { ev.kind = EV_KEY; ev.key = KEY_PGDN; }
+        else if (v == 200) { ev.kind = _EV_PASTE_ON; }
+        else if (v == 201) { ev.kind = _EV_PASTE_OFF; }
+        if (ev.kind == EV_KEY) { ev.mods = _csi_mods(buf, i, p); }
+        return total;
+    }
+    let is i32 as k = _final_key(f);
+    if (k != KEY_NONE) {
+        ev.kind = EV_KEY;
+        ev.key = k;
+        let is i64 as p with mut = 2;
+        _num(buf, i, &p);                     // the leading 1, when it is sent
+        ev.mods = _csi_mods(buf, i, p);
+        return total;
+    }
+    if (f == 73) { ev.kind = EV_FOCUS; ev.down = 1; return total; }   // 'I'
+    if (f == 79) { ev.kind = EV_FOCUS; ev.down = 0; return total; }   // 'O'
+    // Understood as a sequence, not understood as an event: consumed whole and
+    // reported as nothing. Reporting Escape instead is what turned a terminal's
+    // unsolicited replies into keystrokes.
+    return total;
+}
+
+fn _reset(in as *Input) as void {
+    in.fd = io.STDIN;
+    in.ready = 1;
+    in.active = 0;
+    in.m_mouse = 0;
+    in.m_paste = 0;
+    in.m_focus = 0;
+    in.head = 0;
+    in.tail = 0;
+    in.plen = 0;
+    in.inpaste = 0;
+}
+
+// Is there anything to read right now, without waiting for it?
+fn _pending(fd as i64) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        // struct pollfd { int fd; short events; short revents; } — 8 bytes.
+        let is [8]u8 as pfd;
+        let is *i32 as pf = cast(*i32, &pfd);
+        *pf = cast(i32, fd);
+        let is *i16 as pe = cast(*i16, cast(i64, &pfd) + 4);
+        *pe = cast(i16, linux.POLLIN);
+        let is *i16 as pr = cast(*i16, cast(i64, &pfd) + 6);
+        *pr = 0;
+        if (linux.poll(cast(*u8, &pfd), 1, 0) <= 0) { return 0; }
+        return 1;
+    } else if (os.current() == os.OS_WINDOWS) {
+        // UNVERIFIED — see the module header. A console handle signals when an
+        // input RECORD is available, which is not the same claim as "ReadFile
+        // will return bytes".
+        let is i64 as hin = win.GetStdHandle(win.STD_INPUT_HANDLE);
+        if (win.WaitForSingleObject(hin, 0) == cast(u32, 0)) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// Get more bytes. `want` caps the read; `force` = 1 reads without asking
+// whether anything is pending, which is how the 100 ms that resolves a bare
+// Escape gets paid, and how read_key keeps its old one-byte-per-read shape.
+fn _fill(in as *Input, want as i64, force as i32) as i32 {
+    if (in.head > 0) {
+        // Slide the unread tail to the front. At most one partial sequence, or
+        // the five bytes a paste holds back in case they are a closing bracket.
+        let is i64 as keep = in.tail - in.head;
+        if (keep > 0) {
+            mem.memcpy(cast(*u8, &in.buf),
+                       cast(*u8, cast(i64, &in.buf) + in.head), keep);
         }
-        if (seq[2] == 54) { // '6~' = PgDn
-            let is i64 as n4 = io._read_fd(io.STDIN, cast(*u8, cast(i64, &seq) + 3), 1);
-            if (n4 > 0 && seq[3] == 126) { return KEY_PGDN; }
+        in.head = 0;
+        in.tail = keep;
+    }
+    let is i64 as room with mut = IN_BUF - in.tail;
+    if (room <= 0) { return 0; }
+    if (want < room) { room = want; }
+    if (force == 0) {
+        if (_pending(in.fd) == 0) { return 0; }
+    }
+    let is i64 as n = io._read_fd(in.fd, cast(*u8, cast(i64, &in.buf) + in.tail), room);
+    if (n <= 0) { return 0; }
+    in.tail = in.tail + n;
+    return 1;
+}
+
+// Assemble the EV_PASTE between the brackets. Returns 1 when one is ready.
+//
+// The closing bracket can be split across two reads, so while it has not been
+// seen the last five bytes are held back — they might be its beginning. That
+// is also why this cannot live in _scan: a paste is the one thing here whose
+// event spans more bytes than the reader holds at once.
+fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
+    _ev_clear(ev);
+    let is *u8 as b = cast(*u8, &in.buf);
+    let is i64 as mark with mut = 0 - 1;
+    let is i64 as i with mut = in.head;
+    while (i + 6 <= in.tail) {
+        if (cast(i64, b[i]) == 27 && cast(i64, b[i + 1]) == 91
+            && cast(i64, b[i + 2]) == 50 && cast(i64, b[i + 3]) == 48
+            && cast(i64, b[i + 4]) == 49 && cast(i64, b[i + 5]) == 126) {
+            mark = i;
+            break;
+        }
+        i = i + 1;
+    }
+    let is i64 as stop with mut = in.tail;
+    if (mark >= 0) { stop = mark; }
+    else if (last == 0) {
+        stop = in.tail - 5;
+        if (stop < in.head) { stop = in.head; }
+    }
+    let is i64 as take with mut = stop - in.head;
+    let is i32 as full with mut = 0;
+    let is i64 as room = IN_PASTE - in.plen;
+    if (take > room) { take = room; full = 1; }
+    if (take > 0) {
+        mem.memcpy(cast(*u8, cast(i64, &in.text) + in.plen),
+                   cast(*u8, cast(i64, &in.buf) + in.head), take);
+        in.plen = in.plen + take;
+        in.head = in.head + take;
+    }
+    if (full == 1) {
+        // The cap, reached mid-paste: hand out what we have and keep going.
+        ev.kind = EV_PASTE;
+        ev.text = cast(*u8, &in.text);
+        ev.len = in.plen;
+        in.plen = 0;
+        return 1;
+    }
+    if (mark >= 0) {
+        in.head = in.head + 6;
+        in.inpaste = 0;
+        ev.kind = EV_PASTE;
+        ev.text = cast(*u8, &in.text);
+        ev.len = in.plen;
+        in.plen = 0;
+        return 1;
+    }
+    if (last == 1) {
+        // A paste whose closing bracket never came. The bytes are real; the
+        // bracket is the terminal's problem.
+        in.inpaste = 0;
+        if (in.plen == 0) { return 0; }
+        ev.kind = EV_PASTE;
+        ev.text = cast(*u8, &in.text);
+        ev.len = in.plen;
+        in.plen = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// Take events out of the buffer until one of them is worth returning. Returns
+// 0 when the buffer cannot answer without more bytes.
+fn _drain_buf(in as *Input, ev as *Event, last as i32) as i32 {
+    while (1 == 1) {
+        if (in.inpaste == 1) {
+            if (_paste_take(in, ev, last) == 1) { return 1; }
+            return 0;
+        }
+        let is i64 as avail = in.tail - in.head;
+        if (avail <= 0) { return 0; }
+        let is i64 as used = _scan(cast(*u8, cast(i64, &in.buf) + in.head),
+                                  avail, last, ev);
+        if (used <= 0) { return 0; }
+        in.head = in.head + used;
+        if (ev.kind == EV_KEY) { return 1; }
+        if (ev.kind == EV_MOUSE) {
+            // A report for a mode this reader never turned on is chatter, not
+            // an event. Swallowing it whole is the difference between this
+            // reader and the old one.
+            if (in.m_mouse == 1) { return 1; }
+        } else if (ev.kind == EV_FOCUS) {
+            if (in.m_focus == 1) { return 1; }
+        } else if (ev.kind == _EV_PASTE_ON) {
+            if (in.m_paste == 1) { in.inpaste = 1; in.plen = 0; }
+        }
+        // EV_NONE, a stray closing bracket, a mode nobody asked for: consumed
+        // and dropped, and the loop keeps looking for something real.
+    }
+    return 0;
+}
+
+// Open the reader on stdin and turn on the modes the caller wants.
+//
+// It does NOT enter raw mode. Raw mode is a property of the terminal that the
+// whole program shares, and the callers that need it already own an
+// enter_raw/leave_raw pair around their whole run — flipping it here would
+// mean flipping it back in input_close, and closing the reader is not the same
+// event as putting the terminal back.
+fn input_open(in as *Input, want_mouse as i32) as i64 {
+    if (os.current() != os.OS_LINUX && os.current() != os.OS_WINDOWS) {
+        return 0 - 1;
+    }
+    _reset(in);
+    if (want_mouse == 1) {
+        // 1000 press/release, 1002 motion while a button is held (drag, which
+        // the interface needs for selection and for a draggable scrollbar),
+        // 1006 the SGR encoding — the only one whose coordinates are decimal
+        // and therefore not capped at column 223.
+        io._write_fd(io.STDOUT, "\x1b[?1000h\x1b[?1002h\x1b[?1006h", 24);
+        in.m_mouse = 1;
+    }
+    io._write_fd(io.STDOUT, "\x1b[?2004h", 8);          // bracketed paste
+    in.m_paste = 1;
+    io._write_fd(io.STDOUT, "\x1b[?1004h", 8);          // focus reporting
+    in.m_focus = 1;
+    in.active = 1;
+    _cur = cast(i64, in);
+    return 0;
+}
+
+// Put back every mode input_open turned on, and only those.
+//
+// This is a requirement, not a finishing touch: a program that dies with mouse
+// reporting left on leaves the shell it came from printing `<35;40;12M` at
+// every click, and bracketed paste left on leaves it printing `[200~` around
+// every paste. The three resets go out in the reverse order of the sets, and
+// each one is gated on this reader having actually set it.
+fn input_close(in as *Input) as void {
+    if (in.m_focus == 1) {
+        io._write_fd(io.STDOUT, "\x1b[?1004l", 8);
+        in.m_focus = 0;
+    }
+    if (in.m_paste == 1) {
+        io._write_fd(io.STDOUT, "\x1b[?2004l", 8);
+        in.m_paste = 0;
+    }
+    if (in.m_mouse == 1) {
+        io._write_fd(io.STDOUT, "\x1b[?1006l\x1b[?1002l\x1b[?1000l", 24);
+        in.m_mouse = 0;
+    }
+    in.active = 0;
+    in.head = 0;
+    in.tail = 0;
+    in.plen = 0;
+    in.inpaste = 0;
+    if (_cur == cast(i64, in)) { _cur = 0; }
+}
+
+// The descriptor, for whoever owns the select loop.
+//
+// Sleeping on it is right; treating its readiness as the answer to "has the
+// reader an event" is not — the bytes are in this module's buffer, where no
+// epoll set can see them. Drain with input_next until it returns 0 on every
+// wake, or the loop runs one event behind and loses the tail of every burst.
+fn input_fd(in as *Input) as i64 {
+    if (in.ready != 1) { _reset(in); }
+    return in.fd;
+}
+
+// One event, or 0 for "drained".
+//
+// Blocking: it reads only when the descriptor says it has something, EXCEPT
+// while it holds an unresolved prefix — a lone ESC, half a mouse report, a
+// paste whose closing bracket has not arrived — where it does one blocking
+// read, because that wait is the only thing that can tell a bare Escape from
+// the start of an arrow key. Under raw mode's VMIN=0/VTIME=1 that read is
+// bounded at 100 ms; under a pipe it is bounded by the writer, which is why
+// interfaces are tested through a pty and not through a pipe.
+fn input_next(in as *Input, ev as *Event) as i32 {
+    if (in.ready != 1) { _reset(in); }
+    while (1 == 1) {
+        if (_drain_buf(in, ev, 0) == 1) { return 1; }
+        let is i32 as force with mut = 0;
+        if (in.tail > in.head) { force = 1; }
+        if (in.inpaste == 1) { force = 1; }
+        if (_fill(in, IN_BUF, force) == 0) {
+            // Nothing more is coming: whatever is held has to resolve now.
+            if (_drain_buf(in, ev, 1) == 1) { return 1; }
+            _ev_clear(ev);
+            return 0;
         }
     }
+    return 0;
+}
 
-    return KEY_ESC;
+// The reader read_key() speaks to: the caller's, if it opened one, otherwise
+// this module's own — created here and nowhere else, so that importing the
+// module for its colours never touches fd 0.
+fn _reader() as *Input {
+    if (_cur != 0) { return cast(*Input, _cur); }
+    if (_shell.ready != 1) { _reset(&_shell); }
+    return &_shell;
+}
+
+// Read a key from stdin. Returns KEY_* constants or an ASCII byte, KEY_NONE if
+// there was nothing to report — the same signature and the same answers as
+// before, now with the parser underneath shared with input_next.
+//
+// Two properties are kept deliberately, because a caller depends on each:
+//
+//   - one call consumes the bytes of one keystroke and no more. It reads ONE
+//     byte per read, exactly as it always did, so a burst stays in the kernel
+//     queue where a level-triggered poller can still see it. Anything else
+//     silently breaks a select loop that calls this once per readiness report.
+//   - the read blocks. VMIN=0/VTIME=1 bounds it at about 100 ms, and that
+//     timeout is what makes a bare Escape resolvable at all.
+//
+// Non-key events are not returned: a mouse report or a paste is not an i32, and
+// a caller that wants them calls input_next. Such a sequence is consumed whole
+// and answered with KEY_NONE — which the old reader could not do, because it
+// had no way to know where the sequence ended. KEY_NONE was already a possible
+// answer (VMIN=0 lets a read return zero bytes), so every caller already
+// guards on it.
+fn read_key() as i32 {
+    let is *Input as in = _reader();
+    let is Event as ev;
+    let is i64 as pulled with mut = 0;
+    while (1 == 1) {
+        let is i64 as was = in.head;
+        if (_drain_buf(in, &ev, 0) == 1) {
+            if (ev.kind == EV_KEY) { return ev.key; }
+        } else {
+            // A whole sequence went past and none of it was a key — a report
+            // for a mode this reader did not turn on, or a reply the terminal
+            // sent unasked. It is consumed; answer "nothing" now rather than
+            // read on, so that one call still costs at most one keystroke's
+            // worth of bytes and the rest of a burst stays in the kernel where
+            // a poller can see it.
+            if (in.head > was && in.head == in.tail) { return KEY_NONE; }
+            if (pulled >= _RK_MAX) {
+                // Bounded: drop the unresolvable prefix rather than read on
+                // forever. Reachable only if a single event exceeds 64 bytes,
+                // which for this parser means a paste — and a program that
+                // enabled bracketed paste should be reading events, not keys.
+                in.head = in.tail;
+                return KEY_NONE;
+            }
+            if (_fill(in, 1, 1) == 0) {
+                while (_drain_buf(in, &ev, 1) == 1) {
+                    if (ev.kind == EV_KEY) { return ev.key; }
+                }
+                return KEY_NONE;
+            }
+            pulled = pulled + 1;
+        }
+    }
+    return KEY_NONE;
 }
