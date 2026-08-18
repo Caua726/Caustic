@@ -634,6 +634,134 @@ fn t_modes_no_mouse() as void {
     chk("no-mouse exact bytes", diff, 0);
 }
 
+// === read_key and a paste ===
+//
+// A person who pastes two hundred characters has given the program two hundred
+// characters. read_key answers with an i32, so it cannot hand out a paste as
+// one thing — but it may not eat it either, and the first version of this
+// reader did: with paste mode on it assembled the whole EV_PASTE and dropped
+// it, returning KEY_NONE, and nothing anywhere said the text had existed.
+//
+// What it does instead: the brackets are consumed and reported as nothing, and
+// the bytes between them come out as the keystrokes they would have been if
+// they had been typed — one per call, in order, none lost, and each one still
+// left in the kernel queue until it is read so a level-triggered poller keeps
+// seeing them.
+fn t_read_key_paste() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term._shell.fd = pipe_rd();
+    term._shell.ready = 1;
+    term._shell.m_paste = 1;
+    pipe_send("\x1b[200~", 6);
+    pipe_send("hello", 5);
+    pipe_send("\x1b[201~", 6);
+    pipe_send("Z", 1);
+    pipe_seal();
+    let is [16]i64 as got;
+    let is i64 as n with mut = 0;
+    let is i64 as calls with mut = 0;
+    while (calls < 24) {
+        let is i32 as k = term.read_key();
+        if (k != term.KEY_NONE && n < 16) { got[n] = cast(i64, k); n = n + 1; }
+        calls = calls + 1;
+    }
+    chk("rk paste count", n, 6);
+    chk("rk paste 0", got[0], 104);
+    chk("rk paste 1", got[1], 101);
+    chk("rk paste 2", got[2], 108);
+    chk("rk paste 3", got[3], 108);
+    chk("rk paste 4", got[4], 111);
+    chk("rk paste after", got[5], 90);
+    pipe_done();
+    term._shell.ready = 0;
+    term._shell.m_paste = 0;
+}
+
+// The design's worked example, through read_key: two hundred characters, and
+// two hundred is what comes out. Nothing about the count may depend on the
+// bracket having been seen, so the trailing key is checked too.
+fn t_read_key_paste_200() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term._shell.fd = pipe_rd();
+    term._shell.ready = 1;
+    term._shell.m_paste = 1;
+    let is [256]u8 as body;
+    let is i64 as i with mut = 0;
+    while (i < 200) { body[i] = cast(u8, 97 + (i % 26)); i = i + 1; }
+    pipe_send("\x1b[200~", 6);
+    pipe_send(cast(*u8, &body), 200);
+    pipe_send("\x1b[201~", 6);
+    pipe_send("!", 1);
+    pipe_seal();
+    let is i64 as keys with mut = 0;
+    let is i64 as wrong with mut = 0;
+    let is i64 as trailing with mut = 0;
+    let is i64 as calls with mut = 0;
+    while (calls < 400) {
+        let is i32 as k = term.read_key();
+        if (k != term.KEY_NONE) {
+            if (keys < 200) {
+                if (cast(i64, k) != cast(i64, body[keys])) { wrong = wrong + 1; }
+                keys = keys + 1;
+            } else { trailing = trailing + 1; }
+        }
+        calls = calls + 1;
+    }
+    chk("rk paste200 keys", keys, 200);
+    chk("rk paste200 wrong", wrong, 0);
+    chk("rk paste200 trailing", trailing, 1);
+    pipe_done();
+    term._shell.ready = 0;
+    term._shell.m_paste = 0;
+}
+
+// The mixed configuration the module documents: input_next has started
+// assembling a paste, and the program calls read_key before the closing bracket
+// arrived. The bytes already accumulated belong to the person who pasted them,
+// so read_key hands them out as keystrokes instead of leaving them in a buffer
+// nobody will read again.
+//
+// Getting to a genuinely half-assembled paste takes a paste past the cap: that
+// is the one state where input_next returns an event and stays inside a paste,
+// which is what lets this be driven without a second thread. A pipe has no
+// VTIME, so the write end is closed before read_key is called — EOF is the only
+// thing that can end read_key's bounded blocking read here.
+fn t_read_key_paste_handover() as void {
+    let is i64 as cap = term.IN_PASTE;
+    let is i64 as i with mut = 0;
+    while (i < cap + 8) { _big[i] = cast(u8, 97 + (i % 26)); i = i + 1; }
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    // The reader read_key speaks to, driven by input_next first: that IS the
+    // mixed configuration, and there is no second reader anywhere in this test.
+    term._shell.fd = pipe_rd();
+    term._shell.ready = 1;
+    term._shell.m_paste = 1;
+    pipe_send("\x1b[200~", 6);
+    pipe_send(cast(*u8, &_big), cap + 8);
+    let is term.Event as ev;
+    let is i64 as chunk with mut = 0;
+    if (term.input_next(&term._shell, &ev) == 1) { chunk = ev.len; }
+    chk("handover chunk", chunk, cap);
+    chk("handover assembling", cast(i64, term._shell.inpaste), 1);
+    pipe_seal();
+    let is [16]i64 as got;
+    let is i64 as n with mut = 0;
+    let is i64 as calls with mut = 0;
+    while (calls < 32) {
+        let is i32 as k = term.read_key();
+        if (k != term.KEY_NONE && n < 16) { got[n] = cast(i64, k); n = n + 1; }
+        calls = calls + 1;
+    }
+    chk("handover count", n, 8);
+    chk("handover first", got[0], cast(i64, _big[cap]));
+    chk("handover last", got[7], cast(i64, _big[cap + 7]));
+    pipe_done();
+    term._shell.ready = 0;
+    term._shell.m_paste = 0;
+    term._shell.inpaste = 0;
+    term._shell.plen = 0;
+}
+
 // input_open hands read_key the reader it opened, so a program that adopts
 // events does not end up with two buffered readers splitting one byte stream.
 fn t_shared_reader() as void {
@@ -685,6 +813,9 @@ fn main() as i32 {
         t_paste_split();
         t_paste_cap();
         t_paste_unterminated();
+        t_read_key_paste();
+        t_read_key_paste_200();
+        t_read_key_paste_handover();
         t_truncated_reader();
         t_gating();
         t_no_block();
