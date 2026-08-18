@@ -83,6 +83,43 @@ fn t_esc() as void {
     chk("esc+esc tail key", cast(i64, ev.key), cast(i64, term.KEY_UP));
 }
 
+// ESC ESC, and what the byte after it is worth.
+//
+// The header promises that the Escape this parser does not consume is delivered
+// by the next call. The first version of this reader delivered it by CONSUMING
+// THE NEXT KEY: the ESC it left behind met the ESC+byte rule and ate the byte.
+// Verified in a pty with the shape of the interface's own loop — `ESC ESC x y`
+// came back as 27, 27, 121, with the x gone and nothing saying so.
+//
+// Which ESC is consumed depends on the byte after the second one, and that is
+// not a guess: an ESC that introduces a sequence has to be left for the next
+// scan to parse, and an ESC that introduces nothing has to be consumed with the
+// first, because a lone ESC left in the buffer eats the byte after it.
+fn t_esc_esc() as void {
+    let is term.Event as ev;
+    // Nothing is introduced: both ESCs are one Escape and the q is untouched.
+    chk("escesc byte used", term._scan("\x1b\x1bq", 3, 1, &ev), 2);
+    chk("escesc byte key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+    chk("escesc byte tail used", term._scan("q", 1, 1, &ev), 1);
+    chk("escesc byte tail key", cast(i64, ev.key), 113);
+    // The same bytes with more possibly coming: still decidable, because the
+    // byte that decides is already here.
+    chk("escesc byte nolast used", term._scan("\x1b\x1bq", 3, 0, &ev), 2);
+    // A sequence IS introduced: one byte only, so the second ESC survives to be
+    // parsed as what it is.
+    chk("escesc csi used", term._scan("\x1b\x1b[A", 4, 0, &ev), 1);
+    chk("escesc csi key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+    chk("escesc ss3 used", term._scan("\x1b\x1bOA", 4, 0, &ev), 1);
+    chk("escesc osc used", term._scan("\x1b\x1b]0;t\x07", 7, 0, &ev), 1);
+    chk("escesc esc used", term._scan("\x1b\x1b\x1b", 3, 0, &ev), 1);
+    // Two ESCs with the third byte not here yet: ask for it rather than guess.
+    chk("escesc pending", term._scan("\x1b\x1b", 2, 0, &ev), 0);
+    chk("escesc pending kind", ev.kind, term.EV_NONE);
+    // Two ESCs and nothing behind them at all: one Escape, both consumed.
+    chk("escesc alone used", term._scan("\x1b\x1b", 2, 1, &ev), 2);
+    chk("escesc alone key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+}
+
 fn t_keys() as void {
     let is term.Event as ev;
     chk("up used", term._scan("\x1b[A", 3, 0, &ev), 3);
@@ -309,6 +346,43 @@ fn t_esc_then_arrow() as void {
     chk("esc+arrow first", got[0], cast(i64, term.KEY_ESC));
     chk("esc+arrow second", got[1], cast(i64, term.KEY_UP));
     pipe_done();
+}
+
+// ESC ESC and then two real keystrokes, in ONE write — the pty case that found
+// this defect. Every key survives, including the first one after the escapes.
+fn t_esc_esc_reader() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = pipe_rd();
+    pipe_send("\x1b\x1bxy", 4);
+    pipe_seal();
+    let is term.Event as ev;
+    let is [8]i64 as got;
+    let is i64 as n with mut = 0;
+    while (term.input_next(&in, &ev) == 1) {
+        if (ev.kind == term.EV_KEY && n < 8) { got[n] = cast(i64, ev.key); n = n + 1; }
+    }
+    chk("escesc reader count", n, 3);
+    chk("escesc reader 0", got[0], cast(i64, term.KEY_ESC));
+    chk("escesc reader 1", got[1], 120);
+    chk("escesc reader 2", got[2], 121);
+    pipe_done();
+}
+
+// The same through read_key, which is the API the interface actually calls.
+fn t_esc_esc_read_key() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term._shell.fd = pipe_rd();
+    term._shell.ready = 1;
+    pipe_send("\x1b\x1bq", 3);
+    pipe_seal();
+    chk("escesc rk first", cast(i64, term.read_key()), cast(i64, term.KEY_ESC));
+    chk("escesc rk second", cast(i64, term.read_key()), 113);
+    chk("escesc rk drained", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    pipe_done();
+    term._shell.ready = 0;
 }
 
 // An arrow key arrives as three bytes in one write and leaves as one key.
@@ -796,6 +870,7 @@ fn main() as i32 {
     // The parser is a pure function and runs on every target.
     t_bytes();
     t_esc();
+    t_esc_esc();
     t_keys();
     t_mouse();
     t_mouse_broken();
@@ -808,6 +883,8 @@ fn main() as i32 {
         t_read_key_esc();
         t_read_key_arrow();
         t_esc_then_arrow();
+        t_esc_esc_reader();
+        t_esc_esc_read_key();
         t_burst();
         t_paste();
         t_paste_split();

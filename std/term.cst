@@ -43,10 +43,21 @@
 // Two answers changed, both of them where the old ones were wrong. A sequence
 // that is not a key — a mouse report, a paste bracket, a reply the terminal
 // sent unasked — is consumed whole and answered KEY_NONE instead of KEY_ESC
-// plus its own tail as text. And ESC immediately followed by ESC consumes only
-// the first byte, so the second can still introduce a sequence; that is the one
-// case where a read_key call can leave a byte in this module's buffer rather
-// than in the kernel queue, and the next call delivers it.
+// plus its own tail as text. And ESC immediately followed by ESC no longer eats
+// whatever came after it: the byte behind the second ESC decides. If it
+// introduces a sequence, only the first ESC is consumed and the second is left
+// to introduce it; if it does not, the two ESCs are consumed as one Escape and
+// the byte itself is untouched. Both readings destroy input if applied always —
+// consuming one always loses the byte after it (`ESC ESC x` answered Escape,
+// Escape and no x), consuming both always loses a sequence the second ESC was
+// introducing (a paste's `[200~` typed into the input).
+//
+// That decision needs the third byte, so read_key can end a call holding an ESC
+// ESC pair's worth of bytes in this module's buffer rather than in the kernel
+// queue. A level-triggered poller cannot see those, so they are delivered by
+// the next read_key call — which, in a loop that only calls read_key when the
+// descriptor says it is readable, is the next time any input arrives. That is
+// the price of not guessing, and it is one byte, never a lost one.
 //
 // A paste is NOT among the things read_key answers KEY_NONE to. Bracketed text
 // is not the terminal talking, it is a person putting two hundred characters
@@ -435,6 +446,25 @@ fn _num(buf as *u8, n as i64, i as *i64) as i64 {
     return v;
 }
 
+// Does an ESC followed by this byte begin something, rather than being a key?
+//
+// CSI, SS3, SS2 and the five string introducers — OSC, DCS, SOS, PM, APC — plus
+// ESC itself, which begins the same decision one byte later. It exists for the
+// ESC ESC rule: the difference between an ESC that must be left for the next
+// scan and one that must be consumed now is exactly this list.
+fn _introduces(b as i64) as i32 {
+    if (b == 91) { return 1; }         // '[' CSI
+    if (b == 79) { return 1; }         // 'O' SS3
+    if (b == 78) { return 1; }         // 'N' SS2
+    if (b == 93) { return 1; }         // ']' OSC
+    if (b == 80) { return 1; }         // 'P' DCS
+    if (b == 88) { return 1; }         // 'X' SOS
+    if (b == 94) { return 1; }         // '^' PM
+    if (b == 95) { return 1; }         // '_' APC
+    if (b == 27) { return 1; }         // ESC, deciding again one byte along
+    return 0;
+}
+
 // The final byte of a cursor-key sequence, for both CSI and SS3 forms.
 fn _final_key(f as i64) as i32 {
     if (f == 65) { return KEY_UP; }
@@ -522,19 +552,32 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
     }
     let is i64 as b1 = cast(i64, buf[1]);
     if (b1 == 27) {
-        // ESC then ESC. The first one is the Escape key and ONLY it is
-        // consumed: the second may be the start of a real sequence, and eating
-        // a sequence introducer is the defect this rewrite exists to remove.
-        // Found by driving a pty with `ESC` followed by a bracketed paste — the
-        // old rule ate the paste's own ESC and typed `[200~` into the input.
+        // ESC then ESC, and the byte after the second one decides which of them
+        // is consumed. Both readings are wrong on their own:
         //
-        // It is also the one case where a read_key() call can leave a byte in
-        // this module's buffer instead of in the kernel queue. One byte, never
-        // lost, delivered by the next call; the alternative is losing whatever
-        // the second ESC introduced.
+        //   - consume only the first, always: the ESC left behind meets the
+        //     ESC+byte rule below on the next scan, which answers Escape having
+        //     eaten the byte. `ESC ESC x` then loses the x — measured in a pty,
+        //     27, 27 and no 120 at all.
+        //   - consume both, always: a second ESC that was introducing something
+        //     is gone, and its tail is typed as text. Found by driving a pty
+        //     with Escape followed by a bracketed paste — the paste's own ESC
+        //     was eaten and `[200~` went into the input.
+        //
+        // So: if the second ESC introduces a sequence, consume only the first
+        // and let the next scan parse that sequence; otherwise the two ESCs are
+        // one Escape and the byte behind them is untouched. Nothing is guessed —
+        // when the deciding byte is not here yet, this asks for it.
+        if (n == 2) {
+            if (last == 0) { return 0; }
+            ev.kind = EV_KEY;
+            ev.key = KEY_ESC;
+            return 2;                  // two ESCs, nothing behind: one Escape
+        }
         ev.kind = EV_KEY;
         ev.key = KEY_ESC;
-        return 1;
+        if (_introduces(cast(i64, buf[2])) == 1) { return 1; }
+        return 2;
     }
     if (b1 == 79) {                                   // 'O' — SS3
         if (n < 3) {
