@@ -1,0 +1,222 @@
+// =======================================================
+// std/unicode/width.cst
+// How many terminal columns a thing occupies. Three levels of API, because
+// callers arrive holding three different things:
+//
+//   cp_width(cp)                one code point
+//   cluster_next(src, n, cols)  one grapheme cluster, straight from UTF-8 bytes
+//   string_width(src, n)        a whole UTF-8 string
+//
+// Nothing here allocates. Nothing here reads or writes a descriptor. The module
+// answers questions about bytes it is handed and does nothing else.
+//
+// East_Asian_Width is not sufficient and the gap is not exotic. Regional
+// indicators U+1F1E6..U+1F1FF are EAW Neutral, so a flag measured one column
+// against every terminal that draws it two; U+2764 is Neutral too. Two
+// properties close it: Emoji_Presentation ("is the default glyph the emoji
+// one"), read per code point, and U+FE0F, which is only meaningful across a
+// cluster — see cp_run_width.
+//
+// What this module refuses to do: decide whether a byte is safe to draw. `ESC [
+// 2 J` is well-formed UTF-8 measuring three columns (ESC is Cc, so 0, and the
+// other three are 1 each) and it clears the terminal. `ESC [ 6 n` makes the
+// terminal type a reply into the program's own stdin. Measurement reports what
+// it sees; refusing to draw C0/C1 controls is the drawing layer's job and has to
+// live where drawing happens.
+// =======================================================
+
+use "props.cst"            as props;
+use "tables/eaw.cst"       as eaw;
+use "tables/emojipres.cst" as emojipres;
+use "tables/extpict.cst"   as ep;
+use "utf8.cst"             as utf8;
+use "grapheme.cst"         as gr;
+
+// U+FE0F VARIATION SELECTOR-16, which asks for emoji presentation.
+let is i32 as VS16 with imut = 65039;
+
+// U+20E3 COMBINING ENCLOSING KEYCAP, the third code point of a keycap.
+let is i32 as KEYCAP with imut = 8419;
+
+// U+FFFD REPLACEMENT CHARACTER is one column, which is the width charged for a
+// byte that is not UTF-8 — that glyph is what a terminal actually draws there.
+let is i64 as REPLACEMENT_COLS with imut = 1;
+
+// Code points cluster_next will hold on the stack for one cluster.
+//
+// Measured, not guessed. The longest cluster in the UCD's own
+// GraphemeBreakTest.txt is 6 code points (U+1F476 U+1F3FF U+0308 ZWJ U+1F476
+// U+1F3FF). The longest sequence people actually send is a kiss with two skin
+// tones — person, modifier, ZWJ, U+2764, VS16, ZWJ, U+1F48F, ZWJ, person,
+// modifier — which is 10. 32 is the next power of two above triple that, and
+// costs 128 bytes of stack.
+//
+// A cluster longer than this is cut here, which makes the caller's next call
+// start off a real boundary. It degrades in the direction that cannot hurt:
+// the tail of an over-long cluster is combining marks, every one of them zero
+// columns, so a base plus ten thousand marks still measures 1.
+let is i64 as CLUSTER_CP_MAX with imut = 32;
+
+// Columns occupied by one code point: 0, 1, or 2.
+//
+// Order is load-bearing. The zero-width categories come first: a nonspacing or
+// enclosing mark does not advance the cursor whatever else is true of it.
+// Emoji_Presentation comes before East_Asian_Width, because the whole reason
+// that table exists is the code points EAW calls Neutral and terminals draw
+// wide.
+fn cp_width(cp as i32) as i64 {
+    let is i64 as gc = props.general_category(cp);
+    if (gc == props.GC_CC || gc == props.GC_CF || gc == props.GC_MN || gc == props.GC_ME) { return 0; }
+    if (emojipres.emojipres_get(cp) == 1) { return 2; }
+    let is i64 as ea = props.east_asian_width(cp);
+    if (ea == eaw.EAW_W || ea == eaw.EAW_F) { return 2; }
+    return 1;
+}
+
+// Like cp_width, but East-Asian Ambiguous counts as 2 when ambiguous_wide = 1
+// (a CJK legacy locale); otherwise 1.
+fn cp_width_amb(cp as i32, ambiguous_wide as i64) as i64 {
+    let is i64 as w = cp_width(cp);
+    if (ambiguous_wide == 1 && w == 1) {
+        if (props.east_asian_width(cp) == eaw.EAW_A) { return 2; }
+    }
+    return w;
+}
+
+// 1 if this cluster is an emoji presentation sequence — a base that VS16 has
+// asked to be drawn as an emoji rather than as text (UTS #51).
+//
+// This is the half of the emoji width problem that no per-code-point table can
+// answer, which is why it lives here and not in cp_width. U+2764 alone is a
+// narrow dingbat and correctly has no Emoji_Presentation, because alone it is
+// text; U+2764 U+FE0F is a red heart two cells wide. The keycaps are the same
+// shape with an ASCII digit for a base, and the digits are not
+// Extended_Pictographic either, so U+20E3 is what identifies them.
+//
+// The conditions are deliberately narrow. A bare VS16 is 0 — it is Cf, and there
+// is no emoji for it to be the presentation of. `A U+FE0F` stays 1: a variation
+// selector on a Latin letter selects nothing.
+fn _emoji_presented(cps as *i32, start as i64, end as i64) as i64 {
+    let is i64 as vs with mut = 0;
+    let is i64 as keycap with mut = 0;
+    let is i64 as j with mut = start;
+    while (j < end) {
+        if (cps[j] == VS16)   { vs = 1; }
+        if (cps[j] == KEYCAP) { keycap = 1; }
+        j = j + 1;
+    }
+    if (vs == 0) { return 0; }
+    if (keycap == 1) { return 1; }
+    if (ep.extpict_get(cps[start]) == 1) { return 1; }
+    return 0;
+}
+
+// Columns for one cluster: the widest member, or 2 if VS16 made it an emoji.
+fn _cluster_cols(cps as *i32, start as i64, end as i64) as i64 {
+    if (end <= start) { return 0; }
+    let is i64 as w with mut = 0;
+    let is i64 as j with mut = start;
+    while (j < end) {
+        let is i64 as cw = cp_width(cps[j]);
+        if (cw > w) { w = cw; }
+        j = j + 1;
+    }
+    if (w < 2 && _emoji_presented(cps, start, end) == 1) { w = 2; }
+    return w;
+}
+
+// Grapheme-cluster-aware run width over an array of code points.
+fn cp_run_width(cps as *i32, n as i64) as i64 {
+    let is i64 as total with mut = 0;
+    let is gr.GraphemeIter as it = gr.grapheme_iter(cps, n);
+    let is i64 as start with mut = 0;
+    let is i64 as e with mut = gr.grapheme_next(&it);
+    while (e >= 0) {
+        total = total + _cluster_cols(cps, start, e);
+        start = e;
+        e = gr.grapheme_next(&it);
+    }
+    return total;
+}
+
+// Advance over one grapheme cluster starting at a CLUSTER BOUNDARY.
+//
+// Returns bytes consumed, > 0, and writes the cluster's column count — 0, 1 or
+// 2, never negative and never more than 2 — to *cols.
+//
+//   0   the buffer is finished. *cols is 0. There is nothing at src to advance
+//       over and the caller must NOT advance.
+//  -1   the bytes at src are not UTF-8. *cols is 1. The caller advances ONE
+//       byte and draws U+FFFD, which is one column.
+//
+// Those are two answers and not one. A single `0` meaning "end, or rubbish —
+// either way advance a byte" walks the caller past src+n at the end of every
+// buffer: the out-of-bounds read would be in the contract, before anybody wrote
+// a line of code against it.
+//
+// IT IS NOT RESUMABLE FROM AN ARBITRARY BYTE OFFSET. Cluster boundaries are
+// defined looking backwards — GB11 walks down from i-2 over Extend to find the
+// pictograph, GB12/13 count regional-indicator parity behind the cursor, GB9c
+// walks back to the consonant — so a call that starts mid-cluster cannot see
+// what makes the cluster one cluster. Measured: the family
+// U+1F468 ZWJ U+1F469 ZWJ U+1F467 is 2 columns called once at offset 0, and 6 if
+// called at offsets 0, 7 and 14. Callers walk forward from a boundary, and the
+// first boundary is offset 0.
+//
+// No allocation, on any path. The cluster is decoded into a fixed
+// CLUSTER_CP_MAX-element stack array, and the two functions it calls —
+// utf8.decode1 and gr.grapheme_is_boundary — are pure arithmetic over the
+// caller's bytes and over .rodata tries. A renderer measures every visible line
+// several times a second; an allocation two calls deep is still an allocation
+// per line per frame.
+fn cluster_next(src as *u8, n as i64, cols as *i64) as i64 {
+    cols[0] = 0;
+    if (n <= 0) { return 0; }
+
+    let is [32]i32 as cps;                          // CLUSTER_CP_MAX
+    let is i32 as cp with mut = 0;
+    let is i64 as k = utf8.decode1(src, n, 0, &cp);
+    if (k < 0) { cols[0] = REPLACEMENT_COLS; return 0 - 1; }
+
+    cps[0] = cp;
+    let is i64 as ncp with mut = 1;
+    let is i64 as used with mut = k;
+
+    while (used < n && ncp < CLUSTER_CP_MAX) {
+        let is i32 as nx with mut = 0;
+        let is i64 as k2 = utf8.decode1(src, n, used, &nx);
+        // Bad bytes end the cluster rather than joining it. The caller's next
+        // call lands on them and gets the -1 that says so.
+        if (k2 < 0) { break; }
+        cps[ncp] = nx;
+        if (gr.grapheme_is_boundary(cast(*i32, &cps), ncp + 1, ncp) == 1) { break; }
+        ncp = ncp + 1;
+        used = used + k2;
+    }
+
+    cols[0] = _cluster_cols(cast(*i32, &cps), 0, ncp);
+    return used;
+}
+
+// Display width of a UTF-8 string, cluster by cluster. Always >= 0.
+//
+// Never negative, and that is a requirement rather than a nicety.
+// caustic-unicode's string_width returns -1 for the whole string on one bad
+// byte, and a negative column count entering layout arithmetic is a live hostile
+// path: a wrap routine that clamps with `if (take > w) { take = w; }` accepts it
+// happily, and one crooked byte in a stranger's message would zero the
+// measurement of the entire line. A bad byte is one cluster of one column,
+// U+FFFD, which is what the terminal draws there anyway.
+fn string_width(src as *u8, n as i64) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as cols with mut = 0;
+    while (i < n) {
+        let is i64 as k = cluster_next(cast(*u8, cast(i64, src) + i), n - i, &cols);
+        total = total + cols;
+        if (k > 0) { i = i + k; }
+        else if (k < 0) { i = i + 1; }
+        else { return total; }        // cannot happen while i < n; never loops if it does
+    }
+    return total;
+}

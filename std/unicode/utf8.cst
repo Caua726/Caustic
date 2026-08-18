@@ -1,0 +1,152 @@
+// =======================================================
+// std/unicode/utf8.cst
+// UTF-8 decode/encode/validate. Rejects overlong forms, surrogates
+// (U+D800..U+DFFF), and code points > U+10FFFF — the three shapes that a
+// decoder accepting them turns into a security bug rather than a mojibake.
+// Returns bytes consumed/written >= 0, or 0 - errno.UERR_* on error.
+//
+// Nothing here allocates, and that is the reason this file is 40 lines shorter
+// than caustic-unicode's utf/utf8.cst. Its to_cps/from_cps grow a heap CpBuf or
+// ByteBuf, and they were the module's only reason to import core/buf.cst; with
+// width measuring straight from bytes, both go and this module reaches nothing
+// outside its own directory.
+// =======================================================
+
+use "errno.cst" as errno;
+
+// Decode one code point at byte index i in [src, src+n). Writes it to *out,
+// returns bytes consumed (1..4), or 0 - UERR_* on malformed/truncated input.
+fn decode1(src as *u8, n as i64, i as i64, out as *i32) as i64 {
+    if (i >= n) { return 0 - errno.UERR_TRUNC; }
+    let is i32 as b0 = cast(i32, src[i]);
+    if (b0 < 128) { out[0] = b0; return 1; }                 // 0xxxxxxx
+    if (b0 < 192) { return 0 - errno.UERR_INVALID; }         // stray continuation
+    if (b0 < 224) {                                          // 110xxxxx — 2 bytes
+        if (i + 1 >= n) { return 0 - errno.UERR_TRUNC; }
+        let is i32 as b1 = cast(i32, src[i + 1]);
+        if ((b1 & 192) != 128) { return 0 - errno.UERR_INVALID; }
+        let is i32 as cp = ((b0 & 31) << 6) | (b1 & 63);
+        if (cp < 128) { return 0 - errno.UERR_OVERLONG; }
+        out[0] = cp; return 2;
+    }
+    if (b0 < 240) {                                          // 1110xxxx — 3 bytes
+        if (i + 2 >= n) { return 0 - errno.UERR_TRUNC; }
+        let is i32 as b1 = cast(i32, src[i + 1]);
+        let is i32 as b2 = cast(i32, src[i + 2]);
+        if ((b1 & 192) != 128 || (b2 & 192) != 128) { return 0 - errno.UERR_INVALID; }
+        let is i32 as cp = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63);
+        if (cp < 2048) { return 0 - errno.UERR_OVERLONG; }
+        if (cp >= 55296 && cp <= 57343) { return 0 - errno.UERR_RANGE; }   // surrogate
+        out[0] = cp; return 3;
+    }
+    if (b0 < 248) {                                          // 11110xxx — 4 bytes
+        if (i + 3 >= n) { return 0 - errno.UERR_TRUNC; }
+        let is i32 as b1 = cast(i32, src[i + 1]);
+        let is i32 as b2 = cast(i32, src[i + 2]);
+        let is i32 as b3 = cast(i32, src[i + 3]);
+        if ((b1 & 192) != 128 || (b2 & 192) != 128 || (b3 & 192) != 128) { return 0 - errno.UERR_INVALID; }
+        let is i32 as cp = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
+        if (cp < 65536) { return 0 - errno.UERR_OVERLONG; }
+        if (cp > 1114111) { return 0 - errno.UERR_RANGE; }
+        out[0] = cp; return 4;
+    }
+    return 0 - errno.UERR_INVALID;                           // 0xF8..0xFF
+}
+
+// Encode cp into dst (needs up to 4 bytes). Returns bytes written, or
+// 0 - UERR_RANGE for surrogates / out-of-range code points.
+fn encode1(cp as i32, dst as *u8) as i64 {
+    if (cp < 0) { return 0 - errno.UERR_RANGE; }
+    if (cp < 128) { dst[0] = cast(u8, cp); return 1; }
+    if (cp < 2048) {
+        dst[0] = cast(u8, 192 | (cp >> 6));
+        dst[1] = cast(u8, 128 | (cp & 63));
+        return 2;
+    }
+    if (cp >= 55296 && cp <= 57343) { return 0 - errno.UERR_RANGE; }
+    if (cp < 65536) {
+        dst[0] = cast(u8, 224 | (cp >> 12));
+        dst[1] = cast(u8, 128 | ((cp >> 6) & 63));
+        dst[2] = cast(u8, 128 | (cp & 63));
+        return 3;
+    }
+    if (cp > 1114111) { return 0 - errno.UERR_RANGE; }
+    dst[0] = cast(u8, 240 | (cp >> 18));
+    dst[1] = cast(u8, 128 | ((cp >> 12) & 63));
+    dst[2] = cast(u8, 128 | ((cp >> 6) & 63));
+    dst[3] = cast(u8, 128 | (cp & 63));
+    return 4;
+}
+
+// Validate the whole buffer: 0 if well-formed, else 0 - UERR_*.
+fn validate(src as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i32 as cp with mut = 0;
+    while (i < n) {
+        let is i64 as k = decode1(src, n, i, &cp);
+        if (k < 0) { return k; }
+        i = i + k;
+    }
+    return 0;
+}
+
+// Count code points in a buffer; returns count >= 0, or 0 - UERR_* if invalid.
+fn count(src as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as c with mut = 0;
+    let is i32 as cp with mut = 0;
+    while (i < n) {
+        let is i64 as k = decode1(src, n, i, &cp);
+        if (k < 0) { return k; }
+        i = i + k;
+        c = c + 1;
+    }
+    return c;
+}
+
+// Byte offset of the cp_index-th code point (or n past the end), <0 if invalid.
+fn cp_to_byte_index(src as *u8, n as i64, cp_index as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as c with mut = 0;
+    let is i32 as cp with mut = 0;
+    while (i < n && c < cp_index) {
+        let is i64 as k = decode1(src, n, i, &cp);
+        if (k < 0) { return k; }
+        i = i + k;
+        c = c + 1;
+    }
+    return i;
+}
+
+// Code-point index of the cp containing byte_off, <0 if invalid.
+fn byte_to_cp_index(src as *u8, n as i64, byte_off as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as c with mut = 0;
+    let is i32 as cp with mut = 0;
+    while (i < n && i < byte_off) {
+        let is i64 as k = decode1(src, n, i, &cp);
+        if (k < 0) { return k; }
+        i = i + k;
+        c = c + 1;
+    }
+    return c;
+}
+
+// Forward iterator over code points.
+struct Utf8Iter { ptr as *u8; len as i64; pos as i64; }
+
+fn iter(src as *u8, n as i64) as Utf8Iter {
+    let is Utf8Iter as it;
+    it.ptr = src; it.len = n; it.pos = 0;
+    return it;
+}
+
+// Next code point (>= 0), 0 - UERR_END at the end, or 0 - UERR_* on error.
+fn iter_next(it as *Utf8Iter) as i64 {
+    if (it.pos >= it.len) { return 0 - errno.UERR_END; }
+    let is i32 as cp with mut = 0;
+    let is i64 as k = decode1(it.ptr, it.len, it.pos, &cp);
+    if (k < 0) { return k; }
+    it.pos = it.pos + k;
+    return cast(i64, cp);
+}
