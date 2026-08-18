@@ -93,6 +93,34 @@
 // is read as an escape sequence, because an i32 cannot say otherwise. A caller
 // that needs the distinction calls input_next, which does gather it.
 //
+// Who owns the reader read_key reads
+// -----------------------------------
+// This module does. read_key() takes no arguments and is called from code that
+// does not know Input exists, so the reader it reads has to be one whose
+// lifetime nothing outside can end: shared_input(), in .bss. An earlier version
+// kept a module-scope pointer to whatever Input was last handed to input_open,
+// which is a pointer into the caller's memory — a stack-local Input whose frame
+// had returned left it live, and the next read_key read and WROTE 12 KB through
+// it. A program that wants both read_key and input_next against ONE reader hands
+// shared_input() to input_open.
+//
+// What input_close puts back, and what nothing puts back
+// ------------------------------------------------------
+// input_close restores every mode input_open set and only those, in the reverse
+// order, each gated on this reader having actually set it — and a second
+// input_open does not erase that record, it amends it. That is worth stating
+// because getting it wrong is not cosmetic: mouse reporting left on leaves the
+// shell that started the program printing `<35;40;12M` at every click, and
+// bracketed paste left on leaves it printing `[200~` around every paste.
+//
+// A program that dies WITHOUT reaching input_close leaves all five modes set,
+// and nothing here can prevent that. There is no sigaction wrapper anywhere in
+// this stdlib, so there is no handler to hang cleanup off; a SIGTERM, a
+// segfault, or a kill leaves the terminal reporting mouse and bracketing pastes
+// until the user runs `reset`, with nothing to tell them that is what they need.
+// input_open introduces that risk — the old reader set no global terminal modes
+// at all — and this paragraph is here instead of a claim that close is enough.
+//
 // The numbers
 // -----------
 // IN_BUF is 4096 because that is the size of the kernel's tty line-discipline
@@ -405,9 +433,14 @@ struct Event {
 let is i64 as IN_BUF with imut = 4096;
 
 // Chosen, not derived: a paste longer than this arrives as more than one
-// EV_PASTE, split at the cap, with no byte lost. The design's worked example
-// is two hundred characters; this is forty times that, and it costs 8 KiB of
-// .bss in any program that imports the module.
+// EV_PASTE, split at the cap, with no byte lost. The design's worked example is
+// two hundred characters; this is forty times that.
+//
+// What it costs is the whole struct, not this array: the module keeps one Input
+// in .bss for read_key to read through, and sizeof(Input) is 12364 bytes —
+// measured, this array plus IN_BUF plus the bookkeeping. A program that imports
+// this module only for set_color() and clear_screen() measures 12528 bytes of
+// .bss in total, so this is essentially all of it.
 let is i64 as IN_PASTE with imut = 8192;
 
 // How many bytes read_key() will pull while assembling ONE keystroke before it
@@ -422,14 +455,25 @@ let is i64 as IN_PASTE with imut = 8192;
 let is i64 as _RK_MAX with imut = 64;
 
 // An Input must start zeroed, which a global in .bss is and a stack local is
-// not — `ready` is what says "this has been initialised", and a garbage `ready`
-// would skip the initialisation. input_open() initialises unconditionally; a
-// caller that skips input_open (read-only use of input_next on a descriptor it
-// set itself) either uses a global or zeroes the struct.
+// not. `mark` is what says which of three states it is in, and it holds a 64-bit
+// constant rather than a 1 for a reason: the question "has this been
+// initialised?" is being asked of memory that may be an old stack frame, and a
+// frame matching a one-bit answer is likely while one matching this is not.
+//
+//   0, or anything else   never initialised — the input calls reset it
+//   _MARK_READY           initialised, no terminal mode set through it
+//   _MARK_OPEN            between input_open and input_close, so m_* below is
+//                         an undo record and NOT to be zeroed
+//
+// input_open initialises unconditionally, including on the path that refuses.
+// A caller that skips input_open — read-only use of input_next on a descriptor
+// it set itself — either uses a global or zeroes the struct.
+let is i64 as _MARK_READY with imut = 0x7465726D5F726479;   // "term_rdy"
+let is i64 as _MARK_OPEN  with imut = 0x7465726D5F6F706E;   // "term_opn"
+
 struct Input {
     fd      as i64;
-    ready   as i32;     // 1 once the buffer is initialised
-    active  as i32;     // 1 between input_open and input_close
+    mark    as i64;     // which of the three states above
     m_mouse as i32;     // which modes are actually on, so input_close can
     m_paste as i32;     // undo exactly those and nothing else
     m_focus as i32;
@@ -445,19 +489,17 @@ struct Input {
     text    as [IN_PASTE]u8;
 }
 
-// The reader read_key() uses when the program never opened one of its own.
-// Initialised on the first input call and never before: a program that imports
-// this module for set_color() must not find fd 0 taken from under it, and
+// The reader read_key() uses, and the one a program that wants both APIs against
+// one reader passes to input_open — see shared_input() below, which is how it is
+// reached. Initialised on the first input call and never before: a program that
+// imports this module for set_color() must not find fd 0 taken from under it, and
 // examples/calculator.cst is exactly that program — it reads fd 0 itself, one
 // byte at a time, in the same file that calls clear_screen().
+//
+// It is a whole Input, so it costs sizeof(Input) of .bss in any program that
+// imports this module, whether or not that program ever reads a key. See the
+// IN_PASTE note above for the measured number.
 let is Input as _shell with mut;
-
-// The Input most recently handed to input_open, as an address. read_key() uses
-// it in preference to _shell so that a program which adopts input_next() does
-// not end up with two buffered readers splitting the same byte stream between
-// them. It is cleared by input_close, which is therefore not optional: the
-// pointer outlives nothing.
-let is i64 as _cur with mut = 0;
 
 fn _ev_clear(ev as *Event) as void {
     ev.kind = EV_NONE;
@@ -801,13 +843,12 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
     return total;
 }
 
-fn _reset(in as *Input) as void {
+// Everything about the reading, and nothing about the terminal. A second
+// input_open on the same Input goes through here and not through _reset: the
+// mode flags are the undo record input_close is gated on, and zeroing them is
+// how mouse reporting stayed on in the terminal after close.
+fn _reset_buf(in as *Input) as void {
     in.fd = io.STDIN;
-    in.ready = 1;
-    in.active = 0;
-    in.m_mouse = 0;
-    in.m_paste = 0;
-    in.m_focus = 0;
     in.head = 0;
     in.tail = 0;
     in.plen = 0;
@@ -815,6 +856,23 @@ fn _reset(in as *Input) as void {
     in.rk_pos = 0;
     in.rk_end = 0;
     in.skip = 0;
+}
+
+// The whole struct, for an Input that has never been opened. Only correct when
+// nothing has been set through it, which is what the mark is there to tell.
+fn _reset(in as *Input) as void {
+    _reset_buf(in);
+    in.mark = _MARK_READY;
+    in.m_mouse = 0;
+    in.m_paste = 0;
+    in.m_focus = 0;
+}
+
+// Has this Input been through _reset? Asked of memory that may be a dead frame.
+fn _live(in as *Input) as i32 {
+    if (in.mark == _MARK_READY) { return 1; }
+    if (in.mark == _MARK_OPEN) { return 1; }
+    return 0;
 }
 
 // Is there anything to read right now, without waiting for it?
@@ -1101,6 +1159,26 @@ fn _drain_buf(in as *Input, ev as *Event, last as i32, assemble as i32) as i32 {
     return 0;
 }
 
+// The reader read_key() speaks to.
+//
+// It is this module's own, in .bss, and it is the ONLY reader read_key can be
+// made to use. The first version of this kept a module-scope pointer to whatever
+// Input was last handed to input_open so that an argument-less read_key could
+// reach it; a stack-local Input whose frame had returned left that pointer live,
+// and the next read_key read and WROTE about 12 KB through it. No pointer into a
+// caller's memory can be right here, because read_key is called from code that
+// does not know Input exists and cannot say when the object dies.
+//
+// A program that wants read_key AND input_next against one reader passes this to
+// input_open. Opening one of its own instead is allowed and does not break
+// anything of its own, but read_key keeps reading THIS one — two buffered
+// readers on one descriptor split sequences between them, and the module makes
+// the shared one reachable rather than guessing which was meant.
+fn shared_input() as *Input {
+    if (_live(&_shell) == 0) { _reset(&_shell); }
+    return &_shell;
+}
+
 // Open the reader on stdin and turn on the modes the caller wants.
 //
 // It does NOT enter raw mode. Raw mode is a property of the terminal that the
@@ -1108,25 +1186,46 @@ fn _drain_buf(in as *Input, ev as *Event, last as i32, assemble as i32) as i32 {
 // enter_raw/leave_raw pair around their whole run — flipping it here would
 // mean flipping it back in input_close, and closing the reader is not the same
 // event as putting the terminal back.
+//
+// Calling it twice on the same Input is a change of mind about the modes, not a
+// fresh start: what the second call no longer wants is put back right there, what
+// it already has is not set again, and the record of what is on survives. The
+// first version reset that record at the top of every open, which erased the
+// first open's undo information — and since input_close is gated on it, mouse
+// reporting stayed ON in the terminal after close. Measured: seven sets, two
+// resets.
 fn input_open(in as *Input, want_mouse as i32) as i64 {
+    // Unconditionally, and before the target check, so that "input_open
+    // initialises the struct" is true on every path including the refusing one.
+    if (in.mark == _MARK_OPEN) { _reset_buf(in); }        // keep the undo record
+    else { _reset(in); }
     if (os.current() != os.OS_LINUX && os.current() != os.OS_WINDOWS) {
         return 0 - 1;
     }
-    _reset(in);
+    in.mark = _MARK_OPEN;
     if (want_mouse == 1) {
-        // 1000 press/release, 1002 motion while a button is held (drag, which
-        // the interface needs for selection and for a draggable scrollbar),
-        // 1006 the SGR encoding — the only one whose coordinates are decimal
-        // and therefore not capped at column 223.
-        io._write_fd(io.STDOUT, "\x1b[?1000h\x1b[?1002h\x1b[?1006h", 24);
-        in.m_mouse = 1;
+        if (in.m_mouse == 0) {
+            // 1000 press/release, 1002 motion while a button is held (drag, which
+            // the interface needs for selection and for a draggable scrollbar),
+            // 1006 the SGR encoding — the only one whose coordinates are decimal
+            // and therefore not capped at column 223.
+            io._write_fd(io.STDOUT, "\x1b[?1000h\x1b[?1002h\x1b[?1006h", 24);
+            in.m_mouse = 1;
+        }
+    } else if (in.m_mouse == 1) {
+        // A previous open turned these on and this one does not want them: undo
+        // them here, in the reverse order of the sets, so the record stays exact.
+        io._write_fd(io.STDOUT, "\x1b[?1006l\x1b[?1002l\x1b[?1000l", 24);
+        in.m_mouse = 0;
     }
-    io._write_fd(io.STDOUT, "\x1b[?2004h", 8);          // bracketed paste
-    in.m_paste = 1;
-    io._write_fd(io.STDOUT, "\x1b[?1004h", 8);          // focus reporting
-    in.m_focus = 1;
-    in.active = 1;
-    _cur = cast(i64, in);
+    if (in.m_paste == 0) {
+        io._write_fd(io.STDOUT, "\x1b[?2004h", 8);       // bracketed paste
+        in.m_paste = 1;
+    }
+    if (in.m_focus == 0) {
+        io._write_fd(io.STDOUT, "\x1b[?1004h", 8);       // focus reporting
+        in.m_focus = 1;
+    }
     return 0;
 }
 
@@ -1138,6 +1237,7 @@ fn input_open(in as *Input, want_mouse as i32) as i64 {
 // every paste. The three resets go out in the reverse order of the sets, and
 // each one is gated on this reader having actually set it.
 fn input_close(in as *Input) as void {
+    if (_live(in) == 0) { _reset(in); return; }   // never opened: nothing is on
     if (in.m_focus == 1) {
         io._write_fd(io.STDOUT, "\x1b[?1004l", 8);
         in.m_focus = 0;
@@ -1150,12 +1250,11 @@ fn input_close(in as *Input) as void {
         io._write_fd(io.STDOUT, "\x1b[?1006l\x1b[?1002l\x1b[?1000l", 24);
         in.m_mouse = 0;
     }
-    in.active = 0;
-    in.head = 0;
-    in.tail = 0;
-    in.plen = 0;
-    in.inpaste = 0;
-    if (_cur == cast(i64, in)) { _cur = 0; }
+    // Back to initialised-but-not-open. Anything still held — half a sequence, a
+    // paste read_key had not finished handing out — is dropped: the caller has
+    // said it is done reading, and there is nobody left to hand it to.
+    _reset_buf(in);
+    in.mark = _MARK_READY;
 }
 
 // The descriptor, for whoever owns the select loop.
@@ -1165,7 +1264,7 @@ fn input_close(in as *Input) as void {
 // epoll set can see them. Drain with input_next until it returns 0 on every
 // wake, or the loop runs one event behind and loses the tail of every burst.
 fn input_fd(in as *Input) as i64 {
-    if (in.ready != 1) { _reset(in); }
+    if (_live(in) == 0) { _reset(in); }
     return in.fd;
 }
 
@@ -1179,7 +1278,7 @@ fn input_fd(in as *Input) as i64 {
 // bounded at 100 ms; under a pipe it is bounded by the writer, which is why
 // interfaces are tested through a pty and not through a pipe.
 fn input_next(in as *Input, ev as *Event) as i32 {
-    if (in.ready != 1) { _reset(in); }
+    if (_live(in) == 0) { _reset(in); }
     // A paste read_key was in the middle of handing out one byte at a time. The
     // rest of it is still a paste, so a caller that switches back to events
     // gets it as one — the bytes are the user's either way and neither entry
@@ -1215,15 +1314,6 @@ fn input_next(in as *Input, ev as *Event) as i32 {
     return 0;
 }
 
-// The reader read_key() speaks to: the caller's, if it opened one, otherwise
-// this module's own — created here and nowhere else, so that importing the
-// module for its colours never touches fd 0.
-fn _reader() as *Input {
-    if (_cur != 0) { return cast(*Input, _cur); }
-    if (_shell.ready != 1) { _reset(&_shell); }
-    return &_shell;
-}
-
 // Read a key from stdin. Returns KEY_* constants or an ASCII byte, KEY_NONE if
 // there was nothing to report — the same signature and the same answers as
 // before, now with the parser underneath shared with input_next.
@@ -1257,7 +1347,7 @@ fn _reader() as *Input {
 // gathered are handed out the same way, one per call, before the descriptor is
 // touched again. Nothing is dropped in either direction.
 fn read_key() as i32 {
-    let is *Input as in = _reader();
+    let is *Input as in = shared_input();
     let is Event as ev;
     let is i64 as pulled with mut = 0;
     while (1 == 1) {
