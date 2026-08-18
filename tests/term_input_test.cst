@@ -251,6 +251,96 @@ fn t_other_seqs() as void {
     chk("paste off kind", ev.kind, term._EV_PASTE_OFF);
 }
 
+// The five introducers that are not CSI or SS3, and the one the module exists
+// for: an OSC 11 background-colour reply, which some terminals send unasked.
+//
+// Whole-or-nothing held for `ESC [` and `ESC O` and failed for every other
+// introducer: OSC (ESC ]), DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _)
+// and SS2 (ESC N) answered Escape after two bytes and handed the payload back
+// as keystrokes. Measured in a pty with the interface's loop shape: a 25-byte
+// OSC 11 reply arrived as 23 keys, the first of them the one that opens a menu.
+fn t_strings() as void {
+    let is term.Event as ev;
+    // The reply itself: consumed to its ST, reported as nothing.
+    chk("osc11 used", term._scan("\x1b]11;rgb:2e2e/3434/3e3e\x1b\\", 25, 1, &ev), 25);
+    chk("osc11 kind", ev.kind, term.EV_NONE);
+    chk("osc11 key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    // A shorter one, and the same shape without `last`: a complete sequence does
+    // not need to be told that nothing else is coming.
+    chk("osc short used", term._scan("\x1b]11;rgb:2e\x1b\\", 13, 1, &ev), 13);
+    chk("osc short kind", ev.kind, term.EV_NONE);
+    chk("osc nolast used", term._scan("\x1b]11;rgb:2e\x1b\\", 13, 0, &ev), 13);
+    // OSC also ends at BEL, which is what most terminals send.
+    chk("osc bel used", term._scan("\x1b]0;title\x07", 10, 0, &ev), 10);
+    chk("osc bel kind", ev.kind, term.EV_NONE);
+    // DCS, the reply to a DECRQSS.
+    chk("dcs used", term._scan("\x1bP1$r0m\x1b\\", 9, 0, &ev), 9);
+    chk("dcs kind", ev.kind, term.EV_NONE);
+    // APC and PM, which nothing here sends but a terminal may.
+    chk("apc used", term._scan("\x1b_x\x1b\\", 5, 0, &ev), 5);
+    chk("apc kind", ev.kind, term.EV_NONE);
+    chk("pm used", term._scan("\x1b^y\x1b\\", 5, 0, &ev), 5);
+    chk("pm kind", ev.kind, term.EV_NONE);
+    chk("sos used", term._scan("\x1bXy\x1b\\", 5, 0, &ev), 5);
+    // SS2: one byte of payload, exactly like SS3, and no key of ours behind it.
+    chk("ss2 used", term._scan("\x1bNa", 3, 0, &ev), 3);
+    chk("ss2 kind", ev.kind, term.EV_NONE);
+    chk("ss2 pending", term._scan("\x1bN", 2, 0, &ev), 0);
+    // Half a reply, with more possibly coming: ask for it, do not guess.
+    chk("osc pending", term._scan("\x1b]11;rgb", 8, 0, &ev), 0);
+    chk("osc pending kind", ev.kind, term.EV_NONE);
+    chk("dcs pending", term._scan("\x1bP1$r", 5, 0, &ev), 0);
+    // An ESC that is not the beginning of an ST ends the string, and belongs to
+    // whatever comes next — here a real arrow key.
+    chk("osc esc used", term._scan("\x1b]0;a\x1b[A", 8, 0, &ev), 5);
+    chk("osc esc kind", ev.kind, term.EV_NONE);
+    chk("osc esc tail used", term._scan("\x1b[A", 3, 0, &ev), 3);
+    chk("osc esc tail key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    // A C0 control is not payload: it is a keystroke that arrived while the
+    // string was still open, so the string ends and the byte is left alone.
+    chk("osc c0 used", term._scan("\x1b]0;ab\rx", 8, 0, &ev), 6);
+    chk("osc c0 kind", ev.kind, term.EV_NONE);
+    chk("osc c0 tail used", term._scan("\rx", 2, 0, &ev), 1);
+    chk("osc c0 tail key", cast(i64, ev.key), cast(i64, term.KEY_ENTER));
+    // No terminator and nothing more coming. These two bytes are what Alt+] and
+    // Alt+P arrive as, and no terminator ever follows those, so swallowing the
+    // rest would eat what the person typed next. Only the introducer goes, and
+    // no Escape is invented — answering Escape is what turned a terminal's
+    // replies into menu toggles.
+    chk("osc unterminated used", term._scan("\x1b]11;rgb", 8, 1, &ev), 2);
+    chk("osc unterminated kind", ev.kind, term.EV_NONE);
+    chk("osc unterminated key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    chk("ss2 unterminated used", term._scan("\x1bN", 2, 1, &ev), 2);
+    chk("ss2 unterminated kind", ev.kind, term.EV_NONE);
+}
+
+// A CSI whose bytes do not add up in the middle. The sequence is still a
+// sequence — it has a final byte — so all of it goes, and nothing of it is
+// typed. A minus sign is the case that showed this: 0x2D is an intermediate
+// byte, so `ESC [ < 0 ; - 1 ; 1 2 M` used to stop at the digit after it,
+// consume six bytes, and hand `1;12M` back as five keystrokes.
+fn t_csi_out_of_order() as void {
+    let is term.Event as ev;
+    chk("neg coord used", term._scan("\x1b[<0;-1;12M", 11, 0, &ev), 11);
+    chk("neg coord kind", ev.kind, term.EV_NONE);
+    chk("neg coord row", ev.row, 0);
+    chk("neg coord col", ev.col, 0);
+    // A control byte inside a sequence is still a real keystroke, and still the
+    // one case where a byte is handed back.
+    chk("csi c0 used", term._scan("\x1b[1\r", 4, 0, &ev), 3);
+    chk("csi c0 kind", ev.kind, term.EV_NONE);
+    // An intermediate byte in the shape a terminal really sends it.
+    chk("csi intermediate used", term._scan("\x1b[?1000$y", 9, 0, &ev), 9);
+    chk("csi intermediate kind", ev.kind, term.EV_NONE);
+    // A parameter that is empty, and thirty of them: neither may hang, produce
+    // a coordinate, or leave a byte behind.
+    chk("csi empty param used", term._scan("\x1b[;A", 4, 0, &ev), 4);
+    chk("csi 30 params used",
+        term._scan("\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30m",
+                   83, 0, &ev), 83);
+    chk("csi 30 params kind", ev.kind, term.EV_NONE);
+}
+
 // === The reader, over a pipe ===
 
 let is [2]i32 as _pfd with mut;
@@ -576,6 +666,109 @@ fn t_truncated_reader() as void {
     pipe_done();
 }
 
+// The OSC 11 reply through the reader, and then through read_key: a terminal
+// that sends one unasked must not be able to type into whatever has focus.
+fn t_osc_reader() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = pipe_rd();
+    pipe_send("\x1b]11;rgb:2e2e/3434/3e3e\x1b\\x", 26);
+    pipe_seal();
+    let is term.Event as ev;
+    let is i64 as events with mut = 0;
+    let is i64 as keys with mut = 0;
+    let is i64 as last with mut = 0;
+    while (term.input_next(&in, &ev) == 1) {
+        events = events + 1;
+        if (ev.kind == term.EV_KEY) { keys = keys + 1; last = cast(i64, ev.key); }
+        if (events > 40) { break; }
+    }
+    chk("osc reader events", events, 1);
+    chk("osc reader keys", keys, 1);
+    chk("osc reader key", last, 120);
+    pipe_done();
+
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term._shell.fd = pipe_rd();
+    term._shell.ready = 1;
+    pipe_send("\x1b]11;rgb:2e2e/3434/3e3e\x1b\\x", 26);
+    pipe_seal();
+    let is [40]i64 as got;
+    let is i64 as n with mut = 0;
+    let is i64 as calls with mut = 0;
+    while (calls < 40) {
+        let is i32 as k = term.read_key();
+        if (k != term.KEY_NONE && n < 40) { got[n] = cast(i64, k); n = n + 1; }
+        calls = calls + 1;
+    }
+    chk("osc rk count", n, 1);
+    chk("osc rk key", got[0], 120);
+    pipe_done();
+    term._shell.ready = 0;
+}
+
+// A sequence longer than the buffer. The reader cannot hold it, so the only
+// question is what happens to the part it cannot hold: the answer has to be
+// "skipped", because "handed back" means 4096 bytes of a hostile writer's
+// choosing typed into whatever has focus. Only a hostile or broken writer gets
+// here — the longest sequence this parser recognises is 25 bytes.
+fn t_oversize_seq() as void {
+    let is i64 as body = 5998;
+    let is i64 as i with mut = 0;
+    while (i < body) { _big[i] = cast(u8, 49); i = i + 1; }        // '1'
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = pipe_rd();
+    pipe_send("\x1b[", 2);
+    pipe_send(cast(*u8, &_big), body);
+    pipe_send("Az", 2);
+    pipe_seal();
+    let is term.Event as ev;
+    let is i64 as keys with mut = 0;
+    let is i64 as last with mut = 0;
+    let is i64 as rounds with mut = 0;
+    // Drained means drained: the loop keeps asking until input_next says 0 with
+    // the pipe at EOF, so a reader that answers "nothing" while bytes are still
+    // in the kernel is caught by the count, not hidden by it.
+    while (rounds < 4) {
+        while (term.input_next(&in, &ev) == 1) {
+            if (ev.kind == term.EV_KEY) { keys = keys + 1; last = cast(i64, ev.key); }
+        }
+        rounds = rounds + 1;
+    }
+    chk("oversize keys", keys, 1);
+    chk("oversize key", last, 122);
+    pipe_done();
+
+    // The same for a string sequence, whose terminator is ST rather than a
+    // final byte.
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in2 with mut;
+    zero(cast(*u8, &in2), sizeof(term.Input));
+    term.input_fd(&in2);
+    in2.fd = pipe_rd();
+    pipe_send("\x1b]52;c;", 7);
+    pipe_send(cast(*u8, &_big), body);
+    pipe_send("\x1b\\z", 3);
+    pipe_seal();
+    let is i64 as keys2 with mut = 0;
+    let is i64 as last2 with mut = 0;
+    rounds = 0;
+    while (rounds < 4) {
+        while (term.input_next(&in2, &ev) == 1) {
+            if (ev.kind == term.EV_KEY) { keys2 = keys2 + 1; last2 = cast(i64, ev.key); }
+        }
+        rounds = rounds + 1;
+    }
+    chk("oversize osc keys", keys2, 1);
+    chk("oversize osc key", last2, 122);
+    pipe_done();
+}
+
 // A mode this reader never turned on is chatter. With mouse on, the same bytes
 // are an event.
 fn t_gating() as void {
@@ -875,6 +1068,8 @@ fn main() as i32 {
     t_mouse();
     t_mouse_broken();
     t_other_seqs();
+    t_strings();
+    t_csi_out_of_order();
 
     // The reader needs a pipe to be driven from, which is POSIX.
     if (os.current() == os.OS_LINUX) {
@@ -894,6 +1089,8 @@ fn main() as i32 {
         t_read_key_paste_200();
         t_read_key_paste_handover();
         t_truncated_reader();
+        t_osc_reader();
+        t_oversize_seq();
         t_gating();
         t_no_block();
         t_modes();

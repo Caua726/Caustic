@@ -20,15 +20,37 @@
 //
 // They are two things now. _scan() is a pure function over a byte range that
 // either produces one event or says "these bytes are a prefix, feed me more";
-// the reader is the only code here that talks to a descriptor. A CSI sequence
-// is walked to its final byte (0x40..0x7E) and consumed as a unit whether or
-// not anything recognises it, so an unknown sequence leaves nothing behind.
+// the reader is the only code here that talks to a descriptor. Every introducer
+// is walked to its own terminator and consumed as a unit whether or not
+// anything recognises it: CSI (ESC [) and SS3 (ESC O) to a final byte
+// 0x40..0x7E, SS2 (ESC N) over its one payload byte, and the string types —
+// OSC (ESC ]), DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _) — to an ST
+// (ESC \) or, for OSC, a BEL.
+//
+// The five string introducers are in that list because leaving them out was a
+// measured defect and not a theoretical one. A 25-byte OSC 11 reply, which some
+// terminals send unasked, arrived as Escape plus its own text — 23 keystrokes,
+// the first of them the one that opens a menu in the interface built on this.
 //
 // An unknown sequence is reported as nothing — EV_NONE, KEY_NONE — and not as
 // Escape. An escape sequence we do not understand is not the Escape key, and
 // answering Escape is how a terminal's unsolicited replies became menu
 // toggles. A bare ESC with nothing behind it is still KEY_ESC, which is the one
 // Escape behaviour every consumer of this module depends on.
+//
+// Where "nothing behind" is not the whole truth, and both cases are deliberate:
+//
+//   - `ESC [` and `ESC O` with nothing behind them still answer KEY_ESC. That
+//     is what the old reader answered and consumers were built against it. The
+//     newer introducers do NOT: a truncated `ESC ]` or `ESC N` answers nothing,
+//     because inventing an Escape is the harm this module was written to stop.
+//   - a string sequence with no terminator, once nothing more is coming,
+//     gives up its two introducer bytes and leaves its payload to be read as
+//     keystrokes. Those two bytes are also exactly what Alt+] or Alt+P arrive
+//     as, and no terminator ever follows those, so swallowing the payload would
+//     eat what the person typed next. A terminal writes a reply in one write,
+//     so a real reply does not get split across that window; a person pressing
+//     Alt and a letter is not rare at all.
 //
 // What read_key() still promises
 // ------------------------------
@@ -78,6 +100,13 @@
 // full as the kernel will ever let it get. IN_PASTE (8192) and _RK_MAX (64)
 // were chosen, not derived; each says at its declaration what it is measured
 // against.
+//
+// A sequence longer than any of those is not a terminal talking — the longest
+// this parser recognises is a 25-byte OSC reply — so it is SKIPPED rather than
+// dropped: the reader remembers which terminator it is looking for and discards
+// bytes until that terminator arrives. Dropping the buffer instead is what let
+// a 6000-byte CSI hand 1906 bytes back as keystrokes, which is how a hostile
+// writer on fd 0 types arbitrary text into whatever has focus.
 //
 // EV_RESIZE is not implemented
 // ----------------------------
@@ -371,12 +400,15 @@ let is i64 as IN_BUF with imut = 4096;
 // .bss in any program that imports the module.
 let is i64 as IN_PASTE with imut = 8192;
 
-// How many bytes read_key() will pull while assembling ONE keystroke before
-// giving up and dropping what it holds. The longest sequence this parser
-// recognises is an SGR mouse report at four-digit coordinates — 17 bytes — so
-// this is nearly four times the worst legitimate case. It exists only to bound
-// the call against a terminal that sends something endless; in normal use
-// read_key reads one byte, or three for an arrow key.
+// How many bytes read_key() will pull while assembling ONE keystroke before it
+// stops and skips the rest of the sequence. The longest sequence a terminal
+// sends as a KEY is an SGR mouse report at four-digit coordinates — 17 bytes —
+// so this is nearly four times the worst legitimate case for a keystroke. It
+// exists to keep one call costing about one keystroke; in normal use read_key
+// reads one byte, or three for an arrow key. A longer sequence is not dropped
+// when this is reached: it is skipped to its terminator, so no part of it comes
+// back as text. A reply longer than this (an OSC 52 clipboard, say) is therefore
+// read as nothing by read_key, and as nothing by input_next too.
 let is i64 as _RK_MAX with imut = 64;
 
 // An Input must start zeroed, which a global in .bss is and a stack local is
@@ -397,6 +429,8 @@ struct Input {
     inpaste as i32;
     rk_pos  as i64;     // read_key's window into `text`: the bytes of a paste
     rk_end  as i64;     // it is handing out one per call. rk_pos == rk_end: none
+    skip    as i32;     // 0, or which terminator the reader is discarding
+                        // bytes until: 1 = a CSI final byte, 2 = ST or BEL
     buf     as [IN_BUF]u8;
     text    as [IN_PASTE]u8;
 }
@@ -590,6 +624,61 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
         if (k != KEY_NONE) { ev.kind = EV_KEY; ev.key = k; }
         return 3;
     }
+    if (b1 == 78) {                                   // 'N' — SS2
+        // One byte of payload and no key of ours behind it: consumed whole and
+        // reported as nothing, exactly like the SS3 form above.
+        if (n < 3) {
+            if (last == 0) { return 0; }
+            // Two bytes and no payload coming. This is what Alt+N arrives as,
+            // and no Escape is invented for it — see the string case below.
+            return 2;
+        }
+        return 3;
+    }
+    if (b1 == 93 || b1 == 80 || b1 == 88 || b1 == 94 || b1 == 95) {
+        // The string-type sequences: OSC (ESC ]), DCS (ESC P), SOS (ESC X),
+        // PM (ESC ^), APC (ESC _). Their payload is arbitrary text and the
+        // terminator is ST (ESC \) or, for OSC, BEL.
+        //
+        // This is the family the module exists to swallow, and the one where
+        // "an unknown sequence leaves nothing behind" was false: a 25-byte
+        // OSC 11 background-colour reply — which some terminals send unasked —
+        // arrived as an Escape plus its own text, 23 keystrokes, the first of
+        // them the one that opens a menu in the interface built on this.
+        let is i64 as i with mut = 2;
+        while (i < n) {
+            let is i64 as c = cast(i64, buf[i]);
+            if (c == 7) { return i + 1; }                    // BEL ends OSC
+            if (c == 27) {
+                if (i + 1 >= n) {
+                    if (last == 0) { return 0; }             // an ST, split
+                    return i;                                // abandoned here
+                }
+                if (cast(i64, buf[i + 1]) == 92) { return i + 2; }   // ESC \ = ST
+                // An ESC that is not the start of an ST ends the string and
+                // belongs to whatever comes next — often a real arrow key.
+                return i;
+            }
+            if (c < 32) {
+                // A C0 control is not payload. It is a keystroke that arrived
+                // while the string was still open — Enter, most often — so the
+                // string ends here and the byte is left for the next scan.
+                return i;
+            }
+            i = i + 1;
+        }
+        if (last == 0) { return 0; }
+        // No terminator, and nothing more is coming. The two readings are not
+        // symmetric in what they destroy: swallowing everything eats what a
+        // person typed after an Alt+] or Alt+P, which arrive as exactly these
+        // two bytes and are never followed by a terminator, while consuming only
+        // the introducer risks typing the tail of a reply that a terminal split
+        // across the 100 ms window — which a terminal, writing its reply in one
+        // write, does not do. Losing what a person typed is the worse of the
+        // two. So the introducer goes and nothing is reported: answering Escape
+        // here is what turned unsolicited replies into menu toggles.
+        return 2;
+    }
     if (b1 != 91) {                                   // not '[': no sequence
         // Answering Escape here and eating the byte is what read_key has
         // always done, and it is kept: the alternative reading is Alt+key,
@@ -604,15 +693,16 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
     // final byte 0x40..0x7E closes it. Walking to that final byte — instead of
     // guessing from the third byte — is the whole of the fix: the sequence is
     // consumed as a unit whether or not anything below recognises it.
+    //
+    // Both ranges are walked by ONE loop, in any order. Requiring parameters
+    // before intermediates is what a terminal sends, but treating a violation
+    // as the end of the sequence handed the rest of it back as text: a minus
+    // sign is 0x2D, an intermediate, so `ESC [ < 0 ; - 1 ; 1 2 M` stopped at the
+    // digit after it, consumed six bytes, and typed `1;12M` into the input.
     let is i64 as i with mut = 2;
     while (i < n) {
         let is i64 as c = cast(i64, buf[i]);
-        if (c < 48 || c > 63) { break; }
-        i = i + 1;
-    }
-    while (i < n) {
-        let is i64 as c = cast(i64, buf[i]);
-        if (c < 32 || c > 47) { break; }
+        if (c < 32 || c > 63) { break; }
         i = i + 1;
     }
     if (i >= n) {
@@ -626,10 +716,12 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
     }
     let is i64 as f = cast(i64, buf[i]);
     if (f < 64 || f > 126) {
-        // A byte that can be neither parameter nor final: the sequence is
-        // broken. Consume what came before it and leave the byte itself — it
-        // is most likely a real keystroke that arrived mid-sequence, and it is
-        // the one case where handing a byte back is the honest answer.
+        // What stopped the loop is neither a parameter, an intermediate, nor a
+        // final byte: a C0 control, DEL, or a byte with the high bit set. None
+        // of those can appear inside a CSI, and all of them can be typed, so the
+        // sequence ends here and the byte is left alone — it is a real
+        // keystroke, and this is the one case where handing a byte back is the
+        // honest answer. `ESC [ 1` then Enter is the shape.
         return i;
     }
     let is i64 as total = i + 1;
@@ -680,6 +772,7 @@ fn _reset(in as *Input) as void {
     in.inpaste = 0;
     in.rk_pos = 0;
     in.rk_end = 0;
+    in.skip = 0;
 }
 
 // Is there anything to read right now, without waiting for it?
@@ -800,6 +893,64 @@ fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
     return 0;
 }
 
+// The buffer is full and the bytes in it are one unfinished sequence, so no
+// read can make progress: the sequence is longer than IN_BUF.
+//
+// Neither stateless answer is acceptable. Dropping the buffer leaves the tail to
+// be parsed as fresh input — 4096 bytes of a hostile writer's choosing, typed
+// into whatever has focus, which is the defect this module exists to remove at
+// its largest. Keeping the buffer deadlocks the reader. So the rest of the
+// sequence is skipped: the reader remembers which terminator it is looking for
+// and discards bytes until it arrives. Only a hostile or broken writer gets
+// here — the longest sequence this parser recognises is 25 bytes.
+fn _skip_begin(in as *Input) as void {
+    let is *u8 as b = cast(*u8, &in.buf);
+    in.skip = 2;                                   // a string: ST or BEL
+    if (in.tail - in.head >= 2) {
+        if (cast(i64, b[in.head]) == 27 && cast(i64, b[in.head + 1]) == 91) {
+            in.skip = 1;                           // a CSI: a final byte
+        }
+    }
+    in.head = in.tail;
+}
+
+// Discard buffered bytes until the terminator being skipped to. Clears in.skip
+// when it finds it, leaving in.head just past it; leaves in.skip set when the
+// buffer runs out first, so the state survives to the next call.
+fn _skip_take(in as *Input) as void {
+    let is *u8 as b = cast(*u8, &in.buf);
+    let is i64 as i with mut = in.head;
+    while (i < in.tail) {
+        let is i64 as c = cast(i64, b[i]);
+        if (in.skip == 1) {
+            if (c >= 64 && c <= 126) { in.head = i + 1; in.skip = 0; return; }
+            if (c < 32 || c > 126) {
+                // Not a byte a CSI can carry: a keystroke arrived instead, so
+                // stop skipping and leave it, as _scan does in the same case.
+                in.head = i;
+                in.skip = 0;
+                return;
+            }
+        } else {
+            if (c == 7) { in.head = i + 1; in.skip = 0; return; }        // BEL
+            if (c == 27) {
+                if (i + 1 >= in.tail) { in.head = i; return; }  // wait for the ST
+                if (cast(i64, b[i + 1]) == 92) {                // ESC \ = ST
+                    in.head = i + 2;
+                    in.skip = 0;
+                    return;
+                }
+                in.head = i;                       // an ESC that is not an ST
+                in.skip = 0;
+                return;
+            }
+            if (c < 32) { in.head = i; in.skip = 0; return; }   // a keystroke
+        }
+        i = i + 1;
+    }
+    in.head = in.tail;
+}
+
 // Take events out of the buffer until one of them is worth returning. Returns
 // 0 when the buffer cannot answer without more bytes.
 //
@@ -814,6 +965,10 @@ fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
 // definition using.
 fn _drain_buf(in as *Input, ev as *Event, last as i32, assemble as i32) as i32 {
     while (1 == 1) {
+        if (in.skip != 0) {
+            _skip_take(in);
+            if (in.skip != 0) { return 0; }        // the terminator is not here
+        }
         if (in.inpaste == 1) {
             if (_paste_take(in, ev, last) == 1) { return 1; }
             return 0;
@@ -939,6 +1094,13 @@ fn input_next(in as *Input, ev as *Event) as i32 {
         if (in.tail > in.head) { force = 1; }
         if (in.inpaste == 1) { force = 1; }
         if (_fill(in, IN_BUF, force) == 0) {
+            if (in.inpaste == 0 && in.tail - in.head >= IN_BUF) {
+                // Not "nothing more is coming" — no ROOM for more. The sequence
+                // is longer than the buffer; skip the rest of it rather than let
+                // its tail be read as keystrokes.
+                _skip_begin(in);
+                continue;
+            }
             // Nothing more is coming: whatever is held has to resolve now.
             if (_drain_buf(in, ev, 1, 1) == 1) { return 1; }
             _ev_clear(ev);
@@ -1024,11 +1186,13 @@ fn read_key() as i32 {
             // a poller can see it.
             if (in.head > was && in.head == in.tail) { return KEY_NONE; }
             if (pulled >= _RK_MAX) {
-                // Bounded: drop the unresolvable prefix rather than read on
-                // forever. Reachable only if a single event exceeds 64 bytes,
-                // which for this parser means a paste — and a program that
-                // enabled bracketed paste should be reading events, not keys.
-                in.head = in.tail;
+                // Bounded: one call must cost about one keystroke, so a sequence
+                // longer than 64 bytes is not assembled here. It is SKIPPED to
+                // its terminator rather than dropped — dropping it would leave
+                // its tail to be read as keystrokes, which is the same defect at
+                // a smaller size. Reachable only from a terminal sending
+                // something no terminal sends.
+                _skip_begin(in);
                 return KEY_NONE;
             }
             if (_fill(in, 1, 1) == 0) {
