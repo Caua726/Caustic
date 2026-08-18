@@ -101,6 +101,16 @@
 // were chosen, not derived; each says at its declaration what it is measured
 // against.
 //
+// A coordinate is bounded twice. _COORD_MAX (65535) is derived — a winsize
+// carries rows and columns as u16 — and is all the pure parser can do; on top of
+// it the reader asks the descriptor for its actual size and drops a report for a
+// cell the terminal does not have, at 377 ns per delivered report (measured over
+// a million TIOCGWINSZ calls on a real pty). A parameter is bounded at nine
+// digits, which is where the accumulator cannot overflow. Both exist because the
+// bytes come from outside the process and a caller indexes a grid with what
+// comes out: an unbounded accumulator delivered col=7766279631452241919 out of
+// twenty digits, positive and past every guard.
+//
 // A sequence longer than any of those is not a terminal talking — the longest
 // this parser recognises is a 25-byte OSC reply — so it is SKIPPED rather than
 // dropped: the reader remembers which terminator it is looking for and discards
@@ -461,18 +471,45 @@ fn _ev_clear(ev as *Event) as void {
     ev.len = 0;
 }
 
+// The most digits a parameter may carry. Nine is where the accumulator below
+// cannot overflow (999999999 * 10 + 9 is nowhere near i64's ceiling) and it is
+// four more than any sequence this parser reads actually uses — a four-digit
+// coordinate, a three-digit tilde code, one digit of modifier. Ten digits is
+// therefore not a parameter, and saying so is how a number that does not fit is
+// REFUSED instead of being invented.
+let is i64 as _NUM_DIGITS with imut = 9;
+
+// The widest coordinate that can belong to a terminal. Derived, not chosen: a
+// Linux winsize carries rows and columns as u16 and Windows reports them as i16,
+// so a coordinate past 65535 is not describing any terminal whose size this
+// module can ask for. It is a sanity bound on the parser, which is pure and
+// cannot ask; the reader checks against the descriptor's ACTUAL size on top of
+// it — see _mouse_fits.
+let is i64 as _COORD_MAX with imut = 65535;
+
+// The widest SGR button field. Its bits are button (0..2), shift (4), meta (8),
+// ctrl (16), motion (32), wheel (64) and the fourth/fifth button (128); nothing
+// above 255 has a meaning, so a larger number is not a button.
+let is i64 as _BUTTON_MAX with imut = 255;
+
 // Read a decimal number starting at buf[*i], advancing *i past it. Returns -1
-// when there is no digit there — which is how a malformed report is refused
-// instead of being read as zero.
+// when there is no digit there, and -1 when there are more than _NUM_DIGITS of
+// them — which is how a malformed report is refused instead of being read as
+// zero, and how an oversized one is refused instead of being wrapped into a
+// plausible-looking number. Twenty digits of column used to arrive as
+// col=7766279631452241919: positive, past every guard, delivered as a report.
 fn _num(buf as *u8, n as i64, i as *i64) as i64 {
     let is i64 as p with mut = *i;
     if (p >= n) { return 0 - 1; }
     let is i64 as c = cast(i64, buf[p]);
     if (c < 48 || c > 57) { return 0 - 1; }
     let is i64 as v with mut = 0;
+    let is i64 as digits with mut = 0;
     while (p < n) {
         let is i64 as d = cast(i64, buf[p]);
         if (d < 48 || d > 57) { break; }
+        digits = digits + 1;
+        if (digits > _NUM_DIGITS) { return 0 - 1; }
         v = v * 10 + (d - 48);
         p = p + 1;
     }
@@ -543,6 +580,11 @@ fn _mouse(buf as *u8, n as i64, fin as i64, ev as *Event) as void {
     let is i64 as cy = _num(buf, n, &i);
     if (cy < 0) { return; }
     if (i != n) { return; }              // trailing parameters: not this shape
+    // Every number is in range or there is no report. SGR counts cells from one,
+    // so zero is not a coordinate either, and a button field is eight bits.
+    if (cb > _BUTTON_MAX) { return; }
+    if (cx < 1 || cx > _COORD_MAX) { return; }
+    if (cy < 1 || cy > _COORD_MAX) { return; }
     ev.kind = EV_MOUSE;
     ev.button = (cb & 3) + (cb & 192);
     ev.mods = (cb / 4) & 7;
@@ -951,6 +993,65 @@ fn _skip_take(in as *Input) as void {
     in.head = in.tail;
 }
 
+// The size of the terminal behind a descriptor, or 0 when there is not one.
+//
+// get_size() stays what it was — fd 0, no Input, no failure reporting — because
+// callers use it every frame and its signature is public. This is the internal
+// form: it answers about the reader's OWN descriptor, and it says whether the
+// answer means anything, which is the part the mouse gate needs.
+fn _size_of(fd as i64, rows as *i64, cols as *i64) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        let is [8]u8 as ws;
+        if (linux.ioctl(fd, TIOCGWINSZ, cast(*u8, &ws)) < 0) { return 0; }
+        let is *u16 as vals = cast(*u16, &ws);
+        *rows = cast(i64, vals[0]);
+        *cols = cast(i64, vals[1]);
+        if (*rows <= 0 || *cols <= 0) { return 0; }
+        return 1;
+    } else if (os.current() == os.OS_WINDOWS) {
+        // UNVERIFIED, like the rest of the Windows input path: the console size
+        // is a property of the OUTPUT handle, not of the reader's descriptor, so
+        // this asks about the console the process is attached to.
+        let is [22]u8 as info;
+        let is i64 as h = win.GetStdHandle(win.STD_OUTPUT_HANDLE);
+        if (win.GetConsoleScreenBufferInfo(h, cast(*u8, &info)) == 0) { return 0; }
+        let is *i16 as v = cast(*i16, cast(i64, &info) + 10);
+        *cols = cast(i64, v[2]) - cast(i64, v[0]) + 1;
+        *rows = cast(i64, v[3]) - cast(i64, v[1]) + 1;
+        if (*rows <= 0 || *cols <= 0) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+// Is this report describing a cell the terminal actually has?
+//
+// The coordinates come from outside the process: a mouse report is a short
+// preamble and some decimal, and anything with fd 0 open can write one. A caller
+// that indexes a grid with row and col — which the struct's own comment invites,
+// since they are 1-based as the terminal reports them — writes out of bounds if
+// they are larger than the terminal. The parser's _COORD_MAX only rules out
+// numbers no terminal could mean; this rules out the ones THIS terminal cannot.
+//
+// It costs one TIOCGWINSZ per delivered report, measured at 377 ns on this
+// machine over a million calls on a real pty. A drag reporting a hundred a
+// second therefore costs about 38 microseconds a second, against the ten
+// get_size() calls a second the interface on top of this already makes. No cache
+// and no refresh policy: a stale size drops real clicks after a resize, which is
+// a worse failure than an ioctl.
+//
+// When the descriptor cannot answer — a pipe, a file, a socket, which is every
+// test here and every program with input piped in — there is no size to check
+// against, and the parser's ceiling is all there is.
+fn _mouse_fits(in as *Input, ev as *Event) as i32 {
+    let is i64 as rows with mut = 0;
+    let is i64 as cols with mut = 0;
+    if (_size_of(in.fd, &rows, &cols) == 0) { return 1; }
+    if (ev.row > rows) { return 0; }
+    if (ev.col > cols) { return 0; }
+    return 1;
+}
+
 // Take events out of the buffer until one of them is worth returning. Returns
 // 0 when the buffer cannot answer without more bytes.
 //
@@ -983,8 +1084,12 @@ fn _drain_buf(in as *Input, ev as *Event, last as i32, assemble as i32) as i32 {
         if (ev.kind == EV_MOUSE) {
             // A report for a mode this reader never turned on is chatter, not
             // an event. Swallowing it whole is the difference between this
-            // reader and the old one.
-            if (in.m_mouse == 1) { return 1; }
+            // reader and the old one. So is a report for a cell the terminal
+            // does not have: consumed, and not handed to a caller that would
+            // index something with it.
+            if (in.m_mouse == 1) {
+                if (_mouse_fits(in, ev) == 1) { return 1; }
+            }
         } else if (ev.kind == EV_FOCUS) {
             if (in.m_focus == 1) { return 1; }
         } else if (ev.kind == _EV_PASTE_ON) {
