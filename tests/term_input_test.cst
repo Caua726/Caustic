@@ -1996,6 +1996,63 @@ fn t_pty_paste_gap() as void {
     pty_close();
 }
 
+// The far side of the same bound, which the test above cannot see: waiting for a
+// paste that has begun is BOUNDED, and this is what the bound looks like from
+// outside. A writer that goes quiet for longer than _HOLD_PAUSES gets its paste
+// cut, and that is the intended answer — the alternative is a reader that waits
+// for a terminator which may never come, on input that arrives from outside the
+// process.
+//
+// It is worth pinning from outside rather than trusting the constant, because the
+// obvious way to "fix" a report of a paste being cut is to raise _HOLD_PAUSES,
+// and the cost of raising it is invisible at the definition: it is paid by every
+// lone Alt+[ (518 ms at five pauses), and far enough up it stops being a bound at
+// all. If somebody raises it, this test says so.
+//
+// 900 ms rather than 600: the hold is five pauses of VTIME silence measured by
+// the reader, about 520 ms, and a loaded machine stretches each pause rather than
+// shortening it — so the margin belongs above the bound, not below it.
+fn t_pty_paste_past_hold() as void {
+    if (pty_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = _pts;
+    in.m_paste = cast(i32, 1);
+    os.linux.write(_ptm, "\x1b[200~abc", 9);
+    let is i64 as pid = pty_late(900, "def\x1b[201~!", 10);
+    let is term.Event as ev;
+    let is i64 as pastes with mut = 0;
+    let is i64 as plen with mut = 0;
+    let is i64 as keys with mut = 0;
+    let is i64 as idle with mut = 0;
+    let is i64 as sentinel with mut = 0;
+    while (idle < 300 && sentinel == 0) {
+        if (term.input_next(&in, &ev) == 1) {
+            if (ev.kind == term.EV_PASTE) {
+                pastes = pastes + 1;
+                plen = ev.len;
+            }
+            if (ev.kind == term.EV_KEY) {
+                keys = keys + 1;
+                if (ev.key == cast(i32, 33)) { sentinel = 1; }   // '!'
+            }
+        } else {
+            idle = idle + 1;
+            time.sleep_ms(10);
+        }
+    }
+    // The half that arrived before the hold expired is a paste of its own; the
+    // half after it is typing, which is what a cut paste degrades into. Four
+    // keys: d, e, f and the sentinel.
+    chk("pty past hold pastes", pastes, 1);
+    chk("pty past hold len", plen, 3);
+    chk("pty past hold keys", keys, 4);
+    chk("pty past hold sentinel", sentinel, 1);
+    os.linux.wait4(pid, cast(*i32, 0), 0, cast(*u8, 0));
+    pty_close();
+}
+
 // A sequence split by a gap longer than VTIME. `ESC [` is not an Escape key
 // because the writer went quiet for 100 ms — it is the beginning of something,
 // and what it turns out to be arrives 250 ms later.
@@ -2150,6 +2207,7 @@ fn main() as i32 {
         t_reader_is_ours();
         t_double_open();
         t_pty_paste_gap();
+        t_pty_paste_past_hold();
         t_pty_csi_gap();
         t_pty_csi_gap_read_key();
         t_pty_osc_gap();
