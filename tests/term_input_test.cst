@@ -411,14 +411,81 @@ fn t_csi_num_limits() as void {
     chk("ctrl-up still works used", term._scan("\x1b[1;5A", 6, 1, &ev), 6);
     chk("ctrl-up still works key", cast(i64, ev.key), cast(i64, term.KEY_UP));
     chk("ctrl-up still works mods", ev.mods, term.MOD_CTRL);
-    // Where the refusal starts: at ten digits, not at nine. Nine fits, so it is
-    // a number, and `(999999999 - 1) & 7` is 6 — three modifier bits out of a
-    // parameter no terminal sends. Whether a modifier OUTSIDE xterm's 1..16
-    // should be refused as well is a separate question from this one, and this
-    // line pins only that the digit limit is not the thing that answers it.
-    chk("nine digit mods used", term._scan("\x1b[1;999999999A", 14, 1, &ev), 14);
-    chk("nine digit mods kind", ev.kind, term.EV_KEY);
-    chk("nine digit mods mods", ev.mods, 6);
+    // Where the DIGIT refusal starts: at ten digits, not at nine. Nine digits fit,
+    // so this number is refused by the other rule — range, since xterm's modifier
+    // is 1..16 and this is not — and t_mod_range is where that is pinned. The
+    // separate question this line used to leave open is answered there; what it
+    // still pins is that the digit limit is not what answers it, so a number
+    // inside the digit limit reaches the range check at all.
+    chk("nine digit mods used", term._scan("\x1b[1;999999999A", 14, 2, &ev), 14);
+    chk("nine digit mods kind", ev.kind, term.EV_NONE);
+    chk("nine digit mods mods", ev.mods, 0);
+}
+
+// A modifier that FITS and is still not a modifier.
+//
+// The digit limit answered "this number does not fit"; this is the other half,
+// which is range. xterm encodes a modifier as 1 + a four-bit mask — Shift 1,
+// Alt 2, Ctrl 4, Meta 8 — so 1 through 16 is every value that encodes one, and
+// nothing outside that does. `(999999999 - 1) & 7` is 6: three modifier bits,
+// Shift and Alt and Ctrl together, out of a parameter no terminal sends. Nine
+// digits fit, so the digit limit let it through, and the mask made a modifier out
+// of it — the same invention the digit limit was added to stop, one step further
+// in.
+//
+// The rest of this parser refuses the whole sequence when a field cannot be read,
+// rather than delivering it with that field made up, and this now does the same:
+// a value past 16 is not a modifier, so what carried it is not a key.
+fn t_mod_range() as void {
+    let is term.Event as ev;
+    // The floor: 1 is the mask with nothing in it, which is a real answer.
+    chk("mod 1 used", term._scan("\x1b[1;1A", 6, 2, &ev), 6);
+    chk("mod 1 key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("mod 1 mods", ev.mods, 0);
+    chk("mod 2 used", term._scan("\x1b[1;2A", 6, 2, &ev), 6);
+    chk("mod 2 mods", ev.mods, term.MOD_SHIFT);
+    // The ceiling: 16 is Shift+Alt+Ctrl+Meta, the widest mask xterm can send.
+    chk("mod 16 used", term._scan("\x1b[1;16A", 7, 2, &ev), 7);
+    chk("mod 16 key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("mod 16 mods", ev.mods, 7);
+    // Meta is bit 8 and this module has no MOD_META, so that bit is DROPPED and
+    // not invented: Meta+Up is 9, and it arrives as Up with no modifier bits. The
+    // key itself is real, which is why this is a truncation and not a refusal.
+    chk("mod 9 used", term._scan("\x1b[1;9A", 6, 2, &ev), 6);
+    chk("mod 9 key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("mod 9 mods", ev.mods, 0);
+    // One past the ceiling: not a modifier, so not a key either.
+    chk("mod 17 used", term._scan("\x1b[1;17A", 7, 2, &ev), 7);
+    chk("mod 17 kind", ev.kind, term.EV_NONE);
+    chk("mod 17 key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    chk("mod 17 mods", ev.mods, 0);
+    // And the number from the audit, which fits in nine digits and is refused on
+    // range instead.
+    chk("mod nine digits used", term._scan("\x1b[1;999999999A", 14, 2, &ev), 14);
+    chk("mod nine digits kind", ev.kind, term.EV_NONE);
+    chk("mod nine digits mods", ev.mods, 0);
+    // The tilde family reads its modifier through the same function, so Delete
+    // with a modifier out of range is not Delete.
+    chk("tilde mod 17 used", term._scan("\x1b[3;17~", 7, 2, &ev), 7);
+    chk("tilde mod 17 kind", ev.kind, term.EV_NONE);
+    chk("tilde mod 17 key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    chk("tilde mod 16 used", term._scan("\x1b[3;16~", 7, 2, &ev), 7);
+    chk("tilde mod 16 key", cast(i64, ev.key), cast(i64, term.KEY_DEL));
+    chk("tilde mod 16 mods", ev.mods, 7);
+    // Zero and absent get the same answer, and that is the standard's answer and
+    // not an invention: an omitted or zero parameter takes its default, and the
+    // default of this field is 1 — no modifiers. This is the one place where two
+    // shapes legitimately share one answer, so it is written down next to the
+    // refusals that do not.
+    chk("mod 0 used", term._scan("\x1b[1;0A", 6, 2, &ev), 6);
+    chk("mod 0 key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("mod 0 mods", ev.mods, 0);
+    chk("mod absent used", term._scan("\x1b[1;A", 5, 2, &ev), 5);
+    chk("mod absent key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("mod absent mods", ev.mods, 0);
+    // A refused modifier must not leak into the next sequence's answer either.
+    chk("mod after refusal used", term._scan("\x1b[1;5A", 6, 2, &ev), 6);
+    chk("mod after refusal mods", ev.mods, term.MOD_CTRL);
 }
 
 fn t_other_seqs() as void {
@@ -679,6 +746,25 @@ fn t_read_key_csi_over() as void {
     chk("read_key over", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
     chk("read_key over key", cast(i64, term.read_key()), 120);
     chk("read_key over drained",
+        cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    pipe_done();
+    term._shell.mark = 0;
+}
+
+// The range refusal through read_key, where a caller sees only the i32.
+//
+// A modifier out of range makes the sequence unreadable, so the call that
+// finishes it answers KEY_NONE and the keystroke behind it arrives whole on the
+// next call. What must not come out is KEY_UP: an arrow key whose modifier was
+// invented out of a parameter no terminal sends.
+fn t_read_key_mod_range() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    pipe_send("\x1b[1;17Ax", 8);
+    pipe_seal();
+    chk("read_key mod range", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    chk("read_key mod range key", cast(i64, term.read_key()), 120);
+    chk("read_key mod range drained",
         cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
     pipe_done();
     term._shell.mark = 0;
@@ -2022,6 +2108,7 @@ fn main() as i32 {
     t_mouse_broken();
     t_num_limits();
     t_csi_num_limits();
+    t_mod_range();
     t_other_seqs();
     t_strings();
     t_csi_out_of_order();
@@ -2032,6 +2119,7 @@ fn main() as i32 {
         t_defect_events();
         t_defect_read_key();
         t_read_key_csi_over();
+        t_read_key_mod_range();
         t_read_key_nul();
         t_nul_event();
         t_read_key_esc();

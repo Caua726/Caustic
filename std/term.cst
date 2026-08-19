@@ -161,7 +161,9 @@
 // digits, which is where the accumulator cannot overflow. Both exist because the
 // bytes come from outside the process and a caller indexes a grid with what
 // comes out: an unbounded accumulator delivered col=7766279631452241919 out of
-// twenty digits, positive and past every guard.
+// twenty digits, positive and past every guard. _MOD_MAX (16) is derived the same
+// way — 1 plus xterm's four-bit modifier mask — and answers the other question
+// about a parameter, which is range and not width.
 //
 // A parameter past that digit bound refuses the WHOLE sequence, wherever in a
 // sequence it sits: a mouse report with a twenty-digit column produces no
@@ -169,6 +171,34 @@
 // one with no modifier — "there is no digit here" and "these digits do not fit"
 // were the same -1, and a modifier has a default for the first of them while a
 // coordinate has none.
+//
+// Fitting is not the same as being in range, and both refusals exist. A modifier
+// is 1..16 because xterm encodes it as 1 plus a four-bit mask (_MOD_MAX), so
+// `ESC [ 1 ; 17 A` is refused whole even though 17 fits in two digits — and
+// `ESC [ 1 ; 999999999 A`, which fits in nine, is refused by this rule rather
+// than by the digit one, since (999999999 - 1) & 7 is 6 and a mask made of that
+// is three modifier bits nobody sent. A coordinate has both bounds too
+// (_COORD_MAX, and the terminal's own size); a tilde code has a whitelist, which
+// is a range written out.
+//
+// Three fields nearby are NOT bounded that way, and each for its own reason
+// rather than by oversight:
+//
+//   - the cursor-key sequence's LEADING parameter. `ESC [ 5 A` and `ESC [ 999 A`
+//     both deliver KEY_UP; xterm's input form sends 1 there or nothing at all.
+//     The value is read only to step over it and no field of the event is built
+//     out of it, so there is nothing here to invent — only a shape to be strict
+//     about, which this is not.
+//   - the paste brackets' second parameter. `ESC [ 200 ; 17 ~`, and even
+//     `ESC [ 200 ; 9999999999 ~`, open a paste: the tilde path reads a modifier
+//     only once the code has turned out to be a KEY, and 200 and 201 are not
+//     keys. Neither the digit bound nor the range bound is reached, because
+//     nothing reads the field.
+//   - the SGR button field past its assigned bits. cb=128 arrives as button=128,
+//     which is xterm's buttons 8..11 and has no MB_* name here, and cb=192 — the
+//     wheel bit and the extra-button bit together, which means nothing — arrives
+//     as button=192. Both are inside _BUTTON_MAX. What is missing there is a
+//     name, not a bound.
 //
 // A sequence longer than any of those is not a terminal talking — the longest
 // this parser recognises is a 25-byte OSC reply — so it is SKIPPED rather than
@@ -723,6 +753,23 @@ let is i64 as _COORD_MAX with imut = 65535;
 // above 255 has a meaning, so a larger number is not a button.
 let is i64 as _BUTTON_MAX with imut = 255;
 
+// The widest value that encodes a modifier. Derived, not chosen: xterm sends
+// 1 + a four-bit mask — Shift 1, Alt 2, Ctrl 4, Meta 8 — so the field runs 1
+// through 16, and no value outside that range is a modifier at all.
+//
+// It is a second question about the same field, and the first one did not answer
+// it. `(999999999 - 1) & 7` is 6 — Shift and Alt and Ctrl together — out of a
+// parameter no terminal sends: nine digits FIT, so the digit bound passed it
+// through, and the mask made three modifier bits out of it. "Does not fit" and
+// "is not one" are different refusals, and this is the second.
+//
+// The Meta bit is dropped rather than reported, and that is not the same thing as
+// inventing one: there is no MOD_META here, so 9 (Meta and nothing else) arrives
+// as mods=0 with the KEY intact — the key really was sent, only a bit this module
+// does not model went missing. A value past 16 is not a bit this module is missing;
+// it is not a modifier, so what carried it is not a key.
+let is i64 as _MOD_MAX with imut = 16;
+
 // Read a decimal number starting at buf[*i], advancing *i past it.
 //
 // Two things can go wrong here and they are NOT the same answer, so they do not
@@ -797,19 +844,28 @@ fn _final_key(f as i64) as i32 {
 // xterm sends `ESC [ 1 ; 5 A` for Ctrl+Up. `p` points at whatever follows the
 // first parameter; a second parameter, minus one, is the modifier bitmask.
 //
-// No second parameter means no modifiers, and the 0 returned here is that
-// answer. A second parameter that does not FIT is a different thing and does not
-// get that answer: it makes the sequence unreadable, and it leaves through
-// *over, which the caller turns into "consumed whole, reported as nothing". The
-// `m < 1` below used to be reached by both, so a refused number came out as a
-// key with no modifier.
+// Three shapes and only two answers, which is the whole of the care needed here.
+//
+// No second parameter, or a zero one, means no modifiers, and the 0 returned here
+// is that answer — legitimately shared, because it is the standard's answer to
+// both: an omitted or zero parameter takes its field's default, and this field's
+// default is 1. A parameter that does not FIT is not that shape: it makes the
+// sequence unreadable and leaves through *over, which the caller turns into
+// "consumed whole, reported as nothing". The `m < 1` below used to be reached by
+// both, so a refused number came out as a key with no modifier.
+//
+// And a parameter that fits but is out of RANGE is the same kind of unreadable as
+// one that does not fit. 1..16 is every modifier xterm encodes; past that there is
+// nothing to report, so it leaves through *over as well rather than being masked
+// into three plausible-looking bits.
 fn _csi_mods(buf as *u8, n as i64, p as i64, over as *i32) as i64 {
     *over = 0;
     if (p >= n) { return 0; }
     if (cast(i64, buf[p]) != 59) { return 0; }        // ';'
     let is i64 as q with mut = p + 1;
     let is i64 as m = _num(buf, n, &q, over);
-    if (m < 1) { return 0; }
+    if (m < 1) { return 0; }                          // absent or zero: default
+    if (m > _MOD_MAX) { *over = 1; return 0; }        // fits, but is no modifier
     return (m - 1) & 7;
 }
 
