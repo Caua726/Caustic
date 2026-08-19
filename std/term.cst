@@ -65,6 +65,13 @@
 // when a caller moves to events instead, and read_key's own header for the three
 // places where "one sequence per call" needs a qualification.
 //
+// One answer is not the byte it came from. The NUL byte — Ctrl+@, Ctrl+Space —
+// cannot be answered as 0, because 0 is KEY_NONE and KEY_NONE is what this
+// function says whenever there is nothing to report; a caller guarding on it
+// dropped the keystroke. read_key answers KEY_NUL for it. The event API is
+// untouched and needs to be: there the byte is EV_KEY with key=0, and a kind
+// plus a key can say what one i32 cannot.
+//
 // Two answers changed, both of them where the old ones were wrong. A sequence
 // that is not a key — a mouse report, a paste bracket, a reply the terminal
 // sent unasked — is consumed whole and answered KEY_NONE instead of KEY_ESC
@@ -189,8 +196,10 @@
 //
 // What was run
 // ------------
-// tests/term_input_test.cst at -O0/-O1/-O2: 353 assertions, the parser called
-// directly and the reader driven over a pipe.
+// tests/term_input_test.cst at -O0/-O1/-O2: 382 assertions, the parser called
+// directly and the reader driven over a pipe. Every public KEY_* value is pinned
+// there by number, because consumers were compiled against the numbers even
+// though they compare by name.
 //
 // Three things this suite named and did not actually check, each found by
 // mutating the code and watching every assertion stay green, and each now pinned
@@ -249,7 +258,11 @@
 // eutimico rebuilt against this file (a copy of its tree pointed at this std):
 // clean build. It uses enter_raw, leave_raw, get_size, read_key and the KEY_*
 // constants and nothing else, and those constants are byte-identical to what
-// they were before the reader was rewritten. Its pty output is NOT byte-identical
+// they were before the reader was rewritten — KEY_NUL is an addition, and
+// nothing was renumbered to fit it. That interface compares against the names in
+// twenty-four places and also tests `k >= 32 && k < 1000` for "a byte a person
+// typed"; 1009 is outside that window, so Ctrl+Space now arrives as a key it
+// ignores instead of as a key it cannot see. Its pty output is NOT byte-identical
 // to the old reader's any more, and cannot be: the point of the change is that an
 // OSC reply no longer becomes keystrokes and `ESC ESC x` no longer loses the x.
 //
@@ -439,6 +452,24 @@ let is i32 as KEY_ENTER with imut = 13;
 let is i32 as KEY_TAB   with imut = 9;
 let is i32 as KEY_BKSP  with imut = 127;
 
+// The NUL byte — Ctrl+@ and Ctrl+Space — as read_key() answers it, and only
+// there. It is not a code a terminal sends and not a code the parser produces:
+// input_next reports that byte as EV_KEY with key=0, because a kind and a key
+// together CAN say "a key whose value is zero" and a single i32 cannot.
+// read_key's 0 is KEY_NONE, "nothing to report" — a normal answer under VMIN=0,
+// and the one answer every caller guards on — so a NUL handed back as 0 is a
+// keystroke that every caller drops.
+//
+// 1009 is the next number after the cursor-key block above, and it is a choice
+// bounded by two things this module does not get to break. It collides with
+// nothing read_key can already answer: a byte 0..255, one of KEY_UP..KEY_PGDN
+// (1000..1008), KEY_ESC, KEY_ENTER, KEY_TAB, KEY_BKSP. And it sits outside
+// [32,1000), the window a consumer uses to mean "a byte a person typed" — a NUL
+// is not that, and must not end up inserted into a text buffer by a caller that
+// tests the range instead of the names. No existing constant moved to make room
+// for it: consumers were compiled against these numbers.
+let is i32 as KEY_NUL   with imut = 1009;
+
 // =======================================================
 // Event-based input
 // =======================================================
@@ -483,7 +514,8 @@ let is i64 as MOD_CTRL  with imut = 4;
 
 struct Event {
     kind   as i64;
-    key    as i32;    // EV_KEY: the same codes read_key returns
+    key    as i32;    // EV_KEY: the codes read_key returns, with ONE difference —
+                      // the NUL byte is 0 here and KEY_NUL there. See KEY_NUL.
     button as i64;    // EV_MOUSE: MB_*
     down   as i32;    // EV_PRESS / EV_RELEASE / EV_MOTION
     row    as i64;    // EV_MOUSE: 1-based, as the terminal reports it
@@ -1467,6 +1499,14 @@ fn input_next(in as *Input, ev as *Event) as i32 {
 //   - the read blocks. VMIN=0/VTIME=1 bounds it at about 100 ms, and that
 //     timeout is what makes a bare Escape resolvable at all.
 //
+// ONE byte does not answer as itself: NUL, which Ctrl+@ and Ctrl+Space produce.
+// KEY_NONE is 0 and so is that byte, and KEY_NONE is an answer this function
+// gives all the time — so a caller that guards on it, which is every caller,
+// drops the keystroke. It is answered with KEY_NUL instead, a code outside both
+// the byte range and the [32,1000) window a consumer reads as "a typable byte".
+// Nothing else moved: the event API still reports that byte as EV_KEY with
+// key=0, where a kind and a key say between them what one i32 could not.
+//
 // A mouse report or a focus report is not an i32, so it is consumed whole and
 // answered with KEY_NONE — the SAME answer whether or not this reader has that
 // report's mode on. With the mode off the report is chatter and is dropped; with
@@ -1507,6 +1547,17 @@ fn input_next(in as *Input, ev as *Event) as i32 {
 // one byte per call, and the two fields it needed, were unreachable from any
 // sequence of public calls — measured with instrumentation, zero hits across the
 // whole suite — and are gone.
+// The i32 read_key() answers with, for an event that IS a key.
+//
+// Every value passes through untouched except one: the byte 0, which cannot,
+// because 0 is already KEY_NONE on this channel. It comes out as KEY_NUL — see
+// that constant for why neither of the alternatives is available, and why the
+// event API needs no such translation.
+fn _rk_key(k as i32) as i32 {
+    if (k == 0) { return KEY_NUL; }       // the NUL byte, not "nothing"
+    return k;
+}
+
 fn read_key() as i32 {
     let is *Input as in = shared_input();
     let is Event as ev;
@@ -1537,7 +1588,7 @@ fn read_key() as i32 {
         }
         let is i64 as was = in.head;
         if (_drain_buf(in, &ev, 0, 0) == 1) {
-            if (ev.kind == EV_KEY) { return ev.key; }
+            if (ev.kind == EV_KEY) { return _rk_key(ev.key); }
             // A report for a mode this reader DID turn on: a mouse report, a
             // focus report. It is not an i32, so the call ends here with
             // KEY_NONE — the same answer, and the same cost, as the report that
@@ -1570,7 +1621,7 @@ fn read_key() as i32 {
             }
             if (_fill(in, 1, 1) == 0) {
                 while (_drain_buf(in, &ev, 1, 0) == 1) {
-                    if (ev.kind == EV_KEY) { return ev.key; }
+                    if (ev.kind == EV_KEY) { return _rk_key(ev.key); }
                 }
                 return KEY_NONE;
             }

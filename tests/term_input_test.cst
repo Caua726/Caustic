@@ -56,6 +56,15 @@ fn t_bytes() as void {
     chk("utf8 lead key", cast(i64, ev.key), 195);
     chk("utf8 cont used", term._scan(cast(*u8, cast(i64, &u) + 1), 1, 0, &ev), 1);
     chk("utf8 cont key", cast(i64, ev.key), 169);
+    // The NUL byte, which Ctrl+@ and Ctrl+Space both produce. Here it is a byte
+    // like any other, and it may stay one: kind and key TOGETHER say "a key, and
+    // its value is 0", which is a thing a single i32 cannot say — see read_key,
+    // whose 0 is KEY_NONE.
+    let is [2]u8 as z;
+    z[0] = cast(u8, 0);
+    chk("nul used", term._scan(cast(*u8, &z), 1, 0, &ev), 1);
+    chk("nul kind", ev.kind, term.EV_KEY);
+    chk("nul key", cast(i64, ev.key), 0);
 }
 
 fn t_esc() as void {
@@ -154,6 +163,53 @@ fn t_keys() as void {
     // as nothing, nothing left behind.
     chk("ins used", term._scan("\x1b[2~", 4, 0, &ev), 4);
     chk("ins kind", ev.kind, term.EV_NONE);
+}
+
+// The public constants, by value.
+//
+// Consumers compare against these BY NAME, but they were compiled against these
+// numbers, and the interface built on this module also tests `k >= 32 && k < 1000`
+// for "a byte a person typed" — a range, not a name. So the numbers are API:
+// changing one is not a refactor, and adding one has to miss every number
+// already in use and every number that window covers. This is where that is
+// checked instead of reviewed.
+fn t_key_constants() as void {
+    chk("KEY_NONE", cast(i64, term.KEY_NONE), 0);
+    chk("KEY_UP", cast(i64, term.KEY_UP), 1000);
+    chk("KEY_DOWN", cast(i64, term.KEY_DOWN), 1001);
+    chk("KEY_RIGHT", cast(i64, term.KEY_RIGHT), 1002);
+    chk("KEY_LEFT", cast(i64, term.KEY_LEFT), 1003);
+    chk("KEY_HOME", cast(i64, term.KEY_HOME), 1004);
+    chk("KEY_END", cast(i64, term.KEY_END), 1005);
+    chk("KEY_DEL", cast(i64, term.KEY_DEL), 1006);
+    chk("KEY_PGUP", cast(i64, term.KEY_PGUP), 1007);
+    chk("KEY_PGDN", cast(i64, term.KEY_PGDN), 1008);
+    chk("KEY_ESC", cast(i64, term.KEY_ESC), 27);
+    chk("KEY_ENTER", cast(i64, term.KEY_ENTER), 13);
+    chk("KEY_TAB", cast(i64, term.KEY_TAB), 9);
+    chk("KEY_BKSP", cast(i64, term.KEY_BKSP), 127);
+    // The one addition: read_key's answer for the NUL byte, which cannot be 0
+    // because 0 is KEY_NONE.
+    chk("KEY_NUL", cast(i64, term.KEY_NUL), 1009);
+    let is i64 as nul = cast(i64, term.KEY_NUL);
+    // It has to collide with nothing read_key can already answer: any byte, any
+    // of the cursor-key block, or one of the four byte-valued names.
+    let is i64 as clash with mut = 0;
+    if (nul >= 0 && nul <= 255) { clash = 1; }
+    if (nul == cast(i64, term.KEY_UP)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_DOWN)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_RIGHT)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_LEFT)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_HOME)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_END)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_DEL)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_PGUP)) { clash = 1; }
+    if (nul == cast(i64, term.KEY_PGDN)) { clash = 1; }
+    chk("KEY_NUL collides with nothing", clash, 0);
+    // And it must not read as a typable byte to a consumer that tests the range.
+    let is i64 as typable with mut = 0;
+    if (nul >= 32 && nul < 1000) { typable = 1; }
+    chk("KEY_NUL not a typable byte", typable, 0);
 }
 
 fn t_mouse() as void {
@@ -554,6 +610,59 @@ fn t_read_key_csi_over() as void {
         cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
     pipe_done();
     term._shell.mark = 0;
+}
+
+// The NUL byte through read_key(), which answers with an i32 and nothing else.
+//
+// KEY_NONE is 0 and the NUL byte is 0: one value, two owners, on a public
+// channel. KEY_NONE is a normal answer here — VMIN=0 lets a read return no
+// bytes, a report is consumed and answered with it — so every caller guards on
+// it, and every one of them drops Ctrl+@ / Ctrl+Space. The byte needs an answer
+// of its own.
+fn t_read_key_nul() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    let is [4]u8 as b;
+    b[0] = cast(u8, 0);
+    b[1] = cast(u8, 120);
+    pipe_send(cast(*u8, &b), 2);
+    pipe_seal();
+    let is i64 as k = cast(i64, term.read_key());
+    let is i64 as swallowed with mut = 0;
+    if (k == cast(i64, term.KEY_NONE)) { swallowed = 1; }
+    chk("read_key nul not nothing", swallowed, 0);
+    chk("read_key nul", k, cast(i64, term.KEY_NUL));
+    // Whatever it answers, it is one keystroke: the byte behind it still comes
+    // out next, and the reader is empty after it.
+    chk("read_key nul next", cast(i64, term.read_key()), 120);
+    chk("read_key nul drained",
+        cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    pipe_done();
+    term._shell.mark = 0;
+}
+
+// The same byte through the event reader, which needs no new code and gets none:
+// kind=EV_KEY with key=0 already says both things at once. This is here so that
+// stays true — a byte passes through the event API untouched, which is what a
+// caller assembling UTF-8 out of it depends on.
+fn t_nul_event() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = pipe_rd();
+    let is [4]u8 as b;
+    b[0] = cast(u8, 0);
+    b[1] = cast(u8, 120);
+    pipe_send(cast(*u8, &b), 2);
+    pipe_seal();
+    let is term.Event as ev;
+    chk("nul event 1", cast(i64, term.input_next(&in, &ev)), 1);
+    chk("nul event kind", ev.kind, term.EV_KEY);
+    chk("nul event key", cast(i64, ev.key), 0);
+    chk("nul event 2", cast(i64, term.input_next(&in, &ev)), 1);
+    chk("nul event key 2", cast(i64, ev.key), 120);
+    pipe_done();
 }
 
 // A bare Escape still resolves to KEY_ESC, through read_key, when nothing is
@@ -1603,6 +1712,7 @@ fn main() as i32 {
     t_esc();
     t_esc_esc();
     t_keys();
+    t_key_constants();
     t_mouse();
     t_mouse_broken();
     t_num_limits();
@@ -1616,6 +1726,8 @@ fn main() as i32 {
         t_defect_events();
         t_defect_read_key();
         t_read_key_csi_over();
+        t_read_key_nul();
+        t_nul_event();
         t_read_key_esc();
         t_read_key_arrow();
         t_esc_then_arrow();
