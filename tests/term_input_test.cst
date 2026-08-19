@@ -760,6 +760,76 @@ fn t_osc_reader() as void {
     term._shell.mark = 0;
 }
 
+// What read_key's header promises about a report, in BOTH configurations.
+//
+// The header says one call consumes the bytes of one keystroke and no more, and
+// that a mouse report or a focus report is consumed whole and answered with
+// KEY_NONE. Both sentences were true only with the modes OFF, where a report is
+// chatter this reader drops. With the modes ON — which is every caller of
+// input_open, since it turns focus reporting and bracketed paste on
+// unconditionally — a DELIVERED report did not end the call: read_key kept
+// reading, so one call swallowed three reports and the keystroke behind them and
+// answered with the key. Measured with strace: 34 one-byte reads in a single
+// call, and `0,0,120` where the same bytes without input_open gave
+// `0,0,0,0,0,120`.
+//
+// A select loop that calls read_key once per readiness report is what this
+// breaks: the answers it gets stop matching the bytes it was told about.
+fn t_read_key_one_per_report() as void {
+    // Modes off: a report is chatter, dropped, and answered as nothing.
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    pipe_send("\x1b[<0;40;12M", 11);
+    pipe_send("\x1b[<0;41;12M", 11);
+    pipe_send("\x1b[<0;42;12M", 11);
+    pipe_send("x", 1);
+    pipe_seal();
+    let is [8]i64 as off;
+    let is i64 as i with mut = 0;
+    while (i < 8) { off[i] = cast(i64, term.read_key()); i = i + 1; }
+    chk("per report off 0", off[0], cast(i64, term.KEY_NONE));
+    chk("per report off 1", off[1], cast(i64, term.KEY_NONE));
+    chk("per report off 2", off[2], cast(i64, term.KEY_NONE));
+    chk("per report off key", off[3], 120);
+    chk("per report off drained", off[4], cast(i64, term.KEY_NONE));
+    pipe_done();
+    term._shell.mark = 0;
+
+    // Modes on, the same bytes, and the same answers: one report per call, each
+    // answered KEY_NONE, the keystroke behind them delivered on its own call.
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    term.shared_input().m_mouse = 1;
+    term.shared_input().m_focus = 1;
+    pipe_send("\x1b[<0;40;12M", 11);
+    pipe_send("\x1b[<0;41;12M", 11);
+    pipe_send("\x1b[<0;42;12M", 11);
+    pipe_send("x", 1);
+    pipe_seal();
+    let is [8]i64 as on;
+    i = 0;
+    while (i < 8) { on[i] = cast(i64, term.read_key()); i = i + 1; }
+    chk("per report on 0", on[0], cast(i64, term.KEY_NONE));
+    chk("per report on 1", on[1], cast(i64, term.KEY_NONE));
+    chk("per report on 2", on[2], cast(i64, term.KEY_NONE));
+    chk("per report on key", on[3], 120);
+    chk("per report on drained", on[4], cast(i64, term.KEY_NONE));
+    pipe_done();
+    term._shell.mark = 0;
+
+    // A focus report is the same answer as a mouse report, delivered or not:
+    // `ESC [ I` then one key, with focus reporting on.
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    term.shared_input().m_focus = 1;
+    pipe_send("\x1b[Iy", 4);
+    pipe_seal();
+    chk("per report focus none", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    chk("per report focus key", cast(i64, term.read_key()), 121);
+    pipe_done();
+    term._shell.mark = 0;
+}
+
 // A burst of reports that this reader DELIVERS, and the typing behind it.
 //
 // The reports here are focus reports and the reader has focus reporting on,
@@ -1408,6 +1478,7 @@ fn main() as i32 {
         t_read_key_paste_handover();
         t_truncated_reader();
         t_osc_reader();
+        t_read_key_one_per_report();
         t_read_key_report_burst();
         t_skip_begin_needs_bytes();
         t_oversize_seq();

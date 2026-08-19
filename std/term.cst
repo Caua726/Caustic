@@ -55,13 +55,15 @@
 //
 // What read_key() still promises
 // ------------------------------
-// It reads one byte per read(2), so a burst stays in the kernel queue where a
-// level-triggered poller can still see it, and its read blocks — VMIN=0 with
-// VTIME=1 bounds that at about 100 ms, and that timeout is the only thing that
-// can tell a bare Escape from the start of an arrow key. Both halves are load
-// bearing for a caller that polls fd 0 itself and calls read_key once per
-// readiness report; see the note on input_fd below for what changes when a
-// caller moves to events instead.
+// It reads one byte per read(2) and answers on the first sequence it finishes —
+// a keystroke as its i32, a report as KEY_NONE — so the rest of a burst stays in
+// the kernel queue where a level-triggered poller can still see it, and its read
+// blocks: VMIN=0 with VTIME=1 bounds that at about 100 ms, and that timeout is
+// the only thing that can tell a bare Escape from the start of an arrow key. All
+// three are load bearing for a caller that polls fd 0 itself and calls read_key
+// once per readiness report; see the note on input_fd below for what changes
+// when a caller moves to events instead, and read_key's own header for the three
+// places where "one sequence per call" needs a qualification.
 //
 // Two answers changed, both of them where the old ones were wrong. A sequence
 // that is not a key — a mouse report, a paste bracket, a reply the terminal
@@ -180,7 +182,7 @@
 //
 // What was run
 // ------------
-// tests/term_input_test.cst at -O0/-O1/-O2: 295 assertions, the parser called
+// tests/term_input_test.cst at -O0/-O1/-O2: 307 assertions, the parser called
 // directly and the reader driven over a pipe.
 //
 // A program with the shape of the one interface built on this — level-triggered
@@ -205,7 +207,13 @@
 // mouse reporting on and five SGR reports in front of the focus ones: the same
 // six, against the same nothing.
 //
-// One byte per read(2), and where the bytes wait, measured with FIONREAD: five
+// One byte per read(2), and one sequence per call, measured under strace with
+// the reader's modes ON — the configuration where this was false: three SGR
+// reports and a keystroke cost 11, 11, 11 and 1 reads across four calls and
+// answer KEY_NONE, KEY_NONE, KEY_NONE, 'x', where they used to cost 34 reads in
+// the first call and answer 'x' from it.
+//
+// Where the bytes wait, measured with FIONREAD: five
 // typed bytes drain the kernel queue 5,4,3,2,1 with this module's buffer at 0; a
 // mouse report leaves exactly the byte behind it in the kernel; a paste hands its
 // bytes out one per call with the rest still in the KERNEL queue, where a poller
@@ -499,6 +507,13 @@ let is i64 as IN_PASTE with imut = 8192;
 // when this is reached: it is skipped to its terminator, so no part of it comes
 // back as text. A reply longer than this (an OSC 52 clipboard, say) is therefore
 // read as nothing by read_key, and as nothing by input_next too.
+//
+// "Skipped to its terminator" needs bytes that say WHICH terminator, which is
+// the first two of the sequence. Below two, there is no sequence in the buffer to
+// skip and _skip_begin says so by doing nothing: the bytes stay and the next call
+// reads on. A state that only arose from a counter that had stopped meaning one
+// sequence's bytes — see read_key — and the guard is kept anyway, because the
+// default it used to fall through to discards a person's typing.
 let is i64 as _RK_MAX with imut = 64;
 
 // An Input must start zeroed, which a global in .bss is and a stack local is
@@ -1375,17 +1390,47 @@ fn input_next(in as *Input, ev as *Event) as i32 {
 //
 // Two properties are kept deliberately, because a caller depends on each:
 //
-//   - one call consumes the bytes of one keystroke and no more. It reads ONE
-//     byte per read, exactly as it always did, so a burst stays in the kernel
-//     queue where a level-triggered poller can still see it. Anything else
-//     silently breaks a select loop that calls this once per readiness report.
+//   - one call takes ONE sequence off the descriptor and answers as soon as that
+//     sequence resolves: a keystroke as its i32, anything that is not one as
+//     KEY_NONE. It reads one byte per read(2), exactly as it always did, so the
+//     rest of a burst stays in the kernel queue where a level-triggered poller
+//     can still see it. Anything else silently breaks a select loop that calls
+//     this once per readiness report.
+//
+//     Three qualifications, all of them measured rather than reasoned:
+//
+//       Bytes already in THIS module's buffer when the call starts are parsed
+//       with no read at all — the ESC ESC pair this reader holds back, or
+//       whatever input_next left there, since input_next reads in blocks and
+//       this does not. So a run of chatter sitting in that buffer can be
+//       consumed inside one call. Nothing is lost by it, but no poller can
+//       account for it either, which is why it is written down.
+//
+//       A sequence longer than _RK_MAX stops being assembled at 64 bytes and is
+//       skipped to its terminator instead, across as many following calls as the
+//       terminator takes to arrive, KEY_NONE throughout.
+//
+//       A paste's body is not one sequence but many answers: one byte per call,
+//       one read(2) per byte. See the paste paragraph below.
+//
 //   - the read blocks. VMIN=0/VTIME=1 bounds it at about 100 ms, and that
 //     timeout is what makes a bare Escape resolvable at all.
 //
 // A mouse report or a focus report is not an i32, so it is consumed whole and
-// answered with KEY_NONE — which the old reader could not do, because it had no
-// way to know where the sequence ended. KEY_NONE was already a possible answer
-// (VMIN=0 lets a read return zero bytes), so every caller already guards on it.
+// answered with KEY_NONE — the SAME answer whether or not this reader has that
+// report's mode on. With the mode off the report is chatter and is dropped; with
+// it on the report is a real event an i32 cannot carry, and either way the call
+// ends there instead of reading past it.
+//
+// The two configurations did not answer the same for a while, and the open one
+// was the wrong half: with the modes on, ONE call swallowed three SGR reports
+// AND the keystroke behind them and answered with the key. Measured under strace,
+// the same bytes both ways — 11, 11, 11, 1, 1 reads answering 0, 0, 0, 120, 0
+// now, against 34, 1, 1, 1, 1 reads answering 120 first and nothing after.
+//
+// The old reader could not answer a report this way at all, because it had no way
+// to know where a sequence ended. KEY_NONE was already a possible answer (VMIN=0
+// lets a read return zero bytes), so every caller already guards on it.
 //
 // A PASTE IS DIFFERENT, because it is not the terminal talking: it is text a
 // person meant to put into the program. Answering KEY_NONE and dropping it
@@ -1444,10 +1489,13 @@ fn read_key() as i32 {
         } else {
             // A whole sequence went past and none of it was a key — a report
             // for a mode this reader did not turn on, or a reply the terminal
-            // sent unasked. It is consumed; answer "nothing" now rather than
-            // read on, so that one call still costs at most one keystroke's
-            // worth of bytes and the rest of a burst stays in the kernel where
-            // a poller can see it.
+            // sent unasked — and the buffer is empty behind it, which is always
+            // true of bytes this call read itself, one per read(2). It is
+            // consumed; answer "nothing" now rather than read on, so that one
+            // call still costs one sequence and the rest of a burst stays in the
+            // kernel where a poller can see it. When the buffer is NOT empty the
+            // bytes came from input_next, which reads in blocks: the loop keeps
+            // parsing them, making no read, until something resolves.
             if (in.head > was && in.head == in.tail) { return KEY_NONE; }
             if (pulled >= _RK_MAX) {
                 // Bounded: one call must cost about one keystroke, so a sequence
