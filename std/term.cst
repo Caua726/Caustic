@@ -142,6 +142,13 @@
 // comes out: an unbounded accumulator delivered col=7766279631452241919 out of
 // twenty digits, positive and past every guard.
 //
+// A parameter past that digit bound refuses the WHOLE sequence, wherever in a
+// sequence it sits: a mouse report with a twenty-digit column produces no
+// coordinate, and `ESC [ 1 ; 9999999999 A` produces no arrow. It used to produce
+// one with no modifier — "there is no digit here" and "these digits do not fit"
+// were the same -1, and a modifier has a default for the first of them while a
+// coordinate has none.
+//
 // A sequence longer than any of those is not a terminal talking — the longest
 // this parser recognises is a 25-byte OSC reply — so it is SKIPPED rather than
 // dropped: the reader remembers which terminator it is looking for and discards
@@ -182,7 +189,7 @@
 //
 // What was run
 // ------------
-// tests/term_input_test.cst at -O0/-O1/-O2: 326 assertions, the parser called
+// tests/term_input_test.cst at -O0/-O1/-O2: 353 assertions, the parser called
 // directly and the reader driven over a pipe.
 //
 // Three things this suite named and did not actually check, each found by
@@ -607,13 +614,29 @@ let is i64 as _COORD_MAX with imut = 65535;
 // above 255 has a meaning, so a larger number is not a button.
 let is i64 as _BUTTON_MAX with imut = 255;
 
-// Read a decimal number starting at buf[*i], advancing *i past it. Returns -1
-// when there is no digit there, and -1 when there are more than _NUM_DIGITS of
-// them — which is how a malformed report is refused instead of being read as
-// zero, and how an oversized one is refused instead of being wrapped into a
-// plausible-looking number. Twenty digits of column used to arrive as
+// Read a decimal number starting at buf[*i], advancing *i past it.
+//
+// Two things can go wrong here and they are NOT the same answer, so they do not
+// share a channel. The RETURN is -1 for both — "no number for you" — and *over,
+// written on every call, says which: 0 when there was no digit at buf[*i], which
+// means the parameter is absent and is a legal shape for several sequences here,
+// and 1 when there were digits and more than _NUM_DIGITS of them, which is no
+// shape at all. Twenty digits of column used to arrive as
 // col=7766279631452241919: positive, past every guard, delivered as a report.
-fn _num(buf as *u8, n as i64, i as *i64) as i64 {
+//
+// A caller that refuses on `< 0` refuses both, and that is right for every
+// number a report is built out of. A caller that has a DEFAULT for "absent" must
+// look at *over before applying it, because a default is an answer and a number
+// that does not fit has none: `ESC [ 1 ; 9999999999 A` used to arrive as an
+// arrow key with NO modifier, because _csi_mods tested `m < 1` — the same test
+// it uses for "there is no second parameter" — and answered with the default 0.
+// One number that does not fit, refused in a mouse report and invented in a
+// modifier, out of one -1 meaning two things.
+//
+// That is why the flag is an argument and not a convention: a new call site
+// cannot be written without naming a place to put it.
+fn _num(buf as *u8, n as i64, i as *i64, over as *i32) as i64 {
+    *over = 0;
     let is i64 as p with mut = *i;
     if (p >= n) { return 0 - 1; }
     let is i64 as c = cast(i64, buf[p]);
@@ -624,7 +647,7 @@ fn _num(buf as *u8, n as i64, i as *i64) as i64 {
         let is i64 as d = cast(i64, buf[p]);
         if (d < 48 || d > 57) { break; }
         digits = digits + 1;
-        if (digits > _NUM_DIGITS) { return 0 - 1; }
+        if (digits > _NUM_DIGITS) { *over = 1; return 0 - 1; }
         v = v * 10 + (d - 48);
         p = p + 1;
     }
@@ -664,11 +687,19 @@ fn _final_key(f as i64) as i32 {
 
 // xterm sends `ESC [ 1 ; 5 A` for Ctrl+Up. `p` points at whatever follows the
 // first parameter; a second parameter, minus one, is the modifier bitmask.
-fn _csi_mods(buf as *u8, n as i64, p as i64) as i64 {
+//
+// No second parameter means no modifiers, and the 0 returned here is that
+// answer. A second parameter that does not FIT is a different thing and does not
+// get that answer: it makes the sequence unreadable, and it leaves through
+// *over, which the caller turns into "consumed whole, reported as nothing". The
+// `m < 1` below used to be reached by both, so a refused number came out as a
+// key with no modifier.
+fn _csi_mods(buf as *u8, n as i64, p as i64, over as *i32) as i64 {
+    *over = 0;
     if (p >= n) { return 0; }
     if (cast(i64, buf[p]) != 59) { return 0; }        // ';'
     let is i64 as q with mut = p + 1;
-    let is i64 as m = _num(buf, n, &q);
+    let is i64 as m = _num(buf, n, &q, over);
     if (m < 1) { return 0; }
     return (m - 1) & 7;
 }
@@ -682,17 +713,22 @@ fn _csi_mods(buf as *u8, n as i64, p as i64) as i64 {
 // will click on.
 fn _mouse(buf as *u8, n as i64, fin as i64, ev as *Event) as void {
     let is i64 as i with mut = 0;
-    let is i64 as cb = _num(buf, n, &i);
+    // Both of _num's failures are one answer here — a report with a number
+    // missing and a report with a number that does not fit are equally not a
+    // report — so every number below is refused on the return and the flag is
+    // never read. It is passed anyway, because there is nowhere else to put it.
+    let is i32 as ov with mut = 0;
+    let is i64 as cb = _num(buf, n, &i, &ov);
     if (cb < 0) { return; }
     if (i >= n) { return; }
     if (cast(i64, buf[i]) != 59) { return; }
     i = i + 1;
-    let is i64 as cx = _num(buf, n, &i);
+    let is i64 as cx = _num(buf, n, &i, &ov);
     if (cx < 0) { return; }
     if (i >= n) { return; }
     if (cast(i64, buf[i]) != 59) { return; }
     i = i + 1;
-    let is i64 as cy = _num(buf, n, &i);
+    let is i64 as cy = _num(buf, n, &i, &ov);
     if (cy < 0) { return; }
     if (i != n) { return; }              // trailing parameters: not this shape
     // Every number is in range or there is no report. SGR counts cells from one,
@@ -888,7 +924,11 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
     }
     if (f == 126) {                                              // '~'
         let is i64 as p with mut = 2;
-        let is i64 as v = _num(buf, i, &p);
+        let is i32 as ov with mut = 0;
+        // A leading parameter that does not fit needs no check of its own here:
+        // -1 is none of the codes below, so such a sequence already falls
+        // through to "consumed whole, reported as nothing".
+        let is i64 as v = _num(buf, i, &p, &ov);
         if (v == 1 || v == 7) { ev.kind = EV_KEY; ev.key = KEY_HOME; }
         else if (v == 3) { ev.kind = EV_KEY; ev.key = KEY_DEL; }
         else if (v == 4 || v == 8) { ev.kind = EV_KEY; ev.key = KEY_END; }
@@ -896,16 +936,31 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
         else if (v == 6) { ev.kind = EV_KEY; ev.key = KEY_PGDN; }
         else if (v == 200) { ev.kind = _EV_PASTE_ON; }
         else if (v == 201) { ev.kind = _EV_PASTE_OFF; }
-        if (ev.kind == EV_KEY) { ev.mods = _csi_mods(buf, i, p); }
+        if (ev.kind == EV_KEY) {
+            ev.mods = _csi_mods(buf, i, p, &ov);
+            // A modifier that does not fit unmakes the key: Delete with a
+            // parameter this parser refused is not Delete, and answering it with
+            // "no modifier" is inventing the half of the sequence that was
+            // refused.
+            if (ov == 1) { _ev_clear(ev); }
+        }
         return total;
     }
     let is i32 as k = _final_key(f);
     if (k != KEY_NONE) {
+        let is i64 as p with mut = 2;
+        let is i32 as ov with mut = 0;
+        _num(buf, i, &p, &ov);                // the leading 1, when it is sent
+        // The leading parameter's VALUE is discarded — the call is here to step
+        // over it — but "it did not fit" is not a value, and it is exactly what
+        // separates `ESC [ A`, an arrow with no parameter, from
+        // `ESC [ 9999999999 A`, an arrow behind a number this parser refused.
+        // The second one is consumed whole and reported as nothing.
+        if (ov == 1) { return total; }
         ev.kind = EV_KEY;
         ev.key = k;
-        let is i64 as p with mut = 2;
-        _num(buf, i, &p);                     // the leading 1, when it is sent
-        ev.mods = _csi_mods(buf, i, p);
+        ev.mods = _csi_mods(buf, i, p, &ov);
+        if (ov == 1) { _ev_clear(ev); }
         return total;
     }
     if (f == 73) { ev.kind = EV_FOCUS; ev.down = 1; return total; }   // 'I'

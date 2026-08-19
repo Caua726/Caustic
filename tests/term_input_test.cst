@@ -308,6 +308,62 @@ fn t_num_limits() as void {
     chk("wide still works row", ev.row, 567);
 }
 
+// A parameter that does not fit, in a CSI that IS understood.
+//
+// _num answers -1 for two different things — "there is no digit here" and
+// "there are more than nine digits, this does not fit" — and _csi_mods tested
+// `m < 1`, which is the same test it uses for "there is no second parameter".
+// So `ESC [ 1 ; 9999999999 A` came out as EV_KEY key=KEY_UP mods=0: an arrow
+// key with NO modifier, invented out of a number the parser had refused. The
+// mouse path already refused the same shape whole; this one defaulted it.
+//
+// A number that does not fit means the sequence is not readable, so it is
+// consumed whole and reported as nothing — the rule the rest of this parser
+// already follows.
+fn t_csi_num_limits() as void {
+    let is term.Event as ev;
+    // Ten digits of modifier: refused, not defaulted to "no modifier".
+    chk("mods over used", term._scan("\x1b[1;9999999999A", 15, 1, &ev), 15);
+    chk("mods over kind", ev.kind, term.EV_NONE);
+    chk("mods over key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    chk("mods over mods", ev.mods, 0);
+    // The same shape in the tilde family, which reads its modifier through the
+    // same function: Delete with a modifier that does not fit is not Delete.
+    chk("tilde mods over used", term._scan("\x1b[3;9999999999~", 15, 1, &ev), 15);
+    chk("tilde mods over kind", ev.kind, term.EV_NONE);
+    chk("tilde mods over key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    // The LEADING parameter, whose value the arrow path discards — it is read
+    // only to step over it. Ten digits there was dropped on the floor and the
+    // arrow was delivered anyway; it is refused now.
+    chk("lead over used", term._scan("\x1b[9999999999A", 13, 1, &ev), 13);
+    chk("lead over kind", ev.kind, term.EV_NONE);
+    chk("lead over key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
+    // The tilde path already refused this one, because -1 matches no tilde
+    // code; the line is here so that stays true.
+    chk("lead over tilde used", term._scan("\x1b[9999999999~", 13, 1, &ev), 13);
+    chk("lead over tilde kind", ev.kind, term.EV_NONE);
+    // The two shapes that are NOT overflow and must not move with it: no
+    // parameter at all, and a parameter list that stops before the modifier.
+    // Both mean "no modifier", and that is the 0 they still get.
+    chk("bare arrow used", term._scan("\x1b[A", 3, 1, &ev), 3);
+    chk("bare arrow key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("bare arrow mods", ev.mods, 0);
+    chk("empty mods used", term._scan("\x1b[1;A", 5, 1, &ev), 5);
+    chk("empty mods key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("empty mods mods", ev.mods, 0);
+    chk("ctrl-up still works used", term._scan("\x1b[1;5A", 6, 1, &ev), 6);
+    chk("ctrl-up still works key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("ctrl-up still works mods", ev.mods, term.MOD_CTRL);
+    // Where the refusal starts: at ten digits, not at nine. Nine fits, so it is
+    // a number, and `(999999999 - 1) & 7` is 6 — three modifier bits out of a
+    // parameter no terminal sends. Whether a modifier OUTSIDE xterm's 1..16
+    // should be refused as well is a separate question from this one, and this
+    // line pins only that the digit limit is not the thing that answers it.
+    chk("nine digit mods used", term._scan("\x1b[1;999999999A", 14, 1, &ev), 14);
+    chk("nine digit mods kind", ev.kind, term.EV_KEY);
+    chk("nine digit mods mods", ev.mods, 6);
+}
+
 fn t_other_seqs() as void {
     let is term.Event as ev;
     // A reply nobody asked for: consumed to its final byte and reported as
@@ -476,6 +532,26 @@ fn t_defect_read_key() as void {
     chk("read_key defect", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
     chk("read_key defect key", cast(i64, term.read_key()), 120);
     chk("read_key drained", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    pipe_done();
+    term._shell.mark = 0;
+}
+
+// The same refusal through read_key(), where a caller sees only the i32.
+//
+// A CSI whose modifier does not fit is not a key, so the call that finishes the
+// sequence answers KEY_NONE — one sequence, one answer — and the keystroke
+// behind it arrives whole on the next call, with nothing of the sequence left in
+// the stream. What must not come out is the arrow: KEY_UP with no modifier is a
+// key the terminal never sent.
+fn t_read_key_csi_over() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    pipe_send("\x1b[1;9999999999Ax", 16);
+    pipe_seal();
+    chk("read_key over", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    chk("read_key over key", cast(i64, term.read_key()), 120);
+    chk("read_key over drained",
+        cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
     pipe_done();
     term._shell.mark = 0;
 }
@@ -1530,6 +1606,7 @@ fn main() as i32 {
     t_mouse();
     t_mouse_broken();
     t_num_limits();
+    t_csi_num_limits();
     t_other_seqs();
     t_strings();
     t_csi_out_of_order();
@@ -1538,6 +1615,7 @@ fn main() as i32 {
     if (os.current() == os.OS_LINUX) {
         t_defect_events();
         t_defect_read_key();
+        t_read_key_csi_over();
         t_read_key_esc();
         t_read_key_arrow();
         t_esc_then_arrow();
