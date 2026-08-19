@@ -268,7 +268,19 @@ facade only.
   (CommandLineToArgvA-equivalent, hand-rolled in `caustic-ld`).
 - `term.cst` — Terminal: ANSI escapes (portable bytes), raw mode
   (termios on Linux, GetConsoleMode + ENABLE_VIRTUAL_TERMINAL_INPUT on Windows),
-  size query (TIOCGWINSZ vs GetConsoleScreenBufferInfo)
+  size query (TIOCGWINSZ vs GetConsoleScreenBufferInfo). Input arrives as
+  events — `Event`, `Input`, `input_open`/`input_close`/`input_fd`/`input_next` —
+  covering keys, SGR-1006 mouse, bracketed paste as one `EV_PASTE`, and focus.
+  A buffered reader owns the descriptor and consumes a sequence whole or not at
+  all; `read_key()` keeps its old signature as a shell over it. The Windows path
+  compiles and has never been run, which the module header states.
+- `unicode.cst` — Display width in terminal columns, grapheme-cluster aware
+  (`cluster_next` walks one cluster from a boundary and allocates nothing;
+  `cp_width`, `string_width`), UTF-8 decode, and the generated UCD tries it
+  needs — pure, imports nothing outside its own directory.
+  - `unicode/tables/*.cst` — generated from the UCD by `caustic-unicode`'s
+    `tools/gen.cst` and copied here; two megabytes, which is why the module is
+    deliberately absent from `libcaustic.cst`.
 - `process.cst` — fork/execve/wait on Linux; CreateProcessA +
   WaitForSingleObject + GetExitCodeProcess on Windows. `capture()` is
   Linux-only for now (Windows needs CreatePipe wiring).

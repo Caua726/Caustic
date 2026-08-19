@@ -330,7 +330,7 @@ the right backend at compile time. Pure modules have no OS dependency at all.
 | `time.cst` | Monotonic & wall clock, sleep, elapsed | per-OS |
 | `env.cst` | `argc`/`argv`, environment variables | per-OS |
 | `process.cst` | Spawn / exec / wait; `capture()` (Linux) | per-OS |
-| `term.cst` | Raw mode, ANSI escapes, terminal size, key input | per-OS |
+| `term.cst` | Raw mode, ANSI escapes, terminal size; input as events — keys, SGR-1006 mouse, bracketed paste, focus | per-OS |
 | `random.cst` | xoshiro256** PRNG, OS-seeded entropy | per-OS seed |
 | `string.cst` | Dynamic strings: concat, find, substring, split, trim, replace | pure |
 | `slice.cst` | Generic dynamic array (`Slice gen T`) | pure |
@@ -338,6 +338,7 @@ the right backend at compile time. Pure modules have no OS dependency at all.
 | `types.cst` | `Option gen T`, `Result gen T, E` | pure |
 | `math.cst` | abs, min/max, clamp, gcd/lcm, sqrt, isqrt, bit ops, alignment | pure |
 | `sort.cst` | quicksort, heapsort, mergesort with `fn_ptr` comparators | pure |
+| `unicode.cst` | Display width in terminal columns, grapheme-cluster aware; UTF-8 decode; generated UCD tries | pure |
 | `path.cst` | Path join, dirname, basename, ext, `~` expansion | pure |
 | `errors.cst` | `__compile_error` aborts + runtime panic/assert | pure |
 | `arena.cst` | Standalone bump allocator | pure |
