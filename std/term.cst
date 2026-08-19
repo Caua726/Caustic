@@ -45,6 +45,10 @@
 //     is what the old reader answered and consumers were built against it. The
 //     newer introducers do NOT: a truncated `ESC ]` or `ESC N` answers nothing,
 //     because inventing an Escape is the harm this module was written to stop.
+//     "Nothing behind them" is a stronger claim than it used to be: an
+//     introducer that has begun a sequence is not finished by 100 ms of silence,
+//     it waits out the hold — see _HOLD_PAUSES, and the measurement of what that
+//     costs Alt+[ and buys an arrow key split across a stalled link.
 //   - a string sequence with no terminator, once nothing more is coming,
 //     gives up its two introducer bytes and leaves its payload to be read as
 //     keystrokes. Those two bytes are also exactly what Alt+] or Alt+P arrive
@@ -58,12 +62,19 @@
 // It reads one byte per read(2) and answers on the first sequence it finishes —
 // a keystroke as its i32, a report as KEY_NONE — so the rest of a burst stays in
 // the kernel queue where a level-triggered poller can still see it, and its read
-// blocks: VMIN=0 with VTIME=1 bounds that at about 100 ms, and that timeout is
-// the only thing that can tell a bare Escape from the start of an arrow key. All
-// three are load bearing for a caller that polls fd 0 itself and calls read_key
-// once per readiness report; see the note on input_fd below for what changes
-// when a caller moves to events instead, and read_key's own header for the three
-// places where "one sequence per call" needs a qualification.
+// blocks: VMIN=0 with VTIME=1 bounds one read at about 100 ms, and that timeout
+// is the only thing that can tell a bare Escape from the start of an arrow key.
+// All three are load bearing for a caller that polls fd 0 itself and calls
+// read_key once per readiness report; see the note on input_fd below for what
+// changes when a caller moves to events instead, and read_key's own header for
+// the three places where "one sequence per call" needs a qualification.
+//
+// One read is bounded at 100 ms; a CALL holding a sequence that has begun is
+// bounded at _HOLD_PAUSES of those. That is not the same promise, and the
+// difference is the whole of what a timeout may conclude: 100 ms of silence
+// answers the bare-Escape question and nothing else, so `ESC [` followed 250 ms
+// later by `A` is an arrow key and not Escape plus a letter. Measured on a pty
+// both ways, before and after.
 //
 // One answer is not the byte it came from. The NUL byte — Ctrl+@, Ctrl+Space —
 // cannot be answered as 0, because 0 is KEY_NONE and KEY_NONE is what this
@@ -135,9 +146,12 @@
 // -----------
 // IN_BUF is 4096 because that is the size of the kernel's tty line-discipline
 // buffer on Linux (N_TTY_BUF_SIZE): one read of that size empties a queue as
-// full as the kernel will ever let it get. IN_PASTE (8192) and _RK_MAX (64)
-// were chosen, not derived; each says at its declaration what it is measured
-// against.
+// full as the kernel will ever let it get. IN_PASTE (8192), _RK_MAX (64) and
+// _HOLD_PAUSES (5) were chosen, not derived; each says at its declaration what
+// it is measured against. Between them they bound the two ways input can fail to
+// finish: a writer that never stops sending is bounded in BYTES, a writer that
+// stops mid-sequence is bounded in pauses, and neither bound covers the other's
+// case.
 //
 // A coordinate is bounded twice. _COORD_MAX (65535) is derived — a winsize
 // carries rows and columns as u16 — and is all the pure parser can do; on top of
@@ -568,6 +582,69 @@ let is i64 as IN_PASTE with imut = 8192;
 // default it used to fall through to discards a person's typing.
 let is i64 as _RK_MAX with imut = 64;
 
+// What a read that returned no bytes means, which is not one thing.
+//
+// Under raw mode's VMIN=0/VTIME=1 a read returns zero bytes after 100 ms of
+// silence — and a descriptor with nothing left to say returns exactly the same
+// thing. One flag carried both for as long as this reader has existed, because
+// the only question it was written for is answered the same way by either: is a
+// lone ESC the Escape key, or the first byte of a sequence? Every other retained
+// state inherited that flag and was ended by a pause it had no business ending
+// on. Measured on a pty with a 250 ms gap: a paste came out in two pieces, the
+// second of them as individual keystrokes; `ESC [` came out as Escape plus a
+// letter instead of an arrow; and an OSC reply put 21 of its own bytes into the
+// input, which is the founding defect of this module, arriving through a hole in
+// its timeout.
+//
+// So there are three answers, and each retained state names the one it waits for:
+//
+//   _END_NO      more bytes may still arrive; nothing has to resolve
+//   _END_PAUSE   a read timed out. The ESC decision is made here, and only it.
+//   _END_HOLD    the hold below is spent. Everything retained resolves now: a
+//                terminator that has not arrived in this long is not coming, and
+//                waiting for it forever is a hang.
+let is i32 as _END_NO    with imut = 0;
+let is i32 as _END_PAUSE with imut = 1;
+let is i32 as _END_HOLD  with imut = 2;
+
+// How many pauses ONE input_next() or read_key() call waits through, in total,
+// while it holds a paste or a sequence that has begun. Chosen, not derived —
+// here is what it was chosen against.
+//
+// The unit is not chosen. Silence is only observable in VTIME ticks, and one tick
+// measured 100.1 ms to 106.0 ms across thirteen samples on a real pty. So the
+// wait is an integer number of ticks and nothing finer, and it costs no clock:
+// this module reads no clock at all, and a tick is the only interval it can see.
+//
+// A terminal's own delivery does not contain such a silence. 30000 bytes pasted
+// into a real pty arrive in eight reads with 14 to 60 microseconds between them;
+// through tmux, in seven reads, 13 to 36 microseconds; through tmux with the
+// machine oversubscribed three to one, in twelve reads, 18 to 40 microseconds.
+// Zero empty reads inside the paste in all three. A silence in the middle of a
+// paste is therefore not a terminal pacing itself — it is the writer having
+// stopped: a person pasting across a link that stalled, or something that is not
+// a terminal at all.
+//
+// Five ticks is about 520 ms of stalled writer, and both sides of that number are
+// measured on the pty bench. What it buys: a paste and a CSI split by a 250 ms
+// gap and by a 450 ms gap stay whole, where one tick lost both. What it costs:
+// `ESC [` with nothing behind it — which is what Alt+[ arrives as — answers
+// Escape after 518 ms instead of 106 ms, and a paste opener whose closing bracket
+// never comes holds one call for that long before handing over what it gathered.
+// Both costs are a person waiting, which is why this is five and not fifty; a gap
+// past 600 ms splits the paste again, which is why it is not one.
+//
+// Counted per CALL and not per pause, deliberately. Resetting it on every byte
+// that arrives would leave a writer dripping one byte per half-second holding a
+// single call for as long as it liked — 8192 bytes of paste at that rate is an
+// hour, which is a hang with a byte counter in front of it. Per call, the worst
+// case is this many ticks of silence plus whatever the bytes that DO arrive cost,
+// and the byte caps below bound that half: IN_PASTE ends a paste at 8192 bytes
+// and hands it over, IN_BUF ends a sequence by skipping it. Neither bound covers
+// the other's case — a writer that stops needs the ticks, a writer that never
+// stops needs the bytes.
+let is i64 as _HOLD_PAUSES with imut = 5;
+
 // An Input must start zeroed, which a global in .bss is and a stack local is
 // not. `mark` is what says which of three states it is in, and it holds a 64-bit
 // constant rather than a 1 for a reason: the question "has this been
@@ -781,13 +858,17 @@ fn _mouse(buf as *u8, n as i64, fin as i64, ev as *Event) as void {
 // Scan one event out of buf[0..n).
 //
 // Returns the number of bytes it consumed — at least 1 — or 0 to say "these
-// bytes are the start of something longer, feed me more". `last` = 1 means no
-// more bytes are coming, so a prefix has to resolve now.
+// bytes are the start of something longer, feed me more". `end` says what a
+// prefix is allowed to conclude from the reader having no more bytes to give it:
+// _END_NO nothing, _END_PAUSE that a read timed out, _END_HOLD that the wait is
+// over. A lone ESC resolves on the pause — that decision is what the pause is
+// for. Everything else here has BEGUN a sequence, and a sequence does not end
+// because the writer went quiet for a tick, so it waits for _END_HOLD.
 //
 // Pure: no descriptor, no global, no allocation. That is what makes the mouse,
 // the paste brackets and every truncation case testable with no terminal in
 // reach, which is the only way any of this was checked at all.
-fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
+fn _scan(buf as *u8, n as i64, end as i32, ev as *Event) as i64 {
     _ev_clear(ev);
     if (n <= 0) { return 0; }
     let is i64 as b0 = cast(i64, buf[0]);
@@ -799,12 +880,13 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
         ev.key = cast(i32, b0);
         return 1;
     }
-    // ESC with nothing behind it is the Escape key, and only `last` can say
-    // that nothing is behind it. In raw mode that answer costs VTIME=1, one
-    // read that times out at 100 ms, and it is the most-used key in the only
-    // interface built on this module — so it is deliberately paid, not avoided.
+    // ESC with nothing behind it is the Escape key, and a pause is what says
+    // nothing is behind it. In raw mode that answer costs VTIME=1, one read that
+    // times out at 100 ms, and it is the most-used key in the only interface
+    // built on this module — so it is deliberately paid, not avoided. This is the
+    // decision the pause was designed for and the only one it makes.
     if (n == 1) {
-        if (last == 0) { return 0; }
+        if (end == _END_NO) { return 0; }
         ev.kind = EV_KEY;
         ev.key = KEY_ESC;
         return 1;
@@ -828,7 +910,9 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
         // one Escape and the byte behind them is untouched. Nothing is guessed —
         // when the deciding byte is not here yet, this asks for it.
         if (n == 2) {
-            if (last == 0) { return 0; }
+            // The same Escape decision one byte along, so the same pause makes
+            // it: two ESCs with nothing behind them are one Escape.
+            if (end == _END_NO) { return 0; }
             ev.kind = EV_KEY;
             ev.key = KEY_ESC;
             return 2;                  // two ESCs, nothing behind: one Escape
@@ -840,7 +924,10 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
     }
     if (b1 == 79) {                                   // 'O' — SS3
         if (n < 3) {
-            if (last == 0) { return 0; }
+            // Begun, so a pause does not end it: an SS3 arrow split from its
+            // final byte is one key, not Escape plus a letter. At the hold it is
+            // the Escape the old reader answered, which is also what Alt+O is.
+            if (end != _END_HOLD) { return 0; }
             ev.kind = EV_KEY;
             ev.key = KEY_ESC;
             return 2;
@@ -853,9 +940,10 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
         // One byte of payload and no key of ours behind it: consumed whole and
         // reported as nothing, exactly like the SS3 form above.
         if (n < 3) {
-            if (last == 0) { return 0; }
-            // Two bytes and no payload coming. This is what Alt+N arrives as,
-            // and no Escape is invented for it — see the string case below.
+            if (end != _END_HOLD) { return 0; }
+            // Two bytes and no payload coming, once the hold says so. This is
+            // what Alt+N arrives as, and no Escape is invented for it — see the
+            // string case below.
             return 2;
         }
         return 3;
@@ -876,7 +964,7 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
             if (c == 7) { return i + 1; }                    // BEL ends OSC
             if (c == 27) {
                 if (i + 1 >= n) {
-                    if (last == 0) { return 0; }             // an ST, split
+                    if (end != _END_HOLD) { return 0; }      // an ST, split
                     return i;                                // abandoned here
                 }
                 if (cast(i64, buf[i + 1]) == 92) { return i + 2; }   // ESC \ = ST
@@ -892,8 +980,8 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
             }
             i = i + 1;
         }
-        if (last == 0) { return 0; }
-        // No terminator, and nothing more is coming. The two readings are not
+        if (end != _END_HOLD) { return 0; }
+        // No terminator, and the hold spent. The two readings are not
         // symmetric in what they destroy: swallowing everything eats what a
         // person typed after an Alt+] or Alt+P, which arrive as exactly these
         // two bytes and are never followed by a terminator, while consuming only
@@ -931,7 +1019,7 @@ fn _scan(buf as *u8, n as i64, last as i32, ev as *Event) as i64 {
         i = i + 1;
     }
     if (i >= n) {
-        if (last == 0) { return 0; }
+        if (end != _END_HOLD) { return 0; }
         // Truncated and nothing more is coming. `ESC [` alone is what the old
         // reader answered KEY_ESC for, so it still does; anything longer had
         // begun to carry parameters, and manufacturing a keystroke out of half
@@ -1090,7 +1178,14 @@ fn _fill(in as *Input, want as i64, force as i32) as i32 {
 // seen the last five bytes are held back — they might be its beginning. That
 // is also why this cannot live in _scan: a paste is the one thing here whose
 // event spans more bytes than the reader holds at once.
-fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
+//
+// A paste that has begun does not end because the writer went quiet: the person
+// who pressed Ctrl+V did not press it twice, and a pause is all a stalled link
+// looks like from here. So only _END_HOLD closes an unterminated paste, and
+// _END_PAUSE goes on holding back the five bytes that might be its bracket. What
+// ends it instead of a clock, when bytes keep coming and the bracket does not, is
+// the byte cap: IN_PASTE hands over what it has and starts a new chunk.
+fn _paste_take(in as *Input, ev as *Event, end as i32) as i32 {
     _ev_clear(ev);
     let is *u8 as b = cast(*u8, &in.buf);
     let is i64 as mark with mut = 0 - 1;
@@ -1106,7 +1201,7 @@ fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
     }
     let is i64 as stop with mut = in.tail;
     if (mark >= 0) { stop = mark; }
-    else if (last == 0) {
+    else if (end != _END_HOLD) {
         stop = in.tail - 5;
         if (stop < in.head) { stop = in.head; }
     }
@@ -1137,9 +1232,9 @@ fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
         in.plen = 0;
         return 1;
     }
-    if (last == 1) {
-        // A paste whose closing bracket never came. The bytes are real; the
-        // bracket is the terminal's problem.
+    if (end == _END_HOLD) {
+        // A paste whose closing bracket never came, and the hold is spent. The
+        // bytes are real; the bracket is the terminal's problem.
         in.inpaste = 0;
         if (in.plen == 0) { return 0; }
         ev.kind = EV_PASTE;
@@ -1288,20 +1383,20 @@ fn _mouse_fits(in as *Input, ev as *Event) as i32 {
 // level-triggered poller can still see it. Assembling them into this module's
 // buffer would hide them from the poller that a caller of read_key is by
 // definition using.
-fn _drain_buf(in as *Input, ev as *Event, last as i32, assemble as i32) as i32 {
+fn _drain_buf(in as *Input, ev as *Event, end as i32, assemble as i32) as i32 {
     while (1 == 1) {
         if (in.skip != 0) {
             _skip_take(in);
             if (in.skip != 0) { return 0; }        // the terminator is not here
         }
         if (in.inpaste == 1) {
-            if (_paste_take(in, ev, last) == 1) { return 1; }
+            if (_paste_take(in, ev, end) == 1) { return 1; }
             return 0;
         }
         let is i64 as avail = in.tail - in.head;
         if (avail <= 0) { return 0; }
         let is i64 as used = _scan(cast(*u8, cast(i64, &in.buf) + in.head),
-                                  avail, last, ev);
+                                  avail, end, ev);
         if (used <= 0) { return 0; }
         in.head = in.head + used;
         if (ev.kind == EV_KEY) { return 1; }
@@ -1438,15 +1533,28 @@ fn input_fd(in as *Input) as i64 {
 //
 // Blocking: it reads only when the descriptor says it has something, EXCEPT
 // while it holds an unresolved prefix — a lone ESC, half a mouse report, a
-// paste whose closing bracket has not arrived — where it does one blocking
-// read, because that wait is the only thing that can tell a bare Escape from
-// the start of an arrow key. Under raw mode's VMIN=0/VTIME=1 that read is
-// bounded at 100 ms; under a pipe it is bounded by the writer, which is why
-// interfaces are tested through a pty and not through a pipe.
+// paste whose closing bracket has not arrived — where it does a blocking read,
+// because that wait is the only thing that can tell a bare Escape from the start
+// of an arrow key. Under raw mode's VMIN=0/VTIME=1 one such read is bounded at
+// 100 ms; under a pipe it is bounded by the writer, which is why interfaces are
+// tested through a pty and not through a pipe.
+//
+// How MANY of those reads it does depends on what it is holding, and that is the
+// distinction the single `last` flag used to flatten. 100 ms of silence is enough
+// to conclude that a lone ESC is the Escape key. It is not enough to conclude
+// that a paste ended or that a sequence was truncated — a person pasting across a
+// link that stalled has not stopped pasting — so a begun paste and a begun
+// sequence wait through _HOLD_PAUSES pauses, about 520 ms, before this call
+// resolves them as if the writer were gone. Bounded, because a terminator that
+// never arrives must not become a hang; measured, because the number is a choice.
 fn input_next(in as *Input, ev as *Event) as i32 {
     if (_live(in) == 0) { _reset(in); }
+    // Pauses this call has waited through while holding something. Bounded, and
+    // not reset by bytes arriving — see _HOLD_PAUSES for why per call and not
+    // per pause.
+    let is i64 as pauses with mut = 0;
     while (1 == 1) {
-        if (_drain_buf(in, ev, 0, 1) == 1) { return 1; }
+        if (_drain_buf(in, ev, _END_NO, 1) == 1) { return 1; }
         let is i32 as force with mut = 0;
         if (in.tail > in.head) { force = 1; }
         if (in.inpaste == 1) { force = 1; }
@@ -1458,8 +1566,18 @@ fn input_next(in as *Input, ev as *Event) as i32 {
                 _skip_begin(in);
                 continue;
             }
-            // Nothing more is coming: whatever is held has to resolve now.
-            if (_drain_buf(in, ev, 1, 1) == 1) { return 1; }
+            // No bytes. Under VTIME that is 100 ms of silence and nothing more,
+            // so one thing may conclude from it — a lone ESC is the Escape key.
+            if (_drain_buf(in, ev, _END_PAUSE, 1) == 1) { return 1; }
+            // Something is still held: a paste in assembly, or a sequence whose
+            // final byte has not arrived. Neither ended because the writer went
+            // quiet, so wait for it — for a bounded number of pauses, because a
+            // terminator that never comes must not become a hang.
+            if (in.tail > in.head || in.inpaste == 1) {
+                pauses = pauses + 1;
+                if (pauses < _HOLD_PAUSES) { continue; }
+                if (_drain_buf(in, ev, _END_HOLD, 1) == 1) { return 1; }
+            }
             _ev_clear(ev);
             return 0;
         }
@@ -1496,8 +1614,19 @@ fn input_next(in as *Input, ev as *Event) as i32 {
 //       A paste's body is not one sequence but many answers: one byte per call,
 //       one read(2) per byte. See the paste paragraph below.
 //
-//   - the read blocks. VMIN=0/VTIME=1 bounds it at about 100 ms, and that
-//     timeout is what makes a bare Escape resolvable at all.
+//       A call that is HOLDING a sequence — `ESC [` whose final byte has not
+//       arrived — waits for the rest of it across up to _HOLD_PAUSES timed-out
+//       reads instead of answering at the first one. It is still one sequence per
+//       call; what changed is that a 100 ms silence no longer counts as the end of
+//       a sequence that had begun. Measured on a pty: `ESC [` and, 250 ms later,
+//       `A` answered KEY_ESC and then 65, and now answers KEY_UP.
+//
+//   - the read blocks. VMIN=0/VTIME=1 bounds ONE read at about 100 ms, which is
+//     what makes a bare Escape resolvable at all; a call holding a begun sequence
+//     is bounded at _HOLD_PAUSES of those reads, measured at 518 ms against the
+//     106 ms a lone `ESC [` used to cost. A lone ESC — the key, not the
+//     introducer — still answers after one, measured unchanged at 104 ms: the
+//     hold is only ever paid by a sequence that had begun.
 //
 // ONE byte does not answer as itself: NUL, which Ctrl+@ and Ctrl+Space produce.
 // KEY_NONE is 0 and so is that byte, and KEY_NONE is an answer this function
@@ -1567,6 +1696,10 @@ fn read_key() as i32 {
     // reports crossed the ceiling inside a single call and took the typing
     // behind it with it. Every path that finishes a sequence returns.
     let is i64 as pulled with mut = 0;
+    // And the pauses it has waited through while holding a sequence that has
+    // begun, bounded the same way and for the same reason. `pulled` bounds the
+    // bytes one call spends; this bounds the silence.
+    let is i64 as pauses with mut = 0;
     while (1 == 1) {
         if (in.inpaste == 1) {
             // input_next was assembling a paste through this reader. Stop
@@ -1587,7 +1720,7 @@ fn read_key() as i32 {
             in.plen = 0;
         }
         let is i64 as was = in.head;
-        if (_drain_buf(in, &ev, 0, 0) == 1) {
+        if (_drain_buf(in, &ev, _END_NO, 0) == 1) {
             if (ev.kind == EV_KEY) { return _rk_key(ev.key); }
             // A report for a mode this reader DID turn on: a mouse report, a
             // focus report. It is not an i32, so the call ends here with
@@ -1620,8 +1753,22 @@ fn read_key() as i32 {
                 return KEY_NONE;
             }
             if (_fill(in, 1, 1) == 0) {
-                while (_drain_buf(in, &ev, 1, 0) == 1) {
+                // A pause: 100 ms of silence under VTIME. A lone ESC is the
+                // Escape key and resolves here.
+                while (_drain_buf(in, &ev, _END_PAUSE, 0) == 1) {
                     if (ev.kind == EV_KEY) { return _rk_key(ev.key); }
+                }
+                // A sequence that has BEGUN is not Escape plus its own tail as
+                // text, which is what answering here used to make of `ESC [` and,
+                // 250 ms later, `A`. Wait for the rest of the sequence this call
+                // is already holding — bounded, so a tail that never arrives ends
+                // as the truncation it is instead of hanging the call.
+                if (in.tail > in.head) {
+                    pauses = pauses + 1;
+                    if (pauses < _HOLD_PAUSES) { continue; }
+                    while (_drain_buf(in, &ev, _END_HOLD, 0) == 1) {
+                        if (ev.kind == EV_KEY) { return _rk_key(ev.key); }
+                    }
                 }
                 return KEY_NONE;
             }

@@ -21,6 +21,7 @@
 use "../std/io.cst" as io;
 use "../std/os.cst" as os;
 use "../std/term.cst" as term;
+use "../std/time.cst" as time;
 
 let is i32 as fails with mut = 0;
 
@@ -76,7 +77,7 @@ fn t_esc() as void {
     chk("esc resolved", term._scan("\x1b", 1, 1, &ev), 1);
     chk("esc resolved key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
     // `ESC [` and nothing more is what the old reader answered KEY_ESC for.
-    chk("csi bare used", term._scan("\x1b[", 2, 1, &ev), 2);
+    chk("csi bare used", term._scan("\x1b[", 2, 2, &ev), 2);
     chk("csi bare key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
     // ESC followed by a byte that starts no sequence: Escape, both bytes gone.
     // Alt is not modelled; the header says why.
@@ -264,7 +265,7 @@ fn t_mouse_broken() as void {
     chk("half row", ev.row, 0);
     chk("half col", ev.col, 0);
     // The same bytes with nothing more coming: consumed whole, still nothing.
-    chk("half resolved used", term._scan("\x1b[<0;10", 7, 1, &ev), 7);
+    chk("half resolved used", term._scan("\x1b[<0;10", 7, 2, &ev), 7);
     chk("half resolved kind", ev.kind, term.EV_NONE);
     chk("half resolved row", ev.row, 0);
     chk("half resolved col", ev.col, 0);
@@ -275,7 +276,7 @@ fn t_mouse_broken() as void {
     chk("short col", ev.col, 0);
     // One byte of the introducer.
     chk("intro pending", term._scan("\x1b[<", 3, 0, &ev), 0);
-    chk("intro resolved", term._scan("\x1b[<", 3, 1, &ev), 3);
+    chk("intro resolved", term._scan("\x1b[<", 3, 2, &ev), 3);
     chk("intro resolved kind", ev.kind, term.EV_NONE);
     // A control byte inside a sequence: consume the broken part, hand back the
     // byte itself, because it is most likely a real keystroke.
@@ -498,10 +499,10 @@ fn t_strings() as void {
     // rest would eat what the person typed next. Only the introducer goes, and
     // no Escape is invented — answering Escape is what turned a terminal's
     // replies into menu toggles.
-    chk("osc unterminated used", term._scan("\x1b]11;rgb", 8, 1, &ev), 2);
+    chk("osc unterminated used", term._scan("\x1b]11;rgb", 8, 2, &ev), 2);
     chk("osc unterminated kind", ev.kind, term.EV_NONE);
     chk("osc unterminated key", cast(i64, ev.key), cast(i64, term.KEY_NONE));
-    chk("ss2 unterminated used", term._scan("\x1bN", 2, 1, &ev), 2);
+    chk("ss2 unterminated used", term._scan("\x1bN", 2, 2, &ev), 2);
     chk("ss2 unterminated kind", ev.kind, term.EV_NONE);
 }
 
@@ -530,6 +531,77 @@ fn t_csi_out_of_order() as void {
         term._scan("\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30m",
                    83, 0, &ev), 83);
     chk("csi 30 params kind", ev.kind, term.EV_NONE);
+}
+
+// A pause is not the end of the stream, and only ONE decision belongs to a
+// pause.
+//
+// `last` was one bit with two owners. It was set from a read that returned no
+// bytes, and under raw mode's VMIN=0/VTIME=1 that means either "this descriptor
+// is finished" or "the writer has been quiet for 100 ms". The bit was designed
+// for one question — is a lone ESC the Escape key, or the first byte of a
+// sequence? — and every other retained state inherited it.
+//
+// Measured on a pty with a forked writer and a real 250 ms gap, before this
+// changed: a paste split by the gap arrived as PASTE len=3 followed by `d`, `e`
+// and `f` as three separate keystrokes, with the real closing bracket dropped;
+// `ESC [` and then `A` arrived as Escape plus a letter instead of KEY_UP; and an
+// OSC 11 reply split by the gap put 21 of its own bytes into the input as
+// keystrokes, which is the exact defect this module was written to remove.
+//
+// So the parser is told which of the two it is: 0 nothing yet, 1 a pause, 2 the
+// end. A pause answers the ESC question and no other; a sequence or a paste that
+// has BEGUN waits for the end, which the reader declares after a bounded number
+// of pauses — see _HOLD_PAUSES in the module.
+fn t_pause_vs_end() as void {
+    let is term.Event as ev;
+    // The one decision a pause is allowed to make.
+    chk("pause esc used", term._scan("\x1b", 1, 1, &ev), 1);
+    chk("pause esc key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+    // ESC ESC is that same decision one byte along: two ESCs, one Escape.
+    chk("pause escesc used", term._scan("\x1b\x1b", 2, 1, &ev), 2);
+    chk("pause escesc key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+    // A CSI that has begun. This is the pty case: `ESC [`, 250 ms, `A`.
+    chk("pause csi pending", term._scan("\x1b[", 2, 1, &ev), 0);
+    chk("pause csi pending kind", ev.kind, term.EV_NONE);
+    // At the end it is still the Escape the old reader answered — the answer did
+    // not move, only when it is given.
+    chk("end csi used", term._scan("\x1b[", 2, 2, &ev), 2);
+    chk("end csi key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+    // Half a mouse report: the place where a pause would invent a coordinate.
+    chk("pause mouse pending", term._scan("\x1b[<0;10", 7, 1, &ev), 0);
+    chk("pause mouse kind", ev.kind, term.EV_NONE);
+    chk("end mouse used", term._scan("\x1b[<0;10", 7, 2, &ev), 7);
+    chk("end mouse kind", ev.kind, term.EV_NONE);
+    chk("end mouse col", ev.col, 0);
+    // A CSI with parameters behind it, which is not `ESC [` and gets no Escape.
+    chk("pause params pending", term._scan("\x1b[1;5", 5, 1, &ev), 0);
+    chk("end params used", term._scan("\x1b[1;5", 5, 2, &ev), 5);
+    chk("end params kind", ev.kind, term.EV_NONE);
+    // SS3 and SS2. Their two-byte forms are also Alt+O and Alt+N, so the end is
+    // where they answer, and the wait is what an arrow key split in two costs.
+    chk("pause ss3 pending", term._scan("\x1bO", 2, 1, &ev), 0);
+    chk("end ss3 used", term._scan("\x1bO", 2, 2, &ev), 2);
+    chk("end ss3 key", cast(i64, ev.key), cast(i64, term.KEY_ESC));
+    chk("pause ss2 pending", term._scan("\x1bN", 2, 1, &ev), 0);
+    chk("end ss2 used", term._scan("\x1bN", 2, 2, &ev), 2);
+    chk("end ss2 kind", ev.kind, term.EV_NONE);
+    // A string sequence mid-payload: the 21 keystrokes measured on the pty.
+    chk("pause osc pending", term._scan("\x1b]11;rgb", 8, 1, &ev), 0);
+    chk("pause osc kind", ev.kind, term.EV_NONE);
+    chk("end osc used", term._scan("\x1b]11;rgb", 8, 2, &ev), 2);
+    // An ST split down the middle: the ESC is here, its backslash is not.
+    chk("pause st pending", term._scan("\x1b]0;t\x1b", 6, 1, &ev), 0);
+    chk("end st used", term._scan("\x1b]0;t\x1b", 6, 2, &ev), 5);
+    // A sequence that is COMPLETE answers the same at every level: it does not
+    // need to be told anything about what comes after it.
+    chk("pause arrow used", term._scan("\x1b[A", 3, 1, &ev), 3);
+    chk("pause arrow key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    chk("end arrow used", term._scan("\x1b[A", 3, 2, &ev), 3);
+    chk("end arrow key", cast(i64, ev.key), cast(i64, term.KEY_UP));
+    // And a plain byte, at every level, is one key.
+    chk("pause byte used", term._scan("x", 1, 1, &ev), 1);
+    chk("end byte used", term._scan("x", 1, 2, &ev), 1);
 }
 
 // === The reader, over a pipe ===
@@ -1706,6 +1778,239 @@ fn t_double_open() as void {
     chk("reopen same bytes", n3, 80);
 }
 
+// === The reader, on a real pty ===
+//
+// A pipe cannot produce the state this section is about, which is why the defect
+// it pins survived every test above. A read on a pipe returns bytes, blocks, or
+// says EOF; a read on a terminal in raw mode ALSO returns zero bytes after
+// VTIME, and that is a pause in the middle of the input, not the end of it. Every
+// reader test above either writes all its bytes in one go or seals the pipe, so
+// none of them can tell a pause from an end — and the reader could not either:
+// one `last` bit carried both, and every retained state resolved on it.
+//
+// So this section builds a terminal: /dev/ptmx, its slave in VMIN=0/VTIME=1 —
+// the configuration read_key's 100 ms lives in — and a forked child that writes
+// the rest of the input after a real gap. Measured on that bench before the fix:
+// a paste split by 250 ms arrived as PASTE len=3 plus `d`, `e`, `f` as three
+// keystrokes; `ESC [` split from its `A` arrived as Escape plus a letter; an OSC
+// reply split from its terminator put 21 of its own bytes into the input.
+
+let is i64 as TIOCSPTLCK with imut = 0x40045431;
+let is i64 as TIOCGPTN   with imut = 0x80045430;
+let is i64 as O_NOCTTY   with imut = 256;
+
+let is i64 as _ptm with mut = 0 - 1;
+let is i64 as _pts with mut = 0 - 1;
+
+// A pty pair, with the slave set up exactly as enter_raw() sets up fd 0.
+fn pty_open() as i64 {
+    _ptm = os.linux.open("/dev/ptmx", os.linux.O_RDWR + O_NOCTTY, 0);
+    if (_ptm < 0) { return 0 - 1; }
+    let is i32 as unlock with mut = 0;
+    os.linux.ioctl(_ptm, TIOCSPTLCK, cast(*u8, &unlock));
+    let is i32 as ptn with mut = cast(i32, 0 - 1);
+    if (os.linux.ioctl(_ptm, TIOCGPTN, cast(*u8, &ptn)) < 0) { return 0 - 1; }
+    let is [24]u8 as path;
+    let is *u8 as p = cast(*u8, &path);
+    p[0] = cast(u8, 47);  p[1] = cast(u8, 100); p[2] = cast(u8, 101);
+    p[3] = cast(u8, 118); p[4] = cast(u8, 47);  p[5] = cast(u8, 112);
+    p[6] = cast(u8, 116); p[7] = cast(u8, 115); p[8] = cast(u8, 47);
+    let is i64 as n with mut = cast(i64, ptn);
+    let is [8]u8 as digits;
+    let is i64 as nd with mut = 0;
+    if (n == 0) { digits[0] = cast(u8, 48); nd = 1; }
+    while (n > 0) { digits[nd] = cast(u8, 48 + (n % 10)); nd = nd + 1; n = n / 10; }
+    let is i64 as i with mut = 0;
+    while (i < nd) { p[9 + i] = digits[nd - 1 - i]; i = i + 1; }
+    p[9 + nd] = cast(u8, 0);
+    _pts = os.linux.open(p, os.linux.O_RDWR + O_NOCTTY, 0);
+    if (_pts < 0) { return 0 - 1; }
+    let is [60]u8 as tio;
+    if (os.linux.ioctl(_pts, term.TCGETS, cast(*u8, &tio)) < 0) { return 0 - 1; }
+    let is *i32 as iflag = cast(*i32, &tio);
+    *iflag = *iflag & (cast(i32, 0 - 1) - term.ICRNL - term.IXON);
+    let is *i32 as lflag = cast(*i32, cast(i64, &tio) + 12);
+    *lflag = *lflag
+        & (cast(i32, 0 - 1) - term.ECHO - term.ICANON - term.ISIG - term.IEXTEN);
+    // c_cc at 17: VMIN=0, VTIME=1 — a read returns zero bytes after 100 ms of
+    // silence, which is the whole point of this bench.
+    let is *u8 as cc = cast(*u8, cast(i64, &tio) + 17);
+    cc[6] = cast(u8, 0);
+    cc[5] = cast(u8, 1);
+    if (os.linux.ioctl(_pts, term.TCSETS, cast(*u8, &tio)) < 0) { return 0 - 1; }
+    return 0;
+}
+
+fn pty_close() as void {
+    os.linux.close(_pts);
+    os.linux.close(_ptm);
+    _pts = 0 - 1;
+    _ptm = 0 - 1;
+}
+
+// The second half of the input, written by a CHILD after a real gap. A single
+// process cannot produce this: the reader is inside a blocking read while the
+// gap passes, which is exactly the state being tested. The child exits through
+// the raw syscall so that nothing of the parent's buffered output is flushed
+// twice.
+fn pty_late(ms as i64, s as *u8, n as i64) as i64 {
+    let is i64 as pid = os.linux.fork();
+    if (pid == 0) {
+        time.sleep_ms(ms);
+        os.linux.write(_ptm, s, n);
+        os.linux.exit(0);
+    }
+    return pid;
+}
+
+// A paste split by a gap longer than VTIME. It is ONE paste: a pause is not the
+// terminal saying the paste ended, and the person who pressed Ctrl+V did not
+// press it twice. Before this, the first half came out as its own EV_PASTE, the
+// second half as individual keystrokes, and the real closing bracket was dropped
+// as a stray bracket-off — so a caller that treats EV_PASTE specially saw half a
+// paste and typed the rest.
+fn t_pty_paste_gap() as void {
+    if (pty_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = _pts;
+    in.m_paste = cast(i32, 1);
+    os.linux.write(_ptm, "\x1b[200~abc", 9);
+    let is i64 as pid = pty_late(250, "def\x1b[201~!", 10);
+    let is term.Event as ev;
+    let is i64 as pastes with mut = 0;
+    let is i64 as plen with mut = 0;
+    let is i64 as lastb with mut = 0;
+    let is i64 as keys with mut = 0;
+    let is i64 as idle with mut = 0;
+    let is i64 as sentinel with mut = 0;
+    while (idle < 120 && sentinel == 0) {
+        if (term.input_next(&in, &ev) == 1) {
+            if (ev.kind == term.EV_PASTE) {
+                pastes = pastes + 1;
+                plen = ev.len;
+                lastb = cast(i64, ev.text[ev.len - 1]);
+            }
+            if (ev.kind == term.EV_KEY) {
+                keys = keys + 1;
+                if (ev.key == cast(i32, 33)) { sentinel = 1; }   // '!'
+            }
+        } else {
+            idle = idle + 1;
+            time.sleep_ms(10);
+        }
+    }
+    chk("pty paste events", pastes, 1);
+    chk("pty paste len", plen, 6);
+    chk("pty paste last", lastb, 102);
+    chk("pty paste sentinel", sentinel, 1);
+    chk("pty paste keys", keys, 1);
+    os.linux.wait4(pid, cast(*i32, 0), 0, cast(*u8, 0));
+    pty_close();
+}
+
+// A sequence split by a gap longer than VTIME. `ESC [` is not an Escape key
+// because the writer went quiet for 100 ms — it is the beginning of something,
+// and what it turns out to be arrives 250 ms later.
+fn t_pty_csi_gap() as void {
+    if (pty_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = _pts;
+    os.linux.write(_ptm, "\x1b[", 2);
+    let is i64 as pid = pty_late(250, "A!", 2);
+    let is term.Event as ev;
+    let is [8]i64 as got;
+    let is i64 as n with mut = 0;
+    let is i64 as idle with mut = 0;
+    let is i64 as sentinel with mut = 0;
+    while (idle < 120 && sentinel == 0) {
+        if (term.input_next(&in, &ev) == 1) {
+            if (ev.kind == term.EV_KEY) {
+                if (n < 8) { got[n] = cast(i64, ev.key); n = n + 1; }
+                if (ev.key == cast(i32, 33)) { sentinel = 1; }
+            }
+        } else {
+            idle = idle + 1;
+            time.sleep_ms(10);
+        }
+    }
+    chk("pty csi count", n, 2);
+    chk("pty csi key", got[0], cast(i64, term.KEY_UP));
+    chk("pty csi sentinel", got[1], 33);
+    os.linux.wait4(pid, cast(*i32, 0), 0, cast(*u8, 0));
+    pty_close();
+}
+
+// The same split, through read_key, which is the API the interface calls. One
+// call still costs one sequence — it just waits for the rest of the one it is
+// holding instead of answering Escape and handing the letter back.
+fn t_pty_csi_gap_read_key() as void {
+    if (pty_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = _pts;
+    os.linux.write(_ptm, "\x1b[", 2);
+    let is i64 as pid = pty_late(250, "A", 1);
+    chk("pty rk csi key", cast(i64, term.read_key()), cast(i64, term.KEY_UP));
+    chk("pty rk csi after", cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    os.linux.wait4(pid, cast(*i32, 0), 0, cast(*u8, 0));
+    pty_close();
+    term._shell.mark = 0;
+}
+
+// A string reply split from its terminator. This is the module's founding defect
+// at a 250 ms gap: the introducer was given up on the first pause and the payload
+// was read as text, 21 keystrokes of it, the first of them the one that opens a
+// menu in the interface built on this.
+fn t_pty_osc_gap() as void {
+    if (pty_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = _pts;
+    os.linux.write(_ptm, "\x1b]11;rgb:2e2e", 13);
+    let is i64 as pid = pty_late(250, "/3434/3e3e\x1b\\x", 13);
+    let is term.Event as ev;
+    let is i64 as keys with mut = 0;
+    let is i64 as lastk with mut = 0;
+    let is i64 as idle with mut = 0;
+    let is i64 as sentinel with mut = 0;
+    while (idle < 120 && sentinel == 0) {
+        if (term.input_next(&in, &ev) == 1) {
+            if (ev.kind == term.EV_KEY) {
+                keys = keys + 1;
+                lastk = cast(i64, ev.key);
+                if (ev.key == cast(i32, 120)) { sentinel = 1; }   // 'x'
+            }
+        } else {
+            idle = idle + 1;
+            time.sleep_ms(10);
+        }
+    }
+    chk("pty osc keys", keys, 1);
+    chk("pty osc key", lastk, 120);
+    os.linux.wait4(pid, cast(*i32, 0), 0, cast(*u8, 0));
+    pty_close();
+}
+
+// What the waiting costs, pinned: `ESC [` with nothing behind it ever — which is
+// what Alt+[ arrives as — still answers Escape, the answer the old reader gave
+// and consumers were built against. It is given after the hold instead of after
+// one pause: measured on the pty bench, 518 ms against 106 ms. That latency is
+// the price of the arrow key in the test above, and it is paid only by an
+// introducer nothing follows.
+fn t_pty_alt_bracket() as void {
+    if (pty_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = _pts;
+    os.linux.write(_ptm, "\x1b[", 2);
+    chk("pty alt bracket", cast(i64, term.read_key()), cast(i64, term.KEY_ESC));
+    chk("pty alt bracket drained",
+        cast(i64, term.read_key()), cast(i64, term.KEY_NONE));
+    pty_close();
+    term._shell.mark = 0;
+}
+
 fn main() as i32 {
     // The parser is a pure function and runs on every target.
     t_bytes();
@@ -1720,6 +2025,7 @@ fn main() as i32 {
     t_other_seqs();
     t_strings();
     t_csi_out_of_order();
+    t_pause_vs_end();
 
     // The reader needs a pipe to be driven from, which is POSIX.
     if (os.current() == os.OS_LINUX) {
@@ -1755,6 +2061,11 @@ fn main() as i32 {
         t_shared_reader();
         t_reader_is_ours();
         t_double_open();
+        t_pty_paste_gap();
+        t_pty_csi_gap();
+        t_pty_csi_gap_read_key();
+        t_pty_osc_gap();
+        t_pty_alt_bracket();
     }
 
     if (fails == 0) { io.write_str(1, "term_input: ok\n"); }
