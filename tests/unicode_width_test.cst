@@ -155,6 +155,134 @@ fn t_not_resumable() as void {
     chk("family cut into pieces", cut, 6);
 }
 
+// === A cluster longer than CLUSTER_CP_MAX ===
+//
+// width.cst cuts a cluster at 32 code points, and what that costs is asserted
+// here rather than argued. It used to be argued, and wrongly: "the tail of an
+// over-long cluster is combining marks, every one of them zero columns, so a base
+// plus ten thousand marks still measures 1". True of marks, and a ZWJ chain's
+// tail is not marks — it is more emoji, and each piece the cut leaves behind is
+// charged its own two columns. Measured below: 4 where the terminal draws 2.
+//
+// The direction is the property worth having and it is the one that holds. Each
+// piece is measured at its widest code point, and a sum of maxima is never less
+// than the maximum over the whole, so an over-long cluster is charged too MANY
+// columns and never too few. A layout that reserves too much leaves a gap; one
+// that reserves too few draws over the glyph beside it.
+
+let is [4096]u8 as _seq with mut;
+let is i64 as _n with mut = 0;
+
+// UTF-8, encoded here rather than written out, because the cases below are
+// 137 and 173 bytes long and a wall of escapes is not readable. Checked against
+// a literal before it is trusted — see t_encoder.
+fn _put(cp as i64) as void {
+    if (cp < 128) { _seq[_n] = cast(u8, cp); _n = _n + 1; return; }
+    if (cp < 2048) {
+        _seq[_n] = cast(u8, 192 + (cp / 64));
+        _seq[_n + 1] = cast(u8, 128 + (cp % 64));
+        _n = _n + 2;
+        return;
+    }
+    if (cp < 65536) {
+        _seq[_n] = cast(u8, 224 + (cp / 4096));
+        _seq[_n + 1] = cast(u8, 128 + ((cp / 64) % 64));
+        _seq[_n + 2] = cast(u8, 128 + (cp % 64));
+        _n = _n + 3;
+        return;
+    }
+    _seq[_n] = cast(u8, 240 + (cp / 262144));
+    _seq[_n + 1] = cast(u8, 128 + ((cp / 4096) % 64));
+    _seq[_n + 2] = cast(u8, 128 + ((cp / 64) % 64));
+    _seq[_n + 3] = cast(u8, 128 + (cp % 64));
+    _n = _n + 4;
+}
+
+// The encoder itself, against the literal the file already uses for the ZWJ
+// family: same bytes, same measurement. A test whose fixture is generated is
+// only worth its fixture.
+fn t_encoder() as void {
+    _n = 0;
+    _put(0x1F468); _put(0x200D); _put(0x1F469); _put(0x200D); _put(0x1F467);
+    chk("encoder bytes", _n, 18);
+    let is *u8 as lit = "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7";
+    let is i64 as i with mut = 0;
+    let is i64 as same with mut = 1;
+    while (i < 18) { if (_seq[i] != lit[i]) { same = 0; } i = i + 1; }
+    chk("encoder matches literal", same, 1);
+    chk("encoder family width", unicode.string_width(cast(*u8, &_seq), _n), 2);
+}
+
+fn t_over_long_cluster() as void {
+    // A ZWJ chain of 39 code points — U+1F468 and nineteen more joined to it,
+    // 137 bytes. One cluster by GB11, and one cluster is 2 columns: the widest
+    // member, because that is what a terminal draws.
+    _n = 0;
+    _put(0x1F468);
+    let is i64 as i with mut = 0;
+    while (i < 19) { _put(0x200D); _put(0x1F468); i = i + 1; }
+    chk("zwj39 bytes", _n, 137);
+    // 4, not 2, and the two pieces say why: the first stops after the 32nd code
+    // point, which is the SIXTEENTH ZWJ — 112 bytes, two columns — and the
+    // second starts on the U+1F468 behind that ZWJ and is charged two more.
+    // Nothing in that tail is a combining mark.
+    let is i64 as cols with mut = 0;
+    chk("zwj39 first piece bytes", unicode.cluster_next(cast(*u8, &_seq), _n, &cols), 112);
+    chk("zwj39 first piece cols", cols, 2);
+    chk("zwj39 rest bytes",
+        unicode.cluster_next(cast(*u8, cast(i64, &_seq) + 112), _n - 112, &cols), 25);
+    chk("zwj39 rest cols", cols, 2);
+    let is i64 as w39 = unicode.string_width(cast(*u8, &_seq), _n);
+    chk("zwj39 width", w39, 4);
+    // The cluster itself is 2 columns. The cut may only ever charge MORE than
+    // that, which is the claim the module now makes and this is the assertion it
+    // rests on.
+    let is i64 as over39 with mut = 0;
+    if (w39 >= 2) { over39 = 1; }
+    chk("zwj39 never under", over39, 1);
+    // One code point short of the cut: 31 code points, still one cluster, still
+    // the 2 the terminal draws. The over-count starts past the ceiling and not
+    // before it.
+    _n = 0;
+    _put(0x1F468);
+    i = 0;
+    while (i < 15) { _put(0x200D); _put(0x1F468); i = i + 1; }
+    chk("zwj31 bytes", _n, 109);
+    chk("zwj31 width", unicode.string_width(cast(*u8, &_seq), _n), 2);
+
+    // The same shape with skin tones, which is what a real client sends:
+    // U+1F468 U+1F3FF and fifteen ZWJ-joined U+1F469 U+1F3FF, 47 code points in
+    // 173 bytes.
+    _n = 0;
+    _put(0x1F468); _put(0x1F3FF);
+    i = 0;
+    while (i < 15) { _put(0x200D); _put(0x1F469); _put(0x1F3FF); i = i + 1; }
+    chk("zwj tones bytes", _n, 173);
+    let is i64 as wt = unicode.string_width(cast(*u8, &_seq), _n);
+    chk("zwj tones width", wt, 4);
+    let is i64 as overt with mut = 0;
+    if (wt >= 2) { overt = 1; }
+    chk("zwj tones never under", overt, 1);
+
+    // A base and a thousand combining marks: the shape the old claim was written
+    // from, and there it is exactly right. Every code point past the base is zero
+    // columns, so cutting the cluster anywhere costs nothing at all.
+    _n = 0;
+    _put(65);
+    i = 0;
+    while (i < 1000) { _put(0x0301); i = i + 1; }
+    chk("marks1000 bytes", _n, 2001);
+    chk("marks1000 width", unicode.string_width(cast(*u8, &_seq), _n), 1);
+
+    // Forty regional indicators: twenty flags by GB12/13, two columns each, and
+    // no cluster longer than two code points anywhere in it.
+    _n = 0;
+    i = 0;
+    while (i < 40) { _put(0x1F1E6 + (i % 26)); i = i + 1; }
+    chk("ri40 bytes", _n, 160);
+    chk("ri40 width", unicode.string_width(cast(*u8, &_seq), _n), 40);
+}
+
 // === Bytes that are not UTF-8 ===
 //
 // Every malformed shape returns -1 with *cols 1, the caller advances one byte,
@@ -208,6 +336,8 @@ fn main() as i32 {
     t_emoji();
     t_walk();
     t_not_resumable();
+    t_encoder();
+    t_over_long_cluster();
     t_malformed();
     if (fails == 0) { io.write_str(1, "unicode_width: ok\n"); }
     return fails;
