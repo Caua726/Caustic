@@ -182,8 +182,20 @@
 //
 // What was run
 // ------------
-// tests/term_input_test.cst at -O0/-O1/-O2: 307 assertions, the parser called
+// tests/term_input_test.cst at -O0/-O1/-O2: 326 assertions, the parser called
 // directly and the reader driven over a pipe.
+//
+// Three things this suite named and did not actually check, each found by
+// mutating the code and watching every assertion stay green, and each now pinned
+// by a mutation that dies: the SGR button ceiling (deleting `cb > _BUTTON_MAX`
+// used to break nothing; six assertions fail now, and `<300;5;6M` used to arrive
+// as an event with motion and two modifier bits the report never carried); the
+// five bytes a paste holds back when its closing bracket may be split (the old
+// case wrote two write(2)s that a pipe fused into ONE read, so the hold-back
+// never ran — the case now ends a read exactly at IN_BUF, and `stop = in.tail`
+// makes the paste come out 4093 bytes instead of 4087); and read_key's handover
+// of a half-gathered paste, which was not a coverage gap but dead code, measured
+// unreachable with instrumentation and removed.
 //
 // A program with the shape of the one interface built on this — level-triggered
 // epoll on fd 0, one read_key per readiness report — driven through a real pty
@@ -474,11 +486,12 @@ struct Event {
     len    as i64;    //           it stays valid, which is not long.
 }
 
-// Event.text points into the reader's own paste buffer, so it is valid until
-// the NEXT call that may write there — and that is either input_next or
-// read_key, because both drain the same Input and the module deliberately
-// supports a program using both. A caller that needs the bytes after that
-// copies them. The chunks of a paste larger than IN_PASTE all arrive at the
+// Event.text points into the reader's own paste buffer, so it is valid until the
+// next call that writes there, and exactly one entry point does: input_next, and
+// only while it is gathering a paste. read_key never writes into it — it cannot
+// answer with a paste — though it does END a gathering input_next had begun, and
+// the bytes gathered by then are already out by that point. A caller that needs
+// the bytes after that copies them. The chunks of a paste larger than IN_PASTE all arrive at the
 // SAME address, one after another, so comparing pointers is not a way to tell
 // one chunk from the next; ev.len is.
 
@@ -492,9 +505,9 @@ let is i64 as IN_BUF with imut = 4096;
 // two hundred characters; this is forty times that.
 //
 // What it costs is the whole struct, not this array: the module keeps one Input
-// in .bss for read_key to read through, and sizeof(Input) is 12364 bytes —
+// in .bss for read_key to read through, and sizeof(Input) is 12348 bytes —
 // measured, this array plus IN_BUF plus the bookkeeping. A program that imports
-// this module only for set_color() and clear_screen() measures 12528 bytes of
+// this module only for set_color() and clear_screen() measures 12512 bytes of
 // .bss in total, so this is essentially all of it.
 let is i64 as IN_PASTE with imut = 8192;
 
@@ -543,8 +556,6 @@ struct Input {
     tail    as i64;     // one past the last byte read
     plen    as i64;     // bytes accumulated for the EV_PASTE being assembled
     inpaste as i32;
-    rk_pos  as i64;     // read_key's window into `text`: the bytes of a paste
-    rk_end  as i64;     // it is handing out one per call. rk_pos == rk_end: none
     skip    as i32;     // 0, or which terminator the reader is discarding
                         // bytes until: 1 = a CSI final byte, 2 = ST or BEL
     buf     as [IN_BUF]u8;
@@ -915,8 +926,6 @@ fn _reset_buf(in as *Input) as void {
     in.tail = 0;
     in.plen = 0;
     in.inpaste = 0;
-    in.rk_pos = 0;
-    in.rk_end = 0;
     in.skip = 0;
 }
 
@@ -1321,7 +1330,7 @@ fn input_close(in as *Input) as void {
         in.m_mouse = 0;
     }
     // Back to initialised-but-not-open. Anything still held — half a sequence, a
-    // paste read_key had not finished handing out — is dropped: the caller has
+    // paste whose closing bracket never arrived — is dropped: the caller has
     // said it is done reading, and there is nobody left to hand it to.
     _reset_buf(in);
     in.mark = _MARK_READY;
@@ -1349,19 +1358,6 @@ fn input_fd(in as *Input) as i64 {
 // interfaces are tested through a pty and not through a pipe.
 fn input_next(in as *Input, ev as *Event) as i32 {
     if (_live(in) == 0) { _reset(in); }
-    // A paste read_key was in the middle of handing out one byte at a time. The
-    // rest of it is still a paste, so a caller that switches back to events
-    // gets it as one — the bytes are the user's either way and neither entry
-    // point may drop them.
-    if (in.rk_pos < in.rk_end) {
-        _ev_clear(ev);
-        ev.kind = EV_PASTE;
-        ev.text = cast(*u8, cast(i64, &in.text) + in.rk_pos);
-        ev.len = in.rk_end - in.rk_pos;
-        in.rk_pos = 0;
-        in.rk_end = 0;
-        return 1;
-    }
     while (1 == 1) {
         if (_drain_buf(in, ev, 0, 1) == 1) { return 1; }
         let is i32 as force with mut = 0;
@@ -1443,9 +1439,19 @@ fn input_next(in as *Input, ev as *Event) as i32 {
 // pasted, not typed". A caller that needs that distinction calls input_next.
 //
 // If input_next had already begun assembling a paste when read_key is called —
-// the mixed configuration this module supports on purpose — the bytes it had
-// gathered are handed out the same way, one per call, before the descriptor is
-// touched again. Nothing is dropped in either direction.
+// the mixed configuration this module supports on purpose — read_key stops the
+// assembly and reads on. The paste's remaining bytes are in this module's byte
+// buffer and come out of there as keystrokes, in order, so nothing is dropped in
+// either direction.
+//
+// What does NOT happen at that moment is a chunk of already-gathered bytes being
+// handed over, and this paragraph used to say it did. input_next can only return
+// with an assembly still open by way of _paste_take hitting the IN_PASTE cap,
+// which has already delivered every byte it gathered; there is never a partial
+// chunk sitting in the paste buffer between calls. The code that handed one out
+// one byte per call, and the two fields it needed, were unreachable from any
+// sequence of public calls — measured with instrumentation, zero hits across the
+// whole suite — and are gone.
 fn read_key() as i32 {
     let is *Input as in = shared_input();
     let is Event as ev;
@@ -1456,23 +1462,23 @@ fn read_key() as i32 {
     // behind it with it. Every path that finishes a sequence returns.
     let is i64 as pulled with mut = 0;
     while (1 == 1) {
-        // Bytes of a paste that input_next had begun to gather. They arrived
-        // first, so they go out first, and no read happens until they are gone.
-        if (in.rk_pos < in.rk_end) {
-            let is i64 as at = in.rk_pos;
-            in.rk_pos = at + 1;
-            if (in.rk_pos >= in.rk_end) { in.rk_pos = 0; in.rk_end = 0; }
-            return cast(i32, in.text[at]);
-        }
         if (in.inpaste == 1) {
-            // Stop assembling and hand back what was gathered. The bytes still
-            // in the buffer behind them are parsed as keys by the loop below,
-            // so the order the person pasted them in survives.
+            // input_next was assembling a paste through this reader. Stop
+            // assembling: read_key cannot answer with an EV_PASTE, and the
+            // paste's remaining bytes are in this module's byte buffer, where the
+            // loop below reads them as the keystrokes they would have been if
+            // typed — in the order the person pasted them.
+            //
+            // Nothing gathered is waiting here, ever. The only state input_next
+            // can RETURN in with an assembly still open is _paste_take reaching
+            // the IN_PASTE cap, and that path has already handed every gathered
+            // byte out as an EV_PASTE and left plen at 0; every other path clears
+            // inpaste on its way out. So plen is 0 on this line, and the version
+            // of this that copied plen into a window and handed those bytes out
+            // one per call could not run: instrumented, zero hits across the
+            // whole suite, and no sequence of public calls reaches it.
             in.inpaste = 0;
-            in.rk_pos = 0;
-            in.rk_end = in.plen;
             in.plen = 0;
-            if (in.rk_end > 0) { continue; }
         }
         let is i64 as was = in.head;
         if (_drain_buf(in, &ev, 0, 0) == 1) {

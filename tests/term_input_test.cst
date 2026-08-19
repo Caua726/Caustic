@@ -278,6 +278,29 @@ fn t_num_limits() as void {
     chk("zero col kind", ev.kind, term.EV_NONE);
     term._scan("\x1b[<0;40;0M", 10, 1, &ev);
     chk("zero row kind", ev.kind, term.EV_NONE);
+    // The button field's own ceiling, which nothing here asserted: 255 is the
+    // widest field that means anything — button bits, three modifier bits,
+    // motion, wheel, the fourth and fifth buttons — so 256 is not a button.
+    // Deleting that one line broke no test in this suite, and it is a real gate:
+    // without it `ESC [ < 300 ; 5 ; 6 M` arrives as a mouse event carrying
+    // motion and two modifier bits that the report does not carry, because 300's
+    // low bits read as a button field once the number is not refused.
+    chk("button 255 used", term._scan("\x1b[<255;5;6M", 11, 1, &ev), 11);
+    chk("button 255 kind", ev.kind, term.EV_MOUSE);
+    chk("button 255 button", ev.button, 195);
+    chk("button 255 mods", ev.mods, 7);
+    chk("button 256 used", term._scan("\x1b[<256;5;6M", 11, 1, &ev), 11);
+    chk("button 256 kind", ev.kind, term.EV_NONE);
+    chk("button 256 button", ev.button, 0);
+    chk("button 256 mods", ev.mods, 0);
+    chk("button 256 col", ev.col, 0);
+    chk("button 300 used", term._scan("\x1b[<300;5;6M", 11, 1, &ev), 11);
+    chk("button 300 kind", ev.kind, term.EV_NONE);
+    chk("button 300 button", ev.button, 0);
+    chk("button 300 mods", ev.mods, 0);
+    chk("button 300 down", cast(i64, ev.down), 0);
+    chk("button 300 row", ev.row, 0);
+
     // The shapes that are still reports have not moved.
     term._scan("\x1b[<0;1234;567M", 14, 1, &ev);
     chk("wide still works kind", ev.kind, term.EV_MOUSE);
@@ -627,6 +650,55 @@ fn t_paste_split() as void {
 }
 
 let is [9000]u8 as _big with mut;
+
+// The five bytes a paste holds back, in the one shape where the hold-back
+// actually runs.
+//
+// t_paste_split above writes the same bytes in two write(2)s and a pipe FUSES
+// them into one read(2), so the split it is named for never happened: the
+// hold-back was never exercised, and deleting it left this suite green. A read
+// that ends at the buffer's size cannot be fused. IN_BUF is 4096 and the reader
+// asks for exactly that, so `ESC [ 2 0 0 ~` plus 4087 bytes of body plus the
+// first three bytes of the closing bracket — 4096 bytes on the nose — splits the
+// bracket across two reads whatever the writer does.
+//
+// With the hold-back, one paste of 4087 bytes: the three bracket bytes are
+// recognised on the second read. Without it, 4093 — the bracket's own bytes
+// copied into the paste and its remainder read as keystrokes.
+fn t_paste_split_at_buffer() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    in.fd = pipe_rd();
+    in.m_paste = 1;
+    let is i64 as body = term.IN_BUF - 6 - 3;              // 4087
+    let is i64 as i with mut = 0;
+    while (i < body) { _big[i] = cast(u8, 97 + (i % 26)); i = i + 1; }
+    pipe_send("\x1b[200~", 6);
+    pipe_send(cast(*u8, &_big), body);
+    pipe_send("\x1b[2", 3);                                // 4096 bytes so far
+    pipe_send("01~", 3);
+    pipe_seal();
+    let is term.Event as ev;
+    let is i64 as pastes with mut = 0;
+    let is i64 as plen with mut = 0;
+    let is i64 as keys with mut = 0;
+    let is i64 as lastb with mut = 0;
+    while (term.input_next(&in, &ev) == 1) {
+        if (ev.kind == term.EV_PASTE) {
+            pastes = pastes + 1;
+            plen = plen + ev.len;
+            lastb = cast(i64, ev.text[ev.len - 1]);
+        }
+        if (ev.kind == term.EV_KEY) { keys = keys + 1; }
+    }
+    chk("split at buffer events", pastes, 1);
+    chk("split at buffer len", plen, body);
+    chk("split at buffer last byte", lastb, cast(i64, _big[body - 1]));
+    chk("split at buffer keys", keys, 0);
+    pipe_done();
+}
 
 // A paste of exactly the cap, and one past it. The cap is a real limit, so it
 // has a boundary, and the boundary is where an off-by-one shows up as either a
@@ -1234,15 +1306,18 @@ fn t_read_key_paste_200() as void {
 
 // The mixed configuration the module documents: input_next has started
 // assembling a paste, and the program calls read_key before the closing bracket
-// arrived. The bytes already accumulated belong to the person who pasted them,
-// so read_key hands them out as keystrokes instead of leaving them in a buffer
-// nobody will read again.
+// arrived. The bytes belong to the person who pasted them, so read_key comes out
+// with them as keystrokes rather than leaving them in a buffer nobody reads
+// again.
 //
-// Getting to a genuinely half-assembled paste takes a paste past the cap: that
-// is the one state where input_next returns an event and stays inside a paste,
-// which is what lets this be driven without a second thread. A pipe has no
-// VTIME, so the write end is closed before read_key is called — EOF is the only
-// thing that can end read_key's bounded blocking read here.
+// Where they come from is worth being exact about, because the module used to
+// claim the wrong place. They come from the reader's BYTE buffer, parsed as keys:
+// input_next's paste buffer is empty at this moment and always is. A paste past
+// the cap is the one state where input_next returns an event and stays inside a
+// paste — that is what lets this be driven without a second thread — and reaching
+// the cap is precisely the path that has already handed out every gathered byte.
+// A pipe has no VTIME, so the write end is closed before read_key is called: EOF
+// is the only thing that can end read_key's bounded blocking read here.
 fn t_read_key_paste_handover() as void {
     let is i64 as cap = term.IN_PASTE;
     let is i64 as i with mut = 0;
@@ -1471,6 +1546,7 @@ fn main() as i32 {
         t_burst();
         t_paste();
         t_paste_split();
+        t_paste_split_at_buffer();
         t_paste_cap();
         t_paste_unterminated();
         t_read_key_paste();
