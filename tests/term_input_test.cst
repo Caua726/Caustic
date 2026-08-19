@@ -760,6 +760,137 @@ fn t_osc_reader() as void {
     term._shell.mark = 0;
 }
 
+// A burst of reports that this reader DELIVERS, and the typing behind it.
+//
+// The reports here are focus reports and the reader has focus reporting on,
+// which is not an opt-in: input_open turns m_focus and m_paste on for every
+// caller, so `input_open(shared_input(), 0)` — no mouse anywhere — is this
+// state. read_key cannot answer a focus report with an i32, so it answers
+// KEY_NONE and reads on; what it may not do is lose the keystrokes behind it.
+//
+// It did. read_key counted the bytes it had pulled in the call and skipped the
+// rest of the sequence past 64 of them — but the counter was never cleared when
+// a report was DELIVERED, so a burst of them added up inside ONE call. Twenty-two
+// focus reports is 66 bytes: the count crossed 64 while the buffer held a single
+// ESC, which is not enough bytes to say which terminator a skip should look for,
+// and the skip defaulted to "discard until ST or BEL". No ST was coming. Every
+// printable byte after it — `hello`, and the `Q` that ends this loop — was
+// discarded as string payload. Measured in a real pty first: the control run
+// answered 104 101 108 108 111 81 and the burst run answered NOTHING AT ALL, and
+// with the sentinel gone the program did not end either.
+fn t_read_key_report_burst() as void {
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    term.shared_input().m_focus = 1;          // what input_open sets, always
+    let is i64 as i with mut = 0;
+    while (i < 22) { pipe_send("\x1b[I", 3); i = i + 1; }
+    pipe_send("hello", 5);
+    pipe_send("Q", 1);
+    pipe_seal();
+    let is [16]i64 as got;
+    let is i64 as n with mut = 0;
+    let is i64 as calls with mut = 0;
+    // Bounded, because the defect this pins is a program that never ends: with
+    // the sentinel swallowed a real loop spins forever, and a test must fail
+    // instead of hanging.
+    while (calls < 400) {
+        let is i32 as k = term.read_key();
+        if (k != term.KEY_NONE && n < 16) { got[n] = cast(i64, k); n = n + 1; }
+        calls = calls + 1;
+    }
+    chk("report burst keys", n, 6);
+    if (n == 6) {
+        chk("report burst 0", got[0], 104);
+        chk("report burst 1", got[1], 101);
+        chk("report burst 2", got[2], 108);
+        chk("report burst 3", got[3], 108);
+        chk("report burst 4", got[4], 111);
+        chk("report burst 5", got[5], 81);
+    }
+    pipe_done();
+    term._shell.mark = 0;
+
+    // The same shape with mouse reports, which are longer: five SGR reports and
+    // three focus reports is 71 bytes, and it crosses the same ceiling.
+    if (pipe_open() < 0) { fails = fails + 1; return; }
+    term.shared_input().fd = pipe_rd();
+    term.shared_input().m_mouse = 1;
+    term.shared_input().m_focus = 1;
+    i = 0;
+    while (i < 5) { pipe_send("\x1b[<0;40;12M", 11); i = i + 1; }
+    i = 0;
+    while (i < 3) { pipe_send("\x1b[I", 3); i = i + 1; }
+    pipe_send("hi", 2);
+    pipe_send("Q", 1);
+    pipe_seal();
+    let is i64 as n2 with mut = 0;
+    let is [16]i64 as got2;
+    calls = 0;
+    while (calls < 400) {
+        let is i32 as k2 = term.read_key();
+        if (k2 != term.KEY_NONE && n2 < 16) { got2[n2] = cast(i64, k2); n2 = n2 + 1; }
+        calls = calls + 1;
+    }
+    chk("mouse burst keys", n2, 3);
+    if (n2 == 3) {
+        chk("mouse burst 0", got2[0], 104);
+        chk("mouse burst 1", got2[1], 105);
+        chk("mouse burst 2", got2[2], 81);
+    }
+    pipe_done();
+    term._shell.mark = 0;
+}
+
+// The skip a read_key call falls back on when a sequence outruns its byte
+// ceiling, asked of a buffer with nothing in it.
+//
+// _skip_begin exists for one state: the buffer is FULL of one unfinished
+// sequence, and the first two bytes say which terminator to discard until. Its
+// default — a string's ST or BEL — was applied to every other state as well,
+// including a buffer holding nothing, where there is no sequence to skip and no
+// bytes to classify. That default then discarded the caller's typing until an ST
+// that no terminal was going to send. With nothing to classify there is nothing
+// to skip: the reader must stay out of skip mode.
+fn t_skip_begin_needs_bytes() as void {
+    let is term.Input as in with mut;
+    zero(cast(*u8, &in), sizeof(term.Input));
+    term.input_fd(&in);
+    // Empty: no sequence, and in particular not a string sequence.
+    in.head = 0;
+    in.tail = 0;
+    term._skip_begin(&in);
+    chk("skip begin empty", cast(i64, in.skip), 0);
+    chk("skip begin empty head", in.head, 0);
+    // One byte is not two: which terminator to look for is not decidable, and
+    // guessing costs the byte plus everything typed after it.
+    in.buf[0] = cast(u8, 27);
+    in.head = 0;
+    in.tail = 1;
+    in.skip = 0;
+    term._skip_begin(&in);
+    chk("skip begin one byte", cast(i64, in.skip), 0);
+    chk("skip begin one byte head", in.head, 0);
+    // Two bytes that ARE a CSI: this is the state it was written for.
+    in.buf[0] = cast(u8, 27);
+    in.buf[1] = cast(u8, 91);
+    in.head = 0;
+    in.tail = 2;
+    in.skip = 0;
+    term._skip_begin(&in);
+    chk("skip begin csi", cast(i64, in.skip), 1);
+    chk("skip begin csi head", in.head, 2);
+    // Two bytes that are a string introducer: ST or BEL, the case the default
+    // was chosen for.
+    in.buf[0] = cast(u8, 27);
+    in.buf[1] = cast(u8, 93);
+    in.head = 0;
+    in.tail = 2;
+    in.skip = 0;
+    term._skip_begin(&in);
+    chk("skip begin osc", cast(i64, in.skip), 2);
+    chk("skip begin osc head", in.head, 2);
+}
+
 // A sequence longer than the buffer. The reader cannot hold it, so the only
 // question is what happens to the part it cannot hold: the answer has to be
 // "skipped", because "handed back" means 4096 bytes of a hostile writer's
@@ -1277,6 +1408,8 @@ fn main() as i32 {
         t_read_key_paste_handover();
         t_truncated_reader();
         t_osc_reader();
+        t_read_key_report_burst();
+        t_skip_begin_needs_bytes();
         t_oversize_seq();
         t_gating();
         t_no_block();

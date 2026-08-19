@@ -180,7 +180,7 @@
 //
 // What was run
 // ------------
-// tests/term_input_test.cst at -O0/-O1/-O2: 276 assertions, the parser called
+// tests/term_input_test.cst at -O0/-O1/-O2: 295 assertions, the parser called
 // directly and the reader driven over a pipe.
 //
 // A program with the shape of the one interface built on this — level-triggered
@@ -196,6 +196,14 @@
 // An event-driven program on a 24x80 pty, for the mouse gate: `<0;40;12M`
 // delivered, and `<0;200;12M`, `<0;40;999M` and a twenty-digit column dropped,
 // where all four were delivered before.
+//
+// The same shape with the reader OPEN — input_open(shared_input(), 0), which
+// turns focus reporting on for every caller — fed twenty-two focus reports and
+// then `hello` and a `Q`: six keystrokes out and the loop ends, against NOTHING
+// out and a loop that never ended, because the burst crossed read_key's byte
+// ceiling inside one call and the skip that followed ate the typing. Again with
+// mouse reporting on and five SGR reports in front of the focus ones: the same
+// six, against the same nothing.
 //
 // One byte per read(2), and where the bytes wait, measured with FIONREAD: five
 // typed bytes drain the kernel queue 5,4,3,2,1 with this module's buffer at 0; a
@@ -1044,11 +1052,19 @@ fn _paste_take(in as *Input, ev as *Event, last as i32) as i32 {
 // here — the longest sequence this parser recognises is 25 bytes.
 fn _skip_begin(in as *Input) as void {
     let is *u8 as b = cast(*u8, &in.buf);
+    // Which terminator to look for is read off the first two bytes, and fewer
+    // than two bytes cannot say. That is not a state this function was written
+    // for — it is called for a buffer FULL of one unfinished sequence — but a
+    // default chosen for a string sequence was applied to it anyway, and it
+    // reached that state: read_key called this holding a single ESC, the skip
+    // went looking for an ST that no terminal was going to send, and every
+    // printable byte after it, which is the person's typing, was discarded as
+    // string payload. With no sequence here there is nothing to skip: the
+    // bytes stay where they are and the caller reads on.
+    if (in.tail - in.head < 2) { return; }
     in.skip = 2;                                   // a string: ST or BEL
-    if (in.tail - in.head >= 2) {
-        if (cast(i64, b[in.head]) == 27 && cast(i64, b[in.head + 1]) == 91) {
-            in.skip = 1;                           // a CSI: a final byte
-        }
+    if (cast(i64, b[in.head]) == 27 && cast(i64, b[in.head + 1]) == 91) {
+        in.skip = 1;                               // a CSI: a final byte
     }
     in.head = in.tail;
 }
@@ -1388,6 +1404,11 @@ fn input_next(in as *Input, ev as *Event) as i32 {
 fn read_key() as i32 {
     let is *Input as in = shared_input();
     let is Event as ev;
+    // Bytes read while resolving ONE sequence, and nothing else. It is what
+    // _RK_MAX bounds, so anything that makes it mean "work this call has done"
+    // charges one sequence for another's bytes — which is exactly how a burst of
+    // reports crossed the ceiling inside a single call and took the typing
+    // behind it with it. Every path that finishes a sequence returns.
     let is i64 as pulled with mut = 0;
     while (1 == 1) {
         // Bytes of a paste that input_next had begun to gather. They arrived
@@ -1411,6 +1432,15 @@ fn read_key() as i32 {
         let is i64 as was = in.head;
         if (_drain_buf(in, &ev, 0, 0) == 1) {
             if (ev.kind == EV_KEY) { return ev.key; }
+            // A report for a mode this reader DID turn on: a mouse report, a
+            // focus report. It is not an i32, so the call ends here with
+            // KEY_NONE — the same answer, and the same cost, as the report that
+            // gets dropped below because nothing asked for its mode. Reading on
+            // instead is what made the two configurations answer differently: a
+            // burst of delivered reports was consumed inside one call, together
+            // with the keystroke behind it, and `pulled` counted the whole
+            // burst against one sequence's ceiling.
+            return KEY_NONE;
         } else {
             // A whole sequence went past and none of it was a key — a report
             // for a mode this reader did not turn on, or a reply the terminal
