@@ -162,21 +162,29 @@ fn gen_inst_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 // conditionally overwrite dest with vtrue:
 //     mov rcx, <cond> ; test rcx, rcx ; cmovne <dest>, <vtrue>
 // cmovne needs both operands in registers (the assembler only encodes the
-// reg,reg form), so spilled dest/vtrue are shuttled through rax/rcx scratch.
+// reg,reg form), so a dest or vtrue that is not in a general register — spilled,
+// or a float the allocator put in an XMM register (locations 16-31) — is
+// shuttled through rax/rcx: load_op and store_op bridge XMM with movq. Only
+// locations 0-15 may be named with reg64(), which answers "rax" for anything
+// else; taking an XMM location for a general register once made this cmovne
+// read rax, freshly overwritten by the float compare's setcc
+// (tests/float_cmov_test.cst).
 // No flag-clobbering instruction may sit between the test and the cmovne — the
-// only thing between them are `mov` loads, which don't touch FLAGS.
+// only thing between them are mov/movq loads, which don't touch FLAGS.
 fn gen_inst_cmov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     e.load_op(inst.src1.vreg, ctx, "rcx");           // cond -> rcx
     eo.out_str("  test rcx, rcx\n", 16);             // sets FLAGS; rcx now free
     // dest register (holds the preloaded false-value); must be a real register.
     let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
+    let is i32 as dest_gpr with mut = 0;
+    if (dest_loc >= 0 && dest_loc < 16) { dest_gpr = 1; }
     let is *u8 as dr with mut = "rax";
-    if (dest_loc >= 0) { dr = eo.reg64(dest_loc); }
+    if (dest_gpr == 1) { dr = eo.reg64(dest_loc); }
     else { e.load_op(inst.dest.vreg, ctx, "rax"); dr = "rax"; }
     // vtrue register (mov below does not disturb FLAGS).
     let is i32 as vt_loc = al.get_loc(inst.src2.vreg, ctx);
     let is *u8 as vr with mut = "rcx";
-    if (vt_loc >= 0) { vr = eo.reg64(vt_loc); }
+    if (vt_loc >= 0 && vt_loc < 16) { vr = eo.reg64(vt_loc); }
     else { e.load_op(inst.src2.vreg, ctx, "rcx"); vr = "rcx"; }
     eo.out_str("  cmovne ", 9);
     eo.out_cstr(dr);
@@ -184,7 +192,7 @@ fn gen_inst_cmov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     eo.out_cstr(vr);
     eo.out_char(10);
     if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(eo.reg_name_to_idx(dr)); }
-    if (dest_loc < 0) { e.store_op(inst.dest.vreg, ctx, dr); }
+    if (dest_gpr == 0) { e.store_op(inst.dest.vreg, ctx, dr); }
 }
 
 // === gen_inst: ADD, SUB, MUL, DIV, MOD, NEG ===
