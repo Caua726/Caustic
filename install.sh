@@ -345,7 +345,27 @@ fi
 # pkexec drops the environment and runs from /, so a relative path or a $HOME
 # reference would resolve differently than intended. Everything below is passed
 # absolute, which is why this matters only here.
-run() { if [ "$DRY" = 1 ]; then echo "  would: $*"; else $SUDO "$@"; fi; }
+# One escalation for the whole install, not one per file. pkexec does not keep
+# an authorization between calls the way sudo does, so running each step
+# through it asked for the password once per command — a dozen times for a
+# system install. When root is needed the steps are written to a script and
+# run by a single escalation at the end (run_root_now); without root they run
+# as they come, as before.
+ROOT_SCRIPT=""
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+run() {
+    if [ "$DRY" = 1 ]; then echo "  would: $*"; return 0; fi
+    if [ -z "$SUDO" ]; then "$@"; return; fi
+    _line=""
+    for _a in "$@"; do _line="$_line $(q "$_a")"; done
+    printf '%s\n' "$_line" >> "$ROOT_SCRIPT"
+}
+run_root_now() {
+    [ "$DRY" = 1 ] && return 0
+    [ -n "$SUDO" ] || return 0
+    [ -s "$ROOT_SCRIPT" ] || return 0
+    $SUDO sh -e "$ROOT_SCRIPT"
+}
 
 # Every installed path is recorded so uninstall removes exactly what was put
 # there and nothing else — no globbing over a shared prefix like /usr/local.
@@ -370,6 +390,8 @@ fi
 
 # --- obtain the trees to install ---
 TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+ROOT_SCRIPT="$TMPDIR/root-steps.sh"
+: > "$ROOT_SCRIPT"
 is_checkout() { [ -f "$1/Causticfile" ] && [ -f "$1/src/main.cst" ]; }
 
 # The Windows archive is only fetched when something actually needs it.
@@ -581,7 +603,7 @@ if [ -n "$COMPLETIONS" ]; then
         COMP_NAMES="caustic"
         for t in $(echo "$TOOLS" | tr ',' ' '); do
             [ -z "$t" ] && continue
-            [ -f "$BIN_DIR/caustic-$t" ] && COMP_NAMES="$COMP_NAMES caustic-$t"
+            [ -f "$SRC/bin/caustic-$t" ] && COMP_NAMES="$COMP_NAMES caustic-$t"
         done
         # The compiler also answers to the name of the flavour that was
         # installed. bash-completion looks its file up by the exact command
@@ -636,6 +658,7 @@ MANIFEST="$LIB_DIR/install-manifest"
     printf "%s" "$MANIFEST_FILES"
 } > "$TMPDIR/manifest"
 run cp "$TMPDIR/manifest" "$MANIFEST"
+run_root_now || { echo "error: installing to $PREFIX failed"; exit 1; }
 if [ "$PRIMARY" = "exe" ]; then
     echo "caustic installed → $BIN_DIR/caustic.exe  (Windows PE; run it under wine or on Windows)"
 else
