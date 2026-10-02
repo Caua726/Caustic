@@ -389,15 +389,18 @@ if [ "$DRY" = 1 ]; then
 fi
 
 # --- the version a build from source reports ---
-# src/version.cst only moves when a release is cut, so every build between two
+# A version.cst only moves when a release is cut, so every build between two
 # releases used to call itself the older one, and nothing — update.sh included —
-# could tell them apart. A source build derives its version from git instead:
+# could tell them apart. A source build derives each tool's version from git
+# instead — the compiler from this repository, caustic-as and caustic-ld from
+# their own submodules, each counted from its own release tags:
 #   on the tag v0.1.10             0.1.10
 #   20 commits past it             0.1.11-dev.20+ce84abf
 #   ... with uncommitted edits     0.1.11-dev.20+ce84abf.dirty
 #   no release tag to count from   0.1.10+ce84abf   (what version.cst says)
 # A commit past a release is a pre-release of the next patch, so SemVer orders
 # them right: 0.1.10 < 0.1.11-dev.20 < 0.1.11. Prints nothing without git.
+#   source_version <repository> <its version.cst>
 source_version() {
     command -v git >/dev/null 2>&1 || return 0
     _d=$(git -C "$1" describe --tags --long --always --match 'v[0-9]*' --dirty --abbrev=7 2>/dev/null) || return 0
@@ -405,7 +408,7 @@ source_version() {
     case "$_d" in *-dirty) _dirty=".dirty"; _d=${_d%-dirty} ;; esac
     case "$_d" in
         *-g*) ;;
-        *)  _v=$(sed -n 's/.*VERSION with imut = "\([^"]*\)".*/\1/p' "$1/src/version.cst")
+        *)  _v=$(sed -n 's/.*VERSION with imut = "\([^"]*\)".*/\1/p' "$2")
             [ -n "$_v" ] && echo "$_v+$_d$_dirty"
             return 0 ;;
     esac
@@ -417,23 +420,33 @@ source_version() {
     echo "${_base%.*}.$((_patch + 1))-dev.$_n+$_hash$_dirty"
 }
 
-# The version is written into the tree for the length of the build and the file
-# is put back afterwards — on failure too, through the trap below — because the
-# tree may be your own checkout, and a build should not leave it modified.
-VERSION_FILE=""; VERSION_SAVED=""
+# The versions are written into the tree for the length of the build and the
+# files put back afterwards — on failure too, through the trap below — because
+# the tree may be your own checkout, and a build should not leave it modified.
+# VERSION_RESTORE holds one "file|saved copy" line per file written.
+VERSION_RESTORE=""
+stamp_one() {   # <repository> <version.cst> <tool name>
+    [ -f "$2" ] || return 0
+    _v=$(source_version "$1" "$2")
+    [ -n "$_v" ] || return 0
+    _save="$TMPDIR/version.$3.orig"
+    cp "$2" "$_save"
+    sed "s/\(VERSION with imut = \"\)[^\"]*\"/\1$_v\"/" "$_save" > "$2"
+    VERSION_RESTORE="$VERSION_RESTORE$2|$_save
+"
+    echo "  version $3 $_v"
+}
 stamp_version() {
-    BUILD_VERSION=$(source_version "$1")
-    [ -n "$BUILD_VERSION" ] || return 0
-    VERSION_FILE="$1/src/version.cst"
-    VERSION_SAVED="$TMPDIR/version.cst.orig"
-    cp "$VERSION_FILE" "$VERSION_SAVED"
-    sed "s/\(VERSION with imut = \"\)[^\"]*\"/\1$BUILD_VERSION\"/" "$VERSION_SAVED" > "$VERSION_FILE"
-    echo "  version $BUILD_VERSION"
+    stamp_one "$1" "$1/src/version.cst" caustic
+    stamp_one "$1/caustic-assembler" "$1/caustic-assembler/version.cst" caustic-as
+    stamp_one "$1/caustic-linker" "$1/caustic-linker/version.cst" caustic-ld
 }
 unstamp_version() {
-    [ -n "$VERSION_SAVED" ] || return 0
-    cp "$VERSION_SAVED" "$VERSION_FILE"
-    VERSION_SAVED=""
+    [ -n "$VERSION_RESTORE" ] || return 0
+    printf '%s' "$VERSION_RESTORE" | while IFS='|' read -r _f _s; do
+        [ -n "$_f" ] && cp "$_s" "$_f"
+    done
+    VERSION_RESTORE=""
 }
 
 # --- obtain the trees to install ---
