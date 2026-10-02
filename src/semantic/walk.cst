@@ -77,7 +77,7 @@ fn walk_fn_def(node as *ast.Node) as void {
     let is *d.Function as fs = sc.lookup_fn(node.name_ptr, node.name_len);
     if (cast(i64, fs) != 0 && fs.asm_name_len > 0) {
         node.asm_name_ptr = fs.asm_name_ptr;
-        node.asm_name_len = fs.asm_name_len;
+        node.asm_name_len = cast(i16, fs.asm_name_len);
     }
     let is *u8 as saved_rt = sc.current_return_type;
     sc.current_return_type = cast(*u8, node.return_type);
@@ -435,7 +435,7 @@ fn walk_let(node as *ast.Node) as void {
     }
     if (var.asm_name_len > 0) {
         node.asm_name_ptr = var.asm_name_ptr;
-        node.asm_name_len = var.asm_name_len;
+        node.asm_name_len = cast(i16, var.asm_name_len);
     }
     // Locals without an init expression start uninitialized. Globals are
     // BSS-zeroed; aggregates (array/struct) are used as buffers (filled via
@@ -599,14 +599,19 @@ fn walk_assign(node as *ast.Node) as void {
             node.lhs.var_offset = var.offset;
             node.lhs.is_global = var.is_global;
             node.lhs.is_string_const = var.is_string_const;
-            if (var.asm_name_len > 0) { node.lhs.asm_name_ptr = var.asm_name_ptr; node.lhs.asm_name_len = var.asm_name_len; }
+            if (var.asm_name_len > 0) { node.lhs.asm_name_ptr = var.asm_name_ptr; node.lhs.asm_name_len = cast(i16, var.asm_name_len); }
         }
     } else {
         walk(node.lhs);
     }
-    if (node.rhs.kind == ast.NK_NUM) {
-        ty.can_narrow_literal_to(node.rhs, cast(*u8, node.lhs.ty));
-        if (cast(i64, node.rhs.ty) != cast(i64, node.lhs.ty)) {
+    // The rule a `let` is held to. This checked literals only, so a variable of
+    // the wrong type — an f64 into an i64, a function of another signature into
+    // a function type — was stored without a word.
+    if (cast(i64, node.lhs.ty) != 0
+        && ty.try_implicit_convert(node.rhs, cast(*u8, node.lhs.ty)) == 0) {
+        if (cast(i64, node.rhs.ty) != 0 && node.lhs.ty.kind == ast.TY_FN && node.rhs.ty.kind == ast.TY_FN) {
+            sc.sem_error_at(node, "assinatura de funcao incompativel na atribuicao");
+        } else {
             sc.sem_error_at(node, "tipo incompativel na atribuicao");
         }
     }
@@ -647,7 +652,7 @@ fn walk(node as *ast.Node) as void {
         node.var_offset = var.offset;
         node.is_global = var.is_global;
         node.is_string_const = var.is_string_const;
-        if (var.asm_name_len > 0) { node.asm_name_ptr = var.asm_name_ptr; node.asm_name_len = var.asm_name_len; }
+        if (var.asm_name_len > 0) { node.asm_name_ptr = var.asm_name_ptr; node.asm_name_len = cast(i16, var.asm_name_len); }
         // Const-prop at the AST level: if this references an imut global
         // whose init folded to a literal in walk_let, rewrite the node
         // in-place to NK_NUM so downstream arithmetic + comparison folds
@@ -713,7 +718,7 @@ fn walk(node as *ast.Node) as void {
             inner.var_offset = v.offset;
             inner.is_global = v.is_global;
             inner.is_string_const = v.is_string_const;
-            if (v.asm_name_len > 0) { inner.asm_name_ptr = v.asm_name_ptr; inner.asm_name_len = v.asm_name_len; }
+            if (v.asm_name_len > 0) { inner.asm_name_ptr = v.asm_name_ptr; inner.asm_name_len = cast(i16, v.asm_name_len); }
         } else {
             walk(inner);
         }
@@ -802,15 +807,14 @@ fn walk(node as *ast.Node) as void {
             if (argc != ety.field_count) {
                 sc.sem_error_at(node, "numero de argumentos incorreto em call()");
             }
-            // Check arg types
+            // Check arg types — by the rule a direct call uses. This compared
+            // size AND kind before, so it fired only when both differed, and
+            // never between pointers, which are all eight bytes.
             let is i32 as ai with mut = 0;
             a = node.args;
             while (cast(i64, a) != 0 && ai < ety.field_count) {
-                let is *ast.Type as expected = ast.ga_get(ety.fields, ai);
-                if (cast(i64, expected) != 0 && cast(i64, a.ty) != 0) {
-                    if (expected.size != a.ty.size && expected.kind != a.ty.kind) {
-                        sc.sem_error_at(a, "tipo de argumento incompativel em call()");
-                    }
+                if (ty.arg_compatible(a, cast(*u8, ast.ga_get(ety.fields, ai))) == 0) {
+                    sc.sem_error_at(a, "tipo de argumento incompativel em call()");
                 }
                 ai = ai + 1;
                 a = a.next;
@@ -1169,16 +1173,16 @@ fn walk_fncall(node as *ast.Node) as void {
     // Set return type and asm_name
     node.ty = cast(*ast.Type, func.return_type);
     node.asm_name_ptr = func.asm_name_ptr;
-    node.asm_name_len = func.asm_name_len;
-    node.is_variadic = func.is_variadic;
-    node.is_extern = func.is_extern;
+    node.asm_name_len = cast(i16, func.asm_name_len);
+    node.is_variadic = cast(i8, func.is_variadic);
+    node.is_extern = cast(i8, func.is_extern);
     // For calls to `extern "dll.dll" fn`, propagate dll name onto the call
     // node (overloading impl_ptr/impl_len, unused for non-method calls) so
     // IR generation can lower this to IR_FFI_CALL.
     if (func.dll_name_len > 0) {
         let is *ast.Node_Extra as ie = ast.node_ensure_extra(node);
         ie.impl_ptr = func.dll_name_ptr;
-        ie.impl_len = func.dll_name_len;
+        ie.impl_len = cast(i16, func.dll_name_len);
     }
 
     // Verify args
@@ -1202,11 +1206,8 @@ fn walk_fncall(node as *ast.Node) as void {
     while (i < func.param_count) {
         walk(arg);
         let is *u8 as pt = d.pt_get(func.param_types, i);
-        if (arg.kind == ast.NK_NUM) {
-            ty.can_narrow_literal_to(arg, pt);
-            if (cast(i64, arg.ty) != cast(i64, pt)) {
-                sc.sem_error_at2(node, "tipo incompativel no argumento de", func.name_ptr, func.name_len);
-            }
+        if (ty.arg_compatible(arg, pt) == 0) {
+            sc.sem_error_at2(node, "tipo incompativel no argumento de", func.name_ptr, func.name_len);
         }
         arg = arg.next;
         i = i + 1;

@@ -693,10 +693,72 @@ fn is_safe_conversion(from as *u8, to as *u8) as i32 {
     // TY_FN <-> *u8 (both are 8-byte pointers at runtime)
     if (f.kind == ast.TY_FN && t.kind == ast.TY_PTR && t.size == 8) { return 1; }
     if (f.kind == ast.TY_PTR && f.size == 8 && t.kind == ast.TY_FN) { return 1; }
-    if (f.kind == ast.TY_FN && t.kind == ast.TY_FN) { return 1; }
+    if (f.kind == ast.TY_FN && t.kind == ast.TY_FN) { return fn_sig_compatible(from, to); }
     if (f.size > t.size) { return 0; }
-    if (is_signed_type(from) != is_signed_type(to)) { return 0; }
+    // A change of signedness keeps every value in one direction only: unsigned
+    // into a strictly wider signed type — a bool or a u8 into an i32, a u32 into
+    // an i64. Refusing that too rejected `check(a < b)` for an i32 parameter.
+    if (is_signed_type(from) != is_signed_type(to)) {
+        if (is_signed_type(from) == 1 || f.size >= t.size) { return 0; }
+    }
     return 1;
+}
+
+// Two types a function signature may hold in the same position. Every pointer
+// matches every pointer, the way pointer assignment does (see the TODO in
+// try_implicit_convert), and a function type matches a pointer for the same
+// reason TY_FN <-> *u8 converts. Anything else has to be the same kind, and a
+// struct, enum or array the same size. An unresolved type matches anything.
+fn same_param_type(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == cast(i64, b)) { return 1; }
+    if (cast(i64, a) == 0 || cast(i64, b) == 0) { return 1; }
+    let is *ast.Type as x = cast(*ast.Type, a);
+    let is *ast.Type as y = cast(*ast.Type, b);
+    let is i32 as xp with mut = 0;
+    let is i32 as yp with mut = 0;
+    if (x.kind == ast.TY_PTR || x.kind == ast.TY_FN || x.kind == ast.TY_STRING) { xp = 1; }
+    if (y.kind == ast.TY_PTR || y.kind == ast.TY_FN || y.kind == ast.TY_STRING) { yp = 1; }
+    if (xp == 1 && yp == 1) {
+        if (x.kind == ast.TY_FN && y.kind == ast.TY_FN) { return fn_sig_compatible(a, b); }
+        return 1;
+    }
+    if (x.kind != y.kind) { return 0; }
+    if (x.kind == ast.TY_STRUCT || x.kind == ast.TY_ENUM || x.kind == ast.TY_ARRAY) {
+        if (x.size != y.size) { return 0; }
+    }
+    return 1;
+}
+
+// Whether a function of type `from` may be called through a pointer of type
+// `to`: the same number of parameters, each of the same type, and the same
+// return type. Anything looser and `fn(f64) as i64` stored into an
+// `fn(i64, *u8) as i32` is called with a pointer in a float register and its
+// i64 read back as an i32 — which compiled, ran, and printed whatever it found.
+fn fn_sig_compatible(from as *u8, to as *u8) as i32 {
+    let is *ast.Type as f = cast(*ast.Type, from);
+    let is *ast.Type as t = cast(*ast.Type, to);
+    if (f.field_count != t.field_count) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < f.field_count) {
+        if (same_param_type(cast(*u8, ast.ga_get(f.fields, i)), cast(*u8, ast.ga_get(t.fields, i))) == 0) { return 0; }
+        i = i + 1;
+    }
+    let is *u8 as fr with mut = cast(*u8, f.base);
+    let is *u8 as tr with mut = cast(*u8, t.base);
+    if (cast(i64, fr) == 0) { fr = cast(*u8, ast.type_void); }
+    if (cast(i64, tr) == 0) { tr = cast(*u8, ast.type_void); }
+    return same_param_type(fr, tr);
+}
+
+// One argument against one parameter. The same rule as a `let`, a `return`
+// and an assignment — try_implicit_convert — so a direct call, a call()
+// through a typed pointer and a plain store cannot drift apart again. They had:
+// a call and an assignment checked literals only, so a variable of the wrong
+// type went through, and call() compared size AND kind, which fired only when
+// both differed.
+fn arg_compatible(arg as *ast.Node, pt as *u8) as i32 {
+    if (cast(i64, arg) == 0 || cast(i64, pt) == 0) { return 1; }
+    return try_implicit_convert(arg, pt);
 }
 
 fn pointer_to(ty as *u8) as *u8 {
@@ -750,6 +812,57 @@ fn can_narrow_literal_to(node as *ast.Node, target as *u8) as i32 {
     return 0;
 }
 
+// The value of an integer expression built only from literals — `0 - 1`,
+// `1 << 4`, `-8` — or 0 when it is not one. Lets such an expression narrow the
+// way a literal does: `0 - 1` handed to an i32 parameter is -1, and nothing is
+// truncated, so asking for a cast there would only be noise.
+fn const_int_value(node as *ast.Node, out as *i64) as i32 {
+    if (cast(i64, node) == 0) { return 0; }
+    let is i32 as k = node.kind;
+    if (k == ast.NK_NUM) {
+        if (cast(i64, node.ty) != 0 && is_float_type(cast(*u8, node.ty)) == 1) { return 0; }
+        *out = node.val;
+        return 1;
+    }
+    if (k == ast.NK_NEG) {
+        let is i64 as v with mut = 0;
+        if (const_int_value(node.expr, &v) == 0) { return 0; }
+        *out = 0 - v;
+        return 1;
+    }
+    if (k != ast.NK_ADD && k != ast.NK_SUB && k != ast.NK_MUL && k != ast.NK_SHL
+        && k != ast.NK_BAND && k != ast.NK_BOR && k != ast.NK_BXOR) { return 0; }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    if (const_int_value(node.lhs, &a) == 0) { return 0; }
+    if (const_int_value(node.rhs, &b) == 0) { return 0; }
+    if (k == ast.NK_ADD) { *out = a + b; }
+    else if (k == ast.NK_SUB) { *out = a - b; }
+    else if (k == ast.NK_MUL) { *out = a * b; }
+    else if (k == ast.NK_SHL) { if (b < 0 || b > 62) { return 0; } *out = a << b; }
+    else if (k == ast.NK_BAND) { *out = a & b; }
+    else if (k == ast.NK_BOR) { *out = a | b; }
+    else { *out = a ^ b; }
+    return 1;
+}
+
+// Whether a float expression is built only from float literals — `0.0 - 40.0`.
+// A literal narrows to f32 on its own; this lets such an expression do the same
+// instead of asking for a cast around a constant.
+fn const_float_expr(node as *ast.Node) as i32 {
+    if (cast(i64, node) == 0) { return 0; }
+    let is i32 as k = node.kind;
+    if (k == ast.NK_NUM) {
+        if (cast(i64, node.ty) != 0 && is_float_type(cast(*u8, node.ty)) == 1) { return 1; }
+        return 0;
+    }
+    if (k == ast.NK_NEG) { return const_float_expr(node.expr); }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV) {
+        if (const_float_expr(node.lhs) == 1 && const_float_expr(node.rhs) == 1) { return 1; }
+    }
+    return 0;
+}
+
 // Try to implicitly convert an expression node to a target type. Returns 1
 // if convertible (literal may be narrowed in place), 0 otherwise.
 // Centralizes the rules: same-type, literal narrowing, pointer-to-pointer,
@@ -771,7 +884,17 @@ fn try_implicit_convert(node as *ast.Node, target as *u8) as i32 {
         if (src_int == 1 && dst_flt == 1) { return 0; }
     }
 
+    if (node.kind != ast.NK_NUM && is_float_type(cast(*u8, src_ty)) == 1 && is_float_type(target) == 1
+        && const_float_expr(node) == 1) { return 1; }
+    if (node.kind != ast.NK_NUM && is_integer_type(cast(*u8, src_ty)) == 1 && is_integer_type(target) == 1) {
+        let is i64 as cv with mut = 0;
+        if (const_int_value(node, &cv) == 1 && can_narrow_literal(cv, target) == 1) { return 1; }
+    }
+
     let is *ast.Type as dst_ty = cast(*ast.Type, target);
+    // An array where a pointer is expected is its address, as it has always
+    // been passed.
+    if (src_ty.kind == ast.TY_ARRAY && dst_ty.kind == ast.TY_PTR) { return 1; }
     if (src_ty.kind == ast.TY_PTR && dst_ty.kind == ast.TY_PTR) {
         // TODO(safety): the strict check from f8d2c0a rejects valid
         // self-referential struct fields (e.g. `next as *Node` inside a
@@ -781,6 +904,12 @@ fn try_implicit_convert(node as *ast.Node, target as *u8) as i32 {
         // hash table (st_hash_ptrs) rather than Type instance comparison.
         return 1;
     }
+
+    // Floats and everything else are held in different registers and converted
+    // by different instructions, so a value does not cross between them without
+    // a cast. The rule was enforced for literals only: an f64 variable passed
+    // for an i64 parameter compiled, and the callee read its other register.
+    if (is_float_type(cast(*u8, src_ty)) != is_float_type(target)) { return 0; }
 
     return is_safe_conversion(cast(*u8, src_ty), target);
 }
