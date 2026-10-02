@@ -77,6 +77,15 @@ struct Term {
     grid_ready as i64;    // rows committed from the grid's start
     grid_rdyb  as i64;    // bytes committed from the grid's start (page multiple)
     grid_cap   as i64;    // rows reserved; grid_rows is less only when memory ran out
+    // -- appended (all i64): the alternate screen (CSI ?1049h/l), see alt_enter.
+    alt      as i64;      // 1 = a full-screen program has its own screen up
+    alt_save as i64;      // the main screen's visible rows, copied aside (0 = none)
+    alt_len  as i64;      // bytes mapped at alt_save
+    alt_rows as i64;      // rows copied
+    alt_cx   as i64;      // the main screen's cursor and colours
+    alt_cy   as i64;
+    alt_fg   as i64;
+    alt_bg   as i64;
 }
 
 // A lazy grid commits this much more each time the ring reaches its end.
@@ -181,6 +190,38 @@ fn _grid_blank_phys(t as *Term, phys as i64) as void {
     return;
 }
 
+// The physical grid row of LIVE visible row r (whatever view_off says).
+fn _live_phys(t as *Term, r as i64) as i64 {
+    let is i64 as p = t.live_top + r;
+    return p - (p / t.grid_rows) * t.grid_rows;
+}
+
+fn _grid_copy_row(t as *Term, from as i64, to as i64) as void {
+    let is *i64 as g = cast(*i64, t.grid);
+    let is i64 as c with mut = 0;
+    while (c < t.grid_stride) {
+        g[to * t.grid_stride + c] = g[from * t.grid_stride + c];
+        c = c + 1;
+    }
+    return;
+}
+
+// _ring_advance — one line off the top of the live view into history: the
+// grid side of a scroll.
+fn _ring_advance(t as *Term) as void {
+    t.live_top = t.live_top + 1;
+    if (t.live_top >= t.grid_rows) { t.live_top = 0; }
+    let is i64 as p = t.live_top + t.rows - 1;
+    _grid_reach(t, p);
+    if (t.live_top >= t.grid_rows) { t.live_top = t.live_top - t.grid_rows; }
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    _grid_blank_phys(t, phys);
+    let is i64 as hmax = t.grid_rows - t.rows;
+    if (t.hist_count < hmax) { t.hist_count = t.hist_count + 1; }
+    if (t.hist_count > hmax) { t.hist_count = hmax; }
+    return;
+}
+
 // Repaint every visible cell from the grid (honors view_off) and refill the
 // background first — the one true re-render, used by resize and scrollback.
 fn _repaint_view(t as *Term) as void {
@@ -213,6 +254,7 @@ fn _repaint_view(t as *Term) as void {
 // while scrolled back).
 fn scroll_view(t as *Term, delta as i64) as void {
     if (t.grid == 0) { return; }
+    if (t.alt == 1) { return; }              // the history is the main screen's
     let is i64 as v with mut = t.view_off + delta;
     if (v < 0) { v = 0; }
     if (v > t.hist_count) { v = t.hist_count; }
@@ -245,18 +287,17 @@ fn _scroll(t as *Term) as void {
         while (j < pw) { p[j] = t.bg; j = j + 1; }
     }
     if (t.grid != 0) {
-        // the ring absorbs the scroll: the line leaving the top becomes
-        // history, the fresh bottom line is blanked in place
-        t.live_top = t.live_top + 1;
-        if (t.live_top >= t.grid_rows) { t.live_top = 0; }
-        let is i64 as p = t.live_top + t.rows - 1;
-        _grid_reach(t, p);
-        if (t.live_top >= t.grid_rows) { t.live_top = t.live_top - t.grid_rows; }
-        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
-        _grid_blank_phys(t, phys);
-        let is i64 as hmax = t.grid_rows - t.rows;
-        if (t.hist_count < hmax) { t.hist_count = t.hist_count + 1; }
-        if (t.hist_count > hmax) { t.hist_count = hmax; }
+        if (t.alt == 1) {
+            // The alternate screen scrolls in place: nothing a full-screen
+            // program draws becomes history.
+            let is i64 as r with mut = 0;
+            while (r + 1 < t.rows) { _grid_copy_row(t, _live_phys(t, r + 1), _live_phys(t, r)); r = r + 1; }
+            _grid_blank_phys(t, _live_phys(t, t.rows - 1));
+        } else {
+            // the ring absorbs the scroll: the line leaving the top becomes
+            // history, the fresh bottom line is blanked in place
+            _ring_advance(t);
+        }
     }
     _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
     if (t.cy > 0) { t.cy = t.cy - 1; }
@@ -284,6 +325,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
     t.mouse_mode = 0; t.mouse_sgr = 0;
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
+    t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -314,6 +356,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
     t.mouse_mode = 0; t.mouse_sgr = 0;
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
+    t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -344,6 +387,7 @@ fn init_text(width as i64, height as i64) as Term {
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
     t.mouse_mode = 0; t.mouse_sgr = 0;
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
+    t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -612,6 +656,7 @@ fn _csi_dispatch(t as *Term, final as i64) as void {
             if (p0 == 25) { _cursor(t, 0); t.cur_vis = 0; }               // ?25l: erase, then hide
             else if (p0 == 1000 || p0 == 1002 || p0 == 1003) { t.mouse_mode = 0; }
             else if (p0 == 1006) { t.mouse_sgr = 0; }
+            else if (p0 == 1049 || p0 == 1047 || p0 == 47) { alt_leave(t); }
         }
         return;
     }
@@ -621,6 +666,7 @@ fn _csi_dispatch(t as *Term, final as i64) as void {
             else if (p0 == 1000 || p0 == 1002) { t.mouse_mode = 1; }     // button (+drag) tracking
             else if (p0 == 1003) { t.mouse_mode = 3; }                   // any-event (motion) tracking
             else if (p0 == 1006) { t.mouse_sgr = 1; }                    // SGR-encoded reports
+            else if (p0 == 1049 || p0 == 1047 || p0 == 47) { alt_enter(t); }   // alternate screen
         }
         return;
     }
@@ -644,6 +690,107 @@ fn _esc_feed(t as *Term, ch as i64) as void {
     if (ch == 0x3F) { t.csi_q = 1; return; }                                  // '?'
     if (ch >= 0x40 && ch <= 0x7E) { _csi_dispatch(t, ch); t.esc = 0; return; }  // final byte
     // intermediates (0x20-0x2F) and stray bytes: stay in CSI
+}
+
+// ---- the alternate screen (CSI ?1049h / ?1049l) ------------------------------
+//
+// A full-screen program (an editor, htop) draws on a screen of its own and,
+// when it leaves, the one there was comes back — the prompt, the commands and
+// their output — with the cursor where it was. Entering copies the visible
+// rows aside and clears the screen; while it is up a scroll moves the visible
+// rows only, so nothing the program draws becomes history, and the history
+// cannot be scrolled to; leaving puts the rows and the cursor back. Without a
+// grid nothing was recorded to give back, and the screen is just cleared.
+
+fn alt_enter(t as *Term) as void {
+    if (t.alt == 1) { return; }
+    _cursor(t, 0);
+    if (t.view_off != 0) { t.view_off = 0; _repaint_view(t); }
+    t.alt_cx = t.cx; t.alt_cy = t.cy;
+    t.alt_fg = cast(i64, t.fg); t.alt_bg = cast(i64, t.bg);
+    t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    if (t.grid != 0) {
+        let is i64 as rowb = t.grid_stride * 8;
+        let is i64 as bytes = ((t.rows * rowb + 4095) / 4096) * 4096;
+        let is i64 as va = cos.mmap(0, bytes, cos.PROT_READ | cos.PROT_WRITE);
+        if (va > 0) {
+            let is *i64 as g = cast(*i64, t.grid);
+            let is *i64 as d = cast(*i64, va);
+            let is i64 as r with mut = 0;
+            while (r < t.rows) {
+                let is i64 as phys = _live_phys(t, r);
+                let is i64 as c with mut = 0;
+                while (c < t.grid_stride) {
+                    d[r * t.grid_stride + c] = g[phys * t.grid_stride + c];
+                    c = c + 1;
+                }
+                r = r + 1;
+            }
+            t.alt_save = va; t.alt_len = bytes; t.alt_rows = t.rows;
+        }
+    }
+    t.alt = 1;
+    _erase_display(t, 2);
+    return;
+}
+
+fn alt_leave(t as *Term) as void {
+    if (t.alt == 0) { return; }
+    _cursor(t, 0);
+    t.alt = 0;
+    t.view_off = 0;
+    t.fg = cast(u32, t.alt_fg); t.bg = cast(u32, t.alt_bg);
+    if (t.alt_save == 0) {
+        _erase_display(t, 2);
+        t.cx = 0; t.cy = 0;
+        return;
+    }
+    // Saved rows that no longer fit (the window shrank meanwhile) go into
+    // the history, the way a shrink pushes the top rows there; the cursor's
+    // row moves up with them.
+    let is i64 as sr = t.alt_rows;
+    let is i64 as k with mut = sr - t.rows;
+    if (k < 0) { k = 0; }
+    let is i64 as i with mut = 0;
+    while (i < k) { _ring_advance(t); i = i + 1; }
+    let is *i64 as g = cast(*i64, t.grid);
+    let is *i64 as s = cast(*i64, t.alt_save);
+    let is i64 as r with mut = 0;
+    while (r < sr) {
+        // saved row r lands on live row r - k (the first k above the view)
+        let is i64 as p = t.live_top + t.grid_rows + r - k;
+        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+        let is i64 as c with mut = 0;
+        while (c < t.grid_stride) {
+            g[phys * t.grid_stride + c] = s[r * t.grid_stride + c];
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    r = sr - k;
+    while (r < t.rows) { _grid_blank_phys(t, _live_phys(t, r)); r = r + 1; }
+    cos.munmap(t.alt_save, t.alt_len);
+    t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.cy = t.alt_cy - k;
+    t.cx = t.alt_cx;
+    _clamp_cursor(t);
+    _repaint_view(t);
+    return;
+}
+
+// end_program — undo what a program run in the terminal changed and may not
+// have put back (it was killed, or failed on its way out): its own screen, a
+// hidden cursor, mouse reporting, the colours. The holder calls this when the
+// program ends, before writing anything of its own — a prompt drawn on the
+// program's screen, with no cursor, was what a killed htop left behind.
+fn end_program(t as *Term) as void {
+    alt_leave(t);
+    t.cur_vis = 1;
+    t.mouse_mode = 0;
+    t.mouse_sgr = 0;
+    t.fg = cast(u32, t.def_fg);
+    t.bg = cast(u32, t.def_bg);
+    return;
 }
 
 fn putc(t as *Term, ch as i64) as void {
@@ -700,6 +847,14 @@ fn set_color(t as *Term, fg as u32, bg as u32) as void {
 // clear — wipe the visible region to bg and home the cursor (the shell's
 // `clear`). Pitch-aware row fill so windowed buffers only touch their rect.
 fn clear(t as *Term) as void {
+    if (t.alt == 1) {                            // a program's own screen: the
+        _cursor(t, 0);                           // history under it is not its
+        _erase_display(t, 2);                    // to wipe
+        t.cx = 0; t.cy = 0;
+        _mark(t, 0, 0, t.width, t.height);
+        flush(t);
+        return;
+    }
     _fill_bg(t, t.width, t.height);
     if (t.grid != 0) {
         // A lazy grid gives the history's memory back: everything past the
@@ -750,6 +905,9 @@ fn resize(t as *Term, new_w as i64, new_h as i64) as void {
         t.view_off = 0;                              // a resize snaps to live
         // bottom anchor: lines pushed off the top become HISTORY (the ring
         // just advances — nothing is copied or lost)
+        if (t.cy >= new_rows && t.alt == 1) {
+            t.cy = new_rows - 1;                     // the alternate screen keeps no history
+        }
         if (t.cy >= new_rows) {
             let is i64 as shift = t.cy - new_rows + 1;
             let is i64 as p = t.live_top + shift;
