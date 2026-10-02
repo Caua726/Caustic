@@ -71,7 +71,16 @@ struct Term {
     //    decide whether/how to encode a mouse event into the child's stdin. --
     mouse_mode as i64;    // 0 = off, 1 = button (1000/1002), 3 = any-event (1003)
     mouse_sgr  as i64;    // 1 = SGR encoding (?1006): CSI < b;x;y M/m
+    // -- appended (all i64): a grid committed as the ring first fills it
+    //    (attach_grid_lazy) — scrollback costs memory only once it is used. --
+    grid_lazy  as i64;    // 1 = rows past grid_ready are reserved, not committed
+    grid_ready as i64;    // rows committed from the grid's start
+    grid_rdyb  as i64;    // bytes committed from the grid's start (page multiple)
+    grid_cap   as i64;    // rows reserved; grid_rows is less only when memory ran out
 }
+
+// A lazy grid commits this much more each time the ring reaches its end.
+let is i64 as GRID_CHUNK with imut = 65536;
 
 // The grid is a ring of grid_rows text lines. The live view occupies
 // physical rows live_top..live_top+rows-1 (mod grid_rows); scrolling
@@ -241,10 +250,13 @@ fn _scroll(t as *Term) as void {
         t.live_top = t.live_top + 1;
         if (t.live_top >= t.grid_rows) { t.live_top = 0; }
         let is i64 as p = t.live_top + t.rows - 1;
+        _grid_reach(t, p);
+        if (t.live_top >= t.grid_rows) { t.live_top = t.live_top - t.grid_rows; }
         let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
         _grid_blank_phys(t, phys);
         let is i64 as hmax = t.grid_rows - t.rows;
         if (t.hist_count < hmax) { t.hist_count = t.hist_count + 1; }
+        if (t.hist_count > hmax) { t.hist_count = hmax; }
     }
     _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
     if (t.cy > 0) { t.cy = t.cy - 1; }
@@ -271,6 +283,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
     t.mouse_mode = 0; t.mouse_sgr = 0;
+    t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -300,6 +313,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
     t.mouse_mode = 0; t.mouse_sgr = 0;
+    t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -329,6 +343,7 @@ fn init_text(width as i64, height as i64) as Term {
     t.live_top = 0; t.hist_count = 0; t.view_off = 0;
     t.esc = 0; t.csi_q = 0; t.csi_n = 0; t.cur_vis = 1; t.want_size = 0;
     t.mouse_mode = 0; t.mouse_sgr = 0;
+    t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -355,6 +370,10 @@ fn attach_grid(t as *Term, cells as *i64, stride as i64, nrows as i64) as void {
     t.grid = cast(i64, cells);
     t.grid_stride = stride;
     t.grid_rows = nrows;
+    t.grid_lazy = 0;
+    t.grid_ready = nrows;
+    t.grid_rdyb = stride * nrows * 8;
+    t.grid_cap = nrows;
     t.live_top = 0;
     t.hist_count = 0;
     t.view_off = 0;
@@ -364,6 +383,63 @@ fn attach_grid(t as *Term, cells as *i64, stride as i64, nrows as i64) as void {
     let is i64 as i with mut = 0;
     let is i64 as total = stride * nrows;
     while (i < total) { cells[i] = blank; i = i + 1; }
+}
+
+// attach_grid_lazy — a grid over memory that is only RESERVED (cos.reserve,
+// page-aligned, stride * nrows * 8 bytes rounded up to pages). Rows are
+// committed as the ring first reaches them, so a long scrollback costs memory
+// only once there is that much history, and `clear` gives it back. If memory
+// runs out, the ring closes at the rows it has: history stops growing, and
+// nothing else changes. 0, or -1 when not even the visible rows can be had.
+fn attach_grid_lazy(t as *Term, cells as *i64, stride as i64, nrows as i64) as i64 {
+    t.grid = cast(i64, cells);
+    t.grid_stride = stride;
+    t.grid_rows = nrows;
+    t.grid_lazy = 1;
+    t.grid_ready = 0;
+    t.grid_rdyb = 0;
+    t.grid_cap = nrows;
+    t.live_top = 0;
+    t.hist_count = 0;
+    t.view_off = 0;
+    if (t.cols > stride) { t.cols = stride; }
+    if (t.rows > nrows) { t.rows = nrows; }
+    _grid_reach(t, t.rows - 1);
+    if (t.grid_ready < t.rows) { t.grid = 0; return 0 - 1; }
+    let is i64 as r with mut = 0;
+    while (r < t.rows) { _grid_blank_phys(t, r); r = r + 1; }
+    return 0;
+}
+
+// _grid_reach — grid row p (unwrapped: live_top + r) is about to be written.
+// Before the ring first wraps, rows are used in order, so p past the
+// committed rows means "commit the next stretch". When the commit fails the
+// ring is closed at the rows that are there (grid_rows shrinks); the caller
+// takes p modulo the new grid_rows, which lands on the oldest history line.
+// The view's own rows are always there: attach_grid_lazy commits them, and
+// resize grows the view only into rows it could reach.
+fn _grid_reach(t as *Term, p as i64) as void {
+    if (t.grid_lazy == 0) { return; }
+    if (t.grid_ready >= t.grid_rows) { return; }
+    if (p < t.grid_ready) { return; }
+    let is i64 as rowb = t.grid_stride * 8;
+    let is i64 as end with mut = (p + 1) * rowb + GRID_CHUNK;
+    end = ((end + 4095) / 4096) * 4096;
+    let is i64 as full = ((t.grid_rows * rowb + 4095) / 4096) * 4096;
+    if (end > full) { end = full; }
+    if (cos.commit(t.grid + t.grid_rdyb, end - t.grid_rdyb, cos.PROT_READ | cos.PROT_WRITE) == 0) {
+        t.grid_rdyb = end;
+        t.grid_ready = end / rowb;
+        if (t.grid_ready > t.grid_rows) { t.grid_ready = t.grid_rows; }
+        return;
+    }
+    // A ring as tall as the view is still a ring: it keeps no history, and
+    // the screen goes on scrolling.
+    t.grid_rows = t.grid_ready;
+    let is i64 as hmax = t.grid_rows - t.rows;
+    if (t.hist_count > hmax) { t.hist_count = hmax; }
+    if (t.view_off > t.hist_count) { t.view_off = t.hist_count; }
+    return;
 }
 
 // Cursor: a thin underline (bottom 2 rows of the cell) in fg. It sits on the
@@ -626,10 +702,25 @@ fn set_color(t as *Term, fg as u32, bg as u32) as void {
 fn clear(t as *Term) as void {
     _fill_bg(t, t.width, t.height);
     if (t.grid != 0) {
+        // A lazy grid gives the history's memory back: everything past the
+        // visible rows and one stretch more is decommitted, and a ring that
+        // had closed early for want of memory may grow to its full size again.
+        if (t.grid_lazy == 1) {
+            let is i64 as rowb = t.grid_stride * 8;
+            let is i64 as keep with mut = t.rows * rowb + GRID_CHUNK;
+            keep = ((keep + 4095) / 4096) * 4096;
+            if (keep < t.grid_rdyb) {
+                cos.decommit(t.grid + keep, t.grid_rdyb - keep);
+                t.grid_rdyb = keep;
+                t.grid_ready = keep / rowb;
+            }
+            t.grid_rows = t.grid_cap;
+            if (t.grid_ready > t.grid_rows) { t.grid_ready = t.grid_rows; }
+        }
         let is *i64 as g = cast(*i64, t.grid);
         let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
         let is i64 as i with mut = 0;
-        let is i64 as total = t.grid_stride * t.grid_rows;
+        let is i64 as total = t.grid_stride * t.grid_ready;
         while (i < total) { g[i] = blank; i = i + 1; }
         t.live_top = 0;
         t.hist_count = 0;
@@ -654,6 +745,7 @@ fn resize(t as *Term, new_w as i64, new_h as i64) as void {
     if (new_rows < 1) { new_rows = 1; }
     if (t.grid != 0) {
         if (new_cols > t.grid_stride) { new_cols = t.grid_stride; }
+        if (new_rows > t.rows) { _grid_reach(t, t.live_top + new_rows - 1); }
         if (new_rows > t.grid_rows) { new_rows = t.grid_rows; }
         t.view_off = 0;                              // a resize snaps to live
         // bottom anchor: lines pushed off the top become HISTORY (the ring
