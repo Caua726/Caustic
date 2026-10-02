@@ -6,6 +6,81 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## [v0.1.11](https://github.com/Caua726/Caustic/releases/tag/v0.1.11) — 2026-10-02
+
+Two float miscompiles at `-O1`/`-O2`, a terminal reader that reads events
+instead of bytes, display widths in columns, and builds from source that say
+which commit they are. Full notes: [`docs/releases/v0.1.11.md`](docs/releases/v0.1.11.md).
+
+**This is the first release published on GitHub since v0.1.6.** v0.1.7 through
+v0.1.10 were tagged and never released, and the installer downloads the latest
+*release*, so a plain install kept handing out v0.1.6 the whole time. Their
+entries below are what such an install has been missing.
+
+### Fixed
+- **A float compared against `0.0` was compared against a stale register at
+  `-O1` and `-O2`.** `pass_fold_immediates` turns a compare's constant operand
+  into an immediate when its bits fit in 32, and the bits of `0.0` are zero, so
+  every `x > 0.0`, `x < 0.0`, `x <= 0.0` and `x >= 0.0` was folded. The integer
+  compare checked for the immediate; the float one loaded the operand by vreg
+  number, which after folding names whatever that register last held. A loop
+  conditioned on such a compare stopped early, and a graphics suite drew nothing
+  while reporting frames twenty times faster than real. The compiler self-hosts
+  without comparing a float against zero, so the bootstrap never saw it.
+  `tests/float_cmp_imm_test.cst`, at every level.
+- **An if-converted select of floats read `rax`.** `if (c) { x = y; }` becomes
+  `IR_CMOV`, and at `-O1` and above a float `x` or `y` may live in an XMM
+  register. `gen_inst_cmov` named any register location with `reg64()`, which
+  answers `rax` for every XMM location — and `rax` had just been overwritten by
+  the `setcc` of the float compare producing the condition. A running minimum
+  `if (b < hi) { hi = b; }` came out as 5e-324. `tests/float_cmov_test.cst`.
+- **`std/term.cst`'s `read_key()` decoded escape sequences by their third byte
+  and typed the rest.** An SGR mouse report came back as Escape followed by
+  eight keystrokes; an OSC reply a terminal sends unasked, as twenty-three. The
+  reader is rebuilt (see Added), and on the way: a sequence of any introducer —
+  CSI, SS3, OSC, DCS, APC, PM, SOS, SS2 — is consumed whole or not at all; a
+  bracketed paste comes out as the keys it would have been instead of being
+  dropped; `ESC ESC x` no longer loses the `x`; a twenty-digit coordinate is
+  refused instead of wrapping into a valid-looking one, and a report for a cell
+  the terminal does not have is dropped; an over-long or out-of-range modifier
+  is refused instead of becoming Shift+Alt+Ctrl; a burst of focus reports no
+  longer hangs the reader with the typing behind it discarded; a pause in the
+  middle of a paste or a sequence no longer ends it, within a bounded hold; and
+  the NUL byte (Ctrl+Space) answers `KEY_NUL` instead of the `0` that means
+  "nothing". A module-level pointer into the caller's `Input` — a dangling one
+  once that frame returned — is gone; `read_key` reads `shared_input()`.
+- **A build from source called itself the previous release.** `src/version.cst`
+  only moves when a release is cut, so an install from the latest commit
+  answered `caustic 0.1.10` twenty-two commits later. `install.sh --from-source`
+  now derives the version from `git describe` — `0.1.11-dev.22+ddab385`, a
+  pre-release of the next patch, so SemVer orders it after the release it
+  follows — writes it into the tree for the build and puts the file back.
+- **`update.sh` treated a source build as out of date against any release**, and
+  would "update" one built past the latest release to an older compiler. The
+  manifest now records `build=source`, the branch and the commit; a source
+  install is checked against its branch on GitHub and rebuilt from source. One
+  installed before the manifest said so is left alone, with a message.
+- **A system install asked for the password once per file** under pkexec, which
+  keeps no authorization between calls. The steps are queued and run under one
+  escalation.
+
+### Added
+- **`std/term.cst` input as events**: `Event`, `Input`, `input_open` /
+  `input_close` / `input_fd` / `input_next`, covering keys, SGR-1006 mouse,
+  bracketed paste as one `EV_PASTE`, and focus. A buffered reader owns the
+  descriptor; `read_key()` keeps its signature as a shell over it. The Windows
+  path compiles and has never been run, which the module header states.
+- **`std/unicode.cst`** — how many terminal columns text takes, grapheme-cluster
+  aware: `cluster_next` (walks one cluster, allocates nothing), `cp_width`,
+  `string_width`, UTF-8 decode. Ported from caustic-unicode; its two megabytes of
+  tables keep it out of `libcaustic.cst` on purpose.
+- **`tools/prerelease.sh` names every tag past the published release**, which is
+  how v0.1.7–v0.1.10 slipped by: it compared against the newest tag, not what the
+  installer serves. Asset parity is checked against that release too.
+
+### Tests
+- The suite runs `-O2`, not only the default level and `-O1`: 42 checks to 53.
+
 ## [v0.1.10](https://github.com/Caua726/Caustic/releases/tag/v0.1.10) — 2026-08-02
 
 Two silent ceilings on how much data a program may carry as a constant. Both
