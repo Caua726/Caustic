@@ -36,6 +36,8 @@ let is u8 as CH_BSLASH with imut = 92;
 let is u8 as CH_RBRACK with imut = 93;
 let is u8 as CH_CARET  with imut = 94;
 let is u8 as CH_UNDER  with imut = 95;
+let is u8 as CH_e      with imut = 101;
+let is u8 as CH_E      with imut = 69;
 let is u8 as CH_a      with imut = 97;
 let is u8 as CH_b      with imut = 98;
 let is u8 as CH_f      with imut = 102;
@@ -136,27 +138,77 @@ fn parse_octal_val(src as *u8, start as i64, end as i64) as i64 {
     return result;
 }
 
+// Ten to the n, by squaring: exact while the result stays below 2^53 (n <= 22),
+// one rounding per step past that, infinity when it overflows.
+fn _pow10(n as i64) as f64 {
+    let is f64 as p with mut = cast(f64, 1);
+    let is f64 as b with mut = cast(f64, 10);
+    let is i64 as k with mut = n;
+    while (k > 0) {
+        if ((k & 1) == 1) { p = p * b; }
+        b = b * b;
+        k = k >> 1;
+    }
+    return p;
+}
+
+// A decimal literal — `2.5`, `0.0015`, `1e30`, `6.02214076e23` — as the nearest
+// f64. All of its digits are read as one integer M and the decimal point and
+// the exponent as one power of ten, so the value is M * 10^e in a single
+// multiply or divide: correctly rounded whenever M is below 2^53 and |e| is at
+// most 22, which is every literal written by hand, and within an ulp or two
+// past that — enough that the largest finite double written out in full,
+// 1.7976931348623157e308, rounds up to infinity; that one takes a bignum. The previous loop added each fraction digit times 0.1^k, rounding
+// once per digit: 0.0015 came out two ulps off, and so did anything that
+// compared against it.
+//
+// Uses cast(f64, N), not float literals, so the compiler that builds this file
+// does not need to parse one.
 fn parse_float(src as *u8, start as i64, end as i64) as f64 {
-    // Use cast(f64, N) instead of float literals to break bootstrap cycle
-    let is f64 as ten = cast(f64, 10);
-    let is f64 as one_tenth = cast(f64, 1) / ten;
-    let is f64 as result with mut = cast(f64, 0);
+    // Digits beyond what M holds exactly: in the integer part each still
+    // scales the value by ten; in the fraction they are past f64's precision.
+    let is i64 as m_max = 900719925474099;   // M*10 + 9 stays below 2^53
+    let is i64 as m with mut = 0;
+    let is i64 as e10 with mut = 0;
     let is i64 as i with mut = start;
-    while (i < end && src[i] != 46) {
-        if (src[i] != CH_UNDER) { result = result * ten + cast(f64, cast(i64, src[i]) - 48); }
+    while (i < end && src[i] != 46 && src[i] != CH_e && src[i] != CH_E) {
+        if (src[i] != CH_UNDER) {
+            if (m < m_max) { m = m * 10 + cast(i64, src[i]) - 48; }
+            else { e10 = e10 + 1; }
+        }
         i = i + 1;
     }
     if (i < end && src[i] == 46) {
         i = i + 1;
-        let is f64 as frac with mut = one_tenth;
-        while (i < end) {
-            if (src[i] != CH_UNDER) {
-                result = result + cast(f64, cast(i64, src[i]) - 48) * frac;
-                frac = frac * one_tenth;
+        while (i < end && src[i] != CH_e && src[i] != CH_E) {
+            if (src[i] != CH_UNDER && m < m_max) {
+                m = m * 10 + cast(i64, src[i]) - 48;
+                e10 = e10 - 1;
             }
             i = i + 1;
         }
     }
+    if (i < end && (src[i] == CH_e || src[i] == CH_E)) {
+        i = i + 1;
+        let is i32 as neg with mut = 0;
+        if (i < end && src[i] == 45) { neg = 1; i = i + 1; }
+        else if (i < end && src[i] == 43) { i = i + 1; }
+        let is i64 as e with mut = 0;
+        while (i < end) {
+            if (src[i] != CH_UNDER && e < 100000) { e = e * 10 + cast(i64, src[i]) - 48; }
+            i = i + 1;
+        }
+        if (neg == 1) { e10 = e10 - e; } else { e10 = e10 + e; }
+    }
+    let is f64 as result with mut = cast(f64, m);
+    if (e10 > 0) { return result * _pow10(e10); }
+    // A divisor past 10^308 is infinity and would round a denormal like
+    // 4.9e-324 to zero; dividing in steps keeps it.
+    while (e10 < 0 - 300) {
+        result = result / _pow10(300);
+        e10 = e10 + 300;
+    }
+    if (e10 < 0) { return result / _pow10(0 - e10); }
     return result;
 }
 
