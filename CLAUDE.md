@@ -367,7 +367,8 @@ fn work() as i32 {
 - **Syscall numbers**: x86_64 and AArch64 use different tables. Prefer
   `std/os/linux.cst`, whose wrappers select the correct number and translate
   legacy calls to AArch64 `*at` forms where required.
-- **Float literals**: Must match variable type (`10.0` for f64, not `10`). f32 literal narrowing is automatic.
+- **Float literals**: Must match variable type (`10.0` for f64, not `10`). f32 literal narrowing is automatic. Exponents are accepted (`1e30`, `1.5e-3`, `2E+8`), and a literal is the nearest f64 to what was written.
+- **Implicit conversions — one rule everywhere**: `let`, `return`, assignment and call arguments (direct and `call()`) all go through `try_implicit_convert`. No integer narrowing (`i64` into an `i32` slot needs `cast(i32, x)`), no float<->int crossing, and a function stored or passed as an `fn(...)` type must match its signature (parameter count, each type, return). What stays implicit: widening, a `bool` or unsigned value into a strictly wider signed type, any pointer into any pointer, an array where a pointer is expected (its address), and a constant expression that fits (`0 - 1` into an i32, `0.0 - 40.0` into an f32), which narrows like a literal. `tests/reject/ok_convert.cst` and its `convert_*` twins pin the rule.
 - **Char literals**: Now properly typed, no cast needed for `let is char as c = 'A'`
 - **Return via exit code**: `return N` from main becomes process exit code (0-255)
 - **Unused variable warnings**: Variables declared but never used produce a warning (prefix with `_` to suppress)

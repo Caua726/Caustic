@@ -6,6 +6,62 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## Unreleased
+
+### Fixed
+- **A function of another signature could be stored into, or passed as, an
+  `fn(...)` type.** `fn(f64) as i64` went into an `fn(i64, *u8) as i32`
+  without a word, and `call()` through it checked only the number of
+  arguments: its type check compared size AND kind, so it fired only when both
+  differed — never between pointers, which are all eight bytes. The signature
+  is compared now, parameter by parameter and the return type.
+- **Assignments and call arguments were checked only when the value was a
+  literal.** An `f64` variable passed for an `i64` parameter compiled, and the
+  callee read the integer register it was never put in. `let`, `return`,
+  assignment and every call now share one rule — `try_implicit_convert` — so
+  they cannot drift apart again: no float<->int crossing, no implicit integer
+  narrowing, signatures must match. Making the toolchain itself pass it took
+  162 explicit casts, every one an `i64` into an `i32` or an `i32` into a field
+  narrowed to `i16`/`i8` for memory; none was a float, a pointer or a
+  signature. What stays implicit: widening, a `bool` or unsigned value into a
+  wider signed type (which `let` used to refuse too), an array where a pointer
+  is expected, and a constant expression that fits — `0 - 1` into an `i32`,
+  `0.0 - 40.0` into an `f32` — which narrows the way a literal does.
+- **caustic-as dropped every import past the 256th without a word.** The
+  `.cstimport` table was fixed at 256 (lib, symbol) pairs, and the linker
+  builds DT_NEEDED from it alone, while the PLT relocations — from the calls —
+  were all still there. A program whose first 256 imports came from one library
+  lost the NEEDED entry of every library after it and died at exec: 240 imports
+  worked, 280 did not, 770 from a single library did. The table grows.
+- **caustic-ld wrote past two stack arrays.** `-l` libraries went into a
+  `[32]i64` and input files into a `[256]i64`, both filled with no bound check,
+  and the DT_NEEDED offsets were a `[32]i32` filled for the first 32 libraries
+  and read for all of them — the 33rd got a NEEDED naming whatever the stack
+  held. With 40 libraries the binary named `[l5.so]` and `[]` and segfaulted.
+  All three are sized by what they hold.
+- **Float literals were up to two ulps off.** The parser added each fraction
+  digit times 0.1^k, rounding once per digit: `0.0015` was not the double
+  nearest 0.0015. Digits are now read as one integer and scaled by one power of
+  ten, which is correctly rounded for every literal written by hand.
+
+### Added
+- **Float literals take an exponent**: `1e30`, `1.5e-3`, `2E+8`.
+- **`caustic-as --version` and `caustic-ld --version`.** The assembler read
+  `--version` as a file to assemble; the linker refused it.
+- **Source builds version the assembler and linker too.** `install.sh
+  --from-source` derives each tool's version from its own repository's tags,
+  as it does the compiler's.
+
+### Changed
+- `caustic-x86_64-windows.zip` is no longer tracked. It is a release asset, and
+  `install.sh --from-source` rebuilds it whenever it installs `libcaustic.dll`,
+  so every build from a checkout after the first reported itself `.dirty`.
+
+### Upgrading
+The stricter conversions can reject code that compiled before. Every rejection
+is a value that was being changed silently — truncated, or read from the wrong
+register — so the fix is the cast that says so, or the type that was meant.
+
 ## [v0.1.11](https://github.com/Caua726/Caustic/releases/tag/v0.1.11) — 2026-10-02
 
 Two float miscompiles at `-O1`/`-O2`, a terminal reader that reads events
