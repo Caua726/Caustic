@@ -39,6 +39,25 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   and read for all of them — the 33rd got a NEEDED naming whatever the stack
   held. With 40 libraries the binary named `[l5.so]` and `[]` and segfaulted.
   All three are sized by what they hold.
+- **A 33rd custom section was lost, everywhere it passed.** caustic-as filed
+  its bytes under `.data`; its ELF, COFF and AArch64 writers indexed `[32]`
+  stack arrays past their end; caustic-ld skipped the 33rd section and `.rela`
+  of each object and answered the 33rd distinct name with index 0, appending
+  its bytes to the first custom section. All of it is sized by the section
+  count now. The one limit left is an error: 95 custom sections per object,
+  because the 96th would take id 99, the id that means "undefined".
+- **Every executable with a custom section had a corrupt section header
+  table.** The symbol table and section headers were placed at the end of
+  `.data`, on top of the custom sections written after it; readelf, objdump
+  and gdb read garbage. The program ran — the loader never reads that table.
+- **More fixed tables in caustic-ld.** The import table failed the link past
+  1024 pairs (on a duplicate, too); the CSE writer wrote every import past the
+  4096th name against name 0; and on Windows, `.pdata` covered only the first
+  256 functions, leaving the rest without unwind information. All grow now.
+- **An error in an imported module named the module's alias, or the wrong
+  file.** A body error read `pe:92:35`; a declaration error — a duplicate
+  top-level `let` — was reported against the IMPORTER's file at the module's
+  line and column. Every pass now reports against the module's own path.
 - **Float literals were up to two ulps off.** The parser added each fraction
   digit times 0.1^k, rounding once per digit: `0.0015` was not the double
   nearest 0.0015. Digits are now read as one integer and scaled by one power of
