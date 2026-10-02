@@ -388,8 +388,56 @@ if [ "$DRY" = 1 ]; then
     exit 0
 fi
 
+# --- the version a build from source reports ---
+# src/version.cst only moves when a release is cut, so every build between two
+# releases used to call itself the older one, and nothing — update.sh included —
+# could tell them apart. A source build derives its version from git instead:
+#   on the tag v0.1.10             0.1.10
+#   20 commits past it             0.1.11-dev.20+ce84abf
+#   ... with uncommitted edits     0.1.11-dev.20+ce84abf.dirty
+#   no release tag to count from   0.1.10+ce84abf   (what version.cst says)
+# A commit past a release is a pre-release of the next patch, so SemVer orders
+# them right: 0.1.10 < 0.1.11-dev.20 < 0.1.11. Prints nothing without git.
+source_version() {
+    command -v git >/dev/null 2>&1 || return 0
+    _d=$(git -C "$1" describe --tags --long --always --match 'v[0-9]*' --dirty --abbrev=7 2>/dev/null) || return 0
+    _dirty=""
+    case "$_d" in *-dirty) _dirty=".dirty"; _d=${_d%-dirty} ;; esac
+    case "$_d" in
+        *-g*) ;;
+        *)  _v=$(sed -n 's/.*VERSION with imut = "\([^"]*\)".*/\1/p' "$1/src/version.cst")
+            [ -n "$_v" ] && echo "$_v+$_d$_dirty"
+            return 0 ;;
+    esac
+    _hash=${_d##*-g}; _d=${_d%-g*}
+    _n=${_d##*-};     _base=${_d%-*}; _base=${_base#v}
+    if [ "$_n" = 0 ] && [ -z "$_dirty" ]; then echo "$_base"; return 0; fi
+    _patch=${_base##*.}
+    case "$_patch" in ''|*[!0-9]*) echo "$_base+$_n.$_hash$_dirty"; return 0 ;; esac
+    echo "${_base%.*}.$((_patch + 1))-dev.$_n+$_hash$_dirty"
+}
+
+# The version is written into the tree for the length of the build and the file
+# is put back afterwards — on failure too, through the trap below — because the
+# tree may be your own checkout, and a build should not leave it modified.
+VERSION_FILE=""; VERSION_SAVED=""
+stamp_version() {
+    BUILD_VERSION=$(source_version "$1")
+    [ -n "$BUILD_VERSION" ] || return 0
+    VERSION_FILE="$1/src/version.cst"
+    VERSION_SAVED="$TMPDIR/version.cst.orig"
+    cp "$VERSION_FILE" "$VERSION_SAVED"
+    sed "s/\(VERSION with imut = \"\)[^\"]*\"/\1$BUILD_VERSION\"/" "$VERSION_SAVED" > "$VERSION_FILE"
+    echo "  version $BUILD_VERSION"
+}
+unstamp_version() {
+    [ -n "$VERSION_SAVED" ] || return 0
+    cp "$VERSION_SAVED" "$VERSION_FILE"
+    VERSION_SAVED=""
+}
+
 # --- obtain the trees to install ---
-TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+TMPDIR=$(mktemp -d); trap 'unstamp_version; rm -rf "$TMPDIR"' EXIT INT TERM
 ROOT_SCRIPT="$TMPDIR/root-steps.sh"
 : > "$ROOT_SCRIPT"
 is_checkout() { [ -f "$1/Causticfile" ] && [ -f "$1/src/main.cst" ]; }
@@ -414,12 +462,19 @@ if [ "$FROM_SRC" = 1 ]; then
     else
         command -v git >/dev/null 2>&1 || { echo "error: 'git' is required to clone (or use --source-dir=DIR)"; exit 1; }
         echo "cloning $REPO ($REF) ..."
-        git clone --depth 1 --branch "$REF" --recurse-submodules \
+        # The whole history, but no file contents beyond this commit's: the
+        # version below counts commits since the last release tag, and a
+        # --depth 1 clone has neither the tag nor the commits to count.
+        git clone --filter=blob:none --branch "$REF" --recurse-submodules \
             "https://github.com/$REPO.git" "$TMPDIR/src" >/dev/null 2>&1 \
             || { echo "error: clone failed"; exit 1; }
         SOURCE_DIR="$TMPDIR/src"
     fi
     echo "building from $SOURCE_DIR ..."
+    BUILD_COMMIT=$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)
+    BUILD_REF=$(git -C "$SOURCE_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true)
+    [ -n "$BUILD_REF" ] || BUILD_REF="$REF"
+    stamp_version "$SOURCE_DIR"
 
     # Caustic compiles itself, so building it needs a compiler to start from.
     # Prefer one already in the checkout, then one on PATH, and fall back to the
@@ -481,6 +536,7 @@ if [ "$FROM_SRC" = 1 ]; then
           || { echo "error: the universal build produced no $UNIVERSAL"; exit 1; }
         cp "$SOURCE_DIR/$UNIVERSAL" "$SRC/bin/$UNIVERSAL"
     fi
+    unstamp_version
 else
     need_curl
     echo "downloading latest release ..."
@@ -654,6 +710,15 @@ MANIFEST="$LIB_DIR/install-manifest"
     echo "source=$WITH_SRC"
     echo "root=$ROOT_METHOD"
     [ "$WITH_SRC" = 1 ] && echo "stddir=$STD_DIR"
+    # What the binaries were built from. update.sh compares a source build's
+    # commit against the branch it came from, not against the latest release.
+    if [ "$FROM_SRC" = 1 ]; then
+        echo "build=source"
+        echo "ref=$BUILD_REF"
+        [ -n "$BUILD_COMMIT" ] && echo "commit=$BUILD_COMMIT"
+    else
+        echo "build=release"
+    fi
     echo "files:"
     printf "%s" "$MANIFEST_FILES"
 } > "$TMPDIR/manifest"

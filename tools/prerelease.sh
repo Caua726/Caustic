@@ -12,6 +12,9 @@
 #   1. src/version.cst and Causticfile agree on the version string.
 #   2. The version is NEWER than the latest release tag (not the same, not older).
 #   3. A tag v<version> does not already exist (would collide on `git tag`).
+#   4. (warns) Tags newer than the published GitHub release — the installer
+#      serves the release, so those versions never reached anyone.
+#   5. (warns) An asset the last published release carried is not built.
 #
 # It reads only the working tree + git metadata — it builds nothing and mutates
 # nothing. The self-host fixpoint / test gate is a separate step
@@ -96,14 +99,40 @@ if [ -n "$LAST_TAG" ]; then
     info "changelog:  git log --oneline $LAST_TAG..HEAD"
 fi
 
-# ---- 4. asset parity with the previous release -----------------------------
+# ---- 4. tags that never became releases ------------------------------------
+# install.sh downloads /releases/latest, not the newest tag. v0.1.7 to v0.1.10
+# went out as tags alone, and for that whole stretch a plain install still
+# handed out v0.1.6 — nothing said so. A tag with no GitHub release does not
+# exist for anyone who installs the normal way, so name every one of them: the
+# release being cut is the first those users will see, and its notes owe them
+# what they missed. Warns rather than blocks, because publishing this release is
+# what closes the gap.
+PUBLISHED=""
+if [ -n "${LAST_TAG:-}" ] && command -v gh >/dev/null 2>&1; then
+    step "Published GitHub release"
+    PUBLISHED="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+    if [ -z "$PUBLISHED" ]; then
+        info "could not ask GitHub for the latest release"
+    elif [ "$PUBLISHED" = "$LAST_TAG" ]; then
+        ok "the latest tag ($LAST_TAG) is the release the installer serves"
+    else
+        UNPUBLISHED="$(git tag --sort=v:refname | grep -E '^v?[0-9]' \
+                       | awk -v from="$PUBLISHED" 'seen; $0 == from { seen = 1 }' | tr '\n' ' ')"
+        warn "the installer still serves $PUBLISHED; tagged but never released: $UNPUBLISHED"
+        info "cover them in this release's notes, and publish it with gh release create"
+    fi
+fi
+
+# ---- 5. asset parity with the previous release -----------------------------
 # A release that ships fewer downloads than the one before it is a regression
 # nobody notices until someone looks for a file that used to be there. This
 # names them rather than guessing, and warns instead of blocking: dropping an
-# asset can be deliberate, but it should never be a surprise.
-if [ -n "${LAST_TAG:-}" ] && command -v gh >/dev/null 2>&1; then
-    step "Assets carried by $LAST_TAG"
-    PREV_ASSETS="$(gh release view "$LAST_TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+# asset can be deliberate, but it should never be a surprise. Compared against
+# the last PUBLISHED release: a tag with no release has no assets to compare,
+# and asking it for them made this check pass in silence.
+if [ -n "$PUBLISHED" ]; then
+    step "Assets carried by $PUBLISHED"
+    PREV_ASSETS="$(gh release view "$PUBLISHED" --json assets --jq '.assets[].name' 2>/dev/null || true)"
     if [ -n "$PREV_ASSETS" ]; then
         MISSING=""
         for a in $PREV_ASSETS; do
@@ -113,7 +142,7 @@ if [ -n "${LAST_TAG:-}" ] && command -v gh >/dev/null 2>&1; then
             warn "not built yet:$MISSING"
             info "tools/release-build.sh produces all three"
         else
-            ok "every asset $LAST_TAG shipped is present"
+            ok "every asset $PUBLISHED shipped is present"
         fi
     fi
 fi
