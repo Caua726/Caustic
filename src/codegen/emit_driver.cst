@@ -185,6 +185,12 @@ fn gen_func(func as *d.IRFunction) as void {
     // function probes because recursion can place any of them at unbounded
     // depth. The helper itself is hand-emitted (not via gen_func) so it never
     // probes itself.
+    //
+    // How far the stack is committed is the RUNNING THREAD's: fs:[0], the
+    // first word of its thread block (CausticOS abi.THREAD_BLOCK_*). It was a
+    // single global, the first thread's — so the first call any other thread
+    // made compared its own stack against the first one's and ended the
+    // process trying to commit the space in between.
     if (tgt.target_get().object_format == 3 && tgt.cse_stack_dynamic_get() == 1 && func.is_naked == 0) {
         let is i32 as descent = (1 + push_count) * 8 + total;
         let is i64 as pid2 = cast(i64, sa_probe_counter);
@@ -192,11 +198,7 @@ fn gen_func(func as *d.IRFunction) as void {
         eo.out_cstr("  lea rax, [rsp-");
         eo.out_int(cast(i64, descent) + cast(i64, SA_PROBE_MARGIN));
         eo.out_cstr("]\n");
-        // r11 is caller-saved scratch (never an arg), free to clobber at entry.
-        // Load-then-compare avoids `cmp reg, [rip+mem]`, which the ALU encoder
-        // doesn't form (only mov does rip-relative memory).
-        eo.out_cstr("  mov r11, QWORD PTR [rip+__caustic_stk_bottom]\n");
-        eo.out_cstr("  cmp rax, r11\n");
+        eo.out_cstr("  cmp rax, QWORD PTR fs:[0]\n");
         eo.out_cstr("  jae .Lsk");
         eo.out_int(pid2);
         eo.out_cstr("\n");
@@ -676,30 +678,31 @@ fn sa_predetect(p as *d.IRProgram) as void {
     }
 }
 
-// Emit the dynamic-stack runtime (CSE dynamic programs only): the committed-
-// bottom tracker + the grow helper. Called once after all functions.
+// Emit the dynamic-stack runtime (CSE dynamic programs only): the grow helper.
+// Called once after all functions.
 //
-// __caustic_stk_bottom holds the lowest currently-committed stack address,
-// pre-initialized to (USER_STACK_TOP_VA - INITIAL_STACK_COMMIT) — no _start
-// patch needed since both are compile-time constants. THESE TWO CONSTANTS MUST
-// MATCH THE KERNEL (causticos kernel/elf.cst: USER_STACK_TOP_VA and
-// INITIAL_STACK_COMMIT); they are the explicit-growth ABI between toolchain and
-// loader.
+// Each thread's stack is described by its thread block, at its fs base
+// (CausticOS kernel/abi.cst, THREAD_BLOCK_*): fs:[0] is the lowest committed
+// byte, fs:[16] the bottom of the reservation. The loader writes the first
+// thread's; whoever starts another writes that one's (std thread_start). So
+// the runtime keeps no copy of the kernel's stack constants, and every thread
+// grows its own stack.
 //
-// __caustic_stkgrow(rax = lowest address the caller needs): commit
-// [page_down(rax) - 64 KiB, committed_bottom) via SYS_COMMIT(27), update the
-// tracker. Leaf, preserves every GP register (it runs mid-prologue, before the
-// caller has saved its args). Recursing past the reserved ceiling makes
-// SYS_COMMIT fail → exit(134), a clean stack overflow.
+// __caustic_stkgrow(rax = lowest address the caller needs): commit from
+// page_down(rax) - 64 KiB — or the reservation's bottom, if that comes first —
+// up to the committed bottom, via SYS_COMMIT(27), and record the new bottom.
+// Leaf, preserves every GP register (it runs mid-prologue, before the caller
+// has saved its args). Needing more than the reservation holds is a stack
+// overflow: exit(134), as is a SYS_COMMIT that fails.
+//
+// The new bottom crosses the syscall in rbx. It used to cross in rdi, which
+// the kernel did not give back: the first growth recorded the bottom as
+// whatever the kernel left in rdi (12, in the run that found it), every probe
+// after that believed the whole stack committed, and the next frame past the
+// first 64 KiB of growth faulted.
 fn emit_dynamic_stack_runtime() as void {
     if (tgt.target_get().object_format != 3) { return; }
     if (tgt.cse_stack_dynamic_get() != 1) { return; }
-
-    eo.out_cstr(".section .data\n");
-    eo.out_cstr("__caustic_stk_bottom:\n");
-    eo.out_cstr("  .quad ");
-    eo.out_int(0x00007FFFFFFFE000 - 0x20000);   // USER_STACK_TOP_VA - INITIAL_STACK_COMMIT
-    eo.out_cstr("\n");
 
     eo.out_cstr(".section .text\n");
     eo.out_cstr("__caustic_stkgrow:\n");
@@ -711,25 +714,32 @@ fn emit_dynamic_stack_runtime() as void {
     eo.out_line("push r9");
     eo.out_line("push r10");
     eo.out_line("push r11");
+    eo.out_line("push rbx");                         // holds the new bottom across the syscall
     eo.out_line("shr rax, 12");                     // page-align the needed address down
     eo.out_line("shl rax, 12");                     // (avoids AND with a negative immediate)
-    eo.out_line("sub rax, 65536");                  // grow 64 KiB ahead to amortize
-    eo.out_cstr("  mov rcx, QWORD PTR [rip+__caustic_stk_bottom]\n");
+    eo.out_cstr("  mov rcx, QWORD PTR fs:[16]\n"); // the reservation's bottom
+    eo.out_line("cmp rax, rcx");
+    eo.out_cstr("  jb .Lsg_fail\n");               // more than it holds: overflow
+    eo.out_line("sub rax, 65536");                  // grow 64 KiB ahead to amortize,
+    eo.out_line("cmp rax, rcx");
+    eo.out_cstr("  jae .Lsg_ahead\n");
+    eo.out_line("mov rax, rcx");                     // but not past the bottom
+    eo.out_cstr(".Lsg_ahead:\n");
+    eo.out_cstr("  mov rcx, QWORD PTR fs:[0]\n");  // committed so far
     eo.out_line("cmp rax, rcx");                     // already covered? (defensive)
     eo.out_cstr("  jae .Lsg_done\n");
-    eo.out_line("mov rdi, rax");                     // SYS_COMMIT addr = new bottom
-    eo.out_line("mov rsi, rcx");
-    eo.out_line("sub rsi, rax");                     // len = old_bottom - new_bottom
+    eo.out_line("mov rbx, rax");                     // the new bottom, in a register the
+    eo.out_line("mov rdi, rax");                     // syscall ABI always preserved; rdi
+    eo.out_line("mov rsi, rcx");                     // came back as dispatch left it on
+    eo.out_line("sub rsi, rax");                     // kernels before 2026-10
     eo.out_line("mov rdx, 3");                       // PROT_READ | PROT_WRITE
-    eo.out_line("mov rax, 27");                      // SYS_COMMIT
+    eo.out_line("mov rax, 27");                      // SYS_COMMIT(new bottom, old - new)
     eo.out_line("syscall");
     eo.out_line("test rax, rax");
     eo.out_cstr("  jnz .Lsg_fail\n");
-    // The assembler forms rip-relative LOADs but not STOREs, so take the
-    // address first (r10 is saved above) and store through it.
-    eo.out_cstr("  lea r10, [rip+__caustic_stk_bottom]\n");
-    eo.out_cstr("  mov QWORD PTR [r10], rdi\n");
+    eo.out_cstr("  mov QWORD PTR fs:[0], rbx\n");
     eo.out_cstr(".Lsg_done:\n");
+    eo.out_line("pop rbx");
     eo.out_line("pop r11");
     eo.out_line("pop r10");
     eo.out_line("pop r9");

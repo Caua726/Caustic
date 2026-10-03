@@ -458,14 +458,107 @@ fn event_subscribe(pid as i64, mask as i64) as i64 { return syscall(45, pid, mas
 
 // --- threads over one address space. thread_spawn starts a ring-3 thread in
 //     the CALLER's aspace at `entry`, with `arg` in rdi, running on `stack_top`
-//     (the caller mmap'd that stack — the kernel supplies mechanism, the stack
-//     is policy). thread_exit ends the calling thread only; exit() still ends
-//     the whole process. A CPU-bound worker lives here without stalling the
-//     parent's poll loop. ---
-fn thread_spawn(entry as i64, arg as i64, stack_top as i64) as i64 {
-    return syscall(46, entry, arg, stack_top);
+//     (the caller made that stack — the kernel supplies mechanism, the stack
+//     is policy) with `block` as its thread block, its fs base. thread_start
+//     below makes both and is what to call. thread_exit ends the calling
+//     thread only; exit() still ends the whole process. A worker that blocks
+//     or computes lives here without stalling the parent's poll loop. ---
+fn thread_spawn(entry as i64, arg as i64, stack_top as i64, block as i64) as i64 {
+    return syscall(46, entry, arg, stack_top, block);
 }
 fn thread_exit(code as i64) as void { syscall(47, code); }
+
+// The thread block (kernel/abi.cst THREAD_BLOCK_*): what belongs to one thread,
+// at its fs base, 64 bytes. The loader writes the first thread's; thread_start
+// writes the others'.
+//   [0]  lowest committed byte of the thread's stack — a dynamic-stack
+//        program's prologue probes read it (fs:[0]) and lower it as they grow
+//        the stack;
+//   [8]  the block's own address;
+//   [16] the bottom of the stack's reservation, which growth cannot pass.
+let is i64 as THREAD_BLOCK_SIZE with imut = 64;
+let is i64 as TB_STACK_LOW      with imut = 0;
+let is i64 as TB_SELF           with imut = 8;
+let is i64 as TB_STACK_FLOOR    with imut = 16;
+
+// What a thread started by thread_run runs first: its entry function with its
+// argument — the two thread_run left at the top of the new stack, `at` — and
+// then the end of the thread, with what the entry returned as the code. So an
+// entry function may end with thread_exit or simply return.
+fn _thread_main(at as *i64) as void {
+    let is i64 as code = call(at[0], at[1]);
+    thread_exit(code);
+    return;
+}
+
+// A thread's stack and block, as thread_start made them.
+struct ThreadStack {
+    base as i64;     // the reservation: [base, base + size)
+    size as i64;
+    block as i64;    // its thread block, at the top
+    tid as i64;
+}
+
+// thread_block_init — lay a thread block at the top of the stack
+// [base, base + size), whose committed part starts at `low`, and return the
+// block's address: what thread_run starts a thread under. thread_start does
+// this for the stack it makes; a caller that keeps stacks of its own does it
+// each time it starts a thread on one.
+fn thread_block_init(base as i64, size as i64, low as i64) as i64 {
+    let is *i64 as tb = cast(*i64, base + size - THREAD_BLOCK_SIZE);
+    let is i64 as w with mut = 0;
+    while (w < THREAD_BLOCK_SIZE / 8) { tb[w] = 0; w = w + 1; }
+    tb[TB_STACK_LOW / 8] = low;
+    tb[TB_SELF / 8] = cast(i64, tb);
+    tb[TB_STACK_FLOOR / 8] = base;
+    return cast(i64, tb);
+}
+
+// thread_run — start entry(arg) on the stack below `block`, through
+// _thread_main: the entry and its argument go in the top 16 bytes of the
+// stack, and the thread is entered 8 below them, rsp 8 off 16-byte alignment
+// as after a call. The tid, or the errno.
+fn thread_run(entry as i64, arg as i64, block as i64) as i64 {
+    let is *i64 as at = cast(*i64, block - 16);
+    at[0] = entry;
+    at[1] = arg;
+    return thread_spawn(cast(i64, fn_ptr(_thread_main)), cast(i64, at), block - 24, block);
+}
+
+// thread_start — run entry(arg) on a new thread with a stack of its own:
+// `reserve_bytes` of address space, the top `commit_bytes` of them committed
+// (both rounded up to pages, the commit to at least one), the thread block in
+// the top 64 bytes and the stack below it. In a dynamic-stack program the
+// thread's probes commit more as it goes deeper, up to the reservation; in
+// one with a static stack the commit is all it gets, so make it the whole
+// reservation. 0 and `t` filled in, or the errno with nothing left reserved.
+fn thread_start(t as *ThreadStack, entry as i64, arg as i64, reserve_bytes as i64, commit_bytes as i64) as i64 {
+    let is i64 as size = ((reserve_bytes + 4095) / 4096) * 4096;
+    let is i64 as c with mut = ((commit_bytes + 4095) / 4096) * 4096;
+    if (c < 4096) { c = 4096; }
+    if (size < c) { return E_INVAL; }
+    let is i64 as rw = PROT_READ | PROT_WRITE;
+    let is i64 as base = reserve(0, size, rw);
+    if (base < 0) { return base; }
+    let is i64 as rc = commit(base + size - c, c, rw);
+    if (rc != 0) { munmap(base, size); return rc; }
+    let is i64 as tb = thread_block_init(base, size, base + size - c);
+    let is i64 as tid = thread_run(entry, arg, tb);
+    if (tid < 0) { munmap(base, size); return tid; }
+    t.base = base;
+    t.size = size;
+    t.block = tb;
+    t.tid = tid;
+    return 0;
+}
+
+// Give a thread's stack and block back — once the thread has ended, which
+// is the caller's to know (a channel it closed, a flag it set last).
+fn thread_stack_free(t as *ThreadStack) as void {
+    if (t.base != 0) { munmap(t.base, t.size); }
+    t.base = 0; t.size = 0; t.block = 0;
+    return;
+}
 
 // --- device enumeration: the read-all counterpart of dev_count. Writes
 //     {class, index} pairs (2 x i64) for every registered instance, up to
