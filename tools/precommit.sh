@@ -331,6 +331,21 @@ NIMG=$(od -An -tu1 -j6 -N1 "$FATOUT" | tr -d ' ')
 [ "$NIMG" = "2" ] || die "multi-arch .cse declares $NIMG images, expected 2"
 ok ".csl resolves through csl_loader; container carries 2 slices"
 
+# A polyglot is built by the compiler running itself once per format. It used to
+# re-exec argv[0], which is a bare name when the compiler came from PATH, and
+# execve does not search PATH: every polyglot failed unless the compiler was
+# called by a path. So it is called by name here, on purpose — and the result
+# has to come out executable and run.
+mkdir -p "$TMP/pathbin"
+ln -sf "$CUR" "$TMP/pathbin/caustic"
+if ! ( cd "$TMP" && PATH="$TMP/pathbin:$PATH" caustic -q --target=caustic --mode=compat \
+        "$PROBE" -o "$TMP/poly" ) >"$TMP/poly.log" 2>&1; then
+    tail -5 "$TMP/poly.log"; die "a polyglot build with the compiler called by name (via PATH) failed"
+fi
+[ -x "$TMP/poly.cse.exe" ] || die "the polyglot is missing or not executable"
+[ "$(runrc "$TMP/poly.cse.exe")" = "42" ] || die "the polyglot does not run on Linux"
+ok "a polyglot builds with the compiler called by name, and runs"
+
 check_installers
 
 printf "\n${G}${B}pre-commit OK${N} — toolchain builds and self-hosts correctly at -O0/-O1/-O2.\n"

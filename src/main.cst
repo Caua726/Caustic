@@ -1682,43 +1682,81 @@ fn cse_path_with_suffix(out as *u8, base as *u8, suffix as *u8) as *u8 {
     return out;
 }
 
-// fork + execve + wait4 via raw Linux syscalls (the compiler always runs on
-// Linux). Returns the child's exit code, or 1 on fork failure. envp is the
+// fork + execve + wait4 via raw Linux syscalls. Returns the child's exit code;
+// CSE_SPAWN_NOFORK when fork failed, CSE_SPAWN_NOHOST on a host that cannot do
+// this at all, and 128 + the signal when the child was killed. envp is the
 // parent's environment (so the sub-compiler keeps PATH etc.).
-fn cse_spawn_wait(path as *u8, argv as *u8, envp as *u8) as i32 {
+//
+// The child execs /proc/self/exe — THIS compiler, by the kernel's own handle on
+// it — and never argv[0]. argv[0] is whatever the shell was given: the bare
+// name `caustic` when it came from PATH, which execve does not search, so
+// every polyglot build failed unless the compiler was called by a path. It is
+// also right for the symlinked install (caustic → caustic-elf) and for the
+// body a .cse.exe extracts to a temporary file, which may be gone by now.
+let is i32 as CSE_SPAWN_NOFORK with imut = 0 - 1;
+let is i32 as CSE_SPAWN_NOHOST with imut = 0 - 2;
+
+fn cse_spawn_wait(argv as *u8, envp as *u8) as i32 {
     // fork/execve/wait4 — the one-command polyglot orchestrator spawns copies
     // of itself to drive the sub-builds. Linux-HOST-only (raw process syscalls).
     // __target_is_linux folds to a literal, so on Windows/CausticOS builds of
     // the compiler the parser-injected 0 makes this branch dead code and the
-    // raw syscalls never reach codegen. A non-Linux-hosted compiler reports the
-    // spawn as failed — build polyglots on a Linux host.
+    // raw syscalls never reach codegen.
     if (__target_is_linux == 1) {
+        let is *u8 as self_exe = "/proc/self/exe";
         let is i64 as pid with mut = 0;
         if (__target_is_aarch64 == 1) { pid = syscall(220, 17, 0, 0, 0, 0); }
         else { pid = syscall(57, 0, 0, 0); }   // fork
-        if (pid < 0) { return 1; }
+        if (pid < 0) { return CSE_SPAWN_NOFORK; }
         if (pid == 0) {
             if (__target_is_aarch64 == 1) {
-                syscall(221, cast(i64, path), cast(i64, argv), cast(i64, envp));
+                syscall(221, cast(i64, self_exe), cast(i64, argv), cast(i64, envp));
                 syscall(93, 127);
             } else {
-                syscall(59, cast(i64, path), cast(i64, argv), cast(i64, envp));  // execve
+                syscall(59, cast(i64, self_exe), cast(i64, argv), cast(i64, envp));  // execve
                 syscall(60, 127, 0, 0);                 // _exit(127) if execve failed
             }
         }
         let is i64 as status with mut = 0;
         if (__target_is_aarch64 == 1) { syscall(260, pid, cast(i64, &status), 0, 0); }
         else { syscall(61, pid, cast(i64, &status), 0, 0); } // wait4(pid, &status, 0, NULL)
+        if ((status & 127) != 0) { return cast(i32, 128 + (status & 127)); }   // killed by a signal
         return cast(i32, (status >> 8) & 255);      // WEXITSTATUS
+    }
+    return CSE_SPAWN_NOHOST;
+}
+
+// Why a sub-build failed, after which one. The sub-compiler's own errors are
+// already on stderr above this line when it ran at all; what is said here is
+// only what it could not say itself. This used to guess — "program must be
+// portable — no raw syscall(); use std facades" — for every Windows failure,
+// including the ones where the compiler never started.
+fn cse_sub_failed(what as *u8, kind as *u8, rc as i32) as i32 {
+    io.write_str(io.STDERR, "caustic: ");
+    io.write_str(io.STDERR, what);
+    io.write_str(io.STDERR, ": the ");
+    io.write_str(io.STDERR, kind);
+    if (rc == CSE_SPAWN_NOHOST) {
+        io.write_str(io.STDERR, " build needs a Linux host (it runs the compiler once per format)\n");
+    } else if (rc == CSE_SPAWN_NOFORK) {
+        io.write_str(io.STDERR, " build could not start: fork failed\n");
+    } else if (rc == 127) {
+        io.write_str(io.STDERR, " build could not start: the compiler could not run itself again (/proc/self/exe)\n");
+    } else if (rc > 128) {
+        io.write_str(io.STDERR, " build crashed (signal ");
+        io.write_int(io.STDERR, cast(i64, rc - 128));
+        io.write_str(io.STDERR, ")\n");
+    } else {
+        io.write_str(io.STDERR, " build failed; its errors are above\n");
     }
     return 1;
 }
 
-fn cse_subexec(self_path as *u8, targflag as *u8, modeflag as *u8,
+fn cse_subexec(argv0 as *u8, targflag as *u8, modeflag as *u8,
                out_path as *u8, envp as *u8) as i32 {
     let is [128]i64 as cargv;
     let is i32 as n with mut = 0;
-    cargv[n] = cast(i64, self_path); n = n + 1;
+    cargv[n] = cast(i64, argv0); n = n + 1;
     cargv[n] = cast(i64, targflag); n = n + 1;
     if (cast(i64, modeflag) != 0) { cargv[n] = cast(i64, modeflag); n = n + 1; }
     let is i32 as fi with mut = 0;
@@ -1727,7 +1765,7 @@ fn cse_subexec(self_path as *u8, targflag as *u8, modeflag as *u8,
     cargv[n] = cast(i64, "-o"); n = n + 1;
     cargv[n] = cast(i64, out_path); n = n + 1;
     cargv[n] = 0;
-    return cse_spawn_wait(self_path, cast(*u8, &cargv), envp);
+    return cse_spawn_wait(cast(*u8, &cargv), envp);
 }
 
 // Multi-architecture triple: build one pure .cse per CausticOS architecture and fuse them into
@@ -1740,14 +1778,10 @@ fn cse_orchestrate_fat(self_path as *u8, envp as *u8) as i32 {
     let is *u8 as x64 = cse_path_with_suffix(cast(*u8, &x64_buf), out, ".__cse_x64.tmp");
     let is *u8 as a64 = cse_path_with_suffix(cast(*u8, &a64_buf), out, ".__cse_a64.tmp");
 
-    if (cse_subexec(self_path, "--target=caustic-x86_64", "--mode=pure", x64, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE fat: x86_64 build failed\n");
-        return 1;
-    }
-    if (cse_subexec(self_path, "--target=caustic-aarch64", "--mode=pure", a64, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE fat: aarch64 build failed\n");
-        return 1;
-    }
+    let is i32 as rc with mut = cse_subexec(self_path, "--target=caustic-x86_64", "--mode=pure", x64, envp);
+    if (rc != 0) { return cse_sub_failed("CSE fat", "x86_64", rc); }
+    rc = cse_subexec(self_path, "--target=caustic-aarch64", "--mode=pure", a64, envp);
+    if (rc != 0) { return cse_sub_failed("CSE fat", "aarch64", rc); }
     let is i32 as ferr = ldmod.cse_fat_files(x64, a64, out);
     io.unlink(x64);
     io.unlink(a64);
@@ -1773,32 +1807,22 @@ fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
     let is *u8 as pe_a64 = cse_path_with_suffix(cast(*u8, &pe_a64_buf), out, ".__cse_pea64.tmp");
     let is *u8 as cst = cse_path_with_suffix(cast(*u8, &cst_buf), out, ".__cse_cst.tmp");
 
-    if (cse_subexec(self_path, "--target=windows-x86_64", cast(*u8, 0), pe, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE polyglot: Windows PE build failed (program must be portable — no raw syscall(); use std facades)\n");
-        return 1;
-    }
-    if (cse_subexec(self_path, "--target=linux-x86_64", cast(*u8, 0), elf, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE polyglot: Linux ELF build failed\n");
-        return 1;
-    }
+    let is i32 as rc with mut = cse_subexec(self_path, "--target=windows-x86_64", cast(*u8, 0), pe, envp);
+    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Windows PE", rc); }
+    rc = cse_subexec(self_path, "--target=linux-x86_64", cast(*u8, 0), elf, envp);
+    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Linux ELF", rc); }
     // AArch64 Linux body — the shell stub picks between this and the x86_64 one
     // by uname -m.
-    if (cse_subexec(self_path, "--target=linux-aarch64", cast(*u8, 0), elf_a64, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE polyglot: Linux AArch64 ELF build failed\n");
-        return 1;
-    }
+    rc = cse_subexec(self_path, "--target=linux-aarch64", cast(*u8, 0), elf_a64, envp);
+    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Linux AArch64 ELF", rc); }
     // ARM64 Windows body. Carried, not yet reachable — the PE loader sees one
     // Machine, so activating it needs the entry stub to detect an ARM64 host and
     // relaunch. Its location is recorded in the CST* header either way.
-    if (cse_subexec(self_path, "--target=windows-aarch64", cast(*u8, 0), pe_a64, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE polyglot: Windows ARM64 PE build failed\n");
-        return 1;
-    }
+    rc = cse_subexec(self_path, "--target=windows-aarch64", cast(*u8, 0), pe_a64, envp);
+    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Windows ARM64 PE", rc); }
     // CausticOS body carries both architectures in one CST_ v4 container.
-    if (cse_subexec(self_path, "--target=caustic-x86_64-aarch64", cast(*u8, 0), cst, envp) != 0) {
-        io.write_str(io.STDERR, "caustic: CSE polyglot: CST build failed\n");
-        return 1;
-    }
+    rc = cse_subexec(self_path, "--target=caustic-x86_64-aarch64", cast(*u8, 0), cst, envp);
+    if (rc != 0) { return cse_sub_failed("CSE polyglot", "CST", rc); }
     let is i32 as cerr = ldmod.cse_combine_files(pe, elf, elf_a64, pe_a64, cst, out);
     io.unlink(pe);
     io.unlink(elf);
