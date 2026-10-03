@@ -1,0 +1,76 @@
+// tests/segment_test.cst — fs:/gs: memory operands and absolute [disp]
+// addresses in the assembler.
+//
+// The fs base is how a thread finds its own block: a CausticOS program's stack
+// probes read the thread's committed stack bottom from fs:[0], so that every
+// thread — not only the first — can grow its stack. The assembler had no
+// segment overrides at all; the kernel wrote its gs: accesses as .byte runs.
+//
+// Three things are checked: the bytes are the ones the CPU defines (the same
+// GNU as emits), a jump across them lands where it should (pass 1 sized them
+// as pass 2 wrote them), and they read and write through the base Linux is
+// told to use (arch_prctl). Exit 0 = pass; non-zero = the numbered check.
+
+let is i64 as SYS_ARCH_PRCTL with imut = 158;
+let is i64 as ARCH_SET_GS with imut = 0x1001;
+let is i64 as ARCH_SET_FS with imut = 0x1002;
+
+fn encoded() as void with naked {
+    asm("mov r11, QWORD PTR fs:[0]\nmov QWORD PTR fs:[0], rdi\nmov rax, QWORD PTR gs:[0x58]\nmov rax, QWORD PTR fs:[rdi+16]\ncmp rax, QWORD PTR fs:[0]\nmov eax, DWORD PTR fs:[-8]\nret\n");
+}
+
+// 64 4C 8B 1C 25 00000000      mov r11, fs:[0]
+// 64 48 89 3C 25 00000000      mov fs:[0], rdi
+// 65 48 8B 04 25 58000000      mov rax, gs:[0x58]
+// 64 48 8B 47 10               mov rax, fs:[rdi+16]
+// 64 48 3B 04 25 00000000      cmp rax, fs:[0]
+// 64 8B 04 25 F8FFFFFF         mov eax, fs:[-8]
+// C3                           ret
+let is i64 as WANT_LEN with imut = 50;
+fn want_hex() as *u8 {
+    return "644C8B1C25000000006448893C250000000065488B04255800000064488B471064483B042500000000648B0425F8FFFFFFC3";
+}
+
+fn _nib(c as u8) as i64 {
+    if (c >= 48 && c <= 57) { return cast(i64, c) - 48; }
+    return cast(i64, c) - 55;                                 // A-F
+}
+
+// The jump's displacement is fixed in pass 1 from the sizes of what it jumps
+// over; a prefix counted there but not emitted (or the reverse) would land it
+// inside an instruction.
+fn hop() as i64 with naked {
+    asm("xor eax, eax\njmp .Lseg_over\nmov rax, QWORD PTR fs:[0]\nmov QWORD PTR gs:[8], rax\nmov r11, QWORD PTR fs:[24]\n.Lseg_over:\nmov eax, 7\nret\n");
+}
+
+fn fs_read8() as i64 with naked { asm("mov rax, QWORD PTR fs:[8]\nret\n"); }
+fn fs_write16(v as i64) as void with naked { asm("mov QWORD PTR fs:[16], rdi\nret\n"); }
+fn fs_at(off as i64) as i64 with naked { asm("mov rax, QWORD PTR fs:[rdi]\nret\n"); }
+fn gs_read0() as i64 with naked { asm("mov rax, QWORD PTR gs:[0]\nret\n"); }
+
+let is [4]i64 as fblock with mut;
+let is [4]i64 as gblock with mut;
+
+fn main() as i32 {
+    let is *u8 as code = cast(*u8, fn_ptr(encoded));
+    let is *u8 as hx = want_hex();
+    let is i64 as i with mut = 0;
+    while (i < WANT_LEN) {
+        let is i64 as b = _nib(hx[i * 2]) * 16 + _nib(hx[i * 2 + 1]);
+        if (cast(i64, code[i]) != b) { return 1; }
+        i = i + 1;
+    }
+
+    if (hop() != 7) { return 2; }
+
+    fblock[0] = 11; fblock[1] = 22; fblock[2] = 0; fblock[3] = 44;
+    gblock[0] = 55;
+    if (syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, cast(i64, &fblock[0])) != 0) { return 3; }
+    if (syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, cast(i64, &gblock[0])) != 0) { return 4; }
+    if (fs_read8() != 22) { return 5; }
+    fs_write16(33);
+    if (fblock[2] != 33) { return 6; }
+    if (fs_at(24) != 44) { return 7; }
+    if (gs_read0() != 55) { return 8; }
+    return 0;
+}
