@@ -86,6 +86,12 @@ struct Term {
     alt_cy   as i64;
     alt_fg   as i64;
     alt_bg   as i64;
+    // -- appended (all i64): the deferred wrap. A character written on the last
+    //    column leaves the cursor there with the wrap PENDING; the next
+    //    character wraps first. So a line that fills the width exactly takes one
+    //    row, not one row and an empty one, and writing the bottom-right cell
+    //    does not scroll the screen. Anything that moves the cursor drops it.
+    wrap_pend as i64;
 }
 
 // A lazy grid commits this much more each time the ring reaches its end.
@@ -326,6 +332,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.mouse_mode = 0; t.mouse_sgr = 0;
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.wrap_pend = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -357,6 +364,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.mouse_mode = 0; t.mouse_sgr = 0;
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.wrap_pend = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -388,6 +396,7 @@ fn init_text(width as i64, height as i64) as Term {
     t.mouse_mode = 0; t.mouse_sgr = 0;
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
+    t.wrap_pend = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -636,6 +645,8 @@ fn _sgr(t as *Term) as void {
 fn _csi_dispatch(t as *Term, final as i64) as void {
     let is i64 as p0 = _csi_p[0];
     let is i64 as p1 = _csi_p[1];
+    // Positioning and erasing drop a pending wrap; colours and modes do not.
+    if (final != 0x6D && final != 0x68 && final != 0x6C && final != 0x74) { t.wrap_pend = 0; }
     if (final == 0x48 || final == 0x66) {                    // 'H'/'f' position
         _cursor(t, 0);
         let is i64 as r with mut = p0; if (r < 1) { r = 1; }
@@ -705,6 +716,7 @@ fn _esc_feed(t as *Term, ch as i64) as void {
 fn alt_enter(t as *Term) as void {
     if (t.alt == 1) { return; }
     _cursor(t, 0);
+    t.wrap_pend = 0;
     if (t.view_off != 0) { t.view_off = 0; _repaint_view(t); }
     t.alt_cx = t.cx; t.alt_cy = t.cy;
     t.alt_fg = cast(i64, t.fg); t.alt_bg = cast(i64, t.bg);
@@ -737,6 +749,7 @@ fn alt_enter(t as *Term) as void {
 fn alt_leave(t as *Term) as void {
     if (t.alt == 0) { return; }
     _cursor(t, 0);
+    t.wrap_pend = 0;
     t.alt = 0;
     t.view_off = 0;
     t.fg = cast(u32, t.alt_fg); t.bg = cast(u32, t.alt_bg);
@@ -801,10 +814,11 @@ fn putc(t as *Term, ch as i64) as void {
         _repaint_view(t);
     }
     _cursor(t, 0);                                           // lift the cursor before moving/writing
-    if (ch == 0x0A) { _newline(t); return; }                 // \n
-    if (ch == 0x0D) { t.cx = 0; return; }                    // \r
+    if (ch == 0x0A) { t.wrap_pend = 0; _newline(t); return; }   // \n
+    if (ch == 0x0D) { t.wrap_pend = 0; t.cx = 0; return; }      // \r
     if (ch == 0x0C) { clear(t); return; }                    // \f form feed → clear + home
     if (ch == 0x08) {                                        // backspace
+        t.wrap_pend = 0;
         if (t.cx > 0) {
             t.cx = t.cx - 1;
             _glyph(t, 0x20, _cellx(t, t.cx), _celly(t, t.cy));
@@ -817,15 +831,16 @@ fn putc(t as *Term, ch as i64) as void {
         // over keep what they hold, and the last column is as far as it goes
         // (no wrap). It was 4 spaces wherever it started, which put no two
         // columns of a table in line and wrapped names out of ls's grid.
+        t.wrap_pend = 0;
         let is i64 as nx with mut = (t.cx / 8 + 1) * 8;
         if (nx > t.cols - 1) { nx = t.cols - 1; }
         if (nx > t.cx) { t.cx = nx; }
         return;
     }
+    if (t.wrap_pend == 1) { t.wrap_pend = 0; _newline(t); }   // the wrap a full row left pending
     _glyph(t, ch, _cellx(t, t.cx), _celly(t, t.cy));
     _grid_set(t, t.cx, t.cy, ch);
-    t.cx = t.cx + 1;
-    if (t.cx >= t.cols) { _newline(t); }
+    if (t.cx + 1 >= t.cols) { t.wrap_pend = 1; } else { t.cx = t.cx + 1; }
 }
 
 fn puts(t as *Term, s as *u8, n as i64) as void {
@@ -856,6 +871,7 @@ fn clear(t as *Term) as void {
         _cursor(t, 0);                           // history under it is not its
         _erase_display(t, 2);                    // to wipe
         t.cx = 0; t.cy = 0;
+        t.wrap_pend = 0;
         _mark(t, 0, 0, t.width, t.height);
         flush(t);
         return;
@@ -887,6 +903,7 @@ fn clear(t as *Term) as void {
         t.view_off = 0;
     }
     t.cx = 0; t.cy = 0;
+    t.wrap_pend = 0;
     _mark(t, 0, 0, t.width, t.height);
     flush(t);
 }
@@ -899,6 +916,7 @@ fn clear(t as *Term) as void {
 // to re-render content; without one the screen is cleared (documented: a
 // grid is what makes content survive a resize).
 fn resize(t as *Term, new_w as i64, new_h as i64) as void {
+    t.wrap_pend = 0;
     let is i64 as new_cols with mut = (new_w - 2 * PAD_X) / GLYPH_W;
     let is i64 as new_rows with mut = (new_h - 2 * PAD_Y) / GLYPH_H;
     if (new_cols < 1) { new_cols = 1; }
