@@ -607,13 +607,31 @@ fn sa_longest(p as *d.IRProgram, f as *d.IRFunction) as i32 {
     return f.sa_longest;
 }
 
+// The stack facts of the program: how deep main's stack goes, and whether
+// anything recurses or calls indirectly. Every emitted function is a root of
+// the second question, not main alone: one whose address is taken can run
+// with nothing in the program calling it — a thread's entry function, started
+// by the kernel — and recursion there needs a growing stack as much as
+// recursion under main does. Walked from main alone, a program whose only
+// recursion sat behind a thread entry got a fixed stack and no probes, and its
+// thread ran off the end of what was committed.
+fn sa_walk(p as *d.IRProgram) as i32 {
+    sa_recursion_seen = 0;
+    sa_indirect_seen = 0;
+    let is i32 as deepest = sa_longest(p, p.main_func);
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0 && sa_recursion_seen == 0 && sa_indirect_seen == 0) {
+        if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) { sa_longest(p, f); }
+        f = f.next;
+    }
+    return deepest;
+}
+
 // After codegen (CSE only): set the declared stack to the computed value, honor
 // --stack-size override, or error when uncomputable and no flag was given.
 fn sa_compute(p as *d.IRProgram) as void {
     if (cast(i64, p.main_func) == 0) { return; }   // no entry (lib / -c)
-    sa_recursion_seen = 0;
-    sa_indirect_seen = 0;
-    let is i32 as deepest = sa_longest(p, p.main_func);
+    let is i32 as deepest = sa_walk(p);
     let is i32 as flag = tgt.cse_stack_size_get();
     if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
         // Undecidable statically (recursion depth / indirect target are runtime
@@ -634,8 +652,9 @@ fn sa_compute(p as *d.IRProgram) as void {
 // PROBE has to be emitted during gen_func — hence this early pass. Runs after
 // the -O1 inline phase so it sees the same call graph gen_func will emit:
 // materialize each reachable function's IR (regen if freed), build its call
-// edges (sa_record), then walk from main for a cycle (recursion) or an indirect
-// call. Either → the program grows its stack dynamically. CSE target only.
+// edges (sa_record), then walk every function for a cycle (recursion) or an
+// indirect call (sa_walk). Either → the program grows its stack dynamically.
+// CSE target only.
 fn sa_predetect(p as *d.IRProgram) as void {
     if (tgt.target_get().object_format != 3) { return; }
     if (cast(i64, p.main_func) == 0) { return; }
@@ -649,9 +668,7 @@ fn sa_predetect(p as *d.IRProgram) as void {
         }
         f = f.next;
     }
-    sa_recursion_seen = 0;
-    sa_indirect_seen = 0;
-    sa_longest(p, p.main_func);
+    sa_walk(p);
     if (sa_recursion_seen == 1 || sa_indirect_seen == 1) {
         tgt.cse_stack_dynamic_set(1);
         let is i32 as flag = tgt.cse_stack_size_get();
