@@ -71,7 +71,8 @@ fn main() as i32 {
 ## Compilation targets
 
 A single source tree builds multiple architectures and executable formats. Select one with
-`--target=` (Linux is the default):
+`--target=` (Linux is the default — except for the compiler running on CausticOS,
+whose default is CausticOS):
 
 | Target | Flag | Output | Runs on | Status |
 |--------|------|--------|---------|--------|

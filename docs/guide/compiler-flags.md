@@ -37,7 +37,8 @@ Slower compilation (~9x for self-compile), but generated code runs ~3.4x faster.
 Selects the code generator, object architecture, linker output, target builtins,
 and standard-library syscall ABI.
 
-- `linux-x86_64` — default Linux target
+- `linux-x86_64` — the default (on CausticOS the default is `caustic-x86_64`,
+  the system the compiler is running on)
 - `linux-aarch64` — static Linux AArch64 ELF64; scalar codegen, atomics and threads
 - `windows-x86_64` — PE32+ output
 - `caustic-x86_64` — CSE output
