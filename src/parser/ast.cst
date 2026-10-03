@@ -15,12 +15,21 @@ fn ast_alloc(size as i64) as *u8 { return om.opt_alloc(size); }
 // Linux mmap is lazy either way). Types (new_type) and everything outside a
 // function body (globals, decls, params) stay in opt_bins and survive — codegen
 // still needs them. Destroy is skipped on PE builds (they walk the body AST for
-// .cstlocals). Chunk header: [next:8][top:8][cap:8][data...].
+// .cstlocals). Chunk header: [next:8][top:8][cap:8][committed:8][data...].
+//
+// A chunk's 8MB is RESERVED, and committed _NC_STEP at a time as the bump
+// pointer reaches it (committed counts from the chunk base). On CausticOS a
+// commit is real RAM — there is no demand paging — so a chunk committed whole
+// meant a 388-byte file needed 8MB free for its syntax tree alone; on a 64MB
+// machine that failed, and the failure was a header written through the -1 a
+// failed mmap returns. On Linux and Windows reserve is the same lazy mapping as
+// before and commit is a no-op. Running out is mem.core.oom: said, and exit 1.
 let is *u8 as _nc_head with mut = cast(*u8, 0);   // first chunk (for freeing)
 let is *u8 as _nc_cur  with mut = cast(*u8, 0);   // current chunk (for alloc)
 let is i32 as _node_t_active with mut = 0;
 let is i64 as _NC_CHUNK with imut = 8388608;      // 8MB per chunk
-let is i64 as _NC_HDR   with imut = 24;
+let is i64 as _NC_HDR   with imut = 32;
+let is i64 as _NC_STEP  with imut = 65536;       // commit granularity
 
 fn node_transient_begin() as void { _node_t_active = 1; }
 fn node_transient_end() as void { _node_t_active = 0; }
@@ -28,11 +37,35 @@ fn node_transient_end() as void { _node_t_active = 0; }
 fn _nc_new(min as i64) as *u8 {
     let is i64 as cap with mut = _NC_CHUNK;
     if (cap < min) { cap = min; }
-    let is *u8 as c = mem.core.mmap_anon(cap + _NC_HDR);
+    let is i64 as total = cap + _NC_HDR;
+    let is *u8 as c = mem.core.reserve_anon(total);
+    if (cast(i64, c) == 0 || cast(i64, c) == 0 - 1) { mem.core.oom("the syntax tree", total); }
+    let is i64 as first = _nc_round(_NC_HDR + min, total);
+    if (mem.core.commit_anon(c, first) != cast(i32, 0)) { mem.core.oom("the syntax tree", first); }
     *cast(*i64, c) = 0;                            // next
     *cast(*i64, cast(i64, c) + 8) = 0;            // top
     *cast(*i64, cast(i64, c) + 16) = cap;         // cap
+    *cast(*i64, cast(i64, c) + 24) = first;       // committed
     return c;
+}
+
+// `end` rounded up to the commit step, never past the chunk's `total`.
+fn _nc_round(end as i64, total as i64) as i64 {
+    let is i64 as r with mut = (end + (_NC_STEP - 1)) & (0 - _NC_STEP);
+    if (r > total) { r = total; }
+    return r;
+}
+
+// Back the chunk through `end` (bytes from its base) before handing it out.
+fn _nc_commit_to(c as *u8, end as i64) as void {
+    let is i64 as committed = *cast(*i64, cast(i64, c) + 24);
+    if (end <= committed) { return; }
+    let is i64 as total = *cast(*i64, cast(i64, c) + 16) + _NC_HDR;
+    let is i64 as newc = _nc_round(end, total);
+    if (mem.core.commit_anon(cast(*u8, cast(i64, c) + committed), newc - committed) != cast(i32, 0)) {
+        mem.core.oom("the syntax tree", newc - committed);
+    }
+    *cast(*i64, cast(i64, c) + 24) = newc;
 }
 
 fn destroy_transient_nodes() as void {
@@ -336,6 +369,7 @@ fn node_alloc_raw() as *Node {
             let is i64 as top = *cast(*i64, cast(i64, _nc_cur) + 8);
             let is i64 as cap = *cast(*i64, cast(i64, _nc_cur) + 16);
             if (top + need <= cap) {
+                _nc_commit_to(_nc_cur, _NC_HDR + top + need);
                 let is *u8 as p = cast(*u8, cast(i64, _nc_cur) + _NC_HDR + top);
                 *cast(*i64, cast(i64, _nc_cur) + 8) = top + need;
                 return cast(*Node, p);
