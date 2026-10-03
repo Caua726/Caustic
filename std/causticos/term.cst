@@ -1,17 +1,25 @@
 // std/causticos/term.cst — text-grid renderer on a CausticOS framebuffer.
 //
-// CausticOS-ONLY. Renders an 8x16 bitmap console font (font.cst, the VGA
-// default8x16) the way Linux fbcon does: each glyph bit maps 1:1 to a pixel,
+// CausticOS-ONLY. Renders an 8x16 bitmap console font (font.cst, LatGrkCyr
+// with a Unicode map) the way Linux fbcon does: each glyph bit maps 1:1 to a pixel,
 // no anti-aliasing. The font carries its own spacing (blank top/bottom/side
 // rows are part of the 8x16 glyph), so we draw cells edge-to-edge and add only
 // a small screen margin (fbcon centres the grid the same way). flush() blits
 // via SYS_PRESENT. Drives rendering only — the keyboard is input.cst's job.
+//
+// Text is UTF-8. putc takes bytes as they come — a character split across two
+// writes is put together — and draws each code point in as many columns as
+// std/unicode says it takes: a combining mark folds into the character before
+// it (e + U+0301 is é) when the pair composes, a wide character takes two
+// cells. Malformed input draws U+FFFD, never bytes as Latin-1 or CP437.
 //
 //   let is gfx.Framebuffer as fb = gfx.open();
 //   let is term.Term as t = term.init(fb.base, fb.fd, fb.width, fb.height, fb.pitch, fb.bpp);
 //   term.puts(&t, "hello\n", 6);  term.flush(&t);
 use "../os/causticos.cst" as cos;
 use "font.cst" as font;
+use "../unicode/cpwidth.cst" as cpw;
+use "../unicode/compose.cst" as uc;
 
 let is i64 as GLYPH_W with imut = 8;
 let is i64 as GLYPH_H with imut = 16;
@@ -92,6 +100,18 @@ struct Term {
     //    row, not one row and an empty one, and writing the bottom-right cell
     //    does not scroll the screen. Anything that moves the cursor drops it.
     wrap_pend as i64;
+    // -- appended (all i64): UTF-8 arriving one byte at a time.
+    u8_need  as i64;      // continuation bytes still to come (0 = between characters)
+    u8_cp    as i64;      // the code point so far
+    u8_min   as i64;      // the smallest value this length may encode (overlong check)
+    // -- appended (all i64): the last character drawn, where a combining mark
+    //    that follows it folds in. last_cp 0 = nothing to fold into (the
+    //    cursor moved, the line ended, something was erased).
+    last_cp  as i64;
+    last_x   as i64;
+    last_y   as i64;
+    last_fg  as i64;
+    last_bg  as i64;
 }
 
 // A lazy grid commits this much more each time the ring reaches its end.
@@ -108,10 +128,18 @@ fn _phys_row(t as *Term, r as i64) as i64 {
 }
 
 // A grid cell packs everything needed to repaint it after a resize:
-// ch (8 bits, CP437) | fg (24-bit RGB) << 8 | bg (24-bit RGB) << 32.
-fn _cell_pack(ch as i64, fgc as u32, bgc as u32) as i64 {
-    return (ch & 0xFF) | ((cast(i64, fgc) & 0xFFFFFF) << 8) | ((cast(i64, bgc) & 0xFFFFFF) << 32);
+//   code point (bits 0-15) | fg RGB24 (bits 16-39) | bg RGB24 (bits 40-63).
+// 16 bits hold the Basic Multilingual Plane — every character the font draws;
+// one past it is stored as U+FFFD, which is what it would be drawn as anyway.
+// A terminal's TEXT segment carries cells in this layout to the compositor
+// (userspace/lib/wmproto txt_cell_*), so the two change together.
+let is i64 as CELL_WIDE_TAIL with imut = 0xFFFF;   // right half of a two-column character
+fn _cell_pack(cp as i64, fgc as u32, bgc as u32) as i64 {
+    return (cp & 0xFFFF) | ((cast(i64, fgc) & 0xFFFFFF) << 16) | ((cast(i64, bgc) & 0xFFFFFF) << 40);
 }
+fn cell_cp(cell as i64) as i64 { return cell & 0xFFFF; }
+fn cell_fg(cell as i64) as i64 { return (cell >> 16) & 0xFFFFFF; }
+fn cell_bg(cell as i64) as i64 { return (cell >> 40) & 0xFFFFFF; }
 
 // Accumulate a pixel rect into the dirty union (x1/y1 exclusive).
 fn _mark(t as *Term, x as i64, y as i64, w as i64, h as i64) as void {
@@ -153,7 +181,9 @@ fn _celly(t as *Term, cy as i64) as i64 { return PAD_Y + cy * GLYPH_H; }
 // fgc, clear bits → bgc, so the cell is fully repainted (erasing whatever was
 // there). MSB = leftmost.
 fn _glyph_c(t as *Term, ch as i64, px as i64, py as i64, fgc as u32, bgc as u32) as void {
-    let is *u8 as g = font.get_glyph(cast(i32, ch));
+    let is i64 as cp with mut = ch;
+    if (cp == CELL_WIDE_TAIL || cp == 0) { cp = 0x20; }     // a wide character's tail is its blank half
+    let is *u8 as g = font.glyph(cp);
     let is i64 as row with mut = 0;
     while (row < GLYPH_H) {
         let is i64 as bits = cast(i64, g[row]);
@@ -182,6 +212,27 @@ fn _grid_set(t as *Term, col as i64, row as i64, ch as i64) as void {
     let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
     let is *i64 as g = cast(*i64, t.grid);
     g[phys * t.grid_stride + col] = _cell_pack(ch, t.fg, t.bg);
+}
+
+// The same with explicit colours (a combining mark redraws a character in the
+// colours it was written in, whatever is current now).
+fn _grid_set_c(t as *Term, col as i64, row as i64, cp as i64, fgc as u32, bgc as u32) as void {
+    if (t.grid == 0) { return; }
+    if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
+    let is i64 as p = t.live_top + row;
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is *i64 as g = cast(*i64, t.grid);
+    g[phys * t.grid_stride + col] = _cell_pack(cp, fgc, bgc);
+}
+
+// The cell at visible (col,row) of the LIVE view; 0 without a grid.
+fn _grid_get(t as *Term, col as i64, row as i64) as i64 {
+    if (t.grid == 0) { return 0; }
+    if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return 0; }
+    let is i64 as p = t.live_top + row;
+    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is *i64 as g = cast(*i64, t.grid);
+    return g[phys * t.grid_stride + col];
 }
 
 // Blank one physical grid row.
@@ -240,9 +291,9 @@ fn _repaint_view(t as *Term) as void {
         let is i64 as c with mut = 0;
         while (c < t.cols) {
             let is i64 as cell = g[phys * t.grid_stride + c];
-            let is i64 as ch = cell & 0xFF;
-            let is u32 as cfg = cast(u32, (cell >> 8) & 0xFFFFFF);
-            let is u32 as cbg = cast(u32, (cell >> 32) & 0xFFFFFF);
+            let is i64 as ch = cell_cp(cell);
+            let is u32 as cfg = cast(u32, cell_fg(cell));
+            let is u32 as cbg = cast(u32, cell_bg(cell));
             if (ch != 0x20 || cbg != t.bg) {
                 _glyph_c(t, ch, _cellx(t, c), _celly(t, r), cfg, cbg);
             }
@@ -316,7 +367,6 @@ fn _newline(t as *Term) as void {
 }
 
 fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp as i64) as Term {
-    font.init();
     let is Term as t;
     t.base = base; t.fd = fd; t.width = width; t.height = height;
     t.pitch = pitch; t.bpp = bpp;
@@ -333,6 +383,8 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     t.wrap_pend = 0;
+    t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
+    t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -348,7 +400,6 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
 // screen-pitch window sub-rect), never presents (no fd to present on); the
 // holder drains take_dirty() and tells its compositor what changed.
 fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i64) as Term {
-    font.init();
     let is Term as t;
     t.base = base; t.fd = 0 - 1; t.width = width; t.height = height;
     t.pitch = pitch; t.bpp = bpp;
@@ -365,6 +416,8 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     t.wrap_pend = 0;
+    t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
+    t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -380,7 +433,6 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
 // full-screen pixel buffer. width/height are in PIXELS (the WM frames the window
 // in pixels and 8x16 cells), used only to derive cols/rows the same way init does.
 fn init_text(width as i64, height as i64) as Term {
-    font.init();
     let is Term as t;
     t.base = cast(*u8, 0); t.fd = 0 - 1; t.width = width; t.height = height;
     t.pitch = 0; t.bpp = 4;
@@ -397,6 +449,8 @@ fn init_text(width as i64, height as i64) as Term {
     t.grid_lazy = 0; t.grid_ready = 0; t.grid_rdyb = 0; t.grid_cap = 0;
     t.alt = 0; t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     t.wrap_pend = 0;
+    t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
+    t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -646,7 +700,8 @@ fn _csi_dispatch(t as *Term, final as i64) as void {
     let is i64 as p0 = _csi_p[0];
     let is i64 as p1 = _csi_p[1];
     // Positioning and erasing drop a pending wrap; colours and modes do not.
-    if (final != 0x6D && final != 0x68 && final != 0x6C && final != 0x74) { t.wrap_pend = 0; }
+    // They also end what a combining mark could still fold into.
+    if (final != 0x6D && final != 0x68 && final != 0x6C && final != 0x74) { t.wrap_pend = 0; t.last_cp = 0; }
     if (final == 0x48 || final == 0x66) {                    // 'H'/'f' position
         _cursor(t, 0);
         let is i64 as r with mut = p0; if (r < 1) { r = 1; }
@@ -717,6 +772,7 @@ fn alt_enter(t as *Term) as void {
     if (t.alt == 1) { return; }
     _cursor(t, 0);
     t.wrap_pend = 0;
+    t.last_cp = 0;
     if (t.view_off != 0) { t.view_off = 0; _repaint_view(t); }
     t.alt_cx = t.cx; t.alt_cy = t.cy;
     t.alt_fg = cast(i64, t.fg); t.alt_bg = cast(i64, t.bg);
@@ -750,6 +806,7 @@ fn alt_leave(t as *Term) as void {
     if (t.alt == 0) { return; }
     _cursor(t, 0);
     t.wrap_pend = 0;
+    t.last_cp = 0;
     t.alt = 0;
     t.view_off = 0;
     t.fg = cast(u32, t.alt_fg); t.bg = cast(u32, t.alt_bg);
@@ -806,41 +863,152 @@ fn end_program(t as *Term) as void {
     return;
 }
 
+// putc — one byte of output. Bytes are UTF-8: a control acts at once, a
+// character is drawn when its last byte has arrived, and a sequence split
+// across two writes comes together. A byte that cannot be part of UTF-8 —
+// a stray continuation, a lead promising more than came, an overlong form, a
+// surrogate — draws U+FFFD, and the byte after a broken sequence is read
+// afresh rather than swallowed with it.
 fn putc(t as *Term, ch as i64) as void {
-    if (t.esc != 0) { _esc_feed(t, ch); return; }
-    if (ch == 0x1B) { t.esc = 1; return; }                   // ESC begins a sequence
+    let is i64 as b = ch & 0xFF;
+    if (t.esc != 0) { _esc_feed(t, b); return; }
+    if (t.u8_need > 0) {
+        if ((b & 0xC0) == 0x80) {
+            t.u8_cp = (t.u8_cp << 6) | (b & 0x3F);
+            t.u8_need = t.u8_need - 1;
+            if (t.u8_need == 0) {
+                let is i64 as cp with mut = t.u8_cp;
+                if (cp < t.u8_min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { cp = 0xFFFD; }
+                _put_cp(t, cp);
+            }
+            return;
+        }
+        t.u8_need = 0;
+        _put_cp(t, 0xFFFD);
+    }
+    if (b >= 0x80) {
+        if (b >= 0xC2 && b <= 0xDF) { t.u8_need = 1; t.u8_cp = b & 0x1F; t.u8_min = 0x80; return; }
+        if (b >= 0xE0 && b <= 0xEF) { t.u8_need = 2; t.u8_cp = b & 0x0F; t.u8_min = 0x800; return; }
+        if (b >= 0xF0 && b <= 0xF4) { t.u8_need = 3; t.u8_cp = b & 0x07; t.u8_min = 0x10000; return; }
+        _put_cp(t, 0xFFFD);
+        return;
+    }
+    if (b == 0x1B) { t.esc = 1; return; }                    // ESC begins a sequence
+    if (b < 0x20 || b == 0x7F) { _control(t, b); return; }
+    _put_cp(t, b);
+}
+
+// A C0 control. The ones a terminal acts on move the cursor or clear; the
+// rest (BEL, NUL, DEL, ...) draw nothing — they used to draw CP437 pictures.
+fn _control(t as *Term, b as i64) as void {
+    if (b != 0x0A && b != 0x0D && b != 0x0C && b != 0x08 && b != 0x09) { return; }
     if (t.view_off != 0) {                                   // output snaps back to live
         t.view_off = 0;
         _repaint_view(t);
     }
     _cursor(t, 0);                                           // lift the cursor before moving/writing
-    if (ch == 0x0A) { t.wrap_pend = 0; _newline(t); return; }   // \n
-    if (ch == 0x0D) { t.wrap_pend = 0; t.cx = 0; return; }      // \r
-    if (ch == 0x0C) { clear(t); return; }                    // \f form feed → clear + home
-    if (ch == 0x08) {                                        // backspace
+    t.last_cp = 0;
+    if (b == 0x0A) { t.wrap_pend = 0; _newline(t); return; }   // \n
+    if (b == 0x0D) { t.wrap_pend = 0; t.cx = 0; return; }      // \r
+    if (b == 0x0C) { clear(t); return; }                     // \f form feed → clear + home
+    if (b == 0x08) {                                         // backspace
         t.wrap_pend = 0;
         if (t.cx > 0) {
             t.cx = t.cx - 1;
-            _glyph(t, 0x20, _cellx(t, t.cx), _celly(t, t.cy));
-            _grid_set(t, t.cx, t.cy, 0x20);
+            _put_cell(t, t.cx, t.cy, 0x20);
         }
         return;
     }
-    if (ch == 0x09) {                                        // tab: to the next stop
-        // Stops every 8 columns, as every terminal has them; the cells passed
-        // over keep what they hold, and the last column is as far as it goes
-        // (no wrap). It was 4 spaces wherever it started, which put no two
-        // columns of a table in line and wrapped names out of ls's grid.
-        t.wrap_pend = 0;
-        let is i64 as nx with mut = (t.cx / 8 + 1) * 8;
-        if (nx > t.cols - 1) { nx = t.cols - 1; }
-        if (nx > t.cx) { t.cx = nx; }
-        return;
+    // tab: to the next stop. Stops every 8 columns, as every terminal has
+    // them; the cells passed over keep what they hold, and the last column is
+    // as far as it goes (no wrap). It was 4 spaces wherever it started, which
+    // put no two columns of a table in line and wrapped names out of ls's grid.
+    t.wrap_pend = 0;
+    let is i64 as nx with mut = (t.cx / 8 + 1) * 8;
+    if (nx > t.cols - 1) { nx = t.cols - 1; }
+    if (nx > t.cx) { t.cx = nx; }
+}
+
+// Draw one code point at the cursor, in as many columns as it takes.
+fn _put_cp(t as *Term, cp_in as i64) as void {
+    let is i64 as cp with mut = cp_in;
+    if (cp >= 0x80 && cp <= 0x9F) { return; }                // C1 controls draw nothing
+    let is i64 as w = cpw.cp_width(cast(i32, cp));
+    if (w == 0) { _combine(t, cp); return; }
+    if (t.view_off != 0) {
+        t.view_off = 0;
+        _repaint_view(t);
     }
+    _cursor(t, 0);
+    if (cp > 0xFFFF) { cp = 0xFFFD; }                        // a cell holds the BMP
     if (t.wrap_pend == 1) { t.wrap_pend = 0; _newline(t); }   // the wrap a full row left pending
-    _glyph(t, ch, _cellx(t, t.cx), _celly(t, t.cy));
-    _grid_set(t, t.cx, t.cy, ch);
+    let is i64 as wide with mut = 0;
+    if (w == 2 && t.cols >= 2) { wide = 1; }
+    if (wide == 1 && t.cx + 1 >= t.cols) {
+        // No room for both halves: the last column stays empty and the
+        // character starts the next line, as xterm does.
+        _put_cell(t, t.cx, t.cy, 0x20);
+        _newline(t);
+    }
+    _put_cell(t, t.cx, t.cy, cp);
+    t.last_cp = cp; t.last_x = t.cx; t.last_y = t.cy;
+    t.last_fg = cast(i64, t.fg); t.last_bg = cast(i64, t.bg);
+    if (wide == 1) {
+        t.cx = t.cx + 1;
+        _put_tail(t, t.cx, t.cy);
+    }
     if (t.cx + 1 >= t.cols) { t.wrap_pend = 1; } else { t.cx = t.cx + 1; }
+}
+
+// A character that takes no columns. A combining mark folds into the
+// character just drawn when the pair composes to one a cell can hold — "e"
+// then U+0301 is "é" — and is dropped when it does not: a cell draws one
+// glyph, and the other way, the mark in a cell of its own, puts a stray accent
+// between two letters. Joiners, variation selectors and format characters
+// (U+200B, U+FEFF) change nothing on a character grid either.
+fn _combine(t as *Term, mark as i64) as void {
+    if (t.last_cp == 0) { return; }
+    let is i64 as c = uc.compose(t.last_cp, mark);
+    if (c == 0 || c > 0xFFFF) { return; }
+    if (cpw.cp_width(cast(i32, c)) != 1) { return; }
+    if (t.view_off != 0) {
+        t.view_off = 0;
+        _repaint_view(t);
+    }
+    _cursor(t, 0);
+    let is u32 as fg = cast(u32, t.last_fg);
+    let is u32 as bg = cast(u32, t.last_bg);
+    _glyph_c(t, c, _cellx(t, t.last_x), _celly(t, t.last_y), fg, bg);
+    _grid_set_c(t, t.last_x, t.last_y, c, fg, bg);
+    t.last_cp = c;
+}
+
+// One cell: glyph and grid. Writing over half of a two-column character
+// leaves the other half meaningless, so it is blanked, as xterm does.
+fn _put_cell(t as *Term, col as i64, row as i64, cp as i64) as void {
+    if (t.grid != 0) {
+        if (cell_cp(_grid_get(t, col, row)) == CELL_WIDE_TAIL) {
+            if (col > 0) {
+                _glyph(t, 0x20, _cellx(t, col - 1), _celly(t, row));
+                _grid_set(t, col - 1, row, 0x20);
+            }
+        } else if (col + 1 < t.cols && cell_cp(_grid_get(t, col + 1, row)) == CELL_WIDE_TAIL) {
+            _glyph(t, 0x20, _cellx(t, col + 1), _celly(t, row));
+            _grid_set(t, col + 1, row, 0x20);
+        }
+    }
+    _glyph(t, cp, _cellx(t, col), _celly(t, row));
+    _grid_set(t, col, row, cp);
+}
+
+// The right half of the wide character just drawn at col - 1.
+fn _put_tail(t as *Term, col as i64, row as i64) as void {
+    if (t.grid != 0 && col + 1 < t.cols && cell_cp(_grid_get(t, col + 1, row)) == CELL_WIDE_TAIL) {
+        _glyph(t, 0x20, _cellx(t, col + 1), _celly(t, row));
+        _grid_set(t, col + 1, row, 0x20);
+    }
+    _glyph(t, CELL_WIDE_TAIL, _cellx(t, col), _celly(t, row));
+    _grid_set(t, col, row, CELL_WIDE_TAIL);
 }
 
 fn puts(t as *Term, s as *u8, n as i64) as void {
@@ -867,6 +1035,7 @@ fn set_color(t as *Term, fg as u32, bg as u32) as void {
 // clear — wipe the visible region to bg and home the cursor (the shell's
 // `clear`). Pitch-aware row fill so windowed buffers only touch their rect.
 fn clear(t as *Term) as void {
+    t.last_cp = 0;
     if (t.alt == 1) {                            // a program's own screen: the
         _cursor(t, 0);                           // history under it is not its
         _erase_display(t, 2);                    // to wipe
@@ -917,6 +1086,7 @@ fn clear(t as *Term) as void {
 // grid is what makes content survive a resize).
 fn resize(t as *Term, new_w as i64, new_h as i64) as void {
     t.wrap_pend = 0;
+    t.last_cp = 0;
     let is i64 as new_cols with mut = (new_w - 2 * PAD_X) / GLYPH_W;
     let is i64 as new_rows with mut = (new_h - 2 * PAD_Y) / GLYPH_H;
     if (new_cols < 1) { new_cols = 1; }

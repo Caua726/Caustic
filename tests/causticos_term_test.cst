@@ -1,0 +1,128 @@
+// tests/causticos_term_test.cst — std/causticos/term.cst reading UTF-8.
+//
+// The terminal used to draw each byte as a CP437 glyph, so "—" (E2 80 94)
+// came out as three pictures, "ΓÇö". These cases pin down what it does now,
+// by reading the cell grid back: a TEXT-mode Term draws nothing and makes no
+// system call, so this runs on the host.
+//
+// Exit 0 = all passed; the exit code is the number of failures.
+use "../std/io.cst" as io;
+use "../std/causticos/term.cst" as term;
+
+let is i32 as fails with mut = 0;
+let is [4096]i64 as cells with mut;
+
+fn chk(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%x want=%x\n", name, got, want);
+    }
+}
+
+// A 20x4 terminal with a grid, everything blank.
+fn fresh() as term.Term {
+    let is term.Term as t = term.init_text(8 * 20 + 24, 16 * 4 + 24);
+    term.attach_grid(&t, cast(*i64, &cells[0]), 20, 4);
+    return t;
+}
+
+fn cp_at(col as i64, row as i64) as i64 { return term.cell_cp(cells[row * 20 + col]); }
+
+fn put(t as *term.Term, s as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    term.puts(t, s, n);
+}
+
+fn main() as i32 {
+    let is term.Term as t with mut = fresh();
+
+    // Two-, three- and four-byte characters, one cell each.
+    put(&t, "\xc3\xa7\xe2\x80\x94\xc3\x83o");
+    chk("c-cedilla", cp_at(0, 0), 0xE7);
+    chk("em dash", cp_at(1, 0), 0x2014);
+    chk("A-tilde", cp_at(2, 0), 0xC3);
+    chk("then ASCII", cp_at(3, 0), 0x6F);
+    chk("cursor after four characters", t.cx, 4);
+
+    // A character split across two writes is put together.
+    t = fresh();
+    put(&t, "\xe2\x80");
+    chk("half a character draws nothing yet", cp_at(0, 0), 0x20);
+    put(&t, "\x94x");
+    chk("split em dash", cp_at(0, 0), 0x2014);
+    chk("after it", cp_at(1, 0), 0x78);
+
+    // Malformed input is U+FFFD, and the byte after a broken sequence counts.
+    t = fresh();
+    put(&t, "\x80A\xc3B\xc0\x80\xe0\x80\x80\xed\xa0\x80\xf5Z");
+    chk("stray continuation", cp_at(0, 0), 0xFFFD);
+    chk("A", cp_at(1, 0), 0x41);
+    chk("lead cut short", cp_at(2, 0), 0xFFFD);
+    chk("B survives the cut", cp_at(3, 0), 0x42);
+    chk("C0 is never a lead", cp_at(4, 0), 0xFFFD);
+    chk("its continuation", cp_at(5, 0), 0xFFFD);
+    chk("overlong three-byte", cp_at(6, 0), 0xFFFD);
+    chk("surrogate", cp_at(7, 0), 0xFFFD);
+    chk("F5 is never a lead", cp_at(8, 0), 0xFFFD);
+    chk("Z", cp_at(9, 0), 0x5A);
+
+    // A combining mark folds into the character before it when the pair
+    // composes, and is dropped when it does not.
+    t = fresh();
+    put(&t, "e\xcc\x81q\xcc\x81!");
+    chk("e + acute", cp_at(0, 0), 0xE9);
+    chk("q + acute keeps q", cp_at(1, 0), 0x71);
+    chk("and takes no cell", cp_at(2, 0), 0x21);
+    put(&t, "\n\xcc\x81y");
+    chk("a mark with nothing before it", cp_at(0, 1), 0x79);
+    put(&t, "a\x1b[1C\xcc\x83");
+    chk("a cursor move ends what a mark folds into", cp_at(1, 1), 0x61);
+
+    // Wide characters: two cells, and the second is the tail.
+    t = fresh();
+    put(&t, "\xe4\xb8\x80z");
+    chk("wide head", cp_at(0, 0), 0x4E00);
+    chk("wide tail", cp_at(1, 0), term.CELL_WIDE_TAIL);
+    chk("next after wide", cp_at(2, 0), 0x7A);
+    // On the last column there is no room for both halves: it wraps.
+    t = fresh();
+    let is i64 as k with mut = 0;
+    while (k < 19) { put(&t, "-"); k = k + 1; }
+    put(&t, "\xe4\xb8\x80");
+    chk("last column left blank", cp_at(19, 0), 0x20);
+    chk("wide moved to the next line", cp_at(0, 1), 0x4E00);
+    chk("its tail", cp_at(1, 1), term.CELL_WIDE_TAIL);
+    // Writing over one half of a wide character blanks the other.
+    t = fresh();
+    put(&t, "\xe4\xb8\x80\r\x1b[1Cx");
+    chk("head blanked when the tail is overwritten", cp_at(0, 0), 0x20);
+    chk("overwrite", cp_at(1, 0), 0x78);
+    t = fresh();
+    put(&t, "\xe4\xb8\x80\ry");
+    chk("overwrite the head", cp_at(0, 0), 0x79);
+    chk("tail blanked", cp_at(1, 0), 0x20);
+
+    // Past the BMP a cell keeps U+FFFD — still two columns for an emoji.
+    t = fresh();
+    put(&t, "\xf0\x9f\x98\x80.");
+    chk("emoji stored as U+FFFD", cp_at(0, 0), 0xFFFD);
+    chk("emoji is wide", cp_at(1, 0), term.CELL_WIDE_TAIL);
+    chk("after the emoji", cp_at(2, 0), 0x2E);
+
+    // Controls that do nothing draw nothing: BEL, DEL, a C1 control.
+    t = fresh();
+    put(&t, "\x07\x7f\xc2\x85k");
+    chk("BEL DEL NEL draw nothing", cp_at(0, 0), 0x6B);
+
+    // The cell carries its colours next to the code point.
+    t = fresh();
+    term.set_color(&t, cast(u32, 0x123456), cast(u32, 0xABCDEF));
+    put(&t, "\xc3\xa9");
+    chk("fg kept", term.cell_fg(cells[0]), 0x123456);
+    chk("bg kept", term.cell_bg(cells[0]), 0xABCDEF);
+    chk("and the character", cp_at(0, 0), 0xE9);
+
+    if (fails == 0) { io.write_str(1, "causticos_term: ok\n"); }
+    return fails;
+}
