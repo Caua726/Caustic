@@ -6,6 +6,9 @@
 //   2. MOV chain bypass: mov rA, rB + mov rC, rA → keep first, rewrite second to mov rC, rB
 //   3. Dead MOV elimination: mov rA, X; mov rA, Y → remove first
 //      (only when Y does not reference rA in any way)
+//
+// Inline asm (between the #APP / #NO_APP lines codegen brackets it with) is
+// never touched: only pairs of generated lines are candidates.
 
 use "../../std/io.cst" as io;
 use "../../std/mem.cst" as mem;
@@ -55,7 +58,23 @@ fn str_contains(hay as *u8, hlen as i32, ndl as *u8, nlen as i32) as i32 {
 
 let is *u8 as line_offs with mut;
 let is *u8 as line_lens with mut;
+let is *u8 as line_hand with mut;     // 1 = a line of inline asm (#APP .. #NO_APP)
 let is i32 as line_count with mut = 0;
+
+fn hand_written(i as i32) as i32 { return cast(i32, line_hand[i]); }
+
+// The line at off, len is exactly `word` (after leading blanks).
+fn _is_marker(buf as *u8, off as i64, len as i32, word as *u8) as i32 {
+    let is i32 as ws = skip_ws(buf, off, len);
+    let is i32 as wl = ph_strlen(word);
+    if (len - ws != wl) { return 0; }
+    let is i32 as k with mut = 0;
+    while (k < wl) {
+        if (buf[off + cast(i64, ws + k)] != word[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
 
 fn get_off(i as i32) as i64 {
     let is *i64 as p = cast(*i64, cast(i64, line_offs) + cast(i64, i) * 8);
@@ -393,20 +412,22 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
     if (size <= 0) { return buf; }
 
     let is i64 as max_lines = size / 4 + 1024;
-    let is i64 as tbl_size = max_lines * 12 + 131072;
+    let is i64 as tbl_size = max_lines * 13 + 131072;
     let is *u8 as tbl = mem.core.mmap_anon(tbl_size);
     if (cast(i64, tbl) <= 0) { return buf; }
 
     line_offs = tbl;
     line_lens = cast(*u8, cast(i64, tbl) + max_lines * 8);
+    line_hand = cast(*u8, cast(i64, tbl) + max_lines * 12);
     line_count = 0;
-    repl_buf = cast(*u8, cast(i64, tbl) + max_lines * 12);
+    repl_buf = cast(*u8, cast(i64, tbl) + max_lines * 13);
     repl_len = 0;
     repl_cap = 131072;
     stat_removed = 0;
     stat_fused = 0;
 
     let is i64 as pos with mut = 0;
+    let is i32 as in_hand with mut = 0;
     while (pos < size) {
         if (cast(i64, line_count) >= max_lines) { mem.core.munmap(tbl, tbl_size); return buf; }
         let is i64 as start = pos;
@@ -415,6 +436,10 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
         let is i32 as llen with mut = cast(i32, pos - start);
         if (llen > 0 && buf[start + cast(i64, llen) - 1] == 13) { llen = llen - 1; }
         set_len(line_count, llen);
+        // Everything from #APP to #NO_APP is the author's, markers included.
+        if (in_hand == 0 && _is_marker(buf, start, llen, "#APP") == 1) { in_hand = 1; }
+        line_hand[line_count] = cast(u8, in_hand);
+        if (in_hand == 1 && _is_marker(buf, start, llen, "#NO_APP") == 1) { in_hand = 0; }
         line_count = line_count + 1;
         if (pos < size) { pos = pos + 1; }
     }
@@ -425,7 +450,8 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
         changed = 0;
         let is i32 as i with mut = 0;
         while (i < line_count - 1) {
-            if (get_len(i) >= 0 && get_len(i + 1) >= 0 && get_off(i) < REPL_MARKER && get_off(i + 1) < REPL_MARKER) {
+            if (get_len(i) >= 0 && get_len(i + 1) >= 0 && get_off(i) < REPL_MARKER && get_off(i + 1) < REPL_MARKER
+                && hand_written(i) == 0 && hand_written(i + 1) == 0) {
                 // 8.3: pre-filter — only mov/movsxd start with 'm' (109)
                 let is i64 as pf_off = get_off(i);
                 let is i32 as pf_len = get_len(i);
