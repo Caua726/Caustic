@@ -112,6 +112,10 @@ struct Term {
     last_y   as i64;
     last_fg  as i64;
     last_bg  as i64;
+    // -- appended (all i64): which rows are a long line the terminal wrapped,
+    //    so copying text gives the line back whole (attach_wraps).
+    wraps    as i64;      // *u8, one per grid row: 1 = continues the row above; 0 = none attached
+    wraps_n  as i64;      // rows it covers
 }
 
 // A lazy grid commits this much more each time the ring reaches its end.
@@ -235,8 +239,26 @@ fn _grid_get(t as *Term, col as i64, row as i64) as i64 {
     return g[phys * t.grid_stride + col];
 }
 
+// The wrap flag of physical grid row phys (see attach_wraps).
+fn _wrap_set(t as *Term, phys as i64, v as i64) as void {
+    if (t.wraps == 0 || phys < 0 || phys >= t.wraps_n) { return; }
+    let is *u8 as w = cast(*u8, t.wraps);
+    w[phys] = cast(u8, v);
+}
+// The same for LIVE row r (no grid, no flags: nothing to do).
+fn _wrap_live(t as *Term, r as i64, v as i64) as void {
+    if (t.wraps == 0 || t.grid == 0) { return; }
+    _wrap_set(t, _live_phys(t, r), v);
+}
+fn _wrap_get(t as *Term, phys as i64) as i64 {
+    if (t.wraps == 0 || phys < 0 || phys >= t.wraps_n) { return 0; }
+    let is *u8 as w = cast(*u8, t.wraps);
+    return cast(i64, w[phys]);
+}
+
 // Blank one physical grid row.
 fn _grid_blank_phys(t as *Term, phys as i64) as void {
+    _wrap_set(t, phys, 0);
     let is *i64 as g = cast(*i64, t.grid);
     let is i64 as blank = _cell_pack(0x20, t.fg, t.bg);
     let is i64 as c with mut = 0;
@@ -254,6 +276,7 @@ fn _live_phys(t as *Term, r as i64) as i64 {
 }
 
 fn _grid_copy_row(t as *Term, from as i64, to as i64) as void {
+    _wrap_set(t, to, _wrap_get(t, from));
     let is *i64 as g = cast(*i64, t.grid);
     let is i64 as c with mut = 0;
     while (c < t.grid_stride) {
@@ -385,6 +408,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.wrap_pend = 0;
     t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
     t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
+    t.wraps = 0; t.wraps_n = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -418,6 +442,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.wrap_pend = 0;
     t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
     t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
+    t.wraps = 0; t.wraps_n = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -451,6 +476,7 @@ fn init_text(width as i64, height as i64) as Term {
     t.wrap_pend = 0;
     t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
     t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
+    t.wraps = 0; t.wraps_n = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -516,6 +542,119 @@ fn attach_grid_lazy(t as *Term, cells as *i64, stride as i64, nrows as i64) as i
     let is i64 as r with mut = 0;
     while (r < t.rows) { _grid_blank_phys(t, r); r = r + 1; }
     return 0;
+}
+
+// attach_wraps — remember which rows are a long line the terminal wrapped,
+// so copy_text can give it back as the one line it was. `flags` holds one
+// byte per grid row, n of them, at least the grid's capacity (call after
+// attach_grid / attach_grid_lazy). 0, or -1 when n is too small.
+fn attach_wraps(t as *Term, flags as *u8, n as i64) as i64 {
+    if (t.grid == 0 || n < t.grid_cap) { return 0 - 1; }
+    t.wraps = cast(i64, flags);
+    t.wraps_n = n;
+    let is i64 as i with mut = 0;
+    while (i < n) { flags[i] = cast(u8, 0); i = i + 1; }
+    return 0;
+}
+
+// ---- lines, for whoever selects and copies text ----------------------------
+//
+// A LINE here is a row of text counted from the live view's top row, 0; the
+// history above it is -1, -2, ... back to -hist_count. Unlike a visible row,
+// a line keeps naming the same text while the view is scrolled back — though
+// not once output scrolls the screen (every line moves up one).
+
+// The line visible row r (0 = top of the window) is showing.
+fn view_line(t as *Term, r as i64) as i64 { return r - t.view_off; }
+
+fn _line_phys(t as *Term, line as i64) as i64 {
+    let is i64 as p = t.live_top + t.grid_rows + line;
+    return p - (p / t.grid_rows) * t.grid_rows;
+}
+
+// 1 when line continues the line above it: the terminal wrapped a long line
+// there, rather than the text breaking it. 0 without attach_wraps.
+fn line_wrapped(t as *Term, line as i64) as i64 {
+    if (t.grid == 0 || line <= 0 - t.hist_count || line >= t.rows) { return 0; }
+    return _wrap_get(t, _line_phys(t, line));
+}
+
+// The cell at column col of line (0 off the grid).
+fn line_cell(t as *Term, line as i64, col as i64) as i64 {
+    if (t.grid == 0 || line < 0 - t.hist_count || line >= t.rows || col < 0 || col >= t.cols) { return 0; }
+    let is *i64 as g = cast(*i64, t.grid);
+    return g[_line_phys(t, line) * t.grid_stride + col];
+}
+
+// copy_text — the text from (l0, c0) up to, not including, (l1, c1), as UTF-8
+// into out (cap bytes); returns the bytes written, never part of a character.
+// What a reader would type to get it back: the right half of a wide
+// character is not a second character, the blanks a line ends in are not
+// text, and lines join with a newline — except where the terminal wrapped
+// one long line, which comes back whole.
+fn copy_text(t as *Term, l0 as i64, c0 as i64, l1 as i64, c1 as i64, out as *u8, cap as i64) as i64 {
+    if (t.grid == 0) { return 0; }
+    let is i64 as n with mut = 0;
+    let is i64 as line with mut = l0;
+    if (line < 0 - t.hist_count) { line = 0 - t.hist_count; }
+    let is i64 as last with mut = l1;
+    if (last >= t.rows) { last = t.rows - 1; }
+    while (line <= last) {
+        let is i64 as from with mut = 0;
+        if (line == l0) { from = c0; }
+        let is i64 as to with mut = t.cols;
+        if (line == l1) { to = c1; }
+        if (to > t.cols) { to = t.cols; }
+        // The line's text ends at its last non-blank cell, unless the next
+        // line continues it: then every cell up to the edge is text.
+        let is i64 as next_cont with mut = 0;
+        if (line < last) { next_cont = line_wrapped(t, line + 1); }
+        let is i64 as end with mut = to;
+        if (line_wrapped(t, line + 1) == 0) {
+            let is i64 as lend with mut = t.cols;
+            while (lend > 0) {
+                let is i64 as cp0 = cell_cp(line_cell(t, line, lend - 1));
+                if (cp0 != 0x20 && cp0 != 0) { break; }
+                lend = lend - 1;
+            }
+            if (end > lend) { end = lend; }
+        }
+        let is i64 as c with mut = from;
+        while (c < end) {
+            let is i64 as cp with mut = cell_cp(line_cell(t, line, c));
+            if (cp != CELL_WIDE_TAIL) {
+                if (cp == 0) { cp = 0x20; }
+                let is [4]u8 as e;
+                let is i64 as k = _utf8_put(cp, cast(*u8, &e[0]));
+                if (n + k > cap) { return n; }
+                let is i64 as j with mut = 0;
+                while (j < k) { out[n + j] = e[j]; j = j + 1; }
+                n = n + k;
+            }
+            c = c + 1;
+        }
+        if (line < last && next_cont == 0) {
+            if (n + 1 > cap) { return n; }
+            out[n] = cast(u8, 10);
+            n = n + 1;
+        }
+        line = line + 1;
+    }
+    return n;
+}
+
+// A BMP code point as UTF-8 (what a cell holds); its length.
+fn _utf8_put(cp as i64, e as *u8) as i64 {
+    if (cp < 0x80) { e[0] = cast(u8, cp); return 1; }
+    if (cp < 0x800) {
+        e[0] = cast(u8, 0xC0 | (cp >> 6));
+        e[1] = cast(u8, 0x80 | (cp & 0x3F));
+        return 2;
+    }
+    e[0] = cast(u8, 0xE0 | (cp >> 12));
+    e[1] = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+    e[2] = cast(u8, 0x80 | (cp & 0x3F));
+    return 3;
 }
 
 // _grid_reach — grid row p (unwrapped: live_top + r) is about to be written.
@@ -778,12 +917,14 @@ fn alt_enter(t as *Term) as void {
     t.alt_fg = cast(i64, t.fg); t.alt_bg = cast(i64, t.bg);
     t.alt_save = 0; t.alt_len = 0; t.alt_rows = 0;
     if (t.grid != 0) {
+        // The rows, then a byte per row for its wrap flag.
         let is i64 as rowb = t.grid_stride * 8;
-        let is i64 as bytes = ((t.rows * rowb + 4095) / 4096) * 4096;
+        let is i64 as bytes = ((t.rows * rowb + t.rows + 4095) / 4096) * 4096;
         let is i64 as va = cos.mmap(0, bytes, cos.PROT_READ | cos.PROT_WRITE);
         if (va > 0) {
             let is *i64 as g = cast(*i64, t.grid);
             let is *i64 as d = cast(*i64, va);
+            let is *u8 as dw = cast(*u8, va + t.rows * rowb);
             let is i64 as r with mut = 0;
             while (r < t.rows) {
                 let is i64 as phys = _live_phys(t, r);
@@ -792,6 +933,8 @@ fn alt_enter(t as *Term) as void {
                     d[r * t.grid_stride + c] = g[phys * t.grid_stride + c];
                     c = c + 1;
                 }
+                dw[r] = cast(u8, _wrap_get(t, phys));
+                _wrap_set(t, phys, 0);               // the program's screen starts with no long lines
                 r = r + 1;
             }
             t.alt_save = va; t.alt_len = bytes; t.alt_rows = t.rows;
@@ -825,6 +968,7 @@ fn alt_leave(t as *Term) as void {
     while (i < k) { _ring_advance(t); i = i + 1; }
     let is *i64 as g = cast(*i64, t.grid);
     let is *i64 as s = cast(*i64, t.alt_save);
+    let is *u8 as sw = cast(*u8, t.alt_save + sr * t.grid_stride * 8);
     let is i64 as r with mut = 0;
     while (r < sr) {
         // saved row r lands on live row r - k (the first k above the view)
@@ -835,6 +979,7 @@ fn alt_leave(t as *Term) as void {
             g[phys * t.grid_stride + c] = s[r * t.grid_stride + c];
             c = c + 1;
         }
+        _wrap_set(t, phys, cast(i64, sw[r]));
         r = r + 1;
     }
     r = sr - k;
@@ -908,7 +1053,12 @@ fn _control(t as *Term, b as i64) as void {
     }
     _cursor(t, 0);                                           // lift the cursor before moving/writing
     t.last_cp = 0;
-    if (b == 0x0A) { t.wrap_pend = 0; _newline(t); return; }   // \n
+    if (b == 0x0A) {                                         // \n: the row it reaches starts a line
+        t.wrap_pend = 0;
+        _newline(t);
+        _wrap_live(t, t.cy, 0);
+        return;
+    }
     if (b == 0x0D) { t.wrap_pend = 0; t.cx = 0; return; }      // \r
     if (b == 0x0C) { clear(t); return; }                     // \f form feed → clear + home
     if (b == 0x08) {                                         // backspace
@@ -941,7 +1091,11 @@ fn _put_cp(t as *Term, cp_in as i64) as void {
     }
     _cursor(t, 0);
     if (cp > 0xFFFF) { cp = 0xFFFD; }                        // a cell holds the BMP
-    if (t.wrap_pend == 1) { t.wrap_pend = 0; _newline(t); }   // the wrap a full row left pending
+    if (t.wrap_pend == 1) {                                  // the wrap a full row left pending
+        t.wrap_pend = 0;
+        _newline(t);
+        _wrap_live(t, t.cy, 1);
+    }
     let is i64 as wide with mut = 0;
     if (w == 2 && t.cols >= 2) { wide = 1; }
     if (wide == 1 && t.cx + 1 >= t.cols) {
@@ -949,6 +1103,7 @@ fn _put_cp(t as *Term, cp_in as i64) as void {
         // character starts the next line, as xterm does.
         _put_cell(t, t.cx, t.cy, 0x20);
         _newline(t);
+        _wrap_live(t, t.cy, 1);
     }
     _put_cell(t, t.cx, t.cy, cp);
     t.last_cp = cp; t.last_x = t.cx; t.last_y = t.cy;
@@ -1067,6 +1222,8 @@ fn clear(t as *Term) as void {
         let is i64 as i with mut = 0;
         let is i64 as total = t.grid_stride * t.grid_ready;
         while (i < total) { g[i] = blank; i = i + 1; }
+        i = 0;
+        while (i < t.wraps_n) { _wrap_set(t, i, 0); i = i + 1; }
         t.live_top = 0;
         t.hist_count = 0;
         t.view_off = 0;
