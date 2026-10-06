@@ -1,0 +1,240 @@
+// tests/exceptions_test.cst
+//
+// try/catch/throw from std/exceptions.cst — a setjmp/longjmp pair written in
+// Caustic, with no runtime to link. The interesting part is not that a throw
+// reaches a catch (that is one jump); it is that it does so from an arbitrary
+// depth, that the guard stack runs in the right order on the way past, and
+// that the normal path leaves the handler stack exactly as it found it.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+
+use "../std/io.cst" as io;
+use "../std/exceptions.cst" as ex;
+
+let is [8]i64 as g_log with mut;
+let is i64 as g_n with mut = 0;
+
+fn note(a as i64) as void {
+    if (g_n < 8) { g_log[g_n] = a; }
+    g_n = g_n + 1;
+}
+
+// --- a throw from four frames down -----------------------------------------
+fn deep4(n as i64) as i64 {
+    if (n == 4) { ex.throw(40 + n); }
+    return n;
+}
+fn deep3(n as i64) as i64 { return deep4(n) + 1; }
+fn deep2(n as i64) as i64 { return deep3(n) + 2; }
+fn deep1(n as i64) as i64 { return deep2(n) + 3; }
+
+// throw out of a loop, and with a live local the frame never got to use
+fn loop_throw(limit as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as acc with mut = 0;
+    while (i < limit) {
+        if (i == 4) { ex.throw(acc); }
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc;
+}
+
+// --- the try in a helper, so the catch resumes in the helper's frame --------
+// value 0 means "the body returned"; otherwise it is the thrown value.
+fn t_value() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    return deep1(4);
+}
+
+fn t_normal() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    return deep1(1) * 10;
+}
+
+fn t_loop() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    return loop_throw(9);
+}
+
+// --- nesting: the inner try handles its own throw --------------------------
+fn t_nested_inner() as i64 {
+    let is ex.Frame as outer;
+    let is i64 as co = ex.begin(&outer);
+    if (co != 0) { return 1000 + co; }
+    ex.enter(&outer);
+    defer ex.leave(&outer);
+
+    let is ex.Frame as inner;
+    let is i64 as ci = ex.begin(&inner);
+    if (ci != 0) { return ci; }              // inner catches it
+    ex.enter(&inner);
+    defer ex.leave(&inner);
+    ex.throw(7);
+    return -1;
+}
+
+// --- nesting: the inner try never registered, so the outer gets it ---------
+fn t_nested_outer() as i64 {
+    let is ex.Frame as outer;
+    let is i64 as co = ex.begin(&outer);
+    if (co != 0) { return co; }
+    ex.enter(&outer);
+    defer ex.leave(&outer);
+
+    let is ex.Frame as inner;
+    let is i64 as ci = ex.begin(&inner);
+    if (ci != 0) { return 500 + ci; }        // not reached: inner never entered
+    ex.throw(9);                             // so the outer handler must get it
+    return -1;
+}
+
+// --- guards -----------------------------------------------------------------
+fn t_guard_throw() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    let is ex.Frame as g;
+    ex.guard(&g, fn_ptr(note), 5);
+    defer ex.release(&g);
+    ex.throw(41);
+    return -1;
+}
+
+fn t_guard_normal() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return 600 + c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    let is ex.Frame as g;
+    ex.guard(&g, fn_ptr(note), 5);
+    defer ex.release(&g);
+    return 12;
+}
+
+fn t_guard_order() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    let is ex.Frame as g1;
+    ex.guard(&g1, fn_ptr(note), 1);
+    defer ex.release(&g1);
+    let is ex.Frame as g2;
+    ex.guard(&g2, fn_ptr(note), 10);
+    defer ex.release(&g2);
+    ex.throw(42);
+    return -1;
+}
+
+// --- a catch that throws again, to the handler outside it ------------------
+fn t_rethrow() as i64 {
+    let is ex.Frame as outer;
+    let is i64 as co = ex.begin(&outer);
+    if (co != 0) { return co; }
+    ex.enter(&outer);
+    defer ex.leave(&outer);
+
+    let is ex.Frame as inner;
+    let is i64 as ci = ex.begin(&inner);
+    if (ci != 0) {
+        ex.throw(ci + 1);                    // inner is already popped
+        return -1;
+    }
+    ex.enter(&inner);
+    defer ex.leave(&inner);
+    ex.throw(20);
+    return -1;
+}
+
+// --- after a catch, a later try must still work (the stack is not corrupted)
+fn t_after_catch() as i64 {
+    let is ex.Frame as f1;
+    let is i64 as c1 = ex.begin(&f1);
+    if (c1 != 0) { return c1; }
+    ex.enter(&f1);
+    defer ex.leave(&f1);
+    ex.throw(3);
+    return -1;
+}
+
+fn t_second() as i64 {
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return c; }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    ex.throw(4);
+    return -1;
+}
+
+// --- the resuming frame's own locals must survive the jump ------------------
+fn t_frame_intact() as i64 {
+    let is i64 as keep = 1234;
+    let is i64 as also = keep * 2;
+    let is ex.Frame as f;
+    let is i64 as c = ex.begin(&f);
+    if (c != 0) { return keep + also + c; }   // 1234 + 2468 + 9
+    ex.enter(&f);
+    defer ex.leave(&f);
+    ex.throw(9);
+    return -1;
+}
+
+fn main() as i32 {
+    // 1/2: a throw unwinds four frames and delivers its value
+    if (t_value() != 44) { return 1; }
+    if (t_normal() != 70) { return 2; }      // deep1(1) = ((1+1)+2)+3 = 7
+
+    // 3: a throw out of a loop carries a live local (0+1+2+3 = 6)
+    if (t_loop() != 6) { return 3; }
+
+    // 4: the innermost registered handler wins
+    if (t_nested_inner() != 7) { return 4; }
+
+    // 5: with the inner one never entered, the outer handler gets it
+    if (t_nested_outer() != 9) { return 5; }
+
+    // 6/7: a guard runs when a throw unwinds past it, and only then
+    g_n = 0;
+    if (t_guard_throw() != 41) { return 6; }
+    if (g_n != 1 || g_log[0] != 5) { return 7; }
+
+    g_n = 0;
+    if (t_guard_normal() != 12) { return 8; }
+    if (g_n != 0) { return 9; }
+
+    // 10: guards run innermost first
+    g_n = 0;
+    if (t_guard_order() != 42) { return 10; }
+    if (g_n != 2 || g_log[0] != 10 || g_log[1] != 1) { return 11; }
+
+    // 12: a catch may throw again; the outer handler sees the new value
+    if (t_rethrow() != 21) { return 12; }
+
+    // 13/14: a caught throw leaves the handler stack usable
+    if (t_after_catch() != 3) { return 13; }
+    if (t_second() != 4) { return 14; }
+
+    // 15: the frame a throw resumes in keeps its own locals
+    if (t_frame_intact() != 3711) { return 15; }
+
+    io._write_fd(io.STDOUT, "exceptions: try/catch/throw\n", 28);
+    return 0;
+}

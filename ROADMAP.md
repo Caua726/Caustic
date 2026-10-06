@@ -34,14 +34,41 @@ Windows backends now.
   per-function scopes; the modules, their symbol streams, sources and line
   tables are already per-object.
 
+## Exceptions (`std/exceptions.cst`)
+
+`try`/`catch`/`throw` are the stdlib's, not the language's: `begin` captures
+the caller's machine state (a naked function — with a prologue it would save
+its own frame), `enter` registers it as a handler, `throw` runs the guards it
+unwinds past and restores the innermost handler's state. No `_Unwind_*`, no
+libc, no libgcc.
+
+Verified on Linux x86_64 (`-O0/-O1/-O2`), Linux AArch64 (qemu) and Windows
+x86_64 (wine); `tests/exceptions_test.cst` pins the depth, the value, nesting,
+guard order, rethrow and that the resuming frame's own locals survive.
+
+Known limits, deliberate:
+
+- **`defer` does not run on a throw.** It is compiler-inlined at each `return`
+  and there is no addressable "run my defers" thunk for a throw to call.
+  `guard`/`release` is the exception-safe form: the guard runs on the unwind,
+  the paired `defer release` pops it on the normal path.
+- **The handler stack is a plain global, not per-thread.** A `throw` on a
+  thread other than the one that entered a frame would unwind that frame.
+- **No target without inline asm.** A wasm build that uses it fails in the
+  backend with "inline asm is not supported on wasm" — loud, but not a
+  diagnostic this module chooses.
+- **The pattern is explicit.** Without macros, the catch is an `if` on
+  `begin`'s result; `enter` must precede anything that can throw, and a throw
+  with nothing entered is an uncaught panic.
+
 ## Debug info (DWARF, ELF `-g`)
 
-- **No exception syntax.** Caustic has no `try`/`catch`/`throw`, so there is
-  nothing to lower and no `_Unwind_*` runtime to link. What a *foreign*
-  unwinder needs is present: `.eh_frame` + `.eh_frame_hdr` (with a
-  `PT_GNU_EH_FRAME` header) in both executables and `--shared` objects, and a
-  C++ exception thrown from a Caustic `.so` callback now unwinds through it
-  and reaches the caller's `catch`.
+- **No exception syntax in the language.** `try`/`catch`/`throw` are not
+  keywords — exceptions live in the stdlib instead (see below), so there is
+  no `_Unwind_*` runtime to link. What a *foreign* unwinder needs is present:
+  `.eh_frame` + `.eh_frame_hdr` (with a `PT_GNU_EH_FRAME` header) in both
+  executables and `--shared` objects, and a C++ exception thrown from a
+  Caustic `.so` callback unwinds through it and reaches the caller's `catch`.
 - **CFI covers ELF and PE.** ELF carries `.eh_frame` (x86_64 caf 1/ra rip,
   AArch64 caf 4/ra x30, pcrel FDEs in a shared object); PE carries
   `.pdata`/`.xdata` (one `RUNTIME_FUNCTION` + `UNWIND_INFO` per function,

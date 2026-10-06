@@ -8,7 +8,32 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
 ## Unreleased
 
+### Added
+- **Exceptions — `std/exceptions.cst`.** `try`/`catch`/`throw` as a stdlib
+  facility: there is no `_Unwind_*` runtime to link (static binaries, no libc
+  or libgcc), so the module carries its own non-local exit. `begin` is a naked
+  function that saves the CALLER's machine state — with a prologue it would
+  save its own frame, which is gone by the time the throw happens — `enter`
+  registers it as a handler, and `throw` runs every guard it unwinds past and
+  restores the innermost handler's state, so the catch resumes in the frame
+  that called `begin` with the thrown value as its result. Guards are the
+  exception-safe counterpart to `defer` (which the compiler inlines at each
+  `return` and so cannot run on a throw).
+  Verified on Linux x86_64 at `-O0/-O1/-O2`, Linux AArch64 under qemu and
+  Windows x86_64 under wine; `tests/exceptions_test.cst` pins the unwind
+  depth, the delivered value, nesting, guard order, rethrow, and that the
+  resuming frame keeps its own locals.
+  Limitations in the module header and `ROADMAP.md`: the handler stack is not
+  per-thread, and a target without inline asm (wasm) cannot use it.
+
 ### Fixed
+- **AArch64 `mov Rd, #imm` silently emitted `mvn`.** The `mov` case handled
+  only the register form and the `sp` forms, so a numeric operand was read as
+  a register: `mov x0, 0` encoded as `mvn x0, x3` and produced garbage. The
+  compiler only ever emits movz/movk, which is why it went unnoticed until
+  hand-written asm used it. It is now movz when the value is one 16-bit field
+  at shift 0/16/32/48, and is rejected otherwise rather than encoded as
+  something else. `caustic-assembler/aarch64/assembler.cst`.
 - **A multi-file Windows link failed with "duplicate symbol".** A COFF extern
   (`extern fn` referencing another object) was written with section 99, which
   the linker read as "defined" — the ELF reader uses 0 — so the extern looked

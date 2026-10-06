@@ -1,0 +1,161 @@
+// =======================================================
+// std/exceptions.cst — try / catch / throw, entirely in the stdlib.
+//
+// There is no `_Unwind_*` runtime to link (the binaries are static and carry
+// no libc/libgcc), so this does its own non-local exit: a stack of handler
+// frames, and a save/restore of the machine state written in inline asm. It
+// is the classic setjmp/longjmp pair, expressed in Caustic.
+//
+// Usage — `begin` captures, `enter` registers, and the `if` is the catch:
+//
+//     use "std/exceptions.cst" as ex;
+//
+//     fn risky(n as i64) as i64 {
+//         if (n < 0) { ex.throw(1); }
+//         return n * 2;
+//     }
+//
+//     fn main() as i32 {
+//         let is ex.Frame as f;
+//         let is i64 as code = ex.begin(&f);
+//         if (code != 0) {
+//             io.printf("caught %d\n", code);      // the catch block
+//             return 1;
+//         }
+//         ex.enter(&f);
+//         defer ex.leave(&f);                      // runs on every normal return
+//         let is i64 as v = risky(-5);             // may throw
+//         return cast(i32, v);
+//     }
+//
+// `begin` must be a naked function: the context it saves is the CALLER's, so
+// a throw resumes at the instruction after `begin`'s call, in the caller's
+// frame, with the thrown value as `begin`'s result.
+//
+// Cleanup — a `defer` runs on a normal return, not on a throw. To release
+// something on both paths, register a guard; `throw` runs every guard it
+// unwinds past:
+//
+//     let is ex.Frame as g;
+//     ex.guard(&g, fn_ptr(free_it), cast(i64, p));
+//     defer ex.release(&g);                        // normal path: pop, do not run
+//
+// Limitations, deliberate:
+//   * The handler stack is a plain global, not per-thread. A `throw` on a
+//     thread other than the one that entered the frame would unwind it.
+//   * No target without inline asm (wasm) can use this: the asm arm calls
+//     __compile_error, so a wasm build that uses it fails at compile time.
+//   * `enter` must be called before any code that can throw, and `leave` (or
+//     a `throw` that unwinds past it) after. Calling `begin` and then
+//     throwing without `enter` is an uncaught throw.
+// =======================================================
+
+use "io.cst" as io;
+
+// Machine state saved by `begin` and restored by a throw.
+//
+// The asm reads this layout by fixed byte offset, so the field order is part
+// of the interface: `ctx` MUST stay first, and the offsets are
+//   0   ctx   16 i64  —  x86_64: rbx rbp r12 r13 r14 r15 rsp rip
+//                        aarch64: x19..x28 x29 x30 sp
+//   128 prev  *Frame  — the frame below this one on the handler stack
+//   136 cleanup *u8   — the cleanup to run (guard frames)
+//   144 arg   i64     — its argument
+//   152 kind  i32     — 0 = catch, 1 = guard
+struct Frame {
+    ctx as [16]i64;
+    prev as *Frame;
+    cleanup as *u8;
+    arg as i64;
+    kind as i32;
+}
+
+let is i32 as KIND_CATCH with imut = 0;
+let is i32 as KIND_GUARD with imut = 1;
+
+// Top of the handler stack; the innermost frame is the head.
+let is *Frame as _head with mut = cast(*Frame, 0);
+
+// Save the CALLER's machine state into f.ctx and return 0. The caller's
+// context is what a throw restores, so this must be naked: with a prologue it
+// would save its own frame, which is gone by the time the throw happens.
+fn begin(f as *Frame) as i64 with naked {
+    if (__target_is_aarch64 == 1) {
+        asm("str x19, [x0]\nstr x20, [x0, 8]\nstr x21, [x0, 16]\nstr x22, [x0, 24]\nstr x23, [x0, 32]\nstr x24, [x0, 40]\nstr x25, [x0, 48]\nstr x26, [x0, 56]\nstr x27, [x0, 64]\nstr x28, [x0, 72]\nstr x29, [x0, 80]\nstr x30, [x0, 88]\nmov x1, sp\nstr x1, [x0, 96]\nmov x0, 0\nret\n");
+    } else {
+        // [rsp] is the return address, [rsp+8] the caller's rsp once this
+        // returns; rbp is already the caller's, a naked function not having
+        // touched it.
+        asm("mov [rdi], rbx\nmov [rdi+8], rbp\nmov [rdi+16], r12\nmov [rdi+24], r13\nmov [rdi+32], r14\nmov [rdi+40], r15\nlea rax, [rsp+8]\nmov [rdi+48], rax\nmov rax, [rsp]\nmov [rdi+56], rax\nxor eax, eax\nret\n");
+    }
+    return 0;
+}
+
+// Restore f.ctx and jump to it, resuming f's frame with v as the result of
+// its `begin` call. Never returns. Args are in rdi/rsi (x0/x1): Caustic's own
+// calling convention keeps the System V registers on every x86_64 target, so
+// one arm covers Linux and Windows.
+fn _jump(f as *Frame, v as i64) as void with naked {
+    if (__target_is_aarch64 == 1) {
+        asm("ldr x19, [x0]\nldr x20, [x0, 8]\nldr x21, [x0, 16]\nldr x22, [x0, 24]\nldr x23, [x0, 32]\nldr x24, [x0, 40]\nldr x25, [x0, 48]\nldr x26, [x0, 56]\nldr x27, [x0, 64]\nldr x28, [x0, 72]\nldr x29, [x0, 80]\nldr x30, [x0, 88]\nldr x9, [x0, 96]\nmov sp, x9\nmov x0, x1\nret\n");
+    } else {
+        asm("mov r11, [rdi+56]\nmov rax, rsi\nmov rbx, [rdi]\nmov rbp, [rdi+8]\nmov r12, [rdi+16]\nmov r13, [rdi+24]\nmov r14, [rdi+32]\nmov r15, [rdi+40]\nmov rsp, [rdi+48]\njmp r11\n");
+    }
+}
+
+// Register f as a catch handler. Call it after `begin` returned 0 and before
+// anything that can throw.
+fn enter(f as *Frame) as void {
+    f.kind = KIND_CATCH;
+    f.prev = _head;
+    _head = f;
+}
+
+// Unregister f on the normal path. Safe to call only while f is the head,
+// which it is unless a throw already unwound past it.
+fn leave(f as *Frame) as void {
+    if (_head == f) { _head = f.prev; }
+}
+
+// Register a cleanup to run if a throw unwinds past this point. Pair it with
+// `defer release(&g)` so the normal path pops it without running it.
+fn guard(g as *Frame, cleanup as *u8, arg as i64) as void {
+    g.kind = KIND_GUARD;
+    g.cleanup = cleanup;
+    g.arg = arg;
+    g.prev = _head;
+    _head = g;
+}
+
+fn release(g as *Frame) as void {
+    if (_head == g) { _head = g.prev; }
+}
+
+// A throw that finds no handler is a bug in the program, not a value. This
+// does not go through std/errors.cst: importing that module at all compiles
+// its __compile_error stubs, which abort the build (it is only usable under
+// --allow-unsupported).
+fn _uncaught() as void {
+    io.write_str(io.STDERR, "panic: uncaught exception\n");
+    io.exit(1);
+}
+
+// Unwind to the innermost catch handler, running every guard on the way.
+fn throw(v as i64) as void {
+    let is *Frame as f with mut = _head;
+    while (cast(i64, f) != 0) {
+        let is *Frame as prev = f.prev;
+        if (f.kind == KIND_GUARD) {
+            let is *u8 as cb = f.cleanup;
+            let is i64 as arg = f.arg;
+            _head = prev;
+            call(cb, arg);
+        } else {
+            _head = prev;
+            _jump(f, v);
+            return;                 // not reached
+        }
+        f = _head;
+    }
+    _uncaught();
+}
