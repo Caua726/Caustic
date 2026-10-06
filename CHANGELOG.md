@@ -134,6 +134,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **`.eh_frame` — real Call Frame Information for ELF.** Unwinding relied on
+  the frame-pointer chain, so a backtrace was only as good as the heuristic.
+  Codegen now emits `.cfi_startproc`/`.cfi_def_cfa_offset`/`.cfi_offset`/
+  `.cfi_def_cfa_register`/`.cfi_endproc` around each prologue; the assembler
+  turns them into a DW_CFA opcode stream in `.cstcfi`; and the linker wraps
+  those into a real `.eh_frame` (one CIE + one FDE per function) in the loaded
+  R+X segment. `gdb`'s `info frame` now shows the CFI saved-register table
+  (rbx/rbp/r12-r15/rip at their CFA offsets), and `readelf --debug-dump=frames`
+  and `llvm-dwarfdump --eh-frame` read it back cleanly. Naked functions get no
+  CFI. `caustic-linker/elf/eh_frame.cst`.
 - **Windows directory and process facades.** `std/io.cst`'s `list_dir`,
   `count_dir_entries`, `is_dir` and `get_cwd` had a Linux backend only, so on
   Windows they returned -1/0 and every `caustic-mk` glob failed with "pattern

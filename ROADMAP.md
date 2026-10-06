@@ -34,9 +34,10 @@ Windows backends now.
 
 ## Debug info (DWARF, ELF `-g`)
 
-- **No `.eh_frame`/CFI.** Unwinding relies on the frame-pointer chain (gdb's
-  heuristic); there is no call-frame information and no exception/unwind
-  tables. `caustic-linker/elf/elf_debug.cst`.
+- **`.eh_frame` is emitted, but not `.eh_frame_hdr` / `PT_GNU_EH_FRAME`.** The
+  CFI is in the loaded R+X segment and debuggers and profilers read it, but the
+  in-process runtime unwinder (for exceptions) wants the binary-search header
+  and the segment entry too. `caustic-linker/elf/eh_frame.cst`.
 - **Locations are static per function.** A local/parameter is described as a
   fixed `DW_OP_fbreg` off rbp for the whole function, so a value still in a
   register during the prologue (before its spill) is not located — a breakpoint
