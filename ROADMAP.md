@@ -40,11 +40,13 @@ Windows backends now.
   behind it. `caustic-linker/elf/eh_frame.cst`.
 - **CFI is x86_64-ELF only.** PE uses `.pdata`/`.xdata`; the AArch64 assembler
   ignores the `.cfi_*` directives, so `linux-aarch64` objects get no CFI.
-- **Locations are static per function.** A local/parameter is described as a
-  fixed `DW_OP_fbreg` off rbp for the whole function, so a value still in a
-  register during the prologue (before its spill) is not located — a breakpoint
-  at the first line of a function may read a parameter as zero until the spill.
-  A location list would fix it.
+- **Local locations are static per function.** A `let` is described as a fixed
+  `DW_OP_fbreg` off rbp for the whole function; it is valid after its
+  initialization, but a value still in a register at `-O1`/`-O2` is not
+  tracked. Parameters DO get a location list (register before the prologue
+  end, frame slot after) — except in a single-line function, where the
+  prologue end is not distinguishable from the body, so it falls back to the
+  frame slot. A full location list for locals would close it.
 - **One source file per link.** The line table's file table carries the first
   object's source; a multi-object link reports one file.
 - **Enums are not described.** Structs, pointers and arrays are; Caustic's

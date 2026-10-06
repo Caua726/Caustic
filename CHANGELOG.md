@@ -134,6 +134,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **Parameters read correctly at the first breakpoint (`-g`).** A breakpoint
+  on a function landed after the CFI prologue but before the parameter spill,
+  where the DWARF described a parameter as a fixed frame slot that had not
+  been written yet — `print p` said 0 (or `<optimized out>`). Codegen now
+  marks the prologue end (`.dbg_prologue_end`), which the assembler appends to
+  `.cstdebug` and the linker flags with `DW_LNS_set_prologue_end` in the line
+  table; and each scalar, pointer or pointer-to-struct parameter gets a
+  `.debug_loc` list — its incoming register before the prologue end, its frame
+  slot after. `print p`/`p->x` and `info args` now give the real value at the
+  entry breakpoint. `caustic-linker/elf/elf_debug.cst`.
 - **`.eh_frame_hdr` + `PT_GNU_EH_FRAME` — the runtime unwinder works.** The
   CFI had a binary-search header missing, so `libdwfl`/`libgcc` had no way to
   map a pc to its FDE. The linker now emits `.eh_frame_hdr` (version 1, a
