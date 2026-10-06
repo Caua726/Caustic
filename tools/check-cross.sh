@@ -32,7 +32,7 @@ echo "${B}Caustic cross-target checks${N} ${D}(opt-in; never gates a commit)${N}
 step "linux-aarch64 (qemu-aarch64)"
 if command -v qemu-aarch64 >/dev/null 2>&1; then
     # native reference vs cross result must match for a few programs
-    for t in examples/test_sum.cst tests/aarch64/scalar_abi.cst tests/aarch64/linux_syscalls.cst; do
+    for t in examples/test_sum.cst tests/aarch64/scalar_abi.cst tests/aarch64/linux_syscalls.cst tests/exceptions_test.cst; do
         [ -f "$t" ] || continue
         if ! cst "$t" -o "$TMP/nat"; then bad "$t failed to build (native)"; continue; fi
         "$TMP/nat" </dev/null >/dev/null 2>&1; nrc=$?
@@ -68,6 +68,13 @@ if command -v wine >/dev/null 2>&1; then
         wine /tmp/exit42.exe </dev/null >/dev/null 2>&1
         [ $? = 42 ] && ok "hand-rolled exit42.exe -> 42" || bad "exit42.exe wrong exit"
     else bad "exit42 generator failed"; fi
+    # exceptions: the unwind saves the System V registers, and Caustic keeps
+    # them on the PE target too — this is what pins that assumption
+    if cst tests/exceptions_test.cst -o "$TMP/exc_nat" && cst --target=windows-x86_64 tests/exceptions_test.cst -o "$TMP/exc.exe"; then
+        "$TMP/exc_nat" </dev/null >/dev/null 2>&1; nrc=$?
+        wine "$TMP/exc.exe" </dev/null >/dev/null 2>&1; wrc=$?
+        [ "$nrc" = "$wrc" ] && ok "exceptions native==windows (exit $wrc)" || bad "exceptions native($nrc) != windows($wrc)"
+    else bad "exceptions cross-build failed"; fi
 else skip "wine not installed"; fi
 
 # ─── C interop via gcc (shared .so callable from C, System V ABI) ───────────
