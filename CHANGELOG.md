@@ -134,6 +134,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **`-g` emits DWARF, so gdb and lldb can debug a Caustic ELF binary.** The
+  ELF target had no debug information at all — not even a line table — so a
+  debugger saw raw assembly. `-g` now writes `.debug_line`, `.debug_info`,
+  `.debug_abbrev` and `.debug_str`: source-level `list`, breakpoints by
+  `file:line`, `step`/`next`, `backtrace`, `info locals`, `info args`,
+  `ptype`, and printing of variables, structs, arrays and pointers. The
+  compiler emits `.cstlocals`/`.cstsigs`/`.cststructs` for the ELF object and
+  the linker turns them, plus `.loc`, into DWARF; addresses and frame bases use
+  the same rbp-relative model the PE/PDB path already uses. A build without
+  `-g` is byte-identical to before. `caustic-linker/elf/elf_debug.cst`.
 - **`caustic-as --version` and `caustic-ld --version`.** The assembler read
   `--version` as a file to assemble; the linker refused it.
 - **Source builds version the assembler and linker too.** `install.sh

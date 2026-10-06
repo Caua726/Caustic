@@ -38,6 +38,23 @@ still fall back or no-op where the Linux path is complete.
   carry the first `.cstdebug` file; a link of several objects with different
   source paths still reports one. `caustic-linker/pe/pe_debug.cst:build_module_stream`.
 
+## Debug info (DWARF, ELF `-g`)
+
+- **No `.eh_frame`/CFI.** Unwinding relies on the frame-pointer chain (gdb's
+  heuristic); there is no call-frame information and no exception/unwind
+  tables. `caustic-linker/elf/elf_debug.cst`.
+- **Locations are static per function.** A local/parameter is described as a
+  fixed `DW_OP_fbreg` off rbp for the whole function, so a value still in a
+  register during the prologue (before its spill) is not located — a breakpoint
+  at the first line of a function may read a parameter as zero until the spill.
+  A location list would fix it.
+- **One source file per link.** The line table's file table carries the first
+  object's source; a multi-object link reports one file.
+- **Enums are not described.** Structs, pointers and arrays are; Caustic's
+  tagged-union enums have no DWARF representation yet.
+- **`-g` disables the parallel per-module emitter.** Debug builds take the
+  serial whole-program path (the body AST must stay live for `.cstlocals`).
+
 ## Semantic
 
 - **`src/semantic/types.cst:608` — `TODO(safety)`.** A strict pointer/type
