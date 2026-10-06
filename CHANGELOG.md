@@ -116,8 +116,24 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   call now, and an argv that does not fit ends the run with `proc_exit(1)`
   rather than corrupting the module's own argv.
 
+- **The Windows `.pdb` was unreadable by every debugger.** Three defects
+  compounded. Composite struct types (pointer, array, nested struct) were
+  emitted *inside* the open `LF_FIELDLIST` instead of as their own TPI
+  records, so any struct with such a field desynchronised the field list
+  (`UNKNOWN RECORD`), and sub-record padding counted up (`0xF1 0xF2`) when the
+  canonical fill counts down (`0xF2 0xF1`). The MSF container was always 13
+  blocks and wrote one block per stream regardless of size, so any stream past
+  4 KiB mapped the wrong blocks. And nothing produced `.cstdebug`: the
+  assembler discarded `.file`/`.loc`, so the module stream was empty —
+  `llvm-pdbutil` called the whole file corrupt and reported no functions,
+  locals or line table. Types now use forward declarations plus real
+  `LF_FIELDLIST`/`LF_STRUCTURE` records with the canonical padding; the
+  assembler collects `.file`/`.loc` into `.cstdebug`; the linker consumes it
+  for module symbols, typed locals and the line table; and the MSF is sized by
+  its content. The `.pdb` now lands next to `-o` (its path was discarded to
+  the cwd), and the `RSDS` record carries that same path.
+
 ### Added
-- **Float literals take an exponent**: `1e30`, `1.5e-3`, `2E+8`.
 - **`caustic-as --version` and `caustic-ld --version`.** The assembler read
   `--version` as a file to assemble; the linker refused it.
 - **Source builds version the assembler and linker too.** `install.sh

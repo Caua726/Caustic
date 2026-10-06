@@ -29,11 +29,14 @@ still fall back or no-op where the Linux path is complete.
 
 ## PE debug info
 
-- **`caustic-linker/pe/pe_debug.cst:1297` — struct type records use a
-  `T_NOTYPE` fallback.** Real CodeView struct records (proper field lists) are
-  still pending; locals/types currently degrade to "no type" for structs.
-- **`caustic-linker/pe/pdb_writer.cst:320` — PDB stream header is stubbed**
-  ("skip header for now").
+- **TPI/IPI hash streams are absent.** The PDB carries no name-based type
+  hash streams (`hashStreamIndex = 0xFFFF`), only the type records. MSVC's
+  hash algorithm by type name was not reproduced — a wrong hash is worse than
+  none — so `llvm-pdbutil` and address-based consumers work while name-indexed
+  type lookup does not. `caustic-linker/pe/pdb_writer.cst:_emit_tpi_header`.
+- **One source file per PE module.** The module stream's STRINGTABLE/FILECHKSMS
+  carry the first `.cstdebug` file; a link of several objects with different
+  source paths still reports one. `caustic-linker/pe/pe_debug.cst:build_module_stream`.
 
 ## Semantic
 
