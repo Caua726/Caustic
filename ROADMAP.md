@@ -87,12 +87,15 @@ Windows backends now.
   loop-based `fib(10)` fold to constants, `use(x)` with a runtime `x` does not.
   The purity check is by construction — a non-pure body simply fails to fold.
 
-## Project health (deferred — owner deprioritized)
+## Project health
 
-Recorded for honesty; not currently being worked on.
-
-- **No CI.** The bootstrap fixpoint (`gen2 == gen3`, byte-for-byte) and
-  `caustic-mk test` are only run manually. A workflow that builds all five
-  targets and runs the fixpoint on every push would protect self-hosting.
+- **CI** (`.github/workflows/ci.yml`) fetches the latest release as the
+  bootstrap seed, runs `tools/precommit.sh` (self-host fixpoint at
+  `-O0/-O1/-O2` + the suite), then the two opt-in suites. The seed has to be
+  recent enough to compile HEAD; the build fails loudly if it is not.
+- **`tools/check-cross.sh`** (qemu/wine/gcc) and **`tools/check-debuginfo.sh`**
+  (llvm-dwarfdump/llvm-pdbutil/gdb/g++) are opt-in and SKIP a missing tool, so
+  neither can fail for an environment reason — but they are what pins the
+  cross-target ABI and the debug-info work, so run them before a release.
 - **Thin test suite.** ~16 test files against ~58k lines of `.cst`. No golden
   codegen tests, no negative/error-message tests, no fuzzing.

@@ -1,0 +1,61 @@
+name: ci
+
+# The repo deliberately does not commit a compiler binary, so CI fetches the
+# latest release as the bootstrap SEED and then builds everything from source.
+# The seed only has to be recent enough to compile HEAD; if it is not, the
+# build fails loudly at the first step rather than producing a wrong verdict.
+#
+# The pre-commit self-check is native-only and gates the build. The cross and
+# debug-info checks need external tools (qemu, wine, llvm, gdb, g++) and SKIP
+# whatever is missing, so they can never fail for an environment reason.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selfhost:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install external tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ gdb llvm qemu-user wine file curl
+          # llvm-pdbutil / llvm-dwarfdump / llvm-readobj live in the versioned
+          # llvm-N-tools package on some releases; the bare `llvm` pulls them.
+          command -v llvm-pdbutil || sudo apt-get install -y llvm-dev || true
+
+      - name: Fetch the seed toolchain
+        run: |
+          curl -fsSL -o seed.tar.gz \
+            "https://github.com/Caua726/Caustic/releases/latest/download/caustic-x86_64-linux.tar.gz"
+          tar xzf seed.tar.gz
+          cp caustic-x86_64-linux/bin/caustic .
+          cp caustic-x86_64-linux/bin/caustic-as .
+          cp caustic-x86_64-linux/bin/caustic-ld .
+          cp caustic-x86_64-linux/bin/caustic-mk .
+          mkdir -p lib
+          cp -r caustic-x86_64-linux/lib/caustic lib/
+          ./caustic --version
+
+      - name: Self-check (self-host fixpoint at -O0/-O1/-O2 + suite)
+        run: tools/precommit.sh
+
+      - name: Build the toolchain in place
+        run: |
+          ./caustic-mk build caustic
+          ./caustic-mk build caustic-as
+          ./caustic-mk build caustic-ld
+          ./caustic-mk build caustic-mk
+
+      - name: Cross-target checks (opt-in; skips missing tools)
+        run: tools/check-cross.sh
+
+      - name: Debug-info checks (opt-in; skips missing tools)
+        run: tools/check-debuginfo.sh

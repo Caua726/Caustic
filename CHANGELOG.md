@@ -141,6 +141,15 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **CI, and a debug-info regression suite.** `.github/workflows/ci.yml` fetches
+  the latest release as the bootstrap seed, runs the self-host fixpoint at
+  `-O0/-O1/-O2` plus the suite, then the opt-in cross-target and debug-info
+  checks. `tools/check-debuginfo.sh` pins the debug-info work: `llvm-dwarfdump
+  --verify` clean and enum/struct/parameter types present; a pointer parameter
+  and a local read correctly at a breakpoint and an enum prints by name; every
+  `llvm-pdbutil dump` mode exits 0 with an `LF_ENUM` and one module per object;
+  FDEs on ELF, AArch64 and PE; and a C++ exception unwinding through a Caustic
+  `.so` frame.
 - **The Windows `.pdb` is well-formed.** `llvm-pdbutil dump --symbols` failed
   with "Invalid module stream" and `--modules` with "stream too short" (both
   predate the enum work). Four defects: a CodeView subsection's `Length` must
