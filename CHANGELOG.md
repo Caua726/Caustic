@@ -10,10 +10,12 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
 ### Fixed
 - **A multi-file Windows link failed with "duplicate symbol".** A COFF extern
-  (`extern fn` referencing another object) is written with section 99, but the
-  linker's "is it defined" tests only knew the ELF reader's 0, so the extern
-  looked defined and its definition was reported as a duplicate. Both
-  sentinels are accepted now. `caustic-linker/core/linker.cst`.
+  (`extern fn` referencing another object) was written with section 99, which
+  the linker read as "defined" — the ELF reader uses 0 — so the extern looked
+  defined and the object that defined it was reported as a duplicate. The COFF
+  reader now writes 0 like the ELF one, and `__imp_<sym>` (undefined in the
+  object, bound by the import table later) is exempt from the unresolved-symbol
+  check it would otherwise trip. `caustic-linker/readers/coff_reader.cst`.
 - **A function of another signature could be stored into, or passed as, an
   `fn(...)` type.** `fn(f64) as i64` went into an `fn(i64, *u8) as i32`
   without a word, and `call()` through it checked only the number of
