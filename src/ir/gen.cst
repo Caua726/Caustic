@@ -24,18 +24,29 @@ let is i32 as ctx_loop_depth with mut;
 let is i32 as ctx_has_sret with mut;
 let is i32 as ctx_sret_vreg with mut;
 let is i32 as ctx_has_returned with mut;
-// Loop stack: 3 i32 per entry (start, end, continue), max 32 = 384 bytes
-let is [384]u8 as loop_stack with mut;
-// Defer stack: *Node pointers (8 bytes each), max 64 = 512 bytes
-let is [512]u8 as defer_stack with mut;
+// Loop stack: 3 i32 per entry (start, end, continue). Grown on demand — it was
+// a fixed [384]u8 (32 entries) and push_loop silently returned past the 32nd,
+// so a loop nested deeper than that compiled with the wrong break/continue
+// target and no diagnostic.
+let is *u8 as loop_stack with mut = cast(*u8, 0);
+let is i32 as loop_cap with mut = 0;
+// Defer stack: *Node pointers, 8 bytes each. Grown on demand — it was a fixed
+// [512]u8 (64 entries) and push_defer silently returned past the 64th, so the
+// 65th deferred call in one scope never ran.
+let is *u8 as defer_stack with mut = cast(*u8, 0);
+let is i32 as defer_cap with mut = 0;
 let is i32 as defer_count with mut;
 // String registry
 let is *d.StringEntry as string_head with mut;
 let is i32 as string_id_count with mut;
 // gen_ir recursion depth
 let is i32 as ir_depth with mut;
-// Module dedup: track already-processed bodies (max 256 modules)
-let is [2048]u8 as ir_done_bodies with mut;
+// Module dedup: bodies of `use`d modules already processed by gen_ir. Grown on
+// demand — it was a fixed [2048]u8 (256 modules) and the caller's
+// `ir_done_count < 256` guard made the dedup check fail open past that, so a
+// module was walked a second time.
+let is *u8 as ir_done_bodies with mut = cast(*u8, 0);
+let is i32 as ir_done_cap with mut = 0;
 let is i32 as ir_done_count with mut;
 
 fn ir_reset() as void {
@@ -49,6 +60,9 @@ fn ir_reset() as void {
     ctx_has_sret = 0;
     ctx_sret_vreg = 0;
     ctx_has_returned = 0;
+    // The three growable stacks keep their storage across functions and across
+    // input files: one allocation for the whole process, reset to empty here.
+    // Their capacity fields are deliberately not touched.
     defer_count = 0;
     string_head = cast(*d.StringEntry, 0);
     string_id_count = 0;
@@ -204,13 +218,28 @@ fn emit_return(src as i32, line as i32) as void {
 }
 
 fn push_loop(start as i32, end_l as i32, cont as i32) as void {
-    if (ctx_loop_depth >= 32) { return; }
+    if (ctx_loop_depth >= loop_cap) {
+        let is i32 as nc with mut = loop_cap * 2;
+        if (nc < 16) { nc = 16; }
+        let is *u8 as nb = d.opt_alloc(cast(i64, nc) * 12);
+        let is i32 as ne = loop_cap * 3;
+        let is i32 as ci with mut = 0;
+        while (ci < ne) {
+            let is *i32 as dp = cast(*i32, cast(i64, nb) + cast(i64, ci) * 4);
+            let is *i32 as sp = cast(*i32, cast(i64, loop_stack) + cast(i64, ci) * 4);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(loop_stack);
+        loop_stack = nb;
+        loop_cap = nc;
+    }
     let is i64 as off = cast(i64, ctx_loop_depth) * 12;
-    let is *i32 as p = cast(*i32, cast(i64, &loop_stack) + off);
+    let is *i32 as p = cast(*i32, cast(i64, loop_stack) + off);
     *p = start;
-    let is *i32 as p2 = cast(*i32, cast(i64, &loop_stack) + off + 4);
+    let is *i32 as p2 = cast(*i32, cast(i64, loop_stack) + off + 4);
     *p2 = end_l;
-    let is *i32 as p3 = cast(*i32, cast(i64, &loop_stack) + off + 8);
+    let is *i32 as p3 = cast(*i32, cast(i64, loop_stack) + off + 8);
     *p3 = cont;
     ctx_loop_depth = ctx_loop_depth + 1;
 }
@@ -221,28 +250,74 @@ fn pop_loop() as void {
 
 fn get_loop_end() as i32 {
     let is i64 as off = cast(i64, ctx_loop_depth - 1) * 12 + 4;
-    let is *i32 as p = cast(*i32, cast(i64, &loop_stack) + off);
+    let is *i32 as p = cast(*i32, cast(i64, loop_stack) + off);
     return *p;
 }
 
 fn get_loop_continue() as i32 {
     let is i64 as off = cast(i64, ctx_loop_depth - 1) * 12 + 8;
-    let is *i32 as p = cast(*i32, cast(i64, &loop_stack) + off);
+    let is *i32 as p = cast(*i32, cast(i64, loop_stack) + off);
     return *p;
 }
 
 fn push_defer(node as *u8) as void {
-    if (defer_count >= 64) { return; }
+    if (defer_count >= defer_cap) {
+        let is i32 as nc with mut = defer_cap * 2;
+        if (nc < 16) { nc = 16; }
+        let is *u8 as nb = d.opt_alloc(cast(i64, nc) * 8);
+        let is i32 as ci with mut = 0;
+        while (ci < defer_count) {
+            let is *i64 as dp = cast(*i64, cast(i64, nb) + cast(i64, ci) * 8);
+            let is *i64 as sp = cast(*i64, cast(i64, defer_stack) + cast(i64, ci) * 8);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(defer_stack);
+        defer_stack = nb;
+        defer_cap = nc;
+    }
     let is i64 as off = cast(i64, defer_count) * 8;
-    let is *i64 as p = cast(*i64, cast(i64, &defer_stack) + off);
+    let is *i64 as p = cast(*i64, cast(i64, defer_stack) + off);
     *p = cast(i64, node);
     defer_count = defer_count + 1;
 }
 
 fn get_defer(idx as i32) as *u8 {
     let is i64 as off = cast(i64, idx) * 8;
-    let is *i64 as p = cast(*i64, cast(i64, &defer_stack) + off);
+    let is *i64 as p = cast(*i64, cast(i64, defer_stack) + off);
     return cast(*u8, *p);
+}
+
+// Record that a `use`d module's body has been walked by gen_ir. Returns 1 when
+// the caller should walk it (first time), 0 when it already has been — the
+// whole dedup, including the growth, lives next to the table it maintains.
+fn note_done_body(body as *u8) as i32 {
+    let is i64 as body_ptr = cast(i64, body);
+    let is i32 as di with mut = 0;
+    while (di < ir_done_count) {
+        let is *i64 as dp = cast(*i64, cast(i64, ir_done_bodies) + cast(i64, di) * 8);
+        if (*dp == body_ptr) { return 0; }
+        di = di + 1;
+    }
+    if (ir_done_count >= ir_done_cap) {
+        let is i32 as nc with mut = ir_done_cap * 2;
+        if (nc < 256) { nc = 256; }
+        let is *u8 as nb = d.opt_alloc(cast(i64, nc) * 8);
+        let is i32 as ci with mut = 0;
+        while (ci < ir_done_count) {
+            let is *i64 as dp = cast(*i64, cast(i64, nb) + cast(i64, ci) * 8);
+            let is *i64 as sp = cast(*i64, cast(i64, ir_done_bodies) + cast(i64, ci) * 8);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(ir_done_bodies);
+        ir_done_bodies = nb;
+        ir_done_cap = nc;
+    }
+    let is *i64 as dp2 = cast(*i64, cast(i64, ir_done_bodies) + cast(i64, ir_done_count) * 8);
+    *dp2 = body_ptr;
+    ir_done_count = ir_done_count + 1;
+    return 1;
 }
 
 // String dedup hash table (256 buckets, chained)

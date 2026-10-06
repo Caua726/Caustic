@@ -94,6 +94,38 @@ fn _reject(name as *u8, src as *u8) as void {
     _check(name, cast(i32, _run("./caustic", cast(*u8, &c)) != 0));
 }
 
+// Compile `src` and require the EXACT exit code `want`.
+//
+// _reject above only knows "non-zero", which cannot tell a clean diagnostic
+// from a crash: the compiler spends a long time inside recursive descent, and
+// the failure mode being checked here is that a deeply nested input killed the
+// process — exit code 139 (128 + SIGSEGV) — instead of being refused. A test
+// that accepts any non-zero would pass on the crash it is meant to catch.
+fn _compiler_exit(name as *u8, src as *u8, want as i32) as void {
+    let is [6]i64 as c;
+    c[0] = cast(i64, "./caustic"); c[1] = cast(i64, "-q"); c[2] = cast(i64, src); c[3] = cast(i64, "-o"); c[4] = cast(i64, "build/ct_nest"); c[5] = 0;
+    _check(name, cast(i32, _run("./caustic", cast(*u8, &c)) == want));
+}
+
+// Write build/nest_deep.cst: a main that returns `n` nested parens around 0.
+// The depth decides the verdict, so the file is generated here rather than
+// kept in the tree twice. One paren per line: the diagnostic quotes the line it
+// stopped on, and a single line of 12000 parens makes that quote unreadable.
+fn _write_nest_src(n as i32) as void {
+    let is i64 as fd = io._open_write("build/nest_deep.cst");
+    if (fd < 0) { return; }
+    let is *u8 as head = "fn main() as i32 { return ";
+    io._write_fd(fd, head, _slen(head));
+    let is i32 as i with mut = 0;
+    while (i < n) { io._write_fd(fd, "(\n", 2); i = i + 1; }
+    io._write_fd(fd, "0", 1);
+    i = 0;
+    while (i < n) { io._write_fd(fd, ")\n", 2); i = i + 1; }
+    let is *u8 as tail = "; }\n";
+    io._write_fd(fd, tail, _slen(tail));
+    io._close_fd(fd);
+}
+
 fn main() as i32 {
     _p("=== Caustic test suite (run_tests.cst) ===\n");
 
@@ -213,6 +245,44 @@ fn main() as i32 {
     _unit_o2("t_thread_churn -O2", "tests/threads/t_thread_churn.cst");
     _unit_o2("t_sync_full -O2", "tests/threads/t_sync_full.cst");
     _unit_o2("t_alloc_mt -O2", "tests/threads/t_alloc_mt.cst");
+
+    // --- Fixed-capacity scratch state, and the nesting budget ---
+    //
+    // Every entry here is a cap that used to be silent: scratch state with a
+    // fixed capacity that truncated its contents (or a recursion with no depth
+    // budget that ended in SIGSEGV) instead of growing or refusing. Each
+    // fixture returns 0 only when the answer is the right one, and each was
+    // confirmed to FAIL against the pre-fix compiler: params and args died with
+    // 139, defer counted one short, loops broke out one level too high, and the
+    // CFG fixture crashed at -O1/-O2.
+    _p("\n--- Silent caps ---\n");
+    _unit("caps_params", "tests/caps_params_test.cst");
+    _unit_opt("caps_params -O1", "tests/caps_params_test.cst");
+    _unit_o2("caps_params -O2", "tests/caps_params_test.cst");
+    _unit("caps_args", "tests/caps_args_test.cst");
+    _unit_opt("caps_args -O1", "tests/caps_args_test.cst");
+    _unit_o2("caps_args -O2", "tests/caps_args_test.cst");
+    _unit("caps_defer", "tests/caps_defer_test.cst");
+    _unit_opt("caps_defer -O1", "tests/caps_defer_test.cst");
+    _unit_o2("caps_defer -O2", "tests/caps_defer_test.cst");
+    _unit("caps_loops", "tests/caps_loops_test.cst");
+    _unit_opt("caps_loops -O1", "tests/caps_loops_test.cst");
+    _unit_o2("caps_loops -O2", "tests/caps_loops_test.cst");
+    // The block-count fixture only means something where the CFG is built, so
+    // it is registered at -O1/-O2 and not at the default -O0.
+    _unit_opt("caps_cfg -O1", "tests/caps_cfg_test.cst");
+    _unit_o2("caps_cfg -O2", "tests/caps_cfg_test.cst");
+
+    // A deeply nested input is a diagnostic (exit 1), not a crash (139 = SIGSEGV,
+    // which _compiler_exit would refuse to accept). The positive twin is the same
+    // generator at a depth that always worked: the guard must not refuse what it
+    // never refused before.
+    _write_nest_src(12000);
+    _compiler_exit("deep parens rejected", "build/nest_deep.cst", 1);
+    _write_nest_src(200);
+    _compiler_exit("200 nested parens compile", "build/nest_deep.cst", 0);
+    let is [2]i64 as nestrun; nestrun[0] = cast(i64, "build/ct_nest"); nestrun[1] = 0;
+    _check("200 nested parens run", cast(i32, _run("build/ct_nest", cast(*u8, &nestrun)) == 0));
 
     // --- Bootstrap + fixpoint (gen1 -> gen2 -> gen3, gen2 == gen3) ---
     _p("\n--- Bootstrap ---\n");

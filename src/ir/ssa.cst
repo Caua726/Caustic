@@ -21,16 +21,27 @@ struct SlotInfo {
 fn find_promotable(func as *d.IRFunction, slots as *SlotInfo, out_count as *i32) as void {
     let is i32 as count with mut = 0;
 
-    // Pass 1: collect address-taken offsets (IR_ADDR with IMM)
-    let is [256]i64 as addr_taken;
+    // Pass 1: collect address-taken offsets (IR_ADDR with IMM). Sized from a
+    // count first: the old fixed [256]i64 stopped recording past the 256th, and
+    // an offset missing from this list means a local whose address is taken is
+    // never marked non-promotable — it gets promoted, and the code reading it
+    // through the pointer sees a stale value. Silent miscompile, not a rejection.
+    let is i32 as at_total with mut = 0;
+    let is *d.IRInst as cnt with mut = func.instructions;
+    while (cast(i64, cnt) != 0) {
+        if (cnt.is_dead == 0 && cnt.op == d.IR_ADDR && cnt.src1.op_type == d.OP_IMM) {
+            at_total = at_total + 1;
+        }
+        cnt = cnt.next;
+    }
+    let is *i64 as addr_taken = cast(*i64, d.opt_alloc(cast(i64, at_total) * 8 + 8));
     let is i32 as at_count with mut = 0;
     let is *d.IRInst as pre with mut = func.instructions;
     while (cast(i64, pre) != 0) {
         if (pre.is_dead == 0 && pre.op == d.IR_ADDR && pre.src1.op_type == d.OP_IMM) {
-            if (at_count < 256) {
-                addr_taken[at_count] = pre.src1.imm;
-                at_count = at_count + 1;
-            }
+            let is *i64 as ap = cast(*i64, cast(i64, addr_taken) + cast(i64, at_count) * 8);
+            *ap = pre.src1.imm;
+            at_count = at_count + 1;
         }
         pre = pre.next;
     }
@@ -86,7 +97,7 @@ fn find_promotable(func as *d.IRFunction, slots as *SlotInfo, out_count as *i32)
     // Mark address-taken slots as non-promotable
     let is i32 as ai with mut = 0;
     while (ai < at_count) {
-        let is i64 as addr_off = addr_taken[ai];
+        let is i64 as addr_off = *(cast(*i64, cast(i64, addr_taken) + cast(i64, ai) * 8));
         let is i32 as si with mut = 0;
         while (si < count) {
             let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, si) * sizeof(SlotInfo));
@@ -96,6 +107,7 @@ fn find_promotable(func as *d.IRFunction, slots as *SlotInfo, out_count as *i32)
         ai = ai + 1;
     }
 
+    d.opt_free(cast(*u8, addr_taken));
     *out_count = count;
 }
 
@@ -148,6 +160,30 @@ fn slot_bsearch(srt_off as *i64, srt_idx as *i32, np as i32, off as i64) as i32 
     return cast(i32, 0 - 1);
 }
 
+// Push a block onto the phi worklist, doubling the buffer when it is full.
+// The list used to be a fixed [256]i32 with `wl_count < 256` guards at both
+// push sites, so every def block past the 256th was silently dropped: no phi
+// was inserted for it and the slot reads a value from the wrong path.
+fn wl_push(out_buf as **i32, out_cap as *i32, out_count as *i32, b as i32) as void {
+    if (*out_count >= *out_cap) {
+        let is i32 as nc = *out_cap * 2;
+        let is *i32 as nb = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is i32 as ci with mut = 0;
+        while (ci < *out_count) {
+            let is *i32 as dp = cast(*i32, cast(i64, nb) + cast(i64, ci) * 4);
+            let is *i32 as sp = cast(*i32, cast(i64, *out_buf) + cast(i64, ci) * 4);
+            *dp = *sp;
+            ci = ci + 1;
+        }
+        d.opt_free(cast(*u8, *out_buf));
+        *out_buf = nb;
+        *out_cap = nc;
+    }
+    let is *i32 as wp = cast(*i32, cast(i64, *out_buf) + cast(i64, *out_count) * 4);
+    *wp = b;
+    *out_count = *out_count + 1;
+}
+
 // === Step 4: Insert phi nodes ===
 // Returns count of phis inserted. phi_block[i] = block of phi i, phi_slot[i] = slot index,
 // phi_vreg[i] = dest vreg of phi, phi_args[i * max_preds + j] = arg vreg from pred j
@@ -163,7 +199,8 @@ fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
     let is i32 as nphi with mut = 0;
 
     // For each promotable slot, find def blocks and insert phis at DF
-    let is [256]i32 as worklist;
+    let is i32 as wl_cap with mut = 64;
+    let is *i32 as worklist = cast(*i32, d.opt_alloc(cast(i64, wl_cap) * 4));
     let is i32 as hp_size = nblocks * nslots + 1;
     let is *i32 as has_phi = cast(*i32, d.opt_alloc(cast(i64, hp_size) * 4));
     let is i32 as hi with mut = 0;
@@ -232,9 +269,8 @@ fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
             let is i32 as bi with mut = 0;
             while (bi < nblocks) {
                 let is *u8 as bd = cast(*u8, cast(i64, block_def) + cast(i64, bi) * cast(i64, nslots) + cast(i64, si));
-                if (*bd == cast(u8, 1) && wl_count < 256) {
-                    worklist[wl_count] = bi;
-                    wl_count = wl_count + 1;
+                if (*bd == cast(u8, 1)) {
+                    wl_push(&worklist, &wl_cap, &wl_count, bi);
                 }
                 bi = bi + 1;
             }
@@ -270,10 +306,7 @@ fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
                         }
                         nphi = nphi + 1;
                         // Add df_block to worklist if not already a def block
-                        if (wl_count < 256) {
-                            worklist[wl_count] = df_block;
-                            wl_count = wl_count + 1;
-                        }
+                        wl_push(&worklist, &wl_cap, &wl_count, df_block);
                     }
                     di = di + 1;
                 }
@@ -285,6 +318,7 @@ fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
 
     func.vreg_count = next_vreg;
     *out_nphi = nphi;
+    d.opt_free(cast(*u8, worklist));
     d.opt_free(cast(*u8, has_phi));
     d.opt_free(cast(*u8, srt_off));
     d.opt_free(cast(*u8, srt_idx));
@@ -710,7 +744,8 @@ fn mem2reg(func as *d.IRFunction) as void {
     if (any_promo == 0) { d.opt_free(cast(*u8, slots)); return; }
 
     // Step 1: build CFG
-    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg.MAX_BLOCKS) * sizeof(cfg.BasicBlock)));
+    let is i32 as cfg_cap = cfg.count_blocks(func) + 1;
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg_cap) * sizeof(cfg.BasicBlock)));
     let is i32 as lc = func.label_count + 1;
     let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
     let is i32 as li with mut = 0;
@@ -720,7 +755,7 @@ fn mem2reg(func as *d.IRFunction) as void {
         li = li + 1;
     }
     let is i32 as nblocks with mut = 0;
-    cfg.build_cfg(func, blocks, &nblocks, label_to_bb);
+    cfg.build_cfg(func, blocks, cfg_cap, &nblocks, label_to_bb);
     if (nblocks <= 1) {
         // Fast path: single basic block — no phis needed, simple linear forwarding
         let is *i32 as sb_off_map = cast(*i32, d.opt_alloc(cast(i64, OFF_MAP_MAX) * 4));

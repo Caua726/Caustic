@@ -6,6 +6,7 @@ use "../semantic/defs.cst" as sd;
 use "defs.cst" as d;
 use "gen.cst" as g;
 use "../codegen/target.cst" as tgt;
+use "../nest.cst" as nest;
 
 fn emit_deferred_calls() as void {
     let is i32 as i with mut = g.defer_count - 1;
@@ -215,25 +216,36 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         arg_count = arg_count + 1;
     }
 
-    // Generate args - max 32 args
-    let is [256]u8 as arg_vregs;
-    let is [64]u8 as arg_is_flt;
-    let is [64]i64 as arg_types;
+    // Generate args. The three arrays are sized by the call's own argument
+    // count (including the hidden sret slot, which occupies index 0 when
+    // present). They used to be fixed at 64 entries while the loops below
+    // walked to arg_count, so a 65-argument call indexed past the end of all
+    // three: arg vregs went missing and the call passed whatever happened to
+    // be next on the stack.
+    let is i64 as av_bytes with mut = cast(i64, arg_count) * 4;
+    if (av_bytes < 8) { av_bytes = 8; }
+    let is *u8 as arg_vregs = d.opt_alloc(av_bytes);
+    let is *u8 as arg_is_flt = d.opt_alloc(cast(i64, arg_count) + 8);
+    let is *u8 as arg_types = d.opt_alloc(cast(i64, arg_count) * 8 + 8);
     let is i32 as ai with mut = 0;
     if (sret_addr != cast(i32, 0 - 1)) {
-        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
+        let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
         *av = sret_addr;
-        arg_is_flt[ai] = 0;
-        arg_types[ai] = 0;
+        let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, ai));
+        *af = 0;
+        let is *i64 as at = cast(*i64, cast(i64, arg_types) + cast(i64, ai) * 8);
+        *at = 0;
         ai = ai + 1;
     }
     a = node.args;
-    while (cast(i64, a) != 0 && ai < 64) {
-        let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
+    while (cast(i64, a) != 0) {
+        let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
         *av = gen_expr(a);
-        if (g.is_float_kind(a.ty.kind) == 1) { arg_is_flt[ai] = 1; }
-        else { arg_is_flt[ai] = 0; }
-        arg_types[ai] = cast(i64, a.ty);
+        let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, ai));
+        if (g.is_float_kind(a.ty.kind) == 1) { *af = 1; }
+        else { *af = 0; }
+        let is *i64 as at = cast(*i64, cast(i64, arg_types) + cast(i64, ai) * 8);
+        *at = cast(i64, a.ty);
         ai = ai + 1;
         a = a.next;
     }
@@ -258,7 +270,8 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         let is i32 as gpr_total with mut = 0;
         j = 0;
         while (j < arg_count) {
-            if (arg_is_flt[j] == 1) { xmm_total = xmm_total + 1; }
+            let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, j));
+            if (*af == 1) { xmm_total = xmm_total + 1; }
             else { gpr_total = gpr_total + 1; }
             j = j + 1;
         }
@@ -276,20 +289,23 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
             g.emit(pa);
         }
         // Classify each arg: on_stack or register
-        let is [64]u8 as arg_on_stk;
-        let is [64]i32 as arg_stack_slot;
+        let is *u8 as arg_on_stk = d.opt_alloc(cast(i64, arg_count) + 8);
+        let is *i32 as arg_stack_slot = cast(*i32, d.opt_alloc(cast(i64, arg_count) * 4 + 8));
         let is i32 as gi with mut = 0;
         let is i32 as xi with mut = 0;
         let is i32 as stack_slot with mut = 0;
         j = 0;
         while (j < arg_count) {
-            if (arg_is_flt[j] == 1) {
-                if (xi < 8) { arg_on_stk[j] = 0; }
-                else { arg_on_stk[j] = 1; arg_stack_slot[j] = stack_slot; stack_slot = stack_slot + 1; }
+            let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, j));
+            let is *u8 as osk = cast(*u8, cast(i64, arg_on_stk) + cast(i64, j));
+            let is *i32 as oss = cast(*i32, cast(i64, arg_stack_slot) + cast(i64, j) * 4);
+            if (*af == 1) {
+                if (xi < 8) { *osk = 0; }
+                else { *osk = 1; *oss = stack_slot; stack_slot = stack_slot + 1; }
                 xi = xi + 1;
             } else {
-                if (gi < gpr_limit) { arg_on_stk[j] = 0; }
-                else { arg_on_stk[j] = 1; arg_stack_slot[j] = stack_slot; stack_slot = stack_slot + 1; }
+                if (gi < gpr_limit) { *osk = 0; }
+                else { *osk = 1; *oss = stack_slot; stack_slot = stack_slot + 1; }
                 gi = gi + 1;
             }
             j = j + 1;
@@ -297,9 +313,11 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         // Push stack overflow args in reverse
         j = arg_count - 1;
         while (j >= 0) {
-            if (arg_on_stk[j] == 1) {
-                let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-                if (a64 == 1) { g.emit_set_arg(8 + arg_stack_slot[j], *av, cast(*u8, 0), line); }
+            let is *u8 as osk = cast(*u8, cast(i64, arg_on_stk) + cast(i64, j));
+            if (*osk == 1) {
+                let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+                let is *i32 as oss = cast(*i32, cast(i64, arg_stack_slot) + cast(i64, j) * 4);
+                if (a64 == 1) { g.emit_set_arg(8 + *oss, *av, cast(*u8, 0), line); }
                 else { g.emit_set_arg(6, *av, cast(*u8, 0), line); }
             }
             j = j - 1;
@@ -309,21 +327,26 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         xi = 0;
         j = 0;
         while (j < arg_count) {
-            if (arg_on_stk[j] == 0) {
-                let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
-                if (arg_is_flt[j] == 1) {
-                    g.emit_set_arg(xi, *av, cast(*u8, arg_types[j]), line);
+            let is *u8 as osk = cast(*u8, cast(i64, arg_on_stk) + cast(i64, j));
+            let is *u8 as af = cast(*u8, cast(i64, arg_is_flt) + cast(i64, j));
+            if (*osk == 0) {
+                let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
+                if (*af == 1) {
+                    let is *i64 as at = cast(*i64, cast(i64, arg_types) + cast(i64, j) * 8);
+                    g.emit_set_arg(xi, *av, cast(*u8, *at), line);
                     xi = xi + 1;
                 } else {
                     g.emit_set_arg(gi, *av, cast(*u8, 0), line);
                     gi = gi + 1;
                 }
             } else {
-                if (arg_is_flt[j] == 1) { xi = xi + 1; }
+                if (*af == 1) { xi = xi + 1; }
                 else { gi = gi + 1; }
             }
             j = j + 1;
         }
+        d.opt_free(cast(*u8, arg_on_stk));
+        d.opt_free(cast(*u8, arg_stack_slot));
     } else {
         // Internal Caustic ABI: all args in GPRs
         if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
@@ -338,18 +361,22 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         // Stack args in reverse
         j = arg_count - 1;
         while (j >= gpr_limit) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j - 1;
         }
         // Register args
         j = 0;
         while (j < arg_count && j < gpr_limit) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j + 1;
         }
     }
+
+    d.opt_free(arg_vregs);
+    d.opt_free(arg_is_flt);
+    d.opt_free(arg_types);
 
     // Use asm_name if available (for mangled names)
     let is *u8 as cname with mut = node.name_ptr;
@@ -558,6 +585,7 @@ fn gen_expr(node as *ast.Node) as i32 {
         io.write_str(io.STDERR, "ir: null expression node\n");
         io.exit(1);
     }
+    if (nest.spent() == 1) { io.exit(1); }
 
     let is i32 as k = node.kind;
     let is i32 as line = g.tok_line(node.tok_idx);
@@ -988,11 +1016,13 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is *ast.Node as a with mut = node.args;
         while (cast(i64, a) != 0) { arg_count = arg_count + 1; a = a.next; }
 
-        let is [256]u8 as arg_vregs;
+        let is i64 as av_bytes with mut = cast(i64, arg_count) * 4;
+        if (av_bytes < 8) { av_bytes = 8; }
+        let is *u8 as arg_vregs = d.opt_alloc(av_bytes);
         let is i32 as ai with mut = 0;
         a = node.args;
-        while (cast(i64, a) != 0 && ai < 64) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, ai) * 4);
+        while (cast(i64, a) != 0) {
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
             *av = gen_expr(a);
             ai = ai + 1;
             a = a.next;
@@ -1016,16 +1046,17 @@ fn gen_expr(node as *ast.Node) as i32 {
         }
         let is i32 as j with mut = arg_count - 1;
         while (j >= gpr_limit) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j - 1;
         }
         j = 0;
         while (j < arg_count && j < gpr_limit) {
-            let is *i32 as av = cast(*i32, cast(i64, &arg_vregs) + cast(i64, j) * 4);
+            let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4);
             g.emit_set_arg(j, *av, cast(*u8, 0), line);
             j = j + 1;
         }
+        d.opt_free(arg_vregs);
 
         let is i32 as ret_reg = g.emit_call_indirect(fn_ptr_vreg, line);
         // Attach return type for float handling in codegen

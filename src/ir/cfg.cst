@@ -1,8 +1,14 @@
 use "defs.cst" as d;
+use "../../std/io.cst" as io;
 
 // === CFG construction: basic blocks, predecessors, reverse postorder ===
-
-let is i32 as MAX_BLOCKS with imut = 4096;
+//
+// The block array belongs to the caller and is sized from the function itself
+// (count_blocks below); there is no fixed ceiling here. It used to be a
+// MAX_BLOCKS = 4096 constant that only bounded the *initialisation*: a function
+// with more blocks still got nblocks = cur_block + 1, so the successor loop
+// indexed past the end of the array. `capacity` is checked on every block start
+// instead — overrunning it is an internal error, never a silent skip.
 
 struct BasicBlock {
     first as *d.IRInst;
@@ -29,8 +35,57 @@ fn insert_before(prev as *d.IRInst, target as *d.IRInst, newinst as *d.IRInst) a
     prev.next = newinst;
 }
 
-fn build_cfg(func as *d.IRFunction, blocks as *BasicBlock, out_nblocks as *i32,
-             label_to_bb as *i32) as void {
+// Number of basic blocks build_cfg will produce for `func`. A leader is the
+// first instruction, any IR_LABEL, and any instruction following a
+// JMP/JZ/JNZ/RET (unless that branch is last). This is the same scan build_cfg
+// does to mark block starts — kept identical on purpose, since callers size
+// their block array with `count_blocks(func) + 1` and build_cfg asserts the two
+// agree rather than quietly dropping blocks.
+fn count_blocks(func as *d.IRFunction) as i32 {
+    let is i32 as inst_count with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) { inst_count = inst_count + 1; inst = inst.next; }
+
+    let is *i32 as leader = cast(*i32, d.opt_alloc(cast(i64, inst_count + 1) * 4));
+    let is i32 as ii with mut = 0;
+    while (ii <= inst_count) {
+        let is *i32 as p = cast(*i32, cast(i64, leader) + cast(i64, ii) * 4);
+        *p = 0;
+        ii = ii + 1;
+    }
+    let is *i32 as p0 = cast(*i32, cast(i64, leader));
+    *p0 = 1;
+
+    ii = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_LABEL) {
+            let is *i32 as p = cast(*i32, cast(i64, leader) + cast(i64, ii) * 4);
+            *p = 1;
+        }
+        if (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ || inst.op == d.IR_RET) {
+            if (ii + 1 < inst_count) {
+                let is *i32 as p = cast(*i32, cast(i64, leader) + cast(i64, ii + 1) * 4);
+                *p = 1;
+            }
+        }
+        ii = ii + 1;
+        inst = inst.next;
+    }
+
+    let is i32 as n with mut = 0;
+    ii = 0;
+    while (ii < inst_count) {
+        let is *i32 as p = cast(*i32, cast(i64, leader) + cast(i64, ii) * 4);
+        if (*p == 1) { n = n + 1; }
+        ii = ii + 1;
+    }
+    d.opt_free(cast(*u8, leader));
+    return n;
+}
+
+fn build_cfg(func as *d.IRFunction, blocks as *BasicBlock, capacity as i32,
+             out_nblocks as *i32, label_to_bb as *i32) as void {
     // First pass: identify block starts (label targets + after branches)
     let is i32 as nblocks with mut = 0;
     let is i32 as lc = func.label_count + 1;
@@ -80,21 +135,23 @@ fn build_cfg(func as *d.IRFunction, blocks as *BasicBlock, out_nblocks as *i32,
         let is *i32 as lp = cast(*i32, cast(i64, inst_is_leader) + cast(i64, ii) * 4);
         if (*lp == 1) {
             cur_block = cur_block + 1;
-            if (cur_block < MAX_BLOCKS) {
-                let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, cur_block) * sizeof(BasicBlock));
-                bb.first = inst;
-                bb.last = inst;
-                bb.succ0 = cast(i32, 0 - 1);
-                bb.succ1 = cast(i32, 0 - 1);
-                bb.idom = cast(i32, 0 - 1);
-                bb.rpo = cast(i32, 0 - 1);
-                bb.df_start = 0;
-                bb.df_count = 0;
-                bb.pred_start = 0;
-                bb.pred_count = 0;
+            if (cur_block >= capacity) {
+                io.write_str(io.STDERR, "error: internal: more basic blocks than the caller allocated\n");
+                io.exit(1);
             }
+            let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, cur_block) * sizeof(BasicBlock));
+            bb.first = inst;
+            bb.last = inst;
+            bb.succ0 = cast(i32, 0 - 1);
+            bb.succ1 = cast(i32, 0 - 1);
+            bb.idom = cast(i32, 0 - 1);
+            bb.rpo = cast(i32, 0 - 1);
+            bb.df_start = 0;
+            bb.df_count = 0;
+            bb.pred_start = 0;
+            bb.pred_count = 0;
         }
-        if (cur_block >= 0 && cur_block < MAX_BLOCKS) {
+        if (cur_block >= 0) {
             let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, cur_block) * sizeof(BasicBlock));
             bb.last = inst;
             // Map label → block

@@ -1054,12 +1054,13 @@ fn emit_func_body(c as *WBuf, f as *d.IRFunction) as void {
     emit_prologue(&body);
 
     // CFG
-    let is *u8 as blocks = d.opt_alloc(cast(i64, cfg.MAX_BLOCKS) * sizeof(cfg.BasicBlock));
+    let is i32 as cfg_cap = cfg.count_blocks(f) + 1;
+    let is *u8 as blocks = d.opt_alloc(cast(i64, cfg_cap) * sizeof(cfg.BasicBlock));
     let is *u8 as label_to_bb = d.opt_alloc(cast(i64, f.label_count + 2) * 4);
     let is i32 as j with mut = 0;
     while (j < f.label_count + 2) { arr_seti32(label_to_bb, j, 0); j = j + 1; }
     let is i32 as nblocks with mut = 0;
-    cfg.build_cfg(f, cast(*cfg.BasicBlock, blocks), &nblocks, cast(*i32, label_to_bb));
+    cfg.build_cfg(f, cast(*cfg.BasicBlock, blocks), cfg_cap, &nblocks, cast(*i32, label_to_bb));
 
     if (nblocks <= 1) {
         // single block: straight-line, no dispatch loop
@@ -1588,6 +1589,28 @@ fn emit_start_body(c as *WBuf) as void {
         op_i32const(&body, g_argv_base + ARGV_BUFSZ_OFF);
         wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_ARGS_SIZES));
         wb_u8(&body, 0x1A);                                        // drop errno
+        // The argv region is a fixed reservation: MAX_ARGS pointer slots, then
+        // the string area. A host passing more args than that would have
+        // args_get write past the slots and into the strings (the 257th pointer
+        // lands on env_ptrs and then on the buffer itself), so refuse the run
+        // instead — proc_exit(1), no trap. Both comparisons are unsigned
+        // because the WASI values are u32.
+        op_i32const(&body, g_argv_base + ARGV_ARGC_OFF);
+        wb_u8(&body, 0x28); wb_uleb(&body, 2); wb_uleb(&body, 0);  // i32.load argc
+        op_i32const(&body, cast(i64, MAX_ARGS));
+        wb_u8(&body, 0x4B);                                        // i32.gt_u
+        wb_u8(&body, 0x04); wb_u8(&body, 0x40);                    // if
+        op_i32const(&body, 1);
+        wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_PROC_EXIT));
+        wb_u8(&body, 0x0B);                                        // end
+        op_i32const(&body, g_argv_base + ARGV_BUFSZ_OFF);
+        wb_u8(&body, 0x28); wb_uleb(&body, 2); wb_uleb(&body, 0);  // i32.load bufsize
+        op_i32const(&body, ARGV_REGION - ARGV_BUF_OFF);
+        wb_u8(&body, 0x4B);                                        // i32.gt_u
+        wb_u8(&body, 0x04); wb_u8(&body, 0x40);                    // if
+        op_i32const(&body, 1);
+        wb_u8(&body, 0x10); wb_uleb(&body, cast(i64, IMP_PROC_EXIT));
+        wb_u8(&body, 0x0B);                                        // end
         // args_get(wasi_ptrs, argv_buf)
         op_i32const(&body, g_argv_base + ARGV_WPTRS_OFF);
         op_i32const(&body, g_argv_base + ARGV_BUF_OFF);

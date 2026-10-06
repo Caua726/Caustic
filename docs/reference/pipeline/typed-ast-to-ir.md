@@ -265,8 +265,11 @@ let is i32 as ctx_has_returned with mut;      // set after a return statement
 
 Additional state for loops and defers:
 
-- **Loop stack** (384 bytes): Stores start/end/continue labels for nested loops (max 32 levels). Used by `break` and `continue` to jump to the correct labels.
-- **Defer stack** (512 bytes): Stores pointers to deferred `NK_FNCALL` nodes (max 64). Before each `IR_RET`, all deferred calls are emitted in LIFO order.
+- **Loop stack**: Stores start/end/continue labels for nested loops. Used by `break` and `continue` to jump to the correct labels. Grown by doubling (16 entries to start), so nesting depth is not capped.
+- **Defer stack**: Stores pointers to deferred `NK_FNCALL` nodes. Before each `IR_RET`, all deferred calls are emitted in LIFO order. Grown by doubling as well.
+
+Both keep their storage across functions; `ir_reset()` empties them (counters
+only) rather than reallocating.
 
 ## Control Flow Lowering
 

@@ -34,6 +34,30 @@ fn _write_fd(fd as i64, buf as *u8, n as i64) as i64 {
     return 0 - 1;
 }
 
+// Write exactly n bytes. A single write() may transfer less than asked (a pipe
+// with a small buffer, a large file write interrupted by a signal); the raw
+// calls above return the count transferred, and every caller used to drop it on
+// the floor and report success. This loops until the whole buffer is out,
+// retrying only on EINTR (returned as exactly -4, the Linux errno); any other
+// non-positive return ends the attempt, because retrying a real error just
+// spins. Returns the number of bytes written, or -1 on failure.
+//
+// Buffered writers in this file record a failure in `write_failed`; stderr
+// diagnostics keep using the raw call, since losing a diagnosis is better than
+// dying while trying to report it.
+let is i32 as write_failed with mut = 0;
+
+fn write_all_fd(fd as i64, buf as *u8, n as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as w = _write_fd(fd, cast(*u8, cast(i64, buf) + done), n - done);
+        if (w == 0 - 4) { continue; }   // EINTR: the write never started
+        if (w <= 0) { return 0 - 1; }
+        done = done + w;
+    }
+    return done;
+}
+
 fn _read_fd(fd as i64, buf as *u8, n as i64) as i64 {
     if (os.current() == os.OS_LINUX)   { return linux_io.read(fd, buf, n); }
     if (os.current() == os.OS_WINDOWS) { return windows_io.read(fd, buf, n); }
@@ -460,7 +484,7 @@ fn Writer(fd as i64, buf as *u8, cap as i64) as Writer {
 
 fn flush(w as *Writer) as void {
     if (w.len > 0) {
-        _write_fd(w.fd, w.buf, w.len);
+        if (write_all_fd(w.fd, w.buf, w.len) < 0) { write_failed = 1; }
         w.len = 0;
     }
 }
@@ -481,7 +505,7 @@ fn write(w as *Writer, s as string.String) as void {
     // Optimization: if string is larger than buffer, flush and write directly
     if (slen > w.cap) {
         flush(w);
-        _write_fd(w.fd, s.ptr, slen);
+        if (write_all_fd(w.fd, s.ptr, slen) < 0) { write_failed = 1; }
         return;
     }
 
@@ -494,7 +518,7 @@ fn write(w as *Writer, s as string.String) as void {
 fn writer_bytes(w as *Writer, ptr as *u8, len as i64) as void {
     if (len > w.cap) {
         flush(w);
-        _write_fd(w.fd, ptr, len);
+        if (write_all_fd(w.fd, ptr, len) < 0) { write_failed = 1; }
         return;
     }
     let is i64 as i with mut = 0;

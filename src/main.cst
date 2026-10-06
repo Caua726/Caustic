@@ -28,6 +28,7 @@ use "ir/cache_read.cst" as ircr;
 use "../caustic-assembler/main.cst" as asmmod;
 use "../caustic-linker/main.cst" as ldmod;
 use "version.cst" as ver;
+use "nest.cst" as nest;
 use "parser/dump.cst" as dump;
 use "../std/os.cst" as os;
 
@@ -873,9 +874,15 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
             cg.capture_free();
             return 1;
         }
-        io._write_fd(wfd, wptr, wlen);
+        // The .wasm module is the deliverable itself here: a partial write
+        // leaves a file that is not a module, so it is reported as a failure.
+        let is i64 as wgot = io.write_all_fd(wfd, wptr, wlen);
         io._close_fd(wfd);
         cg.capture_free();
+        if (wgot != wlen) {
+            io.write_str(io.STDERR, "Error: cannot write output file\n");
+            return 1;
+        }
         obj_path_out[0] = cast(u8, 0);      // signal: no object to link
         return 0;
     }
@@ -1074,6 +1081,14 @@ fn run_single_file(filename as *u8) as i32 {
     cg.cg_quiet = g_quiet;
     cgd.codegen(cast(*u8, prog), cast(i32, out_fd), filename, fname_len);
     io._close_fd(out_fd);
+    // A flush that could not write the whole buffer leaves a truncated .s on
+    // disk. The assembly this compilation reports as its output is then not
+    // what is there, so say so rather than exiting 0 over it.
+    if (cg.out_failed == 1) {
+        io.write_str(io.STDERR, "Error: cannot write output file\n");
+        ird.ir_alloc_destroy();
+        return 1;
+    }
     ird.ir_alloc_destroy();
     if (g_opt_level >= 1 && tgt.target_get().arch == tgt.ARCH_X86_64) { ph.optimize_asm(asm_path); }
     prof.prof_record("codegen", get_time_us() - t4);
@@ -1852,6 +1867,11 @@ fn main(argc as i64, argv as i64) as i32 {
     // this call getenv answers null for every name, which is not distinguishable
     // from "unset" at the call site.
     env.init(argc, cast(*u8, argv));
+    // Measure the stack this process was given and arm the depth guard. Every
+    // recursive descent below (parser, semantic, IR gen) asks nest.spent()
+    // before going deeper, so a deeply nested input is rejected with a message
+    // instead of killing the process with SIGSEGV.
+    nest.init();
     if (argc < 2) {
         io.write_str(io.STDERR, "Usage: caustic <source.cst>... [-o output] [-c] [-O1] [--profile]\n");
         io.write_str(io.STDERR, "       caustic --version | --help\n");

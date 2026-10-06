@@ -63,6 +63,59 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   nearest 0.0015. Digits are now read as one integer and scaled by one power of
   ten, which is correctly rounded for every literal written by hand.
 
+- **The compiler's fixed-capacity scratch state truncated in silence instead of
+  growing.** Several arrays were sized by hand and then walked with the caller's
+  own count, so each one dropped whatever exceeded it with no diagnostic:
+  per-function parameter vregs (`[32]i32` — a 33rd parameter overwrote the
+  neighbouring stack arrays, so `fn sum(p0..p32)` compiled and returned 496
+  instead of 528, and 40 parameters killed the compiler outright), the per-call
+  argument arrays in `gen_fncall` and in `call()` (`[64]` — a 70-argument call
+  wrote past three arrays and the link then failed for want of a `.o`), the loop
+  stack (32 levels — a `break` deeper than that resolved against the enclosing
+  loop), the defer stack (64 entries — the 65th never ran), the module dedup
+  table (256 entries, which made the check fail *open* and reprocess a module)
+  and mem2reg's address-taken list and phi worklist (256 — an address-taken
+  local stayed unmarked and was promoted, so reads through the pointer saw a
+  stale value). All of them grow now; the loop/defer/dedup stacks keep one
+  allocation per process rather than one per function.
+- **A function with more than 4096 basic blocks indexed past the CFG array.**
+  `MAX_BLOCKS` bounded only the *initialisation* of the block array while
+  `nblocks` came out as `cur_block + 1`, so the successor pass read and wrote
+  past the end: a function with 2500 sequential branches — some 7500 blocks —
+  died of SIGSEGV at `-O1`/`-O2`. The array is now sized from the function
+  itself (`cfg.count_blocks`), and exceeding it is an internal error rather than
+  a silent skip. The same constant bounded the dominator-walk guard in the
+  vectorizer; that bound is the real block count now.
+- **Deeply nested input killed the compiler instead of being refused.** The
+  parser, the semantic walker and the IR generator each recurse once per nesting
+  level, and a few thousand parens or nested `if`s exhausted the process stack:
+  SIGSEGV, no message, no line and column — which reads as a broken compiler
+  rather than as a rejected program. `src/nest.cst` measures the stack the
+  process was given (`prlimit64` on Linux, the PE header's `SizeOfStackReserve`
+  on Windows) and turns it into a floor address; every recursive entry point
+  checks it, so a deep input now ends with `error: nesting too deep` and exit 1.
+  Where the limit cannot be known — CausticOS, wasm, or a `prlimit64` that
+  fails — the guard stays off and behavior is exactly what it was.
+- **caustic-ld wrote past its struct table when a PE carried more debug records
+  than one object.** `struct_indices` was a fixed 256-entry heap block written
+  with no bound: linking three objects carrying 750 struct records between them
+  wrote 494 entries — 1976 bytes — past it, corrupting the linker's own memory
+  while still producing an `.exe` that ran. It grows by doubling now.
+- **A short write was reported as a successful build.** The compiler's `.s`
+  flush, its `.wasm` capture write and all three linker writers wrote once and
+  ignored the returned count, so a partial write (ENOSPC, a pipe) left a
+  truncated artifact behind and exited 0. `io.write_all_fd` loops until the
+  whole buffer is out, retrying only EINTR, and the writers now treat a short
+  image as an error: `caustic-ld tests/section_test.cst.s.o -o /dev/full` says
+  `error: short write` and exits 1 instead of 0 over a truncated ELF.
+- **The wasm `_start` passed a host-supplied argv straight into a fixed
+  region.** It holds 256 pointer slots followed by the string area, and
+  `args_get` was called with whatever `argc` the host reported, so a run with
+  300 arguments had the 257th pointer written over `env_ptrs` and then over the
+  strings themselves. Both the count and the byte size are checked before the
+  call now, and an argv that does not fit ends the run with `proc_exit(1)`
+  rather than corrupting the module's own argv.
+
 ### Added
 - **Float literals take an exponent**: `1e30`, `1.5e-3`, `2E+8`.
 - **`caustic-as --version` and `caustic-ld --version`.** The assembler read
@@ -72,14 +125,39 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   as it does the compiler's.
 
 ### Changed
+- **An unresolved symbol in a static link is an error, not a warning.**
+  `examples/ffi.cst` built without `-lc` printed `warning: undefined symbol:
+  puts` and linked anyway, leaving the relocation pending — the executable it
+  produced segfaulted. The link now fails with the same text as an error and
+  writes no file. A shared object is unaffected: `--shared`, or a link that
+  named the library with `-l`, still allows undefined symbols, since resolving
+  them is what the loader is for.
 - `caustic-x86_64-windows.zip` is no longer tracked. It is a release asset, and
   `install.sh --from-source` rebuilds it whenever it installs `libcaustic.dll`,
   so every build from a checkout after the first reported itself `.dirty`.
+
+### Tests
+- **One fixture per cap above**, in `tests/run_tests.cst`, run at every
+  optimization level it applies to: 33 and 40 parameters, a 70-argument call
+  (direct, and through `io.sprintf`'s variadic path), 65 defers in one scope,
+  33 nested loops against a 30-level control, a function with some 7500 basic
+  blocks, and a nesting pair that requires exit 1 for a 12000-deep input and
+  exit 0 for a 200-deep one — a crash comes back as 139 and fails the check,
+  which is the whole point of pinning the code rather than accepting any
+  non-zero. Each fixture was confirmed to fail against the compiler as it was
+  before the fix.
 
 ### Upgrading
 The stricter conversions can reject code that compiled before. Every rejection
 is a value that was being changed silently — truncated, or read from the wrong
 register — so the fix is the cast that says so, or the type that was meant.
+
+Two more refusals are new. A static link that leaves a symbol unresolved is now
+an error instead of a warning, so a program that calls into a library without
+naming it (`-lc`, `-lm`, ...) is refused instead of linked into a binary that
+crashes; name the library, or drop the declarations it never used. And an input
+nested thousands of levels deep is now rejected with `error: nesting too deep`
+where the compiler previously died of SIGSEGV.
 
 ## [v0.1.11](https://github.com/Caua726/Caustic/releases/tag/v0.1.11) — 2026-10-02
 

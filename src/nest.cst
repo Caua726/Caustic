@@ -1,0 +1,81 @@
+// src/nest.cst — stack budget guard.
+//
+// The compiler recurses: the parser descends one frame per nesting level of
+// parens, calls and types; the IR generator one per nested statement and
+// expression; the semantic walker one per AST node. All three were unbounded.
+// An input with a few thousand `(` — valid source, just deep — consumed the
+// whole stack and the compiler died of SIGSEGV with no message at all: the
+// failure looked like a broken compiler instead of a rejected program, and the
+// line/column of the offending construct was lost.
+//
+// init() turns the process's stack limit into a floor *address* once; spent()
+// answers whether the current frame has reached it. The first caller to see 1
+// prints the diagnostic exactly once; every caller afterwards gets 1 back
+// without printing, so the unwinding path composes with the existing error
+// machinery instead of flooding stderr.
+//
+// Callers with an error channel (the parser) report it as a normal parse error
+// at the current token — same "compilation aborted due to errors" exit as any
+// other syntax error. Callers without one (semantic, IR gen) call io.exit(1);
+// the message is already out.
+//
+// The guard is deliberately disabled — `_stack_floor == 0`, which is exactly
+// the behavior before this module existed — whenever the limit is not knowable:
+// prlimit64 unavailable or failing, a limit below the safety margin, CausticOS,
+// wasm. It never rejects a program on a guess.
+use "../std/io.cst" as io;
+use "../std/os.cst" as os;
+if (__target_is_linux + __compat_mode) use "../std/os/linux.cst" as linux;
+
+// `SizeOfStackReserve` the PE linker writes into every Windows binary, and
+// therefore the stack any Caustic program compiled for Windows actually gets:
+// caustic-linker/pe/pe_writer.cst (the PE optional header). Windows has no
+// prlimit64, so this constant is the only source for the limit there. If that
+// header value changes, this one has to change with it.
+let is i64 as WINDOWS_STACK_RESERVE with imut = 1048576;
+
+// Kept free between the floor and the real limit so that the reporting path
+// itself — io.write_str to stderr, io.exit — has stack to run on after the
+// guard trips.
+let is i64 as SAFETY_MARGIN with imut = 262144;
+
+// Address below which the budget is exhausted. 0 = guard off.
+let is i64 as _stack_floor with mut = 0;
+// 1 once the diagnostic has been printed.
+let is i32 as _reported with mut = 0;
+
+fn init() as void {
+    let is [8]u8 as anchor;
+    let is i64 as base = cast(i64, &anchor);
+    let is i64 as limit with mut = 0;
+
+    if (os.current() == os.OS_LINUX) {
+        // prlimit64(0, RLIMIT_STACK = 3, 0, &rlimit64) — the kernel fills the
+        // caller's buffer with { cur, max } as u64. A non-zero return is an
+        // errno: this sandbox has no prlimit64, so leave the guard off.
+        let is [16]u8 as rl;
+        let is i64 as ret = syscall(linux._nr(302, 261), 0, 3, 0, &rl);
+        if (ret != 0) { return; }
+        limit = *cast(*i64, &rl);
+    } else if (os.current() == os.OS_WINDOWS) {
+        limit = WINDOWS_STACK_RESERVE;
+    } else {
+        // CausticOS / wasm: we do not know the stack, so we do not guess.
+        return;
+    }
+
+    if (limit <= SAFETY_MARGIN) { return; }
+    _stack_floor = base - (limit - SAFETY_MARGIN);
+}
+
+// 1 = the stack budget is exhausted (diagnostic already printed by the first
+// caller to see it); 0 = there is still room.
+fn spent() as i32 {
+    if (_stack_floor == 0) { return 0; }
+    let is [8]u8 as here;
+    if (cast(i64, &here) > _stack_floor) { return 0; }
+    if (_reported == 1) { return 1; }
+    _reported = 1;
+    io.write_str(io.STDERR, "error: nesting too deep: the compiler's stack budget is exhausted\n");
+    return 1;
+}

@@ -307,7 +307,14 @@ fn regen_func_ir(func as *d.IRFunction) as void {
             param_count = param_count + 1;
         }
         func.num_args = param_count;
-        let is [32]i32 as arg_vregs;
+        // One entry per parameter (plus the hidden sret slot, which is read
+        // into its own vreg before this array is filled). Was a fixed [32]i32:
+        // a 33rd parameter overwrote the adjacent stack arrays instead of
+        // overflowing anything detectable, so `fn f(p0..p32)` compiled and
+        // returned a wrong value with no diagnostic at all.
+        let is i64 as av_bytes with mut = cast(i64, param_count) * 4;
+        if (av_bytes < 8) { av_bytes = 8; }
+        let is *i32 as arg_vregs = cast(*i32, d.opt_alloc(av_bytes));
         let is i32 as avi with mut = 0;
         p = node.params;
         while (cast(i64, p) != 0) {
@@ -335,6 +342,7 @@ fn regen_func_ir(func as *d.IRFunction) as void {
             }
             avi = avi + 1; p = p.next;
         }
+        d.opt_free(cast(*u8, arg_vregs));
         gs.gen_stmt(node.body.stmts);
         ge.emit_deferred_calls();
         let is i32 as zero = g.emit_imm(0, 0);
@@ -475,7 +483,9 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                     }
                 func.num_args = param_count;
                     // Get ALL args first (before any COPY that clobbers regs)
-                    let is [32]i32 as arg_vregs_fn;
+                    let is i64 as avf_bytes with mut = cast(i64, func.num_args) * 4;
+                    if (avf_bytes < 8) { avf_bytes = 8; }
+                    let is *i32 as arg_vregs_fn = cast(*i32, d.opt_alloc(avf_bytes));
                     let is i32 as arg_vi with mut = 0;
                     p = node.params;
                     while (cast(i64, p) != 0) {
@@ -515,6 +525,7 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                         arg_vi = arg_vi + 1;
                         p = p.next;
                     }
+                    d.opt_free(cast(*u8, arg_vregs_fn));
                     gs.gen_stmt(node.body.stmts);
                     ge.emit_deferred_calls();
                     // Implicit return
@@ -567,20 +578,10 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
         // NK_USE — recurse
         else if (nk == ast.NK_USE) {
             if (cast(i64, node.body) != 0) {
-                // Check if this body was already processed
-                let is i64 as body_ptr = cast(i64, node.body);
-                let is i32 as already with mut = 0;
-                let is i32 as di with mut = 0;
-                while (di < g.ir_done_count) {
-                    let is *i64 as dp = cast(*i64, cast(i64, &g.ir_done_bodies) + cast(i64, di) * 8);
-                    if (*dp == body_ptr) { already = 1; }
-                    di = di + 1;
-                }
-                if (already == 0 && g.ir_done_count < 256) {
-                    // Mark as done
-                    let is *i64 as dp2 = cast(*i64, cast(i64, &g.ir_done_bodies) + cast(i64, g.ir_done_count) * 8);
-                    *dp2 = body_ptr;
-                    g.ir_done_count = g.ir_done_count + 1;
+                // First time this body is seen? note_done_body grows the table
+                // as needed, so no module is ever walked twice for want of a
+                // free slot.
+                if (g.note_done_body(cast(*u8, node.body)) == 1) {
                     // Save/restore ir_tl: submodules have different token lists
                     let is *u8 as saved_tl = g.ir_tl;
                     g.ir_tl = cast(*u8, 0);

@@ -80,7 +80,12 @@ If emitted outside a loop (`ctx_loop_depth == 0`), both are silently ignored.
 
 ## Loop Stack
 
-The loop stack is a fixed-size array supporting up to 32 levels of nesting. Each entry stores three i32 values (12 bytes total):
+The loop stack grows on demand: it starts at 16 entries and doubles when
+`push_loop` needs more, so nesting is bounded by the compiler's memory rather
+than by a constant. (It used to be a fixed 384-byte array — 32 levels — and
+`push_loop` returned silently past that, so a `break` in a loop nested deeper
+resolved against the enclosing loop.) Each entry stores three i32 values (12
+bytes total):
 
 - **start**: the label at the top of the loop
 - **end**: the label after the loop (break target)
