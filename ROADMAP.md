@@ -6,26 +6,20 @@ points at the source so it is easy to pick up. Status as of 2026-06-14.
 
 ## Windows backend gaps
 
-The Windows (`--target=windows-x86_64`) port is functional but a few facades
-still fall back or no-op where the Linux path is complete.
+The Windows (`--target=windows-x86_64`) port is functional. Directory listing,
+`getcwd`, `is_dir`, `capture`, `execvp`, sockets and terminal input all have
+Windows backends now.
 
-- **`std/process.cst` — `capture()` is Linux-only.** Spawning + reading a
-  child's stdout needs `CreatePipe` + `STARTUPINFO` wiring on Windows. `spawn`
-  / `wait` already work via `CreateProcessA` + `WaitForSingleObject`.
-- **`std/env.cst:180` — `execvp` returns -1 on Windows.** `CreateProcessA` is
-  not yet wired into the `execvp` shim.
-- **`std/io.cst` — directory ops unimplemented on Windows.** `list_dir`
-  (~1004), `is_dir` (~1074), and `get_cwd` (~1085) need the
-  `FindFirstFileA`/`FindNextFileA`/`GetCurrentDirectoryA` path; today they are
-  Linux-syscall only.
+- **No `chdir` binding on Windows.** `caustic-mk` must run from the project
+  root there. A `SetCurrentDirectoryA` binding would close it.
 
 ## Assembler gaps
 
-- **`caustic-assembler/main.cst:175` — native `windows-x86_64` target not
-  implemented.** PE/COFF objects currently come from the compiler+linker path,
-  not from `caustic-as` directly.
-- **`caustic-assembler/output/coff.cst:26` — COFF object writer not
-  implemented ("Fase 2").**
+- **`caustic-assembler/main.cst:175` — the `caustic-as` CLI takes the input
+  file first.** `caustic-as file.s --target=windows-x86_64` works; a leading
+  `--target=` is read as the file name. `output/coff.cst`'s writer is
+  implemented and verified (`caustic-as f.s --target=windows-x86_64` produces
+  a COFF object lld-link links and wine runs).
 
 ## PE debug info
 

@@ -134,6 +134,15 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **Windows directory and process facades.** `std/io.cst`'s `list_dir`,
+  `count_dir_entries`, `is_dir` and `get_cwd` had a Linux backend only, so on
+  Windows they returned -1/0 and every `caustic-mk` glob failed with "pattern
+  matched nothing". They now go through `FindFirstFileA`/`FindNextFileA`,
+  `GetFileAttributesA` and `GetCurrentDirectoryA`, and `std/env.cst`'s
+  `execvp` runs the child via `CreateProcessA` and exits with its code.
+  Verified under wine: `list_dir`/`get_cwd`/`is_dir`, `capture` (which was
+  already implemented — the ROADMAP was stale), `execvp` exit-code
+  propagation, and a `caustic-mk` glob resolving on a Windows host.
 - **`-g` emits DWARF, so gdb and lldb can debug a Caustic ELF binary.** The
   ELF target had no debug information at all — not even a line table — so a
   debugger saw raw assembly. `-g` now writes `.debug_line`, `.debug_info`,
