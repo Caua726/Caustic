@@ -34,10 +34,12 @@ Windows backends now.
 
 ## Debug info (DWARF, ELF `-g`)
 
-- **`.eh_frame` is emitted, but not `.eh_frame_hdr` / `PT_GNU_EH_FRAME`.** The
-  CFI is in the loaded R+X segment and debuggers and profilers read it, but the
-  in-process runtime unwinder (for exceptions) wants the binary-search header
-  and the segment entry too. `caustic-linker/elf/eh_frame.cst`.
+- **No exception runtime.** `.eh_frame` + `.eh_frame_hdr` are complete and a
+  runtime unwinder reads them (`eu-stack` unwinds a live process), but nothing
+  links `libgcc`'s `_Unwind_RaiseException`, so `try`/`catch` has no runtime
+  behind it. `caustic-linker/elf/eh_frame.cst`.
+- **CFI is x86_64-ELF only.** PE uses `.pdata`/`.xdata`; the AArch64 assembler
+  ignores the `.cfi_*` directives, so `linux-aarch64` objects get no CFI.
 - **Locations are static per function.** A local/parameter is described as a
   fixed `DW_OP_fbreg` off rbp for the whole function, so a value still in a
   register during the prologue (before its spill) is not located — a breakpoint
@@ -47,6 +49,9 @@ Windows backends now.
   object's source; a multi-object link reports one file.
 - **Enums are not described.** Structs, pointers and arrays are; Caustic's
   tagged-union enums have no DWARF representation yet.
+- **`.cstdebug` line offsets are object-local.** Like `.cstcfi` was, they are
+  not remapped when dead-code elimination repacks an object's `.text`; the `-g`
+  build avoids it by taking the serial whole-program path.
 - **`-g` disables the parallel per-module emitter.** Debug builds take the
   serial whole-program path (the body AST must stay live for `.cstlocals`).
 

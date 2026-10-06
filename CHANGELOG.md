@@ -134,6 +134,18 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **`.eh_frame_hdr` + `PT_GNU_EH_FRAME` — the runtime unwinder works.** The
+  CFI had a binary-search header missing, so `libdwfl`/`libgcc` had no way to
+  map a pc to its FDE. The linker now emits `.eh_frame_hdr` (version 1, a
+  pcrel pointer to `.eh_frame`, and a datarel-sorted table of
+  `(initial_location, fde_address)`) right after `.eh_frame`, and a
+  `PT_GNU_EH_FRAME` program header pointing at it. FDEs are now keyed by the
+  final text-symbol address rather than the object-local offset in `.cstcfi`:
+  dead-code elimination repacks each object's `.text`, so the offsets were
+  stale by link time and every multi-module binary's FDEs overlapped.
+  Verified end-to-end: `eu-stack -p` unwinds a live Caustic process through
+  its whole stack (`nanosleep ← sleep_ms ← … ← level3 ← level2 ← level1 ← main
+  ← _start`) using the header and the CFI.
 - **`.eh_frame` — real Call Frame Information for ELF.** Unwinding relied on
   the frame-pointer chain, so a backtrace was only as good as the heuristic.
   Codegen now emits `.cfi_startproc`/`.cfi_def_cfa_offset`/`.cfi_offset`/
