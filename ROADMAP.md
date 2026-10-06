@@ -70,17 +70,17 @@ Windows backends now.
   called at sites that are not done yet; listed here so they are not mistaken
   for finished functionality.
 
-## Language: future work (design exists)
+## Language: implemented
 
-- **`with imut` on functions — comptime "Layer 2".** Extend the `imut`
-  qualifier from variables to functions: a pure (no syscall / extern / mut
-  globals) function called with all-literal args is evaluated by a tree-walking
-  interpreter at semantic time and substituted as a literal. Variables/globals
-  already have this via init-expression const-prop; functions do not. Estimated
-  ~500 lines (parser annotation + semantic purity check + AST interpreter).
-  Full design notes in the comptime design discussion referenced from
-  `CLAUDE.md`. Defer until a concrete use case appears (lookup-table
-  generation, compile-time string hashing, etc).
+- **`with imut` on functions — comptime.** A function annotated `with imut`
+  whose arguments all fold to literals is evaluated at semantic time and the
+  call is rewritten to the resulting `NK_NUM`; codegen never sees the call.
+  The parser sets the flag (`src/parser/top.cst`), `try_fold_imut_fn` /
+  `imut_eval_expr` / `imut_exec_stmt` interpret the body (`src/semantic/walk.cst`),
+  and the fold happens at the call site. A call with a runtime argument (or a
+  callee that is not `with imut`) stays a real call. Verified: `sq(7)` and a
+  loop-based `fib(10)` fold to constants, `use(x)` with a runtime `x` does not.
+  The purity check is by construction — a non-pure body simply fails to fold.
 
 ## Project health (deferred — owner deprioritized)
 
