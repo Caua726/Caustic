@@ -9,6 +9,11 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 ## Unreleased
 
 ### Fixed
+- **A multi-file Windows link failed with "duplicate symbol".** A COFF extern
+  (`extern fn` referencing another object) is written with section 99, but the
+  linker's "is it defined" tests only knew the ELF reader's 0, so the extern
+  looked defined and its definition was reported as a duplicate. Both
+  sentinels are accepted now. `caustic-linker/core/linker.cst`.
 - **A function of another signature could be stored into, or passed as, an
   `fn(...)` type.** `fn(f64) as i64` went into an `fn(i64, *u8) as i32`
   without a word, and `call()` through it checked only the number of
@@ -134,6 +139,27 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **Locals read correctly at every optimization level (`-g`).** `mem2reg`
+  promoted a local to an SSA register and its stack slot went stale, so the
+  DWARF's `DW_OP_fbreg` location read an unwritten slot — at `-O1`/`-O2`
+  `print base` gave 0 for a local that had just been assigned. With `-g` the
+  pass is skipped, so the slot stays authoritative. `src/ir/opt.cst`.
+- **Enums are described (DWARF and PDB).** Enums had no debug type at all: a
+  `Color` local showed as an untyped value and `ptype enum Color` failed.
+  Codegen collects every enum into a `.cstenums` section (variants with their
+  discriminant and optional payload) and encodes it as `(kind=600, index)`.
+  ELF: a plain enum is a `DW_TAG_enumeration_type`; a tagged union is a
+  structure holding the tag and a union of the payloads. PE: the same shape
+  as `LF_ENUM` (+ `LF_ENUMERATE`).
+- **Every source file is in the line table.** A `caustic -g a.cst b.cst`
+  link showed only `a.cst`, so a breakpoint in `b.cst` had no line. The line
+  table now carries one file entry per object, each function's sequence
+  selects its own with `DW_LNS_set_file`, and a sequence is extended to the
+  function's end so a single-line function still has a range.
+- **AArch64 call frame information.** The backend emitted no `.cfi_*` and the
+  assembler ignored them, so `linux-aarch64` binaries had no `.eh_frame` and
+  could not be unwound. Both ends are wired now, with an AArch64 CIE (code
+  alignment 4, return address in x30, CFA at sp).
 - **Parameters read correctly at the first breakpoint (`-g`).** A breakpoint
   on a function landed after the CFI prologue but before the parameter spill,
   where the DWARF described a parameter as a fixed frame slot that had not

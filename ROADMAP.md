@@ -28,9 +28,15 @@ Windows backends now.
   hash algorithm by type name was not reproduced — a wrong hash is worse than
   none — so `llvm-pdbutil` and address-based consumers work while name-indexed
   type lookup does not. `caustic-linker/pe/pdb_writer.cst:_emit_tpi_header`.
-- **One source file per PE module.** The module stream's STRINGTABLE/FILECHKSMS
-  carry the first `.cstdebug` file; a link of several objects with different
-  source paths still reports one. `caustic-linker/pe/pe_debug.cst:build_module_stream`.
+- **One PE module for the whole link.** A multi-file Windows build puts every
+  object's symbols in a single module named after the first source. Splitting
+  it means N module streams in the MSF, an N-entry ModuleInfo substream and
+  per-function LF_FUNC_ID scopes in the IPI — the MSF layout, DBI, TPI/IPI and
+  module builder change together. `caustic-linker/pe/{pe_debug,pdb_writer}.cst`.
+- **`llvm-pdbutil dump --modules` reports "stream too short".** The DBI's
+  ModuleInfo substream is one byte short of what the parser expects, after the
+  module entry; it predates the enum work (`hello.pdb` shows it too) and
+  llvm-pdbutil still lists the module. `caustic-linker/pe/pdb_writer.cst:_emit_dbi`.
 
 ## Debug info (DWARF, ELF `-g`)
 
@@ -38,22 +44,22 @@ Windows backends now.
   runtime unwinder reads them (`eu-stack` unwinds a live process), but nothing
   links `libgcc`'s `_Unwind_RaiseException`, so `try`/`catch` has no runtime
   behind it. `caustic-linker/elf/eh_frame.cst`.
-- **CFI is x86_64-ELF only.** PE uses `.pdata`/`.xdata`; the AArch64 assembler
-  ignores the `.cfi_*` directives, so `linux-aarch64` objects get no CFI.
-- **Local locations are static per function.** A `let` is described as a fixed
-  `DW_OP_fbreg` off rbp for the whole function; it is valid after its
-  initialization, but a value still in a register at `-O1`/`-O2` is not
-  tracked. Parameters DO get a location list (register before the prologue
-  end, frame slot after) — except in a single-line function, where the
-  prologue end is not distinguishable from the body, so it falls back to the
-  frame slot. A full location list for locals would close it.
-- **One source file per link.** The line table's file table carries the first
-  object's source; a multi-object link reports one file.
-- **Enums are not described.** Structs, pointers and arrays are; Caustic's
-  tagged-union enums have no DWARF representation yet.
-- **`.cstdebug` line offsets are object-local.** Like `.cstcfi` was, they are
-  not remapped when dead-code elimination repacks an object's `.text`; the `-g`
-  build avoids it by taking the serial whole-program path.
+- **CFI is ELF only.** PE uses `.pdata`/`.xdata`, which are not emitted. Both
+  ELF architectures now carry CFI: x86_64 (caf 1, ra rip) and AArch64 (caf 4,
+  ra x30) each get their own CIE.
+- **Locals are stack-homed at `-g`.** A `let` is a fixed `DW_OP_fbreg` off rbp,
+  which is correct because `-g` skips mem2reg (otherwise the promoted value
+  would live in a register and the slot would go stale). The cost is that a
+  debug build runs without that pass. Parameters get a location list
+  (register before the prologue end, frame slot after) — except in a
+  single-line function, where the prologue end is not distinguishable from the
+  body, so it falls back to the frame slot. A location list per live range
+  would restore the optimization and close the single-line case.
+- **`.cstdebug` line offsets are object-local.** Not remapped when dead-code
+  elimination repacks `.text`, but codegen emits only reachable functions, so
+  the offsets match what is emitted; the `-g` ELF build takes the serial
+  whole-program path regardless. No stale row has been observed on either
+  target.
 - **`-g` disables the parallel per-module emitter.** Debug builds take the
   serial whole-program path (the body AST must stay live for `.cstlocals`).
 
