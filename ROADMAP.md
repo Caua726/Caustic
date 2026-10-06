@@ -28,25 +28,24 @@ Windows backends now.
   hash algorithm by type name was not reproduced — a wrong hash is worse than
   none — so `llvm-pdbutil` and address-based consumers work while name-indexed
   type lookup does not. `caustic-linker/pe/pdb_writer.cst:_emit_tpi_header`.
-- **One PE module for the whole link.** A multi-file Windows build puts every
-  object's symbols in a single module named after the first source. Splitting
-  it means N module streams in the MSF, an N-entry ModuleInfo substream and
-  per-function LF_FUNC_ID scopes in the IPI — the MSF layout, DBI, TPI/IPI and
-  module builder change together. `caustic-linker/pe/{pe_debug,pdb_writer}.cst`.
-- **`llvm-pdbutil dump --modules` reports "stream too short".** The DBI's
-  ModuleInfo substream is one byte short of what the parser expects, after the
-  module entry; it predates the enum work (`hello.pdb` shows it too) and
-  llvm-pdbutil still lists the module. `caustic-linker/pe/pdb_writer.cst:_emit_dbi`.
+- **One build-info for the whole link.** Each module's `S_BUILDINFO` points at
+  the same `LF_BUILDINFO` (built from the first source), and the IPI's
+  `LF_FUNC_ID` scopes are 0. Splitting it means per-module build infos and
+  per-function scopes; the modules, their symbol streams, sources and line
+  tables are already per-object.
 
 ## Debug info (DWARF, ELF `-g`)
 
-- **No exception runtime.** `.eh_frame` + `.eh_frame_hdr` are complete and a
-  runtime unwinder reads them (`eu-stack` unwinds a live process), but nothing
-  links `libgcc`'s `_Unwind_RaiseException`, so `try`/`catch` has no runtime
-  behind it. `caustic-linker/elf/eh_frame.cst`.
-- **CFI is ELF only.** PE uses `.pdata`/`.xdata`, which are not emitted. Both
-  ELF architectures now carry CFI: x86_64 (caf 1, ra rip) and AArch64 (caf 4,
-  ra x30) each get their own CIE.
+- **No exception syntax.** Caustic has no `try`/`catch`/`throw`, so there is
+  nothing to lower and no `_Unwind_*` runtime to link. What a *foreign*
+  unwinder needs is present: `.eh_frame` + `.eh_frame_hdr` (with a
+  `PT_GNU_EH_FRAME` header) in both executables and `--shared` objects, and a
+  C++ exception thrown from a Caustic `.so` callback now unwinds through it
+  and reaches the caller's `catch`.
+- **CFI covers ELF and PE.** ELF carries `.eh_frame` (x86_64 caf 1/ra rip,
+  AArch64 caf 4/ra x30, pcrel FDEs in a shared object); PE carries
+  `.pdata`/`.xdata` (one `RUNTIME_FUNCTION` + `UNWIND_INFO` per function,
+  `llvm-readobj --unwind` clean).
 - **Locals are stack-homed at `-g`.** A `let` is a fixed `DW_OP_fbreg` off rbp,
   which is correct because `-g` skips mem2reg (otherwise the promoted value
   would live in a register and the slot would go stale). The cost is that a

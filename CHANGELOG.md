@@ -141,6 +141,23 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   the cwd), and the `RSDS` record carries that same path.
 
 ### Added
+- **The Windows `.pdb` is well-formed.** `llvm-pdbutil dump --symbols` failed
+  with "Invalid module stream" and `--modules` with "stream too short" (both
+  predate the enum work). Four defects: a CodeView subsection's `Length` must
+  count its padding (`alignTo(DataSize, alignOf(Container))`); the C13 line
+  block's `BlockSize` counts the 8-byte block header, not 12; the LINES block's
+  `offFile` named string-table offset 0 (the empty string) instead of the
+  source; and the DBI had no EC (edit-and-continue) name substream, which the
+  module dump reads unconditionally — that was the "stream too short". Every
+  `llvm-pdbutil dump` mode now exits 0 with no diagnostics.
+- **One PDB module per object.** A multi-file Windows build put every object's
+  symbols in one module named after the first source. Each object now gets its
+  own module stream, `ModuleInfo` record, source and line table.
+- **Unwind info in shared objects.** A `--shared` object had no `.eh_frame`, so
+  a C++ exception thrown from a Caustic callback ran into `terminate`. It now
+  emits `.eh_frame` + `.eh_frame_hdr` (with `PT_GNU_EH_FRAME`), pcrel-encoded
+  because a `.so` is mapped at an arbitrary base — `g++` throwing through a
+  Caustic `.so` now reaches the caller's `catch`.
 - **Locals read correctly at every optimization level (`-g`).** `mem2reg`
   promoted a local to an SSA register and its stack slot went stale, so the
   DWARF's `DW_OP_fbreg` location read an unwritten slot — at `-O1`/`-O2`
