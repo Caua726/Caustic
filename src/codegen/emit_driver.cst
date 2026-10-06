@@ -978,9 +978,11 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     // (300, struct_idx) pairs). .cstlocals consults the same table.
     if (tgt.target_get().object_format == 2 || tgt.debug_get() == 1) {
         _struct_table_init();
+        _enum_table_init();
         emit_cstsigs(p);
         emit_cstlocals(p);
         emit_cststructs();
+        emit_cstenums();
     }
 
     eo.out_flush();
@@ -1033,6 +1035,48 @@ fn _struct_index_of(t as *ast.Type) as i32 {
     return idx;
 }
 
+// === Enum collection (for .cstenums) ===
+//
+// Same idea as the struct table: every enum type that appears in a signature,
+// a local or a struct field is collected by name and gets a 0-based index.
+// .cstsigs encodes an enum type as (kind=600, extra=enum_index) so the linker
+// can resolve it to a DW_TAG_enumeration_type / LF_ENUM.
+
+let is i32 as MAX_ENUMS with imut = 256;
+let is *u8 as g_enum_types with mut;         // *ast.Type[MAX_ENUMS], lazy
+let is i32 as g_enum_count with mut = 0;
+
+fn _enum_table_init() as void {
+    g_enum_types = cast(*u8, 0);
+    g_enum_count = 0;
+}
+
+fn _enum_index_of(t as *ast.Type) as i32 {
+    if (cast(i64, g_enum_types) == 0) {
+        g_enum_types = d.opt_alloc(cast(i64, MAX_ENUMS) * 8);
+    }
+    let is *i64 as arr = cast(*i64, g_enum_types);
+    let is i32 as i with mut = 0;
+    while (i < g_enum_count) {
+        let is *ast.Type as e = cast(*ast.Type, arr[i]);
+        if (e.name_len == t.name_len) {
+            let is i32 as k with mut = 0;
+            let is i32 as eq with mut = 1;
+            while (k < t.name_len) {
+                if (e.name_ptr[k] != t.name_ptr[k]) { eq = 0; k = t.name_len; }
+                k = k + 1;
+            }
+            if (eq == 1) { return i; }
+        }
+        i = i + 1;
+    }
+    if (g_enum_count >= MAX_ENUMS) { return 0; }
+    arr[g_enum_count] = cast(i64, t);
+    let is i32 as idx = g_enum_count;
+    g_enum_count = g_enum_count + 1;
+    return idx;
+}
+
 // === Type encoding for .cstsigs ===
 //
 // Each type is encoded as a (kind, extra) u32 pair. Kind values:
@@ -1069,6 +1113,7 @@ fn _type_pair_kind(ty as *u8) as i32 {
     }
     if (t.kind == ast.TY_STRUCT) { return 300; }
     if (t.kind == ast.TY_FN)     { return 400; }
+    if (t.kind == ast.TY_ENUM)   { return 600; }
     return 999;
 }
 
@@ -1077,6 +1122,7 @@ fn _type_pair_extra(ty as *u8) as i32 {
     let is *ast.Type as t = cast(*ast.Type, ty);
     if (t.kind == ast.TY_ARRAY) { return t.array_len; }
     if (t.kind == ast.TY_STRUCT) { return _struct_index_of(t); }
+    if (t.kind == ast.TY_ENUM) { return _enum_index_of(t); }
     if (t.kind == ast.TY_PTR) {
         let is *ast.Type as b = t.base;
         if (cast(i64, b) != 0 && b.kind == ast.TY_STRUCT) {
@@ -1270,6 +1316,63 @@ fn emit_cststructs() as void {
             eo.out_int(cast(i64, _type_pair_extra(cast(*u8, f.ty))));
             eo.out_char(10);
             f = f.next;
+        }
+        i = i + 1;
+    }
+}
+
+// Emit .cstenums section. Each entry, in collection order:
+//   u32 name_len, byte[name_len] name,
+//   u32 size_bytes,
+//   u32 payload_offset,          (0 = plain enum, 8 = tagged union)
+//   u32 num_variants,
+//   per variant: u32 name_len, byte[name_len] name, u32 discriminant,
+//                u32 payload_kind, u32 payload_extra
+//
+// A variant's payload is 0/0 when the variant carries no data (`Red;`).
+fn emit_cstenums() as void {
+    if (g_enum_count == 0) { return; }
+    eo.out_str(".section .cstenums\n", 20);
+    let is *i64 as arr = cast(*i64, g_enum_types);
+    let is i32 as i with mut = 0;
+    while (i < g_enum_count) {
+        let is *ast.Type as t = cast(*ast.Type, arr[i]);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.name_len));
+        eo.out_char(10);
+        eo.out_str("  .ascii \"", 10);
+        eo.out_str(t.name_ptr, t.name_len);
+        eo.out_str("\"\n", 2);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.size));
+        eo.out_char(10);
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, t.payload_offset));
+        eo.out_char(10);
+        let is i32 as vc with mut = 0;
+        let is *ast.Node as vcw with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, vcw) != 0) { vc = vc + 1; vcw = vcw.next; }
+        eo.out_str("  .long ", 8);
+        eo.out_int(cast(i64, vc));
+        eo.out_char(10);
+        let is *ast.Node as v with mut = cast(*ast.Node, t.fields);
+        while (cast(i64, v) != 0) {
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, v.name_len));
+            eo.out_char(10);
+            eo.out_str("  .ascii \"", 10);
+            eo.out_str(v.name_ptr, v.name_len);
+            eo.out_str("\"\n", 2);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, v.discriminant));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_kind(cast(*u8, v.ty))));
+            eo.out_char(10);
+            eo.out_str("  .long ", 8);
+            eo.out_int(cast(i64, _type_pair_extra(cast(*u8, v.ty))));
+            eo.out_char(10);
+            v = v.next;
         }
         i = i + 1;
     }
