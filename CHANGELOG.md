@@ -45,6 +45,12 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **CausticOS program I/O rejected on Linux.** `std/causticos/prog.cst` used
+  raw CausticOS syscalls for `out`/`err`/`getc` without checking the target, so
+  `prog.outs()` compiled into a Linux binary that exited successfully without
+  output. Those entrypoints now reject non-CausticOS targets; the regression
+  checks compiler exit 1 on Linux and exit 0 on CausticOS.
+
 - **Checkout compilers use their own standard library.** A compiler built beside
   `std/` now discovers that tree before an unrelated installed copy, even when
   the input source lives outside the checkout. CausticOS builds previously fell
