@@ -50,6 +50,10 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   `prog.outs()` compiled into a Linux binary that exited successfully without
   output. Those entrypoints now reject non-CausticOS targets; the regression
   checks compiler exit 1 on Linux and exit 0 on CausticOS.
+- **Terminal-only program error styling.** `STDERR_TTY_FD` is a shell-reserved
+  descriptor mapped only when stderr reaches a terminal; `prog.errs` and
+  `prog.err_num` use red SGR only when that marker is present. `errs_raw` and
+  `err_raw` support non-error prompts. Redirected diagnostics stay plain bytes.
 
 - **Checkout compilers use their own standard library.** A compiler built beside
   `std/` now discovers that tree before an unrelated installed copy, even when
