@@ -45,6 +45,18 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **ELF shared libraries lost their imports.** A `.so` built with
+  `-lcaustic` omitted `DT_NEEDED`, undefined dynamic symbols, and PLT/GOT
+  relocations; its calls to the shared runtime were linked to address zero.
+  The shared writer now emits imports alongside exports and assigns PLT/GOT
+  addresses before applying relocations, in both the integrated and standalone
+  linker. The inliner also excludes shared-library bodies: copying `enter`
+  into a consumer updated its private handler stack while `throw` read the
+  library's. Imports resolved below the configured stdlib root now use stable
+  `_std_*` names, so an absolute installation path does not silently embed
+  another runtime. Cross-library exceptions now reach the executable's catch
+  with one shared runtime at `-O0/-O1/-O2`; the pre-commit gate exercises all
+  three and the standalone linker. Statically embedded runtimes remain independent.
 - **`std/errors.cst` could not be imported.** It carried seven
   `__compile_error` stubs (`unsupported`, `no_vfs`, `no_heap`, `no_network`,
   `no_processes`, `not_implemented`, `todo`), and `__compile_error` fires when

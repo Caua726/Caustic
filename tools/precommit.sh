@@ -294,6 +294,46 @@ for SHARED in "linux-x86_64:so" "windows-x86_64:dll" "caustic-x86_64:csl"; do
 done
 ok "linux/windows/caustic × x86_64/aarch64 all build clean; libcaustic.so/.dll/.csl too"
 
+# A shared runtime must stay shared at every optimization level: inlining
+# enter() used to update a private head while throw() read libcaustic's head.
+# The .so writer also used to discard the import, leaving a literal call 0.
+step "exceptions across ELF shared libraries"
+cat > "$TMP/shared_throw.cst" <<'EOF'
+use "std/exceptions.cst" as ex;
+fn shared_throw(value as i64) as void { ex.throw(value); }
+EOF
+cat > "$TMP/shared_catch.cst" <<'EOF'
+use "std/exceptions.cst" as ex;
+extern fn shared_throw(value as i64) as void;
+fn main() as i32 {
+    let is ex.Frame as f;
+    let is i64 as value = ex.begin(&f);
+    if (value != 0) { return cast(i32, value); }
+    ex.enter(&f);
+    defer ex.leave(&f);
+    shared_throw(42);
+    return 91;
+}
+EOF
+for OPT in -O0 -O1 -O2; do
+    "$CUR" -q "$OPT" --shared -lcaustic "$TMP/shared_throw.cst" \
+        -o "$TMP/libthrow.so" >/dev/null 2>&1 || die "shared throw failed to build ($OPT)"
+    "$CUR" -q "$OPT" -lcaustic "$TMP/shared_catch.cst" -lthrow \
+        -o "$TMP/shared_catch" >/dev/null 2>&1 || die "shared catch failed to build ($OPT)"
+    RC="$(LD_LIBRARY_PATH="$TMP" runrc "$TMP/shared_catch")"
+    [ "$RC" = 42 ] || die "cross-library throw returned $RC ($OPT, expected 42)"
+done
+# The standalone linker must assign imports before relocating, too.
+"$CUR" -q -c -lcaustic "$TMP/shared_throw.cst" >/dev/null 2>&1 \
+    || die "could not emit shared throw assembly"
+"$TMP/caustic-as" "$TMP/shared_throw.cst.s" >/dev/null 2>&1 \
+    || die "could not assemble shared throw"
+"$TMP/caustic-ld" --shared -lcaustic "$TMP/shared_throw.cst.s.o" \
+    -o "$TMP/libthrow.so" >/dev/null 2>&1 || die "standalone shared link failed"
+RC="$(LD_LIBRARY_PATH="$TMP" runrc "$TMP/shared_catch")"
+[ "$RC" = 42 ] || die "standalone cross-library throw returned $RC (expected 42)"
+ok "cross-library throw caught at -O0/-O1/-O2, integrated + standalone linker"
+
 # ─── 8. CSE containers and the shared-library loader ───────────────────────
 # The .csl form was broken in main for a whole release: its header grew and the
 # loader kept reading the old offset, so csl_open failed for every library the

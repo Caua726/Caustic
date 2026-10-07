@@ -19,6 +19,33 @@ Pass a -l flag to caustic-ld:
 The `-lc` flag maps to `libc.so.6`. caustic-ld writes the full .so filename into the
 .dynamic section's DT_NEEDED entries.
 
+## Shared Libraries with Dependencies
+
+`--shared` emits an ELF `ET_DYN` image. A library can import functions from
+another library: `-l` flags and library annotations on `extern` declarations
+become `DT_NEEDED` entries. Undefined functions receive PLT/GOT entries and
+`R_X86_64_JUMP_SLOT` relocations; GOT-relative data imports use
+`R_X86_64_GLOB_DAT`. Defined globals remain exports in the same `.dynsym`.
+The loader resolves imports before execution (`DF_BIND_NOW`); a `.so` has no
+`PT_INTERP` of its own.
+
+```bash
+./caustic --shared --allow-unsupported std/libcaustic.cst -o libcaustic.so
+./caustic --shared -lcaustic library.cst -o libexample.so
+./caustic -lcaustic main.cst -lexample -o program
+LD_LIBRARY_PATH=. ./program
+```
+
+For exceptions crossing the library boundary, every participant must use the
+same runtime: compile both with `-lcaustic` and import
+`use "std/exceptions.cst" as ex;`. Shared-runtime bodies are not inlined into
+consumers, preserving the library's state at every optimization level.
+Modules resolved below the configured stdlib root (`CAUSTIC_LIB`, or the
+installation directory) use stable `_std_*` symbols regardless of its absolute
+path. This also applies to programs whose source files live outside the repo.
+Other modules retain their path-based names.
+Independently embedded static runtimes have independent handler stacks.
+
 ## Additional ELF Structures Generated
 
 Dynamic executables require several additional sections and two extra program headers:

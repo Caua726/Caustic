@@ -67,6 +67,12 @@ Known limits, deliberate:
   is DETECTED (the handler must be an ancestor on this stack) rather than
   supported. Real per-thread needs a thread pointer for every thread, which is
   its own project.
+- **Handlers belong to one runtime image.** An executable and a `.so` that
+  each statically embed `std/exceptions.cst` have separate heads: a throw in
+  the library cannot see a handler in the executable. On Linux x86_64, build
+  every participant with `-lcaustic` and use the canonical
+  `use "std/exceptions.cst"` import to share one `libcaustic.so`. This path is
+  verified at `-O0/-O1/-O2`, including the standalone ELF linker.
 - **No target without inline asm.** A wasm build that uses it fails in the
   backend with "inline asm is not supported on wasm" — loud, but not a
   diagnostic this module chooses.
