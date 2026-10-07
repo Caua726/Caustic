@@ -41,13 +41,17 @@
 //     defer ex.release(&g);                        // normal path: pop, do not run
 //
 // Limitations, deliberate:
-//   * The handler stack is a plain global, not per-thread. A `throw` on a
-//     thread other than the one that entered the frame would unwind it.
+//   * The handler stack is a plain global, not per-thread: the stdlib has no
+//     TLS to hang it off (nothing initialises a thread pointer — `clone` is
+//     handed &Thread, and the main thread has none at all, so reading fs:
+//     would fault before it could tell). A throw that crosses threads is
+//     therefore DETECTED rather than supported: the handler frame must be an
+//     ancestor on this stack, and one that is not is diagnosed.
 //   * No target without inline asm (wasm) can use this: the asm arm calls
 //     __compile_error, so a wasm build that uses it fails at compile time.
-//   * `enter` must be called before any code that can throw, and `leave` (or
-//     a `throw` that unwinds past it) after. Calling `begin` and then
-//     throwing without `enter` is an uncaught throw.
+//   * The try site is explicit. Without macros the catch is an `if` on
+//     `begin`'s result; `enter` must precede anything that can throw, and a
+//     throw with nothing entered is an uncaught panic.
 // =======================================================
 
 use "io.cst" as io;
@@ -56,22 +60,35 @@ use "io.cst" as io;
 //
 // The asm reads this layout by fixed byte offset, so the field order is part
 // of the interface: `ctx` MUST stay first, and the offsets are
-//   0   ctx   16 i64  —  x86_64: rbx rbp r12 r13 r14 r15 rsp rip
-//                        aarch64: x19..x28 x29 x30 sp
-//   128 prev  *Frame  — the frame below this one on the handler stack
-//   136 cleanup *u8   — the cleanup to run (guard frames)
-//   144 arg   i64     — its argument
-//   152 kind  i32     — 0 = catch, 1 = guard
+//   0   ctx    16 i64  —  x86_64: rbx rbp r12 r13 r14 r15 rsp rip
+//                         aarch64: x19..x28 x29 x30 sp
+//   128 prev   *Frame  — the frame below this one on the handler stack
+//   136 cleanup *u8    — the cleanup to run (guard frames)
+//   144 arg    i64     — its argument
+//   152 kind   i32     — 0 = catch, 1 = guard
+//   156 state  i32     — 0 = idle, 1 = registered, 2 = unwound past
+//   160 class  i64     — FRAME_CLASS, so a stale or foreign frame is caught
 struct Frame {
     ctx as [16]i64;
     prev as *Frame;
     cleanup as *u8;
     arg as i64;
     kind as i32;
+    state as i32;
+    class as i64;
 }
 
 let is i32 as KIND_CATCH with imut = 0;
 let is i32 as KIND_GUARD with imut = 1;
+
+let is i32 as STATE_IDLE with imut = 0;
+let is i32 as STATE_LIVE with imut = 1;
+let is i32 as STATE_UNWOUND with imut = 2;
+
+// Stamped by `enter`/`guard` and checked on every pop. A frame that is not
+// ours — or one that was never initialised — is a bug, not something to
+// unwind through.
+let is i64 as FRAME_CLASS with imut = 7595458606938820947;
 
 // Top of the handler stack; the innermost frame is the head.
 let is *Frame as _head with mut = cast(*Frame, 0);
@@ -107,20 +124,32 @@ fn _jump(f as *Frame, v as i64) as void with naked {
 // anything that can throw.
 fn enter(f as *Frame) as void {
     f.kind = KIND_CATCH;
+    f.state = STATE_LIVE;
+    f.class = FRAME_CLASS;
     f.prev = _head;
     _head = f;
 }
 
-// Unregister f on the normal path. Safe to call only while f is the head,
-// which it is unless a throw already unwound past it.
+// Unregister f on the normal path.
+//
+// A `defer leave(&f)` also fires on the catch path, where a throw has already
+// popped f — that is why STATE_UNWOUND is not an error. Anything else (f is
+// neither the head nor already unwound) means the caller's begin/enter/leave
+// pairing is wrong, and silently ignoring it would corrupt the stack.
 fn leave(f as *Frame) as void {
-    if (_head == f) { _head = f.prev; }
+    if (f.class != FRAME_CLASS) { _bad_frame(); }
+    if (f.state == STATE_UNWOUND) { return; }
+    if (_head != f) { _misuse("leave() on a frame that is not the head"); }
+    f.state = STATE_UNWOUND;
+    _head = f.prev;
 }
 
 // Register a cleanup to run if a throw unwinds past this point. Pair it with
 // `defer release(&g)` so the normal path pops it without running it.
 fn guard(g as *Frame, cleanup as *u8, arg as i64) as void {
     g.kind = KIND_GUARD;
+    g.state = STATE_LIVE;
+    g.class = FRAME_CLASS;
     g.cleanup = cleanup;
     g.arg = arg;
     g.prev = _head;
@@ -128,34 +157,91 @@ fn guard(g as *Frame, cleanup as *u8, arg as i64) as void {
 }
 
 fn release(g as *Frame) as void {
-    if (_head == g) { _head = g.prev; }
+    if (g.class != FRAME_CLASS) { _bad_frame(); }
+    if (g.state == STATE_UNWOUND) { return; }
+    if (_head != g) { _misuse("release() on a frame that is not the head"); }
+    g.state = STATE_UNWOUND;
+    _head = g.prev;
 }
 
 // A throw that finds no handler is a bug in the program, not a value. This
 // does not go through std/errors.cst: importing that module at all compiles
 // its __compile_error stubs, which abort the build (it is only usable under
 // --allow-unsupported).
-fn _uncaught() as void {
-    io.write_str(io.STDERR, "panic: uncaught exception\n");
+fn _uncaught(v as i64) as void {
+    io.write_str(io.STDERR, "panic: uncaught exception ");
+    io.write_int(io.STDERR, v);
+    io.write_str(io.STDERR, "\n");
     io.exit(1);
 }
 
-// Unwind to the innermost catch handler, running every guard on the way.
-fn throw(v as i64) as void {
-    let is *Frame as f with mut = _head;
-    while (cast(i64, f) != 0) {
-        let is *Frame as prev = f.prev;
-        if (f.kind == KIND_GUARD) {
-            let is *u8 as cb = f.cleanup;
-            let is i64 as arg = f.arg;
-            _head = prev;
-            call(cb, arg);
-        } else {
-            _head = prev;
-            _jump(f, v);
-            return;                 // not reached
-        }
-        f = _head;
+fn _misuse(msg as *u8) as void {
+    io.write_str(io.STDERR, "panic: exceptions misused: ");
+    io.write_str(io.STDERR, msg);
+    io.write_str(io.STDERR, "\n");
+    io.exit(2);
+}
+
+fn _bad_frame() as void {
+    io.write_str(io.STDERR, "panic: exceptions: handler stack corrupted\n");
+    io.exit(3);
+}
+
+// The stack pointer a handler frame was entered on. Slot 6 holds rsp on
+// x86_64, slot 12 holds sp on aarch64 — see the Frame layout comment.
+fn _frame_sp(f as *Frame) as i64 {
+    if (__target_is_aarch64 == 1) { return f.ctx[12]; }
+    return f.ctx[6];
+}
+
+// A registered handler must be an ANCESTOR frame on this thread's stack, so
+// the stack pointer it saved is above anything this throw can address. A
+// frame that fails this is stale (its stack region is gone) or belongs to
+// another thread — the one case the process-global head cannot handle. Better
+// to say so than to jump into a dead frame.
+fn _check_ancestor(f as *Frame, here as i64) as void {
+    if (_frame_sp(f) <= here) {
+        io.write_str(io.STDERR, "panic: exceptions: handler frame is not an ancestor on this stack\n");
+        io.exit(4);
     }
-    _uncaught();
+}
+
+// Unwind to the innermost catch handler.
+//
+// Two phases, like a real unwinder, and for a real reason: phase 1 only LOOKS
+// for the handler. If there is none the program aborts having run nothing —
+// tearing state down and then dying is strictly worse than dying.
+fn throw(v as i64) as void {
+    let is i64 as anchor with mut = 0;
+    let is i64 as here = cast(i64, &anchor);
+
+    // Phase 1: search. Nothing is popped, no cleanup runs.
+    let is *Frame as f with mut = _head;
+    let is i32 as found with mut = 0;
+    while (cast(i64, f) != 0) {
+        if (f.class != FRAME_CLASS) { _bad_frame(); }
+        if (f.kind == KIND_CATCH && f.state == STATE_LIVE) {
+            _check_ancestor(f, here);
+            found = 1;
+            break;
+        }
+        f = f.prev;
+    }
+    if (found == 0) { _uncaught(v); }
+
+    // Phase 2: cleanups between the head and the handler, innermost first,
+    // then hand control to it. A cleanup that throws continues from wherever
+    // the walk got to, which is defined: the frames below are still intact.
+    while (_head != f) {
+        let is *Frame as g = _head;
+        if (g.class != FRAME_CLASS) { _bad_frame(); }
+        let is *u8 as cb = g.cleanup;
+        let is i64 as a = g.arg;
+        g.state = STATE_UNWOUND;
+        _head = g.prev;
+        call(cb, a);
+    }
+    f.state = STATE_UNWOUND;
+    _head = f.prev;
+    _jump(f, v);
 }
