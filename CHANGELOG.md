@@ -25,6 +25,24 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   resuming frame keeps its own locals.
   Limitations in the module header and `ROADMAP.md`: the handler stack is not
   per-thread, and a target without inline asm (wasm) cannot use it.
+- **Exceptions fail loudly.** `throw` is two-phase like a real unwinder: phase
+  1 only searches, so an uncaught throw aborts having run NOTHING — it used to
+  pop and run every guard on its way to the end of the stack, tearing the
+  program's state down and then dying. The uncaught path also keeps the thrown
+  value (it printed a fixed string) and prints a backtrace. Frames carry a
+  class and a state, so a frame that is not ours is caught before it is jumped
+  into, and `leave`/`release` can tell "already unwound" from "you are popping
+  the wrong frame" — which used to be a silent no-op; misuse now exits 2 with
+  a message. A handler must be an ancestor on this stack: the head is
+  process-global (the stdlib has no TLS to make it per-thread), so a throw
+  that crosses threads is detected rather than silently jumping into a dead
+  frame.
+- **A frame-pointer backtrace** (`std/exceptions.cst:backtrace`). Caustic
+  always emits a frame pointer, so `[fp]`/`[fp+8]` is the caller's frame
+  pointer and return address exactly — a chain walk, no DWARF unwind, no
+  tables, no runtime. Addresses only: `.symtab`/`.debug_*` are in the file,
+  not the loaded image, so `llvm-symbolizer` over them is still the way to get
+  names.
 
 ### Fixed
 - **AArch64 `mov Rd, #imm` silently emitted `mvn`.** The `mov` case handled

@@ -49,17 +49,42 @@ guard order, rethrow and that the resuming frame's own locals survive.
 Known limits, deliberate:
 
 - **`defer` does not run on a throw.** It is compiler-inlined at each `return`
-  and there is no addressable "run my defers" thunk for a throw to call.
-  `guard`/`release` is the exception-safe form: the guard runs on the unwind,
-  the paired `defer release` pops it on the normal path.
-- **The handler stack is a plain global, not per-thread.** A `throw` on a
-  thread other than the one that entered a frame would unwind that frame.
+  (`src/ir/gen_expr.cst:emit_deferred_calls`) and there is no addressable "run
+  my defers" thunk for a throw to call. `guard`/`release` is the
+  exception-safe form: the guard runs on the unwind, the paired `defer
+  release` pops it on the normal path. Closing this needs the compiler, and
+  the design is settled enough to state: emit a cleanup thunk per
+  scope-with-defers, register it at scope entry, and have `throw` run it. Two
+  open questions — the thunk must address the ORIGINAL frame's locals (either
+  a naked thunk with the runtime setting rbp before the call, which needs the
+  deferred call's arguments to be simple, or a new `IR_ADDR_BASE` op so a
+  normal thunk can take the frame as a parameter), and mem2reg must be told
+  not to promote a local whose address a deferred call reads.
+- **The handler stack is a plain global, not per-thread.** The stdlib has no
+  TLS to hang it off: nothing initialises a thread pointer — `clone` is handed
+  `&Thread` (which nothing reads) and the main thread has none at all, so
+  reading `fs:` would fault before it could tell. A throw that crosses threads
+  is DETECTED (the handler must be an ancestor on this stack) rather than
+  supported. Real per-thread needs a thread pointer for every thread, which is
+  its own project.
 - **No target without inline asm.** A wasm build that uses it fails in the
   backend with "inline asm is not supported on wasm" — loud, but not a
   diagnostic this module chooses.
 - **The pattern is explicit.** Without macros, the catch is an `if` on
   `begin`'s result; `enter` must precede anything that can throw, and a throw
   with nothing entered is an uncaught panic.
+- **The try pays on the hot path.** `begin` is a call plus ten stores and a
+  164-byte frame, and the compiler never inlines a function containing asm
+  (`src/ir/opt_loop.cst:inline_has_asm`), so a try cannot be optimized at all.
+  Zero cost needs tables: the compiler emits an LSDA and a landing pad per
+  frame, and `throw` walks `.eh_frame` instead of a pushed stack. We already
+  emit half of it — `.eh_frame` with a `"zR"` CIE, no `P` (personality) and no
+  `L` (LSDA) — so the work is the LSDA, a personality, and a DWARF CFI
+  interpreter written in Caustic (the shape of `libgcc/unwind.inc` and
+  `std/src/sys/personality/dwarf/eh.rs`), with no libgcc to lean on.
+- **A backtrace is addresses only.** `std/exceptions.cst:backtrace` walks the
+  frame-pointer chain; naming the frames needs a loadable name table, since
+  `.symtab` and `.debug_*` are in the file and not in the loaded image.
 
 ## Debug info (DWARF, ELF `-g`)
 

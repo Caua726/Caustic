@@ -164,6 +164,64 @@ fn release(g as *Frame) as void {
     _head = g.prev;
 }
 
+// Read the caller's frame pointer. Naked: with a prologue this would return
+// its own rbp, and the whole chain hangs off the caller's.
+fn _fp() as i64 with naked {
+    if (__target_is_aarch64 == 1) { asm("mov x0, x29\nret\n"); }
+    else { asm("mov rax, rbp\nret\n"); }
+    return 0;
+}
+
+fn _hex(fd as i64, v as i64) as void {
+    if (v == 0) { io.write_str(fd, "0"); return; }
+    let is [16]u8 as buf;
+    let is i32 as i with mut = 16;
+    let is i64 as x with mut = v;
+    while (x != 0 && i > 0) {
+        i = i - 1;
+        let is i32 as d = cast(i32, x & 15);
+        let is i32 as ch with mut = 48 + d;
+        if (d > 9) { ch = 87 + d; }              // 'a' - 10
+        buf[i] = cast(u8, ch);
+        x = x >> 4;
+    }
+    io._write_fd(fd, cast(*u8, cast(i64, &buf) + cast(i64, i)), cast(i64, 16 - i));
+}
+
+// Walk the frame-pointer chain and print the return addresses.
+//
+// Caustic always emits a frame pointer — x86_64 `push rbp; mov rbp, rsp`,
+// aarch64 `mov x29, sp`, with no omit-frame-pointer option — so [fp] is the
+// caller's frame pointer and [fp+8] its return address, exactly. That makes
+// this a chain walk rather than a DWARF unwind, which is why it needs no
+// tables and no runtime to link.
+//
+// Addresses only. `.symtab` and `.debug_*` are in the file, not in the loaded
+// image, so naming them means emitting a loadable name table — a separate
+// job. Until then `llvm-symbolizer`/`addr2line` over the addresses is the way.
+//
+// The chain is bounded and must climb: the stack grows down, so every caller's
+// frame pointer is strictly above the callee's. A chain that stops climbing is
+// corrupt and the walk stops rather than looping.
+fn backtrace(fd as i64, skip as i32) as void {
+    let is i64 as fp with mut = _fp();
+    let is i32 as n with mut = 0;
+    while (fp != 0 && n < 32) {
+        let is *i64 as p = cast(*i64, fp);
+        let is i64 as next = p[0];
+        if (n >= skip) {
+            io.write_str(fd, "  #");
+            io.write_int(fd, cast(i64, n - skip));
+            io.write_str(fd, "  0x");
+            _hex(fd, p[1]);
+            io.write_str(fd, "\n");
+        }
+        if (next <= fp) { break; }
+        fp = next;
+        n = n + 1;
+    }
+}
+
 // A throw that finds no handler is a bug in the program, not a value. This
 // does not go through std/errors.cst: importing that module at all compiles
 // its __compile_error stubs, which abort the build (it is only usable under
@@ -172,6 +230,7 @@ fn _uncaught(v as i64) as void {
     io.write_str(io.STDERR, "panic: uncaught exception ");
     io.write_int(io.STDERR, v);
     io.write_str(io.STDERR, "\n");
+    backtrace(io.STDERR, 0);
     io.exit(1);
 }
 
