@@ -120,12 +120,25 @@ Known limits, deliberate:
   check (introduced in `f8d2c0a`) was relaxed because it rejected valid code;
   revisit with a more precise rule.
 
-## stdlib placeholder helpers (intentional)
+## `__compile_error` (intentional, but narrower than it looks)
 
-- **`std/errors.cst:43,47` — `error_not_implemented()` / `error_todo()`** abort
-  the build via `__compile_error`. These are intentional stubs meant to be
-  called at sites that are not done yet; listed here so they are not mistaken
-  for finished functionality.
+- **`__compile_error` fires when its enclosing function is EMITTED, not when
+  it is called.** `src/codegen/emit_inst.cst:1405` aborts the build on
+  reaching the marker, and its comment says the marker "survived dead-branch
+  elim + function DCE" — true for a dead branch, but function DCE does not
+  remove an uncalled function, so a helper that is nothing but a
+  `__compile_error` aborts as soon as its module is imported. Verified:
+  `fn unused() as void { __compile_error("boom"); }` in a file that never
+  calls it still fails the build.
+- **So the check belongs at the call site, inside the target guard** — that is
+  what makes the branch dead and lets it be eliminated:
+  `if (__target_is_causticos == 0) { __compile_error("..."); }`
+  (`std/causticos/*.cst`), or `__compile_error` inline (`std/io.cst`).
+- `std/errors.cst` carried seven such helpers (`unsupported`, `no_vfs`,
+  `no_heap`, `no_network`, `no_processes`, `not_implemented`, `todo`), none of
+  which had a single call site, and their presence made the whole module
+  unimportable — `panic` and `assert` could not be used either. They were
+  removed. If a stub is wanted at a site, write it there.
 
 ## Language: implemented
 

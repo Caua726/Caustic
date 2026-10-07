@@ -45,6 +45,15 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **`std/errors.cst` could not be imported.** It carried seven
+  `__compile_error` stubs (`unsupported`, `no_vfs`, `no_heap`, `no_network`,
+  `no_processes`, `not_implemented`, `todo`), and `__compile_error` fires when
+  its enclosing function is EMITTED rather than when it is called — function
+  DCE does not remove an uncalled function — so merely importing the module
+  aborted the build with "operation not supported on the target OS". None of
+  the seven had a single call site. They are gone, so `panic`/`assert` work,
+  and the ROADMAP records why the helper form cannot work and where the check
+  belongs instead (at the call site, inside the target guard).
 - **AArch64 `mov Rd, #imm` silently emitted `mvn`.** The `mov` case handled
   only the register form and the `sp` forms, so a numeric operand was read as
   a register: `mov x0, 0` encoded as `mvn x0, x3` and produced garbage. The
