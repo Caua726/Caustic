@@ -80,7 +80,11 @@ fn main() as i32 {
 }
 ```
 
-The stdlib is resolved automatically from `<binary_dir>/../lib/caustic/` or `/usr/local/lib/caustic/`.
+If an import is absent beside its source and under any `--path` directories,
+the compiler falls back to the configured standard library. Its root is chosen
+from `CAUSTIC_LIB`, then a `std/` beside the compiler (a source checkout), then
+`<binary_dir>/../lib/caustic/` (an installation), then `/usr/local/lib/caustic/`.
+`CAUSTIC_LIB` names the directory **containing** `std/`, not `std/` itself.
 
 ## Manual Pipeline
 

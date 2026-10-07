@@ -45,6 +45,14 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **Checkout compilers use their own standard library.** A compiler built beside
+  `std/` now discovers that tree before an unrelated installed copy, even when
+  the input source lives outside the checkout. CausticOS builds previously fell
+  through to an older `/usr/local/lib/caustic`, losing Unicode imports and the
+  current console-font API. `CAUSTIC_LIB` remains the first override; the
+  installed `<binary>/../lib/caustic` layout remains supported. The self-host gate
+  compiles and runs an external Unicode/font consumer in both layouts without
+  the override.
 - **ELF shared libraries lost their imports.** A `.so` built with
   `-lcaustic` omitted `DT_NEEDED`, undefined dynamic symbols, and PLT/GOT
   relocations; its calls to the shared runtime were linked to address zero.

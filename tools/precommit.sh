@@ -207,6 +207,35 @@ for OPT in -O0 -O1 -O2; do
     [ "$OPT" = "-O2" ] && CUR="$TMP/g4$OPT"
 done
 
+# The source is outside either compiler layout: source-relative imports cannot
+# hide a wrong stdlib fallback, and the gate's explicit override is cleared.
+step "binary-relative stdlib (checkout and installed layouts)"
+mkdir -p "$TMP/layout/bin" "$TMP/layout/lib/caustic"
+cp "$CUR" "$TMP/layout/caustic"
+cp "$CUR" "$TMP/layout/bin/caustic"
+ln -s "$ROOT/std" "$TMP/layout/std"
+ln -s "$ROOT/std" "$TMP/layout/lib/caustic/std"
+STDLIB_PROBE="$TMP/stdlib_probe.cst"
+cat > "$STDLIB_PROBE" <<'EOF'
+use "std/unicode/compose.cst" as compose;
+use "std/unicode/cpwidth.cst" as width;
+use "std/causticos/font.cst" as font;
+fn main() as i32 {
+    if (compose.compose(0x65, 0x301) != 0xE9) { return 1; }
+    if (width.cp_width(0x301) != 0 || width.cp_width(0x4E00) != 2) { return 2; }
+    if (cast(i64, font.glyph(0xAC)) == cast(i64, font.glyph(0xFFFD))) { return 3; }
+    return 0;
+}
+EOF
+for cc in "$TMP/layout/caustic" "$TMP/layout/bin/caustic"; do
+    CAUSTIC_LIB= compile "$cc" "$STDLIB_PROBE" "$TMP/stdlib_probe" \
+        || die "binary-relative stdlib failed to compile: $cc"
+    [ "$(runrc "$TMP/stdlib_probe")" = "0" ] \
+        || die "binary-relative stdlib produced wrong Unicode/font behaviour: $cc"
+done
+ok "external source resolves and runs with checkout/installed stdlibs"
+
+
 # ─── 4. examples: identical behaviour across -O0/-O1/-O2 ────────────────────
 # Catches any optimization that changes a real program's result. Uses the
 # current-source -O2 compiler to compile each example at all three levels.
