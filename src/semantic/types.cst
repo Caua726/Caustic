@@ -163,14 +163,8 @@ fn resolve_alias(ty_ptr as *u8) as *u8 {
     if (cast(i64, ty_ptr) == 0) { return ty_ptr; }
     let is *ast.Type as ty = cast(*ast.Type, ty_ptr);
     if (ty.kind == ast.TY_STRUCT && cast(i64, ty.fields) == 0 && ty.name_len > 0) {
-        let is *u8 as alias with mut = lookup_type_alias(ty.name_ptr, ty.name_len);
-        if (cast(i64, alias) == 0 && sc.current_mod_prefix_len > 0) {
-            let is i32 as amlen with mut = 0;
-            let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
-            alias = lookup_type_alias(amangled, amlen);
-            if (cast(i64, alias) == 0) { d.sem_free(amangled); }
-        }
-        // Try dot-split for module.Type references (mod.T, mod.sub.T, ...)
+        let is *u8 as alias with mut = cast(*u8, 0);
+        // Explicit module qualification is resolved before local/root names.
         if (cast(i64, alias) == 0) {
             let is i32 as tail_off with mut = 0;
             let is i32 as chain_only with mut = 0;
@@ -181,7 +175,7 @@ fn resolve_alias(ty_ptr as *u8) as *u8 {
                 let is i32 as dmlen with mut = 0;
                 let is *u8 as dmangled = d.str_concat3(modd.prefix_ptr, modd.prefix_len, "_", 1, tname_ptr, tname_len, &dmlen);
                 alias = lookup_type_alias(dmangled, dmlen);
-                if (cast(i64, alias) == 0) { d.sem_free(dmangled); }
+                d.sem_free(dmangled);
                 // Fallback: search submodules (for 'only' imports)
                 if (cast(i64, alias) == 0 && chain_only == 1) {
                     let is *d.SubModule as sm with mut = cast(*d.SubModule, modd.submodules);
@@ -190,12 +184,19 @@ fn resolve_alias(ty_ptr as *u8) as *u8 {
                         let is i32 as smlen with mut = 0;
                         let is *u8 as smangled = d.str_concat3(sub.prefix_ptr, sub.prefix_len, "_", 1, tname_ptr, tname_len, &smlen);
                         alias = lookup_type_alias(smangled, smlen);
-                        if (cast(i64, alias) == 0) { d.sem_free(smangled); }
+                        d.sem_free(smangled);
                         sm = cast(*d.SubModule, sm.next);
                     }
                 }
             }
         }
+        if (cast(i64, alias) == 0 && sc.current_mod_prefix_len > 0) {
+            let is i32 as amlen with mut = 0;
+            let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
+            alias = lookup_type_alias(amangled, amlen);
+            d.sem_free(amangled);
+        }
+        if (cast(i64, alias) == 0) { alias = lookup_type_alias(ty.name_ptr, ty.name_len); }
         if (cast(i64, alias) != 0) { return alias; }
     }
     return ty_ptr;
@@ -229,31 +230,29 @@ fn lookup_enum(name_ptr as *u8, name_len as i32) as *u8 {
     return cast(*u8, 0);
 }
 
-// Prefix-aware lookups: a type defined in the module currently being compiled is
-// registered under its mangled key (`<prefix>_Name`, see walk_module.cst), so a
-// bare `Name` lookup misses it. These retry with the current module prefix when
-// the bare lookup fails — the same fallback `resolve_type_ref` already does for
-// field/param types. Needed for `Type.method()` / `Enum.Variant` references to a
-// LOCAL type under `--module-only` (the whole-program root has no prefix, so the
-// fallback is inert there). Only fires after a bare miss, so it never changes a
-// resolution that already succeeded.
+// The importing module's own type shadows a bare root type. Already-mangled
+// names still resolve through the final exact-key lookup.
 fn lookup_struct_pf(name_ptr as *u8, name_len as i32) as *u8 {
-    let is *u8 as def with mut = lookup_struct(name_ptr, name_len);
-    if (cast(i64, def) == 0 && sc.current_mod_prefix_len > 0) {
+    let is *u8 as def with mut = cast(*u8, 0);
+    if (sc.current_mod_prefix_len > 0) {
         let is i32 as mlen with mut = 0;
         let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, name_ptr, name_len, &mlen);
         def = lookup_struct(mangled, mlen);
+        d.sem_free(mangled);
     }
+    if (cast(i64, def) == 0) { def = lookup_struct(name_ptr, name_len); }
     return def;
 }
 
 fn lookup_enum_pf(name_ptr as *u8, name_len as i32) as *u8 {
-    let is *u8 as def with mut = lookup_enum(name_ptr, name_len);
-    if (cast(i64, def) == 0 && sc.current_mod_prefix_len > 0) {
+    let is *u8 as def with mut = cast(*u8, 0);
+    if (sc.current_mod_prefix_len > 0) {
         let is i32 as mlen with mut = 0;
         let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, name_ptr, name_len, &mlen);
         def = lookup_enum(mangled, mlen);
+        d.sem_free(mangled);
     }
+    if (cast(i64, def) == 0) { def = lookup_enum(name_ptr, name_len); }
     return def;
 }
 
@@ -509,43 +508,24 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
             }
         }
 
-        let is *u8 as def with mut = lookup_struct(ty.name_ptr, ty.name_len);
-
-        // 1. Try mangled name (internal reference)
-        if (cast(i64, def) == 0 && sc.current_mod_prefix_len > 0) {
-            let is i32 as mlen with mut = 0;
-            let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &mlen);
-            def = lookup_struct(mangled, mlen);
-            if (cast(i64, def) == 0) {
-                d.sem_free(mangled);
-            }
-        }
-
-        // 2. Try dot-mangled (external reference with dot)
+        // Explicit qualification wins; otherwise the importing module's own
+        // definition wins before an exact bare root-name fallback.
+        let is *u8 as def with mut = cast(*u8, 0);
         let is i32 as from_dot with mut = 0;
-        if (cast(i64, def) == 0 && cast(i64, dot_mangled_ptr) != 0) {
+        if (cast(i64, dot_mangled_ptr) != 0) {
             def = lookup_struct(dot_mangled_ptr, dot_mangled_len);
             if (cast(i64, def) != 0) { from_dot = 1; }
-        }
-
-        // 3. Try generic instantiation
-        if (cast(i64, def) == 0 && ty.gen_arg_count > 0 && ty.base_name_len > 0) {
-            // Generic struct instantiation handled in walk.cst via callback
-            // For now, just try lookup with the mangled name as-is
+        } else {
+            def = lookup_struct_pf(ty.name_ptr, ty.name_len);
         }
 
         if (cast(i64, def) == 0) {
             // Try enum lookup
-            let is *u8 as edef with mut = lookup_enum(ty.name_ptr, ty.name_len);
-            if (cast(i64, edef) == 0 && sc.current_mod_prefix_len > 0) {
-                let is i32 as mlen with mut = 0;
-                let is *u8 as mangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &mlen);
-                edef = lookup_enum(mangled, mlen);
-                if (cast(i64, edef) == 0) { d.sem_free(mangled); }
-            }
-            // Try dot-mangled for enum
-            if (cast(i64, edef) == 0 && cast(i64, dot_mangled_ptr) != 0) {
+            let is *u8 as edef with mut = cast(*u8, 0);
+            if (cast(i64, dot_mangled_ptr) != 0) {
                 edef = lookup_enum(dot_mangled_ptr, dot_mangled_len);
+            } else {
+                edef = lookup_enum_pf(ty.name_ptr, ty.name_len);
             }
             if (cast(i64, edef) != 0) {
                 let is *ast.Type as et = cast(*ast.Type, edef);
@@ -557,16 +537,17 @@ fn resolve_type_ref(ty_ptr as *u8) as void {
                 ty.max_payload = et.max_payload;
             } else {
                 // Try type alias
-                let is *u8 as alias_ty with mut = lookup_type_alias(ty.name_ptr, ty.name_len);
-                if (cast(i64, alias_ty) == 0 && sc.current_mod_prefix_len > 0) {
-                    let is i32 as amlen with mut = 0;
-                    let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
-                    alias_ty = lookup_type_alias(amangled, amlen);
-                    if (cast(i64, alias_ty) == 0) { d.sem_free(amangled); }
-                }
-                // Try dot-mangled for alias
-                if (cast(i64, alias_ty) == 0 && cast(i64, dot_mangled_ptr) != 0) {
+                let is *u8 as alias_ty with mut = cast(*u8, 0);
+                if (cast(i64, dot_mangled_ptr) != 0) {
                     alias_ty = lookup_type_alias(dot_mangled_ptr, dot_mangled_len);
+                } else {
+                    if (sc.current_mod_prefix_len > 0) {
+                        let is i32 as amlen with mut = 0;
+                        let is *u8 as amangled = d.str_concat3(sc.current_mod_prefix_ptr, sc.current_mod_prefix_len, "_", 1, ty.name_ptr, ty.name_len, &amlen);
+                        alias_ty = lookup_type_alias(amangled, amlen);
+                        d.sem_free(amangled);
+                    }
+                    if (cast(i64, alias_ty) == 0) { alias_ty = lookup_type_alias(ty.name_ptr, ty.name_len); }
                 }
                 if (cast(i64, alias_ty) != 0) {
                     let is *ast.Type as at = cast(*ast.Type, alias_ty);

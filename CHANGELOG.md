@@ -45,6 +45,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **Named types use their module context before root fallback.** Explicit
+  qualification wins; an imported module's own structs, enums and aliases
+  no longer capture a homonymous root definition. Debug type tables also
+  distinguish resolved field identities, preserving the correct fields and
+  enum variants. Consumers run at O0/O1/O2, with direct `-g` and separate
+  `-c` / link / GDB checks in `caustic-mk run test-module-context`.
+- **Single-object output is assembled at the requested path.** `-c -o` no
+  longer silently loses a cross-filesystem rename or claims success for a
+  nonexistent destination directory. The independent linker accepts `-g`
+  and `--debug` to retain DWARF from those objects.
 - **PE stack probes resolve before validation.** The PE writer validates
   unresolved symbols only after assigning the real `__caustic_chkstk` and
   IAT definitions, before relocations. A symbol merely named `__imp_*` is
