@@ -287,6 +287,13 @@ qemu-aarch64 ./program-aarch64
 - **Defer** — LIFO cleanup that runs before every `return`: `defer free(ptr);`.
 - **Modules** — `use "path" as alias`, `only` selective imports, submodule
   dot-notation, module caching.
+- **String globals** — mutable literal-initialized globals own writable pointer
+  storage with a relocation to shared read-only bytes. Reassignment and
+  address-of update the pointer, not the literal; custom sections behave the
+  same way. Immutable string globals retain shared literal aliases.
+  The permanent native runner covers direct and separate-object consumers;
+  `caustic-mk run test-windows` additionally executes O0/O1/O2 PE images and
+  the same consumer in forcibly rebased DLLs, requiring Wine/Xvfb and mingw.
 - **Function pointers** — typed `fn_ptr(...)` plus type-checked indirect
   `call(ptr, args)`.
 - **FFI** — `extern "kernel32.dll" fn ...` declarations and System V struct

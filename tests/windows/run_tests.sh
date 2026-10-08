@@ -1,5 +1,5 @@
 #!/bin/sh
-# Permanent PE stack-probe/target-guard consumers. No installed tool replacement.
+# Permanent PE stack probes, target guards, mutable pointers and loader rebasing.
 # Usage: sh tests/windows/run_tests.sh [compiler]
 # --inside reuses an explicitly owned Wine/X session (mutation workers).
 set -eu
@@ -39,6 +39,8 @@ shift
 cc=${1:-./caustic}
 export LC_ALL=C
 mkdir -p build/pe-tests
+x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+    tests/windows/rebased_string_consumer.c -o build/pe-tests/rebased-string-consumer.exe
 for level in 0 1 2; do
     "$cc" -q "-O$level" tests/logical_fold_test.cst -o "build/pe-tests/logical-$level"
     "build/pe-tests/logical-$level"
@@ -66,12 +68,23 @@ for level in 0 1 2; do
     timeout 30 wine "build/pe-tests/target-$level.exe"
     "$cc" -q "-O$level" --target=windows-x86_64 tests/windows/stack_probe.cst -o "build/pe-tests/probe-$level.exe"
     timeout 30 wine "build/pe-tests/probe-$level.exe"
+    "$cc" -q "-O$level" --target=windows-x86_64 tests/string_global_test.cst -o "build/pe-tests/strings-$level.exe"
+    timeout 30 wine "build/pe-tests/strings-$level.exe"
+    "$cc" -q "-O$level" --target=windows-x86_64 --shared tests/string_global_test.cst -o "build/pe-tests/strings-$level.dll"
+    timeout 30 wine build/pe-tests/rebased-string-consumer.exe "build/pe-tests/strings-$level.dll"
     echo "PE target guards and 8192-byte recursive probe: -O$level passed"
 done
 "$cc" -q caustic-linker/main.cst -o build/pe-tests/linker
 "$cc" -q --target=windows-x86_64 -c tests/windows/stack_probe.cst -o build/pe-tests/probe.o
 build/pe-tests/linker --target=windows-x86_64 build/pe-tests/probe.o -o build/pe-tests/probe-separate.exe
 timeout 30 wine build/pe-tests/probe-separate.exe
+"$cc" -q --target=windows-x86_64 -O1 -c tests/string_global_test.cst -o build/pe-tests/strings.o
+build/pe-tests/linker --target=windows-x86_64 build/pe-tests/strings.o -o build/pe-tests/strings-separate.exe
+timeout 30 wine build/pe-tests/strings-separate.exe
+"$cc" -q caustic-assembler/main.cst -o build/pe-tests/assembler
+build/pe-tests/assembler tests/windows/section_bounds.s
+build/pe-tests/linker --target=windows-x86_64 tests/windows/section_bounds.s.o -o build/pe-tests/section-bounds.exe
+timeout 30 wine build/pe-tests/section-bounds.exe
 # A genuine unresolved symbol must fail without creating an executable.
 for target in linux-x86_64 windows-x86_64; do
     for fixture in missing_symbol missing_import_slot; do
