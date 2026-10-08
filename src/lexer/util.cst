@@ -138,78 +138,197 @@ fn parse_octal_val(src as *u8, start as i64, end as i64) as i64 {
     return result;
 }
 
-// Ten to the n, by squaring: exact while the result stays below 2^53 (n <= 22),
-// one rounding per step past that, infinity when it overflows.
-fn _pow10(n as i64) as f64 {
-    let is f64 as p with mut = cast(f64, 1);
-    let is f64 as b with mut = cast(f64, 10);
-    let is i64 as k with mut = n;
-    while (k > 0) {
-        if ((k & 1) == 1) { p = p * b; }
-        b = b * b;
-        k = k >> 1;
-    }
-    return p;
+// Binary64 midpoint decimals have fewer than 1024 significant digits.
+// Retain that prefix plus a sticky tail and round the exact rational once.
+// 160 limbs cover the prefix, the worst subnormal divisor and 53 quotient bits.
+struct DecimalInteger {
+    words as [160]u32;
+    used as i32;
 }
 
-// A decimal literal — `2.5`, `0.0015`, `1e30`, `6.02214076e23` — as the nearest
-// f64. All of its digits are read as one integer M and the decimal point and
-// the exponent as one power of ten, so the value is M * 10^e in a single
-// multiply or divide: correctly rounded whenever M is below 2^53 and |e| is at
-// most 22, which is every literal written by hand, and within an ulp or two
-// past that — enough that the largest finite double written out in full,
-// 1.7976931348623157e308, rounds up to infinity; that one takes a bignum. The previous loop added each fraction digit times 0.1^k, rounding
-// once per digit: 0.0015 came out two ulps off, and so did anything that
-// compared against it.
-//
-// Uses cast(f64, N), not float literals, so the compiler that builds this file
-// does not need to parse one.
+fn _decimal_init(n as *DecimalInteger, value as u32) as void {
+    n.words[0] = value; n.used = 1;
+}
+
+fn _decimal_mul10(n as *DecimalInteger, digit as u32) as void {
+    let is u64 as carry with mut = cast(u64, digit);
+    let is i32 as i with mut = 0;
+    while (i < n.used) {
+        let is u64 as value = cast(u64, n.words[i]) * cast(u64, 10) + carry;
+        n.words[i] = cast(u32, value); carry = value >> 32;
+        i = i + 1;
+    }
+    if (carry != cast(u64, 0)) { n.words[n.used] = cast(u32, carry); n.used = n.used + 1; }
+}
+
+fn _decimal_bits(n as *DecimalInteger) as i32 {
+    let is u32 as top with mut = n.words[n.used - 1];
+    let is i32 as bits with mut = (n.used - 1) * 32;
+    while (top != cast(u32, 0)) { top = top >> 1; bits = bits + 1; }
+    return bits;
+}
+
+fn _decimal_shift_left(n as *DecimalInteger, shift as i32) as void {
+    let is i32 as whole = shift / 32;
+    let is i32 as part = shift % 32;
+    let is i32 as count = n.used + whole + 1;
+    let is i32 as i with mut = count - 1;
+    while (i >= 0) {
+        let is u64 as value with mut = cast(u64, 0);
+        let is i32 as source = i - whole;
+        if (source >= 0 && source < n.used) { value = cast(u64, n.words[source]) << part; }
+        if (part > 0 && source > 0 && source - 1 < n.used) {
+            value = value | (cast(u64, n.words[source - 1]) >> (32 - part));
+        }
+        n.words[i] = cast(u32, value);
+        i = i - 1;
+    }
+    n.used = count;
+    while (n.used > 1 && n.words[n.used - 1] == cast(u32, 0)) { n.used = n.used - 1; }
+}
+
+fn _decimal_shift_right(n as *DecimalInteger, shift as i32) as void {
+    let is i32 as whole = shift / 32;
+    let is i32 as part = shift % 32;
+    let is i32 as count = n.used - whole;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is u64 as value with mut = cast(u64, n.words[i + whole]) >> part;
+        if (part > 0 && i + whole + 1 < n.used) {
+            value = value | (cast(u64, n.words[i + whole + 1]) << (32 - part));
+        }
+        n.words[i] = cast(u32, value); i = i + 1;
+    }
+    n.used = count;
+    while (n.used > 1 && n.words[n.used - 1] == cast(u32, 0)) { n.used = n.used - 1; }
+}
+
+fn _decimal_compare(a as *DecimalInteger, b as *DecimalInteger) as i32 {
+    if (a.used > b.used) { return 1; }
+    if (a.used < b.used) { return 0 - 1; }
+    let is i32 as i with mut = a.used - 1;
+    while (i >= 0) {
+        if (a.words[i] > b.words[i]) { return 1; }
+        if (a.words[i] < b.words[i]) { return 0 - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _decimal_subtract(a as *DecimalInteger, b as *DecimalInteger) as void {
+    let is u64 as borrow with mut = cast(u64, 0);
+    let is i32 as i with mut = 0;
+    while (i < a.used) {
+        let is u64 as rhs with mut = borrow;
+        if (i < b.used) { rhs = rhs + cast(u64, b.words[i]); }
+        let is u64 as lhs = cast(u64, a.words[i]);
+        a.words[i] = cast(u32, lhs - rhs);
+        borrow = cast(u64, lhs < rhs);
+        i = i + 1;
+    }
+    while (a.used > 1 && a.words[a.used - 1] == cast(u32, 0)) { a.used = a.used - 1; }
+}
+
 fn parse_float(src as *u8, start as i64, end as i64) as f64 {
-    // Digits beyond what M holds exactly: in the integer part each still
-    // scales the value by ten; in the fraction they are past f64's precision.
-    let is i64 as m_max = 900719925474099;   // M*10 + 9 stays below 2^53
-    let is i64 as m with mut = 0;
-    let is i64 as e10 with mut = 0;
+    let is DecimalInteger as numerator with mut;
+    let is DecimalInteger as denominator with mut;
+    _decimal_init(&numerator, cast(u32, 0));
+    _decimal_init(&denominator, cast(u32, 1));
+    let is i32 as digits with mut = 0;
+    let is i32 as fractional with mut = 0;
+    let is i32 as sticky with mut = 0;
+    let is i64 as scale with mut = 0;
     let is i64 as i with mut = start;
-    while (i < end && src[i] != 46 && src[i] != CH_e && src[i] != CH_E) {
-        if (src[i] != CH_UNDER) {
-            if (m < m_max) { m = m * 10 + cast(i64, src[i]) - 48; }
-            else { e10 = e10 + 1; }
-        }
-        i = i + 1;
-    }
-    if (i < end && src[i] == 46) {
-        i = i + 1;
-        while (i < end && src[i] != CH_e && src[i] != CH_E) {
-            if (src[i] != CH_UNDER && m < m_max) {
-                m = m * 10 + cast(i64, src[i]) - 48;
-                e10 = e10 - 1;
+    while (i < end && src[i] != CH_e && src[i] != CH_E) {
+        let is u8 as c = src[i];
+        if (c == 46) { fractional = 1; }
+        else if (c != CH_UNDER) {
+            if (fractional == 1) { scale = scale - 1; }
+            if (digits > 0 || c != 48) {
+                if (digits < 1024) {
+                    _decimal_mul10(&numerator, cast(u32, c) - cast(u32, 48));
+                    digits = digits + 1;
+                } else {
+                    scale = scale + 1;
+                    if (c != 48) { sticky = 1; }
+                }
             }
-            i = i + 1;
         }
-    }
-    if (i < end && (src[i] == CH_e || src[i] == CH_E)) {
         i = i + 1;
-        let is i32 as neg with mut = 0;
-        if (i < end && src[i] == 45) { neg = 1; i = i + 1; }
+    }
+    if (i < end) {
+        i = i + 1;
+        let is i32 as negative with mut = 0;
+        if (i < end && src[i] == 45) { negative = 1; i = i + 1; }
         else if (i < end && src[i] == 43) { i = i + 1; }
-        let is i64 as e with mut = 0;
+        let is i64 as exponent with mut = 0;
         while (i < end) {
-            if (src[i] != CH_UNDER && e < 100000) { e = e * 10 + cast(i64, src[i]) - 48; }
+            if (src[i] != CH_UNDER && exponent < 100000) { exponent = exponent * 10 + cast(i64, src[i]) - 48; }
             i = i + 1;
         }
-        if (neg == 1) { e10 = e10 - e; } else { e10 = e10 + e; }
+        if (negative == 1) { scale = scale - exponent; } else { scale = scale + exponent; }
     }
-    let is f64 as result with mut = cast(f64, m);
-    if (e10 > 0) { return result * _pow10(e10); }
-    // A divisor past 10^308 is infinity and would round a denormal like
-    // 4.9e-324 to zero; dividing in steps keeps it.
-    while (e10 < 0 - 300) {
-        result = result / _pow10(300);
-        e10 = e10 + 300;
+    let is i64 as bits with mut = 0;
+    // Clinger's exact fast path: one hardware rounding when both the integer
+    // significand and power of ten are exactly representable in binary64.
+    if (sticky == 0 && _decimal_bits(&numerator) <= 53 && scale >= 0 - 22 && scale <= 22) {
+        let is i64 as small with mut = cast(i64, numerator.words[0]);
+        if (numerator.used == 2) { small = small | (cast(i64, numerator.words[1]) << 32); }
+        let is i64 as count with mut = scale;
+        if (count < 0) { count = 0 - count; }
+        let is f64 as power with mut = cast(f64, 1);
+        let is f64 as base with mut = cast(f64, 10);
+        while (count > 0) {
+            if ((count & 1) == 1) { power = power * base; }
+            count = count >> 1;
+            if (count > 0) { base = base * base; }
+        }
+        if (scale >= 0) { return cast(f64, small) * power; }
+        return cast(f64, small) / power;
     }
-    if (e10 < 0) { return result / _pow10(0 - e10); }
-    return result;
+    if (digits == 0 || cast(i64, digits) + scale < 0 - 323) { return *cast(*f64, &bits); }
+    if (cast(i64, digits) + scale > 309) { bits = 0x7ff0000000000000; return *cast(*f64, &bits); }
+    while (scale > 0) { _decimal_mul10(&numerator, cast(u32, 0)); scale = scale - 1; }
+    while (scale < 0) { _decimal_mul10(&denominator, cast(u32, 0)); scale = scale + 1; }
+    let is i32 as exponent with mut = _decimal_bits(&numerator) - _decimal_bits(&denominator);
+    let is i32 as comparison with mut = 0;
+    if (exponent >= 0) {
+        _decimal_shift_left(&denominator, exponent);
+        comparison = _decimal_compare(&numerator, &denominator);
+        _decimal_shift_right(&denominator, exponent);
+    } else {
+        _decimal_shift_left(&numerator, 0 - exponent);
+        comparison = _decimal_compare(&numerator, &denominator);
+        _decimal_shift_right(&numerator, 0 - exponent);
+    }
+    if (comparison < 0) { exponent = exponent - 1; }
+    let is i32 as shift with mut = 52 - exponent;
+    if (exponent < 0 - 1022) { shift = 1074; }
+    if (shift >= 0) { _decimal_shift_left(&numerator, shift); }
+    else { _decimal_shift_left(&denominator, 0 - shift); }
+    _decimal_shift_left(&denominator, 52);
+    let is i32 as bit with mut = 52;
+    let is i64 as significand with mut = 0;
+    while (bit >= 0) {
+        if (_decimal_compare(&numerator, &denominator) >= 0) {
+            _decimal_subtract(&numerator, &denominator);
+            significand = significand | (cast(i64, 1) << bit);
+        }
+        if (bit > 0) { _decimal_shift_right(&denominator, 1); }
+        bit = bit - 1;
+    }
+    _decimal_shift_left(&numerator, 1);
+    comparison = _decimal_compare(&numerator, &denominator);
+    if (comparison > 0 || (comparison == 0 && (sticky == 1 || (significand & 1) == 1))) {
+        significand = significand + 1;
+    }
+    if (exponent < 0 - 1022) { bits = significand; }
+    else {
+        if (significand == (cast(i64, 1) << 53)) { significand = significand >> 1; exponent = exponent + 1; }
+        if (exponent > 1023) { bits = 0x7ff0000000000000; }
+        else { bits = (cast(i64, exponent + 1023) << 52) | (significand & 0xfffffffffffff); }
+    }
+    return *cast(*f64, &bits);
 }
 
 fn resolve_escape(c as u8) as i64 {

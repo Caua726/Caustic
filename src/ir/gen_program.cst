@@ -3,42 +3,28 @@ use "../../std/io.cst" as io;
 use "../parser/ast.cst" as ast;
 use "../semantic/scope.cst" as sc;
 use "../semantic/defs.cst" as sd;
+use "../semantic/types.cst" as wt;
 use "defs.cst" as d;
 use "gen.cst" as g;
 use "gen_expr.cst" as ge;
 use "gen_stmt.cst" as gs;
 use "opt.cst" as opt;
 
-// === f64 bits → f32 bits (integer math, no FPU needed) ===
-
-fn f64_to_f32_bits(bits as i64) as i64 {
-    if (bits == 0) { return 0; }
-    let is i64 as neg_zero = cast(i64, 1) << 63;
-    if (bits == neg_zero) { return cast(i64, 1) << 31; }
-    let is i64 as sign = (bits >> 63) & 1;
-    let is i64 as exp_mask = (cast(i64, 1) << 11) - 1;
-    let is i64 as f64_exp = (bits >> 52) & exp_mask;
-    let is i64 as mant_mask = (cast(i64, 1) << 52) - 1;
-    let is i64 as f64_mant = bits & mant_mask;
-    // infinity / NaN
-    if (f64_exp == 2047) {
-        if (f64_mant == 0) { return (sign << 31) | (255 << 23); }
-        return (sign << 31) | (255 << 23) | 1;
-    }
-    let is i64 as f32_exp = f64_exp - 1023 + 127;
-    if (f32_exp >= 255) { return (sign << 31) | (255 << 23); }
-    if (f32_exp <= 0) { return sign << 31; }
-    let is i64 as f32_mant = f64_mant >> 29;
-    return (sign << 31) | (f32_exp << 23) | f32_mant;
-}
-
 // === eval_const_expr ===
+
+fn _const_float_value(node as *ast.Node) as f64 {
+    let is i64 as value = eval_const_expr(node);
+    if (g.is_float_kind(node.ty.kind) == 1) { return ast.i64_to_f64(value); }
+    return ast.integer_to_f64(value, wt.is_signed_type(cast(*u8, node.ty)));
+}
 
 fn eval_const_expr(node as *ast.Node) as i64 {
     if (node.kind == ast.NK_NUM) {
         // Float literals: value is in fval, not val
         if (cast(i64, node.ty) != 0 && (node.ty.kind == ast.TY_F32 || node.ty.kind == ast.TY_F64)) {
-            return ast.f64_to_i64(node.fval);
+            let is f64 as value with mut = node.fval;
+            if (node.ty.kind == ast.TY_F32) { value = ast.round_f32(value); }
+            return ast.f64_to_i64(value);
         }
         return node.val;
     }
@@ -51,6 +37,22 @@ fn eval_const_expr(node as *ast.Node) as i64 {
             return v.folded_init_val;
         }
     }
+    if (node.kind == ast.NK_NEG) {
+        let is i64 as value = eval_const_expr(node.expr);
+        if (g.is_float_kind(node.ty.kind) == 1) { return value ^ (cast(i64, 1) << 63); }
+        return 0 - value;
+    }
+    if (g.is_float_kind(node.ty.kind) == 1 &&
+        (node.kind == ast.NK_ADD || node.kind == ast.NK_SUB || node.kind == ast.NK_MUL || node.kind == ast.NK_DIV)) {
+        let is f64 as lhs = _const_float_value(node.lhs);
+        let is f64 as rhs = _const_float_value(node.rhs);
+        let is f64 as result with mut = lhs + rhs;
+        if (node.kind == ast.NK_SUB) { result = lhs - rhs; }
+        else if (node.kind == ast.NK_MUL) { result = lhs * rhs; }
+        else if (node.kind == ast.NK_DIV) { result = lhs / rhs; }
+        if (node.ty.kind == ast.TY_F32) { result = ast.round_f32(result); }
+        return ast.f64_to_i64(result);
+    }
     if (node.kind == ast.NK_ADD) { return eval_const_expr(node.lhs) + eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_SUB) { return eval_const_expr(node.lhs) - eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_MUL) { return eval_const_expr(node.lhs) * eval_const_expr(node.rhs); }
@@ -61,10 +63,32 @@ fn eval_const_expr(node as *ast.Node) as i64 {
     if (node.kind == ast.NK_BAND) { return eval_const_expr(node.lhs) & eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_BOR) { return eval_const_expr(node.lhs) | eval_const_expr(node.rhs); }
     if (node.kind == ast.NK_BXOR) { return eval_const_expr(node.lhs) ^ eval_const_expr(node.rhs); }
-    // Cast of a compile-time constant: the integer value carries through
-    // (cast(*T, 0) -> 0, cast(i32, expr) -> expr). Width narrowing happens where
-    // the value is stored/used, exactly as for a literal init.
-    if (node.kind == ast.NK_CAST) { return eval_const_expr(node.expr); }
+    if (node.kind == ast.NK_CAST) {
+        let is i64 as value with mut = eval_const_expr(node.expr);
+        let is i32 as from_float = g.is_float_kind(node.expr.ty.kind);
+        let is i32 as to_float = g.is_float_kind(node.ty.kind);
+        if (to_float == 1) {
+            let is f64 as converted with mut = 0.0;
+            if (from_float == 1) { converted = ast.i64_to_f64(value); }
+            else {
+                if (node.ty.kind == ast.TY_F32) {
+                    return ast.f64_to_i64(ast.integer_to_f32(value, wt.is_signed_type(cast(*u8, node.expr.ty))));
+                }
+                converted = ast.integer_to_f64(value, wt.is_signed_type(cast(*u8, node.expr.ty)));
+            }
+            if (node.ty.kind == ast.TY_F32) { converted = ast.round_f32(converted); }
+            return ast.f64_to_i64(converted);
+        }
+        if (from_float == 1) { value = cast(i64, ast.i64_to_f64(value)); }
+        if (node.ty.size > 0 && node.ty.size < 8) {
+            let is i32 as width = node.ty.size * 8;
+            value = value & ((cast(i64, 1) << width) - 1);
+            if (wt.is_signed_type(cast(*u8, node.ty)) == 1 && (value & (cast(i64, 1) << (width - 1))) != 0) {
+                value = value - (cast(i64, 1) << width);
+            }
+        }
+        return value;
+    }
     io.write_str(io.STDERR, "ir: non-constant expr in global init\n");
     io.exit(1);
     return 0;
@@ -402,7 +426,7 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                         glob.init_value = eval_const_expr(node.init_expr);
                         // f32 global: convert f64 bits to f32 bits
                         if (node.ty.kind == ast.TY_F32) {
-                            glob.init_value = f64_to_f32_bits(glob.init_value);
+                            glob.init_value = ast.f32_bits(ast.i64_to_f64(glob.init_value));
                         }
                     }
                     glob.is_initialized = 1;

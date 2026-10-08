@@ -275,6 +275,11 @@ qemu-aarch64 ./program-aarch64
 
 - **Types** — `i8`–`i64`, `u8`–`u64`, `f32`, `f64`, `bool`, `char`, `string`,
   `void`, pointers (`*T`), arrays (`[N]T`), structs, and tagged-union enums.
+- **Floating point** — `f32` arithmetic and casts round to binary32 before the
+  next operation, call or return; `f64` retains binary64 precision. Comparisons
+  follow IEEE unordered rules: NaN is unequal and never ordered. Decimal
+  literals round to the nearest binary64, ties to even, including subnormals
+  and finite/overflow boundaries. `__builtin_sqrt` preserves float precision.
 - **Generics** — monomorphized: `fn max gen T`, `struct Pair gen T, U`,
   `enum Option gen T`.
 - **Pattern matching** — `match` / `case` / `else` over enums, with destructuring.
