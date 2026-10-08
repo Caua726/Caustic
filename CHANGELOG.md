@@ -45,6 +45,9 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **VT Backspace preserves terminal cells.** The CausticOS text-grid parser
+  moves left without erasing the cell; regression coverage checks default,
+  `-O1`, and `-O2`, with a QEMU shell screen showing the preserved character.
 - **CausticOS program I/O rejected on Linux.** `std/causticos/prog.cst` used
   raw CausticOS syscalls for `out`/`err`/`getc` without checking the target, so
   `prog.outs()` compiled into a Linux binary that exited successfully without
