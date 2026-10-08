@@ -45,6 +45,13 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **Declarations never reuse a same-scope variable.** Duplicate locals and
+  parameters now diagnose the second declaration; the outer function body
+  shares its parameter scope while explicit nested/sibling blocks preserve
+  legal shadowing. Naked, foreign and generic signatures are checked without
+  allocating fake parameter frames. Module rebinding uses explicit lookup.
+  `caustic-mk run test-scope` exercises rejection/no-output and real nested
+  shadowing/naked-ABI consumers at O0/O1/O2.
 - **Named types use their module context before root fallback.** Explicit
   qualification wins; an imported module's own structs, enums and aliases
   no longer capture a homonymous root definition. Debug type tables also

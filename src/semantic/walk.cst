@@ -70,7 +70,7 @@ fn walk_fn_def(node as *ast.Node) as void {
     if (naked == 0) {
         let is *ast.Node as param with mut = node.params;
         while (cast(i64, param) != 0) {
-            let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags);
+            let is *d.Variable as var = sc.declare_var(param.name_ptr, param.name_len, cast(*u8, param.ty), param.flags, param);
             param.var_offset = var.offset;
             param = param.next;
         }
@@ -82,7 +82,13 @@ fn walk_fn_def(node as *ast.Node) as void {
     }
     let is *u8 as saved_rt = sc.current_return_type;
     sc.current_return_type = cast(*u8, node.return_type);
-    walk(node.body);
+    // Parameters and the outer function body are one lexical scope. Only an
+    // explicitly nested block introduces a scope in which they may be shadowed.
+    if (cast(i64, node.body) != 0 && node.body.kind == ast.NK_BLOCK) {
+        walk_block_contents(node.body, sc.current_scope.vars);
+    } else {
+        walk(node.body);
+    }
     let is *ast.Type as rt = cast(*ast.Type, node.return_type);
     if (naked == 0 && cast(i64, rt) != cast(i64, ast.type_void) && body_always_returns(node.body) == 0) {
         sc.sem_error_at2(node, "funcao nao retorna em todos os paths", node.name_ptr, node.name_len);
@@ -92,15 +98,14 @@ fn walk_fn_def(node as *ast.Node) as void {
     sc.exit_scope();
 }
 
-fn walk_block(node as *ast.Node) as void {
-    sc.enter_scope();
+fn walk_block_contents(node as *ast.Node, stop_before as *d.Variable) as void {
     let is *ast.Node as s with mut = node.stmts;
     while (cast(i64, s) != 0) {
         walk(s);
         s = s.next;
     }
     let is *d.Variable as bv with mut = sc.current_scope.vars;
-    while (cast(i64, bv) != 0) {
+    while (cast(i64, bv) != cast(i64, stop_before)) {
         if (bv.is_used == 0 && bv.is_global == 0 && bv.is_module == 0) {
             if (bv.name_len > 0 && bv.name_ptr[0] != cast(u8, 95)) {
                 let is *ast.Node as bwn = ast.new_node(ast.NK_IDENT);
@@ -110,6 +115,11 @@ fn walk_block(node as *ast.Node) as void {
         }
         bv = bv.next;
     }
+}
+
+fn walk_block(node as *ast.Node) as void {
+    sc.enter_scope();
+    walk_block_contents(node, cast(*d.Variable, 0));
     sc.exit_scope();
 }
 
@@ -389,22 +399,12 @@ fn try_fold_const(n as *ast.Node, out as *i64, depth as i32) as i32 {
 }
 
 fn walk_let(node as *ast.Node) as void {
-    // A second top-level `let` of a name this module already declares. It used
-    // to be swallowed: declare_var handed back the FIRST variable, so the
-    // second initializer wrote into it — last value wins at runtime — while
-    // codegen emitted the definition twice and the assembler kept the first.
-    // Nothing said anything at any stage. Locals are untouched: shadowing in an
-    // inner scope is deliberate and stays legal.
-    if (sc.global_var_exists(node.name_ptr, node.name_len) == 1) {
-        sc.sem_error_at2(node, "ja existe uma declaracao de topo com esse nome neste modulo:",
-                         node.name_ptr, node.name_len);
-    }
     node.ty = wt.resolve_type_ptr(cast(*u8, node.ty));
     if (node.ty.kind == ast.TY_VOID) {
         sc.sem_error_at2(node, "variavel nao pode ser void", node.name_ptr, node.name_len);
     }
     if (node.is_extern == 1) {
-        let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
+        let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags, node);
         var.is_extern = 1;
         node.var_offset = var.offset;
         node.is_global = var.is_global;
@@ -416,7 +416,7 @@ fn walk_let(node as *ast.Node) as void {
             sc.sem_error_at2(node, "tipo incompativel na inicializacao de", node.name_ptr, node.name_len);
         }
     }
-    let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags);
+    let is *d.Variable as var = sc.declare_var(node.name_ptr, node.name_len, cast(*u8, node.ty), node.flags, node);
     var.decl_tok_idx = node.tok_idx;
     node.var_offset = var.offset;
     node.is_global = var.is_global;
@@ -1347,7 +1347,7 @@ fn walk_match(node as *ast.Node) as void {
                 while (cast(i64, binding) != 0 && cast(i64, pf) != 0) {
                     wt.resolve_type(cast(*u8, pf.ty));
                     binding.ty = pf.ty;
-                    let is *d.Variable as bvar = sc.declare_var(binding.name_ptr, binding.name_len, cast(*u8, pf.ty), ast.VF_NONE);
+                    let is *d.Variable as bvar = sc.declare_var(binding.name_ptr, binding.name_len, cast(*u8, pf.ty), ast.VF_NONE, binding);
                     binding.var_offset = bvar.offset;
                     binding = binding.next;
                     pf = pf.next;
@@ -1357,7 +1357,7 @@ fn walk_match(node as *ast.Node) as void {
                 let is *ast.Node as binding = c.params;
                 wt.resolve_type(cast(*u8, vty));
                 binding.ty = vty;
-                let is *d.Variable as bvar = sc.declare_var(binding.name_ptr, binding.name_len, cast(*u8, vty), ast.VF_NONE);
+                let is *d.Variable as bvar = sc.declare_var(binding.name_ptr, binding.name_len, cast(*u8, vty), ast.VF_NONE, binding);
                 binding.var_offset = bvar.offset;
             }
         }
