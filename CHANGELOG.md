@@ -45,6 +45,17 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **PE stack probes resolve before validation.** The PE writer validates
+  unresolved symbols only after assigning the real `__caustic_chkstk` and
+  IAT definitions, before relocations. A symbol merely named `__imp_*` is
+  no longer accepted as an import. The permanent Windows runner exercises
+  an 8192-byte recursive local at `-O0/-O1/-O2`, separate object linking,
+  and genuine/bogus-import undefined symbols without creating an image.
+- **Compound immutable target guards fold before reachability.** Integer
+  `&&`, `||` and `!` expressions collapse in semantic analysis, preserving
+  short-circuit side effects and omitting inaccessible wrong-target arms.
+  ELF/PE consumers verify actual import tables, live foreign calls and an
+  address-taken callback. Run `caustic-mk run test-windows` with Wine/Xvfb.
 - **VT Backspace preserves terminal cells.** The CausticOS text-grid parser
   moves left without erasing the cell; regression coverage checks default,
   `-O1`, and `-O2`, with a QEMU shell screen showing the preserved character.
