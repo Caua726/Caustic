@@ -148,14 +148,91 @@ fn arg(argv as *u8, i as i64) as *u8 {
     return cast(*u8, p[i]);
 }
 
-// abspath(raw, out): CausticOS has no cwd, so every VFS path must be absolute.
-// Return `raw` unchanged if it already starts with '/', else copy "/" + raw into
-// `out` (caller provides a buffer >= len+2) and return it.
+// --- The directory this program was started in ---
+//
+// The kernel resolves only absolute paths and keeps no directory per process
+// (no ambient namespace). A shell keeps its own, and at every spawn it hands
+// the child the directory it is in AT THAT MOMENT, at sys.DIR_FD: a one-page
+// segment holding DIR_MAGIC, the path's length and the path. A cd in the shell
+// afterwards does not move a program already started. It is read once, on
+// first use, and then let go. Nothing at DIR_FD — or something that is not
+// such a segment, a file the program opened there itself — means "/".
+let is i64 as DIR_MAGIC with imut = 0x3130305249445343;   // "CSDIR001"
+let is i64 as PATH_MAX with imut = 255;
+let is [256]u8 as _dir with mut;
+let is i64 as _dir_len with mut = 0 - 1;                  // -1: not looked at yet
+
+fn _dir_load() as void {
+    if (_dir_len >= 0) { return; }
+    _dir[0] = cast(u8, 47); _dir[1] = cast(u8, 0); _dir_len = 1;
+    let is [2]i64 as hdr;
+    if (sys.seg_read(sys.DIR_FD, 0, cast(*u8, &hdr[0]), 16) != 0) { return; }
+    if (hdr[0] != DIR_MAGIC || hdr[1] <= 0 || hdr[1] > PATH_MAX) { return; }
+    let is [256]u8 as d;
+    if (sys.seg_read(sys.DIR_FD, 16, cast(*u8, &d[0]), hdr[1]) != 0) { return; }
+    sys.close(sys.DIR_FD);
+    if (d[0] != cast(u8, 47)) { return; }
+    let is i64 as i with mut = 0;
+    while (i < hdr[1]) { _dir[i] = d[i]; i = i + 1; }
+    _dir[i] = cast(u8, 0);
+    _dir_len = hdr[1];
+}
+
+// dir(): the directory this program was started in, NUL-terminated, absolute.
+fn dir() as *u8 { _dir_load(); return cast(*u8, &_dir[0]); }
+fn dir_len() as i64 { _dir_load(); return _dir_len; }
+
+// dir_handoff(path, n): a segment carrying directory path[0..n), to install at
+// sys.DIR_FD in a child about to be spawned. The caller closes it after the
+// spawn. -1 when it cannot be made (the child is then in "/").
+fn dir_handoff(path as *u8, n as i64) as i64 {
+    if (n <= 0 || n > PATH_MAX || path[0] != cast(u8, 47)) { return 0 - 1; }
+    let is i64 as fd = sys.seg_create(1, 0);
+    if (fd < 0) { return 0 - 1; }
+    let is [2]i64 as hdr;
+    hdr[0] = DIR_MAGIC; hdr[1] = n;
+    if (sys.seg_write(fd, 0, cast(*u8, &hdr[0]), 16) != 0
+        || sys.seg_write(fd, 16, path, n) != 0) {
+        sys.close(fd);
+        return 0 - 1;
+    }
+    return fd;
+}
+
+// dir_for_child(): my own directory, handed on — for a program that spawns
+// others, so a relative path a child is given means what it meant here.
+fn dir_for_child() as i64 { return dir_handoff(dir(), dir_len()); }
+
+// abspath(raw, out): `raw` as an absolute path. One that starts with '/' comes
+// back unchanged; any other is resolved against dir(), "." and ".." folded,
+// into `out`, which holds 256 bytes (PATH_MAX and its NUL). A result longer
+// than the kernel takes comes back empty, and opening it fails.
 fn abspath(raw as *u8, out as *u8) as *u8 {
     if (raw[0] == cast(u8, 47)) { return raw; }
-    out[0] = cast(u8, 47);
+    let is *u8 as d = dir();
+    let is i64 as n with mut = 0;
+    while (n < _dir_len) { out[n] = d[n]; n = n + 1; }
     let is i64 as i with mut = 0;
-    while (raw[i] != 0 && i < 254) { out[1 + i] = raw[i]; i = i + 1; }
-    out[1 + i] = cast(u8, 0);
+    while (raw[i] != 0) {
+        let is i64 as s = i;
+        while (raw[i] != 0 && raw[i] != cast(u8, 47)) { i = i + 1; }
+        let is i64 as len = i - s;
+        if (raw[i] == cast(u8, 47)) { i = i + 1; }
+        if (len == 0 || (len == 1 && raw[s] == cast(u8, 46))) { continue; }   // "" or "."
+        if (len == 2 && raw[s] == cast(u8, 46) && raw[s + 1] == cast(u8, 46)) {
+            // "..": back to the previous '/', never above the root.
+            while (n > 1 && out[n - 1] != cast(u8, 47)) { n = n - 1; }
+            if (n > 1) { n = n - 1; }
+            continue;
+        }
+        if (n > 1) {
+            if (n >= PATH_MAX) { out[0] = cast(u8, 0); return out; }
+            out[n] = cast(u8, 47); n = n + 1;
+        }
+        if (n + len > PATH_MAX) { out[0] = cast(u8, 0); return out; }
+        let is i64 as k with mut = 0;
+        while (k < len) { out[n] = raw[s + k]; n = n + 1; k = k + 1; }
+    }
+    out[n] = cast(u8, 0);
     return out;
 }
