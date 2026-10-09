@@ -20,9 +20,11 @@ once. A code point the font lacks draws U+FFFD's glyph.
 The font has no ¬ (U+00AC) or ¦ (U+00A6), and keyboard layouts type both
 (Brazilian ABNT2 and US-International have them on AltGr), so SUPPLEMENT
 draws them, in the font's own one-pixel strokes: ¬ is its "-" with a tick
-down at the right end, ¦ is its "|" broken in the middle. Drawn here, they are
-under the same terms as the rest of this file. A supplement never replaces a
-glyph the font has.
+down at the right end, ¦ is its "|" broken in the middle. It has ■ but no
+□ (U+25A1) or ⧉ (U+29C9), the maximise and restore buttons of a titlebar:
+□ is the outline of its ■, ⧉ a smaller pair of them overlapping. Drawn here,
+they are under the same terms as the rest of this file. A supplement never
+replaces a glyph the font has.
 """
 import gzip
 import os
@@ -83,6 +85,10 @@ SUPPLEMENT = {
              0x7E, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00],
     0x00A6: [0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00,       # ¦
              0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00],
+    0x25A1: [0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x42, 0x42,       # □
+             0x42, 0x42, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00],
+    0x29C9: [0x00, 0x00, 0x00, 0x00, 0x1E, 0x12, 0x7A, 0x4A,       # ⧉
+             0x4E, 0x48, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00],
 }
 
 
