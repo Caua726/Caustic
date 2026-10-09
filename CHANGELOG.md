@@ -45,6 +45,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **A function declared twice in one module is an error at its line.** Only
+  a repeated global was caught; a second function by the same name reached
+  the assembler as a label defined twice, with no file or line, and a second
+  `extern` was dropped without a word whatever signature it gave. A function,
+  an extern or a generic whose name the module already gave to a function —
+  or a global named like one, which is the same symbol — is now refused as
+  "declaracao duplicada no mesmo escopo" at the second declaration, in the
+  file it is in. Pinned by `tests/reject/dup_fn.cst`, `dup_extern.cst`,
+  `dup_generic.cst` and `fn_global_clash.cst`, with their accepted twin
+  `ok_module_names.cst`.
 - **A failed polyglot build no longer litters its output's directory.** Each
   body is built beside the output (`<out>.__cse_pe.tmp` and friends) and each
   Windows body drops a `.pdb` beside its own; they were removed only after a
