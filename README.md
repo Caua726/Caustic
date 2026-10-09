@@ -287,6 +287,13 @@ qemu-aarch64 ./program-aarch64
 - **Defer** — LIFO cleanup that runs before every `return`: `defer free(ptr);`.
 - **Modules** — `use "path" as alias`, `only` selective imports, submodule
   dot-notation, module caching.
+- **Capacity regressions** — the native suite generates 300 modules and checks
+  every imported function/global before and after independent writes.
+  `caustic-mk run test-capacity` additionally links 301 module objects and calls
+  300 foreign symbols from one real library plus seven interleaved symbols from
+  another, through ELF/PE direct, separate-object and cold/hot maker builds.
+  The extended matrix requires GCC, mingw, Wine, Xvfb and xdpyinfo; Wine groups
+  own their prefix/server, bound startup and preserve command failures.
 - **String globals** — mutable literal-initialized globals own writable pointer
   storage with a relocation to shared read-only bytes. Reassignment and
   address-of update the pointer, not the literal; custom sections behave the

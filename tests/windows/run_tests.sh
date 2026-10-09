@@ -4,36 +4,7 @@
 # --inside reuses an explicitly owned Wine/X session (mutation workers).
 set -eu
 if [ "${1:-}" != "--inside" ]; then
-    work=$(mktemp -d "${TMPDIR:-/tmp}/caustic-pe-tests.XXXXXX")
-    export WINEPREFIX="$work/wine" WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d
-    unset WAYLAND_DISPLAY
-    xvfb_pid=""
-    cleanup() {
-        wineserver -k 2>/dev/null || true
-        timeout 10 wineserver -w 2>/dev/null || true
-        if [ -n "$xvfb_pid" ]; then
-            kill "$xvfb_pid" 2>/dev/null || true
-            wait "$xvfb_pid" 2>/dev/null || true
-        fi
-        rm -rf "$work"
-    }
-    trap cleanup EXIT HUP INT TERM
-    : > "$work/display"
-    Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp -noreset 3>"$work/display" >"$work/xvfb.log" 2>&1 &
-    xvfb_pid=$!
-    attempt=0
-    while [ "$attempt" -lt 100 ]; do
-        if IFS= read -r display < "$work/display"; then
-            export DISPLAY=":$display"
-            if xdpyinfo >/dev/null 2>&1; then break; fi
-        fi
-        kill -0 "$xvfb_pid" 2>/dev/null || { cat "$work/xvfb.log"; exit 1; }
-        sleep 0.05
-        attempt=$((attempt + 1))
-    done
-    [ "$attempt" -lt 100 ] || { echo "PE runner: X server did not answer within 5s" >&2; exit 1; }
-    sh "$0" --inside "${1:-./caustic}"
-    exit 0
+    exec sh "$(dirname "$0")/run_wine.sh" sh "$0" --inside "${1:-./caustic}"
 fi
 shift
 cc=${1:-./caustic}
@@ -85,15 +56,27 @@ timeout 30 wine build/pe-tests/strings-separate.exe
 build/pe-tests/assembler tests/windows/section_bounds.s
 build/pe-tests/linker --target=windows-x86_64 tests/windows/section_bounds.s.o -o build/pe-tests/section-bounds.exe
 timeout 30 wine build/pe-tests/section-bounds.exe
-# A genuine unresolved symbol must fail without creating an executable.
+# Rejected links must remove a prior successful executable, not just avoid a new one.
 for target in linux-x86_64 windows-x86_64; do
     for fixture in missing_symbol missing_import_slot; do
-        rm -f build/pe-tests/missing.exe
-        if "$cc" -q "--target=$target" "tests/windows/$fixture.cst" -o build/pe-tests/missing.exe; then
-            echo "$target accepted an unresolved static symbol" >&2
-            exit 1
-        fi
-        [ ! -e build/pe-tests/missing.exe ]
+        for mode in normal quiet; do
+            "$cc" -q "--target=$target" tests/string_global_test.cst -o build/pe-tests/missing.exe
+            if [ "$mode" = quiet ]; then set -- -q; else set --; fi
+            set +e
+            "$cc" "$@" "--target=$target" "tests/windows/$fixture.cst" -o build/pe-tests/missing.exe
+            status=$?
+            set -e
+            [ "$status" -eq 1 ] || { echo "$target/$mode unresolved link exited $status, expected 1" >&2; exit 1; }
+            [ ! -e build/pe-tests/missing.exe ] || { echo "$target/$mode retained a stale executable" >&2; exit 1; }
+        done
+        "$cc" -q "--target=$target" -c "tests/windows/$fixture.cst" -o build/pe-tests/missing.o
+        "$cc" -q "--target=$target" tests/string_global_test.cst -o build/pe-tests/missing.exe
+        set +e
+        build/pe-tests/linker "--target=$target" build/pe-tests/missing.o -o build/pe-tests/missing.exe
+        status=$?
+        set -e
+        [ "$status" -eq 1 ] || { echo "$target standalone unresolved link exited $status, expected 1" >&2; exit 1; }
+        [ ! -e build/pe-tests/missing.exe ] || { echo "$target standalone retained a stale executable" >&2; exit 1; }
     done
 done
 echo "PE separate link and ELF/PE unresolved-symbol rejection: passed"
