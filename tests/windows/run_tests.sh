@@ -52,6 +52,24 @@ timeout 30 wine build/pe-tests/probe-separate.exe
 "$cc" -q --target=windows-x86_64 -O1 -c tests/string_global_test.cst -o build/pe-tests/strings.o
 build/pe-tests/linker --target=windows-x86_64 build/pe-tests/strings.o -o build/pe-tests/strings-separate.exe
 timeout 30 wine build/pe-tests/strings-separate.exe
+# Unix-only modules (libc.so.6, an unversioned libdemo.so) in a Windows program:
+# absent from the whole-program image; --module-objects emits every module
+# function, and their calls become traps with no import. Both PEs load.
+"$cc" -q -O1 --target=windows-x86_64 tests/windows/foreign_unix_test.cst -o build/pe-tests/foreign.exe
+rm -rf build/pe-tests/foreign-objects
+mkdir -p build/pe-tests/foreign-objects
+"$cc" -q -O1 --target=windows-x86_64 --module-objects build/pe-tests/foreign-objects tests/windows/foreign_unix_test.cst
+build/pe-tests/linker --target=windows-x86_64 build/pe-tests/foreign-objects/*.o \
+    --entry=_tests_windows_foreign_unix_test_cst_main -o build/pe-tests/foreign-separate.exe
+for image in foreign foreign-separate; do
+    objdump -p "build/pe-tests/$image.exe" > "build/pe-tests/$image.imports"
+    if grep -q 'DLL Name: lib' "build/pe-tests/$image.imports"; then
+        echo "$image.exe imports a Unix shared object" >&2; exit 1
+    fi
+    grep -qi 'DLL Name: user32.dll' "build/pe-tests/$image.imports"
+    timeout 30 wine "build/pe-tests/$image.exe"
+done
+echo "PE with Unix-only modules: no shared-object import, whole and module objects: passed"
 "$cc" -q caustic-assembler/main.cst -o build/pe-tests/assembler
 build/pe-tests/assembler tests/windows/section_bounds.s
 build/pe-tests/linker --target=windows-x86_64 tests/windows/section_bounds.s.o -o build/pe-tests/section-bounds.exe

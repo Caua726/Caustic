@@ -45,6 +45,18 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **A module for another system no longer leaks its libraries.** A portable
+  program importing a Windows-only module (or a Windows program importing a
+  Unix-only one) linked that module's DLL or shared object as a dependency
+  whenever separate compilation emitted the whole module, so a Linux binary
+  could not start without `user32.dll`. Codegen now asks whether the target's
+  loader can open the library at all (`foreign_library_loadable`: a DLL in any
+  case for ELF, `.so`/`.so.N` for PE); where it cannot, a whole-program build
+  refuses the reachable call by name, and separate compilation emits a trap
+  with no import on x86-64 and AArch64. Separate compilation likewise stubs a
+  Linux wrapper's syscall as `-ENOSYS` on Windows, as `--allow-unsupported`
+  already did, instead of aborting. Consumers: Linux, AArch64 (qemu) and PE
+  (wine) images, whole and separate, checked by their import tables.
 - **Declarations never reuse a same-scope variable.** Duplicate locals and
   parameters now diagnose the second declaration; the outer function body
   shares its parameter scope while explicit nested/sibling blocks preserve

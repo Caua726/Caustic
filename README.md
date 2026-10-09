@@ -304,7 +304,11 @@ qemu-aarch64 ./program-aarch64
 - **Function pointers** — typed `fn_ptr(...)` plus type-checked indirect
   `call(ptr, args)`.
 - **FFI** — `extern "kernel32.dll" fn ...` declarations and System V struct
-  passing for C interop.
+  passing for C interop. A call into a library the target cannot load (a
+  `.dll` in an ELF, a `.so` in a PE) is refused by whole-program builds; where
+  separate compilation emits a whole module — the default per-module build,
+  `--module-only`, `--module-objects` — it becomes a trap with no import, so a Linux
+  binary that imports a Windows-only module never depends on its DLLs.
 - **Low-level escape hatches** — `syscall(...)`, inline `asm("...")`,
   `cast(T, x)`, `sizeof`, custom ELF/PE sections via `with section(".name")`.
 - **`with imut`** — "immutable *and* compile-time-known": the initializer folds to
