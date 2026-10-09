@@ -34,6 +34,14 @@
 # SHELL COMPLETIONS        --completions=LIST  (bash,zsh | auto | none)
 #                          default auto = whichever of bash and zsh is installed
 #
+# POLYGLOTS                --binfmt=auto|yes|no   (default auto)
+#   A polyglot .cse.exe starts with MZ for Windows, and MZ is what wine and mono
+#   claim in binfmt_misc: where either is installed, running one by name runs
+#   its Windows body instead of its Linux one. `yes` registers polyglots to run
+#   through /bin/sh, for the whole system and across reboots (needs root, asked
+#   for once); `auto` does it when the install runs as root anyway and
+#   otherwise says what claims MZ here; `no` leaves binfmt_misc alone.
+#
 # FROM SOURCE
 #   --from-source [--source-dir=DIR] [--ref=BRANCH]
 #
@@ -58,6 +66,44 @@ need_unzip() { command -v unzip >/dev/null 2>&1 || { echo "error: 'unzip' is req
 # `case ,$list, in *,item,*` is the POSIX way to ask "is item in this list".
 has() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
+# --- polyglots and binfmt_misc ---
+# Every polyglot caustic-ld writes begins "MZqFpD='\n": MZ for the Windows
+# loader, then a shell quote that hides the PE header from /bin/sh, whose stub
+# extracts the body for `uname -m` and execs it. The kernel never reaches that
+# stub when a binfmt_misc entry claims plain MZ — wine and mono both do — so
+# the polyglot gets its own entry, longer and more specific, with the shell as
+# its interpreter. binfmt_misc tries the most recently registered entry first,
+# so it has to be registered after theirs: live, by registering it now (they
+# were registered at boot), and across reboots by a binfmt.d file that sorts
+# after wine.conf and mono.conf, the order systemd-binfmt registers them in.
+BF_DIR="/proc/sys/fs/binfmt_misc"
+BF_NAME="caustic-polyglot"
+BF_CONF="/etc/binfmt.d/zz-caustic-polyglot.conf"
+BF_LINE=':caustic-polyglot:M::\x4d\x5a\x71\x46\x70\x44\x3d\x27\x0a::/bin/sh:'
+# What claims MZ on this machine, as "name (interpreter)" — empty when nothing
+# does, or when binfmt_misc is not mounted to ask.
+mz_claimants() {
+    _c=""
+    for _e in "$BF_DIR"/*; do
+        [ -f "$_e" ] || continue
+        case "${_e##*/}" in register|status|"$BF_NAME") continue ;; esac
+        grep -qx enabled "$_e" 2>/dev/null || continue
+        grep -qx 'offset 0' "$_e" 2>/dev/null || continue
+        grep -q '^magic 4d5a' "$_e" 2>/dev/null || continue
+        _c="${_c:+$_c, }${_e##*/} ($(sed -n 's/^interpreter //p' "$_e"))"
+    done
+    printf '%s' "$_c"
+}
+# The registration, as root: the persistent file first, then the live entry,
+# replaced if present so it moves in front of whatever registered since.
+binfmt_register_script() {
+    printf 'mkdir -p /etc/binfmt.d\n'
+    printf "printf '%%s\\\\n' %s > %s\n" "$(q "$BF_LINE")" "$(q "$BF_CONF")"
+    printf '[ -e %s ] || mount -t binfmt_misc binfmt_misc %s\n' "$(q "$BF_DIR/register")" "$(q "$BF_DIR")"
+    printf '[ ! -e %s ] || echo -1 > %s\n' "$(q "$BF_DIR/$BF_NAME")" "$(q "$BF_DIR/$BF_NAME")"
+    printf "printf '%%s\\\\n' %s > %s\n" "$(q "$BF_LINE")" "$(q "$BF_DIR/register")"
+}
+
 # --- options ---
 MODE="default"
 PREFIX=""
@@ -67,6 +113,7 @@ TOOLS="none";  SET_TOOLS=0
 LIBS="so";     SET_LIBS=0
 COMPLETIONS="auto"; SET_COMP=0
 REINSTALL=""
+BINFMT="auto"
 WITH_SRC=1
 DRY=0
 ASSUME_YES=0
@@ -90,6 +137,7 @@ for arg in "$@"; do
         --completions=*) COMPLETIONS="${arg#*=}"; SET_COMP=1; SPECIFIED=1 ;;
         --no-completions) COMPLETIONS="none"; SET_COMP=1; SPECIFIED=1 ;;
         --reinstall|--force) REINSTALL=yes; SPECIFIED=1 ;;
+        --binfmt=*)   BINFMT="${arg#*=}"; SPECIFIED=1 ;;
         --no-source)  WITH_SRC=0; SPECIFIED=1 ;;
         --source)     WITH_SRC=1; SPECIFIED=1 ;;
         --dry-run)    DRY=1 ;;
@@ -238,6 +286,13 @@ interactive_setup() {
     menu "Shell completions (TAB expands targets, triples, flags)" \
          "for whichever of bash and zsh is installed" "bash only" "zsh only" "none"
     case "$MENU_CHOICE" in 2) COMPLETIONS="bash" ;; 3) COMPLETIONS="zsh" ;; 4) COMPLETIONS="none" ;; *) COMPLETIONS="auto" ;; esac
+
+    _mz=$(mz_claimants)
+    if [ -n "$_mz" ]; then
+        menu "$_mz claim MZ here, so a polyglot .cse.exe run by name runs its Windows body" \
+             "register polyglots to run through /bin/sh (needs root)" "leave it"
+        case "$MENU_CHOICE" in 2) BINFMT="no" ;; *) BINFMT="yes" ;; esac
+    fi
 }
 
 if [ "$MODE" = "custom" ] && may_ask; then
@@ -274,6 +329,7 @@ done
 for s in $(echo "$COMPLETIONS" | tr ',' ' '); do
     case "$s" in bash|zsh) ;; *) echo "error: unknown --completions '$s' (bash|zsh|auto|none)"; exit 1 ;; esac
 done
+case "$BINFMT" in auto|yes|no) ;; *) echo "error: unknown --binfmt '$BINFMT' (auto|yes|no)"; exit 1 ;; esac
 
 # --- prefix + privilege escalation ---
 [ -z "$PREFIX" ] && PREFIX="$HOME/.local"
@@ -373,12 +429,44 @@ MANIFEST_FILES=""
 track() { MANIFEST_FILES="$MANIFEST_FILES$1
 "; }
 
+# --- polyglots: whether to register them, and with whose root ---
+# `auto` registers only when root is in hand anyway: a per-user install
+# promises not to ask for it. `yes` asks once, for this one step, even when
+# the files themselves go somewhere the user can write.
+E_BINFMT=""
+[ -f "$EXISTING" ] && E_BINFMT=$(sed -n 's/^binfmt=//p' "$EXISTING")
+BF_DO=0
+BF_SUDO=""
+if [ "$BINFMT" = "yes" ] || { [ "$BINFMT" = "auto" ] && { [ "$(id -u)" -eq 0 ] || [ -n "$SUDO" ]; }; }; then
+    BF_DO=1
+    if [ "$(id -u)" -ne 0 ]; then
+        BF_SUDO="$SUDO"
+        if [ -z "$BF_SUDO" ]; then
+            case "$ROOT_METHOD" in
+                none) echo "error: --binfmt=yes needs root and --root=none was given"; exit 1 ;;
+                auto) for m in pkexec sudo doas; do
+                          command -v "$m" >/dev/null 2>&1 && { BF_SUDO="$m"; break; }
+                      done
+                      [ -n "$BF_SUDO" ] || { echo "error: --binfmt=yes needs root and no pkexec/sudo/doas was found"; exit 1; } ;;
+                *)    command -v "$ROOT_METHOD" >/dev/null 2>&1 \
+                          || { echo "error: --root=$ROOT_METHOD not found on PATH"; exit 1; }
+                      BF_SUDO="$ROOT_METHOD" ;;
+            esac
+        fi
+    fi
+fi
+
 echo "install plan"
 echo "  prefix:   $PREFIX${SUDO:+  (via $SUDO)}"
 echo "  compiler: $FORMATS   (\`caustic\` → $PRIMARY)"
 echo "  tools:    ${TOOLS:-none}"
 echo "  stdlib:   ${LIBS:-no shared lib}$([ "$WITH_SRC" = 1 ] && echo ' + sources')"
 echo "  complete: ${COMPLETIONS:-none}"
+if [ "$BF_DO" = 1 ]; then
+    echo "  binfmt:   polyglots run through /bin/sh  ($BF_CONF${BF_SUDO:+, via $BF_SUDO})"
+else
+    echo "  binfmt:   left alone$([ -n "$E_BINFMT" ] && echo ' (an earlier install registered polyglots)')"
+fi
 [ "$DRY" = 1 ] && echo "  (dry run — nothing will be written)"
 
 # A dry run answers "what would you do", so it must not reach the network or
@@ -600,9 +688,10 @@ install_format() {
             # shell ever sees the stub, so running the image by name silently
             # executes its Windows body instead of the ELF one — it compiles,
             # and quietly produces a broken binary. Going through sh explicitly
-            # is what keeps the right body running, so the invocable name is a
-            # launcher and the image itself is only ever data. $0 is absolute
-            # here: the kernel got a resolved path to run the #! line with.
+            # keeps the right body running whether or not --binfmt registered
+            # polyglots, so the invocable name is a launcher and the image
+            # itself is only ever data. $0 is absolute here: the kernel got a
+            # resolved path to run the #! line with.
             printf '#!/bin/sh\nexec sh "$(dirname -- "$0")/%s" "$@"\n' "$UNIVERSAL" \
                 > "$TMPDIR/caustic-cse"
             chmod +x "$TMPDIR/caustic-cse"
@@ -709,6 +798,25 @@ if [ -n "$COMPLETIONS" ] && has zsh "$COMPLETIONS"; then
     INSTALLED_COMP="${INSTALLED_COMP:+$INSTALLED_COMP,}zsh"
 fi
 
+# --- polyglots ---
+# Before the manifest, which records it. A failure here leaves the compiler
+# installed and working — only running polyglots by name is affected — so it
+# is reported, not fatal.
+BF_OK=0
+if [ "$BF_DO" = 1 ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        sh -e -c "$(binfmt_register_script)" && BF_OK=1
+    else
+        $BF_SUDO sh -e -c "$(binfmt_register_script)" && BF_OK=1
+    fi
+    if [ "$BF_OK" = 1 ]; then
+        echo "polyglots registered → $BF_CONF (binfmt_misc entry $BF_NAME)"
+    else
+        echo "error: registering polyglots with binfmt_misc failed; a polyglot run by name"
+        echo "       still goes to whatever claims MZ here — run it as  sh ./prog.cse.exe"
+    fi
+fi
+
 # --- manifest ---
 # update.sh replays these choices; uninstall.sh removes these paths. Written
 # last so a failed install leaves no manifest claiming success.
@@ -723,6 +831,11 @@ MANIFEST="$LIB_DIR/install-manifest"
     echo "source=$WITH_SRC"
     echo "root=$ROOT_METHOD"
     [ "$WITH_SRC" = 1 ] && echo "stddir=$STD_DIR"
+    # The binfmt.d file this install (or the one it replaces) put down, so
+    # uninstall.sh takes it and the live entry away again.
+    if [ "$BF_OK" = 1 ] || { [ -n "$E_BINFMT" ] && [ -e "$BF_CONF" ]; }; then
+        echo "binfmt=$BF_CONF"
+    fi
     # What the binaries were built from. update.sh compares a source build's
     # commit against the branch it came from, not against the latest release.
     if [ "$FROM_SRC" = 1 ]; then
@@ -741,6 +854,21 @@ if [ "$PRIMARY" = "exe" ]; then
     echo "caustic installed → $BIN_DIR/caustic.exe  (Windows PE; run it under wine or on Windows)"
 else
     echo "caustic installed → $BIN_DIR/caustic → $PRIMARY_NAME"
+fi
+
+# Something claiming MZ, and nothing registered for polyglots in front of it:
+# every polyglot run by name on this machine goes to that something. Say so,
+# with the way out, rather than let the first one quietly run under wine.
+if [ "$BF_OK" = 0 ] && [ ! -e "$BF_DIR/$BF_NAME" ]; then
+    _mz=$(mz_claimants)
+    if [ -n "$_mz" ]; then
+        echo "note: $_mz"
+        echo "      claim MZ on this machine, so a polyglot .cse.exe run by name runs its"
+        echo "      Windows body there instead of its Linux one. To register polyglots to"
+        echo "      run through /bin/sh (asks for root once):"
+        echo "        curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --binfmt=yes"
+        echo "      or run one as  sh ./prog.cse.exe"
+    fi
 fi
 command -v caustic >/dev/null 2>&1 || echo "  (add to PATH:  export PATH=\"$BIN_DIR:\$PATH\")"
 

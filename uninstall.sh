@@ -73,6 +73,7 @@ if [ -n "$SUDO" ] && [ "$DRY" != 1 ]; then
 fi
 
 STDDIR=$(sed -n 's/^stddir=//p' "$MANIFEST")
+BF_CONF=$(sed -n 's/^binfmt=//p' "$MANIFEST")
 echo "removing the caustic install at $PREFIX"
 
 # Files, from the manifest's `files:` section to the end.
@@ -84,6 +85,34 @@ done
 # The stdlib sources are a directory install.sh copied wholesale.
 [ -n "$STDDIR" ] && [ -d "$STDDIR" ] && run rm -rf "$STDDIR"
 run rm -f "$MANIFEST"
+
+# The polyglot registration install.sh --binfmt made, if it made one: its
+# binfmt.d file and the live binfmt_misc entry. Both belong to the system, so
+# this takes root even when the prefix did not.
+if [ -n "$BF_CONF" ]; then
+    BF_ENTRY="/proc/sys/fs/binfmt_misc/caustic-polyglot"
+    BF_SCRIPT="rm -f $(q "$BF_CONF"); [ ! -e $(q "$BF_ENTRY") ] || echo -1 > $(q "$BF_ENTRY")"
+    if [ "$DRY" = 1 ]; then
+        echo "  would: remove $BF_CONF and the binfmt_misc entry caustic-polyglot"
+    elif [ "$(id -u)" -eq 0 ]; then
+        sh -e -c "$BF_SCRIPT"
+    elif [ -n "$SUDO" ]; then
+        printf '%s\n' "$BF_SCRIPT" >> "$ROOT_SCRIPT"
+    else
+        BF_SUDO=""
+        case "$ROOT_METHOD" in
+            none) ;;
+            auto) for m in pkexec sudo doas; do command -v "$m" >/dev/null 2>&1 && { BF_SUDO="$m"; break; }; done ;;
+            *)    command -v "$ROOT_METHOD" >/dev/null 2>&1 && BF_SUDO="$ROOT_METHOD" ;;
+        esac
+        if [ -n "$BF_SUDO" ] && $BF_SUDO sh -e -c "$BF_SCRIPT"; then
+            echo "  polyglot registration removed ($BF_CONF)"
+        else
+            echo "error: the polyglot registration needs root to remove; as root:"
+            echo "         $BF_SCRIPT"
+        fi
+    fi
+fi
 
 # Only remove the directories if they are now empty — a shared prefix keeps
 # whatever else lives there. The completion directories come first: they are

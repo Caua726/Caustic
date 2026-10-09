@@ -98,12 +98,14 @@ PE, a Linux ELF per architecture, and the CausticOS container.
 
 Three caveats worth knowing before you rely on it:
 
-- **Linux runs the native ELF, but not through `execve`.** `MZ` sits at offset 0
-  for Windows, so the kernel does not recognise the file and it runs because a
-  shell re-reads it as a script, extracting the body matching `uname -m`. Callers
-  that are not shells (`make`, `systemd`, `subprocess` without `shell=True`)
-  cannot launch it. Registering the format with `binfmt_misc` removes the caveat
-  without changing the binary.
+- **Linux runs the native ELF, but not through `execve` alone.** `MZ` sits at
+  offset 0 for Windows, so the kernel does not recognise the file and it runs
+  because a shell re-reads it as a script, extracting the body matching
+  `uname -m`. Callers that are not shells (`make`, `systemd`, `subprocess`
+  without `shell=True`) cannot launch it, and where wine or mono is installed
+  the kernel hands it to them, since both claim `MZ` in `binfmt_misc`.
+  `install.sh --binfmt=yes` registers the polyglot's own magic with `/bin/sh`,
+  which removes both caveats without changing the binary.
 - **Windows on ARM64 runs the x64 body under emulation.** The native ARM64 PE is
   carried in the file, but the PE loader reads one COFF Machine — reaching it
   needs an entry stub that detects the host and relaunches, which is not written.

@@ -45,6 +45,20 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **A polyglot run by name runs its Linux body on a machine with wine.** Every
+  polyglot starts with `MZ` for the Windows loader, and wine and mono claim
+  `MZ` in `binfmt_misc`, so the kernel handed `./prog.cse.exe` to wine before
+  any shell could read its stub. `install.sh --binfmt=yes` registers the
+  polyglot's own, longer magic (`MZqFpD='\n`) with `/bin/sh` as interpreter:
+  live, in front of the entries registered at boot, and in
+  `/etc/binfmt.d/zz-caustic-polyglot.conf`, which sorts after `wine.conf` and
+  `mono.conf` so systemd-binfmt keeps it in front on the next boot. The
+  default `--binfmt=auto` does it when the install runs as root anyway; a
+  per-user install never asks for root and instead names what claims `MZ`
+  and how to fix it. The manifest records the registration and
+  `uninstall.sh` removes both. Verified in a private `binfmt_misc` (a user
+  namespace) with an `MZ` claimant registered first: install, the polyglot
+  by name runs its ELF body, uninstall, the claimant gets it again.
 - **A module for another system no longer leaks its libraries.** A portable
   program importing a Windows-only module (or a Windows program importing a
   Unix-only one) linked that module's DLL or shared object as a dependency
