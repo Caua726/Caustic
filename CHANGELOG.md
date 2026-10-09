@@ -45,6 +45,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   names.
 
 ### Fixed
+- **A failed polyglot build no longer litters its output's directory.** Each
+  body is built beside the output (`<out>.__cse_pe.tmp` and friends) and each
+  Windows body drops a `.pdb` beside its own; they were removed only after a
+  successful combine, so a body that failed left every body built before it
+  and both `.pdb` files behind — `ls` after one failed `--mode=bundle` build
+  showed six of them. Every exit path now removes all of them, and the
+  multi-architecture CausticOS build removes its finished slice when the
+  other one fails. `tools/precommit.sh` builds a polyglot that succeeds and
+  one whose CausticOS body cannot link into the same directory and requires
+  that only the first one's output is left.
 - **A polyglot run by name runs its Linux body on a machine with wine.** Every
   polyglot starts with `MZ` for the Windows loader, and wine and mono claim
   `MZ` in `binfmt_misc`, so the kernel handed `./prog.cse.exe` to wine before

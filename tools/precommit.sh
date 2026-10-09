@@ -416,6 +416,25 @@ fi
 [ "$(runrc "$TMP/poly.cse.exe")" = "42" ] || die "the polyglot does not run on Linux"
 ok "a polyglot builds with the compiler called by name, and runs"
 
+# Each body of a polyglot is built beside the output, and each Windows body
+# drops a .pdb beside its own. None of them may outlive the build — not when
+# it succeeds, and not when a later body fails, which used to leave every body
+# built before it, and both .pdb files, in the output's directory. The program
+# whose CausticOS body cannot link (a reachable user32.dll call) fails last.
+mkdir -p "$TMP/polyclean" "$TMP/polysrc"
+cp "$ROOT/tests/reject/foreign_wrong_target.cst" "$TMP/polysrc/foreign.cst"
+if ! ( cd "$TMP" && PATH="$TMP/pathbin:$PATH" caustic -q --target=caustic --mode=compat \
+        "$PROBE" -o "$TMP/polyclean/ok" ) >"$TMP/polyclean.log" 2>&1; then
+    tail -5 "$TMP/polyclean.log"; die "a polyglot build into its own directory failed"
+fi
+if ( cd "$TMP" && PATH="$TMP/pathbin:$PATH" caustic -q --target=caustic --mode=compat \
+        "$TMP/polysrc/foreign.cst" -o "$TMP/polyclean/bad" ) >>"$TMP/polyclean.log" 2>&1; then
+    die "a polyglot whose CausticOS body cannot link was built anyway"
+fi
+LEFT=$(ls -A "$TMP/polyclean" | grep -vx 'ok.cse.exe' || true)
+[ -z "$LEFT" ] || die "polyglot builds left temporaries beside the output: $(echo $LEFT)"
+ok "a polyglot build leaves only its output, whether it succeeds or a body fails"
+
 check_installers
 
 printf "\n${G}${B}pre-commit OK${N} — toolchain builds and self-hosts correctly at -O0/-O1/-O2.\n"

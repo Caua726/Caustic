@@ -1816,9 +1816,9 @@ fn cse_orchestrate_fat(self_path as *u8, envp as *u8) as i32 {
     let is *u8 as a64 = cse_path_with_suffix(cast(*u8, &a64_buf), out, ".__cse_a64.tmp");
 
     let is i32 as rc with mut = cse_subexec(self_path, "--target=caustic-x86_64", "--mode=pure", x64, envp);
-    if (rc != 0) { return cse_sub_failed("CSE fat", "x86_64", rc); }
+    if (rc != 0) { io.unlink(x64); return cse_sub_failed("CSE fat", "x86_64", rc); }
     rc = cse_subexec(self_path, "--target=caustic-aarch64", "--mode=pure", a64, envp);
-    if (rc != 0) { return cse_sub_failed("CSE fat", "aarch64", rc); }
+    if (rc != 0) { io.unlink(x64); io.unlink(a64); return cse_sub_failed("CSE fat", "aarch64", rc); }
     let is i32 as ferr = ldmod.cse_fat_files(x64, a64, out);
     io.unlink(x64);
     io.unlink(a64);
@@ -1829,6 +1829,21 @@ fn cse_orchestrate_fat(self_path as *u8, envp as *u8) as i32 {
         io.write_str(io.STDOUT, " (CSE fat: x86_64 + aarch64)\n");
     }
     return 0;
+}
+
+// Everything a polyglot build puts next to its output while it works: the five
+// bodies, and the CodeView .pdb each Windows sub-build writes beside its own
+// output. Removed however the build ends — a body that failed half-way through
+// used to leave every one built before it, .pdb files included.
+fn cse_poly_clean(pe as *u8, elf as *u8, elf_a64 as *u8, pe_a64 as *u8, cst as *u8) as void {
+    io.unlink(pe);
+    io.unlink(elf);
+    io.unlink(elf_a64);
+    io.unlink(pe_a64);
+    io.unlink(cst);
+    let is [512]u8 as pdb_buf;
+    io.unlink(cse_path_with_suffix(cast(*u8, &pdb_buf), pe, ".pdb"));
+    io.unlink(cse_path_with_suffix(cast(*u8, &pdb_buf), pe_a64, ".pdb"));
 }
 
 fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
@@ -1845,33 +1860,23 @@ fn cse_orchestrate(self_path as *u8, envp as *u8) as i32 {
     let is *u8 as cst = cse_path_with_suffix(cast(*u8, &cst_buf), out, ".__cse_cst.tmp");
 
     let is i32 as rc with mut = cse_subexec(self_path, "--target=windows-x86_64", cast(*u8, 0), pe, envp);
-    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Windows PE", rc); }
+    if (rc != 0) { cse_poly_clean(pe, elf, elf_a64, pe_a64, cst); return cse_sub_failed("CSE polyglot", "Windows PE", rc); }
     rc = cse_subexec(self_path, "--target=linux-x86_64", cast(*u8, 0), elf, envp);
-    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Linux ELF", rc); }
+    if (rc != 0) { cse_poly_clean(pe, elf, elf_a64, pe_a64, cst); return cse_sub_failed("CSE polyglot", "Linux ELF", rc); }
     // AArch64 Linux body — the shell stub picks between this and the x86_64 one
     // by uname -m.
     rc = cse_subexec(self_path, "--target=linux-aarch64", cast(*u8, 0), elf_a64, envp);
-    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Linux AArch64 ELF", rc); }
+    if (rc != 0) { cse_poly_clean(pe, elf, elf_a64, pe_a64, cst); return cse_sub_failed("CSE polyglot", "Linux AArch64 ELF", rc); }
     // ARM64 Windows body. Carried, not yet reachable — the PE loader sees one
     // Machine, so activating it needs the entry stub to detect an ARM64 host and
     // relaunch. Its location is recorded in the CST* header either way.
     rc = cse_subexec(self_path, "--target=windows-aarch64", cast(*u8, 0), pe_a64, envp);
-    if (rc != 0) { return cse_sub_failed("CSE polyglot", "Windows ARM64 PE", rc); }
+    if (rc != 0) { cse_poly_clean(pe, elf, elf_a64, pe_a64, cst); return cse_sub_failed("CSE polyglot", "Windows ARM64 PE", rc); }
     // CausticOS body carries both architectures in one CST_ v4 container.
     rc = cse_subexec(self_path, "--target=caustic-x86_64-aarch64", cast(*u8, 0), cst, envp);
-    if (rc != 0) { return cse_sub_failed("CSE polyglot", "CST", rc); }
+    if (rc != 0) { cse_poly_clean(pe, elf, elf_a64, pe_a64, cst); return cse_sub_failed("CSE polyglot", "CST", rc); }
     let is i32 as cerr = ldmod.cse_combine_files(pe, elf, elf_a64, pe_a64, cst, out);
-    io.unlink(pe);
-    io.unlink(elf);
-    io.unlink(elf_a64);
-    io.unlink(pe_a64);
-    io.unlink(cst);
-    // Each Windows PE sub-build also drops a CodeView .pdb next to its output —
-    // both of them, or the ARM64 one is left behind beside the finished binary.
-    let is [512]u8 as pdb_buf;
-    io.unlink(cse_path_with_suffix(cast(*u8, &pdb_buf), pe, ".pdb"));
-    let is [512]u8 as pdb_a64_buf;
-    io.unlink(cse_path_with_suffix(cast(*u8, &pdb_a64_buf), pe_a64, ".pdb"));
+    cse_poly_clean(pe, elf, elf_a64, pe_a64, cst);
     if (cerr != 0) { return 1; }
     if (g_quiet == 0) {
         io.write_str(io.STDOUT, "caustic: ");
