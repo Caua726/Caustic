@@ -234,6 +234,26 @@ for cc in "$TMP/layout/caustic" "$TMP/layout/bin/caustic"; do
         || die "binary-relative stdlib produced wrong Unicode/font behaviour: $cc"
 done
 ok "external source resolves and runs with checkout/installed stdlibs"
+# A compiler in "/" — how CausticOS installs it, /caustic.cse beside /std. The
+# root's directory has length 1 and "no directory" length 0; taking one for the
+# other sent every `use "std/..."` to /usr/local/lib/caustic. It needs a root of
+# its own, which an unprivileged user namespace gives; a host without them says
+# so instead of passing quietly.
+if unshare -r true 2>/dev/null; then
+    R="$TMP/rootlayout"
+    mkdir -p "$R/src" "$R/proc" "$R/out"
+    cp "$CUR" "$R/caustic"
+    cp -r "$ROOT/std" "$R/std"
+    cp "$STDLIB_PROBE" "$R/src/probe.cst"
+    unshare -r --fork --pid --mount --mount-proc="$R/proc" \
+        chroot "$R" /caustic -q /src/probe.cst -o /out/probe >/dev/null 2>&1 \
+        || die "a compiler in / did not find the /std beside it"
+    unshare -r chroot "$R" /out/probe </dev/null >/dev/null 2>&1 \
+        || die "a compiler in / built a program with the wrong stdlib behaviour"
+    ok "a compiler installed in / finds the /std beside it"
+else
+    skip "compiler in / — this host has no unprivileged user namespaces to make a root in"
+fi
 
 
 # ─── 4. examples: identical behaviour across -O0/-O1/-O2 ────────────────────
