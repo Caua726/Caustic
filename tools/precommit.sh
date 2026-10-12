@@ -281,7 +281,24 @@ rm -f "$TMP/probe.cst.s" "$TMP/probe.cst.s.o"
 ok "caustic-as + caustic-ld assemble/link/run a program"
 
 
-# ─── 7. every target still builds ──────────────────────────────────────────
+# ─── 7. the output name is the name it writes ───────────────────────────────
+# cse_normalize_output cut the path at the first ".cse" ANYWHERE, so
+# `-o o.cse2` wrote `o.cse` — over whatever was there — and said it had written
+# what was asked for. The convention suffix is stripped only at the END now, so
+# a name that is not already a .cse gets one appended instead of losing its tail.
+step "CSE output naming"
+NAME_DIR="$TMP/names"
+mkdir -p "$NAME_DIR/dir.cse"
+"$CUR" -q --target=caustic-x86_64 "$PROBE" -o "$NAME_DIR/o.cse2" >/dev/null 2>&1 || true
+[ -f "$NAME_DIR/o.cse2.cse" ] || die "an output named o.cse2 did not become o.cse2.cse"
+if [ -f "$NAME_DIR/o.cse" ]; then die "an output named o.cse2 wrote o.cse instead"; fi
+"$CUR" -q --target=caustic-x86_64 "$PROBE" -o "$NAME_DIR/dir.cse/x" >/dev/null 2>&1 || true
+[ -f "$NAME_DIR/dir.cse/x.cse" ] || die "a path with a .cse directory did not write into it"
+if [ -f "$NAME_DIR/dir.cse/x" ]; then die "the .cse convention ignored the requested name"; fi
+ok "o.cse2 becomes o.cse2.cse, and a .cse directory stays a directory"
+
+
+# ─── 8. every target still builds ──────────────────────────────────────────
 # Compiling for another architecture or OS needs no external tool — only
 # RUNNING the result does, which is why check-cross.sh stays opt-in. Building
 # them, though, gives the same verdict on every machine, so it belongs here.
@@ -364,7 +381,7 @@ RC="$(LD_LIBRARY_PATH="$TMP" runrc "$TMP/shared_catch")"
 [ "$RC" = 42 ] || die "standalone cross-library throw returned $RC (expected 42)"
 ok "cross-library throw caught at -O0/-O1/-O2, integrated + standalone linker"
 
-# ─── 8. CSE containers and the shared-library loader ───────────────────────
+# ─── 9. CSE containers and the shared-library loader ───────────────────────
 # The .csl form was broken in main for a whole release: its header grew and the
 # loader kept reading the old offset, so csl_open failed for every library the
 # writer produced. Nothing exercised it. This does.
