@@ -44,6 +44,21 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   not the loaded image, so `llvm-symbolizer` over them is still the way to get
   names.
 
+### Changed
+- **The compiler writes no `.s` beside a source unless it is asked to.** A
+  full build left `<source>.s` next to every file it compiled, written as a
+  "debug cache" nothing read back — the assembler consumes the assembly in
+  memory and the object goes straight to the linker. `--no-asm-cache` existed
+  only to skip that write; it is gone. `--emit-asm` asks for the file, and
+  `caustic-mk` passes it on the staged paths that assemble the compiler's own
+  output with `caustic-as` (the kernel target and the incremental per-module
+  compile), which is where the `.s` really is an intermediate. A CausticOS
+  build went from 292 leftover `.cst.s` files beside the sources to the one the
+  kernel's staged pipeline reads, and the biggest write of the build now
+  happens only when the generated code is what is being read. The guest
+  self-host round (`userspace/tests/bootstrap.cst` in causticos) checks both
+  halves on CausticOS itself.
+
 ### Fixed
 - **A function declared twice in one module is an error at its line.** Only
   a repeated global was caught; a second function by the same name reached

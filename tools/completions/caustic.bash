@@ -127,7 +127,7 @@ _caustic() {
     local flags="-c -o -j --parallel --max-ram --shared --emit-interface --emit-csti
 --emit-tokens --emit-ast --emit-ir --profile --cache
 --module-objects --module-only --emit-deps --csti-dir
--O0 -O1 -O2 --path -q --quiet --no-asm-cache
+-O0 -O1 -O2 --path -q --quiet --emit-asm
 -debuglexer -debugparser -debugir --freestanding --allow-unsupported
 --target= --mode= --entry= --base= --app-version= --stack-size= --extension="
     # Both are read straight off argv[1] and stop the compiler there, so they
