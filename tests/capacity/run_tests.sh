@@ -1,5 +1,6 @@
 #!/bin/sh
-# Generated 300-module / 300+7 foreign-symbol consumers, with real ELF/DLL providers.
+# Generated 300-module / 300+7 foreign-symbol consumers, with real ELF/DLL
+# providers, and 20000 functions in one program.
 # Usage from the compiler root: sh tests/capacity/run_tests.sh [compiler]
 set -eu
 if [ "${1:-}" = --wine ]; then
@@ -44,6 +45,9 @@ done
 "$cc" -q -O1 tests/capacity/generate.cst -o "$work/tools/generate"
 "$work/tools/generate" "$work/project"
 project="$work/project"
+"$cc" -q -O1 "$project/functions.cst" -o "$project/functions"
+"$project/functions"
+echo "20000 functions, each found by a call and fn_ptr: passed"
 cp tests/capacity/Causticfile "$project/Causticfile"
 cp tests/windows/missing_symbol.cst "$project/missing.cst"
 for library in a b; do

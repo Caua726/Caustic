@@ -16,8 +16,10 @@ let is i32 as fn_count with mut = 0;
 let is i32 as loop_depth with mut;
 
 // === Function hash table (DJB2 + chaining) ===
-let is i32 as FN_HASH_BUCKETS with imut = 4096;
-let is i32 as FN_HASH_CAP with imut = 8192;
+// Grown, never full: every function declared is found again. Its buckets are
+// half its room, all chains rebuilt when it doubles.
+let is i32 as fn_hash_buckets_n with mut = 4096;
+let is i32 as fn_hash_cap with mut = 8192;
 let is *i32 as fn_hash_buckets with mut;
 let is *i32 as fn_hash_next with mut;
 let is *i64 as fn_hash_ptrs with mut;
@@ -36,19 +38,48 @@ fn fn_hash(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i3
         i = i + 1;
     }
     h = h & 9223372036854775807;
-    return cast(i32, h & cast(i64, FN_HASH_BUCKETS - 1));
+    return cast(i32, h & cast(i64, fn_hash_buckets_n - 1));
 }
 
-fn fn_hash_init() as void {
-    fn_hash_buckets = cast(*i32, d.sem_alloc(cast(i64, FN_HASH_BUCKETS) * 4));
-    fn_hash_next = cast(*i32, d.sem_alloc(cast(i64, FN_HASH_CAP) * 4));
-    fn_hash_ptrs = cast(*i64, d.sem_alloc(cast(i64, FN_HASH_CAP) * 8));
+fn _fn_hash_tables(cap as i32, buckets as i32) as void {
+    fn_hash_cap = cap;
+    fn_hash_buckets_n = buckets;
+    fn_hash_buckets = cast(*i32, d.sem_alloc(cast(i64, buckets) * 4));
+    fn_hash_next = cast(*i32, d.sem_alloc(cast(i64, cap) * 4));
+    fn_hash_ptrs = cast(*i64, d.sem_alloc(cast(i64, cap) * 8));
     let is i32 as i with mut = 0;
-    while (i < FN_HASH_BUCKETS) {
+    while (i < buckets) {
         fn_hash_buckets[i] = 0 - 1;
         i = i + 1;
     }
+}
+
+fn fn_hash_init() as void {
+    _fn_hash_tables(8192, 4096);
     fn_count = 0;
+}
+
+// Room doubled: the entries keep their indices, chained again in the order
+// they were declared, so a chain still holds the latest first.
+fn _fn_hash_grow() as void {
+    let is i32 as was_cap = fn_hash_cap;
+    let is i32 as was_buckets = fn_hash_buckets_n;
+    let is *i32 as old_buckets = fn_hash_buckets;
+    let is *i32 as old_next = fn_hash_next;
+    let is *i64 as old_ptrs = fn_hash_ptrs;
+    _fn_hash_tables(was_cap * 2, was_buckets * 2);
+    let is i32 as idx with mut = 0;
+    while (idx < fn_count) {
+        let is *d.Function as f = cast(*d.Function, old_ptrs[idx]);
+        let is i32 as h = fn_hash(f.name_ptr, f.name_len, f.mod_prefix_ptr, f.mod_prefix_len);
+        fn_hash_ptrs[idx] = old_ptrs[idx];
+        fn_hash_next[idx] = fn_hash_buckets[h];
+        fn_hash_buckets[h] = idx;
+        idx = idx + 1;
+    }
+    d.sem_free(cast(*u8, old_buckets));
+    d.sem_free(cast(*u8, old_next));
+    d.sem_free(cast(*u8, old_ptrs));
 }
 
 let is *u8 as current_return_type with mut;
@@ -354,14 +385,13 @@ fn declare_fn_dll(name_ptr as *u8, name_len as i32, ret_ty as *u8, param_types a
     function_table = nf;
 
     // Insert into hash table
-    if (fn_count < FN_HASH_CAP) {
-        let is i32 as idx = fn_count;
-        let is i32 as h = fn_hash(nf.name_ptr, nf.name_len, nf.mod_prefix_ptr, nf.mod_prefix_len);
-        fn_hash_ptrs[idx] = cast(i64, nf);
-        fn_hash_next[idx] = fn_hash_buckets[h];
-        fn_hash_buckets[h] = idx;
-        fn_count = fn_count + 1;
-    }
+    if (fn_count == fn_hash_cap) { _fn_hash_grow(); }
+    let is i32 as idx = fn_count;
+    let is i32 as h = fn_hash(nf.name_ptr, nf.name_len, nf.mod_prefix_ptr, nf.mod_prefix_len);
+    fn_hash_ptrs[idx] = cast(i64, nf);
+    fn_hash_next[idx] = fn_hash_buckets[h];
+    fn_hash_buckets[h] = idx;
+    fn_count = fn_count + 1;
 }
 
 fn lookup_fn_qualified(name_ptr as *u8, name_len as i32, prefix_ptr as *u8, prefix_len as i32) as *d.Function {
