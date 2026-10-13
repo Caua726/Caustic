@@ -155,70 +155,56 @@ fn arg(argv as *u8, i as i64) as *u8 {
 
 // --- The directory this program was started in ---
 //
-// The kernel resolves only absolute paths and keeps no directory per process
-// (no ambient namespace). A shell keeps its own, and at every spawn it hands
-// the child the directory it is in AT THAT MOMENT, as the key KEY_DIR: a
-// one-page segment holding DIR_MAGIC, the path's length and the path. A cd in
-// the shell afterwards does not move a program already started. It is read
-// once, on first use, and then let go. No such key — or one that is not such
-// a segment — means "/".
-let is i64 as DIR_MAGIC with imut = 0x3130305249445343;   // "CSDIR001"
+// The kernel keeps no directory per process (no ambient namespace). A shell
+// keeps its own, and at every spawn it hands the child the directory it is in
+// AT THAT MOMENT as the key KEY_DIR: a directory key (sys.dir_open), which
+// holds the directory itself rather than its name. A cd in the shell
+// afterwards does not move a program already started, and neither does a
+// rename lose it: the kernel says where the directory is each time a name is
+// resolved under it (sys.dir_resolve), and the std opens a relative name there
+// (sys.openat). It used to be the path, copied into a segment — rename the
+// directory between the spawn and the first relative name, and the program
+// pointed at nothing (bugs.md N124). No key means "/". A key whose directory
+// was removed resolves nothing: dir() is then empty and a relative name comes
+// out empty, so opening it fails instead of meaning some other directory.
 let is i64 as PATH_MAX with imut = 255;
 let is [256]u8 as _dir with mut;
-let is i64 as _dir_len with mut = 0 - 1;                  // -1: not looked at yet
+let is i64 as _dir_len with mut = 0;
 
-fn _dir_load() as void {
-    if (_dir_len >= 0) { return; }
-    _dir[0] = cast(u8, 47); _dir[1] = cast(u8, 0); _dir_len = 1;
+fn _dir_now() as void {
     let is i64 as dk = sys.key(sys.KEY_DIR);
-    if (dk < 0) { return; }
-    let is [2]i64 as hdr;
-    if (sys.seg_read(dk, 0, cast(*u8, &hdr[0]), 16) != 0) { return; }
-    if (hdr[0] != DIR_MAGIC || hdr[1] <= 0 || hdr[1] > PATH_MAX) { return; }
-    let is [256]u8 as d;
-    if (sys.seg_read(dk, 16, cast(*u8, &d[0]), hdr[1]) != 0) { return; }
-    sys.close(dk);
-    if (d[0] != cast(u8, 47)) { return; }
-    let is i64 as i with mut = 0;
-    while (i < hdr[1]) { _dir[i] = d[i]; i = i + 1; }
-    _dir[i] = cast(u8, 0);
-    _dir_len = hdr[1];
+    if (dk < 0) { _dir[0] = cast(u8, 47); _dir[1] = cast(u8, 0); _dir_len = 1; return; }
+    let is i64 as n = sys.dir_resolve(dk, cast(*u8, ""), 0, cast(*u8, &_dir[0]), 256);
+    if (n < 0) { _dir[0] = cast(u8, 0); _dir_len = 0; return; }
+    _dir_len = n;
 }
 
-// dir(): the directory this program was started in, NUL-terminated, absolute.
-fn dir() as *u8 { _dir_load(); return cast(*u8, &_dir[0]); }
-fn dir_len() as i64 { _dir_load(); return _dir_len; }
+// dir(): the directory this program was started in, where it is now:
+// NUL-terminated, absolute; empty once it was removed.
+fn dir() as *u8 { _dir_now(); return cast(*u8, &_dir[0]); }
+fn dir_len() as i64 { _dir_now(); return _dir_len; }
 
-// dir_handoff(path, n): a segment carrying directory path[0..n), to hand a
-// child about to be spawned as its KEY_DIR. The caller closes it after the
-// spawn. -1 when it cannot be made (the child is then in "/").
-fn dir_handoff(path as *u8, n as i64) as i64 {
-    if (n <= 0 || n > PATH_MAX || path[0] != cast(u8, 47)) { return 0 - 1; }
-    let is i64 as fd = sys.seg_create(1, 0);
-    if (fd < 0) { return 0 - 1; }
-    let is [2]i64 as hdr;
-    hdr[0] = DIR_MAGIC; hdr[1] = n;
-    if (sys.seg_write(fd, 0, cast(*u8, &hdr[0]), 16) != 0
-        || sys.seg_write(fd, 16, path, n) != 0) {
-        sys.close(fd);
-        return 0 - 1;
-    }
-    return fd;
-}
-
-// dir_for_child(): my own directory, handed on — for a program that spawns
-// others, so a relative path a child is given means what it meant here.
-fn dir_for_child() as i64 { return dir_handoff(dir(), dir_len()); }
+// dir_for_child(): my own directory key, to hand a child as its KEY_DIR, so a
+// relative path it is given means what it meant here — the same directory,
+// not one looked up again by name. Borrowed: not to be closed. -1 when I have
+// none (the child is then in "/", as I am).
+fn dir_for_child() as i64 { return sys.key(sys.KEY_DIR); }
 
 // abspath(raw, out): `raw` as an absolute path. One that starts with '/' comes
-// back unchanged; any other is resolved against dir(), "." and ".." folded,
-// into `out`, which holds 256 bytes (PATH_MAX and its NUL). A result longer
-// than the kernel takes comes back empty, and opening it fails.
+// back unchanged; any other is resolved where the start directory is now, "."
+// and ".." folded, into `out`, which holds 256 bytes (PATH_MAX and its NUL). A
+// result longer than the kernel takes, or a name under a removed directory,
+// comes back empty, and opening it fails.
 fn abspath(raw as *u8, out as *u8) as *u8 {
     if (raw[0] == cast(u8, 47)) { return raw; }
-    let is *u8 as d = dir();
-    let is i64 as n with mut = 0;
-    while (n < _dir_len) { out[n] = d[n]; n = n + 1; }
+    let is i64 as dk = sys.key(sys.KEY_DIR);
+    if (dk >= 0) {
+        if (sys.dir_resolve(dk, raw, slen(raw), out, 256) < 0) { out[0] = cast(u8, 0); }
+        return out;
+    }
+    // No key: the start directory is "/".
+    out[0] = cast(u8, 47);
+    let is i64 as n with mut = 1;
     let is i64 as i with mut = 0;
     while (raw[i] != 0) {
         let is i64 as s = i;

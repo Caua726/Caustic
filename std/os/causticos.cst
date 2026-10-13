@@ -88,7 +88,7 @@ let is i64 as SYS_NET_INFO        with imut = 50;
 let is i64 as SYS_GET_RANDOM      with imut = 51;
 let is i64 as SYS_RANDOM_QUALITY  with imut = 52;
 let is i64 as SYS_AUDIO_INFO      with imut = 53;
-let is i64 as SYS_COUNT           with imut = 55;
+let is i64 as SYS_COUNT           with imut = 64;
 
 // Errno values the kernel returns (negative in rax).
 let is i64 as E_OK    with imut = 0;
@@ -237,7 +237,7 @@ let is i64 as KEY_KIND_MASK   with imut = 0xFFFFFFFF;
 let is i64 as KEY_STDIN       with imut = 1;    // read, write, ... name these three 0,
 let is i64 as KEY_STDOUT      with imut = 2;    // 1 and 2 (the label minus one;
 let is i64 as KEY_STDERR      with imut = 3;    // _fd below)
-let is i64 as KEY_DIR         with imut = 4;    // the directory it started in (prog.dir)
+let is i64 as KEY_DIR         with imut = 4;    // a directory key: where it started (prog.dir)
 let is i64 as KEY_TTY         with imut = 5;    // the terminal's control channel (ttyproto),
                                                 // with a stdout that is the terminal
 let is i64 as KEY_WM          with imut = 6;    // a window's channel to the window manager
@@ -267,6 +267,25 @@ fn is_terminal(fd as i64) as i64 {
     if (syscall(SYS_KEY, KEY_STDIN + fd, KEY_KIND_MASK, cast(i64, &full[0])) < 0) { return 0; }
     if ((full[0] & KEY_TERMINAL) != 0) { return 1; }
     return 0;
+}
+
+// ---- directory keys: a directory held by what it is, not by its name ----
+//
+// dir_open makes one for the directory an absolute path[0..n) names. It
+// follows the directory when a rename moves it and resolves nothing once the
+// directory is removed (E_NOENT). openat opens a name under one as the open_*
+// calls do (flags O_*); dir_resolve writes into out (cap bytes) the absolute
+// path name[0..n) has under one now — n 0 is the directory itself — and
+// returns its length. E_NOTDIR when dir_fd is not a directory key.
+let is i64 as SYS_DIR_OPEN    with imut = 61;
+let is i64 as SYS_OPENAT      with imut = 62;
+let is i64 as SYS_DIR_RESOLVE with imut = 63;
+fn dir_open(path as *u8, n as i64) as i64 { return syscall(SYS_DIR_OPEN, path, n); }
+fn openat(dir_fd as i64, path as *u8, flags as i64) as i64 {
+    return syscall(SYS_OPENAT, dir_fd, path, _slen(path), flags);
+}
+fn dir_resolve(dir_fd as i64, name as *u8, n as i64, out as *u8, cap as i64) as i64 {
+    return syscall(SYS_DIR_RESOLVE, dir_fd, name, n, out, cap);
 }
 
 // SYS_POLL readiness bits. Each entry is 3 x i64 {fd, want, got}: `want` is
@@ -320,9 +339,23 @@ fn write(fd as i64, buf as *u8, n as i64) as i64 {
     return r;
 }
 fn read(fd as i64, buf as *u8, n as i64) as i64 { return syscall(10, _fd(fd), buf, n); }
-fn open_read(path as *u8) as i64   { return syscall(9, path, _slen(path), O_RDONLY); }
-fn open_write(path as *u8) as i64  { return syscall(9, path, _slen(path), O_WRONLY | O_CREAT | O_TRUNC); }
-fn open_append(path as *u8) as i64 { return syscall(9, path, _slen(path), O_WRONLY | O_CREAT | O_APPEND); }
+// A relative path opens under the directory this program was started in, as
+// it is now: its key KEY_DIR, through SYS_OPENAT. With no such key a relative
+// path opens nothing, as before there were keys. An empty path names nothing
+// (E_NOENT, as POSIX has it) — it is what a name under a start directory that
+// was removed comes out as (prog.abspath).
+fn _open(path as *u8, flags as i64) as i64 {
+    let is i64 as n = _slen(path);
+    if (n == 0) { return E_NOENT; }
+    if (path[0] != cast(u8, 47)) {
+        let is i64 as dk = key(KEY_DIR);
+        if (dk >= 0) { return syscall(SYS_OPENAT, dk, path, n, flags); }
+    }
+    return syscall(9, path, n, flags);
+}
+fn open_read(path as *u8) as i64   { return _open(path, O_RDONLY); }
+fn open_write(path as *u8) as i64  { return _open(path, O_WRONLY | O_CREAT | O_TRUNC); }
+fn open_append(path as *u8) as i64 { return _open(path, O_WRONLY | O_CREAT | O_APPEND); }
 fn close(fd as i64) as i32 {
     let is i64 as real = _fd(fd);
     if (fd >= 0 && fd <= 2) { _stdio[fd] = 0 - 1; }
