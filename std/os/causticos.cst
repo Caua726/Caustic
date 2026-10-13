@@ -221,15 +221,35 @@ let is i64 as MMAP_FD              with imut = 0x10;
 let is i64 as MMAP_RESERVE         with imut = 0x20;   // reserve-only (back no pages)
 let is i64 as SURFACE_FMT_XRGB8888 with imut = 0;
 
-// Shell-reserved marker: fd 9 is present only when stderr reaches a terminal.
-// Programs may poll it to decide whether terminal-only styling is safe.
-let is i64 as STDERR_TTY_FD with imut = 9;
+// ---- keys: what a spawner hands a child, by what each one is for ----
+//
+// A spawn's fdacts are {label, src_fd} pairs; the kernel gives each key an fd
+// of its own choosing and key() finds it by label (SYS_KEY). This is the one
+// place labels are named: one number per purpose, so a program can never take
+// one daemon's channel for another's (it once did: the compositor adopted
+// netd's channel thinking it was soundd's, when keys were found at agreed fd
+// numbers — bugs.md N122). The kernel knows none of these; they are ours.
+//
+// KEY_KIND_MASK is the part of a label that says what the key is for; key()
+// matches on it, so bits above it are free to describe the key.
+let is i64 as SYS_KEY         with imut = 60;
+let is i64 as KEY_KIND_MASK   with imut = 0xFFFFFFFF;
+let is i64 as KEY_STDIN       with imut = 1;    // read, write, ... name these three 0,
+let is i64 as KEY_STDOUT      with imut = 2;    // 1 and 2 (the label minus one;
+let is i64 as KEY_STDERR      with imut = 3;    // _fd below)
+let is i64 as KEY_DIR         with imut = 4;    // the directory it started in (prog.dir)
+let is i64 as KEY_TTY         with imut = 5;    // terminal control, when stdout is one (ttyproto)
+let is i64 as KEY_STDERR_TTY  with imut = 6;    // present only when stderr reaches a terminal
+let is i64 as KEY_WM          with imut = 7;    // a window's channel to the window manager
+let is i64 as KEY_CTL         with imut = 8;    // a terminal's job: its channel back to the terminal
+let is i64 as KEY_INPUT       with imut = 9;    // input events, compositor → WM
+let is i64 as KEY_SCENE       with imut = 10;   // scene updates, WM → compositor
+let is i64 as KEY_NET         with imut = 11;   // netd's gate
+let is i64 as KEY_SOUND       with imut = 12;   // soundd's gate
 
-// Shell-reserved: fd 10 is the directory the program was started in, as its
-// spawner captured it — a segment std/causticos/prog reads once (prog.dir,
-// prog.abspath). The kernel keeps no directory per process; a program
-// started with nothing at fd 10 is in "/".
-let is i64 as DIR_FD with imut = 10;
+// key: the fd of the key labelled `label`, or E_NOENT when the spawner gave
+// none (or it was closed).
+fn key(label as i64) as i64 { return syscall(SYS_KEY, label, KEY_KIND_MASK, 0); }
 
 // SYS_POLL readiness bits. Each entry is 3 x i64 {fd, want, got}: `want` is
 // the bits the caller cares about; the kernel writes `got` = observed state
@@ -251,22 +271,46 @@ fn _slen(s as *u8) as i64 {
 
 // ---- io facade backend (called by std/io.cst's OS_CAUSTIC dispatch) ----
 
+// 0, 1 and 2 are stdin, stdout and stderr in every call here that takes an fd
+// (read, write, close, lseek, chan_info, poll): the std reads each as the key
+// labelled KEY_STDIN/STDOUT/STDERR, wherever the kernel put it. The kernel
+// never hands out 0..2 itself, so a real descriptor is never shadowed. It is
+// what portable code needs — the compiler writes to 1 and 2 on every OS — and
+// what lets a program find its stdio without knowing its number. Looked up
+// once: _stdio holds fd + 1 once found, -1 when there is no such key, 0 before.
+let is [3]i64 as _stdio with mut;
+
+fn _fd(fd as i64) as i64 {
+    if (fd < 0 || fd > 2) { return fd; }
+    let is i64 as c = _stdio[fd];
+    if (c > 0) { return c - 1; }
+    if (c < 0) { return 0 - 1; }
+    let is i64 as k = key(KEY_STDIN + fd);
+    if (k < 0) { _stdio[fd] = 0 - 1; return 0 - 1; }
+    _stdio[fd] = k + 1;
+    return k;
+}
+
 // write(fd, buf, n): SYS_WRITE to the fd — a VFS file or a console-channel
-// endpoint the shell installed (fd 1 = stdout). If the fd doesn't exist (a
-// standalone program writing to fd 1 with no console), fall back to the serial
+// endpoint the shell handed down (1 = stdout). If the fd doesn't exist (a
+// standalone program writing to stdout with none), fall back to the serial
 // console so output still appears. So: under the shell, write(1) reaches the
 // terminal via the console channel; run bare, it reaches serial.
 fn write(fd as i64, buf as *u8, n as i64) as i64 {
-    let is i64 as r = syscall(11, fd, buf, n);
+    let is i64 as r = syscall(11, _fd(fd), buf, n);
     if (r == E_BADF) { return syscall(6, buf, n); }
     return r;
 }
-fn read(fd as i64, buf as *u8, n as i64) as i64 { return syscall(10, fd, buf, n); }
+fn read(fd as i64, buf as *u8, n as i64) as i64 { return syscall(10, _fd(fd), buf, n); }
 fn open_read(path as *u8) as i64   { return syscall(9, path, _slen(path), O_RDONLY); }
 fn open_write(path as *u8) as i64  { return syscall(9, path, _slen(path), O_WRONLY | O_CREAT | O_TRUNC); }
 fn open_append(path as *u8) as i64 { return syscall(9, path, _slen(path), O_WRONLY | O_CREAT | O_APPEND); }
-fn close(fd as i64) as i32         { return cast(i32, syscall(12, fd)); }
-fn lseek(fd as i64, offset as i64, whence as i32) as i64 { return syscall(13, fd, offset, cast(i64, whence)); }
+fn close(fd as i64) as i32 {
+    let is i64 as real = _fd(fd);
+    if (fd >= 0 && fd <= 2) { _stdio[fd] = 0 - 1; }
+    return cast(i32, syscall(12, real));
+}
+fn lseek(fd as i64, offset as i64, whence as i32) as i64 { return syscall(13, _fd(fd), offset, cast(i64, whence)); }
 
 // ---- self-path (stdlib discovery for the self-hosting compiler) ----
 // CausticOS does NOT track a process's path. A spawn names the image it starts
@@ -327,8 +371,11 @@ fn decommit(addr as i64, len as i64) as i64 { return syscall(28, addr, len); }
 // Naming the source instead lets the kernel's image cache map one set of frames
 // into every process running the same program.
 //
-//   fdacts: array of {child_fd, src_fd} (16 B each), n_acts <= 16 — the ONLY way
-//           the child gets keys (its fd table starts empty). Pass 0/0 for none.
+//   fdacts: array of {label, src_fd} (16 B each), n_acts <= 16 — the ONLY way
+//           the child gets keys (its fd table starts empty): the object at
+//           src_fd, as the key labelled KEY_* (see key() above), at an fd the
+//           kernel picks. A src_fd of 0..2 is this program's own stdio, as
+//           everywhere in the std. Pass 0/0 for none.
 //   argv:   array of {str_ptr, str_len} (16 B each), at most ARGV_MAX bytes of
 //           them (each argument's length + 9), else E_2BIG — copied onto the
 //           child's System V stack as argc/argv. argv is data, not authority:
@@ -344,12 +391,27 @@ let is i64 as SPAWN_SRC_FD   with imut = 1;
 fn _spawn(kind as i64, fd as i64, path as *u8, path_len as i64,
           fdacts as *u8, n_acts as i64, argv as *u8, argc as i64,
           budget as i64) as i64 {
+    // The keys, with a src_fd of 0..2 read as this program's stdio. Copied:
+    // the caller's array is the caller's. More than 16 is the kernel's to
+    // refuse, so those are passed as they are.
+    let is [32]i64 as acts;
+    let is *i64 as src = cast(*i64, fdacts);
+    let is *u8 as use_acts with mut = fdacts;
+    if (n_acts > 0 && n_acts <= 16 && cast(i64, fdacts) != 0) {
+        let is i64 as i with mut = 0;
+        while (i < n_acts) {
+            acts[i * 2] = src[i * 2];
+            acts[i * 2 + 1] = _fd(src[i * 2 + 1]);
+            i = i + 1;
+        }
+        use_acts = cast(*u8, &acts[0]);
+    }
     let is [9]i64 as sp;
     sp[0] = kind;
     sp[1] = fd;
     sp[2] = cast(i64, path);
     sp[3] = path_len;
-    sp[4] = cast(i64, fdacts);
+    sp[4] = cast(i64, use_acts);
     sp[5] = n_acts;
     sp[6] = cast(i64, argv);
     sp[7] = argc;
@@ -741,7 +803,7 @@ let is i64 as CHAN_INFO_WORDS with imut = 4;
 
 let is i64 as SYS_CHAN_INFO       with imut = 54;
 
-fn chan_info(fd as i64, out as *i64) as i64 { return syscall(SYS_CHAN_INFO, fd, out); }
+fn chan_info(fd as i64, out as *i64) as i64 { return syscall(SYS_CHAN_INFO, _fd(fd), out); }
 
 // SYS_WATCH — an fd that polls READABLE once `path` changes: a file opened
 // for writing closed, the name created, removed or renamed (either side). A
@@ -830,7 +892,23 @@ fn net_mac_byte(packed as i64, i as i64) as i64 {
 //     array of n records, 3 x i64 each: {fd, want, got}. Returns how many
 //     entries have got != 0 (0 = timeout). timeout_ns < 0 waits forever. A
 //     bad fd marks its own entry POLL_ERROR and counts as ready — one dead
-//     fd never wedges the loop. ---
+//     fd never wedges the loop. 0..2 are stdio, as everywhere here: such an
+//     entry is polled on its key and handed back as the caller wrote it (the
+//     first 8 of them; there are three names). ---
 fn poll(entries as *i64, n as i64, timeout_ns as i64) as i64 {
-    return syscall(34, cast(i64, entries), n, timeout_ns);
+    let is [8]i64 as at;                           // which entries named 0..2,
+    let is [8]i64 as was;                          // and which name
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as fd = entries[i * 3];
+        if (fd >= 0 && fd <= 2 && k < 8) {
+            at[k] = i; was[k] = fd; k = k + 1;
+            entries[i * 3] = _fd(fd);
+        }
+        i = i + 1;
+    }
+    let is i64 as r = syscall(34, cast(i64, entries), n, timeout_ns);
+    while (k > 0) { k = k - 1; entries[at[k] * 3] = was[k]; }
+    return r;
 }

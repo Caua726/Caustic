@@ -1,9 +1,10 @@
 // std/causticos/prog.cst — tiny runtime for CausticOS userspace programs.
 //
-// A program spawned by the shell gets fd 1 = a console channel (its stdout) and
-// argv on its stack. This wraps the two things every little program needs:
-// write to stdout, and read argv. `out*` go to fd 1 -> the shell renders them on
-// the framebuffer (or, run bare with no console, they fall back to serial).
+// A program spawned by the shell gets a console channel as its stdout key —
+// 1, as the std names it (std/os/causticos.cst) — and argv on its stack. This
+// wraps the two things every little program needs: write to stdout, and read
+// argv. `out*` go to stdout -> the shell renders them on the framebuffer (or,
+// run bare with no console, they fall back to serial).
 // argv (from main's 2nd param) is char** — a NUL-terminated array of string
 // pointers; arg(argv, i) returns the i-th.
 use "../os/causticos.cst" as sys;
@@ -36,8 +37,8 @@ fn out(s as *u8, n as i64) as void {
 }
 fn outs(s as *u8) as void { out(s, slen(s)); }
 
-// Write directly to stderr. Only a shell-created fd 9 marks that stderr reaches
-// a terminal; redirected diagnostics stay byte-for-byte plain.
+// Write directly to stderr. Only the shell's KEY_STDERR_TTY key marks that
+// stderr reaches a terminal; redirected diagnostics stay byte-for-byte plain.
 fn _err_write(s as *u8, n as i64) as void {
     if (__target_is_caustic == 0) { __compile_error("std/causticos/prog I/O is CausticOS-only — build with a CausticOS target"); }
     let is i64 as done with mut = 0;
@@ -48,8 +49,10 @@ fn _err_write(s as *u8, n as i64) as void {
     }
 }
 fn _stderr_is_terminal() as i64 {
+    let is i64 as m = sys.key(sys.KEY_STDERR_TTY);
+    if (m < 0) { return 0; }
     let is [3]i64 as p;
-    p[0] = sys.STDERR_TTY_FD; p[1] = sys.POLL_WRITABLE; p[2] = 0;
+    p[0] = m; p[1] = sys.POLL_WRITABLE; p[2] = 0;
     let is i64 as ready = sys.poll(cast(*i64, &p[0]), 1, 0);
     if (ready <= 0 || (p[2] & sys.POLL_WRITABLE) == 0) { return 0; }
     if ((p[2] & (sys.POLL_CLOSED | sys.POLL_ERROR)) != 0) { return 0; }
@@ -154,11 +157,11 @@ fn arg(argv as *u8, i as i64) as *u8 {
 //
 // The kernel resolves only absolute paths and keeps no directory per process
 // (no ambient namespace). A shell keeps its own, and at every spawn it hands
-// the child the directory it is in AT THAT MOMENT, at sys.DIR_FD: a one-page
-// segment holding DIR_MAGIC, the path's length and the path. A cd in the shell
-// afterwards does not move a program already started. It is read once, on
-// first use, and then let go. Nothing at DIR_FD — or something that is not
-// such a segment, a file the program opened there itself — means "/".
+// the child the directory it is in AT THAT MOMENT, as the key KEY_DIR: a
+// one-page segment holding DIR_MAGIC, the path's length and the path. A cd in
+// the shell afterwards does not move a program already started. It is read
+// once, on first use, and then let go. No such key — or one that is not such
+// a segment — means "/".
 let is i64 as DIR_MAGIC with imut = 0x3130305249445343;   // "CSDIR001"
 let is i64 as PATH_MAX with imut = 255;
 let is [256]u8 as _dir with mut;
@@ -167,12 +170,14 @@ let is i64 as _dir_len with mut = 0 - 1;                  // -1: not looked at y
 fn _dir_load() as void {
     if (_dir_len >= 0) { return; }
     _dir[0] = cast(u8, 47); _dir[1] = cast(u8, 0); _dir_len = 1;
+    let is i64 as dk = sys.key(sys.KEY_DIR);
+    if (dk < 0) { return; }
     let is [2]i64 as hdr;
-    if (sys.seg_read(sys.DIR_FD, 0, cast(*u8, &hdr[0]), 16) != 0) { return; }
+    if (sys.seg_read(dk, 0, cast(*u8, &hdr[0]), 16) != 0) { return; }
     if (hdr[0] != DIR_MAGIC || hdr[1] <= 0 || hdr[1] > PATH_MAX) { return; }
     let is [256]u8 as d;
-    if (sys.seg_read(sys.DIR_FD, 16, cast(*u8, &d[0]), hdr[1]) != 0) { return; }
-    sys.close(sys.DIR_FD);
+    if (sys.seg_read(dk, 16, cast(*u8, &d[0]), hdr[1]) != 0) { return; }
+    sys.close(dk);
     if (d[0] != cast(u8, 47)) { return; }
     let is i64 as i with mut = 0;
     while (i < hdr[1]) { _dir[i] = d[i]; i = i + 1; }
@@ -184,8 +189,8 @@ fn _dir_load() as void {
 fn dir() as *u8 { _dir_load(); return cast(*u8, &_dir[0]); }
 fn dir_len() as i64 { _dir_load(); return _dir_len; }
 
-// dir_handoff(path, n): a segment carrying directory path[0..n), to install at
-// sys.DIR_FD in a child about to be spawned. The caller closes it after the
+// dir_handoff(path, n): a segment carrying directory path[0..n), to hand a
+// child about to be spawned as its KEY_DIR. The caller closes it after the
 // spawn. -1 when it cannot be made (the child is then in "/").
 fn dir_handoff(path as *u8, n as i64) as i64 {
     if (n <= 0 || n > PATH_MAX || path[0] != cast(u8, 47)) { return 0 - 1; }
