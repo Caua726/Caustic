@@ -162,6 +162,312 @@ fn gc2_get_iv(intervals as *core.LiveInterval, idx as i32) as *core.LiveInterval
     return cast(*core.LiveInterval, cast(i64, intervals) + cast(i64, idx) * sizeof(core.LiveInterval));
 }
 
+// === Interference from liveness (-O2) ===
+//
+// The -O1 graph joins two vregs whenever their [first, last] intervals touch.
+// For a copy `MOV b = a` where a dies, both intervals contain the MOV, so a and
+// b always interfere and the copy is never coalesced — no MOV is ever merged at
+// -O1. Each copy left behind is a `mov` in the output, inside loops too.
+//
+// At -O2 the graph comes from liveness instead (GCC tree-ssa-coalesce.cc
+// build_ssa_conflict_graph; LLVM RegisterCoalescer JoinVals). Walking each block
+// backwards with the set of live vregs, a definition of d interferes with every
+// vreg live after it, except the source of `MOV d = s`: right after the copy d
+// and s hold the same value, so they may share a register. If either is written
+// again while the other is still live, that later definition adds the edge.
+//
+// Two rules stay as conservative as the interval graph:
+// - a definition interferes with every operand of its own instruction (except
+//   the MOV source), because the emitters may write dest before reading all
+//   sources;
+// - vregs live into the entry block (read on some path before any write) all
+//   interfere with each other.
+//
+// Which operand is read and which is written: src1 and src2 are always read.
+// dest is written, except STORE and COPY (dest is the address, a read) and CMOV
+// (dest is read and written: its false value is preloaded into it).
+
+let is *i32 as _lv_edges with mut = cast(*i32, 0);   // recorded pairs, for the adjacency index
+let is i32 as _lv_ecnt with mut = 0;
+let is i32 as _lv_ecap with mut = 0;
+
+fn _lv_reads_dest(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_CMOV) { return 1; }
+    return 0;
+}
+
+fn _lv_writes_dest(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_COPY) { return 0; }
+    return 1;
+}
+
+fn _lv_ends_block(op as i32) as i32 {
+    if (op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { return 1; }
+    return 0;
+}
+
+fn _lv_set(bs as *i64, v as i32) as void {
+    bs[v >> 6] = bs[v >> 6] | (cast(i64, 1) << cast(i64, v & 63));
+}
+
+fn _lv_clr(bs as *i64, v as i32) as void {
+    bs[v >> 6] = bs[v >> 6] & ((cast(i64, 1) << cast(i64, v & 63)) ^ (cast(i64, 0) - 1));
+}
+
+fn _lv_has(bs as *i64, v as i32) as i32 {
+    if (((bs[v >> 6] >> cast(i64, v & 63)) & 1) == 1) { return 1; }
+    return 0;
+}
+
+// The vreg an operand reads, or -1.
+fn _lv_opv(o as *d.Operand, n as i32) as i32 {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { return o.vreg; }
+    return 0 - 1;
+}
+
+fn _lv_edge(matrix as *u8, n as i32, degree as *i32, a as i32, b as i32) as void {
+    if (a == b || a < 0 || b < 0) { return; }
+    if (bm_test(matrix, n, a, b) == 1) { return; }
+    bm_set(matrix, n, a, b);
+    degree[a] = degree[a] + 1;
+    degree[b] = degree[b] + 1;
+    if (_lv_ecnt + 2 > _lv_ecap) {
+        let is i32 as ncap with mut = _lv_ecap * 2;
+        if (ncap < 1024) { ncap = 1024; }
+        let is *i32 as ne = cast(*i32, d.opt_alloc(cast(i64, ncap) * 4));
+        let is i32 as k with mut = 0;
+        while (k < _lv_ecnt) { ne[k] = _lv_edges[k]; k = k + 1; }
+        if (cast(i64, _lv_edges) != 0) { d.opt_free(cast(*u8, _lv_edges)); }
+        _lv_edges = ne;
+        _lv_ecap = ncap;
+    }
+    _lv_edges[_lv_ecnt] = a;
+    _lv_edges[_lv_ecnt + 1] = b;
+    _lv_ecnt = _lv_ecnt + 2;
+}
+
+// Edges from `def` to every vreg in `live`, except `skip`.
+fn _lv_edges_to_live(matrix as *u8, n as i32, degree as *i32, live as *i64, words as i32, def as i32, skip as i32) as void {
+    let is i32 as w with mut = 0;
+    while (w < words) {
+        let is i64 as bits = live[w];
+        if (bits != 0) {
+            let is i32 as j with mut = 0;
+            while (j < 64) {
+                if (((bits >> cast(i64, j)) & 1) == 1) {
+                    let is i32 as v = w * 64 + j;
+                    if (v != def && v != skip) { _lv_edge(matrix, n, degree, def, v); }
+                }
+                j = j + 1;
+            }
+        }
+        w = w + 1;
+    }
+}
+
+fn _lv_build(func as *d.IRFunction, n as i32, matrix as *u8, degree as *i32) as void {
+    let is i32 as words = (n + 63) / 64;
+    _lv_ecnt = 0;
+
+    // Instructions that reach the output (live ones, and every label), in order.
+    let is i32 as m with mut = 0;
+    let is *d.IRInst as x with mut = func.instructions;
+    while (cast(i64, x) != 0) {
+        if (x.is_dead == 0 || x.op == d.IR_LABEL) { m = m + 1; }
+        x = x.next;
+    }
+    if (m == 0) { return; }
+    let is *i64 as ins = cast(*i64, d.opt_alloc(cast(i64, m) * 8));
+    let is *i32 as bstart = cast(*i32, d.opt_alloc(cast(i64, m + 1) * 4));
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as label_blk = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as k with mut = 0;
+    while (k < lc) { label_blk[k] = 0 - 1; k = k + 1; }
+
+    // Blocks: a label starts one; a jump or return ends one.
+    let is i32 as nb with mut = 0;
+    let is i32 as open with mut = 0;
+    k = 0;
+    x = func.instructions;
+    while (cast(i64, x) != 0) {
+        if (x.is_dead == 0 || x.op == d.IR_LABEL) {
+            if (x.op == d.IR_LABEL) { open = 0; }
+            if (open == 0) { bstart[nb] = k; nb = nb + 1; open = 1; }
+            if (x.op == d.IR_LABEL && x.dest.label >= 0 && x.dest.label < lc) { label_blk[x.dest.label] = nb - 1; }
+            ins[k] = cast(i64, x);
+            k = k + 1;
+            if (_lv_ends_block(x.op) == 1) { open = 0; }
+        }
+        x = x.next;
+    }
+    bstart[nb] = m;
+
+    // Successors: the jump target, and the next block unless the block ends
+    // in an unconditional jump or a return.
+    let is *i32 as succ0 = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is *i32 as succ1 = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is i32 as b with mut = 0;
+    while (b < nb) {
+        succ0[b] = 0 - 1;
+        succ1[b] = 0 - 1;
+        let is *d.IRInst as last = cast(*d.IRInst, ins[bstart[b + 1] - 1]);
+        let is i32 as lop = last.op;
+        if (lop == d.IR_JMP || lop == d.IR_JZ || lop == d.IR_JNZ) {
+            if (last.dest.label >= 0 && last.dest.label < lc) { succ0[b] = label_blk[last.dest.label]; }
+        }
+        if (lop != d.IR_JMP && lop != d.IR_RET && b + 1 < nb) { succ1[b] = b + 1; }
+        b = b + 1;
+    }
+
+    // Per-block use (read before any write in the block) and def sets.
+    let is i64 as bs_bytes = cast(i64, nb) * cast(i64, words) * 8;
+    let is *i64 as use_bs = cast(*i64, d.opt_alloc(bs_bytes));
+    let is *i64 as def_bs = cast(*i64, d.opt_alloc(bs_bytes));
+    let is *i64 as in_bs = cast(*i64, d.opt_alloc(bs_bytes));
+    let is *i64 as out_bs = cast(*i64, d.opt_alloc(bs_bytes));
+    core.memzero(cast(*u8, use_bs), bs_bytes);
+    core.memzero(cast(*u8, def_bs), bs_bytes);
+    core.memzero(cast(*u8, in_bs), bs_bytes);
+    core.memzero(cast(*u8, out_bs), bs_bytes);
+    b = 0;
+    while (b < nb) {
+        let is *i64 as ub = cast(*i64, cast(i64, use_bs) + cast(i64, b) * cast(i64, words) * 8);
+        let is *i64 as db = cast(*i64, cast(i64, def_bs) + cast(i64, b) * cast(i64, words) * 8);
+        k = bstart[b];
+        while (k < bstart[b + 1]) {
+            let is *d.IRInst as y = cast(*d.IRInst, ins[k]);
+            if (y.op != d.IR_LABEL) {
+                let is i32 as u1 = _lv_opv(&y.src1, n);
+                let is i32 as u2 = _lv_opv(&y.src2, n);
+                if (u1 >= 0 && _lv_has(db, u1) == 0) { _lv_set(ub, u1); }
+                if (u2 >= 0 && _lv_has(db, u2) == 0) { _lv_set(ub, u2); }
+                let is i32 as dv = _lv_opv(&y.dest, n);
+                if (dv >= 0 && _lv_reads_dest(y.op) == 1 && _lv_has(db, dv) == 0) { _lv_set(ub, dv); }
+                if (dv >= 0 && _lv_writes_dest(y.op) == 1) { _lv_set(db, dv); }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+
+    // live_out(b) = union of live_in(succ); live_in(b) = use | (out & ~def).
+    // Backward order converges in a few rounds.
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        b = nb - 1;
+        while (b >= 0) {
+            let is i64 as boff = cast(i64, b) * cast(i64, words) * 8;
+            let is *i64 as ob = cast(*i64, cast(i64, out_bs) + boff);
+            let is *i64 as ib = cast(*i64, cast(i64, in_bs) + boff);
+            let is *i64 as ub = cast(*i64, cast(i64, use_bs) + boff);
+            let is *i64 as db = cast(*i64, cast(i64, def_bs) + boff);
+            let is *i64 as s0 with mut = cast(*i64, 0);
+            let is *i64 as s1 with mut = cast(*i64, 0);
+            if (succ0[b] >= 0) { s0 = cast(*i64, cast(i64, in_bs) + cast(i64, succ0[b]) * cast(i64, words) * 8); }
+            if (succ1[b] >= 0) { s1 = cast(*i64, cast(i64, in_bs) + cast(i64, succ1[b]) * cast(i64, words) * 8); }
+            let is i32 as w with mut = 0;
+            while (w < words) {
+                let is i64 as o with mut = 0;
+                if (cast(i64, s0) != 0) { o = o | s0[w]; }
+                if (cast(i64, s1) != 0) { o = o | s1[w]; }
+                ob[w] = o;
+                let is i64 as nin = ub[w] | (o & (db[w] ^ (cast(i64, 0) - 1)));
+                if (nin != ib[w]) { ib[w] = nin; changed = 1; }
+                w = w + 1;
+            }
+            b = b - 1;
+        }
+    }
+
+    // Interference: each block backwards from its live_out.
+    let is *i64 as live = cast(*i64, d.opt_alloc(cast(i64, words) * 8));
+    b = 0;
+    while (b < nb) {
+        let is *i64 as ob = cast(*i64, cast(i64, out_bs) + cast(i64, b) * cast(i64, words) * 8);
+        let is i32 as w with mut = 0;
+        while (w < words) { live[w] = ob[w]; w = w + 1; }
+        k = bstart[b + 1] - 1;
+        while (k >= bstart[b]) {
+            let is *d.IRInst as y = cast(*d.IRInst, ins[k]);
+            if (y.op != d.IR_LABEL) {
+                let is i32 as u1 = _lv_opv(&y.src1, n);
+                let is i32 as u2 = _lv_opv(&y.src2, n);
+                let is i32 as dv = _lv_opv(&y.dest, n);
+                let is i32 as u3 with mut = 0 - 1;
+                if (dv >= 0 && _lv_reads_dest(y.op) == 1) { u3 = dv; }
+                if (dv >= 0 && _lv_writes_dest(y.op) == 1) {
+                    // The copy source may share d's register — when both are
+                    // the same register class.
+                    let is i32 as skip with mut = 0 - 1;
+                    if (y.op == d.IR_MOV && u1 >= 0 && d.vreg_class_get(func, u1) == d.vreg_class_get(func, dv)) { skip = u1; }
+                    _lv_edges_to_live(matrix, n, degree, live, words, dv, skip);
+                    if (u1 != skip) { _lv_edge(matrix, n, degree, dv, u1); }
+                    _lv_edge(matrix, n, degree, dv, u2);
+                    _lv_clr(live, dv);
+                }
+                if (u1 >= 0) { _lv_set(live, u1); }
+                if (u2 >= 0) { _lv_set(live, u2); }
+                if (u3 >= 0) { _lv_set(live, u3); }
+            }
+            k = k - 1;
+        }
+        b = b + 1;
+    }
+
+    // Vregs read before any write on some path from the entry: no definition
+    // orders them, so they all interfere with each other.
+    let is i32 as v with mut = 0;
+    while (v < n) {
+        if (_lv_has(in_bs, v) == 1) {
+            let is i32 as v2 with mut = v + 1;
+            while (v2 < n) {
+                if (_lv_has(in_bs, v2) == 1) { _lv_edge(matrix, n, degree, v, v2); }
+                v2 = v2 + 1;
+            }
+        }
+        v = v + 1;
+    }
+
+    d.opt_free(cast(*u8, live));
+    d.opt_free(cast(*u8, use_bs));
+    d.opt_free(cast(*u8, def_bs));
+    d.opt_free(cast(*u8, in_bs));
+    d.opt_free(cast(*u8, out_bs));
+    d.opt_free(cast(*u8, succ0));
+    d.opt_free(cast(*u8, succ1));
+    d.opt_free(cast(*u8, label_blk));
+    d.opt_free(cast(*u8, bstart));
+    d.opt_free(cast(*u8, ins));
+}
+
+// === Postponed moves (Appel's activeMoves / EnableMoves) ===
+// A move whose George test fails is not retried on every step: its status
+// becomes MV_WAIT + the step it failed at. It is retried once a node it depends
+// on is woken — wake[x] records the last step x's degree fell below K (or x
+// absorbed a merge); waking x also wakes its neighbours, since the George test
+// of a move reads the degrees of its endpoint's neighbours. Without the
+// adjacency index everything wakes at once (_gc_wake_all).
+let is i32 as MV_WAIT with imut = 100;
+let is i32 as _gc_wake_all with mut = 0;
+
+fn _gc_wake(x as i32, step as i32, wake as *i32) as void {
+    wake[x] = step;
+    if (gadj_on == 0) { _gc_wake_all = step; return; }
+    let is i32 as k with mut = *(cast(*i32, cast(i64, gadj_head) + cast(i64, x) * 4));
+    while (k >= 0) {
+        let is i32 as y = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, k) * 4));
+        wake[y] = step;
+        k = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, k) * 4));
+    }
+}
+
+// Active or postponed: the move may still be coalesced.
+fn _mv_open(st as i32) as i32 {
+    if (st == 0 || st >= MV_WAIT) { return 1; }
+    return 0;
+}
+
 fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void {
     let is i32 as n = func.vreg_count;
     if (n == 0) {
@@ -268,10 +574,16 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     // mmap returns zeroed pages for large allocs — skip redundant memzero
     if (bm_bytes <= 65520) { core.memzero(matrix, bm_bytes); }
 
+    // -O2 builds the graph from liveness (see _lv_build); -O1 keeps the
+    // interval-overlap sweep below.
+    let is i32 as lv_mode with mut = 0;
+    if (core.al_opt_level >= 2) { lv_mode = 1; _lv_build(func, n, matrix, degree); }
+
     // Sorted sweep: iterate intervals in start-position order for early exit
     // ctx.intervals are already sorted by start after merge_sort
     let is i32 as iv_count = ctx.count;
     i = 0;
+    if (lv_mode == 1) { i = iv_count; }
     while (i < iv_count) {
         let is *core.LiveInterval as ia = gc2_get_iv(ctx.intervals, i);
         if (ia.start != INT_MAX) {
@@ -320,8 +632,14 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         while (i < n) { let is *i32 as hp = cast(*i32, cast(i64, gadj_head) + cast(i64, i) * 4); *hp = cast(i32, 0 - 1); i = i + 1; }
         gadj_top = 0;
         gadj_on = 1;
+        // Liveness mode recorded its edges as it went.
+        if (lv_mode == 1) {
+            let is i32 as ek with mut = 0;
+            while (ek < _lv_ecnt) { adj_add_edge(_lv_edges[ek], _lv_edges[ek + 1]); ek = ek + 2; }
+        }
         // Second sweep: same overlap logic, populate the lists.
         let is i32 as ai with mut = 0;
+        if (lv_mode == 1) { ai = iv_count; }
         while (ai < iv_count) {
             let is *core.LiveInterval as aa = gc2_get_iv(ctx.intervals, ai);
             if (aa.start != INT_MAX) {
@@ -459,7 +777,10 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
             let is i32 as vs = tinst.src1.vreg;
             let is i32 as vd = tinst.dest.vreg;
-            if (vs < n && vd < n) {
+            // A copy between a GPR and an XMM vreg can never share a register.
+            let is i32 as same_class with mut = 1;
+            if (lv_mode == 1 && vs < n && vd < n && d.vreg_class_get(func, vs) != d.vreg_class_get(func, vd)) { same_class = 0; }
+            if (vs < n && vd < n && same_class == 1) {
                 let is *GCMove as mv = cast(*GCMove, cast(i64, moves) + cast(i64, mi) * sizeof(GCMove));
                 mv.src = vs;
                 mv.dst = vd;
@@ -516,8 +837,13 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
 
     // === Main loop ===
     let is i32 as progress with mut = 1;
+    let is i32 as gc_step with mut = 0;
+    let is *i32 as wake = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    core.memzero(cast(*u8, wake), cast(i64, n) * 4);
+    _gc_wake_all = 0;
     while (progress == 1) {
         progress = 0;
+        gc_step = gc_step + 1;
 
         // 1. SIMPLIFY
         if (simplify_cnt > 0) {
@@ -544,6 +870,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         let is i32 as k_nb with mut = 10;
                         if (*cc_nb == 1) { k_nb = 5; }
                         if (*dnb == k_nb - 1) {
+                            _gc_wake(nb, gc_step, wake);
                             let is *i32 as mr_nb = cast(*i32, cast(i64, is_mr) + cast(i64, nb) * 4);
                             if (*mr_nb == 1) {
                                 wl_remove(spill_wl, &spill_cnt, nb);
@@ -567,13 +894,34 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             let is i32 as mci with mut = 0;
             while (mci < mov_count && did_coalesce == 0) {
                 let is *GCMove as mv = cast(*GCMove, cast(i64, moves) + cast(i64, mci) * sizeof(GCMove));
-                if (mv.status == 0) {
+                let is i32 as mv_try with mut = 0;
+                if (mv.status == 0) { mv_try = 1; }
+                else if (mv.status >= MV_WAIT) {
+                    let is i32 as since = mv.status - MV_WAIT;
+                    if (_gc_wake_all >= since) { mv_try = 1; }
+                    else {
+                        if (wake[gc2_resolve(alias, mv.src)] >= since) { mv_try = 1; }
+                        if (wake[gc2_resolve(alias, mv.dst)] >= since) { mv_try = 1; }
+                    }
+                }
+                if (mv_try == 1) {
                     let is i32 as a = gc2_resolve(alias, mv.src);
                     let is i32 as b = gc2_resolve(alias, mv.dst);
                     if (a == b) {
                         mv.status = 1;
                         did_coalesce = 1;
                     } else if (bm_test(matrix, n, a, b) == 1) {
+                        mv.status = 3;
+                        did_coalesce = 1;
+                    } else if (status[a] != 0 || status[b] != 0) {
+                        // One side is already on the select stack (picked as a
+                        // spill candidate while still move-related). Merging it
+                        // would put it back on a worklist and push it twice:
+                        // the move is frozen instead, as Appel's FreezeMoves does.
+                        mv.status = 2;
+                        did_coalesce = 1;
+                    } else if (ga_param[a] >= 0 && ga_param[b] >= 0 && ga_param[a] != ga_param[b]) {
+                        // Two parameters each keep their own ABI-register exclusion.
                         mv.status = 3;
                         did_coalesce = 1;
                     } else {
@@ -616,6 +964,9 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                             // Merge a into b
                             let is *i32 as al_a = cast(*i32, cast(i64, alias) + cast(i64, a) * 4);
                             *al_a = b;
+                            // A parameter keeps out of the other parameters' ABI
+                            // registers until GET_ARG has read them; b inherits that.
+                            if (ga_param[b] < 0) { ga_param[b] = ga_param[a]; }
                             let is *i32 as st_a = cast(*i32, cast(i64, status) + cast(i64, a) * 4);
                             *st_a = 2;
                             // Propagate call-crossing
@@ -626,8 +977,24 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                             let is *i32 as mr_a = cast(*i32, cast(i64, is_mr) + cast(i64, a) * 4);
                             let is *i32 as mr_b = cast(*i32, cast(i64, is_mr) + cast(i64, b) * 4);
                             *mr_b = *mr_b | *mr_a;
-                            // Transfer edges
+                            // Transfer edges. With the adjacency index, walk a's
+                            // neighbours; the full matrix row scan is the fallback
+                            // (and finishes the job if the index overflows midway —
+                            // re-adding an existing edge is a no-op).
+                            let is i32 as tk with mut = cast(i32, 0 - 1);
+                            if (gadj_on == 1) { tk = *(cast(*i32, cast(i64, gadj_head) + cast(i64, a) * 4)); }
+                            while (tk >= 0 && gadj_on == 1) {
+                                let is i32 as tl = *(cast(*i32, cast(i64, gadj_nbr) + cast(i64, tk) * 4));
+                                if (tl != a && tl != b && status[tl] == 0 && bm_test(matrix, n, tl, b) == 0) {
+                                    bm_set(matrix, n, tl, b);
+                                    adj_add_edge(tl, b);
+                                    degree[b] = degree[b] + 1;
+                                    degree[tl] = degree[tl] + 1;
+                                }
+                                tk = *(cast(*i32, cast(i64, gadj_nxt) + cast(i64, tk) * 4));
+                            }
                             t = 0;
+                            if (gadj_on == 1) { t = n; }
                             while (t < n) {
                                 if (t != a && t != b && bm_test(matrix, n, a, t) == 1) {
                                     let is *i32 as st_t2 = cast(*i32, cast(i64, status) + cast(i64, t) * 4);
@@ -675,6 +1042,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                         let is i32 as k_t3 with mut = 10;
                                         if (*cc_t3 == 1) { k_t3 = 5; }
                                         if (*dt3 < k_t3 && wl_in(t, 3) == 1) {
+                                            _gc_wake(t, gc_step, wake);
                                             wl_remove(spill_wl, &spill_cnt, t);
                                             let is *i32 as mr_t3 = cast(*i32, cast(i64, is_mr) + cast(i64, t) * 4);
                                             if (*mr_t3 == 1) {
@@ -690,6 +1058,9 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                             }
                             mv.status = 1;
                             did_coalesce = 1;
+                            _gc_wake(b, gc_step, wake);
+                        } else {
+                            mv.status = MV_WAIT + gc_step;
                         }
                     }
                 }
@@ -706,7 +1077,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                     let is i32 as fm with mut = 0;
                     while (fm < mov_count) {
                         let is *GCMove as fmv = cast(*GCMove, cast(i64, moves) + cast(i64, fm) * sizeof(GCMove));
-                        if (fmv.status == 0) {
+                        if (_mv_open(fmv.status) == 1) {
                             let is i32 as fa = gc2_resolve(alias, fmv.src);
                             let is i32 as fb = gc2_resolve(alias, fmv.dst);
                             if (fa == fv || fb == fv) {
@@ -719,7 +1090,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                 let is i32 as pm with mut = 0;
                                 while (pm < mov_count) {
                                     let is *GCMove as pmv = cast(*GCMove, cast(i64, moves) + cast(i64, pm) * sizeof(GCMove));
-                                    if (pmv.status == 0) {
+                                    if (_mv_open(pmv.status) == 1) {
                                         let is i32 as pa = gc2_resolve(alias, pmv.src);
                                         let is i32 as pb = gc2_resolve(alias, pmv.dst);
                                         if (pa == p || pb == p) { has_active = 1; }
@@ -797,6 +1168,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                 let is i32 as k_snb with mut = 10;
                                 if (*cc_snb == 1) { k_snb = 5; }
                                 if (*dsnb == k_snb - 1) {
+                                    _gc_wake(snb, gc_step, wake);
                                     let is *i32 as mr_snb = cast(*i32, cast(i64, is_mr) + cast(i64, snb) * 4);
                                     if (*mr_snb == 1) {
                                         wl_remove(spill_wl, &spill_cnt, snb);
@@ -1123,6 +1495,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     d.opt_free(cast(*u8, mh_off));
     d.opt_free(cast(*u8, mh_par));
     d.opt_free(cast(*u8, nsl));
+    d.opt_free(cast(*u8, wake));
     // Adjacency index (guard on the pointer: overflow can clear gadj_on while the
     // arrays are still allocated). Null them so the next function starts clean.
     if (cast(i64, gadj_head) != 0) {
@@ -1134,4 +1507,8 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
         gadj_nxt = cast(*i32, 0);
     }
     gadj_on = 0;
+    if (cast(i64, _lv_edges) != 0) { d.opt_free(cast(*u8, _lv_edges)); }
+    _lv_edges = cast(*i32, 0);
+    _lv_ecap = 0;
+    _lv_ecnt = 0;
 }
