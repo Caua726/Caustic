@@ -1,0 +1,273 @@
+use "defs.cst" as d;
+
+// === Loop rotation: the test moves to the bottom of the loop ===
+//
+// -O2 only. The front-end lays a while/for loop out as
+//
+//     Lh:  H            ; the test: a few pure instructions
+//          jz c, X      ; leave (or jnz)
+//          body
+//          jmp Lh       ; back-edge
+//
+// so every iteration takes two branches: the jmp back and the test. This pass
+// copies H to the back-edge and turns the jmp into the inverse branch:
+//
+//     Lh:  H
+//          jz c, X      ; now runs once, on entry (and on `continue` jumps)
+//     Lb:  body
+//          H'
+//          jnz c', Lb   ; one branch per iteration
+//          [jmp X]      ; only if X does not follow
+//
+// The program runs the same instructions in the same order: H runs before every
+// test exactly as before, once at Lh and then at the bottom. Only the layout
+// changes, and the code grows by one copy of H per loop.
+//
+// H is copied only when it is short (ROT_MAX_HDR instructions) and made of the
+// plain operations below. A value H computes for its own test gets a fresh vreg
+// in the copy; a header whose values are read elsewhere in the function is left
+// alone, so no vreg gains a second definition.
+//
+// Runs at codegen (emit_driver.cst), after the vectorizer, unroll and
+// if-conversion, which all match the loop in its original shape.
+
+let is i32 as ROT_MAX_HDR with imut = 8;
+let is i32 as ROT_MAX_LOOPS with imut = 256;
+
+fn _rot_hdr_op(op as i32) as i32 {
+    if (op == d.IR_IMM || op == d.IR_MOV || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
+        || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR
+        || op == d.IR_NEG || op == d.IR_NOT || op == d.IR_CAST || op == d.IR_LOAD
+        || op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { return 1; }
+    return 0;
+}
+
+fn _rot_clone(src as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n = d.new_inst(src.op);
+    n.dest = src.dest;
+    n.src1 = src.src1;
+    n.src2 = src.src2;
+    n.line = src.line;
+    n.cast_to = src.cast_to;
+    n.cast_from = src.cast_from;
+    n.global_name_ptr = src.global_name_ptr;
+    n.global_name_len = src.global_name_len;
+    n.is_extern_global = src.is_extern_global;
+    n.disp_tail_bytes = src.disp_tail_bytes;
+    return n;
+}
+
+fn _rot_count(o as *d.Operand, cnt as *i32, vc as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, cnt) + cast(i64, o.vreg) * 4);
+        *p = *p + 1;
+    }
+}
+
+fn _rot_uncount(o as *d.Operand, cnt as *i32, vc as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, cnt) + cast(i64, o.vreg) * 4);
+        *p = *p - 1;
+    }
+}
+
+fn _rot_get(arr as *i32, i as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, arr) + cast(i64, i) * 4);
+    return *p;
+}
+
+fn _rot_put(arr as *i32, i as i32, v as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, arr) + cast(i64, i) * 4);
+    *p = v;
+}
+
+// Rename a vreg operand of the copy through map (vreg -> new vreg, -1 = keep).
+fn _rot_rename(o as *d.Operand, map as *i32, vc as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc) {
+        let is i32 as nv = _rot_get(map, o.vreg);
+        if (nv >= 0) { o.vreg = nv; }
+    }
+}
+
+// Rotate the loop whose back-edge is `latch` (a live jmp to `hdr_lbl`).
+// Returns 1 if it did.
+fn _rot_one(func as *d.IRFunction, latch as *d.IRInst, hdr_lbl as i32) as i32 {
+    // Find the header label and the latch's predecessor.
+    let is *d.IRInst as lh with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as lprev with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as w with mut = func.instructions;
+    let is *d.IRInst as wprev with mut = cast(*d.IRInst, 0);
+    while (cast(i64, w) != 0) {
+        if (w.op == d.IR_LABEL && w.dest.label == hdr_lbl && cast(i64, lh) == 0) { lh = w; }
+        if (cast(i64, w) == cast(i64, latch)) { lprev = wprev; w = cast(*d.IRInst, 0); }
+        else { wprev = w; w = w.next; }
+    }
+    if (cast(i64, lh) == 0 || cast(i64, lprev) == 0) { return 0; }
+
+    // Header: live instructions after Lh up to the first conditional branch.
+    let is *d.IRInst as g with mut = cast(*d.IRInst, 0);
+    let is i32 as hn with mut = 0;
+    w = lh.next;
+    while (cast(i64, w) != 0 && cast(i64, g) == 0) {
+        if (cast(i64, w) == cast(i64, latch)) { return 0; }
+        if (w.is_dead == 0) {
+            if (w.op == d.IR_JZ || w.op == d.IR_JNZ) { g = w; }
+            else {
+                if (_rot_hdr_op(w.op) == 0) { return 0; }
+                hn = hn + 1;
+                if (hn > ROT_MAX_HDR) { return 0; }
+            }
+        }
+        if (cast(i64, g) == 0) { w = w.next; }
+    }
+    if (cast(i64, g) == 0) { return 0; }
+    if (g.dest.op_type != d.OP_LABEL) { return 0; }
+
+    // Every vreg H defines must be read only inside H and the test.
+    let is i32 as vc = func.vreg_count;
+    let is *i32 as cnt = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    let is *i32 as map = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    let is *i64 as immd = cast(*i64, d.opt_alloc(cast(i64, vc + 1) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        _rot_put(cnt, i, 0); _rot_put(map, i, 0 - 1);
+        let is *i64 as ip = cast(*i64, cast(i64, immd) + cast(i64, i) * 8); *ip = 0;
+        i = i + 1;
+    }
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        _rot_count(&w.dest, cnt, vc); _rot_count(&w.src1, cnt, vc); _rot_count(&w.src2, cnt, vc);
+        if (w.is_dead == 0 && w.op == d.IR_IMM && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is *i64 as ip = cast(*i64, cast(i64, immd) + cast(i64, w.dest.vreg) * 8); *ip = cast(i64, w);
+        }
+        w = w.next;
+    }
+    w = lh.next;
+    let is i32 as stop with mut = 0;
+    while (stop == 0) {
+        _rot_uncount(&w.dest, cnt, vc); _rot_uncount(&w.src1, cnt, vc); _rot_uncount(&w.src2, cnt, vc);
+        if (cast(i64, w) == cast(i64, g)) { stop = 1; } else { w = w.next; }
+    }
+    let is i32 as ok with mut = 1;
+    w = lh.next;
+    stop = 0;
+    while (stop == 0) {
+        if (cast(i64, w) != cast(i64, g) && w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            if (_rot_get(cnt, w.dest.vreg) != 0) { ok = 0; }
+        }
+        if (cast(i64, w) == cast(i64, g)) { stop = 1; } else { w = w.next; }
+    }
+    if (ok == 0) {
+        d.opt_free(cast(*u8, cnt)); d.opt_free(cast(*u8, map)); d.opt_free(cast(*u8, immd));
+        return 0;
+    }
+
+    // Fresh vregs for the copy.
+    w = lh.next;
+    stop = 0;
+    while (stop == 0) {
+        if (cast(i64, w) != cast(i64, g) && w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            if (_rot_get(map, w.dest.vreg) < 0) {
+                _rot_put(map, w.dest.vreg, func.vreg_count);
+                func.vreg_count = func.vreg_count + 1;
+            }
+        }
+        if (cast(i64, w) == cast(i64, g)) { stop = 1; } else { w = w.next; }
+    }
+
+    // Lb: the body's entry, right after the test.
+    let is i32 as lb = func.label_count;
+    func.label_count = func.label_count + 1;
+    let is *d.IRInst as lbi = d.new_inst(d.IR_LABEL);
+    lbi.dest = d.op_label(lb);
+    lbi.next = g.next;
+    g.next = lbi;
+
+    // H' and the inverted test, in place of the jmp.
+    let is *d.IRInst as tail with mut = lprev;
+    w = lh.next;
+    stop = 0;
+    while (stop == 0) {
+        if (cast(i64, w) != cast(i64, g) && w.is_dead == 0) {
+            let is *d.IRInst as c = _rot_clone(w);
+            // A compare against a constant hoisted out of the loop reads it as an
+            // immediate only while the constant has one use. The copy would be a
+            // second use, so it takes the value as an immediate operand.
+            let is i32 as s2 = w.src2.vreg;
+            if (w.op >= d.IR_EQ && w.op <= d.IR_GE && w.src2.op_type == d.OP_VREG && s2 >= 0 && s2 < vc
+                && _rot_get(map, s2) < 0 && _rot_get(cnt, s2) == 1) {
+                let is *i64 as ip = cast(*i64, cast(i64, immd) + cast(i64, s2) * 8);
+                if (*ip != 0) {
+                    let is *d.IRInst as k = cast(*d.IRInst, *ip);
+                    let is i64 as kv = k.src1.imm;
+                    if (k.src1.op_type == d.OP_IMM && kv >= (0 - 2147483647) && kv <= 2147483647) {
+                        c.src2 = d.op_imm(kv);
+                    }
+                }
+            }
+            _rot_rename(&c.dest, map, vc); _rot_rename(&c.src1, map, vc); _rot_rename(&c.src2, map, vc);
+            tail.next = c; tail = c;
+        }
+        if (cast(i64, w) == cast(i64, g)) { stop = 1; } else { w = w.next; }
+    }
+    let is i32 as inv with mut = d.IR_JNZ;
+    if (g.op == d.IR_JNZ) { inv = d.IR_JZ; }
+    let is *d.IRInst as br = d.new_inst(inv);
+    br.src1 = g.src1;
+    _rot_rename(&br.src1, map, vc);
+    br.dest = d.op_label(lb);
+    br.line = latch.line;
+    tail.next = br; tail = br;
+
+    // The test's exit, unless it is the next thing after the latch.
+    let is *d.IRInst as after with mut = latch.next;
+    while (cast(i64, after) != 0 && after.is_dead != 0) { after = after.next; }
+    let is i32 as falls with mut = 0;
+    if (cast(i64, after) != 0 && after.op == d.IR_LABEL && after.dest.label == g.dest.label) { falls = 1; }
+    if (falls == 0) {
+        let is *d.IRInst as ex = d.new_inst(d.IR_JMP);
+        ex.dest = d.op_label(g.dest.label);
+        ex.line = latch.line;
+        tail.next = ex; tail = ex;
+    }
+    tail.next = latch.next;
+
+    d.opt_free(cast(*u8, cnt)); d.opt_free(cast(*u8, map)); d.opt_free(cast(*u8, immd));
+    return 1;
+}
+
+fn pass_rotate(func as *d.IRFunction) as void {
+    // Latches: for each header label, the last live jmp back to it.
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as seen = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i64 as lat_sz = cast(i64, lc) * 8;
+    let is *i64 as lat = cast(*i64, d.opt_alloc(lat_sz));
+    let is i32 as i with mut = 0;
+    while (i < lc) {
+        _rot_put(seen, i, 0);
+        let is *i64 as lp = cast(*i64, cast(i64, lat) + cast(i64, i) * 8); *lp = 0;
+        i = i + 1;
+    }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.op == d.IR_LABEL && w.dest.label >= 0 && w.dest.label < lc) { _rot_put(seen, w.dest.label, 1); }
+        if (w.is_dead == 0 && w.op == d.IR_JMP && w.dest.op_type == d.OP_LABEL
+            && w.dest.label >= 0 && w.dest.label < lc && _rot_get(seen, w.dest.label) == 1) {
+            let is *i64 as lp = cast(*i64, cast(i64, lat) + cast(i64, w.dest.label) * 8);
+            *lp = cast(i64, w);
+        }
+        w = w.next;
+    }
+    let is i32 as done with mut = 0;
+    i = 0;
+    while (i < lc && done < ROT_MAX_LOOPS) {
+        let is *i64 as lp = cast(*i64, cast(i64, lat) + cast(i64, i) * 8);
+        if (*lp != 0) {
+            if (_rot_one(func, cast(*d.IRInst, *lp), i) == 1) { done = done + 1; }
+        }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, seen));
+    d.opt_free(cast(*u8, lat));
+}
