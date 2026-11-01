@@ -293,8 +293,12 @@ fn is_float_type(ty_ptr as *u8) as i32 {
 // Called after every integer arithmetic op whose result is a narrow type
 // so that subsequent 64-bit operations (cmp, load, spill) see the value
 // in the canonical wrapped representation.
+// Set around an ADD/SUB that lz_lazy_inst leaves unextended.
+let is i32 as lz_skip_narrow with mut = 0;
+
 fn emit_narrow_truncate(reg_idx as i32, cast_to as *u8) as void {
     if (cast(i64, cast_to) == 0) { return; }
+    if (lz_skip_narrow == 1 && _is_i32s(cast_to) == 1) { eo.sxd_clear(reg_idx); return; }
     if (is_float_type(cast_to) == 1) { return; }
     let is i32 as sz = get_type_size(cast_to);
     if (sz >= 8 || sz <= 0) { return; }
@@ -504,10 +508,219 @@ fn _sx32_get(v as i32) as i32 {
     return cast(i32, sx32[v]);
 }
 
+// === -O2: i32 sums left unextended ===
+//
+// An i32 ADD/SUB is followed by `movsxd r, r32` so the register holds the
+// sign-extended value. When nothing that reads the result looks above bit 31,
+// that movsxd is waste: the low 32 bits are right either way. Readers that
+// look only at the low half:
+//
+//   * an integer CAST: one from a value that may be unextended always emits
+//     its own extension (movsxd to i64/i32, movzx/movsx to narrower types);
+//   * a compare whose operands are both i32 values: it compares the 32-bit
+//     registers (cmp r32, r32);
+//   * another i32 ADD/SUB, whose own result is extended or left alone by
+//     this same rule;
+//   * a copy into a vreg whose readers are all of these.
+//
+// lz_tol[v]  every reader of v is one of the above (greatest fixpoint);
+// lz_i32v[v] every definition of v makes an i32 value (greatest fixpoint);
+// lz_pl[v]   v may hold an unextended value (least fixpoint from the ADD/SUBs
+//            whose dest is lz_tol, through copies).
+let is *u8 as lz_tol with mut = cast(*u8, 0);
+let is *u8 as lz_i32v with mut = cast(*u8, 0);
+let is *u8 as lz_pl with mut = cast(*u8, 0);
+let is i32 as lz_vc with mut = 0;
+
+fn _lz_get(a as *u8, v as i32) as i32 {
+    if (cast(i64, a) == 0 || v < 0 || v >= lz_vc) { return 0; }
+    return cast(i32, a[v]);
+}
+
+fn _lz_imm32(o as *d.Operand) as i32 {
+    if (o.op_type == d.OP_IMM && o.imm >= 0 - 2147483648 && o.imm <= 2147483647) { return 1; }
+    return 0;
+}
+
+// Both operands of an integer compare are i32 values.
+fn _lz_cmp_i32(inst as *d.IRInst) as i32 {
+    if (inst.op != d.IR_EQ && inst.op != d.IR_NE && inst.op != d.IR_LT && inst.op != d.IR_LE
+        && inst.op != d.IR_GT && inst.op != d.IR_GE) { return 0; }
+    if (is_float_type(inst.cast_to) == 1 || get_type_size(inst.cast_to) != 4) { return 0; }
+    if (inst.src1.op_type != d.OP_VREG || _lz_get(lz_i32v, inst.src1.vreg) == 0) { return 0; }
+    if (inst.src2.op_type == d.OP_VREG) { return _lz_get(lz_i32v, inst.src2.vreg); }
+    return _lz_imm32(&inst.src2);
+}
+
+fn _lz_is_addsub32(inst as *d.IRInst) as i32 {
+    if ((inst.op == d.IR_ADD || inst.op == d.IR_SUB) && _is_i32s(inst.cast_to) == 1
+        && inst.dest.op_type == d.OP_VREG) { return 1; }
+    return 0;
+}
+
+// Does `inst` read operand v (as src1 or src2) only through its low 32 bits?
+fn _lz_reader_ok(inst as *d.IRInst) as i32 {
+    let is i32 as op = inst.op;
+    if (op == d.IR_CAST) {
+        if (cast(i64, inst.cast_to) == 0 || is_float_type(inst.cast_to) == 1) { return 0; }
+        if (cast(i64, inst.cast_from) != 0 && is_float_type(inst.cast_from) == 1) { return 0; }
+        return 1;
+    }
+    if (_lz_cmp_i32(inst) == 1) { return 1; }
+    if (_lz_is_addsub32(inst) == 1) { return 1; }
+    if (op == d.IR_MOV && _is_split_copy(inst) == 0 && inst.dest.op_type == d.OP_VREG) {
+        return _lz_get(lz_tol, inst.dest.vreg);
+    }
+    return 0;
+}
+
+// This ADD/SUB, or cast to i32, leaves its result unextended: a cast to i32
+// whose readers all tolerate that is a plain copy.
+fn lz_lazy_inst(inst as *d.IRInst) as i32 {
+    if (_lz_is_addsub32(inst) == 0 && _lz_is_cast32(inst) == 0) { return 0; }
+    return _lz_get(lz_tol, inst.dest.vreg);
+}
+
+fn _lz_is_cast32(inst as *d.IRInst) as i32 {
+    if (_is_cast_to_i32s(inst) == 1 && inst.dest.op_type == d.OP_VREG && inst.src1.op_type == d.OP_VREG) { return 1; }
+    return 0;
+}
+
+fn lz_may_be_lazy(v as i32) as i32 { return _lz_get(lz_pl, v); }
+
+// A compare that must use the 32-bit registers: an operand may be unextended.
+fn lz_cmp32(inst as *d.IRInst) as i32 {
+    if (_lz_cmp_i32(inst) == 0) { return 0; }
+    if (inst.src1.op_type == d.OP_VREG && _lz_get(lz_pl, inst.src1.vreg) == 1) { return 1; }
+    if (inst.src2.op_type == d.OP_VREG && _lz_get(lz_pl, inst.src2.vreg) == 1) { return 1; }
+    return 0;
+}
+
+fn _lz_init(func as *d.IRFunction, vc as i32) as void {
+    if (cast(i64, lz_tol) != 0) { d.opt_free(lz_tol); d.opt_free(lz_i32v); d.opt_free(lz_pl); }
+    lz_tol = cast(*u8, 0); lz_i32v = cast(*u8, 0); lz_pl = cast(*u8, 0);
+    lz_vc = 0;
+    if (al.al_opt_level < 2) { return; }
+    lz_vc = vc;
+    lz_tol = d.opt_alloc(cast(i64, vc) + 1);
+    lz_i32v = d.opt_alloc(cast(i64, vc) + 1);
+    lz_pl = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as i with mut = 0;
+    while (i < vc) { lz_tol[i] = cast(u8, 1); lz_i32v[i] = cast(u8, 0); lz_pl[i] = cast(u8, 0); i = i + 1; }
+
+    // lz_i32v: start at "has a definition", clear what a definition can't vouch for.
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+            && _dest_is_read(inst.op) == 0) { lz_i32v[inst.dest.vreg] = cast(u8, 1); }
+        inst = inst.next;
+    }
+    let is i32 as chg with mut = 1;
+    while (chg == 1) {
+        chg = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+                && _dest_is_read(inst.op) == 0 && lz_i32v[inst.dest.vreg] == cast(u8, 1)) {
+                let is i32 as ok with mut = 0;
+                let is i32 as op = inst.op;
+                if (_is_cast_to_i32s(inst) == 1) { ok = 1; }
+                else if ((op == d.IR_LOAD || op == d.IR_ADD || op == d.IR_SUB) && _is_i32s(inst.cast_to) == 1) { ok = 1; }
+                else if (op == d.IR_IMM) { ok = _lz_imm32(&inst.src1); }
+                else if (op == d.IR_MOV) {
+                    if (inst.src1.op_type == d.OP_VREG) { ok = _lz_get(lz_i32v, inst.src1.vreg); }
+                    else { ok = _lz_imm32(&inst.src1); }
+                }
+                if (ok == 0) { lz_i32v[inst.dest.vreg] = cast(u8, 0); chg = 1; }
+            }
+            inst = inst.next;
+        }
+    }
+
+    // A value that is widened to 64 bits somewhere gets its extension where
+    // it is made, as before: one movsxd at the definition costs no more than
+    // one at the widening, and keeps it off the address the widening feeds
+    // (a plain copy is free, a movsxd is not). Mark every vreg whose value can
+    // reach a widening cast through copies and i32 casts, and keep it out.
+    let is *u8 as wid = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { wid[i] = cast(u8, 0); i = i + 1; }
+    chg = 1;
+    while (chg == 1) {
+        chg = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc
+                && wid[inst.src1.vreg] == cast(u8, 0)) {
+                let is i32 as w with mut = 0;
+                if (inst.op == d.IR_CAST && cast(i64, inst.cast_to) != 0 && is_float_type(inst.cast_to) == 0
+                    && get_type_size(inst.cast_to) == 8) { w = 1; }
+                if ((inst.op == d.IR_MOV || _lz_is_cast32(inst) == 1) && inst.dest.op_type == d.OP_VREG
+                    && inst.dest.vreg >= 0 && inst.dest.vreg < vc && wid[inst.dest.vreg] == cast(u8, 1)) { w = 1; }
+                if (w == 1) { wid[inst.src1.vreg] = cast(u8, 1); chg = 1; }
+            }
+            inst = inst.next;
+        }
+    }
+    i = 0;
+    while (i < vc) { if (wid[i] == cast(u8, 1)) { lz_tol[i] = cast(u8, 0); } i = i + 1; }
+    d.opt_free(wid);
+
+    // lz_tol: clear every vreg some reader needs whole.
+    chg = 1;
+    while (chg == 1) {
+        chg = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0) {
+                let is i32 as rok = _lz_reader_ok(inst);
+                if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc
+                    && lz_tol[inst.src1.vreg] == cast(u8, 1) && rok == 0) {
+                    lz_tol[inst.src1.vreg] = cast(u8, 0); chg = 1;
+                }
+                if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc
+                    && lz_tol[inst.src2.vreg] == cast(u8, 1) && rok == 0) {
+                    lz_tol[inst.src2.vreg] = cast(u8, 0); chg = 1;
+                }
+                if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+                    && _dest_is_read(inst.op) == 1 && lz_tol[inst.dest.vreg] == cast(u8, 1)) {
+                    lz_tol[inst.dest.vreg] = cast(u8, 0); chg = 1;
+                }
+                // A MOV reader is judged by its dest, which may still change.
+            }
+            inst = inst.next;
+        }
+    }
+
+    // lz_pl: from the lazy ADD/SUBs through copies.
+    chg = 1;
+    while (chg == 1) {
+        chg = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+                && lz_pl[inst.dest.vreg] == cast(u8, 0)) {
+                let is i32 as p with mut = 0;
+                if (lz_lazy_inst(inst) == 1) {
+                    p = 1;
+                    // A lazy cast of an extended i32 copies an extended value.
+                    if (_lz_is_cast32(inst) == 1 && _lz_get(lz_i32v, inst.src1.vreg) == 1
+                        && _lz_get(lz_pl, inst.src1.vreg) == 0) { p = 0; }
+                }
+                if (inst.op == d.IR_MOV && inst.src1.op_type == d.OP_VREG && _lz_get(lz_pl, inst.src1.vreg) == 1) { p = 1; }
+                if (p == 1) { lz_pl[inst.dest.vreg] = cast(u8, 1); chg = 1; }
+            }
+            inst = inst.next;
+        }
+    }
+}
+
 // Does this definition leave its dest sign-extended as an i32?
 fn _sx32_def_ok(inst as *d.IRInst) as i32 {
     let is i32 as op = inst.op;
+    if (_lz_is_cast32(inst) == 1 && _lz_get(lz_pl, inst.dest.vreg) == 1) { return 0; }
     if (_is_cast_to_i32s(inst) == 1) { return 1; }
+    if ((op == d.IR_ADD || op == d.IR_SUB) && lz_lazy_inst(inst) == 1) { return 0; }
     if (op == d.IR_LOAD || op == d.IR_ADD || op == d.IR_SUB) { return _is_i32s(inst.cast_to); }
     if (op == d.IR_IMM) {
         if (inst.src1.imm >= 0 - 2147483648 && inst.src1.imm <= 2147483647) { return 1; }
@@ -550,6 +763,7 @@ fn sx32_init(func as *d.IRFunction) as void {
     sx32_vc = vc;
     sx32 = d.opt_alloc(cast(i64, vc) + 1);
     argx32 = d.opt_alloc(cast(i64, vc) + 1);
+    _lz_init(func, vc);
     let is i32 as i with mut = 0;
     while (i < vc) { sx32[i] = cast(u8, 0); argx32[i] = cast(u8, 0); i = i + 1; }
 
@@ -673,7 +887,9 @@ fn casts_to_moves(func as *d.IRFunction) as void {
             && d.vreg_class_get(func, inst.dest.vreg) == d.VR_GPR
             && d.vreg_class_get(func, inst.src1.vreg) == d.VR_GPR) {
             let is i32 as sz = get_type_size(inst.cast_to);
-            if (sz == 8 || (_is_cast_to_i32s(inst) == 1 && _sx32_get(inst.src1.vreg) == 1)) {
+            if ((sz == 8 && lz_may_be_lazy(inst.src1.vreg) == 0)
+                || (_is_cast_to_i32s(inst) == 1 && _sx32_get(inst.src1.vreg) == 1)
+                || lz_lazy_inst(inst) == 1) {
                 inst.op = d.IR_MOV;
             }
         }

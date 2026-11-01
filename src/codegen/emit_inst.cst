@@ -958,6 +958,31 @@ fn try_and_test(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     return 1;
 }
 
+// The flag-setting part of an i32 compare whose operand may be unextended
+// (e.lz_cmp32): the 32-bit registers, or the low dword of a spill slot.
+// `s1` is the scratch for src1 when it is not in a register.
+fn _cmp32_flags(inst as *d.IRInst, ctx as *al.AllocCtx, s1 as i32) as void {
+    let is *u8 as r1 = eo.reg32(e.op_reg_idx(inst.src1.vreg, ctx, s1));
+    let is i64 as imm_val = cmp_try_inline_imm(inst);
+    if (imm_val != cast(i64, 0) - cast(i64, 9999999999)) {
+        if (imm_val == 0) {
+            eo.out_str("  test ", 7); eo.out_cstr(r1); eo.out_str(", ", 2); eo.out_cstr(r1); eo.out_char(10);
+        } else {
+            eo.out_str("  cmp ", 6); eo.out_cstr(r1); eo.out_str(", ", 2); eo.out_int(imm_val); eo.out_char(10);
+        }
+        return;
+    }
+    eo.out_str("  cmp ", 6); eo.out_cstr(r1); eo.out_str(", ", 2);
+    let is i32 as loc = al.get_loc(inst.src2.vreg, ctx);
+    if (loc >= 0 && loc < 16) {
+        eo.out_cstr(eo.reg32(loc));
+    } else {
+        let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        eo.out_str("DWORD PTR [", 11); eo.out_fp(off); eo.out_str("]", 1);
+    }
+    eo.out_char(10);
+}
+
 fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     let is i32 as is_flt = e.is_float_type(inst.cast_to);
@@ -972,6 +997,8 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 let is *u8 as xr = e.op_reg(test_and_src, ctx, 0);
                 eo.out_str("  test ", 7); eo.out_cstr(xr); eo.out_str(", ", 2);
                 eo.out_int(test_and_imm); eo.out_char(10);
+            } else if (is_flt == 0 && e.lz_cmp32(inst) == 1) {
+                _cmp32_flags(inst, ctx, 0);
             } else if (is_flt == 1) {
                 // Unordered sets CF/ZF/PF together. Parity distinguishes it
                 // from equality and less-than before using unsigned conditions.
@@ -1047,9 +1074,21 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             let is i64 as imm_val2 = cmp_try_inline_imm(inst);
             let is i32 as has_imm2 with mut = 0;
             if (imm_val2 != cast(i64, 0) - cast(i64, 9999999999)) { has_imm2 = 1; }
-            let is *u8 as cr2 = e.op_reg(inst.src1.vreg, ctx, 1);
+            let is i32 as c32 = e.lz_cmp32(inst);
+            let is *u8 as cr2 with mut = "rcx";
+            if (c32 == 0) { cr2 = e.op_reg(inst.src1.vreg, ctx, 1); }
             eo.out_line("xor eax, eax");
-            if (has_imm2 == 1 && imm_val2 == 0) {
+            if (c32 == 1) {
+                if (has_imm2 == 1) {
+                    // cmp_try_inline_imm already took the constant; say it again.
+                    let is *u8 as r1 = eo.reg32(e.op_reg_idx(inst.src1.vreg, ctx, 1));
+                    if (imm_val2 == 0) { eo.out_str("  test ", 7); eo.out_cstr(r1); eo.out_str(", ", 2); eo.out_cstr(r1); }
+                    else { eo.out_str("  cmp ", 6); eo.out_cstr(r1); eo.out_str(", ", 2); eo.out_int(imm_val2); }
+                    eo.out_char(10);
+                } else {
+                    _cmp32_flags(inst, ctx, 1);
+                }
+            } else if (has_imm2 == 1 && imm_val2 == 0) {
                 eo.out_str("  test ", 7); eo.out_cstr(cr2); eo.out_str(", ", 2); eo.out_cstr(cr2); eo.out_char(10);
             } else if (has_imm2 == 1) {
                 eo.out_str("  cmp ", 6); eo.out_cstr(cr2); eo.out_str(", ", 2);
@@ -1695,8 +1734,12 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // Already a sign-extended i32 (e.sx32_init): the movsxd would change nothing.
     let is i32 as already_sx with mut = 0;
     if (al.al_opt_level >= 1 && to_sz == 4 && sgn == 1 && e.sx32_is(inst.src1.vreg) == 1) { already_sx = 1; }
+    if (to_sz == 4 && sgn == 1 && e.lz_lazy_inst(inst) == 1) { already_sx = 1; }
     if (already_sx == 1) {
         // copy only
+    } else if (to_sz == 8 && e.lz_may_be_lazy(inst.src1.vreg) == 1) {
+        // An i32 left unextended (e.lz_init) is extended where it is widened.
+        eo.out_str("  movsxd ", 9); eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_cstr(eo.reg32(si)); eo.out_char(10);
     } else if (to_sz == 4) {
         if (sgn == 1) { eo.out_str("  movsxd ", 9); eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_cstr(eo.reg32(si)); eo.out_char(10); }
         else { eo.out_str("  mov ", 6); eo.out_cstr(eo.reg32(si)); eo.out_str(", ", 2); eo.out_cstr(eo.reg32(si)); eo.out_char(10); }
