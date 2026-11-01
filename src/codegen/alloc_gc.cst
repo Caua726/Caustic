@@ -800,7 +800,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     let is i32 as mov_count with mut = 0;
     tinst = func.instructions;
     while (cast(i64, tinst) != 0) {
-        if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
+        if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.is_extern_call != cast(i8, 2) && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
             mov_count = mov_count + 1;
         }
         tinst = tinst.next;
@@ -810,7 +810,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     let is i32 as mi with mut = 0;
     tinst = func.instructions;
     while (cast(i64, tinst) != 0) {
-        if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
+        if (tinst.is_dead == 0 && tinst.op == d.IR_MOV && tinst.is_extern_call != cast(i8, 2) && tinst.src1.op_type == d.OP_VREG && tinst.dest.op_type == d.OP_VREG) {
             let is i32 as vs = tinst.src1.vreg;
             let is i32 as vd = tinst.dest.vreg;
             // A copy between a GPR and an XMM vreg can never share a register.
@@ -1281,6 +1281,27 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     }
     d.opt_free(cast(*u8, mh_cur));
 
+    // -O2: `d = s1 op s2` with d tied to s1 (_lv_tie_src1) costs no copy when d
+    // and s1 share a register. Remember one such partner per vreg, both ways,
+    // as a colour hint for SELECT (after the move partners).
+    let is *i32 as tie_par = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    i = 0;
+    while (i < n) { let is *i32 as tp0 = cast(*i32, cast(i64, tie_par) + cast(i64, i) * 4); *tp0 = cast(i32, 0 - 1); i = i + 1; }
+    if (lv_mode == 1) {
+        let is *d.IRInst as ti with mut = func.instructions;
+        while (cast(i64, ti) != 0) {
+            if (ti.is_dead == 0 && _lv_tie_src1(ti) == 1 && ti.dest.op_type == d.OP_VREG && ti.src1.op_type == d.OP_VREG
+                && ti.dest.vreg >= 0 && ti.dest.vreg < n && ti.src1.vreg >= 0 && ti.src1.vreg < n
+                && d.vreg_class_get(func, ti.dest.vreg) == d.vreg_class_get(func, ti.src1.vreg)) {
+                let is *i32 as tpd = cast(*i32, cast(i64, tie_par) + cast(i64, ti.dest.vreg) * 4);
+                let is *i32 as tps = cast(*i32, cast(i64, tie_par) + cast(i64, ti.src1.vreg) * 4);
+                *tpd = ti.src1.vreg;
+                *tps = ti.dest.vreg;
+            }
+            ti = ti.next;
+        }
+    }
+
     // === SELECT: pop stack LIFO, assign colors ===
     while (stack_top > 0) {
         stack_top = stack_top - 1;
@@ -1395,6 +1416,27 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                 hk = hk + 1;
             }
 
+            // -O2: a value that lives across no call takes a caller-saved
+            // register first (slots 4..8: r8 r9 r10 rsi rdi). A callee-saved
+            // one costs a push/pop in the prologue, and the part of the
+            // function before a shrink-wrapped prologue may use none.
+            if (chosen < 0 && lv_mode == 1) {
+                let is i32 as tpv = *(cast(*i32, cast(i64, tie_par) + cast(i64, v) * 4));
+                if (tpv >= 0) {
+                    let is *i32 as cpt = cast(*i32, cast(i64, color) + cast(i64, gc2_resolve(alias, tpv)) * 4);
+                    if (*cpt >= 0) {
+                        let is i32 as pts = core.reg_to_slot(*cpt);
+                        if (pts >= 0 && used[pts] == 0) { chosen = *cpt; }
+                    }
+                }
+            }
+            if (chosen < 0 && lv_mode == 1 && *cc_v == 0) {
+                ri = 4;
+                while (ri < 9 && chosen < 0) {
+                    if (used[ri] == 0) { chosen = regs[ri]; }
+                    ri = ri + 1;
+                }
+            }
             if (chosen < 0) {
                 ri = 0;
                 while (ri < 10 && chosen < 0) {
@@ -1520,6 +1562,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     d.opt_free(cast(*u8, status));
     d.opt_free(cast(*u8, is_mr));
     d.opt_free(cast(*u8, spill_cost));
+    d.opt_free(cast(*u8, tie_par));
     d.opt_free(cast(*u8, crosses_call));
     d.opt_free(matrix);
     d.opt_free(cast(*u8, moves));

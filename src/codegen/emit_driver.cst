@@ -15,6 +15,7 @@ use "emit.cst" as e;
 use "emit_inst.cst" as ei;
 use "target.cst" as tgt;
 use "dynsyms.cst" as dyns;
+use "shrinkwrap.cst" as sw;
 
 // Dynamic-stdlib mode (-lcaustic on an ELF/PE target): functions whose mangled
 // name starts with "_std_" are provided by libcaustic.so at runtime, so we
@@ -127,6 +128,162 @@ fn _frame_makes_calls(func as *d.IRFunction) as i32 {
     return 0;
 }
 
+// CFI for a push in a function without a frame pointer: the k-th push leaves
+// rsp at CFA - 8 - 8k (the CFA is the caller's rsp, past the return address).
+fn _cfi_push(reg as *u8, k as i32) as void {
+    eo.out_str(".cfi_def_cfa_offset ", 20); eo.out_int(cast(i64, 8 + 8 * k)); eo.out_char(10);
+    eo.out_str(".cfi_offset ", 12); eo.out_cstr(reg); eo.out_str(", -", 3); eo.out_int(cast(i64, 8 + 8 * k)); eo.out_char(10);
+}
+
+// The CFA inside the framed part / at a frameless block (shrink-wrapping).
+fn _cfa_framed(push_count as i32) as void {
+    if (eo.fp_omit == 1) {
+        eo.out_str(".cfi_def_cfa_offset ", 20);
+        eo.out_int(8 + eo.fp_bias);
+        eo.out_char(10);
+        return;
+    }
+    eo.out_line(".cfi_def_cfa_register rbp");
+    eo.out_line(".cfi_def_cfa_offset 16");
+}
+
+fn _cfa_frameless() as void {
+    if (eo.fp_omit == 0) { eo.out_line(".cfi_def_cfa_register rsp"); }
+    eo.out_line(".cfi_def_cfa_offset 8");
+}
+
+// -O2: can this function run without rbp as a frame pointer? Its frame is then
+// addressed from rsp (eo.out_fp), which needs rsp fixed in the body after the
+// prologue. Kept: hand-written asm (it may name rbp or move rsp; the compiler
+// also pads calls with stack arguments through asm), variadics (their save
+// area and overflow pointer are rbp-based), stack-passed parameters, FFI calls
+// (they move rsp around the call). std/exceptions.cst's backtrace unwinds
+// through such a frame with the CFI emitted here (.eh_frame). rbp is never
+// written in it, so the frame-pointer chain stays valid too, pointing at the
+// nearest caller that kept rbp. A program that becomes a dynamic executable
+// through an `extern "lib.so"` call gets no .eh_frame from caustic-ld (only the
+// static writer builds it), so its backtrace falls back to that chain and
+// lists only the frames that kept rbp.
+fn _frame_can_omit_fp(func as *d.IRFunction) as i32 {
+    if (al.al_opt_level < 2 || func.is_naked == 1 || func.is_variadic == 1 || func.num_args > 6) { return 0; }
+    // Only where the image carries unwind tables: std/exceptions.cst's
+    // backtrace walks them, and the frame-pointer chain where they are absent.
+    if (tgt.unwind_tables() == 0) { return 0; }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_ASM || op == d.IR_FFI_CALL || op == d.IR_VA_START) { return 0; }
+            if (op == d.IR_SET_ARG && inst.dest.imm >= 6) { return 0; }
+            if (op == d.IR_GET_ARG && inst.src1.imm >= 6) { return 0; }
+        }
+        inst = inst.next;
+    }
+    return 1;
+}
+
+// The prologue: CausticOS stack probe, push rbp / mov rbp, rsp, the
+// callee-saved pushes, the frame body and the variadic save area. At the entry,
+// or at the shrink-wrap point (shrinkwrap.cst).
+fn _emit_prologue(func as *d.IRFunction, ctx as *al.AllocCtx, push_count as i32, total as i32,
+                  local_size as i32, spill_size as i32, alloc_size as i32) as void {
+    let is i32 as mask = ctx.used_callee_mask;
+    // Dynamic-stack probe (recursion/indirect programs). Before this frame
+    // descends — pushes AND sub rsp — make sure the committed stack reaches the
+    // lowest address it (plus the grow helper) will touch; if not,
+    // __caustic_stkgrow commits more via SYS_COMMIT. Emitted ABOVE the pushes so
+    // it guards them too. rax is caller-saved scratch at entry (never an arg),
+    // so clobbering it here is free; the helper preserves everything else. Every
+    // function probes because recursion can place any of them at unbounded
+    // depth. The helper itself is hand-emitted (not via gen_func) so it never
+    // probes itself.
+    //
+    // How far the stack is committed is the RUNNING THREAD's: fs:[0], the
+    // first word of its thread block (CausticOS abi.THREAD_BLOCK_*). It was a
+    // single global, the first thread's — so the first call any other thread
+    // made compared its own stack against the first one's and ended the
+    // process trying to commit the space in between.
+    if (tgt.target_get().object_format == 3 && tgt.cse_stack_dynamic_get() == 1 && func.is_naked == 0) {
+        let is i32 as descent with mut = (1 + push_count) * 8 + total;
+        if (eo.fp_omit == 1) { descent = push_count * 8 + total; }
+        let is i64 as pid2 = cast(i64, sa_probe_counter);
+        sa_probe_counter = sa_probe_counter + 1;
+        eo.out_cstr("  lea rax, [rsp-");
+        eo.out_int(cast(i64, descent) + cast(i64, SA_PROBE_MARGIN));
+        eo.out_cstr("]\n");
+        eo.out_cstr("  cmp rax, QWORD PTR fs:[0]\n");
+        eo.out_cstr("  jae .Lsk");
+        eo.out_int(pid2);
+        eo.out_cstr("\n");
+        eo.out_cstr("  call __caustic_stkgrow\n");
+        eo.out_cstr(".Lsk");
+        eo.out_int(pid2);
+        eo.out_cstr(":\n");
+    }
+
+    // Prologue — skipped entirely for `with naked` functions (asm-only body
+    // takes full control of the stack; e.g. clone trampolines / ABI shims).
+    if (func.is_naked == 0 && eo.fp_omit == 1) {
+        // No frame pointer: the CFA stays rsp-based and moves with each push.
+        let is i32 as k with mut = 0;
+        if (mask & 1) { k = k + 1; eo.out_line("push rbx"); _cfi_push("rbx", k); }
+        if (mask & 2) { k = k + 1; eo.out_line("push r12"); _cfi_push("r12", k); }
+        if (mask & 4) { k = k + 1; eo.out_line("push r13"); _cfi_push("r13", k); }
+        if (mask & 8) { k = k + 1; eo.out_line("push r14"); _cfi_push("r14", k); }
+        if (mask & 16) { k = k + 1; eo.out_line("push r15"); _cfi_push("r15", k); }
+    }
+    if (func.is_naked == 0) {
+    if (eo.fp_omit == 0) {
+    eo.out_line("push rbp");
+    eo.out_line(".cfi_def_cfa_offset 16");
+    eo.out_line(".cfi_offset rbp, -16");
+    eo.out_line("mov rbp, rsp");
+    eo.out_line(".cfi_def_cfa_register rbp");
+    if (mask & 1) { eo.out_line("push rbx"); eo.out_line(".cfi_offset rbx, -24"); }
+    if (mask & 2) { eo.out_line("push r12"); eo.out_line(".cfi_offset r12, -32"); }
+    if (mask & 4) { eo.out_line("push r13"); eo.out_line(".cfi_offset r13, -40"); }
+    if (mask & 8) { eo.out_line("push r14"); eo.out_line(".cfi_offset r14, -48"); }
+    if (mask & 16) { eo.out_line("push r15"); eo.out_line(".cfi_offset r15, -56"); }
+    }
+    if (ctx.aligned_stack_size > 0) {
+        // Windows: frames ≥ 4 KiB must probe guard pages before allocating,
+        // or the kernel refuses to commit the stack and raises a fault on
+        // the first store past the current commit limit. We call into
+        // __caustic_chkstk (emitted once by the PE linker) which touches
+        // each 4 KiB page descending from rsp, then we do the actual
+        // `sub rsp, rax`. Linux and small Windows frames keep the simple
+        // single-instruction prologue.
+        if (tgt.target_get().object_format == 2 && ctx.aligned_stack_size >= 4096) {
+            eo.out_str("  mov rax, ", 11);
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
+            eo.out_line("call __caustic_chkstk");
+            eo.out_line("sub rsp, rax");
+        } else {
+            eo.out_str("  sub rsp, ", 11);
+            eo.out_int(cast(i64, ctx.aligned_stack_size));
+            eo.out_char(10);
+        }
+        if (eo.fp_omit == 1) { _cfa_framed(push_count); }
+    }
+
+    // Variadic prologue: save 6 arg registers to register save area
+    if (func.is_variadic == 1) {
+        // va_save_offset = total offset from rbp to start of 48-byte save area
+        // Layout: [rbp - va_save_offset] = rdi (first), ..., [rbp - va_save_offset + 40] = r9 (last)
+        let is i32 as vso = local_size + spill_size + alloc_size + 48;
+        ctx.va_save_offset = vso;
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso)); eo.out_str("], rdi\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 8)); eo.out_str("], rsi\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 16)); eo.out_str("], rdx\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 24)); eo.out_str("], rcx\n", 7);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 32)); eo.out_str("], r8\n", 6);
+        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 40)); eo.out_str("], r9\n", 6);
+    }
+    }
+
+}
+
 fn gen_func(func as *d.IRFunction) as void {
     // -O2 loop unrolling: runs HERE (post-optimize, pre-regalloc) — never inside
     // optimize_func — because it reuses vregs across unrolled copies, which would
@@ -148,20 +305,31 @@ fn gen_func(func as *d.IRFunction) as void {
     // -O2 loop rotation: the test moves to the bottom, one branch per iteration.
     // After the passes above, which match loops in their original shape.
     if (al.al_opt_level >= 2) { rot.pass_rotate(func); }
+    // -O2 shrink-wrapping: plan where the prologue goes (shrinkwrap.cst). The
+    // split copies it inserts must exist before the use counts below.
+    sw.sw_reset();
+    if (al.al_opt_level >= 2) { sw.sw_plan(func); }
+    // Allocation runs at most twice: a shrink-wrap plan the allocation rejects
+    // is undone and the function allocated again without it.
+    let is *al.AllocCtx as ctx with mut = cast(*al.AllocCtx, 0);
+    let is i32 as attempt with mut = 0;
+    while (attempt < 2) {
     // Init register cache, instruction selection use counts, and def table
     eo.rc_init();
     eo.peep_reset();
     if (al.al_opt_level >= 1) {
+        if (attempt == 1) { d.opt_free(cast(*u8, e.isel_uses)); d.opt_free(cast(*u8, e.isel_defs)); }
         e.isel_init(func);
         e.isel_init_defs(func);
         e.sx32_init(func);
     }
 
     // Build intervals and allocate registers
-    let is *al.AllocCtx as ctx = al.new_alloc_ctx();
+    ctx = al.new_alloc_ctx();
     ctx.func = cast(*u8, func);
     ctx.next_spill = 1;
 
+    if (attempt == 1 && cast(i64, func.vreg_class) != 0) { d.opt_free(cast(*u8, func.vreg_class)); func.vreg_class = cast(*i32, 0); }
     d.infer_vreg_classes(func);
     if (al.al_opt_level >= 2) { e.casts_to_moves(func); }
     al.build_intervals(func, ctx);
@@ -176,6 +344,18 @@ fn gen_func(func as *d.IRFunction) as void {
         io.write_str(io.STDERR, " spills=");
         io.write_int(io.STDERR, cast(i64, ctx.stack_slots));
         io.write_str(io.STDERR, "\n");
+    }
+    // The frameless part must have come out of allocation using no
+    // callee-saved register and no spill slot; otherwise undo the split and
+    // allocate again with the prologue at the entry.
+    sw.sw_check(func, ctx);
+    if (sw.sw_planned == 1 && sw.sw_active == 0) {
+        sw.sw_undo(func);
+        al.free_alloc_ctx(ctx);
+        attempt = attempt + 1;
+    } else {
+        attempt = 2;
+    }
     }
 
     // Count callee-saved pushes from mask bits
@@ -219,23 +399,27 @@ fn gen_func(func as *d.IRFunction) as void {
     // Align total to 16-byte boundary considering call(8) + push rbp(8) + pushes.
     // The alignment only matters to a callee: a function that calls nothing and
     // has nothing on the stack keeps rsp where the pushes left it.
-    let is i32 as frame_fixed = 16 + push_count * 8;
+    eo.fp_omit = _frame_can_omit_fp(func);
+    let is i32 as frame_fixed with mut = 16 + push_count * 8;
+    if (eo.fp_omit == 1) { frame_fixed = 8 + push_count * 8; }
     let is i32 as needs_frame with mut = 1;
     if (al.al_opt_level >= 1 && total == 0 && _frame_makes_calls(func) == 0) { needs_frame = 0; }
     if (needs_frame == 1) {
-        if (total < 8) { total = 8; }
+        if (total < 8 && eo.fp_omit == 0) { total = 8; }
         let is i32 as rem = (frame_fixed + total) % 16;
         if (rem != 0) {
             total = total + 16 - rem;
         }
     }
     ctx.aligned_stack_size = total;
+    eo.fp_bias = cast(i64, push_count * 8 + total);
 
     // Record this frame for the CSE stack-usage analysis while the instruction
     // list is still live (it is freed right after gen_func). frame = return addr
     // (8) + push rbp (8) + callee-saved pushes + the aligned sub-rsp body.
     if (tgt.target_get().object_format == 3) {
-        sa_record(func, 16 + push_count * 8 + total);
+        if (eo.fp_omit == 1) { sa_record(func, 8 + push_count * 8 + total); }
+        else { sa_record(func, 16 + push_count * 8 + total); }
     }
 
     // Function label
@@ -251,85 +435,10 @@ fn gen_func(func as *d.IRFunction) as void {
         eo.out_char(10);
     }
 
-    // Dynamic-stack probe (recursion/indirect programs). Before this frame
-    // descends — pushes AND sub rsp — make sure the committed stack reaches the
-    // lowest address it (plus the grow helper) will touch; if not,
-    // __caustic_stkgrow commits more via SYS_COMMIT. Emitted ABOVE the pushes so
-    // it guards them too. rax is caller-saved scratch at entry (never an arg),
-    // so clobbering it here is free; the helper preserves everything else. Every
-    // function probes because recursion can place any of them at unbounded
-    // depth. The helper itself is hand-emitted (not via gen_func) so it never
-    // probes itself.
-    //
-    // How far the stack is committed is the RUNNING THREAD's: fs:[0], the
-    // first word of its thread block (CausticOS abi.THREAD_BLOCK_*). It was a
-    // single global, the first thread's — so the first call any other thread
-    // made compared its own stack against the first one's and ended the
-    // process trying to commit the space in between.
-    if (tgt.target_get().object_format == 3 && tgt.cse_stack_dynamic_get() == 1 && func.is_naked == 0) {
-        let is i32 as descent = (1 + push_count) * 8 + total;
-        let is i64 as pid2 = cast(i64, sa_probe_counter);
-        sa_probe_counter = sa_probe_counter + 1;
-        eo.out_cstr("  lea rax, [rsp-");
-        eo.out_int(cast(i64, descent) + cast(i64, SA_PROBE_MARGIN));
-        eo.out_cstr("]\n");
-        eo.out_cstr("  cmp rax, QWORD PTR fs:[0]\n");
-        eo.out_cstr("  jae .Lsk");
-        eo.out_int(pid2);
-        eo.out_cstr("\n");
-        eo.out_cstr("  call __caustic_stkgrow\n");
-        eo.out_cstr(".Lsk");
-        eo.out_int(pid2);
-        eo.out_cstr(":\n");
-    }
-
-    // Prologue — skipped entirely for `with naked` functions (asm-only body
-    // takes full control of the stack; e.g. clone trampolines / ABI shims).
-    if (func.is_naked == 0) {
-    eo.out_line("push rbp");
-    eo.out_line(".cfi_def_cfa_offset 16");
-    eo.out_line(".cfi_offset rbp, -16");
-    eo.out_line("mov rbp, rsp");
-    eo.out_line(".cfi_def_cfa_register rbp");
-    if (mask & 1) { eo.out_line("push rbx"); eo.out_line(".cfi_offset rbx, -24"); }
-    if (mask & 2) { eo.out_line("push r12"); eo.out_line(".cfi_offset r12, -32"); }
-    if (mask & 4) { eo.out_line("push r13"); eo.out_line(".cfi_offset r13, -40"); }
-    if (mask & 8) { eo.out_line("push r14"); eo.out_line(".cfi_offset r14, -48"); }
-    if (mask & 16) { eo.out_line("push r15"); eo.out_line(".cfi_offset r15, -56"); }
-    if (ctx.aligned_stack_size > 0) {
-        // Windows: frames ≥ 4 KiB must probe guard pages before allocating,
-        // or the kernel refuses to commit the stack and raises a fault on
-        // the first store past the current commit limit. We call into
-        // __caustic_chkstk (emitted once by the PE linker) which touches
-        // each 4 KiB page descending from rsp, then we do the actual
-        // `sub rsp, rax`. Linux and small Windows frames keep the simple
-        // single-instruction prologue.
-        if (tgt.target_get().object_format == 2 && ctx.aligned_stack_size >= 4096) {
-            eo.out_str("  mov rax, ", 11);
-            eo.out_int(cast(i64, ctx.aligned_stack_size));
-            eo.out_char(10);
-            eo.out_line("call __caustic_chkstk");
-            eo.out_line("sub rsp, rax");
-        } else {
-            eo.out_str("  sub rsp, ", 11);
-            eo.out_int(cast(i64, ctx.aligned_stack_size));
-            eo.out_char(10);
-        }
-    }
-
-    // Variadic prologue: save 6 arg registers to register save area
-    if (func.is_variadic == 1) {
-        // va_save_offset = total offset from rbp to start of 48-byte save area
-        // Layout: [rbp - va_save_offset] = rdi (first), ..., [rbp - va_save_offset + 40] = r9 (last)
-        let is i32 as vso = local_size + spill_size + alloc_size + 48;
-        ctx.va_save_offset = vso;
-        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso)); eo.out_str("], rdi\n", 7);
-        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 8)); eo.out_str("], rsi\n", 7);
-        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 16)); eo.out_str("], rdx\n", 7);
-        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 24)); eo.out_str("], rcx\n", 7);
-        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 32)); eo.out_str("], r8\n", 6);
-        eo.out_str("  mov QWORD PTR [rbp-", 21); eo.out_int(cast(i64, vso - 40)); eo.out_str("], r9\n", 6);
-    }
+    let is i32 as cfa_framed with mut = 0;
+    if (sw.sw_active == 0) {
+        _emit_prologue(func, ctx, push_count, total, local_size, spill_size, alloc_size);
+        cfa_framed = 1;
     }
 
     // Instructions
@@ -354,11 +463,36 @@ fn gen_func(func as *d.IRFunction) as void {
             eo.out_str(" 0\n", 3);
             last_line = inst.line;
         }
+        if (sw.sw_active == 1) {
+            // Shrink-wrapped: returns outside the region are frameless, and the
+            // CFA follows the textual switches between the two kinds of block.
+            let is i32 as inr = sw.sw_step(inst);
+            ctx.sw_frameless = 1 - inr;
+            if (cast(i64, inst) == cast(i64, sw.sw_p)) {
+                if (inst.op == d.IR_LABEL) { gen_inst(inst, ctx); }
+                if (cfa_framed == 1) { _cfa_frameless(); }
+                _emit_prologue(func, ctx, push_count, total, local_size, spill_size, alloc_size);
+                cfa_framed = 1;
+                if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
+                if (inst.op != d.IR_LABEL && inst.is_dead != 1) { gen_inst(inst, ctx); }
+                inst = inst.next;
+                continue;
+            }
+            if (inr == 1 && cfa_framed == 0) {
+                _cfa_framed(push_count);
+                cfa_framed = 1;
+            } else if (inr == 0 && cfa_framed == 1) {
+                _cfa_frameless();
+                cfa_framed = 0;
+            }
+        }
         if (inst.is_dead != 1) {
             gen_inst(inst, ctx);
         }
         inst = inst.next;
     }
+    ctx.sw_frameless = 0;
+    eo.fp_omit = 0;
 
     // The function is fully emitted; its register-allocation context is now
     // dead. Free it so codegen doesn't accumulate one ctx per function.

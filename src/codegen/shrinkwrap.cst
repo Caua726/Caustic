@@ -1,0 +1,454 @@
+use "../ir/defs.cst" as d;
+use "alloc_core.cst" as al;
+
+// === Shrink-wrapping: the prologue moves to the code that needs it ===
+//
+// -O2 only. A function like
+//
+//     fn fib(n) { if (n <= 1) { return n; } return fib(n-1) + fib(n-2); }
+//
+// pays push rbp / push rbx / sub rsp ... pop rbx / pop rbp on every call, even
+// on the early return that touches nothing but n. Here the prologue is placed
+// at the start of the part of the function that needs a frame, and the returns
+// outside that part are a bare `ret`:
+//
+//     fib:  cmp rdi, 1
+//           jg  .L1
+//           mov rax, rdi
+//           ret                 ; no frame
+//     .L1:  push rbp ...        ; prologue
+//
+// The part that needs the frame is a region R entered at one block P:
+//   - every instruction that needs the frame (a call, a stack slot, &local,
+//     arguments on the stack) is in R;
+//   - R is everything reachable from P, so control never leaves R except
+//     through a return, and those returns run the full epilogue;
+//   - no block of R other than P has a predecessor outside R, and P has none
+//     inside R: the prologue at P runs exactly once on the way in.
+// Among the blocks that qualify, P is the one with the largest R: the frameless
+// part is then just the early exits, which is where the gain is, and it keeps
+// register pressure there low enough for the five caller-saved registers.
+//
+// A value computed before P and read inside R is copied at P into a fresh vreg
+// and R reads the copy (a split live range): the value that crosses the calls
+// in R gets a callee-saved register from the copy on, and the original lives
+// only in the frameless part. That copy is marked so the allocator never merges
+// the two (is_extern_call = 2 on the MOV).
+//
+// The plan is made before register allocation (sw_plan) and checked after it
+// (sw_check): the frameless part must not end up using a callee-saved register
+// (not saved yet) or a spill slot (no frame yet). If it does, the function
+// keeps the ordinary prologue at its entry; the split copy is then harmless.
+
+let is i32 as SW_MAX_BLOCKS with imut = 512;
+
+// Planned function: the first instruction of P, and per block (by first
+// instruction) whether it lies in R. Emission walks the same list in order.
+let is i32 as sw_active with mut = 0;
+let is *d.IRInst as sw_p with mut = cast(*d.IRInst, 0);
+let is *i64 as sw_bfirst with mut = cast(*i64, 0);   // block -> first live inst
+let is *u8 as sw_inr with mut = cast(*u8, 0);        // block -> 1 if in R
+let is i32 as sw_nb with mut = 0;
+let is i32 as sw_cur with mut = 0;                    // emission cursor (block)
+let is i32 as sw_vc_old with mut = 0;                 // vreg_count before the split
+let is *i32 as sw_rev with mut = cast(*i32, 0);       // copy vreg - vc_old -> original
+let is i32 as sw_planned with mut = 0;                // a split was made (even if rejected)
+
+fn _gi(a as *i32, i as i32) as i32 { return *(cast(*i32, cast(i64, a) + cast(i64, i) * 4)); }
+fn _pi(a as *i32, i as i32, v as i32) as void { let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4); *p = v; }
+fn _gb(a as *u8, i as i32) as i32 { return cast(i32, a[i]); }
+fn _pb(a as *u8, i as i32, v as i32) as void { a[i] = cast(u8, v); }
+
+fn _is_term(op as i32) as i32 {
+    if (op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { return 1; }
+    return 0;
+}
+
+// Does this instruction need the frame no matter where its operands live?
+fn _sw_heavy(i as *d.IRInst) as i32 {
+    let is i32 as op = i.op;
+    if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL) { return 1; }
+    if (op == d.IR_ADDR || op == d.IR_GET_ALLOC_ADDR || op == d.IR_VA_START) { return 1; }
+    if (op == d.IR_SET_ARG || op == d.IR_SET_CTX) { return 1; }
+    if (op == d.IR_LOAD && i.src1.op_type != d.OP_VREG) { return 1; }
+    if (op == d.IR_STORE && i.dest.op_type != d.OP_VREG) { return 1; }
+    return 0;
+}
+
+fn sw_reset() as void {
+    if (cast(i64, sw_bfirst) != 0) { d.opt_free(cast(*u8, sw_bfirst)); }
+    if (cast(i64, sw_inr) != 0) { d.opt_free(sw_inr); }
+    if (cast(i64, sw_rev) != 0) { d.opt_free(cast(*u8, sw_rev)); }
+    sw_rev = cast(*i32, 0);
+    sw_planned = 0;
+    sw_vc_old = 0;
+    sw_bfirst = cast(*i64, 0);
+    sw_inr = cast(*u8, 0);
+    sw_active = 0;
+    sw_p = cast(*d.IRInst, 0);
+    sw_nb = 0;
+    sw_cur = 0;
+}
+
+fn _ren(o as *d.Operand, map as *i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0) {
+        let is i32 as m = _gi(map, o.vreg);
+        if (m >= 0) { o.vreg = m; }
+    }
+}
+
+fn _mark(o as *d.Operand, arr as *u8, vc as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc) { arr[o.vreg] = cast(u8, 1); }
+}
+
+// Plan the shrink-wrap of func. Returns 1 if a region was chosen (and the
+// split copies inserted).
+fn sw_plan(func as *d.IRFunction) as i32 {
+    sw_reset();
+    if (func.is_naked == 1 || func.is_variadic == 1 || func.num_args > 6) { return 0; }
+    if (func.label_count <= 0) { return 0; }
+
+    // --- blocks ---
+    let is i32 as nb with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    let is i32 as open with mut = 0;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_ASM) { return 0; }
+            if (inst.op == d.IR_LABEL && open == 1) { open = 0; }
+            if (open == 0) { nb = nb + 1; open = 1; }
+            if (_is_term(inst.op) == 1) { open = 0; }
+        }
+        inst = inst.next;
+    }
+    if (nb < 2 || nb > SW_MAX_BLOCKS) { return 0; }
+
+    let is *i64 as bfirst = cast(*i64, d.opt_alloc(cast(i64, nb) * 8));
+    let is *i32 as s0 = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is *i32 as s1 = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is *u8 as heavy = d.opt_alloc(cast(i64, nb));
+    let is *u8 as hasret = d.opt_alloc(cast(i64, nb));
+    let is *u8 as reach = d.opt_alloc(cast(i64, nb));
+    let is *u8 as inr = d.opt_alloc(cast(i64, nb));
+    let is *u8 as best = d.opt_alloc(cast(i64, nb));
+    let is *i32 as stk = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is *i32 as lblk = cast(*i32, d.opt_alloc(cast(i64, func.label_count) * 4));
+    let is *i32 as bterm_label = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is *i32 as bterm_op = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is i32 as k with mut = 0;
+    while (k < func.label_count) { _pi(lblk, k, 0 - 1); k = k + 1; }
+    k = 0;
+    while (k < nb) {
+        _pi(s0, k, 0 - 1); _pi(s1, k, 0 - 1); _pi(bterm_op, k, 0 - 1); _pi(bterm_label, k, 0 - 1);
+        heavy[k] = cast(u8, 0); hasret[k] = cast(u8, 0); reach[k] = cast(u8, 0);
+        inr[k] = cast(u8, 0); best[k] = cast(u8, 0);
+        k = k + 1;
+    }
+
+    let is i32 as b with mut = 0 - 1;
+    open = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_LABEL && open == 1) { open = 0; }
+            if (open == 0) {
+                b = b + 1; open = 1;
+                let is *i64 as bp = cast(*i64, cast(i64, bfirst) + cast(i64, b) * 8);
+                *bp = cast(i64, inst);
+            }
+            if (inst.op == d.IR_LABEL && inst.dest.label >= 0 && inst.dest.label < func.label_count) {
+                _pi(lblk, inst.dest.label, b);
+            }
+            if (_sw_heavy(inst) == 1) { heavy[b] = cast(u8, 1); }
+            if (_is_term(inst.op) == 1) {
+                _pi(bterm_op, b, inst.op);
+                if (inst.op != d.IR_RET) { _pi(bterm_label, b, inst.dest.label); }
+                else { hasret[b] = cast(u8, 1); }
+                open = 0;
+            }
+        }
+        inst = inst.next;
+    }
+
+    // --- successors ---
+    b = 0;
+    while (b < nb) {
+        let is i32 as top = _gi(bterm_op, b);
+        let is i32 as tl = _gi(bterm_label, b);
+        let is i32 as tb with mut = 0 - 1;
+        if (tl >= 0 && tl < func.label_count) { tb = _gi(lblk, tl); }
+        if (top == d.IR_JMP) { _pi(s0, b, tb); }
+        else if (top == d.IR_JZ || top == d.IR_JNZ) {
+            if (b + 1 < nb) { _pi(s0, b, b + 1); }
+            _pi(s1, b, tb);
+        } else if (top != d.IR_RET) {
+            if (b + 1 < nb) { _pi(s0, b, b + 1); }
+        }
+        b = b + 1;
+    }
+
+    // --- reachable from the entry ---
+    let is i32 as sp with mut = 0;
+    reach[0] = cast(u8, 1); _pi(stk, 0, 0); sp = 1;
+    while (sp > 0) {
+        sp = sp - 1;
+        let is i32 as x = _gi(stk, sp);
+        let is i32 as y0 = _gi(s0, x);
+        let is i32 as y1 = _gi(s1, x);
+        if (y0 >= 0 && reach[y0] == cast(u8, 0)) { reach[y0] = cast(u8, 1); _pi(stk, sp, y0); sp = sp + 1; }
+        if (y1 >= 0 && reach[y1] == cast(u8, 0)) { reach[y1] = cast(u8, 1); _pi(stk, sp, y1); sp = sp + 1; }
+    }
+    // An unresolved jump target: give up.
+    b = 0;
+    let is i32 as bad with mut = 0;
+    while (b < nb) {
+        if (reach[b] == cast(u8, 1) && _gi(bterm_label, b) >= 0) {
+            let is i32 as tl2 = _gi(bterm_label, b);
+            if (tl2 >= func.label_count || _gi(lblk, tl2) < 0) { bad = 1; }
+        }
+        b = b + 1;
+    }
+    let is i32 as anyheavy with mut = 0;
+    b = 0;
+    while (b < nb) { if (reach[b] == cast(u8, 1) && heavy[b] == cast(u8, 1)) { anyheavy = 1; } b = b + 1; }
+
+    // --- choose P ---
+    let is i32 as pbest with mut = 0 - 1;
+    let is i32 as bestsz with mut = 0;
+    let is i32 as cand with mut = 1;
+    while (bad == 0 && anyheavy == 1 && cand < nb) {
+        if (reach[cand] == cast(u8, 1)) {
+            k = 0;
+            while (k < nb) { inr[k] = cast(u8, 0); k = k + 1; }
+            inr[cand] = cast(u8, 1); _pi(stk, 0, cand); sp = 1;
+            let is i32 as sz with mut = 1;
+            while (sp > 0) {
+                sp = sp - 1;
+                let is i32 as x2 = _gi(stk, sp);
+                let is i32 as z0 = _gi(s0, x2);
+                let is i32 as z1 = _gi(s1, x2);
+                if (z0 >= 0 && inr[z0] == cast(u8, 0)) { inr[z0] = cast(u8, 1); sz = sz + 1; _pi(stk, sp, z0); sp = sp + 1; }
+                if (z1 >= 0 && inr[z1] == cast(u8, 0)) { inr[z1] = cast(u8, 1); sz = sz + 1; _pi(stk, sp, z1); sp = sp + 1; }
+            }
+            let is i32 as ok with mut = 1;
+            if (inr[0] == cast(u8, 1)) { ok = 0; }
+            // every reachable heavy block in R; some reachable return outside R
+            let is i32 as outret with mut = 0;
+            k = 0;
+            while (k < nb && ok == 1) {
+                if (reach[k] == cast(u8, 1)) {
+                    if (heavy[k] == cast(u8, 1) && inr[k] == cast(u8, 0)) { ok = 0; }
+                    if (hasret[k] == cast(u8, 1) && inr[k] == cast(u8, 0)) { outret = 1; }
+                }
+                k = k + 1;
+            }
+            if (outret == 0) { ok = 0; }
+            // edges: reachable x -> y with y in R must have x in R, unless y == P
+            // and x outside R
+            k = 0;
+            while (k < nb && ok == 1) {
+                if (reach[k] == cast(u8, 1)) {
+                    let is i32 as e0 = _gi(s0, k);
+                    let is i32 as e1 = _gi(s1, k);
+                    let is i32 as kin = cast(i32, inr[k]);
+                    if (e0 >= 0 && inr[e0] == cast(u8, 1)) {
+                        if (e0 == cand && kin == 1) { ok = 0; }
+                        if (e0 != cand && kin == 0) { ok = 0; }
+                    }
+                    if (e1 >= 0 && inr[e1] == cast(u8, 1)) {
+                        if (e1 == cand && kin == 1) { ok = 0; }
+                        if (e1 != cand && kin == 0) { ok = 0; }
+                    }
+                }
+                k = k + 1;
+            }
+            if (ok == 1 && (pbest < 0 || sz > bestsz)) {
+                bestsz = sz; pbest = cand;
+                k = 0;
+                while (k < nb) { best[k] = inr[k]; k = k + 1; }
+            }
+        }
+        cand = cand + 1;
+    }
+
+    d.opt_free(cast(*u8, s0)); d.opt_free(cast(*u8, s1)); d.opt_free(heavy); d.opt_free(hasret);
+    d.opt_free(reach); d.opt_free(inr); d.opt_free(cast(*u8, stk)); d.opt_free(cast(*u8, lblk));
+    d.opt_free(cast(*u8, bterm_label)); d.opt_free(cast(*u8, bterm_op));
+    if (pbest < 0) {
+        d.opt_free(cast(*u8, bfirst)); d.opt_free(best);
+        return 0;
+    }
+
+    // --- split: values from outside R read inside R get a copy at P ---
+    let is i32 as vc = func.vreg_count;
+    let is *u8 as in_use = d.opt_alloc(cast(i64, vc + 1));
+    let is *u8 as out_def = d.opt_alloc(cast(i64, vc + 1));
+    let is *i32 as map = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    k = 0;
+    while (k <= vc) { in_use[k] = cast(u8, 0); out_def[k] = cast(u8, 0); _pi(map, k, 0 - 1); k = k + 1; }
+    b = 0 - 1;
+    open = 0;
+    let is i32 as cur_in with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_LABEL && open == 1) { open = 0; }
+            if (open == 0) { b = b + 1; open = 1; cur_in = cast(i32, best[b]); }
+            if (cur_in == 1) {
+                _mark(&inst.dest, in_use, vc); _mark(&inst.src1, in_use, vc); _mark(&inst.src2, in_use, vc);
+            } else {
+                // any operand outside R counts: a def there, or a read of a
+                // value defined there (only reachable through a def outside R)
+                _mark(&inst.dest, out_def, vc); _mark(&inst.src1, out_def, vc); _mark(&inst.src2, out_def, vc);
+            }
+            if (_is_term(inst.op) == 1) { open = 0; }
+        }
+        inst = inst.next;
+    }
+    let is *d.IRInst as pfirst with mut = cast(*d.IRInst, *(cast(*i64, cast(i64, bfirst) + cast(i64, pbest) * 8)));
+    // insertion point: after P's label (if it has one), else before its first inst
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as anchor with mut = cast(*d.IRInst, 0);
+    if (pfirst.op == d.IR_LABEL) { anchor = pfirst; }
+    else {
+        let is *d.IRInst as w with mut = func.instructions;
+        while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, pfirst)) { w = w.next; }
+        prev = w;
+    }
+    let is i32 as v with mut = 0;
+    let is i32 as ncopies with mut = 0;
+    while (v < vc) { if (in_use[v] == cast(u8, 1) && out_def[v] == cast(u8, 1)) { ncopies = ncopies + 1; } v = v + 1; }
+    sw_vc_old = vc;
+    sw_rev = cast(*i32, d.opt_alloc(cast(i64, ncopies + 1) * 4));
+    v = 0;
+    let is *d.IRInst as first_copy with mut = cast(*d.IRInst, 0);
+    while (v < vc) {
+        if (in_use[v] == cast(u8, 1) && out_def[v] == cast(u8, 1)) {
+            let is i32 as nv = func.vreg_count;
+            func.vreg_count = func.vreg_count + 1;
+            _pi(map, v, nv);
+            _pi(sw_rev, nv - vc, v);
+            let is *d.IRInst as mv = d.new_inst(d.IR_MOV);
+            mv.dest = d.op_vreg(nv);
+            mv.src1 = d.op_vreg(v);
+            mv.line = pfirst.line;
+            mv.is_extern_call = cast(i8, 2);
+            if (cast(i64, anchor) != 0) {
+                mv.next = anchor.next; anchor.next = mv; anchor = mv;
+            } else {
+                if (cast(i64, first_copy) == 0) { first_copy = mv; }
+                if (cast(i64, prev) != 0) { mv.next = prev.next; prev.next = mv; prev = mv; }
+                else { mv.next = func.instructions; func.instructions = mv; prev = mv; }
+            }
+        }
+        v = v + 1;
+    }
+    // P now starts at the first copy when it had no label.
+    if (pfirst.op != d.IR_LABEL && cast(i64, first_copy) != 0) {
+        let is *i64 as bp2 = cast(*i64, cast(i64, bfirst) + cast(i64, pbest) * 8);
+        *bp2 = cast(i64, first_copy);
+        pfirst = first_copy;
+    }
+    // rename inside R (the copies themselves read the old vreg: skip them)
+    b = 0 - 1;
+    open = 0;
+    cur_in = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as is_copy with mut = 0;
+            if (inst.op == d.IR_MOV && inst.is_extern_call == cast(i8, 2)) { is_copy = 1; }
+            if (inst.op == d.IR_LABEL && open == 1) { open = 0; }
+            if (open == 0 && is_copy == 0) { b = b + 1; open = 1; cur_in = cast(i32, best[b]); }
+            if (cur_in == 1 && is_copy == 0) {
+                _ren(&inst.dest, map); _ren(&inst.src1, map); _ren(&inst.src2, map);
+            }
+            if (_is_term(inst.op) == 1) { open = 0; }
+        }
+        inst = inst.next;
+    }
+    d.opt_free(in_use); d.opt_free(out_def); d.opt_free(cast(*u8, map));
+
+    sw_bfirst = bfirst;
+    sw_inr = best;
+    sw_nb = nb;
+    sw_p = pfirst;
+    sw_active = 1;
+    sw_planned = 1;
+    return 1;
+}
+
+// After allocation: the frameless part may use only caller-saved registers.
+fn _ok_loc(o as *d.Operand, ctx as *al.AllocCtx) as i32 {
+    if (o.op_type != d.OP_VREG) { return 1; }
+    let is i32 as loc = al.get_loc(o.vreg, ctx);
+    if (loc < 0) { return 0; }
+    if (loc == 3 || loc == 10 || loc == 11 || loc == 12 || loc == 15 || loc == 13 || loc == 14) { return 0; }
+    return 1;
+}
+
+fn sw_check(func as *d.IRFunction, ctx as *al.AllocCtx) as void {
+    if (sw_active == 0) { return; }
+    let is i32 as b with mut = 0 - 1;
+    let is i32 as cur_in with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0 && sw_active == 1) {
+        if (b + 1 < sw_nb && cast(i64, inst) == *(cast(*i64, cast(i64, sw_bfirst) + cast(i64, b + 1) * 8))) {
+            b = b + 1;
+            cur_in = cast(i32, sw_inr[b]);
+        }
+        let is i32 as fused with mut = 0;
+        if (inst.op >= d.IR_EQ && inst.op <= d.IR_GE && cast(i64, inst.next) != 0
+            && (inst.next.op == d.IR_JZ || inst.next.op == d.IR_JNZ) && inst.next.is_dead == 0
+            && inst.dest.op_type == d.OP_VREG && inst.next.src1.vreg == inst.dest.vreg) {
+            // gen_inst_compare fuses the pair into cmp + jcc: dest is never written
+            fused = 1;
+            if (_ok_loc(&inst.src1, ctx) == 0 || _ok_loc(&inst.src2, ctx) == 0) {
+                if (cur_in == 0) { sw_active = 0; }
+            }
+        }
+        if (fused == 1) {
+            // the jcc reads only the flags; step over it (it starts no block)
+            inst = inst.next;
+        } else if (inst.is_dead == 0 && cur_in == 0) {
+            if (_ok_loc(&inst.dest, ctx) == 0 || _ok_loc(&inst.src1, ctx) == 0 || _ok_loc(&inst.src2, ctx) == 0) {
+                sw_active = 0;
+            }
+        }
+        inst = inst.next;
+    }
+}
+
+// Emission cursor: called for every instruction in list order. Returns the
+// in-R flag of the block the instruction belongs to.
+fn sw_step(inst as *d.IRInst) as i32 {
+    if (sw_cur < sw_nb && cast(i64, inst) == *(cast(*i64, cast(i64, sw_bfirst) + cast(i64, sw_cur) * 8))) {
+        sw_cur = sw_cur + 1;
+    }
+    if (sw_cur == 0) { return 0; }
+    return cast(i32, sw_inr[sw_cur - 1]);
+}
+
+// The split was rejected: put the original vregs back and drop the copies, so
+// the function is allocated again exactly as without shrink-wrapping.
+fn sw_undo(func as *d.IRFunction) as void {
+    if (sw_planned == 0) { return; }
+    let is i32 as nnew = func.vreg_count - sw_vc_old;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_MOV && inst.is_extern_call == cast(i8, 2)) {
+            inst.is_dead = cast(i8, 1);
+            inst.is_extern_call = cast(i8, 0);
+        }
+        _unren(&inst.dest, nnew); _unren(&inst.src1, nnew); _unren(&inst.src2, nnew);
+        inst = inst.next;
+    }
+    func.vreg_count = sw_vc_old;
+    sw_reset();
+}
+
+fn _unren(o as *d.Operand, nnew as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= sw_vc_old && o.vreg < sw_vc_old + nnew) {
+        o.vreg = _gi(sw_rev, o.vreg - sw_vc_old);
+    }
+}
