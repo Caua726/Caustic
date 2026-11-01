@@ -6,6 +6,7 @@
 //   2. MOV chain bypass: mov rA, rB + mov rC, rA → keep first, rewrite second to mov rC, rB
 //   3. Dead MOV elimination: mov rA, X; mov rA, Y → remove first
 //      (only when Y does not reference rA in any way)
+//   5. Load through a copied address: mov rA, rB + mov rA, [rA+…] → mov rA, [rB+…]
 //
 // Inline asm (between the #APP / #NO_APP lines codegen brackets it with) is
 // never touched: only pairs of generated lines are candidates.
@@ -347,6 +348,106 @@ fn try_pat3(buf as *u8, i as i32) as i32 {
     return 1;
 }
 
+// ── Pattern 5: load through a copied address ────────────────────────
+// mov rA, rB ; mov/movzx/movsx/movsxd/lea rA, <mem using rA>
+//   → mov/... rA, <mem using rB>
+// The second line overwrites rA and reads it only in the address, so the copy
+// is never seen: rA ends with the same value and rB is untouched.
+
+fn _ph_alnum(c as u8) as i32 {
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c == 95) { return 1; }
+    return 0;
+}
+
+// Offset of the first whole-token occurrence of reg in s, or -1.
+fn _ph_find_reg(s as *u8, slen as i32, reg as *u8, rlen as i32, from as i32) as i32 {
+    let is i32 as i with mut = from;
+    while (i + rlen <= slen) {
+        if (ph_streq(cast(*u8, cast(i64, s) + cast(i64, i)), rlen, reg, rlen) == 1) {
+            let is i32 as before_ok = i == 0 || _ph_alnum(s[i - 1]) == 0;
+            let is i32 as after_ok = i + rlen == slen || _ph_alnum(s[i + rlen]) == 0;
+            if (before_ok == 1 && after_ok == 1) { return i; }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn try_pat5(buf as *u8, i as i32) as i32 {
+    let is i64 as off1 = get_off(i);
+    let is i32 as len1 = get_len(i);
+    let is i64 as off2 = get_off(i + 1);
+    let is i32 as len2 = get_len(i + 1);
+
+    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
+    if (p1 == 99999) { return 0; }
+    let is i32 as al with mut = 0;
+    let is *u8 as a = get_operand(buf, off1, p1, len1, &al);
+    if (is_reg64(a, al) == 0) { return 0; }
+    let is i32 as bs = p1 + al + 2;
+    if (bs >= len1) { return 0; }
+    let is i32 as bl with mut = 0;
+    let is *u8 as b = get_operand(buf, off1, bs, len1, &bl);
+    if (bs + bl != len1) { return 0; }
+    if (is_reg64(b, bl) == 0) { return 0; }
+    if (ph_streq(a, al, b, bl) == 1) { return 0; }
+
+    let is *u8 as mn with mut = "mov";
+    let is i32 as p2 with mut = match_inst(buf, off2, len2, "mov", 3);
+    if (p2 == 99999) { mn = "movzx"; p2 = match_inst(buf, off2, len2, "movzx", 5); }
+    if (p2 == 99999) { mn = "movsx"; p2 = match_inst(buf, off2, len2, "movsx", 5); }
+    if (p2 == 99999) { mn = "movsxd"; p2 = match_inst(buf, off2, len2, "movsxd", 6); }
+    if (p2 == 99999) { mn = "lea"; p2 = match_inst(buf, off2, len2, "lea", 3); }
+    if (p2 == 99999) { return 0; }
+    let is i32 as dl with mut = 0;
+    let is *u8 as dst = get_operand(buf, off2, p2, len2, &dl);
+    if (ph_streq(dst, dl, a, al) == 0) { return 0; }
+    let is i32 as rs = p2 + dl + 2;
+    if (rs >= len2) { return 0; }
+    let is *u8 as rest = cast(*u8, cast(i64, buf) + off2 + cast(i64, rs));
+    let is i32 as rl = len2 - rs;
+    // The source must be a memory operand that names rA (and nothing else
+    // reads rA: its narrower names must not appear).
+    if (str_contains(rest, rl, "[", 1) == 0) { return 0; }
+    if (str_contains(rest, rl, ",", 1) == 1) { return 0; }
+    let is *u8 as a32 = reg64_to_32(a, al);
+    if (cast(i64, a32) == 0) { return 0; }
+    if (str_contains(rest, rl, a32, ph_strlen(a32)) == 1) { return 0; }
+    if (_ph_find_reg(rest, rl, a, al, 0) < 0) { return 0; }
+
+    let is i32 as tp with mut = 0;
+    pat_tmp[0] = 32; pat_tmp[1] = 32; tp = 2;
+    let is i32 as mnl = ph_strlen(mn);
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), mn, cast(i64, mnl)); tp = tp + mnl;
+    pat_tmp[tp] = 32; tp = tp + 1;
+    ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), a, cast(i64, al)); tp = tp + al;
+    pat_tmp[tp] = 44; tp = tp + 1;
+    pat_tmp[tp] = 32; tp = tp + 1;
+    let is i32 as k with mut = 0;
+    while (k < rl) {
+        if (tp + bl + 2 >= 128) { return 0; }
+        let is i32 as hit = _ph_find_reg(rest, rl, a, al, k);
+        if (hit == k) {
+            ph_memcpy(cast(*u8, cast(i64, &pat_tmp) + cast(i64, tp)), b, cast(i64, bl)); tp = tp + bl;
+            k = k + al;
+        } else {
+            pat_tmp[tp] = rest[k]; tp = tp + 1;
+            k = k + 1;
+        }
+    }
+
+    let is i64 as roff = repl_line(cast(*u8, &pat_tmp), tp);
+    if (roff < 0) { return 0; }
+    set_len(i, cast(i32, 0 - 1));
+    set_off(i + 1, REPL_MARKER + roff);
+    set_len(i + 1, tp);
+    stat_fused = stat_fused + 1;
+    return 1;
+}
+
 // Pattern 4: redundant `jmp .Lx` immediately followed by `.Lx:` (a jump to the
 // next instruction = a no-op fall-through). Removing the jmp preserves semantics
 // exactly (the label stays, so other branches to .Lx still resolve). Only
@@ -460,6 +561,7 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
                     if (try_pat1(buf, i) == 1) { changed = 1; }
                     if (get_len(i) >= 0 && try_pat2(buf, i) == 1) { changed = 1; }
                     if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat3(buf, i) == 1) { changed = 1; }
+                    if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat5(buf, i) == 1) { changed = 1; }
                 } else if (pf_ws < pf_len && buf[pf_off + cast(i64, pf_ws)] == 106) {
                     // 'j' — unconditional jump-to-next removal
                     if (try_jmp_next(buf, i) == 1) { changed = 1; }

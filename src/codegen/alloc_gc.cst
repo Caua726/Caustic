@@ -178,8 +178,8 @@ fn gc2_get_iv(intervals as *core.LiveInterval, idx as i32) as *core.LiveInterval
 //
 // Two rules stay as conservative as the interval graph:
 // - a definition interferes with every operand of its own instruction (except
-//   the MOV source), because the emitters may write dest before reading all
-//   sources;
+//   the MOV source, and src1 of the ops in _lv_tie_src1), because the emitters
+//   may write dest before reading all sources;
 // - vregs live into the entry block (read on some path before any write) all
 //   interfere with each other.
 //
@@ -199,6 +199,18 @@ fn _lv_reads_dest(op as i32) as i32 {
 fn _lv_writes_dest(op as i32) as i32 {
     if (op == d.IR_STORE || op == d.IR_COPY) { return 0; }
     return 1;
+}
+
+// Emitters that load src1 into dest's register before anything else writes it
+// (gen_binop, the MUL and shift paths, DIV by a power of two): dest may share
+// src1's register. src2 is read after that load, so dest and src2 keep their edge.
+fn _lv_tie_src1(y as *d.IRInst) as i32 {
+    let is i32 as op = y.op;
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_AND
+        || op == d.IR_OR || op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR) { return 1; }
+    if (op == d.IR_DIV && y.src2.op_type == d.OP_IMM && y.src2.imm > 0
+        && (y.src2.imm & (y.src2.imm - 1)) == 0) { return 1; }
+    return 0;
 }
 
 fn _lv_ends_block(op as i32) as i32 {
@@ -350,6 +362,27 @@ fn _lv_build(func as *d.IRFunction, n as i32, matrix as *u8, degree as *i32) as 
         b = b + 1;
     }
 
+    // A vreg no live instruction writes (a join copy reading a variable that
+    // was never assigned on that path) holds no value: it is left out of
+    // liveness, so it neither stays live from the entry nor holds a register
+    // against anything.
+    let is *i64 as anydef = cast(*i64, d.opt_alloc(cast(i64, words) * 8));
+    core.memzero(cast(*u8, anydef), cast(i64, words) * 8);
+    b = 0;
+    while (b < nb) {
+        let is *i64 as db = cast(*i64, cast(i64, def_bs) + cast(i64, b) * cast(i64, words) * 8);
+        let is i32 as w with mut = 0;
+        while (w < words) { anydef[w] = anydef[w] | db[w]; w = w + 1; }
+        b = b + 1;
+    }
+    b = 0;
+    while (b < nb) {
+        let is *i64 as ub = cast(*i64, cast(i64, use_bs) + cast(i64, b) * cast(i64, words) * 8);
+        let is i32 as w with mut = 0;
+        while (w < words) { ub[w] = ub[w] & anydef[w]; w = w + 1; }
+        b = b + 1;
+    }
+
     // live_out(b) = union of live_in(succ); live_in(b) = use | (out & ~def).
     // Backward order converges in a few rounds.
     let is i32 as changed with mut = 1;
@@ -391,9 +424,11 @@ fn _lv_build(func as *d.IRFunction, n as i32, matrix as *u8, degree as *i32) as 
         while (k >= bstart[b]) {
             let is *d.IRInst as y = cast(*d.IRInst, ins[k]);
             if (y.op != d.IR_LABEL) {
-                let is i32 as u1 = _lv_opv(&y.src1, n);
-                let is i32 as u2 = _lv_opv(&y.src2, n);
+                let is i32 as u1 with mut = _lv_opv(&y.src1, n);
+                let is i32 as u2 with mut = _lv_opv(&y.src2, n);
                 let is i32 as dv = _lv_opv(&y.dest, n);
+                if (u1 >= 0 && _lv_has(anydef, u1) == 0) { u1 = 0 - 1; }
+                if (u2 >= 0 && _lv_has(anydef, u2) == 0) { u2 = 0 - 1; }
                 let is i32 as u3 with mut = 0 - 1;
                 if (dv >= 0 && _lv_reads_dest(y.op) == 1) { u3 = dv; }
                 if (dv >= 0 && _lv_writes_dest(y.op) == 1) {
@@ -402,7 +437,7 @@ fn _lv_build(func as *d.IRFunction, n as i32, matrix as *u8, degree as *i32) as 
                     let is i32 as skip with mut = 0 - 1;
                     if (y.op == d.IR_MOV && u1 >= 0 && d.vreg_class_get(func, u1) == d.vreg_class_get(func, dv)) { skip = u1; }
                     _lv_edges_to_live(matrix, n, degree, live, words, dv, skip);
-                    if (u1 != skip) { _lv_edge(matrix, n, degree, dv, u1); }
+                    if (u1 != skip && _lv_tie_src1(y) == 0) { _lv_edge(matrix, n, degree, dv, u1); }
                     _lv_edge(matrix, n, degree, dv, u2);
                     _lv_clr(live, dv);
                 }
@@ -432,6 +467,7 @@ fn _lv_build(func as *d.IRFunction, n as i32, matrix as *u8, degree as *i32) as 
     d.opt_free(cast(*u8, live));
     d.opt_free(cast(*u8, use_bs));
     d.opt_free(cast(*u8, def_bs));
+    d.opt_free(cast(*u8, anydef));
     d.opt_free(cast(*u8, in_bs));
     d.opt_free(cast(*u8, out_bs));
     d.opt_free(cast(*u8, succ0));
