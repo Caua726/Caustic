@@ -182,6 +182,29 @@ fn _frame_can_omit_fp(func as *d.IRFunction) as i32 {
     return 1;
 }
 
+// Labels some later jump goes back to: the heads of loops.
+fn _loop_heads(func as *d.IRFunction) as *u8 {
+    let is i32 as lc = func.label_count;
+    let is *u8 as seen = d.opt_alloc(cast(i64, lc));
+    let is *u8 as head = d.opt_alloc(cast(i64, lc));
+    let is i32 as k with mut = 0;
+    while (k < lc) { seen[k] = cast(u8, 0); head[k] = cast(u8, 0); k = k + 1; }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_LABEL && inst.dest.label >= 0 && inst.dest.label < lc) { seen[inst.dest.label] = cast(u8, 1); }
+            if ((op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) && inst.dest.op_type == d.OP_LABEL
+                && inst.dest.label >= 0 && inst.dest.label < lc && seen[inst.dest.label] == cast(u8, 1)) {
+                head[inst.dest.label] = cast(u8, 1);
+            }
+        }
+        inst = inst.next;
+    }
+    d.opt_free(seen);
+    return head;
+}
+
 // The prologue: CausticOS stack probe, push rbp / mov rbp, rsp, the
 // callee-saved pushes, the frame body and the variadic save area. At the entry,
 // or at the shrink-wrap point (shrinkwrap.cst).
@@ -422,6 +445,15 @@ fn gen_func(func as *d.IRFunction) as void {
         else { sa_record(func, 16 + push_count * 8 + total); }
     }
 
+    // -O2: functions start on a 16-byte boundary (the linker keeps it,
+    // g_align_funcs) and so do loop heads below, as gcc does: where a hot loop
+    // lands relative to the fetch blocks moves its speed by tens of percent.
+    let is *u8 as loop_head with mut = cast(*u8, 0);
+    if (al.al_opt_level >= 2 && func.label_count > 0) {
+        eo.out_str(".p2align 4\n", 11);
+        loop_head = _loop_heads(func);
+    }
+
     // Function label
     eo.out_str(func.asm_name_ptr, func.asm_name_len);
     eo.out_str(":\n", 2);
@@ -469,7 +501,7 @@ fn gen_func(func as *d.IRFunction) as void {
             let is i32 as inr = sw.sw_step(inst);
             ctx.sw_frameless = 1 - inr;
             if (cast(i64, inst) == cast(i64, sw.sw_p)) {
-                if (inst.op == d.IR_LABEL) { gen_inst(inst, ctx); }
+                if (inst.op == d.IR_LABEL) { eo.out_str(".p2align 4,,10\n", 15); gen_inst(inst, ctx); }
                 if (cfa_framed == 1) { _cfa_frameless(); }
                 _emit_prologue(func, ctx, push_count, total, local_size, spill_size, alloc_size);
                 cfa_framed = 1;
@@ -487,10 +519,16 @@ fn gen_func(func as *d.IRFunction) as void {
             }
         }
         if (inst.is_dead != 1) {
+            // A loop head: pad to 16 unless that takes more than 10 bytes.
+            if (cast(i64, loop_head) != 0 && inst.op == d.IR_LABEL && inst.dest.label >= 0
+                && inst.dest.label < func.label_count && loop_head[inst.dest.label] == cast(u8, 1)) {
+                eo.out_str(".p2align 4,,10\n", 15);
+            }
             gen_inst(inst, ctx);
         }
         inst = inst.next;
     }
+    if (cast(i64, loop_head) != 0) { d.opt_free(loop_head); }
     ctx.sw_frameless = 0;
     eo.fp_omit = 0;
 
