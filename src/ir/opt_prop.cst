@@ -1,6 +1,92 @@
 use "defs.cst" as d;
 use "opt_helpers.cst" as oh;
 
+// === Block-local copy propagation ===
+//
+// The global pass above follows copies only when the source has a single
+// definition. After mem2reg the IR reads every loop variable through a fresh
+// copy of a multi-def vreg (`MOV v6 = v4; NE v7 = v6, v5`, with v4 redefined
+// on the back edge), so those copies all survive to the register allocator.
+//
+// Inside one block the question is simpler: from `MOV a = b` until the next
+// definition of a or of b, a and b hold the same bits, so a use of a may read b
+// instead. Facts die at a LABEL (another path may enter there), at a PHI (its
+// operands come from predecessors) and when either side is redefined. IR_MOV
+// is a plain 64-bit copy in every backend, so no type check is needed. The
+// copies left without uses are removed by DCE.
+//
+// LCP_MAX bounds the facts live at once so a long block stays linear.
+let is i32 as LCP_MAX with imut = 64;
+
+fn _lcp_kill(v as i32, src_of as *i32, active as *i32, n_active as *i32) as void {
+    // v is redefined: drop its own fact and every fact that copies from it.
+    let is i32 as k with mut = 0;
+    while (k < *n_active) {
+        let is i32 as a = active[k];
+        if (a == v || src_of[a] == v) {
+            src_of[a] = 0 - 1;
+            *n_active = *n_active - 1;
+            active[k] = active[*n_active];
+        } else {
+            k = k + 1;
+        }
+    }
+}
+
+fn _lcp_clear(src_of as *i32, active as *i32, n_active as *i32) as void {
+    let is i32 as k with mut = 0;
+    while (k < *n_active) { src_of[active[k]] = 0 - 1; k = k + 1; }
+    *n_active = 0;
+}
+
+fn _lcp_sub(o as *d.Operand, src_of as *i32, vc as i32) as void {
+    if (o.op_type != d.OP_VREG) { return; }
+    let is i32 as v = o.vreg;
+    if (v < 0 || v >= vc) { return; }
+    if (src_of[v] >= 0) { o.vreg = src_of[v]; }
+}
+
+fn pass_local_copy_prop(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc == 0) { return; }
+    let is *i32 as src_of = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { src_of[i] = 0 - 1; i = i + 1; }
+    let is *i32 as active = cast(*i32, d.opt_alloc(cast(i64, LCP_MAX) * 4));
+    let is i32 as n_active with mut = 0;
+
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_LABEL || op == d.IR_PHI) {
+                _lcp_clear(src_of, active, &n_active);
+            } else {
+                // Uses first: they read the values from before this instruction.
+                _lcp_sub(&inst.src1, src_of, vc);
+                _lcp_sub(&inst.src2, src_of, vc);
+                // STORE and COPY read dest as an address; they define nothing.
+                let is i32 as dest_is_use = op == d.IR_STORE || op == d.IR_COPY;
+                if (dest_is_use == 1) { _lcp_sub(&inst.dest, src_of, vc); }
+                // Then the definition, which ends the facts it overwrites.
+                if (dest_is_use == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc) {
+                    let is i32 as dv = inst.dest.vreg;
+                    _lcp_kill(dv, src_of, active, &n_active);
+                    if (op == d.IR_MOV && inst.src1.op_type == d.OP_VREG && inst.src1.vreg != dv
+                        && inst.src1.vreg >= 0 && inst.src1.vreg < vc && n_active < LCP_MAX) {
+                        src_of[dv] = inst.src1.vreg;
+                        active[n_active] = dv;
+                        n_active = n_active + 1;
+                    }
+                }
+            }
+        }
+        inst = inst.next;
+    }
+    d.opt_free(cast(*u8, active));
+    d.opt_free(cast(*u8, src_of));
+}
+
 // === Pass 1: Constant Prop + Copy Prop (forward) ===
 
 fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64, copy_of as *i32, vc as i32) as void {

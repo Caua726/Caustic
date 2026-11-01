@@ -94,6 +94,38 @@ fn _is_dyn_library(f as *d.IRFunction) as i32 {
     return 0;
 }
 
+// Does any live instruction address the locals area ([rbp - off])? Only three
+// IR forms do: a LOAD or STORE whose address is a stack offset instead of a
+// vreg, and IR_ADDR (&local). Hand-written asm may name [rbp - off] itself, so
+// a function with live asm keeps its locals. Spill slots, the alloca area and
+// the variadic save area are addressed past arg_spill_base and move with it.
+fn _frame_locals_used(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_ADDR || op == d.IR_ASM) { return 1; }
+            if (op == d.IR_LOAD && inst.src1.op_type != d.OP_VREG) { return 1; }
+            if (op == d.IR_STORE && inst.dest.op_type != d.OP_VREG) { return 1; }
+        }
+        inst = inst.next;
+    }
+    return 0;
+}
+
+// Does the function call out (and so need rsp 16-byte aligned at the call)?
+fn _frame_makes_calls(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_ASM) { return 1; }
+        }
+        inst = inst.next;
+    }
+    return 0;
+}
+
 fn gen_func(func as *d.IRFunction) as void {
     // -O2 loop unrolling: runs HERE (post-optimize, pre-regalloc) — never inside
     // optimize_func — because it reuses vregs across unrolled copies, which would
@@ -118,6 +150,7 @@ fn gen_func(func as *d.IRFunction) as void {
     if (al.al_opt_level >= 1) {
         e.isel_init(func);
         e.isel_init_defs(func);
+        e.sx32_init(func);
     }
 
     // Build intervals and allocate registers
@@ -140,16 +173,6 @@ fn gen_func(func as *d.IRFunction) as void {
         io.write_str(io.STDERR, "\n");
     }
 
-    // Set arg_spill_base so spill slots don't overlap with local vars
-    ctx.arg_spill_base = func.stack_size;
-
-    // Compute total stack size needed
-    let is i32 as local_size = func.stack_size;
-    let is i32 as spill_size = ctx.stack_slots * 8;
-    let is i32 as alloc_size = func.alloc_stack_size;
-    let is i32 as va_size with mut = 0;
-    if (func.is_variadic == 1) { va_size = 48; }
-    let is i32 as total with mut = local_size + spill_size + alloc_size + va_size;
     // Count callee-saved pushes from mask bits
     let is i32 as mask = ctx.used_callee_mask;
     let is i32 as push_count with mut = 0;
@@ -158,13 +181,48 @@ fn gen_func(func as *d.IRFunction) as void {
     if (mask & 4) { push_count = push_count + 1; }
     if (mask & 8) { push_count = push_count + 1; }
     if (mask & 16) { push_count = push_count + 1; }
-    // Minimum stack frame
-    if (total < 8) { total = 8; }
-    // Align total to 16-byte boundary considering call(8) + push rbp(8) + pushes
+
+    // Frame layout, as offsets below rbp: the callee-saved pushes sit at
+    // [rbp-8 .. rbp-push_count*8], inside the 48 bytes semantic reserves at the
+    // top of every locals area (walk.cst: stack_offset starts at 48); locals
+    // follow, then spill slots (from arg_spill_base), then alloca, then the
+    // variadic save area.
+    //
+    // The locals area is only real if something live still addresses it. After
+    // mem2reg most scalar locals live in vregs and their stack STOREs are dead,
+    // yet func.stack_size still counts their slots — every function paid a
+    // `sub rsp` for memory nothing touched. When no live instruction reaches
+    // the area, it shrinks to the pushes alone and spill slots start right
+    // below them. The pushes already moved rsp past their own bytes, so only
+    // what lies beneath them is subtracted.
+    let is i32 as local_size with mut = func.stack_size;
+    let is i32 as pushed_bytes with mut = 0;
+    if (al.al_opt_level >= 1 && _frame_locals_used(func) == 0) {
+        local_size = push_count * 8;
+        pushed_bytes = local_size;
+    }
+
+    // Set arg_spill_base so spill slots don't overlap with local vars
+    ctx.arg_spill_base = local_size;
+
+    // Compute total stack size needed
+    let is i32 as spill_size = ctx.stack_slots * 8;
+    let is i32 as alloc_size = func.alloc_stack_size;
+    let is i32 as va_size with mut = 0;
+    if (func.is_variadic == 1) { va_size = 48; }
+    let is i32 as total with mut = local_size - pushed_bytes + spill_size + alloc_size + va_size;
+    // Align total to 16-byte boundary considering call(8) + push rbp(8) + pushes.
+    // The alignment only matters to a callee: a function that calls nothing and
+    // has nothing on the stack keeps rsp where the pushes left it.
     let is i32 as frame_fixed = 16 + push_count * 8;
-    let is i32 as rem = (frame_fixed + total) % 16;
-    if (rem != 0) {
-        total = total + 16 - rem;
+    let is i32 as needs_frame with mut = 1;
+    if (al.al_opt_level >= 1 && total == 0 && _frame_makes_calls(func) == 0) { needs_frame = 0; }
+    if (needs_frame == 1) {
+        if (total < 8) { total = 8; }
+        let is i32 as rem = (frame_fixed + total) % 16;
+        if (rem != 0) {
+            total = total + 16 - rem;
+        }
     }
     ctx.aligned_stack_size = total;
 

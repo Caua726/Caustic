@@ -445,6 +445,142 @@ fn isel_get_def(vreg as i32) as *d.IRInst {
     return cast(*d.IRInst, *p);
 }
 
+// === Sign-extended i32 values ===
+//
+// A signed i32 lives in a 64-bit register, and every instruction that produces
+// one with its type attached (CAST/LOAD/ADD/SUB to i32) leaves it sign-extended:
+// the upper 32 bits copy bit 31. After mem2reg, each read of an i32 local is a
+// CAST (i32->i32) that emits `movsxd r, r32` again — one per use, inside loops
+// too. When the value is already sign-extended that movsxd changes nothing, so
+// the CAST is emitted as a plain copy.
+//
+// sx32[v] = 1 when EVERY live definition of v leaves it sign-extended. It is a
+// greatest fixpoint: start everything at 1 and clear what a definition can't
+// vouch for, until nothing changes. A MOV inherits its source; a vreg with no
+// definition stays 0.
+//
+// Parameters arrive from the caller, which may be C code that left the upper
+// half undefined. A parameter whose only uses are CASTs to i32 is extended once
+// on entry (argx32[v] = 1); every other parameter is left alone and its casts
+// keep their movsxd.
+let is *u8 as sx32 with mut = cast(*u8, 0);
+let is *u8 as argx32 with mut = cast(*u8, 0);
+let is i32 as sx32_vc with mut = 0;
+
+fn _is_i32s(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    if (is_float_type(t) == 1) { return 0; }
+    if (get_type_size(t) != 4) { return 0; }
+    if (is_signed_type(t) != 1) { return 0; }
+    return 1;
+}
+
+// A CAST that turns an integer into a signed i32: its result is sign-extended
+// whether or not the movsxd is emitted.
+fn _is_cast_to_i32s(inst as *d.IRInst) as i32 {
+    if (inst.op != d.IR_CAST) { return 0; }
+    if (_is_i32s(inst.cast_to) == 0) { return 0; }
+    if (cast(i64, inst.cast_from) != 0 && is_float_type(inst.cast_from) == 1) { return 0; }
+    return 1;
+}
+
+fn _sx32_get(v as i32) as i32 {
+    if (v < 0 || v >= sx32_vc) { return 0; }
+    return cast(i32, sx32[v]);
+}
+
+// Does this definition leave its dest sign-extended as an i32?
+fn _sx32_def_ok(inst as *d.IRInst) as i32 {
+    let is i32 as op = inst.op;
+    if (_is_cast_to_i32s(inst) == 1) { return 1; }
+    if (op == d.IR_LOAD || op == d.IR_ADD || op == d.IR_SUB) { return _is_i32s(inst.cast_to); }
+    if (op == d.IR_IMM) {
+        if (inst.src1.imm >= 0 - 2147483648 && inst.src1.imm <= 2147483647) { return 1; }
+        return 0;
+    }
+    if (op == d.IR_MOV) {
+        if (inst.src1.op_type == d.OP_VREG) { return _sx32_get(inst.src1.vreg); }
+        if (inst.src1.op_type == d.OP_IMM && inst.src1.imm >= 0 - 2147483648 && inst.src1.imm <= 2147483647) { return 1; }
+        return 0;
+    }
+    if (op == d.IR_GET_ARG) { return cast(i32, argx32[inst.dest.vreg]); }
+    return 0;
+}
+
+fn sx32_init(func as *d.IRFunction) as void {
+    if (cast(i64, sx32) != 0) { d.opt_free(sx32); }
+    if (cast(i64, argx32) != 0) { d.opt_free(argx32); }
+    let is i32 as vc = func.vreg_count;
+    sx32_vc = vc;
+    sx32 = d.opt_alloc(cast(i64, vc) + 1);
+    argx32 = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as i with mut = 0;
+    while (i < vc) { sx32[i] = cast(u8, 0); argx32[i] = cast(u8, 0); i = i + 1; }
+
+    // Parameters: candidate when defined by a GET_ARG with a register index;
+    // disqualified by any other appearance than as the source of an i32 cast.
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_GET_ARG && inst.dest.op_type == d.OP_VREG
+            && inst.src1.imm < 6 && inst.dest.vreg < vc) {
+            argx32[inst.dest.vreg] = cast(u8, 1);
+        }
+        inst = inst.next;
+    }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg < vc && _is_cast_to_i32s(inst) == 0) {
+                argx32[inst.src1.vreg] = cast(u8, 0);
+            }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg < vc) {
+                argx32[inst.src2.vreg] = cast(u8, 0);
+            }
+            if (inst.op != d.IR_GET_ARG && inst.dest.op_type == d.OP_VREG && inst.dest.vreg < vc) {
+                argx32[inst.dest.vreg] = cast(u8, 0);
+            }
+        }
+        inst = inst.next;
+    }
+
+    // Greatest fixpoint over the definitions.
+    let is *u8 as has_def = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { has_def[i] = cast(u8, 0); i = i + 1; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg < vc) {
+            has_def[inst.dest.vreg] = cast(u8, 1);
+        }
+        inst = inst.next;
+    }
+    i = 0;
+    while (i < vc) { sx32[i] = has_def[i]; i = i + 1; }
+    d.opt_free(has_def);
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg < vc) {
+                let is i32 as v = inst.dest.vreg;
+                if (sx32[v] == cast(u8, 1) && _sx32_def_ok(inst) == 0) {
+                    sx32[v] = cast(u8, 0);
+                    changed = 1;
+                }
+            }
+            inst = inst.next;
+        }
+    }
+}
+
+fn sx32_is(v as i32) as i32 { return _sx32_get(v); }
+
+fn sx32_arg_ext(v as i32) as i32 {
+    if (v < 0 || v >= sx32_vc) { return 0; }
+    return cast(i32, argx32[v]);
+}
+
 // Addressing mode result: [base_reg + index_reg * scale]
 // scale: 1, 2, 4, or 8. If scale=0, no index.
 struct AddrMode {
