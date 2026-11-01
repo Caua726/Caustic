@@ -918,15 +918,61 @@ fn _float_label(vreg as i32, suffix as *u8) as void {
     eo.out_char(95); eo.out_int(cast(i64, vreg)); eo.out_cstr(suffix);
 }
 
+// === -O2: `(x & k) == 0` branch as one `test x, k` ===
+//
+//     AND t = x, k ; EQ/NE c = t, 0 ; JZ/JNZ c
+//
+// t is read only by the compare, and c only by the jump, so neither value
+// needs to exist: the AND emits nothing and the compare emits `test x, k`,
+// which sets ZF exactly as `and` + `test t, t` would. The AND's dest is never
+// written, so the allocator's choice for it does not matter.
+let is i32 as test_and_vreg with mut = 0 - 1;
+let is i32 as test_and_src with mut = 0 - 1;
+let is i64 as test_and_imm with mut = 0;
+
+fn _next_live(i as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n with mut = i.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1) { n = n.next; }
+    return n;
+}
+
+fn try_and_test(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    test_and_vreg = 0 - 1;
+    if (al.al_opt_level < 2) { return 0; }
+    if (inst.op != d.IR_AND || inst.src2.op_type != d.OP_IMM || inst.src1.op_type != d.OP_VREG
+        || inst.dest.op_type != d.OP_VREG) { return 0; }
+    if (inst.src2.imm < (0 - 2147483647) || inst.src2.imm > 2147483647) { return 0; }
+    if (inst.src1.vreg == inst.dest.vreg) { return 0; }
+    if (e.isel_get_uses(inst.dest.vreg) != 1) { return 0; }
+    let is *d.IRInst as c = _next_live(inst);
+    if (cast(i64, c) == 0 || (c.op != d.IR_EQ && c.op != d.IR_NE)) { return 0; }
+    if (e.is_float_type(c.cast_to) == 1) { return 0; }
+    if (c.src1.op_type != d.OP_VREG || c.src1.vreg != inst.dest.vreg) { return 0; }
+    if (c.src2.op_type != d.OP_IMM || c.src2.imm != 0) { return 0; }
+    let is *d.IRInst as j = c.next;
+    if (cast(i64, j) == 0 || j.is_dead == 1 || (j.op != d.IR_JZ && j.op != d.IR_JNZ)
+        || j.src1.vreg != c.dest.vreg) { return 0; }
+    test_and_vreg = inst.dest.vreg;
+    test_and_src = inst.src1.vreg;
+    test_and_imm = inst.src2.imm;
+    return 1;
+}
+
 fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     let is i32 as is_flt = e.is_float_type(inst.cast_to);
     let is i32 as fused with mut = 0;
     let is *d.IRInst as nx = inst.next;
+    let is i32 as and_t = test_and_vreg;
+    test_and_vreg = 0 - 1;
     if (cast(i64, nx) != 0 && nx.is_dead != 1) {
         let is i32 as nx_op = nx.op;
         if ((nx_op == d.IR_JZ || nx_op == d.IR_JNZ) && nx.src1.vreg == inst.dest.vreg) {
-            if (is_flt == 1) {
+            if (is_flt == 0 && and_t >= 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg == and_t) {
+                let is *u8 as xr = e.op_reg(test_and_src, ctx, 0);
+                eo.out_str("  test ", 7); eo.out_cstr(xr); eo.out_str(", ", 2);
+                eo.out_int(test_and_imm); eo.out_char(10);
+            } else if (is_flt == 1) {
                 // Unordered sets CF/ZF/PF together. Parity distinguishes it
                 // from equality and less-than before using unsigned conditions.
                 e.load_op(inst.src1.vreg, ctx, "rax");
@@ -1037,6 +1083,7 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
 fn gen_inst_shift_bitwise(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
+    if (op == d.IR_AND && try_and_test(inst, ctx) == 1) { return; }
     if (op == d.IR_SHL) {
         let is *u8 as scr = e.get_scratch(inst.dest.vreg, ctx);
         e.load_op(inst.src1.vreg, ctx, scr);
