@@ -1,0 +1,439 @@
+use "defs.cst" as d;
+
+// === Tail recursion becomes a loop ===
+//
+// -O2 only. A call a function makes to itself, whose result is the function's
+// own result, needs no new frame: the arguments become the parameters and the
+// body runs again. Two shapes are rewritten:
+//
+//     return f(a, b);              // plain: jump back with the new arguments
+//     return x + f(a, b);          // accumulated: acc = acc + x, then jump back
+//
+// and, in a void function, a call to itself right before the return. With an
+// accumulator every other `return v` becomes `return acc + v`; acc starts at 0.
+// Integer addition wraps, so (acc + x) + v equals acc + (x + v) for every input,
+// which is what makes the second shape exact. Only ADD is accumulated.
+//
+//     entry: GET_ARG v0..vk
+//            MOV n0 = v0 .. MOV nk = vk ; IMM acc = 0
+//     H:     body, where every use of vi reads ni
+//     tail:  SET_ARG i = ai   ->  MOV ti = ai      (same place, same value)
+//            CALL f           ->  (gone)
+//                                 [ADD a2 = acc, x ; MOV acc = a2]
+//                                 MOV ni = ti
+//            RET              ->  JMP H
+//
+// The arguments are captured where the SET_ARGs stood, so an argument that
+// reads a parameter sees the old value even when another one is reassigned
+// first.
+//
+// Left alone: a function whose return type IR generation did not record
+// (IRFunction.ret_kind), one whose frame holds anything (a stack slot read or
+// written, an address taken, alloca): the loop would reuse storage a callee's
+// pointer might still see. Also inline asm, variadic, naked, struct-returning,
+// more than six parameters, and a parameter written after entry.
+//
+// A frame that is no longer there is a frame a backtrace no longer shows; gcc
+// and clang make the same trade at -O2.
+
+let is i32 as TRE_MAX_ARGS with imut = 6;
+
+fn _tre_self(func as *d.IRFunction, inst as *d.IRInst) as i32 {
+    if (inst.op != d.IR_CALL) { return 0; }
+    if (inst.is_extern_call != cast(i8, 0) || inst.is_variadic_call != cast(i8, 0)) { return 0; }
+    return d.str_eq(inst.call_name_ptr, cast(i32, inst.call_name_len), func.asm_name_ptr, func.asm_name_len);
+}
+
+// Next live instruction after p (null at the end).
+fn _tre_next(p as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n with mut = p.next;
+    while (cast(i64, n) != 0 && n.is_dead != cast(i8, 0)) { n = n.next; }
+    return n;
+}
+
+fn _tre_uses(cnt as *i32, o as *d.Operand, vc as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc) {
+        let is *i32 as p = cast(*i32, cast(i64, cnt) + cast(i64, o.vreg) * 4);
+        *p = *p + 1;
+    }
+}
+
+fn _tre_get(a as *i32, i as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4);
+    return *p;
+}
+
+fn _tre_put(a as *i32, i as i32, v as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4);
+    *p = v;
+}
+
+fn _tre_rename(o as *d.Operand, from as *i32, to as *i32, n as i32) as void {
+    if (o.op_type != d.OP_VREG) { return; }
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (o.vreg == _tre_get(from, i)) { o.vreg = _tre_get(to, i); return; }
+        i = i + 1;
+    }
+}
+
+fn _tre_mov(dst as i32, src as d.Operand, line as i32) as *d.IRInst {
+    let is *d.IRInst as m = d.new_inst(d.IR_MOV);
+    m.dest = d.op_vreg(dst);
+    m.src1 = src;
+    m.line = line;
+    return m;
+}
+
+fn _tre_pure(i as *d.IRInst) as i32 {
+    let is i32 as op = i.op;
+    if (op == d.IR_IMM || op == d.IR_MOV || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
+        || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR
+        || op == d.IR_NEG || op == d.IR_NOT || op == d.IR_CAST
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { return 1; }
+    return 0;
+}
+
+fn _tre_reads(i as *d.IRInst, v as i32) as i32 {
+    if (i.src1.op_type == d.OP_VREG && i.src1.vreg == v) { return 1; }
+    if (i.src2.op_type == d.OP_VREG && i.src2.vreg == v) { return 1; }
+    return 0;
+}
+
+// Is `call` a tail site? Returns 1 (plain), 2 (accumulated: *add_out is the
+// ADD) or 0. The live sequence after the call must be exactly the return.
+fn _tre_site(func as *d.IRFunction, ci as *d.IRInst, is_void as i32, uses as *i32, vc as i32, add_out as *i64) as i32 {
+    let is *d.IRInst as a with mut = _tre_next(ci);
+    if (cast(i64, a) == 0) { return 0; }
+    let is i32 as c with mut = 0 - 1;
+    if (ci.dest.op_type == d.OP_VREG) { c = ci.dest.vreg; }
+    // plain: RET c
+    if (a.op == d.IR_RET && c >= 0 && a.src1.op_type == d.OP_VREG && a.src1.vreg == c
+        && _tre_get(uses, c) == 1) { return 1; }
+    // void: [IMM k] RET [k], the call's value unused
+    if (is_void == 1 && (c < 0 || _tre_get(uses, c) == 0)) {
+        if (a.op == d.IR_RET) { return 1; }
+        if (a.op == d.IR_IMM && a.dest.op_type == d.OP_VREG) {
+            let is *d.IRInst as r = _tre_next(a);
+            if (cast(i64, r) != 0 && r.op == d.IR_RET && r.src1.op_type == d.OP_VREG
+                && r.src1.vreg == a.dest.vreg && _tre_get(uses, a.dest.vreg) == 1) { return 1; }
+        }
+        return 0;
+    }
+    // accumulated: ADD r = x, c (or c, x) ; RET r. Register arithmetic that
+    // does not read c may come between: it ran after the call and now runs
+    // before the rest of the recursion, which only memory could tell apart.
+    while (is_void == 0 && c >= 0 && _tre_pure(a) == 1 && _tre_reads(a, c) == 0) {
+        a = _tre_next(a);
+        if (cast(i64, a) == 0) { return 0; }
+    }
+    if (is_void == 0 && c >= 0 && a.op == d.IR_ADD && _tre_get(uses, c) == 1
+        && a.dest.op_type == d.OP_VREG && a.src1.op_type != d.OP_NONE && a.src2.op_type != d.OP_NONE) {
+        let is i32 as one with mut = 0;
+        let is i32 as two with mut = 0;
+        if (a.src1.op_type == d.OP_VREG && a.src1.vreg == c) { one = 1; }
+        if (a.src2.op_type == d.OP_VREG && a.src2.vreg == c) { two = 1; }
+        if (one == two) { return 0; }
+        let is *d.IRInst as r = _tre_next(a);
+        if (cast(i64, r) != 0 && r.op == d.IR_RET && r.src1.op_type == d.OP_VREG
+            && r.src1.vreg == a.dest.vreg && _tre_get(uses, a.dest.vreg) == 1) {
+            *add_out = cast(i64, a);
+            return 2;
+        }
+    }
+    return 0;
+}
+
+// The live SET_ARGs right before `call`, one per parameter index 0..n-1, into
+// sa[]. Returns 1 when they are exactly that.
+fn _tre_args(func as *d.IRFunction, ci as *d.IRInst, sa as *i64, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is *i64 as p = cast(*i64, cast(i64, sa) + cast(i64, i) * 8);
+        *p = 0;
+        i = i + 1;
+    }
+    // Walk the list; the run of live SET_ARGs that ends at `call`.
+    let is *d.IRInst as run_start with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0 && cast(i64, it) != cast(i64, ci)) {
+        if (it.is_dead == cast(i8, 0)) {
+            if (it.op == d.IR_SET_ARG) {
+                if (cast(i64, run_start) == 0) { run_start = it; }
+            } else { run_start = cast(*d.IRInst, 0); }
+        }
+        it = it.next;
+    }
+    if (cast(i64, it) == 0) { return 0; }
+    let is i32 as got with mut = 0;
+    it = run_start;
+    while (cast(i64, it) != 0 && cast(i64, it) != cast(i64, ci)) {
+        if (it.is_dead == cast(i8, 0)) {
+            let is i64 as idx = it.dest.imm;
+            if (it.dest.op_type != d.OP_IMM || idx < 0 || idx >= cast(i64, n)) { return 0; }
+            let is *i64 as p = cast(*i64, cast(i64, sa) + idx * 8);
+            if (*p != 0) { return 0; }
+            *p = cast(i64, it);
+            got = got + 1;
+        }
+        it = it.next;
+    }
+    if (got != n) { return 0; }
+    return 1;
+}
+
+fn pass_tre(func as *d.IRFunction) as i32 {
+    if (func.is_naked != 0 || func.is_variadic != 0) { return 0; }
+    let is i32 as na = func.num_args;
+    if (na > TRE_MAX_ARGS) { return 0; }
+    // The return type comes from IR generation; unknown or a struct: no.
+    if (func.ret_kind != 1 && func.ret_kind != 2) { return 0; }
+
+    let is i32 as vc = func.vreg_count;
+    let is i32 as is_void with mut = 0;
+    if (func.ret_kind == 1) { is_void = 1; }
+
+    // Shape of the function: no frame contents, parameters at the top and
+    // never written again, at least one self call.
+    let is [6]i32 as pv;
+    let is i32 as npv with mut = 0;
+    let is i32 as nself with mut = 0;
+    let is *d.IRInst as last_arg with mut = cast(*d.IRInst, 0);
+    let is i32 as top with mut = 1;
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    let is i32 as i with mut = 0;
+    while (i <= vc) { _tre_put(uses, i, 0); i = i + 1; }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == cast(i8, 0)) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_ASM || op == d.IR_VA_START || op == d.IR_SET_CTX || op == d.IR_GET_ALLOC_ADDR
+                || op == d.IR_COPY || op == d.IR_PHI) { d.opt_free(cast(*u8, uses)); return 0; }
+            if (op == d.IR_ADDR) { d.opt_free(cast(*u8, uses)); return 0; }
+            if (op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) { d.opt_free(cast(*u8, uses)); return 0; }
+            if (op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) { d.opt_free(cast(*u8, uses)); return 0; }
+            if (op == d.IR_GET_ARG) {
+                if (top == 0 || inst.dest.op_type != d.OP_VREG || npv >= 6) { d.opt_free(cast(*u8, uses)); return 0; }
+                pv[npv] = inst.dest.vreg;
+                npv = npv + 1;
+                last_arg = inst;
+            } else {
+                top = 0;
+                if (inst.dest.op_type == d.OP_VREG) {
+                    let is i32 as k with mut = 0;
+                    while (k < npv) {
+                        if (pv[k] == inst.dest.vreg && op != d.IR_STORE) { d.opt_free(cast(*u8, uses)); return 0; }
+                        k = k + 1;
+                    }
+                }
+            }
+            if (_tre_self(func, inst) == 1) { nself = nself + 1; }
+            _tre_uses(uses, &inst.src1, vc);
+            _tre_uses(uses, &inst.src2, vc);
+            if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+                || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_LABEL || op == d.IR_SET_ARG) {
+                _tre_uses(uses, &inst.dest, vc);
+            }
+        }
+        inst = inst.next;
+    }
+    if (nself == 0 || npv != na) { d.opt_free(cast(*u8, uses)); return 0; }
+
+    // Find the tail sites.
+    let is i32 as nsite with mut = 0;
+    let is i32 as has_acc with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == cast(i8, 0) && _tre_self(func, inst) == 1) {
+            let is i64 as addp with mut = 0;
+            let is i32 as k = _tre_site(func, inst, is_void, uses, vc, &addp);
+            if (k != 0) {
+                nsite = nsite + 1;
+                if (k == 2) { has_acc = 1; }
+            }
+        }
+        inst = inst.next;
+    }
+    if (nsite == 0) { d.opt_free(cast(*u8, uses)); return 0; }
+
+    // Entry: copies of the parameters, the accumulator, the loop head.
+    let is [6]i32 as nv;
+    let is i32 as line0 with mut = 0;
+    if (cast(i64, last_arg) != 0) { line0 = last_arg.line; }
+    let is *d.IRInst as tailp with mut = last_arg;
+    let is *d.IRInst as after with mut = func.instructions;
+    if (cast(i64, last_arg) != 0) { after = last_arg.next; }
+    let is *d.IRInst as chain_h with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as chain_t with mut = cast(*d.IRInst, 0);
+    i = 0;
+    while (i < na) {
+        nv[i] = func.vreg_count;
+        func.vreg_count = func.vreg_count + 1;
+        let is *d.IRInst as m = _tre_mov(nv[i], d.op_vreg(pv[i]), line0);
+        if (cast(i64, chain_h) == 0) { chain_h = m; } else { chain_t.next = m; }
+        chain_t = m;
+        i = i + 1;
+    }
+    let is i32 as acc with mut = 0 - 1;
+    let is *d.IRInst as acc_tpl with mut = cast(*d.IRInst, 0);
+    if (has_acc == 1) {
+        acc = func.vreg_count;
+        func.vreg_count = func.vreg_count + 1;
+        let is *d.IRInst as z = d.new_inst(d.IR_IMM);
+        z.dest = d.op_vreg(acc);
+        z.src1 = d.op_imm(0);
+        z.line = line0;
+        if (cast(i64, chain_h) == 0) { chain_h = z; } else { chain_t.next = z; }
+        chain_t = z;
+    }
+    let is i32 as head = func.label_count;
+    func.label_count = func.label_count + 1;
+    let is *d.IRInst as hl = d.new_inst(d.IR_LABEL);
+    hl.dest = d.op_label(head);
+    if (cast(i64, chain_h) == 0) { chain_h = hl; } else { chain_t.next = hl; }
+    chain_t = hl;
+    chain_t.next = after;
+    if (cast(i64, tailp) == 0) { func.instructions = chain_h; } else { tailp.next = chain_h; }
+
+    // Every use of a parameter past the head reads its copy.
+    let is i32 as pv_n = na;
+    inst = hl.next;
+    while (cast(i64, inst) != 0) {
+        _tre_rename(&inst.dest, cast(*i32, &pv), cast(*i32, &nv), pv_n);
+        _tre_rename(&inst.src1, cast(*i32, &pv), cast(*i32, &nv), pv_n);
+        _tre_rename(&inst.src2, cast(*i32, &pv), cast(*i32, &nv), pv_n);
+        inst = inst.next;
+    }
+
+    // Rewrite the tail sites.
+    let is [6]i64 as sa;
+    let is [6]i32 as tv;
+    inst = hl.next;
+    while (cast(i64, inst) != 0) {
+        let is *d.IRInst as nxt with mut = inst.next;
+        if (inst.is_dead == cast(i8, 0) && _tre_self(func, inst) == 1) {
+            let is i64 as addp with mut = 0;
+            let is i32 as k = _tre_site(func, inst, is_void, uses, vc, &addp);
+            if (k != 0 && _tre_args(func, inst, cast(*i64, &sa), na) == 1) {
+                let is i32 as line = inst.line;
+                // An argument that is the parameter itself needs nothing
+                // (tv = -2). One that reads no parameter is copied in at the
+                // jump (tv = -1). One that reads another parameter is captured
+                // where its SET_ARG stood (SET_ARG i = ai -> MOV ti = ai), as
+                // that parameter may be written first.
+                i = 0;
+                while (i < na) {
+                    let is *d.IRInst as s = cast(*d.IRInst, sa[i]);
+                    let is i32 as reads_n with mut = 0;
+                    if (s.src1.op_type == d.OP_VREG) {
+                        let is i32 as q with mut = 0;
+                        while (q < na) { if (s.src1.vreg == nv[q]) { reads_n = 1; } q = q + 1; }
+                    }
+                    if (s.src1.op_type == d.OP_VREG && s.src1.vreg == nv[i]) {
+                        tv[i] = 0 - 2;
+                        s.is_dead = cast(i8, 1);
+                    } else if (reads_n == 0) {
+                        tv[i] = 0 - 1;
+                        s.is_dead = cast(i8, 1);
+                    } else {
+                        tv[i] = func.vreg_count;
+                        func.vreg_count = func.vreg_count + 1;
+                        s.op = cast(i8, d.IR_MOV);
+                        s.dest = d.op_vreg(tv[i]);
+                        s.cast_to = cast(*u8, 0);
+                    }
+                    i = i + 1;
+                }
+                inst.is_dead = cast(i8, 1);
+                let is *d.IRInst as ch with mut = cast(*d.IRInst, 0);
+                let is *d.IRInst as ct with mut = cast(*d.IRInst, 0);
+                let is *d.IRInst as ret with mut = _tre_next(inst);
+                if (k == 2) {
+                    let is *d.IRInst as add = cast(*d.IRInst, addp);
+                    let is d.Operand as x with mut = add.src1;
+                    if (add.src1.op_type == d.OP_VREG && add.src1.vreg == inst.dest.vreg) { x = add.src2; }
+                    let is i32 as a2 = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as na2 = d.new_inst(d.IR_ADD);
+                    na2.dest = d.op_vreg(a2);
+                    na2.src1 = d.op_vreg(acc);
+                    na2.src2 = x;
+                    na2.cast_to = add.cast_to;
+                    na2.cast_from = add.cast_from;
+                    na2.line = add.line;
+                    ch = na2;
+                    ct = na2;
+                    let is *d.IRInst as ma = _tre_mov(acc, d.op_vreg(a2), add.line);
+                    ct.next = ma;
+                    ct = ma;
+                    if (cast(i64, acc_tpl) == 0) { acc_tpl = add; }
+                    add.is_dead = cast(i8, 1);
+                    ret = _tre_next(add);
+                } else if (ret.op == d.IR_IMM) {
+                    ret.is_dead = cast(i8, 1);
+                    ret = _tre_next(ret);
+                }
+                i = 0;
+                while (i < na) {
+                    if (tv[i] != 0 - 2) {
+                        let is *d.IRInst as s = cast(*d.IRInst, sa[i]);
+                        let is d.Operand as src with mut = s.src1;
+                        if (tv[i] >= 0) { src = d.op_vreg(tv[i]); }
+                        let is *d.IRInst as m = _tre_mov(nv[i], src, line);
+                        if (cast(i64, ch) == 0) { ch = m; } else { ct.next = m; }
+                        ct = m;
+                    }
+                    i = i + 1;
+                }
+                // RET -> JMP head; the new code goes right before it.
+                let is *d.IRInst as j = d.new_inst(d.IR_JMP);
+                j.dest = d.op_label(head);
+                j.line = ret.line;
+                if (cast(i64, ch) == 0) { ch = j; } else { ct.next = j; }
+                ct = j;
+                ret.is_dead = cast(i8, 1);
+                let is *d.IRInst as before with mut = inst;
+                while (cast(i64, before.next) != cast(i64, ret)) { before = before.next; }
+                ct.next = ret;
+                before.next = ch;
+                nxt = ret.next;
+            }
+        }
+        inst = nxt;
+    }
+
+    // With an accumulator every other return adds it.
+    if (has_acc == 1 && cast(i64, acc_tpl) != 0) {
+        inst = hl.next;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == cast(i8, 0) && inst.op == d.IR_RET && inst.src1.op_type != d.OP_NONE) {
+                let is i32 as t = func.vreg_count;
+                func.vreg_count = func.vreg_count + 1;
+                let is *d.IRInst as ad = d.new_inst(d.IR_ADD);
+                ad.dest = d.op_vreg(t);
+                ad.src1 = d.op_vreg(acc);
+                ad.src2 = inst.src1;
+                ad.cast_to = acc_tpl.cast_to;
+                ad.cast_from = acc_tpl.cast_from;
+                ad.line = inst.line;
+                // Turn this RET into the ADD and put a fresh RET after it.
+                let is *d.IRInst as r = d.new_inst(d.IR_RET);
+                r.src1 = d.op_vreg(t);
+                r.line = inst.line;
+                r.cast_to = inst.cast_to;
+                r.next = inst.next;
+                inst.op = cast(i8, d.IR_ADD);
+                inst.dest = ad.dest;
+                inst.src1 = ad.src1;
+                inst.src2 = ad.src2;
+                inst.cast_to = ad.cast_to;
+                inst.cast_from = ad.cast_from;
+                inst.next = r;
+                inst = r;
+            }
+            inst = inst.next;
+        }
+    }
+    d.opt_free(cast(*u8, uses));
+    return 1;
+}

@@ -522,6 +522,21 @@ fn _sx32_def_ok(inst as *d.IRInst) as i32 {
     return 0;
 }
 
+// Does this instruction read its src1 as an i32 and nothing more?
+fn _sx32_keeps(inst as *d.IRInst, i32only as *u8, vc as i32) as i32 {
+    if (_is_cast_to_i32s(inst) == 1) { return 1; }
+    if (inst.op == d.IR_MOV && _is_split_copy(inst) == 0 && inst.dest.op_type == d.OP_VREG
+        && inst.dest.vreg >= 0 && inst.dest.vreg < vc && i32only[inst.dest.vreg] == cast(u8, 1)) { return 1; }
+    return 0;
+}
+
+// Ops whose dest operand is read, not written.
+fn _dest_is_read(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+        || op == d.IR_CMOV || op == d.IR_COPY) { return 1; }
+    return 0;
+}
+
 fn _is_split_copy(inst as *d.IRInst) as i32 {
     if (inst.op == d.IR_MOV && inst.is_extern_call == cast(i8, 2)
         && inst.dest.op_type == d.OP_VREG && inst.src1.op_type == d.OP_VREG) { return 1; }
@@ -553,12 +568,42 @@ fn sx32_init(func as *d.IRFunction) as void {
         }
         inst = inst.next;
     }
+    // i32only[v] = 1 when every read of v keeps only its low 32 bits as a
+    // signed i32: the source of an i32 cast, or of a plain copy into a vreg
+    // that is itself i32only (a loop-carried copy of a parameter, as
+    // opt_tre.cst makes). Greatest fixpoint.
+    let is *u8 as i32only = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { i32only[i] = cast(u8, 1); i = i + 1; }
+    let is i32 as ichg with mut = 1;
+    while (ichg == 1) {
+        ichg = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0) {
+                if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc
+                    && i32only[inst.src1.vreg] == cast(u8, 1) && _sx32_keeps(inst, i32only, vc) == 0) {
+                    i32only[inst.src1.vreg] = cast(u8, 0); ichg = 1;
+                }
+                if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc
+                    && i32only[inst.src2.vreg] == cast(u8, 1)) {
+                    i32only[inst.src2.vreg] = cast(u8, 0); ichg = 1;
+                }
+                if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+                    && _dest_is_read(inst.op) == 1 && i32only[inst.dest.vreg] == cast(u8, 1)) {
+                    i32only[inst.dest.vreg] = cast(u8, 0); ichg = 1;
+                }
+            }
+            inst = inst.next;
+        }
+    }
+
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && _is_split_copy(inst) == 1) {
             // judged below, once its dest's uses are known
         } else if (inst.is_dead == 0) {
-            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg < vc && _is_cast_to_i32s(inst) == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg < vc && _sx32_keeps(inst, i32only, vc) == 0) {
                 argx32[inst.src1.vreg] = cast(u8, 0);
             }
             if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg < vc) {
@@ -579,6 +624,7 @@ fn sx32_init(func as *d.IRFunction) as void {
         }
         inst = inst.next;
     }
+    d.opt_free(i32only);
 
     // Greatest fixpoint over the definitions.
     let is *u8 as has_def = d.opt_alloc(cast(i64, vc) + 1);
