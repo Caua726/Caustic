@@ -47,6 +47,122 @@ fn build_def_table(func as *d.IRFunction, vc as i32, def_count as *i32, def_inst
     }
 }
 
+// --- loop context (set by the driver around the analysis of one loop) ---
+// Without it every value the walk cannot see through counts as invariant, which
+// is only true of values defined outside the loop. With it:
+//   sc_inloop[v] = 1   v has a live def inside the loop body
+//   sc_piv[v]    = C   v is a pointer induction: its only in-loop def is
+//                      `v = v + C` in the latch, and nothing in the loop reads v
+//                      after that add, so in iteration t it holds v_entry + C*t.
+//                      Strength reduction leaves addresses in this shape.
+// A value defined in the loop that is neither the IV nor a pointer induction is
+// UNKNOWN.
+let is *i8 as sc_inloop with mut = cast(*i8, 0);
+let is *i64 as sc_piv with mut = cast(*i64, 0);
+let is i32 as sc_vc with mut = 0;
+// sc_ext = 1 also lets through what only the multiply-add path can execute:
+// pointer inductions and the sign-extended IV. The older map and reduction
+// paths address elements as base + iv*elem and see neither.
+let is i32 as sc_ext with mut = 0;
+
+fn _sc_ops_read(o as *d.Operand, v as i32) as i32 {
+    if (o.op_type == d.OP_VREG && o.vreg == v) { return 1; }
+    return 0;
+}
+
+// first..last: the loop body as a contiguous instruction range; lfirst: first
+// instruction of the latch block.
+fn loop_ctx_begin(first as *d.IRInst, lfirst as *d.IRInst, last as *d.IRInst, vc as i32, def_count as *i32) as void {
+    sc_vc = vc;
+    sc_inloop = cast(*i8, d.opt_alloc(cast(i64, vc + 1)));
+    sc_piv = cast(*i64, d.opt_alloc(cast(i64, vc + 1) * 8));
+    let is *i32 as ndef = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        let is *i8 as ip = cast(*i8, cast(i64, sc_inloop) + cast(i64, i)); *ip = cast(i8, 0);
+        let is *i64 as pp = cast(*i64, cast(i64, sc_piv) + cast(i64, i) * 8); *pp = 0;
+        let is *i32 as np = cast(*i32, cast(i64, ndef) + cast(i64, i) * 4); *np = 0;
+        i = i + 1;
+    }
+    // in-loop defs; candidate step from a latch `v = v + C`
+    let is i32 as in_latch with mut = 0;
+    let is *d.IRInst as w with mut = first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, w) != 0) {
+        if (cast(i64, w) == cast(i64, lfirst)) { in_latch = 1; }
+        if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.op != d.IR_STORE && w.op != d.IR_COPY
+            && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is i32 as v = w.dest.vreg;
+            let is *i8 as ip = cast(*i8, cast(i64, sc_inloop) + cast(i64, v)); *ip = cast(i8, 1);
+            let is *i32 as np = cast(*i32, cast(i64, ndef) + cast(i64, v) * 4); *np = *np + 1;
+            let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, v) * 4);
+            if (in_latch == 1 && *dcp > 1 && w.op == d.IR_ADD && w.src1.op_type == d.OP_VREG && w.src1.vreg == v
+                && w.src2.op_type == d.OP_IMM && w.src2.imm != 0) {
+                // no read of v later in the body
+                let is i32 as later with mut = 0;
+                let is *d.IRInst as r with mut = w.next;
+                let is i32 as rstop with mut = 0;
+                if (cast(i64, w) == cast(i64, last)) { rstop = 1; }
+                while (rstop == 0 && cast(i64, r) != 0) {
+                    if (r.is_dead == 0) {
+                        if (_sc_ops_read(&r.src1, v) == 1 || _sc_ops_read(&r.src2, v) == 1) { later = 1; }
+                        if ((r.op == d.IR_STORE || r.op == d.IR_COPY || r.op == d.IR_CMOV) && _sc_ops_read(&r.dest, v) == 1) { later = 1; }
+                    }
+                    if (cast(i64, r) == cast(i64, last)) { rstop = 1; } else { r = r.next; }
+                }
+                if (later == 0) {
+                    let is *i64 as pp = cast(*i64, cast(i64, sc_piv) + cast(i64, v) * 8); *pp = w.src2.imm;
+                }
+            }
+        }
+        if (cast(i64, w) == cast(i64, last)) { stop = 1; } else { w = w.next; }
+    }
+    // a pointer induction has exactly one in-loop def
+    i = 0;
+    while (i < vc) {
+        let is *i32 as np = cast(*i32, cast(i64, ndef) + cast(i64, i) * 4);
+        if (*np != 1) { let is *i64 as pp = cast(*i64, cast(i64, sc_piv) + cast(i64, i) * 8); *pp = 0; }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, ndef));
+}
+
+fn loop_ctx_end() as void {
+    if (cast(i64, sc_inloop) != 0) { d.opt_free(cast(*u8, sc_inloop)); }
+    if (cast(i64, sc_piv) != 0) { d.opt_free(cast(*u8, sc_piv)); }
+    sc_inloop = cast(*i8, 0); sc_piv = cast(*i64, 0); sc_vc = 0;
+}
+
+fn ctx_inloop(v as i32) as i32 {
+    if (cast(i64, sc_inloop) == 0 || v < 0 || v >= sc_vc) { return 0; }
+    let is *i8 as ip = cast(*i8, cast(i64, sc_inloop) + cast(i64, v));
+    return cast(i32, *ip);
+}
+
+fn ctx_piv(v as i32) as i64 {
+    if (sc_ext == 0 || cast(i64, sc_piv) == 0 || v < 0 || v >= sc_vc) { return 0; }
+    let is *i64 as pp = cast(*i64, cast(i64, sc_piv) + cast(i64, v) * 8);
+    return *pp;
+}
+
+// i64 / u64 / pointer (ast kinds 4, 8, 14; kind is the Type's first field).
+// A null type is the 8-byte default.
+fn _sc_word(ty as *u8) as i32 {
+    if (cast(i64, ty) == 0) { return 1; }
+    let is *i32 as kp = cast(*i32, cast(i64, ty));
+    if (*kp == 4 || *kp == 8 || *kp == 14) { return 1; }
+    return 0;
+}
+
+// i32 -> i32 or i32 -> i64 (ast kinds 3, 4)
+fn _sc_sext32(from as *u8, to as *u8) as i32 {
+    if (cast(i64, from) == 0 || cast(i64, to) == 0) { return 0; }
+    let is *i32 as fp = cast(*i32, cast(i64, from));
+    let is *i32 as tp = cast(*i32, cast(i64, to));
+    if (*fp == 3 && (*tp == 3 || *tp == 4)) { return 1; }
+    return 0;
+}
+
 // single-def inst of v, or 0 if multi-def / undefined / out of range
 fn scev_sdef(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as *d.IRInst {
     if (v < 0 || v >= vc) { return cast(*d.IRInst, 0); }
@@ -117,7 +233,28 @@ fn scev_of_vreg(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_st
     let is i32 as r = scev_resolve(def_inst, def_count, vc, v);
     if (r == iv) { ae_set(out, AE_AFFINE, cast(i32, 0 - 1), 0, iv_step, 1); return; }
     let is *d.IRInst as di = scev_sdef(def_inst, def_count, vc, r);
-    if (cast(i64, di) == 0) { ae_set(out, AE_INVARIANT, r, 0, 0, 0); return; }  // param / multi-def → invariant base
+    if (cast(i64, di) == 0) {
+        let is i64 as pstep = ctx_piv(r);
+        if (pstep != 0) { ae_set(out, AE_AFFINE, r, 0, pstep, 1); return; }
+        if (ctx_inloop(r) == 1) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+        ae_set(out, AE_INVARIANT, r, 0, 0, 0); return;   // param / def outside the loop
+    }
+    // between two 8-byte integer/pointer types a cast is a copy
+    if (di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && _sc_word(di.cast_to) == 1 && _sc_word(di.cast_from) == 1) {
+        scev_of_vreg(def_inst, def_count, vc, iv, iv_step, di.src1.vreg, out, depth + 1);
+        return;
+    }
+    // Sign-extending the IV (i32 -> i32 or i32 -> i64) keeps its value: the loop
+    // test bounds it by an i32, so it never wraps. Only the IV itself is let
+    // through; i32 arithmetic on it could wrap, and is left opaque.
+    if (sc_ext == 1 && di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && _sc_sext32(di.cast_from, di.cast_to) == 1) {
+        let is AffineExpr as ai;
+        scev_of_vreg(def_inst, def_count, vc, iv, iv_step, di.src1.vreg, &ai, depth + 1);
+        if (cast(i32, ai.kind) == AE_AFFINE && ai.base == cast(i32, 0 - 1) && ai.base_imm == 0 && ai.step == iv_step) {
+            ae_set(out, AE_AFFINE, cast(i32, 0 - 1), 0, iv_step, 1);
+            return;
+        }
+    }
     let is i32 as op = di.op;
     if (op == d.IR_IMM && di.src1.op_type == d.OP_IMM) { ae_set(out, AE_INVARIANT, cast(i32, 0 - 1), di.src1.imm, 0, 1); return; }
     if (op == d.IR_ADD || op == d.IR_SUB) {
@@ -158,6 +295,8 @@ fn scev_of_vreg(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_st
         if (ns != 0) { ae_set(out, AE_AFFINE, ab.base, ni, ns, nw); } else { ae_set(out, AE_INVARIANT, ab.base, ni, 0, nw); }
         return;
     }
-    // a no-op cast was already chased by scev_resolve; anything else is opaque.
+    // a no-op cast was already chased by scev_resolve; anything else is opaque:
+    // a fixed value if computed outside the loop, unknown if computed inside it.
+    if (ctx_inloop(r) == 1) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
     ae_set(out, AE_INVARIANT, r, 0, 0, 0);
 }

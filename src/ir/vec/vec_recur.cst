@@ -204,3 +204,164 @@ fn detect_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.V
     out.load_addr = load_addr;
     return 1;
 }
+
+// Multiply-add map: c[i] = a[i] + k * b[i] on i64, k loop-invariant (a vreg or
+// an immediate). a and c may be the same array (c[i] += k*b[i], the matmul
+// inner loop). Addresses come from the IV or from pointer inductions.
+struct AxpyDescriptor {
+    base_c as i32; base_a as i32; base_b as i32;
+    kvreg as i32;       // -1 when k is an immediate
+    kimm as i64;
+}
+
+fn _ax_mark(u as *i8, o as *d.Operand, vc as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < vc) {
+        let is *i8 as p = cast(*i8, cast(i64, u) + cast(i64, o.vreg)); *p = cast(i8, 1);
+    }
+}
+
+fn _ax_get(u as *i8, v as i32, vc as i32) as i32 {
+    if (v < 0 || v >= vc) { return 0; }
+    let is *i8 as p = cast(*i8, cast(i64, u) + cast(i64, v));
+    return cast(i32, *p);
+}
+
+fn _ax_reads_dest(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_CMOV) { return 1; }
+    return 0;
+}
+
+// An outside reader of a value the vector loop does not compute: anything
+// defined in the loop other than the IV and the pointer inductions.
+fn _ax_bad_read(o as *d.Operand, iv as i32) as i32 {
+    if (o.op_type != d.OP_VREG) { return 0; }
+    let is i32 as v = o.vreg;
+    if (v == iv) { return 0; }
+    if (sc.ctx_inloop(v) == 0) { return 0; }
+    if (sc.ctx_piv(v) != 0) { return 0; }
+    return 1;
+}
+
+// i64 element at an affine address: step 8, no constant offset.
+fn _ax_addr(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_step as i64, v as i32, out_base as *i32) as i32 {
+    let is sc.AffineExpr as ae;
+    sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, v, &ae, 0);
+    if (cast(i32, ae.kind) != sc.AE_AFFINE || ae.base < 0 || ae.step != 8 || ae.base_imm != 0) { return 0; }
+    *out_base = ae.base;
+    return 1;
+}
+
+fn _ax_load(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as *d.IRInst {
+    let is *d.IRInst as ld = sc.scev_sdef(def_inst, def_count, vc, sc.scev_resolve(def_inst, def_count, vc, v));
+    if (cast(i64, ld) == 0 || ld.op != d.IR_LOAD || ld.src1.op_type != d.OP_VREG) { return cast(*d.IRInst, 0); }
+    if (sc._sc_word(ld.cast_to) == 0) { return cast(*d.IRInst, 0); }
+    return ld;
+}
+
+fn detect_axpy(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+               iv as i32, iv_step as i64, def_inst as *i64, def_count as *i32, vc as i32,
+               out as *AxpyDescriptor) as i32 {
+    if (iv_step != 1 || L.nbody != 2) { return 0; }
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    // one store, one conditional branch (the header's test)
+    let is *d.IRInst as store with mut = cast(*d.IRInst, 0);
+    let is i32 as nstores with mut = 0;
+    let is i32 as nbr with mut = 0;
+    let is *d.IRInst as b with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, b) != 0) {
+        if (b.is_dead == 0) {
+            if (b.op == d.IR_STORE) { store = b; nstores = nstores + 1; }
+            if (b.op == d.IR_JZ || b.op == d.IR_JNZ) { nbr = nbr + 1; }
+        }
+        if (cast(i64, b) == cast(i64, lb.last)) { stop = 1; } else { b = b.next; }
+    }
+    if (nstores != 1 || nbr != 1) { return 0; }
+    if (store.dest.op_type != d.OP_VREG || store.src1.op_type != d.OP_VREG) { return 0; }
+    if (sc._sc_word(store.cast_to) == 0) { return 0; }
+    let is i32 as base_c with mut = 0;
+    if (_ax_addr(def_inst, def_count, vc, iv, iv_step, store.dest.vreg, &base_c) == 0) { return 0; }
+    // value = a[i] + m, m = k * b[i]
+    let is *d.IRInst as od = sc.scev_sdef(def_inst, def_count, vc, sc.scev_resolve(def_inst, def_count, vc, store.src1.vreg));
+    if (cast(i64, od) == 0 || od.op != d.IR_ADD || od.src1.op_type != d.OP_VREG || od.src2.op_type != d.OP_VREG) { return 0; }
+    let is *d.IRInst as xd with mut = _ax_load(def_inst, def_count, vc, od.src1.vreg);
+    let is i32 as mv with mut = od.src2.vreg;
+    if (cast(i64, xd) == 0) { xd = _ax_load(def_inst, def_count, vc, od.src2.vreg); mv = od.src1.vreg; }
+    if (cast(i64, xd) == 0) { return 0; }
+    let is *d.IRInst as md = sc.scev_sdef(def_inst, def_count, vc, sc.scev_resolve(def_inst, def_count, vc, mv));
+    if (cast(i64, md) == 0 || md.op != d.IR_MUL) { return 0; }
+    // b[i] is the operand loaded from an address that moves with the loop (k
+    // may itself be a load, made before the loop)
+    let is *d.IRInst as yd with mut = cast(*d.IRInst, 0);
+    let is d.Operand as ko with mut;
+    let is i32 as base_b with mut = 0;
+    if (md.src1.op_type == d.OP_VREG) {
+        let is *d.IRInst as y1 = _ax_load(def_inst, def_count, vc, md.src1.vreg);
+        if (cast(i64, y1) != 0 && _ax_addr(def_inst, def_count, vc, iv, iv_step, y1.src1.vreg, &base_b) == 1) { yd = y1; ko = md.src2; }
+    }
+    if (cast(i64, yd) == 0 && md.src2.op_type == d.OP_VREG) {
+        let is *d.IRInst as y2 = _ax_load(def_inst, def_count, vc, md.src2.vreg);
+        if (cast(i64, y2) != 0 && _ax_addr(def_inst, def_count, vc, iv, iv_step, y2.src1.vreg, &base_b) == 1) { yd = y2; ko = md.src1; }
+    }
+    if (cast(i64, yd) == 0) { return 0; }
+    let is i32 as kvreg with mut = cast(i32, 0 - 1);
+    let is i64 as kimm with mut = 0;
+    if (ko.op_type == d.OP_IMM) { kimm = ko.imm; }
+    else if (ko.op_type == d.OP_VREG) {
+        let is sc.AffineExpr as ak;
+        sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, ko.vreg, &ak, 0);
+        if (cast(i32, ak.kind) != sc.AE_INVARIANT || sc.ctx_inloop(ko.vreg) == 1) { return 0; }
+        kvreg = ko.vreg;
+    } else { return 0; }
+    let is i32 as base_a with mut = 0;
+    if (_ax_addr(def_inst, def_count, vc, iv, iv_step, xd.src1.vreg, &base_a) == 0) { return 0; }
+
+    // Values the vector loop skips must not be needed after the loop. A value is
+    // needed if something other than a copy reads it, or a copy into a needed value.
+    let is *i8 as u = cast(*i8, d.opt_alloc(cast(i64, vc + 1)));
+    let is i32 as i with mut = 0;
+    while (i < vc) { let is *i8 as p = cast(*i8, cast(i64, u) + cast(i64, i)); *p = cast(i8, 0); i = i + 1; }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.op != d.IR_MOV) {
+            _ax_mark(u, &w.src1, vc); _ax_mark(u, &w.src2, vc);
+            if (_ax_reads_dest(w.op) == 1) { _ax_mark(u, &w.dest, vc); }
+        }
+        w = w.next;
+    }
+    let is i32 as changed with mut = 1;
+    let is i32 as rounds with mut = 0;
+    while (changed == 1 && rounds < 64) {
+        changed = 0; rounds = rounds + 1;
+        w = func.instructions;
+        while (cast(i64, w) != 0) {
+            if (w.is_dead == 0 && w.op == d.IR_MOV && w.dest.op_type == d.OP_VREG && w.src1.op_type == d.OP_VREG
+                && _ax_get(u, w.dest.vreg, vc) == 1 && _ax_get(u, w.src1.vreg, vc) == 0) {
+                _ax_mark(u, &w.src1, vc); changed = 1;
+            }
+            w = w.next;
+        }
+    }
+    let is i32 as ok with mut = 1;
+    let is i32 as inside with mut = 0;
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (cast(i64, w) == cast(i64, hb.first)) { inside = 1; }
+        if (inside == 0 && w.is_dead == 0) {
+            let is i32 as reads with mut = 1;
+            if (w.op == d.IR_MOV && (w.dest.op_type != d.OP_VREG || _ax_get(u, w.dest.vreg, vc) == 0)) { reads = 0; }
+            if (reads == 1) {
+                if (_ax_bad_read(&w.src1, iv) == 1 || _ax_bad_read(&w.src2, iv) == 1) { ok = 0; }
+                if (_ax_reads_dest(w.op) == 1 && _ax_bad_read(&w.dest, iv) == 1) { ok = 0; }
+            }
+        }
+        if (cast(i64, w) == cast(i64, lb.last)) { inside = 0; }
+        w = w.next;
+    }
+    d.opt_free(cast(*u8, u));
+    if (ok == 0) { return 0; }
+    out.base_c = base_c; out.base_a = base_a; out.base_b = base_b;
+    out.kvreg = kvreg; out.kimm = kimm;
+    return 1;
+}

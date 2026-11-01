@@ -465,6 +465,33 @@ fn _avx_extract(opcode as i32, src_num as i32, imm as i32) as void {
     eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", 125, "); eo.out_int(cast(i64, opcode));
     eo.out_cstr(", "); eo.out_int(cast(i64, modrm)); eo.out_cstr(", "); eo.out_int(cast(i64, imm)); eo.out_char(10);
 }
+// 256-bit VEX shift by immediate (66 0F 73 /ext ib): ymm[dnum] = ymm[snum] shifted.
+// ext 2 = vpsrlq, 6 = vpsllq. vvvv names the destination, rm the source.
+fn _avx_shift(ext as i32, dnum as i32, snum as i32, imm as i32) as void {
+    let is i32 as bbit with mut = 1; if (snum >= 8) { bbit = 0; }
+    let is i32 as b1 = bbit * 32 + 193;   // R=1 X=1, B from the source, map 0F
+    let is i32 as b2 = (15 - dnum) * 8 + 4 + 1;
+    let is i32 as modrm = 192 + ext * 8 + (snum % 8);
+    eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", "); eo.out_int(cast(i64, b2));
+    eo.out_cstr(", 115, "); eo.out_int(cast(i64, modrm)); eo.out_cstr(", "); eo.out_int(cast(i64, imm)); eo.out_char(10);
+}
+// SSE2 66 [REX] 0F op /r, reg-reg: xmm[dnum] = op(xmm[dnum], xmm[snum]).
+fn _sse_rr(opcode as i32, dnum as i32, snum as i32) as void {
+    eo.out_cstr("  .byte 102, ");
+    if (dnum >= 8 || snum >= 8) {
+        let is i32 as rex with mut = 64; if (dnum >= 8) { rex = rex + 4; } if (snum >= 8) { rex = rex + 1; }
+        eo.out_int(cast(i64, rex)); eo.out_cstr(", ");
+    }
+    eo.out_cstr("15, "); eo.out_int(cast(i64, opcode)); eo.out_cstr(", ");
+    eo.out_int(cast(i64, 192 + (dnum % 8) * 8 + (snum % 8))); eo.out_char(10);
+}
+// SSE2 shift by immediate, 66 [REX.B] 0F 73 /ext ib (2 = psrlq, 6 = psllq).
+fn _sse_shift(ext as i32, xnum as i32, imm as i32) as void {
+    eo.out_cstr("  .byte 102, ");
+    if (xnum >= 8) { eo.out_cstr("65, "); }
+    eo.out_cstr("15, 115, "); eo.out_int(cast(i64, 192 + ext * 8 + (xnum % 8)));
+    eo.out_cstr(", "); eo.out_int(cast(i64, imm)); eo.out_char(10);
+}
 fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     // ---- AVX2 (256-bit) ----
@@ -522,6 +549,44 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         _avx_rr(oc, 1, 1, dn, s1, s2);
         return;
     }
+    // i64 lane multiply, low 64 bits. SSE2/AVX2 multiply only 32x32->64
+    // (pmuludq), so: a*b = lo(a)*lo(b) + ((hi(a)*lo(b) + lo(a)*hi(b)) << 32).
+    // xmm0/xmm1 (ymm0/ymm1) are the reserved vector scratch; dest is written last,
+    // so it may share a register with either source.
+    if (op == d.IR_VMULQ256) {
+        let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
+        let is i32 as an = _vec_num(inst.src1.vreg, ctx);
+        let is i32 as bn = _vec_num(inst.src2.vreg, ctx);
+        _avx_shift(2, 0, an, 32);          // y0 = a >> 32
+        _avx_rr(244, 1, 1, 0, 0, bn);      // y0 = hi(a) * lo(b)      (vpmuludq)
+        _avx_shift(2, 1, bn, 32);          // y1 = b >> 32
+        _avx_rr(244, 1, 1, 1, 1, an);      // y1 = hi(b) * lo(a)
+        _avx_rr(212, 1, 1, 0, 0, 1);       // y0 += y1                (vpaddq)
+        _avx_shift(6, 0, 0, 32);           // y0 <<= 32
+        _avx_rr(244, 1, 1, 1, an, bn);     // y1 = lo(a) * lo(b)
+        _avx_rr(212, 1, 1, dn, 1, 0);      // d = y1 + y0
+        return;
+    }
+    if (op == d.IR_VMULQ) {
+        let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
+        let is i32 as an = _vec_num(inst.src1.vreg, ctx);
+        let is i32 as bn = _vec_num(inst.src2.vreg, ctx);
+        let is *u8 as ar = eo.reg_xmm(an + 16);
+        let is *u8 as br = eo.reg_xmm(bn + 16);
+        eo.out_str("  movdqu xmm0, ", 15); eo.out_cstr(ar); eo.out_char(10);
+        _sse_shift(2, 0, 32);              // xmm0 = a >> 32
+        _sse_rr(244, 0, bn);               // xmm0 = hi(a) * lo(b)   (pmuludq)
+        eo.out_str("  movdqu xmm1, ", 15); eo.out_cstr(br); eo.out_char(10);
+        _sse_shift(2, 1, 32);              // xmm1 = b >> 32
+        _sse_rr(244, 1, an);               // xmm1 = hi(b) * lo(a)
+        eo.out_line("paddq xmm0, xmm1");
+        _sse_shift(6, 0, 32);              // xmm0 <<= 32
+        eo.out_str("  movdqu xmm1, ", 15); eo.out_cstr(ar); eo.out_char(10);
+        _sse_rr(244, 1, bn);               // xmm1 = lo(a) * lo(b)
+        eo.out_line("paddq xmm1, xmm0");
+        eo.out_str("  movdqu ", 9); eo.out_cstr(eo.reg_xmm(dn + 16)); eo.out_str(", xmm1\n", 7);
+        return;
+    }
     if (op == d.IR_VSPLATPD) {
         // dst = [k, k]. Caustic keeps f64 scalars as bit-patterns in GPRs, so k is
         // usually a GPR: movq the bits into the dst xmm, then movddup to both lanes.
@@ -556,7 +621,9 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             srcn = _vec_num(inst.src1.vreg, ctx);
         } else {
             e.load_op(inst.src1.vreg, ctx, "rcx");
-            eo.out_cstr("  movq xmm1, rcx"); eo.out_char(10);
+            // vmovq xmm1, rcx in its VEX form: the legacy-SSE movq between 256-bit
+            // ops pays the SSE/AVX transition on every loop iteration.
+            eo.out_line(".byte 196, 225, 249, 110, 201");
             srcn = 1;
         }
         _avx_rr(25, 1, 2, dn, 0, srcn);   // vbroadcastsd ymm[dn], xmm[srcn] (0F38.19, vvvv unused)
