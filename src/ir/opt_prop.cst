@@ -89,6 +89,26 @@ fn pass_local_copy_prop(func as *d.IRFunction) as void {
 
 // === Pass 1: Constant Prop + Copy Prop (forward) ===
 
+// Type kind of an integer cast operand (ast.TY_I8..TY_U64 = 1..8), else 0.
+fn _int_kind(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, tp);
+    if (k >= 1 && k <= 8) { return k; }
+    return 0;
+}
+
+// The value `v` takes after a cast to integer kind `k` (truncate, then
+// zero- or sign-extend to 64 bits, as the x86 cast does).
+fn _cast_const(v as i64, k as i32) as i64 {
+    if (k == 5) { return v & 255; }
+    if (k == 6) { return v & 65535; }
+    if (k == 7) { return v & 4294967295; }
+    if (k == 1) { return ((v & 255) ^ 128) - 128; }
+    if (k == 2) { return ((v & 65535) ^ 32768) - 32768; }
+    if (k == 3) { return ((v & 4294967295) ^ 2147483648) - 2147483648; }
+    return v;
+}
+
 fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64, copy_of as *i32, vc as i32) as void {
     let is i32 as vc_ext = vc + 512;
     // Pre-compute def counts: vregs with multiple defs cannot be safely marked const
@@ -173,6 +193,32 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                         let is *i64 as src_val = cast(*i64, cast(i64, imm_val) + cast(i64, sv) * 8);
                         let is *i64 as dst_val = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
                         *dst_val = *src_val;
+                    }
+                }
+            }
+
+            // -O2: an integer cast of a constant is the constant, already
+            // truncated and extended (`cast(u8, 1)` stores and compares an
+            // immediate instead of materializing and re-extending it).
+            if (op == d.IR_CAST && d.ir_opt_level >= 2 && inst.src1.op_type == d.OP_VREG) {
+                let is i32 as sv = inst.src1.vreg;
+                let is i32 as dv = inst.dest.vreg;
+                let is *i32 as scp = cast(*i32, cast(i64, is_const) + cast(i64, sv) * 4);
+                let is i32 as kt = _int_kind(inst.cast_to);
+                let is i32 as kf = _int_kind(inst.cast_from);
+                if (*scp == 1 && kt != 0 && kf != 0 && dv >= 0 && dv < vc_ext) {
+                    let is *i64 as svp = cast(*i64, cast(i64, imm_val) + cast(i64, sv) * 8);
+                    let is i64 as cv = _cast_const(*svp, kt);
+                    inst.op = d.IR_IMM;
+                    inst.src1.op_type = d.OP_IMM;
+                    inst.src1.imm = cv;
+                    inst.src2.op_type = d.OP_NONE;
+                    let is *i32 as cdp = cast(*i32, cast(i64, ccp_defs) + cast(i64, dv) * 4);
+                    if (*cdp == 1) {
+                        let is *i32 as dcp = cast(*i32, cast(i64, is_const) + cast(i64, dv) * 4);
+                        *dcp = 1;
+                        let is *i64 as dvp = cast(*i64, cast(i64, imm_val) + cast(i64, dv) * 8);
+                        *dvp = cv;
                     }
                 }
             }

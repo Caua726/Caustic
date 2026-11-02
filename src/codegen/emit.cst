@@ -964,6 +964,88 @@ fn size_reg(idx as i32, sz as i32) as *u8 {
     return eo.reg64(idx);
 }
 
+// === -O2: `base + i` folded into the memory operand that reads it ===
+//
+//     ADD a = b, i ; LOAD t = [a]          → [b + i]
+//     ADD a = b, i ; STORE [a] = v
+//     ADD a = b, i ; IMM k ; STORE [a] = k
+//
+// a is read only by that access, which comes right after the ADD, so the ADD
+// emits nothing and the access addresses [b + i]. b and i must sit in
+// registers: nothing runs between the ADD and the access (the fused IMM emits
+// nothing), so both registers still hold them there.
+let is i32 as aa_vreg with mut = 0 - 1;
+let is i32 as aa_b with mut = 0;
+let is i32 as aa_i with mut = 0;
+let is [24]u8 as aa_buf;
+
+fn _aa_reg(v as i32, ctx as *al.AllocCtx) as i32 {
+    let is i32 as loc = al.get_loc(v, ctx);
+    if (loc >= 0 && loc < 16 && loc != 13 && loc != 14) { return loc; }
+    return 0 - 1;
+}
+
+fn _aa_next(i as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n with mut = i.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1) { n = n.next; }
+    return n;
+}
+
+fn try_addr_add(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    aa_vreg = 0 - 1;
+    if (al.al_opt_level < 2) { return 0; }
+    if (inst.op != d.IR_ADD || inst.src1.op_type != d.OP_VREG || inst.src2.op_type != d.OP_VREG
+        || inst.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as a = inst.dest.vreg;
+    if (isel_get_uses(a) != 1) { return 0; }
+    let is i32 as rb = _aa_reg(inst.src1.vreg, ctx);
+    let is i32 as ri = _aa_reg(inst.src2.vreg, ctx);
+    if (rb < 0 || ri < 0) { return 0; }
+    let is *d.IRInst as n = _aa_next(inst);
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as ok with mut = 0;
+    if (n.op == d.IR_LOAD && n.src1.op_type == d.OP_VREG && n.src1.vreg == a
+        && is_float_type(n.cast_to) == 0) { ok = 1; }
+    if (n.op == d.IR_STORE && n.dest.op_type == d.OP_VREG && n.dest.vreg == a
+        && n.src1.op_type == d.OP_VREG && n.src1.vreg != a && is_float_type(n.cast_to) == 0) {
+        let is i32 as sz = get_type_size(n.cast_to);
+        if (sz == 1 || sz == 2 || sz == 4 || sz == 8) { ok = 1; }
+    }
+    if (n.op == d.IR_IMM && n.dest.op_type == d.OP_VREG) {
+        let is *d.IRInst as s = n.next;
+        if (cast(i64, s) != 0 && s.is_dead == 0 && s.op == d.IR_STORE && s.dest.op_type == d.OP_VREG
+            && s.dest.vreg == a && s.src1.op_type == d.OP_VREG && s.src1.vreg == n.dest.vreg
+            && isel_get_uses(n.dest.vreg) == 1 && is_float_type(s.cast_to) == 0
+            && n.src1.imm <= 2147483647 && n.src1.imm >= 0 - 2147483647
+            && get_type_size(s.cast_to) <= 8) { ok = 1; }
+    }
+    if (ok == 0) { return 0; }
+    aa_vreg = a;
+    aa_b = rb;
+    aa_i = ri;
+    return 1;
+}
+
+// The inside of `[...]` for address vreg `v`: "b + i" when its ADD was folded,
+// else the register holding v (loaded into `scratch` if it is not in one).
+fn addr_reg(v as i32, ctx as *al.AllocCtx, scratch as i32) as *u8 {
+    if (aa_vreg >= 0 && v == aa_vreg) {
+        aa_vreg = 0 - 1;
+        let is *u8 as bn = eo.reg64(aa_b);
+        let is *u8 as xn = eo.reg64(aa_i);
+        let is *u8 as out = cast(*u8, &aa_buf);
+        let is i32 as k with mut = 0;
+        let is i32 as q with mut = 0;
+        while (bn[q] != cast(u8, 0)) { out[k] = bn[q]; k = k + 1; q = q + 1; }
+        out[k] = cast(u8, 32); out[k + 1] = cast(u8, 43); out[k + 2] = cast(u8, 32); k = k + 3;
+        q = 0;
+        while (xn[q] != cast(u8, 0)) { out[k] = xn[q]; k = k + 1; q = q + 1; }
+        out[k] = cast(u8, 0);
+        return out;
+    }
+    return op_reg(v, ctx, scratch);
+}
+
 // Pattern: IR_IMM v=const + IR_STORE [addr]=v → mov PTR [addr], const
 // Only when addr is a vreg (indirect store) and imm fits 32-bit
 fn try_fuse_imm_store(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
@@ -979,10 +1061,14 @@ fn try_fuse_imm_store(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     let is i32 as sz = get_type_size(nx.cast_to);
     if (sz > 8) { return 0; }
     // Emit: mov SIZE PTR [addr_reg], imm
-    load_op(nx.dest.vreg, ctx, "rcx");
+    let is *u8 as ar with mut = "rcx";
+    if (al.al_opt_level >= 2) { ar = addr_reg(nx.dest.vreg, ctx, 1); }
+    else { load_op(nx.dest.vreg, ctx, "rcx"); }
     eo.out_str("  mov ", 6);
     eo.out_cstr(size_name(sz));
-    eo.out_str(" [rcx], ", 8);
+    eo.out_str(" [", 2);
+    eo.out_cstr(ar);
+    eo.out_str("], ", 3);
     eo.out_int(val);
     eo.out_char(10);
     nx.is_dead = 1;

@@ -209,6 +209,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         e.emit_vreg_copy(inst.dest.vreg, inst.src1.vreg, ctx, inst.cast_to);
         return;
     }
+    if (op == d.IR_ADD && e.try_addr_add(inst, ctx) == 1) { return; }
     if (op == d.IR_ADD) { e.gen_binop(inst, ctx, "add"); return; }
     if (op == d.IR_SUB) { e.gen_binop(inst, ctx, "sub"); return; }
     if (op == d.IR_MUL) {
@@ -958,6 +959,41 @@ fn try_and_test(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     return 1;
 }
 
+// === -O2: a byte load read only by `== k` / `!= k` feeding a branch ===
+//
+//     LOAD t = [a] (1 byte) ; EQ/NE c = t, k ; JZ/JNZ c
+//
+// The load emits nothing and the compare reads memory: `cmp BYTE PTR [a], k`.
+// k must be a value the extended byte can hold, so the 8-bit compare answers
+// the same as the full-width one. a is read right before the branch, with no
+// instruction in between that could move it.
+let is i32 as ldcmp_vreg with mut = 0 - 1;
+let is i32 as ldcmp_addr with mut = 0 - 1;
+
+fn try_load_cmp(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    ldcmp_vreg = 0 - 1;
+    if (al.al_opt_level < 2) { return 0; }
+    if (inst.op != d.IR_LOAD || inst.src1.op_type != d.OP_VREG || inst.dest.op_type != d.OP_VREG) { return 0; }
+    if (e.get_type_size(inst.cast_to) != 1 || e.is_float_type(inst.cast_to) == 1) { return 0; }
+    if (e.isel_get_uses(inst.dest.vreg) != 1) { return 0; }
+    let is *d.IRInst as c = _next_live(inst);
+    if (cast(i64, c) == 0 || (c.op != d.IR_EQ && c.op != d.IR_NE)) { return 0; }
+    if (c.src1.op_type != d.OP_VREG || c.src1.vreg != inst.dest.vreg) { return 0; }
+    if (c.src2.op_type != d.OP_IMM) { return 0; }
+    let is i64 as k = c.src2.imm;
+    if (e.is_signed_type(inst.cast_to) == 1) {
+        if (k < 0 - 128 || k > 127) { return 0; }
+    } else {
+        if (k < 0 || k > 255) { return 0; }
+    }
+    let is *d.IRInst as j = c.next;
+    if (cast(i64, j) == 0 || j.is_dead == 1 || (j.op != d.IR_JZ && j.op != d.IR_JNZ)
+        || j.src1.vreg != c.dest.vreg) { return 0; }
+    ldcmp_vreg = inst.dest.vreg;
+    ldcmp_addr = inst.src1.vreg;
+    return 1;
+}
+
 // The flag-setting part of an i32 compare whose operand may be unextended
 // (e.lz_cmp32): the 32-bit registers, or the low dword of a spill slot.
 // `s1` is the scratch for src1 when it is not in a register.
@@ -990,10 +1026,17 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is *d.IRInst as nx = inst.next;
     let is i32 as and_t = test_and_vreg;
     test_and_vreg = 0 - 1;
+    let is i32 as ld_t = ldcmp_vreg;
+    ldcmp_vreg = 0 - 1;
     if (cast(i64, nx) != 0 && nx.is_dead != 1) {
         let is i32 as nx_op = nx.op;
         if ((nx_op == d.IR_JZ || nx_op == d.IR_JNZ) && nx.src1.vreg == inst.dest.vreg) {
-            if (is_flt == 0 && and_t >= 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg == and_t) {
+            if (is_flt == 0 && ld_t >= 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg == ld_t
+                && inst.src2.op_type == d.OP_IMM) {
+                let is *u8 as ar = e.addr_reg(ldcmp_addr, ctx, 0);
+                eo.out_str("  cmp BYTE PTR [", 16); eo.out_cstr(ar); eo.out_str("], ", 3);
+                eo.out_int(inst.src2.imm); eo.out_char(10);
+            } else if (is_flt == 0 && and_t >= 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg == and_t) {
                 let is *u8 as xr = e.op_reg(test_and_src, ctx, 0);
                 eo.out_str("  test ", 7); eo.out_cstr(xr); eo.out_str(", ", 2);
                 eo.out_int(test_and_imm); eo.out_char(10);
@@ -1429,6 +1472,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 return;
             }
         }
+        if (try_load_cmp(inst, ctx) == 1) { return; }
         let is i32 as si = e.get_scratch_idx(inst.dest.vreg, ctx);
         let is *u8 as scr = eo.reg64(si);
         let is *u8 as scr32 = eo.reg32(si);
@@ -1456,7 +1500,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                     eo.out_str("  mov ", 6); eo.out_cstr(scr); _am_open(", QWORD PTR [", amb, ami); eo.out_int(cast(i64, am.scale)); eo.out_str("]\n", 2);
                 }
             } else {
-            let is *u8 as ar = e.op_reg(inst.src1.vreg, ctx, si);
+            let is *u8 as ar = e.addr_reg(inst.src1.vreg, ctx, si);
             if (sz == 8) {
                 eo.out_str("  mov ", 6); eo.out_cstr(scr); eo.out_str(", QWORD PTR [", 13); eo.out_cstr(ar); eo.out_str("]\n", 2);
             } else if (sz == 4) {
@@ -1536,7 +1580,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         if (inst.dest.op_type == d.OP_VREG && e.is_float_type(inst.cast_to) == 0
             && (sz == 1 || sz == 2 || sz == 4 || sz == 8)) {
             let is i32 as vi = e.op_reg_idx(inst.src1.vreg, ctx, 0);
-            let is *u8 as ar = e.op_reg(inst.dest.vreg, ctx, 1);
+            let is *u8 as ar = e.addr_reg(inst.dest.vreg, ctx, 1);
             if (sz == 8) { eo.out_str("  mov QWORD PTR [", 17); }
             else if (sz == 4) { eo.out_str("  mov DWORD PTR [", 17); }
             else if (sz == 2) { eo.out_str("  mov WORD PTR [", 16); }
