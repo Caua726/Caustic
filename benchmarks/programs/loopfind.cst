@@ -1,0 +1,1021 @@
+// Loop recognition on a synthetic control-flow graph: a diamond-and-loop
+// pattern is replicated into a graph of 5213 basic blocks, and the loop
+// finder (depth-first numbering, union-find over back and non-back
+// predecessors, classification of reducible, irreducible and self loops)
+// runs 1500 times into one loop-structure graph and 50 times more into
+// fresh ones; then the loops' nesting levels are computed. The graph lives
+// in growable vectors, sets kept as vectors searched by callback, and an
+// identity-keyed hash dictionary from blocks to their numbers. Run 10 times.
+// Self-check: 6102 loops are recorded and the graph has 5213 blocks.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as ROUNDS with imut = 10;
+let is i32 as INNER with imut = 1500;
+
+let is mem.bins.Bins as heap with mut;
+
+fn alloc(n as i64) as *u8 { return mem.bins.bins_alloc(&heap, n); }
+fn release(p as *u8) as void { mem.bins.bins_free(&heap, p); }
+
+// ---------------------------------------------------------------------------
+// Growable vector of word-sized elements. Removing from the front advances
+// first; appending past the capacity doubles the storage.
+
+let is i64 as INITIAL_SIZE with imut = 10;
+
+struct Vector {
+    storage as *i64;
+    capacity as i64;
+    first as i64;
+    last as i64;
+}
+
+fn new_storage(n as i64) as *i64 {
+    let is *i64 as s = cast(*i64, alloc(n * 8));
+    mem.memset(cast(*u8, s), 0, n * 8);
+    return s;
+}
+
+fn vec_init(v as *Vector, size as i64) as void {
+    if (size == 0) { v.storage = cast(*i64, 0); } else { v.storage = new_storage(size); }
+    v.capacity = size;
+    v.first = 0;
+    v.last = 0;
+}
+
+fn vec_new(size as i64) as *Vector {
+    let is *Vector as v = cast(*Vector, alloc(sizeof(Vector)));
+    vec_init(v, size);
+    return v;
+}
+
+fn vec_dispose(v as *Vector) as void {
+    if (cast(i64, v.storage) != 0) { release(cast(*u8, v.storage)); }
+}
+
+fn vec_free(v as *Vector) as void {
+    vec_dispose(v);
+    release(cast(*u8, v));
+}
+
+fn vec_append(v as *Vector, elem as i64) as void {
+    if (cast(i64, v.storage) == 0) {
+        v.storage = new_storage(INITIAL_SIZE);
+        v.capacity = INITIAL_SIZE;
+    } else if (v.last >= v.capacity) {
+        v.capacity = v.capacity * 2;
+        let is *i64 as ns = new_storage(v.capacity);
+        let is i64 as i with mut = 0;
+        while (i < v.last) { ns[i] = v.storage[i]; i = i + 1; }
+        release(cast(*u8, v.storage));
+        v.storage = ns;
+    }
+    v.storage[v.last] = elem;
+    v.last = v.last + 1;
+}
+
+fn vec_with(elem as i64) as *Vector {
+    let is *Vector as v = vec_new(1);
+    vec_append(v, elem);
+    return v;
+}
+
+fn vec_at(v as *Vector, idx as i64) as *i64 {
+    if (cast(i64, v.storage) == 0 || idx >= v.last - v.first) { return cast(*i64, 0); }
+    return &v.storage[v.first + idx];
+}
+
+fn vec_is_empty(v as *Vector) as i32 { return v.last == v.first; }
+
+fn vec_size(v as *Vector) as i64 { return v.last - v.first; }
+
+// fn(ctx, elem) for every element, in order.
+fn vec_for_each(v as *Vector, f as *u8, ctx as *u8) as void {
+    let is i64 as i with mut = v.first;
+    while (i < v.last) {
+        call(f, ctx, v.storage[i]);
+        i = i + 1;
+    }
+}
+
+fn vec_remove_first(v as *Vector) as i64 {
+    if (vec_is_empty(v) != 0) { return 0; }
+    v.first = v.first + 1;
+    return v.storage[v.first - 1];
+}
+
+// Drops every occurrence of obj, compacting in place; 1 if there was one.
+fn vec_remove(v as *Vector, obj as i64) as i32 {
+    if (cast(i64, v.storage) == 0 || vec_is_empty(v) != 0) { return 0; }
+    let is i32 as found with mut = 0;
+    let is i64 as new_last with mut = v.first;
+    let is i64 as i with mut = v.first;
+    while (i < v.last) {
+        if (v.storage[i] == obj) {
+            found = 1;
+        } else {
+            v.storage[new_last] = v.storage[i];
+            new_last = new_last + 1;
+        }
+        i = i + 1;
+    }
+    v.last = new_last;
+    return found;
+}
+
+fn vec_swap(s as *i64, i as i64, j as i64) as void {
+    let is i64 as t = s[i];
+    s[i] = s[j];
+    s[j] = t;
+}
+
+// Median-of-three quicksort of storage[i..j] under c(a, b) (< 0: a first).
+fn vec_sort_range(v as *Vector, i as i64, j as i64, c as *u8) as void {
+    let is i64 as n = j + 1 - i;
+    if (n <= 1) { return; }
+    let is *i64 as s = v.storage;
+    let is i64 as di with mut = s[i];
+    let is i64 as dj with mut = s[j];
+    if (call(c, di, dj) > 0) {
+        vec_swap(s, i, j);
+        let is i64 as tt = di;
+        di = dj;
+        dj = tt;
+    }
+    if (n > 2) {
+        let is i64 as ij = (i + j) / 2;
+        let is i64 as dij with mut = s[ij];
+        if (call(c, di, dij) <= 0) {
+            if (call(c, dij, dj) > 0) {
+                vec_swap(s, j, ij);
+                dij = dj;
+            }
+        } else {
+            vec_swap(s, i, ij);
+            dij = di;
+        }
+        if (n > 3) {
+            let is i64 as k with mut = i;
+            let is i64 as l with mut = j - 1;
+            while (1 == 1) {
+                while (k <= l && call(c, dij, s[l]) <= 0) { l = l - 1; }
+                k = k + 1;
+                while (k <= l && call(c, s[k], dij) <= 0) { k = k + 1; }
+                if (k > l) { break; }
+                vec_swap(s, k, l);
+            }
+            vec_sort_range(v, i, l, c);
+            vec_sort_range(v, k, j, c);
+        }
+    }
+}
+
+fn vec_sort(v as *Vector, c as *u8) as void {
+    if (vec_size(v) > 0) { vec_sort_range(v, v.first, v.last - 1, c); }
+}
+
+// Stores val at idx, growing the storage to the next doubling that holds it.
+fn vec_at_put(v as *Vector, idx as i64, val as i64) as void {
+    if (cast(i64, v.storage) == 0) {
+        v.capacity = idx + 1;
+        if (v.capacity < INITIAL_SIZE) { v.capacity = INITIAL_SIZE; }
+        v.storage = new_storage(v.capacity);
+    } else if (idx >= v.last - v.first) {
+        let is i64 as new_length with mut = v.capacity;
+        while (new_length <= idx + v.first) { new_length = new_length * 2; }
+        let is *i64 as ns = new_storage(new_length);
+        let is i64 as i with mut = 0;
+        while (i < v.last) { ns[i] = v.storage[i]; i = i + 1; }
+        release(cast(*u8, v.storage));
+        v.storage = ns;
+        v.capacity = new_length;
+    }
+    v.storage[v.first + idx] = val;
+    if (v.last < idx + 1) { v.last = idx + 1; }
+}
+
+// 1 when f(ctx, elem) is non-zero for some element.
+fn vec_has_some(v as *Vector, f as *u8, ctx as *u8) as i32 {
+    let is i64 as i with mut = v.first;
+    while (i < v.last) {
+        if (call(f, ctx, v.storage[i]) != 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn word_equals(ctx as *u8, e as i64) as i64 {
+    return e == *cast(*i64, ctx);
+}
+
+// A set is a vector that appends only what it does not hold yet.
+fn set_add(items as *Vector, obj as i64) as void {
+    let is i64 as o with mut = obj;
+    if (vec_has_some(items, fn_ptr(word_equals), cast(*u8, &o)) == 0) { vec_append(items, obj); }
+}
+
+fn set_new() as *Vector { return vec_new(INITIAL_SIZE); }
+
+// ---------------------------------------------------------------------------
+// Hash dictionary keyed by object identity, with chained buckets; a block's
+// hash is its name, spread by xoring its high half down.
+
+struct Entry {
+    hash as i64;
+    key as *u8;
+    value as i64;
+    next as *Entry;
+}
+
+struct Dictionary {
+    buckets as **Entry;
+    size as i64;
+    capacity as i64;
+}
+
+fn dict_new() as *Dictionary {
+    let is *Dictionary as d = cast(*Dictionary, alloc(sizeof(Dictionary)));
+    d.capacity = 16;
+    d.size = 0;
+    d.buckets = cast(**Entry, new_storage(16));
+    return d;
+}
+
+fn dict_hash(key as *BasicBlock) as i64 {
+    if (cast(i64, key) == 0) { return 0; }
+    let is i64 as h = key.name & 4294967295;
+    return h ^ (h >> 16);
+}
+
+fn entry_new(key as *u8, value as i64, hash as i64) as *Entry {
+    let is *Entry as e = cast(*Entry, alloc(sizeof(Entry)));
+    e.hash = hash;
+    e.key = key;
+    e.value = value;
+    e.next = cast(*Entry, 0);
+    return e;
+}
+
+fn entry_match(e as *Entry, h as i64, k as *u8) as i32 {
+    return e.hash == h && e.key == k;
+}
+
+fn dict_at(d as *Dictionary, key as *BasicBlock) as *i64 {
+    let is i64 as h = dict_hash(key);
+    let is *Entry as e with mut = d.buckets[(d.capacity - 1) & h];
+    while (cast(i64, e) != 0) {
+        if (entry_match(e, h, cast(*u8, key)) != 0) { return &e.value; }
+        e = e.next;
+    }
+    return cast(*i64, 0);
+}
+
+fn dict_split_bucket(d as *Dictionary, old_capacity as i64, idx as i64, head as *Entry) as void {
+    let is *Entry as lo_head with mut = cast(*Entry, 0);
+    let is *Entry as lo_tail with mut = cast(*Entry, 0);
+    let is *Entry as hi_head with mut = cast(*Entry, 0);
+    let is *Entry as hi_tail with mut = cast(*Entry, 0);
+    let is *Entry as current with mut = head;
+    while (cast(i64, current) != 0) {
+        if ((current.hash & old_capacity) == 0) {
+            if (cast(i64, lo_tail) == 0) { lo_head = current; } else { lo_tail.next = current; }
+            lo_tail = current;
+        } else {
+            if (cast(i64, hi_tail) == 0) { hi_head = current; } else { hi_tail.next = current; }
+            hi_tail = current;
+        }
+        current = current.next;
+    }
+    if (cast(i64, lo_tail) != 0) {
+        lo_tail.next = cast(*Entry, 0);
+        d.buckets[idx] = lo_head;
+    }
+    if (cast(i64, hi_tail) != 0) {
+        hi_tail.next = cast(*Entry, 0);
+        d.buckets[idx + old_capacity] = hi_head;
+    }
+}
+
+fn dict_resize(d as *Dictionary) as void {
+    let is **Entry as old = d.buckets;
+    let is i64 as old_capacity = d.capacity;
+    d.capacity = d.capacity * 2;
+    d.buckets = cast(**Entry, new_storage(d.capacity));
+    let is i64 as i with mut = 0;
+    while (i < old_capacity) {
+        let is *Entry as current = old[i];
+        if (cast(i64, current) != 0) {
+            old[i] = cast(*Entry, 0);
+            if (cast(i64, current.next) == 0) {
+                d.buckets[current.hash & (old_capacity - 1)] = current;
+            } else {
+                dict_split_bucket(d, old_capacity, i, current);
+            }
+        }
+        i = i + 1;
+    }
+    release(cast(*u8, old));
+}
+
+fn dict_at_put(d as *Dictionary, key as *BasicBlock, value as i64) as void {
+    let is i64 as h = dict_hash(key);
+    let is i64 as i = (d.capacity - 1) & h;
+    let is *Entry as current with mut = d.buckets[i];
+    if (cast(i64, current) == 0) {
+        d.buckets[i] = entry_new(cast(*u8, key), value, h);
+        d.size = d.size + 1;
+    } else {
+        while (1 == 1) {
+            if (entry_match(current, h, cast(*u8, key)) != 0) {
+                current.value = value;
+                break;
+            }
+            if (cast(i64, current.next) == 0) {
+                d.size = d.size + 1;
+                current.next = entry_new(cast(*u8, key), value, h);
+                break;
+            }
+            current = current.next;
+        }
+    }
+    if (d.size > d.capacity) { dict_resize(d); }
+}
+
+fn dict_remove_all(d as *Dictionary) as void {
+    let is i64 as i with mut = 0;
+    while (i < d.capacity) {
+        let is *Entry as current with mut = d.buckets[i];
+        while (cast(i64, current) != 0) {
+            let is *Entry as dead = current;
+            current = current.next;
+            release(cast(*u8, dead));
+        }
+        d.buckets[i] = cast(*Entry, 0);
+        i = i + 1;
+    }
+    d.size = 0;
+}
+
+fn dict_free(d as *Dictionary) as void {
+    dict_remove_all(d);
+    release(cast(*u8, d.buckets));
+    release(cast(*u8, d));
+}
+
+// ---------------------------------------------------------------------------
+// The control-flow graph.
+
+struct BasicBlock {
+    in_edges as Vector;
+    out_edges as Vector;
+    name as i64;
+}
+
+struct BasicBlockEdge {
+    from as *BasicBlock;
+    to as *BasicBlock;
+}
+
+struct ControlFlowGraph {
+    basic_block_map as Vector;
+    start_node as *BasicBlock;
+    edge_list as Vector;
+}
+
+fn new_basic_block(name as i64) as *BasicBlock {
+    let is *BasicBlock as bb = cast(*BasicBlock, alloc(sizeof(BasicBlock)));
+    vec_init(&bb.in_edges, 2);
+    vec_init(&bb.out_edges, 2);
+    bb.name = name;
+    return bb;
+}
+
+fn free_basic_block(bb as *BasicBlock) as void {
+    vec_dispose(&bb.in_edges);
+    vec_dispose(&bb.out_edges);
+    release(cast(*u8, bb));
+}
+
+fn cfg_num_nodes(cfg as *ControlFlowGraph) as i64 { return vec_size(&cfg.basic_block_map); }
+
+fn create_node(cfg as *ControlFlowGraph, name as i64) as *BasicBlock {
+    let is *BasicBlock as node with mut = cast(*BasicBlock, 0);
+    let is *i64 as slot = vec_at(&cfg.basic_block_map, name);
+    if (cast(i64, slot) != 0 && *slot != 0) {
+        node = cast(*BasicBlock, *slot);
+    } else {
+        node = new_basic_block(name);
+        vec_at_put(&cfg.basic_block_map, name, cast(i64, node));
+    }
+    if (cfg_num_nodes(cfg) == 1) { cfg.start_node = node; }
+    return node;
+}
+
+fn new_edge(cfg as *ControlFlowGraph, from_name as i64, to_name as i64) as void {
+    let is *BasicBlockEdge as e = cast(*BasicBlockEdge, alloc(sizeof(BasicBlockEdge)));
+    e.from = create_node(cfg, from_name);
+    e.to = create_node(cfg, to_name);
+    vec_append(&e.from.out_edges, cast(i64, e.to));
+    vec_append(&e.to.in_edges, cast(i64, e.from));
+    vec_append(&cfg.edge_list, cast(i64, e));
+}
+
+fn cfg_init(cfg as *ControlFlowGraph) as void {
+    vec_init(&cfg.basic_block_map, 0);
+    cfg.start_node = cast(*BasicBlock, 0);
+    vec_init(&cfg.edge_list, 0);
+}
+
+fn cfg_dispose(cfg as *ControlFlowGraph) as void {
+    let is i64 as i with mut = 0;
+    while (i < vec_size(&cfg.basic_block_map)) {
+        free_basic_block(cast(*BasicBlock, *vec_at(&cfg.basic_block_map, i)));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < vec_size(&cfg.edge_list)) {
+        release(cast(*u8, *vec_at(&cfg.edge_list, i)));
+        i = i + 1;
+    }
+    vec_dispose(&cfg.basic_block_map);
+    vec_dispose(&cfg.edge_list);
+}
+
+// ---------------------------------------------------------------------------
+// Loops and the loop-structure graph.
+
+struct SimpleLoop {
+    basic_blocks as Vector;     // a set
+    children as Vector;         // a set
+    parent as *SimpleLoop;
+    header as *BasicBlock;
+    is_reducible as i32;
+    is_root as i32;
+    nesting_level as i32;
+    counter as i32;
+    depth_level as i32;
+}
+
+struct LoopStructureGraph {
+    root as *SimpleLoop;
+    loops as Vector;
+    loop_counter as i32;
+}
+
+fn new_simple_loop(bb as *BasicBlock, is_reducible as i32) as *SimpleLoop {
+    let is *SimpleLoop as l = cast(*SimpleLoop, alloc(sizeof(SimpleLoop)));
+    vec_init(&l.basic_blocks, INITIAL_SIZE);
+    vec_init(&l.children, INITIAL_SIZE);
+    l.parent = cast(*SimpleLoop, 0);
+    l.header = bb;
+    l.is_reducible = is_reducible;
+    l.is_root = 0;
+    l.nesting_level = 0;
+    l.counter = 0;
+    l.depth_level = 0;
+    if (cast(i64, bb) != 0) { set_add(&l.basic_blocks, cast(i64, bb)); }
+    return l;
+}
+
+fn free_simple_loop(l as *SimpleLoop) as void {
+    vec_dispose(&l.basic_blocks);
+    vec_dispose(&l.children);
+    release(cast(*u8, l));
+}
+
+fn set_parent(l as *SimpleLoop, parent as *SimpleLoop) as void {
+    l.parent = parent;
+    set_add(&parent.children, cast(i64, l));
+}
+
+fn set_nesting_level(l as *SimpleLoop, level as i32) as void {
+    l.nesting_level = level;
+    if (level == 0) { l.is_root = 1; }
+}
+
+fn lsg_init(g as *LoopStructureGraph) as void {
+    g.root = new_simple_loop(cast(*BasicBlock, 0), 1);
+    vec_init(&g.loops, 0);
+    g.loop_counter = 0;
+    set_nesting_level(g.root, 0);
+    g.root.counter = g.loop_counter;
+    g.loop_counter = g.loop_counter + 1;
+    vec_append(&g.loops, cast(i64, g.root));
+}
+
+fn lsg_dispose(g as *LoopStructureGraph) as void {
+    let is i64 as i with mut = 0;
+    while (i < vec_size(&g.loops)) {
+        free_simple_loop(cast(*SimpleLoop, *vec_at(&g.loops, i)));
+        i = i + 1;
+    }
+    vec_dispose(&g.loops);
+}
+
+fn create_new_loop(g as *LoopStructureGraph, bb as *BasicBlock, is_reducible as i32) as *SimpleLoop {
+    let is *SimpleLoop as l = new_simple_loop(bb, is_reducible);
+    l.counter = g.loop_counter;
+    g.loop_counter = g.loop_counter + 1;
+    vec_append(&g.loops, cast(i64, l));
+    return l;
+}
+
+fn parent_to_root(ctx as *u8, l as *SimpleLoop) as i64 {
+    let is *LoopStructureGraph as g = cast(*LoopStructureGraph, ctx);
+    if (l.is_root == 0) {
+        if (cast(i64, l.parent) == 0) { set_parent(l, g.root); }
+    }
+    return 0;
+}
+
+struct NestingCtx {
+    loop as *SimpleLoop;
+    depth as i32;
+}
+
+fn nesting_visit(ctx as *u8, child as *SimpleLoop) as i64 {
+    let is *NestingCtx as k = cast(*NestingCtx, ctx);
+    calculate_nesting_level_rec(child, k.depth + 1);
+    let is i32 as level with mut = k.loop.nesting_level;
+    if (1 + child.nesting_level > level) { level = 1 + child.nesting_level; }
+    set_nesting_level(k.loop, level);
+    return 0;
+}
+
+fn calculate_nesting_level_rec(l as *SimpleLoop, depth as i32) as void {
+    l.depth_level = depth;
+    let is NestingCtx as k;
+    k.loop = l;
+    k.depth = depth;
+    vec_for_each(&l.children, fn_ptr(nesting_visit), cast(*u8, &k));
+}
+
+fn calculate_nesting_level(g as *LoopStructureGraph) as void {
+    vec_for_each(&g.loops, fn_ptr(parent_to_root), cast(*u8, g));
+    calculate_nesting_level_rec(g.root, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Union-find nodes.
+
+struct UnionFindNode {
+    parent as *UnionFindNode;
+    bb as *BasicBlock;
+    loop as *SimpleLoop;
+    dfs_number as i32;
+}
+
+fn init_node(n as *UnionFindNode, bb as *BasicBlock, dfs_number as i32) as void {
+    n.parent = n;
+    n.bb = bb;
+    n.dfs_number = dfs_number;
+    n.loop = cast(*SimpleLoop, 0);
+}
+
+fn union_to_parent(ctx as *u8, n as *UnionFindNode) as i64 {
+    n.parent = cast(*UnionFindNode, ctx);
+    return 0;
+}
+
+// The set's representative; every node on a path longer than one step is
+// pointed at this node's parent.
+fn find_set(self as *UnionFindNode) as *UnionFindNode {
+    let is Vector as node_list;
+    vec_init(&node_list, 0);
+    let is *UnionFindNode as node with mut = self;
+    while (node != node.parent) {
+        if (node.parent != node.parent.parent) { vec_append(&node_list, cast(i64, node)); }
+        node = node.parent;
+    }
+    vec_for_each(&node_list, fn_ptr(union_to_parent), cast(*u8, self.parent));
+    vec_dispose(&node_list);
+    return node;
+}
+
+// ---------------------------------------------------------------------------
+// The loop finder.
+
+let is i32 as BB_TOP with imut = 0;
+let is i32 as BB_NONHEADER with imut = 1;
+let is i32 as BB_REDUCIBLE with imut = 2;
+let is i32 as BB_SELF with imut = 3;
+let is i32 as BB_IRREDUCIBLE with imut = 4;
+let is i32 as BB_DEAD with imut = 5;
+let is i32 as BB_LAST with imut = 6;
+
+let is i64 as UNVISITED with imut = 2147483647;
+let is i64 as MAXNONBACKPREDS with imut = 32768;
+
+struct LoopFinder {
+    cfg as *ControlFlowGraph;
+    lsg as *LoopStructureGraph;
+    non_back_preds as Vector;   // of sets of numbers
+    back_preds as Vector;       // of vectors of numbers
+    number as *Dictionary;
+    max_size as i32;
+    header as *i32;
+    kind as *i32;
+    last as *i32;
+    nodes as **UnionFindNode;
+}
+
+fn finder_init(f as *LoopFinder, cfg as *ControlFlowGraph, lsg as *LoopStructureGraph) as void {
+    f.cfg = cfg;
+    f.lsg = lsg;
+    vec_init(&f.non_back_preds, 0);
+    vec_init(&f.back_preds, 0);
+    f.number = dict_new();
+    f.max_size = 0;
+    f.header = cast(*i32, 0);
+    f.kind = cast(*i32, 0);
+    f.last = cast(*i32, 0);
+    f.nodes = cast(**UnionFindNode, 0);
+}
+
+fn free_vectors(v as *Vector) as void {
+    let is i64 as i with mut = 0;
+    while (i < vec_size(v)) {
+        vec_free(cast(*Vector, *vec_at(v, i)));
+        i = i + 1;
+    }
+    vec_dispose(v);
+}
+
+fn finder_dispose(f as *LoopFinder) as void {
+    free_vectors(&f.non_back_preds);
+    free_vectors(&f.back_preds);
+    dict_free(f.number);
+    if (f.max_size > 0) {
+        release(cast(*u8, f.header));
+        release(cast(*u8, f.kind));
+        release(cast(*u8, f.last));
+        let is i32 as i with mut = 0;
+        while (i < f.max_size) { release(cast(*u8, f.nodes[i])); i = i + 1; }
+        release(cast(*u8, f.nodes));
+    }
+}
+
+fn is_ancestor(f as *LoopFinder, w as i32, v as i32) as i32 {
+    return w <= v && v <= f.last[w];
+}
+
+fn number_of(f as *LoopFinder, bb as *BasicBlock) as i64 { return *dict_at(f.number, bb); }
+
+fn do_dfs(f as *LoopFinder, current_node as *BasicBlock, current as i32) as i32 {
+    init_node(f.nodes[current], current_node, current);
+    dict_at_put(f.number, current_node, cast(i64, current));
+    let is i32 as last_id with mut = current;
+    let is *Vector as outer_blocks = &current_node.out_edges;
+    let is i64 as i with mut = 0;
+    while (i < vec_size(outer_blocks)) {
+        let is *BasicBlock as target = cast(*BasicBlock, *vec_at(outer_blocks, i));
+        if (number_of(f, target) == UNVISITED) { last_id = do_dfs(f, target, last_id + 1); }
+        i = i + 1;
+    }
+    f.last[current] = last_id;
+    return last_id;
+}
+
+fn mark_unvisited(ctx as *u8, bb as *BasicBlock) as i64 {
+    dict_at_put(cast(*Dictionary, ctx), bb, UNVISITED);
+    return 0;
+}
+
+fn init_all_nodes(f as *LoopFinder) as void {
+    vec_for_each(&f.cfg.basic_block_map, fn_ptr(mark_unvisited), cast(*u8, f.number));
+    do_dfs(f, f.cfg.start_node, 0);
+}
+
+struct EdgeCtx {
+    f as *LoopFinder;
+    w as i32;
+}
+
+fn classify_in_edge(ctx as *u8, node_v as *BasicBlock) as i64 {
+    let is *EdgeCtx as k = cast(*EdgeCtx, ctx);
+    let is i64 as v = number_of(k.f, node_v);
+    if (v != UNVISITED) {
+        if (is_ancestor(k.f, k.w, cast(i32, v)) != 0) {
+            vec_append(cast(*Vector, *vec_at(&k.f.back_preds, cast(i64, k.w))), v);
+        } else {
+            set_add(cast(*Vector, *vec_at(&k.f.non_back_preds, cast(i64, k.w))), v);
+        }
+    }
+    return 0;
+}
+
+fn process_edges(f as *LoopFinder, node_w as *BasicBlock, w as i32) as void {
+    if (vec_size(&node_w.in_edges) > 0) {
+        let is EdgeCtx as k;
+        k.f = f;
+        k.w = w;
+        vec_for_each(&node_w.in_edges, fn_ptr(classify_in_edge), cast(*u8, &k));
+    }
+}
+
+fn identify_edges(f as *LoopFinder, size as i32) as void {
+    let is i32 as w with mut = 0;
+    while (w < size) {
+        f.header[w] = 0;
+        f.kind[w] = BB_NONHEADER;
+        let is *BasicBlock as node_w = f.nodes[w].bb;
+        if (cast(i64, node_w) == 0) {
+            f.kind[w] = BB_DEAD;
+        } else {
+            process_edges(f, node_w, w);
+        }
+        w = w + 1;
+    }
+}
+
+struct StepCtx {
+    f as *LoopFinder;
+    w as i32;
+    node_pool as *Vector;
+    work_list as *Vector;
+}
+
+fn same_node(ctx as *u8, e as i64) as i64 { return e == cast(i64, ctx); }
+
+fn non_back_pred_visit(ctx as *u8, iter as i64) as i64 {
+    let is *StepCtx as k = cast(*StepCtx, ctx);
+    let is *UnionFindNode as y = k.f.nodes[iter];
+    let is *UnionFindNode as ydash = find_set(y);
+    if (is_ancestor(k.f, k.w, ydash.dfs_number) == 0) {
+        k.f.kind[k.w] = BB_IRREDUCIBLE;
+        set_add(cast(*Vector, *vec_at(&k.f.non_back_preds, cast(i64, k.w))), cast(i64, ydash.dfs_number));
+    } else {
+        if (ydash.dfs_number != k.w) {
+            if (vec_has_some(k.node_pool, fn_ptr(same_node), cast(*u8, ydash)) == 0) {
+                vec_append(k.work_list, cast(i64, ydash));
+                vec_append(k.node_pool, cast(i64, ydash));
+            }
+        }
+    }
+    return 0;
+}
+
+fn step_e_process_non_back_preds(f as *LoopFinder, w as i32, node_pool as *Vector, work_list as *Vector, x as *UnionFindNode) as void {
+    let is StepCtx as k;
+    k.f = f;
+    k.w = w;
+    k.node_pool = node_pool;
+    k.work_list = work_list;
+    vec_for_each(cast(*Vector, *vec_at(&f.non_back_preds, cast(i64, x.dfs_number))), fn_ptr(non_back_pred_visit), cast(*u8, &k));
+}
+
+struct LoopAttrCtx {
+    f as *LoopFinder;
+    w as i32;
+    loop as *SimpleLoop;
+}
+
+fn loop_attr_visit(ctx as *u8, node as *UnionFindNode) as i64 {
+    let is *LoopAttrCtx as k = cast(*LoopAttrCtx, ctx);
+    k.f.header[node.dfs_number] = k.w;
+    node.parent = k.f.nodes[k.w];
+    if (cast(i64, node.loop) != 0) {
+        set_parent(node.loop, k.loop);
+    } else {
+        set_add(&k.loop.basic_blocks, cast(i64, node.bb));
+    }
+    return 0;
+}
+
+fn set_loop_attributes(f as *LoopFinder, w as i32, node_pool as *Vector, l as *SimpleLoop) as void {
+    f.nodes[w].loop = l;
+    let is LoopAttrCtx as k;
+    k.f = f;
+    k.w = w;
+    k.loop = l;
+    vec_for_each(node_pool, fn_ptr(loop_attr_visit), cast(*u8, &k));
+}
+
+struct StepDCtx {
+    f as *LoopFinder;
+    w as i32;
+    node_pool as *Vector;
+}
+
+fn back_pred_visit(ctx as *u8, v as i64) as i64 {
+    let is *StepDCtx as k = cast(*StepDCtx, ctx);
+    if (v != cast(i64, k.w)) {
+        vec_append(k.node_pool, cast(i64, find_set(k.f.nodes[v])));
+    } else {
+        k.f.kind[k.w] = BB_SELF;
+    }
+    return 0;
+}
+
+fn step_d(f as *LoopFinder, w as i32, node_pool as *Vector) as void {
+    let is StepDCtx as k;
+    k.f = f;
+    k.w = w;
+    k.node_pool = node_pool;
+    vec_for_each(cast(*Vector, *vec_at(&f.back_preds, cast(i64, w))), fn_ptr(back_pred_visit), cast(*u8, &k));
+}
+
+fn append_to(ctx as *u8, e as i64) as i64 {
+    vec_append(cast(*Vector, ctx), e);
+    return 0;
+}
+
+fn find_loops_with(f as *LoopFinder) as void {
+    if (cast(i64, f.cfg.start_node) == 0) { return; }
+    let is i32 as size = cast(i32, cfg_num_nodes(f.cfg));
+    // Both are empty in a fresh finder.
+    vec_dispose(&f.non_back_preds);
+    vec_init(&f.non_back_preds, f.non_back_preds.capacity);
+    vec_dispose(&f.back_preds);
+    vec_init(&f.back_preds, f.back_preds.capacity);
+    dict_remove_all(f.number);
+    if (size > f.max_size) {
+        f.header = cast(*i32, alloc(cast(i64, size) * 4));
+        f.kind = cast(*i32, alloc(cast(i64, size) * 4));
+        f.last = cast(*i32, alloc(cast(i64, size) * 4));
+        f.nodes = cast(**UnionFindNode, alloc(cast(i64, size) * 8));
+        f.max_size = size;
+    }
+    let is i32 as i with mut = 0;
+    while (i < size) {
+        vec_append(&f.non_back_preds, cast(i64, set_new()));
+        vec_append(&f.back_preds, cast(i64, vec_new(0)));
+        let is *UnionFindNode as n = cast(*UnionFindNode, alloc(sizeof(UnionFindNode)));
+        n.parent = cast(*UnionFindNode, 0);
+        n.bb = cast(*BasicBlock, 0);
+        n.loop = cast(*SimpleLoop, 0);
+        n.dfs_number = 0;
+        f.nodes[i] = n;
+        i = i + 1;
+    }
+    init_all_nodes(f);
+    identify_edges(f, size);
+    f.header[0] = 0;
+
+    let is i32 as w with mut = size - 1;
+    while (w >= 0) {
+        let is Vector as node_pool;
+        vec_init(&node_pool, 0);
+        let is *BasicBlock as node_w = f.nodes[w].bb;
+        if (cast(i64, node_w) != 0) {
+            step_d(f, w, &node_pool);
+            let is Vector as work_list;
+            vec_init(&work_list, 0);
+            vec_for_each(&node_pool, fn_ptr(append_to), cast(*u8, &work_list));
+            if (vec_size(&node_pool) != 0) { f.kind[w] = BB_REDUCIBLE; }
+            while (vec_is_empty(&work_list) == 0) {
+                let is *UnionFindNode as x = cast(*UnionFindNode, vec_remove_first(&work_list));
+                let is i64 as non_back_size = vec_size(cast(*Vector, *vec_at(&f.non_back_preds, cast(i64, x.dfs_number))));
+                if (non_back_size > MAXNONBACKPREDS) {
+                    vec_dispose(&work_list);
+                    vec_dispose(&node_pool);
+                    return;
+                }
+                step_e_process_non_back_preds(f, w, &node_pool, &work_list, x);
+            }
+            if (vec_size(&node_pool) > 0 || f.kind[w] == BB_SELF) {
+                let is *SimpleLoop as lp = create_new_loop(f.lsg, node_w, f.kind[w] != BB_IRREDUCIBLE);
+                set_loop_attributes(f, w, &node_pool, lp);
+            }
+            vec_dispose(&work_list);
+        }
+        vec_dispose(&node_pool);
+        w = w - 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Building the test graph.
+
+struct LoopTester {
+    cfg as ControlFlowGraph;
+    lsg as LoopStructureGraph;
+}
+
+fn build_diamond(t as *LoopTester, start as i64) as i64 {
+    let is i64 as bb0 = start;
+    new_edge(&t.cfg, bb0, bb0 + 1);
+    new_edge(&t.cfg, bb0, bb0 + 2);
+    new_edge(&t.cfg, bb0 + 1, bb0 + 3);
+    new_edge(&t.cfg, bb0 + 2, bb0 + 3);
+    return bb0 + 3;
+}
+
+fn build_connect(t as *LoopTester, start as i64, end as i64) as void {
+    new_edge(&t.cfg, start, end);
+}
+
+fn build_straight(t as *LoopTester, start as i64, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        build_connect(t, start + i, start + i + 1);
+        i = i + 1;
+    }
+    return start + n;
+}
+
+fn build_base_loop(t as *LoopTester, from as i64) as i64 {
+    let is i64 as header = build_straight(t, from, 1);
+    let is i64 as diamond1 = build_diamond(t, header);
+    let is i64 as d11 = build_straight(t, diamond1, 1);
+    let is i64 as diamond2 = build_diamond(t, d11);
+    let is i64 as footer with mut = build_straight(t, diamond2, 1);
+    build_connect(t, diamond2, d11);
+    build_connect(t, diamond1, header);
+    build_connect(t, footer, from);
+    footer = build_straight(t, footer, 1);
+    return footer;
+}
+
+fn construct_simple_cfg(t as *LoopTester) as void {
+    create_node(&t.cfg, 0);
+    build_base_loop(t, 0);
+    create_node(&t.cfg, 1);
+    new_edge(&t.cfg, 0, 2);
+}
+
+fn construct_cfg(t as *LoopTester, par_loops as i32, ppar_loops as i32, pppar_loops as i32) as void {
+    let is i64 as n with mut = 2;
+    let is i32 as parlooptrees with mut = 0;
+    while (parlooptrees < par_loops) {
+        create_node(&t.cfg, n + 1);
+        build_connect(t, 2, n + 1);
+        n = n + 1;
+        let is i32 as i with mut = 0;
+        while (i < ppar_loops) {
+            let is i64 as top = n;
+            n = build_straight(t, n, 1);
+            let is i32 as j with mut = 0;
+            while (j < pppar_loops) {
+                n = build_base_loop(t, n);
+                j = j + 1;
+            }
+            let is i64 as bottom = build_straight(t, n, 1);
+            build_connect(t, n, top);
+            n = bottom;
+            i = i + 1;
+        }
+        build_connect(t, n, 1);
+        parlooptrees = parlooptrees + 1;
+    }
+}
+
+fn find_loops(t as *LoopTester, loop_structure as *LoopStructureGraph) as void {
+    let is LoopFinder as finder;
+    finder_init(&finder, &t.cfg, loop_structure);
+    find_loops_with(&finder);
+    finder_dispose(&finder);
+}
+
+fn add_dummy_loops(t as *LoopTester, num_dummy_loops as i32) as void {
+    let is i32 as dummyloop with mut = 0;
+    while (dummyloop < num_dummy_loops) {
+        find_loops(t, &t.lsg);
+        dummyloop = dummyloop + 1;
+    }
+}
+
+// Returns the number of loops; *num_nodes gets the number of blocks.
+fn tester_main(num_dummy_loops as i32, find_loop_iterations as i32, par_loops as i32,
+               ppar_loops as i32, pppar_loops as i32, num_nodes as *i64) as i64 {
+    let is LoopTester as t;
+    cfg_init(&t.cfg);
+    lsg_init(&t.lsg);
+    create_node(&t.cfg, 0);
+
+    construct_simple_cfg(&t);
+    add_dummy_loops(&t, num_dummy_loops);
+    construct_cfg(&t, par_loops, ppar_loops, pppar_loops);
+    find_loops(&t, &t.lsg);
+    let is i32 as i with mut = 0;
+    while (i < find_loop_iterations) {
+        let is LoopStructureGraph as l;
+        lsg_init(&l);
+        find_loops(&t, &l);
+        lsg_dispose(&l);
+        i = i + 1;
+    }
+    calculate_nesting_level(&t.lsg);
+    let is i64 as num_loops = vec_size(&t.lsg.loops);
+    num_nodes[0] = cfg_num_nodes(&t.cfg);
+    lsg_dispose(&t.lsg);
+    cfg_dispose(&t.cfg);
+    return num_loops;
+}
+
+fn main() as i32 {
+    let is i64 as loops with mut = 0;
+    let is i64 as nodes with mut = 0;
+    let is i32 as r with mut = 0;
+    while (r < ROUNDS) {
+        loops = tester_main(INNER, 50, 10, 10, 5, &nodes);
+        if (loops != 6102 || nodes != 5213) {
+            io.printf("loopfind: wrong result %d loops, %d blocks\n", loops, nodes);
+            return 1;
+        }
+        r = r + 1;
+    }
+    io.printf("loopfind: %d loops, %d blocks\n", loops, nodes);
+    return 0;
+}

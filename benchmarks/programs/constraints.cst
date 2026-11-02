@@ -1,0 +1,1111 @@
+// An incremental dataflow constraint solver: variables are tied together by
+// equality, scale-and-offset, stay and edit constraints of eight strengths;
+// adding or removing a constraint re-plans which constraint determines each
+// variable, walking the graph with growable vectors and visitor callbacks,
+// and an extracted plan is executed to propagate new values. Two tests per
+// call: a chain of 12000 equalities driven from one end, and 12000 scaled
+// copies of a variable whose source, destination, scale and offset are each
+// changed in turn. Constraints are objects with a table of methods; strengths
+// are looked up in identity-keyed hash dictionaries. Run 10 times.
+// Self-check: every propagated value the two tests check.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as ROUNDS with imut = 10;
+let is i32 as INNER with imut = 12000;
+
+let is mem.bins.Bins as heap with mut;
+
+fn alloc(n as i64) as *u8 { return mem.bins.bins_alloc(&heap, n); }
+fn release(p as *u8) as void { mem.bins.bins_free(&heap, p); }
+
+fn fail(msg as *u8) as void {
+    io.write_bytes(io.STDERR, msg, io.strlen(msg));
+    io.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Growable vector of word-sized elements. Removing from the front advances
+// first; appending past the capacity doubles the storage.
+
+let is i64 as INITIAL_SIZE with imut = 10;
+
+struct Vector {
+    storage as *i64;
+    capacity as i64;
+    first as i64;
+    last as i64;
+}
+
+fn new_storage(n as i64) as *i64 {
+    let is *i64 as s = cast(*i64, alloc(n * 8));
+    mem.memset(cast(*u8, s), 0, n * 8);
+    return s;
+}
+
+fn vec_init(v as *Vector, size as i64) as void {
+    if (size == 0) { v.storage = cast(*i64, 0); } else { v.storage = new_storage(size); }
+    v.capacity = size;
+    v.first = 0;
+    v.last = 0;
+}
+
+fn vec_new(size as i64) as *Vector {
+    let is *Vector as v = cast(*Vector, alloc(sizeof(Vector)));
+    vec_init(v, size);
+    return v;
+}
+
+fn vec_dispose(v as *Vector) as void {
+    if (cast(i64, v.storage) != 0) { release(cast(*u8, v.storage)); }
+}
+
+fn vec_free(v as *Vector) as void {
+    vec_dispose(v);
+    release(cast(*u8, v));
+}
+
+fn vec_append(v as *Vector, elem as i64) as void {
+    if (cast(i64, v.storage) == 0) {
+        v.storage = new_storage(INITIAL_SIZE);
+        v.capacity = INITIAL_SIZE;
+    } else if (v.last >= v.capacity) {
+        v.capacity = v.capacity * 2;
+        let is *i64 as ns = new_storage(v.capacity);
+        let is i64 as i with mut = 0;
+        while (i < v.last) { ns[i] = v.storage[i]; i = i + 1; }
+        release(cast(*u8, v.storage));
+        v.storage = ns;
+    }
+    v.storage[v.last] = elem;
+    v.last = v.last + 1;
+}
+
+fn vec_with(elem as i64) as *Vector {
+    let is *Vector as v = vec_new(1);
+    vec_append(v, elem);
+    return v;
+}
+
+fn vec_at(v as *Vector, idx as i64) as *i64 {
+    if (cast(i64, v.storage) == 0 || idx >= v.last - v.first) { return cast(*i64, 0); }
+    return &v.storage[v.first + idx];
+}
+
+fn vec_is_empty(v as *Vector) as i32 { return v.last == v.first; }
+
+fn vec_size(v as *Vector) as i64 { return v.last - v.first; }
+
+// fn(ctx, elem) for every element, in order.
+fn vec_for_each(v as *Vector, f as *u8, ctx as *u8) as void {
+    let is i64 as i with mut = v.first;
+    while (i < v.last) {
+        call(f, ctx, v.storage[i]);
+        i = i + 1;
+    }
+}
+
+fn vec_remove_first(v as *Vector) as i64 {
+    if (vec_is_empty(v) != 0) { return 0; }
+    v.first = v.first + 1;
+    return v.storage[v.first - 1];
+}
+
+// Drops every occurrence of obj, compacting in place; 1 if there was one.
+fn vec_remove(v as *Vector, obj as i64) as i32 {
+    if (cast(i64, v.storage) == 0 || vec_is_empty(v) != 0) { return 0; }
+    let is i32 as found with mut = 0;
+    let is i64 as new_last with mut = v.first;
+    let is i64 as i with mut = v.first;
+    while (i < v.last) {
+        if (v.storage[i] == obj) {
+            found = 1;
+        } else {
+            v.storage[new_last] = v.storage[i];
+            new_last = new_last + 1;
+        }
+        i = i + 1;
+    }
+    v.last = new_last;
+    return found;
+}
+
+fn vec_swap(s as *i64, i as i64, j as i64) as void {
+    let is i64 as t = s[i];
+    s[i] = s[j];
+    s[j] = t;
+}
+
+// Median-of-three quicksort of storage[i..j] under c(a, b) (< 0: a first).
+fn vec_sort_range(v as *Vector, i as i64, j as i64, c as *u8) as void {
+    let is i64 as n = j + 1 - i;
+    if (n <= 1) { return; }
+    let is *i64 as s = v.storage;
+    let is i64 as di with mut = s[i];
+    let is i64 as dj with mut = s[j];
+    if (call(c, di, dj) > 0) {
+        vec_swap(s, i, j);
+        let is i64 as tt = di;
+        di = dj;
+        dj = tt;
+    }
+    if (n > 2) {
+        let is i64 as ij = (i + j) / 2;
+        let is i64 as dij with mut = s[ij];
+        if (call(c, di, dij) <= 0) {
+            if (call(c, dij, dj) > 0) {
+                vec_swap(s, j, ij);
+                dij = dj;
+            }
+        } else {
+            vec_swap(s, i, ij);
+            dij = di;
+        }
+        if (n > 3) {
+            let is i64 as k with mut = i;
+            let is i64 as l with mut = j - 1;
+            while (1 == 1) {
+                while (k <= l && call(c, dij, s[l]) <= 0) { l = l - 1; }
+                k = k + 1;
+                while (k <= l && call(c, s[k], dij) <= 0) { k = k + 1; }
+                if (k > l) { break; }
+                vec_swap(s, k, l);
+            }
+            vec_sort_range(v, i, l, c);
+            vec_sort_range(v, k, j, c);
+        }
+    }
+}
+
+fn vec_sort(v as *Vector, c as *u8) as void {
+    if (vec_size(v) > 0) { vec_sort_range(v, v.first, v.last - 1, c); }
+}
+
+// ---------------------------------------------------------------------------
+// Hash dictionary keyed by object identity, with chained buckets; the key's
+// hash is the symbol's own number, spread by xoring its high half down.
+
+struct Sym { hash as i64; }
+
+struct Entry {
+    hash as i64;
+    key as *u8;
+    value as i64;
+    next as *Entry;
+}
+
+struct Dictionary {
+    buckets as **Entry;
+    size as i64;
+    capacity as i64;
+}
+
+fn dict_new() as *Dictionary {
+    let is *Dictionary as d = cast(*Dictionary, alloc(sizeof(Dictionary)));
+    d.capacity = 16;
+    d.size = 0;
+    d.buckets = cast(**Entry, new_storage(16));
+    return d;
+}
+
+fn dict_hash(key as *Sym) as i64 {
+    if (cast(i64, key) == 0) { return 0; }
+    let is i64 as h = key.hash & 4294967295;
+    return h ^ (h >> 16);
+}
+
+fn entry_new(key as *u8, value as i64, hash as i64) as *Entry {
+    let is *Entry as e = cast(*Entry, alloc(sizeof(Entry)));
+    e.hash = hash;
+    e.key = key;
+    e.value = value;
+    e.next = cast(*Entry, 0);
+    return e;
+}
+
+fn entry_match(e as *Entry, h as i64, k as *u8) as i32 {
+    return e.hash == h && e.key == k;
+}
+
+fn dict_at(d as *Dictionary, key as *Sym) as *i64 {
+    let is i64 as h = dict_hash(key);
+    let is *Entry as e with mut = d.buckets[(d.capacity - 1) & h];
+    while (cast(i64, e) != 0) {
+        if (entry_match(e, h, cast(*u8, key)) != 0) { return &e.value; }
+        e = e.next;
+    }
+    return cast(*i64, 0);
+}
+
+fn dict_split_bucket(d as *Dictionary, old_capacity as i64, idx as i64, head as *Entry) as void {
+    let is *Entry as lo_head with mut = cast(*Entry, 0);
+    let is *Entry as lo_tail with mut = cast(*Entry, 0);
+    let is *Entry as hi_head with mut = cast(*Entry, 0);
+    let is *Entry as hi_tail with mut = cast(*Entry, 0);
+    let is *Entry as current with mut = head;
+    while (cast(i64, current) != 0) {
+        if ((current.hash & old_capacity) == 0) {
+            if (cast(i64, lo_tail) == 0) { lo_head = current; } else { lo_tail.next = current; }
+            lo_tail = current;
+        } else {
+            if (cast(i64, hi_tail) == 0) { hi_head = current; } else { hi_tail.next = current; }
+            hi_tail = current;
+        }
+        current = current.next;
+    }
+    if (cast(i64, lo_tail) != 0) {
+        lo_tail.next = cast(*Entry, 0);
+        d.buckets[idx] = lo_head;
+    }
+    if (cast(i64, hi_tail) != 0) {
+        hi_tail.next = cast(*Entry, 0);
+        d.buckets[idx + old_capacity] = hi_head;
+    }
+}
+
+fn dict_resize(d as *Dictionary) as void {
+    let is **Entry as old = d.buckets;
+    let is i64 as old_capacity = d.capacity;
+    d.capacity = d.capacity * 2;
+    d.buckets = cast(**Entry, new_storage(d.capacity));
+    let is i64 as i with mut = 0;
+    while (i < old_capacity) {
+        let is *Entry as current = old[i];
+        if (cast(i64, current) != 0) {
+            old[i] = cast(*Entry, 0);
+            if (cast(i64, current.next) == 0) {
+                d.buckets[current.hash & (old_capacity - 1)] = current;
+            } else {
+                dict_split_bucket(d, old_capacity, i, current);
+            }
+        }
+        i = i + 1;
+    }
+    release(cast(*u8, old));
+}
+
+fn dict_at_put(d as *Dictionary, key as *Sym, value as i64) as void {
+    let is i64 as h = dict_hash(key);
+    let is i64 as i = (d.capacity - 1) & h;
+    let is *Entry as current with mut = d.buckets[i];
+    if (cast(i64, current) == 0) {
+        d.buckets[i] = entry_new(cast(*u8, key), value, h);
+        d.size = d.size + 1;
+    } else {
+        while (1 == 1) {
+            if (entry_match(current, h, cast(*u8, key)) != 0) {
+                current.value = value;
+                break;
+            }
+            if (cast(i64, current.next) == 0) {
+                d.size = d.size + 1;
+                current.next = entry_new(cast(*u8, key), value, h);
+                break;
+            }
+            current = current.next;
+        }
+    }
+    if (d.size > d.capacity) { dict_resize(d); }
+}
+
+fn dict_get_keys(d as *Dictionary) as *Vector {
+    let is *Vector as keys = vec_new(0);
+    let is i64 as i with mut = 0;
+    while (i < d.capacity) {
+        let is *Entry as current with mut = d.buckets[i];
+        while (cast(i64, current) != 0) {
+            vec_append(keys, cast(i64, current.key));
+            current = current.next;
+        }
+        i = i + 1;
+    }
+    return keys;
+}
+
+// Frees the entries and the dictionary; with free_values, the values too.
+fn dict_free(d as *Dictionary, free_values as i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < d.capacity) {
+        let is *Entry as current with mut = d.buckets[i];
+        while (cast(i64, current) != 0) {
+            let is *Entry as dead = current;
+            current = current.next;
+            if (free_values != 0) { release(cast(*u8, dead.value)); }
+            release(cast(*u8, dead));
+        }
+        i = i + 1;
+    }
+    release(cast(*u8, d.buckets));
+    release(cast(*u8, d));
+}
+
+// ---------------------------------------------------------------------------
+// Strengths: a symbol and the number the strength table gives it; lower is
+// stronger.
+
+struct Strength {
+    arithmetic_value as i64;
+    symbolic_value as *Sym;
+}
+
+let is [8]Sym as syms with mut;
+let is i64 as ABSOLUTE_STRONGEST with imut = 0;
+let is i64 as REQUIRED with imut = 1;
+let is i64 as STRONG_PREFERRED with imut = 2;
+let is i64 as PREFERRED with imut = 3;
+let is i64 as STRONG_DEFAULT with imut = 4;
+let is i64 as DEFAULT with imut = 5;
+let is i64 as WEAK_DEFAULT with imut = 6;
+let is i64 as ABSOLUTE_WEAKEST with imut = 7;
+
+let is *Dictionary as strength_table with mut;
+let is *Dictionary as strength_constant with mut;
+let is *Strength as absolute_weakest with mut;
+let is *Strength as required with mut;
+
+fn sym(k as i64) as *Sym { return &syms[k]; }
+
+fn strength_new(s as *Sym) as *Strength {
+    let is *Strength as st = cast(*Strength, alloc(sizeof(Strength)));
+    st.arithmetic_value = *dict_at(strength_table, s);
+    st.symbolic_value = s;
+    return st;
+}
+
+fn strength_of(s as *Sym) as *Strength {
+    return cast(*Strength, *dict_at(strength_constant, s));
+}
+
+fn same_as(a as *Strength, b as *Strength) as i32 { return a.arithmetic_value == b.arithmetic_value; }
+fn stronger(a as *Strength, b as *Strength) as i32 { return a.arithmetic_value < b.arithmetic_value; }
+fn weaker(a as *Strength, b as *Strength) as i32 { return a.arithmetic_value > b.arithmetic_value; }
+
+fn weakest(a as *Strength, b as *Strength) as *Strength {
+    if (weaker(b, a) != 0) { return b; }
+    return a;
+}
+
+fn put_strength_constant(d as *u8, key as i64) as i64 {
+    dict_at_put(cast(*Dictionary, d), cast(*Sym, key), cast(i64, strength_new(cast(*Sym, key))));
+    return 0;
+}
+
+fn initialize_constants() as void {
+    let is i64 as k with mut = 0;
+    while (k < 8) { syms[k].hash = k; k = k + 1; }
+    strength_table = dict_new();
+    dict_at_put(strength_table, sym(ABSOLUTE_STRONGEST), 0 - 10000);
+    dict_at_put(strength_table, sym(REQUIRED), 0 - 800);
+    dict_at_put(strength_table, sym(STRONG_PREFERRED), 0 - 600);
+    dict_at_put(strength_table, sym(PREFERRED), 0 - 400);
+    dict_at_put(strength_table, sym(STRONG_DEFAULT), 0 - 200);
+    dict_at_put(strength_table, sym(DEFAULT), 0);
+    dict_at_put(strength_table, sym(WEAK_DEFAULT), 500);
+    dict_at_put(strength_table, sym(ABSOLUTE_WEAKEST), 10000);
+    strength_constant = dict_new();
+    let is *Vector as keys = dict_get_keys(strength_table);
+    vec_for_each(keys, fn_ptr(put_strength_constant), cast(*u8, strength_constant));
+    vec_free(keys);
+    absolute_weakest = strength_of(sym(ABSOLUTE_WEAKEST));
+    required = strength_of(sym(REQUIRED));
+}
+
+fn release_constants() as void {
+    dict_free(strength_table, 0);
+    dict_free(strength_constant, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Variables and constraints.
+
+struct Variable {
+    value as i32;
+    constraints as *Vector;
+    determined_by as *Constraint;
+    mark as i32;
+    walk_strength as *Strength;
+    stay as i32;
+}
+
+// The methods every kind of constraint provides.
+struct ConstraintClass {
+    is_input as *u8;            // fn(*Constraint) as i64
+    is_satisfied as *u8;        // fn(*Constraint) as i64
+    add_to_graph as *u8;        // fn(*Constraint) as i64
+    remove_from_graph as *u8;   // fn(*Constraint) as i64
+    choose_method as *u8;       // fn(*Constraint, mark) as i64
+    execute as *u8;             // fn(*Constraint) as i64
+    inputs_do as *u8;           // fn(*Constraint, f, ctx) as i64
+    inputs_has_one as *u8;      // fn(*Constraint, f, ctx) as i64
+    mark_unsatisfied as *u8;    // fn(*Constraint) as i64
+    get_output as *u8;          // fn(*Constraint) as *Variable
+    recalculate as *u8;         // fn(*Constraint) as i64
+}
+
+let is i64 as FORWARD with imut = 0;
+let is i64 as BACKWARD with imut = 1;
+let is i64 as NONE with imut = 2;
+
+// Unary constraints use output and satisfied; binary ones v1, v2 and
+// direction; the scale constraint also scale and offset.
+struct Constraint {
+    cls as *ConstraintClass;
+    strength as *Strength;
+    output as *Variable;
+    satisfied as i64;
+    v1 as *Variable;
+    v2 as *Variable;
+    direction as i64;
+    scale as *Variable;
+    offset as *Variable;
+}
+
+struct Planner {
+    current_mark as i32;
+}
+
+let is ConstraintClass as stay_class with mut;
+let is ConstraintClass as edit_class with mut;
+let is ConstraintClass as equality_class with mut;
+let is ConstraintClass as scale_class with mut;
+
+// Every variable and constraint of a test, freed together at its end.
+let is Vector as tracked with mut;
+
+fn track(p as *u8) as *u8 {
+    vec_append(&tracked, cast(i64, p));
+    return p;
+}
+
+fn new_variable() as *Variable {
+    let is *Variable as v = cast(*Variable, track(alloc(sizeof(Variable))));
+    v.value = 0;
+    v.constraints = vec_new(2);
+    v.determined_by = cast(*Constraint, 0);
+    v.mark = 0;
+    v.walk_strength = absolute_weakest;
+    v.stay = 1;
+    return v;
+}
+
+fn variable_value(a as i32) as *Variable {
+    let is *Variable as v = new_variable();
+    v.value = a;
+    return v;
+}
+
+fn release_all() as void {
+    let is i64 as i with mut = 0;
+    while (i < vec_size(&tracked)) {
+        release(cast(*u8, *vec_at(&tracked, i)));
+        i = i + 1;
+    }
+    vec_dispose(&tracked);
+    vec_init(&tracked, 0);
+}
+
+fn free_variable(v as *Variable) as void {
+    vec_free(v.constraints);
+}
+
+fn add_variable_constraint(v as *Variable, c as *Constraint) as void {
+    vec_append(v.constraints, cast(i64, c));
+}
+
+fn remove_variable_constraint(v as *Variable, c as *Constraint) as void {
+    vec_remove(v.constraints, cast(i64, c));
+    if (v.determined_by == c) { v.determined_by = cast(*Constraint, 0); }
+}
+
+fn output_of(c as *Constraint) as *Variable {
+    return cast(*Variable, call(c.cls.get_output, c));
+}
+
+fn satisfied(c as *Constraint) as i64 {
+    return call(c.cls.is_satisfied, c);
+}
+
+// --- unary constraints (stay, edit) ---
+
+fn unary_is_satisfied(c as *Constraint) as i64 { return c.satisfied; }
+
+fn unary_add_to_graph(c as *Constraint) as i64 {
+    add_variable_constraint(c.output, c);
+    c.satisfied = 0;
+    return 0;
+}
+
+fn unary_remove_from_graph(c as *Constraint) as i64 {
+    if (cast(i64, c.output) != 0) { remove_variable_constraint(c.output, c); }
+    c.satisfied = 0;
+    return 0;
+}
+
+fn unary_choose_method(c as *Constraint, mark as i64) as i64 {
+    c.satisfied = 0;
+    if (c.output.mark != mark && stronger(c.strength, c.output.walk_strength) != 0) { c.satisfied = 1; }
+    return NONE;
+}
+
+fn unary_inputs_do(c as *Constraint, f as *u8, ctx as *u8) as i64 { return 0; }
+fn unary_inputs_has_one(c as *Constraint, f as *u8, ctx as *u8) as i64 { return 0; }
+
+fn unary_mark_unsatisfied(c as *Constraint) as i64 {
+    c.satisfied = 0;
+    return 0;
+}
+
+fn unary_get_output(c as *Constraint) as *Variable { return c.output; }
+
+fn unary_recalculate(c as *Constraint) as i64 {
+    c.output.walk_strength = c.strength;
+    c.output.stay = 1;
+    if (call(c.cls.is_input, c) != 0) { c.output.stay = 0; }
+    if (c.output.stay != 0) { call(c.cls.execute, c); }
+    return 0;
+}
+
+fn not_input(c as *Constraint) as i64 { return 0; }
+fn is_input(c as *Constraint) as i64 { return 1; }
+fn do_nothing(c as *Constraint) as i64 { return 0; }
+
+// --- binary constraints (equality, scale) ---
+
+fn binary_is_satisfied(c as *Constraint) as i64 { return c.direction != NONE; }
+
+fn binary_add_to_graph(c as *Constraint) as i64 {
+    add_variable_constraint(c.v1, c);
+    add_variable_constraint(c.v2, c);
+    c.direction = NONE;
+    return 0;
+}
+
+fn binary_remove_from_graph(c as *Constraint) as i64 {
+    remove_variable_constraint(c.v1, c);
+    remove_variable_constraint(c.v2, c);
+    c.direction = NONE;
+    return 0;
+}
+
+fn binary_choose_method(c as *Constraint, mark as i64) as i64 {
+    if (c.v1.mark == mark) {
+        if (c.v2.mark != mark && stronger(c.strength, c.v2.walk_strength) != 0) {
+            c.direction = FORWARD;
+            return c.direction;
+        }
+        c.direction = NONE;
+        return c.direction;
+    }
+    if (c.v2.mark == mark) {
+        if (c.v1.mark != mark && stronger(c.strength, c.v1.walk_strength) != 0) {
+            c.direction = BACKWARD;
+            return c.direction;
+        }
+        c.direction = NONE;
+        return c.direction;
+    }
+    if (weaker(c.v1.walk_strength, c.v2.walk_strength) != 0) {
+        if (stronger(c.strength, c.v1.walk_strength) != 0) {
+            c.direction = BACKWARD;
+            return c.direction;
+        }
+        c.direction = NONE;
+        return c.direction;
+    }
+    if (stronger(c.strength, c.v2.walk_strength) != 0) {
+        c.direction = FORWARD;
+        return c.direction;
+    }
+    c.direction = NONE;
+    return c.direction;
+}
+
+fn binary_inputs_do(c as *Constraint, f as *u8, ctx as *u8) as i64 {
+    if (c.direction == FORWARD) { call(f, ctx, c.v1); } else { call(f, ctx, c.v2); }
+    return 0;
+}
+
+fn binary_inputs_has_one(c as *Constraint, f as *u8, ctx as *u8) as i64 {
+    if (c.direction == FORWARD) { return call(f, ctx, c.v1); }
+    return call(f, ctx, c.v2);
+}
+
+fn binary_mark_unsatisfied(c as *Constraint) as i64 {
+    c.direction = NONE;
+    return 0;
+}
+
+fn binary_get_output(c as *Constraint) as *Variable {
+    if (c.direction == FORWARD) { return c.v2; }
+    return c.v1;
+}
+
+fn binary_recalculate(c as *Constraint) as i64 {
+    let is *Variable as in with mut = c.v2;
+    let is *Variable as out with mut = c.v1;
+    if (c.direction == FORWARD) {
+        in = c.v1;
+        out = c.v2;
+    }
+    out.walk_strength = weakest(c.strength, in.walk_strength);
+    out.stay = in.stay;
+    if (out.stay != 0) { call(c.cls.execute, c); }
+    return 0;
+}
+
+fn equality_execute(c as *Constraint) as i64 {
+    if (c.direction == FORWARD) { c.v2.value = c.v1.value; } else { c.v1.value = c.v2.value; }
+    return 0;
+}
+
+fn scale_add_to_graph(c as *Constraint) as i64 {
+    add_variable_constraint(c.v1, c);
+    add_variable_constraint(c.v2, c);
+    add_variable_constraint(c.scale, c);
+    add_variable_constraint(c.offset, c);
+    c.direction = NONE;
+    return 0;
+}
+
+fn scale_remove_from_graph(c as *Constraint) as i64 {
+    if (cast(i64, c.v1) != 0) { remove_variable_constraint(c.v1, c); }
+    if (cast(i64, c.v2) != 0) { remove_variable_constraint(c.v2, c); }
+    if (cast(i64, c.scale) != 0) { remove_variable_constraint(c.scale, c); }
+    if (cast(i64, c.offset) != 0) { remove_variable_constraint(c.offset, c); }
+    c.direction = NONE;
+    return 0;
+}
+
+fn scale_execute(c as *Constraint) as i64 {
+    if (c.direction == FORWARD) {
+        c.v2.value = c.v1.value * c.scale.value + c.offset.value;
+    } else {
+        c.v1.value = (c.v2.value - c.offset.value) / c.scale.value;
+    }
+    return 0;
+}
+
+fn scale_inputs_do(c as *Constraint, f as *u8, ctx as *u8) as i64 {
+    if (c.direction == FORWARD) {
+        call(f, ctx, c.v1);
+        call(f, ctx, c.scale);
+        call(f, ctx, c.offset);
+    } else {
+        call(f, ctx, c.v2);
+        call(f, ctx, c.scale);
+        call(f, ctx, c.offset);
+    }
+    return 0;
+}
+
+fn scale_recalculate(c as *Constraint) as i64 {
+    let is *Variable as in with mut = c.v2;
+    let is *Variable as out with mut = c.v1;
+    if (c.direction == FORWARD) {
+        in = c.v1;
+        out = c.v2;
+    }
+    out.walk_strength = weakest(c.strength, in.walk_strength);
+    out.stay = in.stay != 0 && c.scale.stay != 0 && c.offset.stay != 0;
+    if (out.stay != 0) { call(c.cls.execute, c); }
+    return 0;
+}
+
+fn init_classes() as void {
+    stay_class.is_input = fn_ptr(not_input);
+    stay_class.is_satisfied = fn_ptr(unary_is_satisfied);
+    stay_class.add_to_graph = fn_ptr(unary_add_to_graph);
+    stay_class.remove_from_graph = fn_ptr(unary_remove_from_graph);
+    stay_class.choose_method = fn_ptr(unary_choose_method);
+    stay_class.execute = fn_ptr(do_nothing);
+    stay_class.inputs_do = fn_ptr(unary_inputs_do);
+    stay_class.inputs_has_one = fn_ptr(unary_inputs_has_one);
+    stay_class.mark_unsatisfied = fn_ptr(unary_mark_unsatisfied);
+    stay_class.get_output = fn_ptr(unary_get_output);
+    stay_class.recalculate = fn_ptr(unary_recalculate);
+
+    edit_class = stay_class;
+    edit_class.is_input = fn_ptr(is_input);
+
+    equality_class.is_input = fn_ptr(not_input);
+    equality_class.is_satisfied = fn_ptr(binary_is_satisfied);
+    equality_class.add_to_graph = fn_ptr(binary_add_to_graph);
+    equality_class.remove_from_graph = fn_ptr(binary_remove_from_graph);
+    equality_class.choose_method = fn_ptr(binary_choose_method);
+    equality_class.execute = fn_ptr(equality_execute);
+    equality_class.inputs_do = fn_ptr(binary_inputs_do);
+    equality_class.inputs_has_one = fn_ptr(binary_inputs_has_one);
+    equality_class.mark_unsatisfied = fn_ptr(binary_mark_unsatisfied);
+    equality_class.get_output = fn_ptr(binary_get_output);
+    equality_class.recalculate = fn_ptr(binary_recalculate);
+
+    scale_class = equality_class;
+    scale_class.add_to_graph = fn_ptr(scale_add_to_graph);
+    scale_class.remove_from_graph = fn_ptr(scale_remove_from_graph);
+    scale_class.execute = fn_ptr(scale_execute);
+    scale_class.inputs_do = fn_ptr(scale_inputs_do);
+    scale_class.recalculate = fn_ptr(scale_recalculate);
+}
+
+// --- what every constraint does the same way ---
+
+fn set_mark_of(ctx as *u8, v as *Variable) as i64 {
+    v.mark = cast(i32, *cast(*i64, ctx));
+    return 0;
+}
+
+// The visitor of inputs_known: an input that is neither marked, a stay, nor
+// undetermined.
+fn input_unknown(ctx as *u8, v as *Variable) as i64 {
+    let is i64 as mark = *cast(*i64, ctx);
+    if (v.mark == mark || v.stay != 0 || cast(i64, v.determined_by) == 0) { return 0; }
+    return 1;
+}
+
+fn inputs_known(c as *Constraint, mark as i64) as i32 {
+    let is i64 as m with mut = mark;
+    return call(c.cls.inputs_has_one, c, fn_ptr(input_unknown), cast(*u8, &m)) == 0;
+}
+
+fn satisfy(c as *Constraint, mark as i64, planner as *Planner) as *Constraint {
+    let is *Constraint as overridden with mut = cast(*Constraint, 0);
+    call(c.cls.choose_method, c, mark);
+    if (satisfied(c) != 0) {
+        let is i64 as m with mut = mark;
+        call(c.cls.inputs_do, c, fn_ptr(set_mark_of), cast(*u8, &m));
+        let is *Variable as out = output_of(c);
+        overridden = out.determined_by;
+        if (cast(i64, overridden) != 0) { call(overridden.cls.mark_unsatisfied, overridden); }
+        out.determined_by = c;
+        if (add_propagate(planner, c, mark) == 0) { fail("Cycle encountered\n"); }
+        out.mark = cast(i32, mark);
+    } else {
+        overridden = cast(*Constraint, 0);
+        if (same_as(c.strength, required) != 0) { fail("Could not satisfy a required constraint\n"); }
+    }
+    return overridden;
+}
+
+fn add_constraint(c as *Constraint, planner as *Planner) as void {
+    call(c.cls.add_to_graph, c);
+    incremental_add(planner, c);
+}
+
+fn destroy_constraint(c as *Constraint, planner as *Planner) as void {
+    if (satisfied(c) != 0) { incremental_remove(planner, c); }
+    call(c.cls.remove_from_graph, c);
+}
+
+fn new_constraint(cls as *ConstraintClass, strength as *Sym) as *Constraint {
+    let is *Constraint as c = cast(*Constraint, track(alloc(sizeof(Constraint))));
+    c.cls = cls;
+    c.strength = strength_of(strength);
+    c.output = cast(*Variable, 0);
+    c.satisfied = 0;
+    c.v1 = cast(*Variable, 0);
+    c.v2 = cast(*Variable, 0);
+    c.direction = NONE;
+    c.scale = cast(*Variable, 0);
+    c.offset = cast(*Variable, 0);
+    return c;
+}
+
+fn new_unary(cls as *ConstraintClass, v as *Variable, strength as *Sym, planner as *Planner) as *Constraint {
+    let is *Constraint as c = new_constraint(cls, strength);
+    c.output = v;
+    add_constraint(c, planner);
+    return c;
+}
+
+fn new_equality(v1 as *Variable, v2 as *Variable, strength as *Sym, planner as *Planner) as *Constraint {
+    let is *Constraint as c = new_constraint(&equality_class, strength);
+    c.v1 = v1;
+    c.v2 = v2;
+    add_constraint(c, planner);
+    return c;
+}
+
+fn new_scale(src as *Variable, scale as *Variable, offset as *Variable, dest as *Variable,
+             strength as *Sym, planner as *Planner) as *Constraint {
+    let is *Constraint as c = new_constraint(&scale_class, strength);
+    c.v1 = src;
+    c.v2 = dest;
+    c.scale = scale;
+    c.offset = offset;
+    add_constraint(c, planner);
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// The planner.
+
+fn new_mark(p as *Planner) as i64 {
+    p.current_mark = p.current_mark + 1;
+    return cast(i64, p.current_mark);
+}
+
+fn incremental_add(p as *Planner, c as *Constraint) as void {
+    let is i64 as mark = new_mark(p);
+    let is *Constraint as overridden with mut = satisfy(c, mark, p);
+    while (cast(i64, overridden) != 0) { overridden = satisfy(overridden, mark, p); }
+}
+
+fn incremental_add_visit(ctx as *u8, c as *Constraint) as i64 {
+    incremental_add(cast(*Planner, ctx), c);
+    return 0;
+}
+
+fn incremental_remove(p as *Planner, c as *Constraint) as void {
+    let is *Variable as out = output_of(c);
+    call(c.cls.mark_unsatisfied, c);
+    call(c.cls.remove_from_graph, c);
+    let is *Vector as unsatisfied = remove_propagate_from(p, out);
+    vec_for_each(unsatisfied, fn_ptr(incremental_add_visit), cast(*u8, p));
+    vec_free(unsatisfied);
+}
+
+fn collect_input_source(ctx as *u8, c as *Constraint) as i64 {
+    if (call(c.cls.is_input, c) != 0 && satisfied(c) != 0) { vec_append(cast(*Vector, ctx), cast(i64, c)); }
+    return 0;
+}
+
+fn extract_plan_from_constraints(p as *Planner, constraints as *Vector) as *Vector {
+    let is Vector as sources;
+    vec_init(&sources, 0);
+    vec_for_each(constraints, fn_ptr(collect_input_source), cast(*u8, &sources));
+    let is *Vector as plan = make_plan(p, &sources);
+    vec_dispose(&sources);
+    return plan;
+}
+
+fn make_plan(p as *Planner, sources as *Vector) as *Vector {
+    let is i64 as mark = new_mark(p);
+    let is *Vector as plan = vec_new(15);
+    let is *Vector as todo = sources;
+    while (vec_is_empty(todo) == 0) {
+        let is *Constraint as c = cast(*Constraint, vec_remove_first(todo));
+        if (output_of(c).mark != mark && inputs_known(c, mark) != 0) {
+            vec_append(plan, cast(i64, c));
+            output_of(c).mark = cast(i32, mark);
+            add_constraints_consuming_to(output_of(c), todo);
+        }
+    }
+    return plan;
+}
+
+fn execute_visit(ctx as *u8, c as *Constraint) as i64 {
+    call(c.cls.execute, c);
+    return 0;
+}
+
+fn plan_execute(plan as *Vector) as void {
+    vec_for_each(plan, fn_ptr(execute_visit), cast(*u8, 0));
+}
+
+struct ConsumingTo {
+    determining as *Constraint;
+    coll as *Vector;
+}
+
+fn consuming_to_visit(ctx as *u8, c as *Constraint) as i64 {
+    let is *ConsumingTo as k = cast(*ConsumingTo, ctx);
+    if (c != k.determining && satisfied(c) != 0) { vec_append(k.coll, cast(i64, c)); }
+    return 0;
+}
+
+fn add_constraints_consuming_to(v as *Variable, coll as *Vector) as void {
+    let is ConsumingTo as k;
+    k.determining = v.determined_by;
+    k.coll = coll;
+    vec_for_each(v.constraints, fn_ptr(consuming_to_visit), cast(*u8, &k));
+}
+
+fn add_propagate(p as *Planner, c as *Constraint, mark as i64) as i32 {
+    let is *Vector as todo = vec_with(cast(i64, c));
+    while (vec_is_empty(todo) == 0) {
+        let is *Constraint as d = cast(*Constraint, vec_remove_first(todo));
+        if (output_of(d).mark == mark) {
+            incremental_remove(p, c);
+            vec_free(todo);
+            return 0;
+        }
+        call(d.cls.recalculate, d);
+        add_constraints_consuming_to(output_of(d), todo);
+    }
+    vec_free(todo);
+    return 1;
+}
+
+fn change(p as *Planner, v as *Variable, new_value as i32) as void {
+    let is *Constraint as edit_c = new_unary(&edit_class, v, sym(PREFERRED), p);
+    let is *Vector as edit_v = vec_with(cast(i64, edit_c));
+    let is *Vector as plan = extract_plan_from_constraints(p, edit_v);
+    let is i32 as i with mut = 0;
+    while (i < 10) {
+        v.value = new_value;
+        plan_execute(plan);
+        i = i + 1;
+    }
+    destroy_constraint(edit_c, p);
+    vec_free(plan);
+    vec_free(edit_v);
+}
+
+struct Consuming {
+    determining as *Constraint;
+    f as *u8;
+    ctx as *u8;
+}
+
+fn consuming_visit(ctx as *u8, c as *Constraint) as i64 {
+    let is *Consuming as k = cast(*Consuming, ctx);
+    if (c != k.determining && satisfied(c) != 0) { call(k.f, k.ctx, c); }
+    return 0;
+}
+
+fn constraints_consuming(v as *Variable, f as *u8, ctx as *u8) as void {
+    let is Consuming as k;
+    k.determining = v.determined_by;
+    k.f = f;
+    k.ctx = ctx;
+    vec_for_each(v.constraints, fn_ptr(consuming_visit), cast(*u8, &k));
+}
+
+fn collect_unsatisfied(ctx as *u8, c as *Constraint) as i64 {
+    if (satisfied(c) == 0) { vec_append(cast(*Vector, ctx), cast(i64, c)); }
+    return 0;
+}
+
+fn recalculate_and_queue(ctx as *u8, c as *Constraint) as i64 {
+    call(c.cls.recalculate, c);
+    vec_append(cast(*Vector, ctx), cast(i64, output_of(c)));
+    return 0;
+}
+
+fn by_strength(c1 as *Constraint, c2 as *Constraint) as i64 {
+    if (stronger(c1.strength, c2.strength) != 0) { return 0 - 1; }
+    return 1;
+}
+
+fn remove_propagate_from(p as *Planner, out as *Variable) as *Vector {
+    let is *Vector as unsatisfied = vec_new(0);
+    out.determined_by = cast(*Constraint, 0);
+    out.walk_strength = absolute_weakest;
+    out.stay = 1;
+    let is *Vector as todo = vec_with(cast(i64, out));
+    while (vec_is_empty(todo) == 0) {
+        let is *Variable as v = cast(*Variable, vec_remove_first(todo));
+        vec_for_each(v.constraints, fn_ptr(collect_unsatisfied), cast(*u8, unsatisfied));
+        constraints_consuming(v, fn_ptr(recalculate_and_queue), cast(*u8, todo));
+    }
+    vec_free(todo);
+    vec_sort(unsatisfied, fn_ptr(by_strength));
+    return unsatisfied;
+}
+
+fn release_test_objects(variables as *Vector) as void {
+    let is i64 as i with mut = 0;
+    while (i < vec_size(variables)) {
+        free_variable(cast(*Variable, *vec_at(variables, i)));
+        i = i + 1;
+    }
+    release_all();
+}
+
+fn chain_test(n as i32) as void {
+    initialize_constants();
+    let is Planner as planner;
+    planner.current_mark = 1;
+    let is *Vector as all_vars = vec_new(0);
+    let is **Variable as vars = cast(**Variable, alloc((cast(i64, n) + 1) * 8));
+    let is i32 as i with mut = 0;
+    while (i < n + 1) {
+        vars[i] = new_variable();
+        vec_append(all_vars, cast(i64, vars[i]));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        new_equality(vars[i], vars[i + 1], sym(REQUIRED), &planner);
+        i = i + 1;
+    }
+    new_unary(&stay_class, vars[n], sym(STRONG_DEFAULT), &planner);
+    let is *Constraint as edit_c = new_unary(&edit_class, vars[0], sym(PREFERRED), &planner);
+    let is *Vector as edit_v = vec_with(cast(i64, edit_c));
+    let is *Vector as plan = extract_plan_from_constraints(&planner, edit_v);
+    vec_free(edit_v);
+    i = 0;
+    while (i < 100) {
+        vars[0].value = i;
+        plan_execute(plan);
+        if (vars[n].value != i) { fail("Chain test failed!\n"); }
+        i = i + 1;
+    }
+    destroy_constraint(edit_c, &planner);
+    vec_free(plan);
+    release(cast(*u8, vars));
+    release_test_objects(all_vars);
+    vec_free(all_vars);
+}
+
+fn projection_test(n as i32) as void {
+    let is Planner as planner;
+    planner.current_mark = 1;
+    let is Vector as dests;
+    vec_init(&dests, 0);
+    let is *Vector as all_vars = vec_new(0);
+    let is *Variable as scale = variable_value(10);
+    let is *Variable as offset = variable_value(1000);
+    vec_append(all_vars, cast(i64, scale));
+    vec_append(all_vars, cast(i64, offset));
+    let is *Variable as src with mut = cast(*Variable, 0);
+    let is *Variable as dst with mut = cast(*Variable, 0);
+    let is i32 as i with mut = 1;
+    while (i <= n) {
+        src = variable_value(i);
+        dst = variable_value(i);
+        vec_append(all_vars, cast(i64, src));
+        vec_append(all_vars, cast(i64, dst));
+        vec_append(&dests, cast(i64, dst));
+        new_unary(&stay_class, src, sym(DEFAULT), &planner);
+        new_scale(src, scale, offset, dst, sym(REQUIRED), &planner);
+        i = i + 1;
+    }
+    change(&planner, src, 17);
+    if (dst.value != 1170) { fail("Projection test 1 failed!\n"); }
+    change(&planner, dst, 1050);
+    if (src.value != 5) { fail("Projection test 2 failed!\n"); }
+    change(&planner, scale, 5);
+    i = 0;
+    while (i < n - 1) {
+        if (cast(*Variable, *vec_at(&dests, cast(i64, i))).value != (i + 1) * 5 + 1000) {
+            fail("Projection test 3 failed!\n");
+        }
+        i = i + 1;
+    }
+    change(&planner, offset, 2000);
+    i = 0;
+    while (i < n - 1) {
+        if (cast(*Variable, *vec_at(&dests, cast(i64, i))).value != (i + 1) * 5 + 2000) {
+            fail("Projection test 4 failed!\n");
+        }
+        i = i + 1;
+    }
+    vec_dispose(&dests);
+    release_test_objects(all_vars);
+    vec_free(all_vars);
+    release_constants();
+}
+
+fn main() as i32 {
+    init_classes();
+    vec_init(&tracked, 0);
+    let is i32 as r with mut = 0;
+    while (r < ROUNDS) {
+        chain_test(INNER);
+        projection_test(INNER);
+        r = r + 1;
+    }
+    io.printf("constraints: chain and projection tests of %d passed\n", INNER);
+    return 0;
+}

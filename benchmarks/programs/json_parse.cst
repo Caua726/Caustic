@@ -1,0 +1,888 @@
+// A JSON parser over a 25820-byte document (156 user-interface operations
+// with nested objects, arrays, strings, numbers and literals): it walks the
+// text one-character string at a time, captures names, strings and numbers
+// as heap copies, and builds a tree of values in growable vectors, objects
+// indexing their names through a small hash table. The parsed document is
+// checked and freed. The run is 10 rounds of 100 parses.
+// Self-check: the document is an object whose "head" is an object and whose
+// "operations" is an array of 156 values.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as ROUNDS with imut = 10;
+let is i32 as INNER with imut = 100;
+
+let is mem.bins.Bins as heap with mut;
+
+fn alloc(n as i64) as *u8 { return mem.bins.bins_alloc(&heap, n); }
+fn release(p as *u8) as void { mem.bins.bins_free(&heap, p); }
+
+fn fail(msg as *u8) as void {
+    io.write_bytes(io.STDERR, msg, io.strlen(msg));
+    io.write_bytes(io.STDERR, "\n", 1);
+    io.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Growable vector of word-sized elements; appending past the capacity
+// doubles the storage.
+
+let is i64 as INITIAL_SIZE with imut = 10;
+
+struct Vector {
+    storage as *i64;
+    capacity as i64;
+    first as i64;
+    last as i64;
+}
+
+fn new_storage(n as i64) as *i64 {
+    let is *i64 as s = cast(*i64, alloc(n * 8));
+    mem.memset(cast(*u8, s), 0, n * 8);
+    return s;
+}
+
+fn vec_init(v as *Vector, size as i64) as void {
+    if (size == 0) { v.storage = cast(*i64, 0); } else { v.storage = new_storage(size); }
+    v.capacity = size;
+    v.first = 0;
+    v.last = 0;
+}
+
+fn vec_new(size as i64) as *Vector {
+    let is *Vector as v = cast(*Vector, alloc(sizeof(Vector)));
+    vec_init(v, size);
+    return v;
+}
+
+fn vec_dispose(v as *Vector) as void {
+    if (cast(i64, v.storage) != 0) { release(cast(*u8, v.storage)); }
+}
+
+fn vec_free(v as *Vector) as void {
+    vec_dispose(v);
+    release(cast(*u8, v));
+}
+
+fn vec_append(v as *Vector, elem as i64) as void {
+    if (cast(i64, v.storage) == 0) {
+        v.storage = new_storage(INITIAL_SIZE);
+        v.capacity = INITIAL_SIZE;
+    } else if (v.last >= v.capacity) {
+        v.capacity = v.capacity * 2;
+        let is *i64 as ns = new_storage(v.capacity);
+        let is i64 as i with mut = 0;
+        while (i < v.last) { ns[i] = v.storage[i]; i = i + 1; }
+        release(cast(*u8, v.storage));
+        v.storage = ns;
+    }
+    v.storage[v.last] = elem;
+    v.last = v.last + 1;
+}
+
+fn vec_at(v as *Vector, idx as i64) as *i64 {
+    if (cast(i64, v.storage) == 0 || idx >= v.last - v.first) { return cast(*i64, 0); }
+    return &v.storage[v.first + idx];
+}
+
+fn vec_is_empty(v as *Vector) as i32 { return v.last == v.first; }
+
+fn vec_size(v as *Vector) as i64 { return v.last - v.first; }
+
+
+// ---------------------------------------------------------------------------
+// Strings: a heap copy with its length.
+
+struct Str {
+    p as *u8;
+    n as i64;
+}
+
+fn str_new(src as *u8, n as i64) as *Str {
+    let is *Str as s = cast(*Str, alloc(sizeof(Str)));
+    s.n = n;
+    s.p = alloc(n + 1);
+    let is i64 as i with mut = 0;
+    while (i < n) { s.p[i] = src[i]; i = i + 1; }
+    s.p[n] = 0;
+    return s;
+}
+
+fn str_free(s as *Str) as void {
+    release(s.p);
+    release(cast(*u8, s));
+}
+
+fn str_eq(a as *Str, b as *Str) as i32 {
+    if (a.n != b.n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        if (a.p[i] != b.p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn str_eq_lit(a as *Str, lit as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        if (lit[i] == 0 || a.p[i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    return lit[i] == 0;
+}
+
+// A growable byte buffer for captures that span escapes.
+struct Buffer {
+    p as *u8;
+    n as i64;
+    cap as i64;
+}
+
+fn buf_add(b as *Buffer, src as *u8, n as i64) as void {
+    if (b.n + n > b.cap) {
+        let is i64 as cap with mut = b.cap * 2;
+        if (cap < 16) { cap = 16; }
+        while (cap < b.n + n) { cap = cap * 2; }
+        let is *u8 as np = alloc(cap);
+        let is i64 as i with mut = 0;
+        while (i < b.n) { np[i] = b.p[i]; i = i + 1; }
+        if (b.cap > 0) { release(b.p); }
+        b.p = np;
+        b.cap = cap;
+    }
+    let is i64 as k with mut = 0;
+    while (k < n) { b.p[b.n + k] = src[k]; k = k + 1; }
+    b.n = b.n + n;
+}
+
+// ---------------------------------------------------------------------------
+// JSON values.
+
+let is i32 as KIND_OBJECT with imut = 0;
+let is i32 as KIND_ARRAY with imut = 1;
+let is i32 as KIND_NUMBER with imut = 2;
+let is i32 as KIND_STRING with imut = 3;
+let is i32 as KIND_LITERAL with imut = 4;
+
+// Objects use names, values and table; arrays values; the rest text.
+struct JsonValue {
+    kind as i32;
+    is_null as i32;
+    is_true as i32;
+    is_false as i32;
+    text as *Str;
+    names as Vector;
+    values as Vector;
+    table as [32]i32;
+}
+
+fn new_value(kind as i32) as *JsonValue {
+    let is *JsonValue as v = cast(*JsonValue, alloc(sizeof(JsonValue)));
+    v.kind = kind;
+    v.is_null = 0;
+    v.is_true = 0;
+    v.is_false = 0;
+    v.text = cast(*Str, 0);
+    vec_init(&v.names, 0);
+    vec_init(&v.values, 0);
+    return v;
+}
+
+fn free_value(v as *JsonValue) as void {
+    let is i64 as i with mut = 0;
+    while (i < vec_size(&v.values)) {
+        free_value(cast(*JsonValue, *vec_at(&v.values, i)));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < vec_size(&v.names)) {
+        str_free(cast(*Str, *vec_at(&v.names, i)));
+        i = i + 1;
+    }
+    vec_dispose(&v.values);
+    vec_dispose(&v.names);
+    if (cast(i64, v.text) != 0) { str_free(v.text); }
+    release(cast(*u8, v));
+}
+
+fn is_object(v as *JsonValue) as i32 { return v.kind == KIND_OBJECT; }
+fn is_array(v as *JsonValue) as i32 { return v.kind == KIND_ARRAY; }
+
+fn new_object() as *JsonValue {
+    let is *JsonValue as v = new_value(KIND_OBJECT);
+    let is i32 as i with mut = 0;
+    while (i < 32) { v.table[i] = 0; i = i + 1; }
+    return v;
+}
+
+fn new_literal(text as *u8, n as i64, is_null as i32, is_true as i32, is_false as i32) as *JsonValue {
+    let is *JsonValue as v = new_value(KIND_LITERAL);
+    v.text = str_new(text, n);
+    v.is_null = is_null;
+    v.is_true = is_true;
+    v.is_false = is_false;
+    return v;
+}
+
+fn new_text_value(kind as i32, text as *Str) as *JsonValue {
+    if (kind == KIND_NUMBER && text.n == 0) { fail("value is null"); }
+    let is *JsonValue as v = new_value(kind);
+    v.text = text;
+    return v;
+}
+
+fn array_add(a as *JsonValue, value as *JsonValue) as void {
+    if (cast(i64, value) == 0) { fail("value is null"); }
+    vec_append(&a.values, cast(i64, value));
+}
+
+// The name's slot in the 32-entry table: its length times 1402589, masked.
+fn hash_slot_for(name as *Str) as i32 {
+    return cast(i32, name.n * 1402589) & 31;
+}
+
+fn table_add(o as *JsonValue, name as *Str, index as i32) as void {
+    let is i32 as slot = hash_slot_for(name);
+    if (index < 255) { o.table[slot] = (index + 1) & 255; } else { o.table[slot] = 0; }
+}
+
+fn table_get(o as *JsonValue, name as *Str) as i32 {
+    let is i32 as slot = hash_slot_for(name);
+    return (o.table[slot] & 255) - 1;
+}
+
+fn object_add(o as *JsonValue, name as *Str, value as *JsonValue) as void {
+    if (name.n == 0) { fail("name is null"); }
+    if (cast(i64, value) == 0) { fail("value is null"); }
+    table_add(o, name, cast(i32, vec_size(&o.names)));
+    vec_append(&o.names, cast(i64, name));
+    vec_append(&o.values, cast(i64, value));
+}
+
+fn index_of(o as *JsonValue, name as *Str) as i32 {
+    let is i32 as index = table_get(o, name);
+    if (index != 0 - 1 && str_eq(name, cast(*Str, *vec_at(&o.names, cast(i64, index)))) != 0) { return index; }
+    fail("not yet implemented, not relevant for the benchmark");
+    return 0 - 1;
+}
+
+fn object_get(o as *JsonValue, name as *Str) as *JsonValue {
+    if (name.n == 0) { fail("name is null"); }
+    let is i32 as index = index_of(o, name);
+    if (index == 0 - 1) { return cast(*JsonValue, 0); }
+    return cast(*JsonValue, *vec_at(&o.values, cast(i64, index)));
+}
+
+// ---------------------------------------------------------------------------
+// The parser. `cur` is the current character as a one-character string, or
+// empty at the end of the text.
+
+struct Parser {
+    input as *u8;
+    input_len as i64;
+    index as i64;
+    line as i32;
+    column as i32;
+    cur as *u8;
+    cur_len as i64;
+    capture_buffer as Buffer;
+    capture_start as i64;
+}
+
+fn cur_is(p as *Parser, ch as char) as i32 {
+    return p.cur_len == 1 && p.cur[0] == cast(u8, ch);
+}
+
+fn at_end(p as *Parser) as i32 { return p.cur_len == 0; }
+
+fn read(p as *Parser) as void {
+    if (cur_is(p, '\n') != 0) {
+        p.line = p.line + 1;
+        p.column = 0;
+    }
+    p.index = p.index + 1;
+    if (p.index < p.input_len) {
+        p.cur = &p.input[p.index];
+        p.cur_len = 1;
+    } else {
+        p.cur_len = 0;
+    }
+}
+
+fn expected(p as *Parser, what as *u8) as void {
+    if (at_end(p) != 0) { fail("Unexpected end of input"); }
+    io.write_bytes(io.STDERR, "Expected ", 9);
+    fail(what);
+}
+
+fn read_char(p as *Parser, ch as char) as i32 {
+    if (cur_is(p, ch) == 0) { return 0; }
+    read(p);
+    return 1;
+}
+
+fn is_digit(p as *Parser) as i32 {
+    return cur_is(p, '0') != 0 || cur_is(p, '1') != 0 || cur_is(p, '2') != 0 || cur_is(p, '3') != 0
+        || cur_is(p, '4') != 0 || cur_is(p, '5') != 0 || cur_is(p, '6') != 0 || cur_is(p, '7') != 0
+        || cur_is(p, '8') != 0 || cur_is(p, '9') != 0;
+}
+
+fn is_white_space(p as *Parser) as i32 {
+    return cur_is(p, ' ') != 0 || cur_is(p, '\t') != 0 || cur_is(p, '\n') != 0 || cur_is(p, '\r') != 0;
+}
+
+fn read_digit(p as *Parser) as i32 {
+    if (is_digit(p) == 0) { return 0; }
+    read(p);
+    return 1;
+}
+
+fn skip_white_space(p as *Parser) as void {
+    while (is_white_space(p) != 0) { read(p); }
+}
+
+fn read_required_char(p as *Parser, ch as char, what as *u8) as void {
+    if (read_char(p, ch) == 0) { expected(p, what); }
+}
+
+fn start_capture(p as *Parser) as void { p.capture_start = p.index; }
+
+fn capture_end(p as *Parser) as i64 {
+    if (at_end(p) != 0) { return p.index; }
+    return p.index - 1;
+}
+
+fn pause_capture(p as *Parser) as void {
+    let is i64 as end = capture_end(p);
+    buf_add(&p.capture_buffer, &p.input[p.capture_start], end - p.capture_start + 1);
+    p.capture_start = 0 - 1;
+}
+
+fn end_capture(p as *Parser) as *Str {
+    let is i64 as end = capture_end(p);
+    let is *Str as captured with mut = cast(*Str, 0);
+    if (p.capture_buffer.n == 0) {
+        captured = str_new(&p.input[p.capture_start], end - p.capture_start + 1);
+    } else {
+        buf_add(&p.capture_buffer, &p.input[p.capture_start], end - p.capture_start + 1);
+        captured = str_new(p.capture_buffer.p, p.capture_buffer.n);
+        p.capture_buffer.n = 0;
+    }
+    p.capture_start = 0 - 1;
+    return captured;
+}
+
+fn read_escape(p as *Parser) as void {
+    read(p);
+    let is u8 as c with mut = 0;
+    if (cur_is(p, '"') != 0 || cur_is(p, '/') != 0 || cur_is(p, '\\') != 0) {
+        c = p.cur[0];
+    } else if (cur_is(p, 'b') != 0) {
+        c = 8;
+    } else if (cur_is(p, 'f') != 0) {
+        c = 12;
+    } else if (cur_is(p, 'n') != 0) {
+        c = 10;
+    } else if (cur_is(p, 'r') != 0) {
+        c = 13;
+    } else if (cur_is(p, 't') != 0) {
+        c = 9;
+    } else {
+        expected(p, "valid escape sequence");
+    }
+    buf_add(&p.capture_buffer, &c, 1);
+    read(p);
+}
+
+fn read_string_internal(p as *Parser) as *Str {
+    read(p);
+    start_capture(p);
+    while (cur_is(p, '"') == 0) {
+        if (cur_is(p, '\\') != 0) {
+            pause_capture(p);
+            read_escape(p);
+            start_capture(p);
+        } else {
+            read(p);
+        }
+    }
+    let is *Str as s = end_capture(p);
+    read(p);
+    return s;
+}
+
+fn read_name(p as *Parser) as *Str {
+    if (cur_is(p, '"') == 0) { expected(p, "name"); }
+    return read_string_internal(p);
+}
+
+fn read_fraction(p as *Parser) as i32 {
+    if (read_char(p, '.') == 0) { return 0; }
+    if (read_digit(p) == 0) { expected(p, "digit"); }
+    while (read_digit(p) != 0) { }
+    return 1;
+}
+
+fn read_exponent(p as *Parser) as i32 {
+    if (read_char(p, 'e') == 0 && read_char(p, 'E') == 0) { return 0; }
+    if (read_char(p, '+') == 0) { read_char(p, '-'); }
+    if (read_digit(p) == 0) { expected(p, "digit"); }
+    while (read_digit(p) != 0) { }
+    return 1;
+}
+
+fn read_number(p as *Parser) as *JsonValue {
+    start_capture(p);
+    read_char(p, '-');
+    let is i32 as first_is_zero = cur_is(p, '0');
+    if (read_digit(p) == 0) { expected(p, "digit"); }
+    if (first_is_zero == 0) {
+        while (read_digit(p) != 0) { }
+    }
+    read_fraction(p);
+    read_exponent(p);
+    return new_text_value(KIND_NUMBER, end_capture(p));
+}
+
+fn read_array(p as *Parser) as *JsonValue {
+    read(p);
+    let is *JsonValue as array = new_value(KIND_ARRAY);
+    skip_white_space(p);
+    if (read_char(p, ']') != 0) { return array; }
+    let is i32 as more with mut = 1;
+    while (more != 0) {
+        skip_white_space(p);
+        array_add(array, read_value(p));
+        skip_white_space(p);
+        more = read_char(p, ',');
+    }
+    if (read_char(p, ']') == 0) { expected(p, "',' or ']'"); }
+    return array;
+}
+
+fn read_object(p as *Parser) as *JsonValue {
+    read(p);
+    let is *JsonValue as object = new_object();
+    skip_white_space(p);
+    if (read_char(p, '}') != 0) { return object; }
+    let is i32 as more with mut = 1;
+    while (more != 0) {
+        skip_white_space(p);
+        let is *Str as name = read_name(p);
+        skip_white_space(p);
+        if (read_char(p, ':') == 0) { expected(p, "':'"); }
+        skip_white_space(p);
+        object_add(object, name, read_value(p));
+        skip_white_space(p);
+        more = read_char(p, ',');
+    }
+    if (read_char(p, '}') == 0) { expected(p, "',' or '}'"); }
+    return object;
+}
+
+fn read_null(p as *Parser) as *JsonValue {
+    read(p);
+    read_required_char(p, 'u', "'u'");
+    read_required_char(p, 'l', "'l'");
+    read_required_char(p, 'l', "'l'");
+    return new_literal("null", 4, 1, 0, 0);
+}
+
+fn read_true(p as *Parser) as *JsonValue {
+    read(p);
+    read_required_char(p, 'r', "'r'");
+    read_required_char(p, 'u', "'u'");
+    read_required_char(p, 'e', "'e'");
+    return new_literal("true", 4, 0, 1, 0);
+}
+
+fn read_false(p as *Parser) as *JsonValue {
+    read(p);
+    read_required_char(p, 'a', "'a'");
+    read_required_char(p, 'l', "'l'");
+    read_required_char(p, 's', "'s'");
+    read_required_char(p, 'e', "'e'");
+    return new_literal("false", 5, 0, 0, 1);
+}
+
+fn read_value(p as *Parser) as *JsonValue {
+    if (cur_is(p, 'n') != 0) { return read_null(p); }
+    if (cur_is(p, 't') != 0) { return read_true(p); }
+    if (cur_is(p, 'f') != 0) { return read_false(p); }
+    if (cur_is(p, '"') != 0) { return new_text_value(KIND_STRING, read_string_internal(p)); }
+    if (cur_is(p, '[') != 0) { return read_array(p); }
+    if (cur_is(p, '{') != 0) { return read_object(p); }
+    if (cur_is(p, '-') != 0 || cur_is(p, '0') != 0 || cur_is(p, '1') != 0 || cur_is(p, '2') != 0
+        || cur_is(p, '3') != 0 || cur_is(p, '4') != 0 || cur_is(p, '5') != 0 || cur_is(p, '6') != 0
+        || cur_is(p, '7') != 0 || cur_is(p, '8') != 0 || cur_is(p, '9') != 0) {
+        return read_number(p);
+    }
+    expected(p, "value");
+    return cast(*JsonValue, 0);
+}
+
+fn parse(text as *Buffer) as *JsonValue {
+    let is Parser as p;
+    p.input = text.p;
+    p.input_len = text.n;
+    p.index = 0 - 1;
+    p.line = 1;
+    p.column = 0;
+    p.cur = text.p;
+    p.cur_len = 0;
+    p.capture_buffer.p = cast(*u8, 0);
+    p.capture_buffer.n = 0;
+    p.capture_buffer.cap = 0;
+    p.capture_start = 0 - 1;
+    read(&p);
+    skip_white_space(&p);
+    let is *JsonValue as result = read_value(&p);
+    skip_white_space(&p);
+    if (at_end(&p) == 0) { fail("Unexpected character"); }
+    if (p.capture_buffer.cap > 0) { release(p.capture_buffer.p); }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+
+fn has_expected_content(result as *JsonValue) as i32 {
+    if (is_object(result) == 0) { return 0; }
+    let is *Str as head = str_new("head", 4);
+    let is *Str as operations = str_new("operations", 10);
+    let is i32 as ok with mut = 1;
+    if (is_object(object_get(result, head)) == 0) { ok = 0; }
+    else if (is_array(object_get(result, operations)) == 0) { ok = 0; }
+    else if (vec_size(&object_get(result, operations).values) != 156) { ok = 0; }
+    str_free(head);
+    str_free(operations);
+    return ok;
+}
+
+fn put(t as *Buffer, s as *u8) as void { buf_add(t, s, io.strlen(s)); }
+
+fn document(t as *Buffer) as void {
+    put(t, "{\"head\":{\"requestCounter\":4},\"operations\":[[\"destroy\",\"w54\"],[\"set\",\"w2\",{\"activeControl");
+    put(t, "\":\"w99\"}],[\"set\",\"w21\",{\"customVariant\":\"variant_navigation\"}],[\"set\",\"w28\",{\"customVari");
+    put(t, "ant\":\"variant_selected\"}],[\"set\",\"w53\",{\"children\":[\"w95\"]}],[\"create\",\"w95\",\"rwt.widget");
+    put(t, "s.Composite\",{\"parent\":\"w53\",\"style\":[\"NONE\"],\"bounds\":[0,0,1008,586],\"children\":[\"w96\",");
+    put(t, "\"w97\"],\"tabIndex\":-1,\"clientArea\":[0,0,1008,586]}],[\"create\",\"w96\",\"rwt.widgets.Label\",{");
+    put(t, "\"parent\":\"w95\",\"style\":[\"NONE\"],\"bounds\":[10,30,112,26],\"tabIndex\":-1,\"customVariant\":\"v");
+    put(t, "ariant_pageHeadline\",\"text\":\"TableViewer\"}],[\"create\",\"w97\",\"rwt.widgets.Composite\",{\"pa");
+    put(t, "rent\":\"w95\",\"style\":[\"NONE\"],\"bounds\":[0,61,1008,525],\"children\":[\"w98\",\"w99\",\"w226\",\"w2");
+    put(t, "28\"],\"tabIndex\":-1,\"clientArea\":[0,0,1008,525]}],[\"create\",\"w98\",\"rwt.widgets.Text\",{\"pa");
+    put(t, "rent\":\"w97\",\"style\":[\"LEFT\",\"SINGLE\",\"BORDER\"],\"bounds\":[10,10,988,32],\"tabIndex\":22,\"ac");
+    put(t, "tiveKeys\":[\"#13\",\"#27\",\"#40\"]}],[\"listen\",\"w98\",{\"KeyDown\":true,\"Modify\":true}],[\"create");
+    put(t, "\",\"w99\",\"rwt.widgets.Grid\",{\"parent\":\"w97\",\"style\":[\"SINGLE\",\"BORDER\"],\"appearance\":\"tab");
+    put(t, "le\",\"indentionWidth\":0,\"treeColumn\":-1,\"markupEnabled\":false}],[\"create\",\"w100\",\"rwt.wid");
+    put(t, "gets.ScrollBar\",{\"parent\":\"w99\",\"style\":[\"HORIZONTAL\"]}],[\"create\",\"w101\",\"rwt.widgets.S");
+    put(t, "crollBar\",{\"parent\":\"w99\",\"style\":[\"VERTICAL\"]}],[\"set\",\"w99\",{\"bounds\":[10,52,988,402],");
+    put(t, "\"children\":[],\"tabIndex\":23,\"activeKeys\":[\"CTRL+#70\",\"CTRL+#78\",\"CTRL+#82\",\"CTRL+#89\",\"C");
+    put(t, "TRL+#83\",\"CTRL+#71\",\"CTRL+#69\"],\"cancelKeys\":[\"CTRL+#70\",\"CTRL+#78\",\"CTRL+#82\",\"CTRL+#89");
+    put(t, "\",\"CTRL+#83\",\"CTRL+#71\",\"CTRL+#69\"]}],[\"listen\",\"w99\",{\"MouseDown\":true,\"MouseUp\":true,\"");
+    put(t, "MouseDoubleClick\":true,\"KeyDown\":true}],[\"set\",\"w99\",{\"itemCount\":118,\"itemHeight\":28,\"i");
+    put(t, "temMetrics\":[[0,0,50,3,0,3,44],[1,50,50,53,0,53,44],[2,100,140,103,0,103,134],[3,240,180");
+    put(t, ",243,0,243,174],[4,420,50,423,0,423,44],[5,470,50,473,0,473,44]],\"columnCount\":6,\"header");
+    put(t, "Height\":35,\"headerVisible\":true,\"linesVisible\":true,\"focusItem\":\"w108\",\"selection\":[\"w10");
+    put(t, "8\"]}],[\"listen\",\"w99\",{\"Selection\":true,\"DefaultSelection\":true}],[\"set\",\"w99\",{\"enableC");
+    put(t, "ellToolTip\":true}],[\"listen\",\"w100\",{\"Selection\":true}],[\"set\",\"w101\",{\"visibility\":true");
+    put(t, "}],[\"listen\",\"w101\",{\"Selection\":true}],[\"create\",\"w102\",\"rwt.widgets.GridColumn\",{\"pare");
+    put(t, "nt\":\"w99\",\"text\":\"Nr.\",\"width\":50,\"moveable\":true}],[\"listen\",\"w102\",{\"Selection\":true}]");
+    put(t, ",[\"create\",\"w103\",\"rwt.widgets.GridColumn\",{\"parent\":\"w99\",\"text\":\"Sym.\",\"index\":1,\"left");
+    put(t, "\":50,\"width\":50,\"moveable\":true}],[\"listen\",\"w103\",{\"Selection\":true}],[\"create\",\"w104\",");
+    put(t, "\"rwt.widgets.GridColumn\",{\"parent\":\"w99\",\"text\":\"Name\",\"index\":2,\"left\":100,\"width\":140,");
+    put(t, "\"moveable\":true}],[\"listen\",\"w104\",{\"Selection\":true}],[\"create\",\"w105\",\"rwt.widgets.Gri");
+    put(t, "dColumn\",{\"parent\":\"w99\",\"text\":\"Series\",\"index\":3,\"left\":240,\"width\":180,\"moveable\":tru");
+    put(t, "e}],[\"listen\",\"w105\",{\"Selection\":true}],[\"create\",\"w106\",\"rwt.widgets.GridColumn\",{\"par");
+    put(t, "ent\":\"w99\",\"text\":\"Group\",\"index\":4,\"left\":420,\"width\":50,\"moveable\":true}],[\"listen\",\"w");
+    put(t, "106\",{\"Selection\":true}],[\"create\",\"w107\",\"rwt.widgets.GridColumn\",{\"parent\":\"w99\",\"text");
+    put(t, "\":\"Period\",\"index\":5,\"left\":470,\"width\":50,\"moveable\":true}],[\"listen\",\"w107\",{\"Selectio");
+    put(t, "n\":true}],[\"create\",\"w108\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":0,\"texts\":[\"1\"");
+    put(t, ",\"H\",\"Hydrogen\",\"Nonmetal\",\"1\",\"1\"],\"cellBackgrounds\":[null,null,null,[138,226,52,255],n");
+    put(t, "ull,null]}],[\"create\",\"w109\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":1,\"texts\":[\"");
+    put(t, "2\",\"He\",\"Helium\",\"Noble gas\",\"18\",\"1\"],\"cellBackgrounds\":[null,null,null,[114,159,207,25");
+    put(t, "5],null,null]}],[\"create\",\"w110\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":2,\"texts");
+    put(t, "\":[\"3\",\"Li\",\"Lithium\",\"Alkali metal\",\"1\",\"2\"],\"cellBackgrounds\":[null,null,null,[239,41,");
+    put(t, "41,255],null,null]}],[\"create\",\"w111\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":3,\"");
+    put(t, "texts\":[\"4\",\"Be\",\"Beryllium\",\"Alkaline earth metal\",\"2\",\"2\"],\"cellBackgrounds\":[null,nul");
+    put(t, "l,null,[233,185,110,255],null,null]}],[\"create\",\"w112\",\"rwt.widgets.GridItem\",{\"parent\":");
+    put(t, "\"w99\",\"index\":4,\"texts\":[\"5\",\"B\",\"Boron\",\"Metalloid\",\"13\",\"2\"],\"cellBackgrounds\":[null,n");
+    put(t, "ull,null,[156,159,153,255],null,null]}],[\"create\",\"w113\",\"rwt.widgets.GridItem\",{\"parent");
+    put(t, "\":\"w99\",\"index\":5,\"texts\":[\"6\",\"C\",\"Carbon\",\"Nonmetal\",\"14\",\"2\"],\"cellBackgrounds\":[null");
+    put(t, ",null,null,[138,226,52,255],null,null]}],[\"create\",\"w114\",\"rwt.widgets.GridItem\",{\"paren");
+    put(t, "t\":\"w99\",\"index\":6,\"texts\":[\"7\",\"N\",\"Nitrogen\",\"Nonmetal\",\"15\",\"2\"],\"cellBackgrounds\":[n");
+    put(t, "ull,null,null,[138,226,52,255],null,null]}],[\"create\",\"w115\",\"rwt.widgets.GridItem\",{\"pa");
+    put(t, "rent\":\"w99\",\"index\":7,\"texts\":[\"8\",\"O\",\"Oxygen\",\"Nonmetal\",\"16\",\"2\"],\"cellBackgrounds\":[");
+    put(t, "null,null,null,[138,226,52,255],null,null]}],[\"create\",\"w116\",\"rwt.widgets.GridItem\",{\"p");
+    put(t, "arent\":\"w99\",\"index\":8,\"texts\":[\"9\",\"F\",\"Fluorine\",\"Halogen\",\"17\",\"2\"],\"cellBackgrounds\"");
+    put(t, ":[null,null,null,[252,233,79,255],null,null]}],[\"create\",\"w117\",\"rwt.widgets.GridItem\",{");
+    put(t, "\"parent\":\"w99\",\"index\":9,\"texts\":[\"10\",\"Ne\",\"Neon\",\"Noble gas\",\"18\",\"2\"],\"cellBackground");
+    put(t, "s\":[null,null,null,[114,159,207,255],null,null]}],[\"create\",\"w118\",\"rwt.widgets.GridItem");
+    put(t, "\",{\"parent\":\"w99\",\"index\":10,\"texts\":[\"11\",\"Na\",\"Sodium\",\"Alkali metal\",\"1\",\"3\"],\"cellBa");
+    put(t, "ckgrounds\":[null,null,null,[239,41,41,255],null,null]}],[\"create\",\"w119\",\"rwt.widgets.Gr");
+    put(t, "idItem\",{\"parent\":\"w99\",\"index\":11,\"texts\":[\"12\",\"Mg\",\"Magnesium\",\"Alkaline earth metal\"");
+    put(t, ",\"2\",\"3\"],\"cellBackgrounds\":[null,null,null,[233,185,110,255],null,null]}],[\"create\",\"w1");
+    put(t, "20\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":12,\"texts\":[\"13\",\"Al\",\"Aluminium\",\"Po");
+    put(t, "or metal\",\"13\",\"3\"],\"cellBackgrounds\":[null,null,null,[238,238,236,255],null,null]}],[\"c");
+    put(t, "reate\",\"w121\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":13,\"texts\":[\"14\",\"Si\",\"Sili");
+    put(t, "con\",\"Metalloid\",\"14\",\"3\"],\"cellBackgrounds\":[null,null,null,[156,159,153,255],null,null");
+    put(t, "]}],[\"create\",\"w122\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":14,\"texts\":[\"15\",\"P\"");
+    put(t, ",\"Phosphorus\",\"Nonmetal\",\"15\",\"3\"],\"cellBackgrounds\":[null,null,null,[138,226,52,255],nu");
+    put(t, "ll,null]}],[\"create\",\"w123\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":15,\"texts\":[\"");
+    put(t, "16\",\"S\",\"Sulfur\",\"Nonmetal\",\"16\",\"3\"],\"cellBackgrounds\":[null,null,null,[138,226,52,255]");
+    put(t, ",null,null]}],[\"create\",\"w124\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":16,\"texts\"");
+    put(t, ":[\"17\",\"Cl\",\"Chlorine\",\"Halogen\",\"17\",\"3\"],\"cellBackgrounds\":[null,null,null,[252,233,79");
+    put(t, ",255],null,null]}],[\"create\",\"w125\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":17,\"t");
+    put(t, "exts\":[\"18\",\"Ar\",\"Argon\",\"Noble gas\",\"18\",\"3\"],\"cellBackgrounds\":[null,null,null,[114,15");
+    put(t, "9,207,255],null,null]}],[\"create\",\"w126\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":");
+    put(t, "18,\"texts\":[\"19\",\"K\",\"Potassium\",\"Alkali metal\",\"1\",\"4\"],\"cellBackgrounds\":[null,null,nu");
+    put(t, "ll,[239,41,41,255],null,null]}],[\"create\",\"w127\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",");
+    put(t, "\"index\":19,\"texts\":[\"20\",\"Ca\",\"Calcium\",\"Alkaline earth metal\",\"2\",\"4\"],\"cellBackgrounds");
+    put(t, "\":[null,null,null,[233,185,110,255],null,null]}],[\"create\",\"w128\",\"rwt.widgets.GridItem\"");
+    put(t, ",{\"parent\":\"w99\",\"index\":20,\"texts\":[\"21\",\"Sc\",\"Scandium\",\"Transition metal\",\"3\",\"4\"],\"c");
+    put(t, "ellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w129\",\"rwt.widg");
+    put(t, "ets.GridItem\",{\"parent\":\"w99\",\"index\":21,\"texts\":[\"22\",\"Ti\",\"Titanium\",\"Transition metal");
+    put(t, "\",\"4\",\"4\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w1");
+    put(t, "30\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":22,\"texts\":[\"23\",\"V\",\"Vanadium\",\"Tran");
+    put(t, "sition metal\",\"5\",\"4\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[");
+    put(t, "\"create\",\"w131\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":23,\"texts\":[\"24\",\"Cr\",\"Ch");
+    put(t, "romium\",\"Transition metal\",\"6\",\"4\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],n");
+    put(t, "ull,null]}],[\"create\",\"w132\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":24,\"texts\":[");
+    put(t, "\"25\",\"Mn\",\"Manganese\",\"Transition metal\",\"7\",\"4\"],\"cellBackgrounds\":[null,null,null,[252");
+    put(t, ",175,62,255],null,null]}],[\"create\",\"w133\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index");
+    put(t, "\":25,\"texts\":[\"26\",\"Fe\",\"Iron\",\"Transition metal\",\"8\",\"4\"],\"cellBackgrounds\":[null,null,");
+    put(t, "null,[252,175,62,255],null,null]}],[\"create\",\"w134\",\"rwt.widgets.GridItem\",{\"parent\":\"w9");
+    put(t, "9\",\"index\":26,\"texts\":[\"27\",\"Co\",\"Cobalt\",\"Transition metal\",\"9\",\"4\"],\"cellBackgrounds\":");
+    put(t, "[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w135\",\"rwt.widgets.GridItem\",{\"");
+    put(t, "parent\":\"w99\",\"index\":27,\"texts\":[\"28\",\"Ni\",\"Nickel\",\"Transition metal\",\"10\",\"4\"],\"cellB");
+    put(t, "ackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w136\",\"rwt.widgets.");
+    put(t, "GridItem\",{\"parent\":\"w99\",\"index\":28,\"texts\":[\"29\",\"Cu\",\"Copper\",\"Transition metal\",\"11\"");
+    put(t, ",\"4\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w137\",\"");
+    put(t, "rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":29,\"texts\":[\"30\",\"Zn\",\"Zinc\",\"Transition m");
+    put(t, "etal\",\"12\",\"4\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create");
+    put(t, "\",\"w138\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":30,\"texts\":[\"31\",\"Ga\",\"Gallium\",");
+    put(t, "\"Poor metal\",\"13\",\"4\"],\"cellBackgrounds\":[null,null,null,[238,238,236,255],null,null]}],");
+    put(t, "[\"create\",\"w139\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":31,\"texts\":[\"32\",\"Ge\",\"G");
+    put(t, "ermanium\",\"Metalloid\",\"14\",\"4\"],\"cellBackgrounds\":[null,null,null,[156,159,153,255],null");
+    put(t, ",null]}],[\"create\",\"w140\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":32,\"texts\":[\"33");
+    put(t, "\",\"As\",\"Arsenic\",\"Metalloid\",\"15\",\"4\"],\"cellBackgrounds\":[null,null,null,[156,159,153,25");
+    put(t, "5],null,null]}],[\"create\",\"w141\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":33,\"text");
+    put(t, "s\":[\"34\",\"Se\",\"Selenium\",\"Nonmetal\",\"16\",\"4\"],\"cellBackgrounds\":[null,null,null,[138,226");
+    put(t, ",52,255],null,null]}],[\"create\",\"w142\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":34");
+    put(t, ",\"texts\":[\"35\",\"Br\",\"Bromine\",\"Halogen\",\"17\",\"4\"],\"cellBackgrounds\":[null,null,null,[252");
+    put(t, ",233,79,255],null,null]}],[\"create\",\"w143\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index");
+    put(t, "\":35,\"texts\":[\"36\",\"Kr\",\"Krypton\",\"Noble gas\",\"18\",\"4\"],\"cellBackgrounds\":[null,null,nul");
+    put(t, "l,[114,159,207,255],null,null]}],[\"create\",\"w144\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\"");
+    put(t, ",\"index\":36,\"texts\":[\"37\",\"Rb\",\"Rubidium\",\"Alkali metal\",\"1\",\"5\"],\"cellBackgrounds\":[nul");
+    put(t, "l,null,null,[239,41,41,255],null,null]}],[\"create\",\"w145\",\"rwt.widgets.GridItem\",{\"paren");
+    put(t, "t\":\"w99\",\"index\":37,\"texts\":[\"38\",\"Sr\",\"Strontium\",\"Alkaline earth metal\",\"2\",\"5\"],\"cell");
+    put(t, "Backgrounds\":[null,null,null,[233,185,110,255],null,null]}],[\"create\",\"w146\",\"rwt.widget");
+    put(t, "s.GridItem\",{\"parent\":\"w99\",\"index\":38,\"texts\":[\"39\",\"Y\",\"Yttrium\",\"Transition metal\",\"3");
+    put(t, "\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w147\",");
+    put(t, "\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":39,\"texts\":[\"40\",\"Zr\",\"Zirconium\",\"Transi");
+    put(t, "tion metal\",\"4\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"c");
+    put(t, "reate\",\"w148\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":40,\"texts\":[\"41\",\"Nb\",\"Niob");
+    put(t, "ium\",\"Transition metal\",\"5\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null");
+    put(t, ",null]}],[\"create\",\"w149\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":41,\"texts\":[\"42");
+    put(t, "\",\"Mo\",\"Molybdenum\",\"Transition metal\",\"6\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,1");
+    put(t, "75,62,255],null,null]}],[\"create\",\"w150\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":");
+    put(t, "42,\"texts\":[\"43\",\"Tc\",\"Technetium\",\"Transition metal\",\"7\",\"5\"],\"cellBackgrounds\":[null,n");
+    put(t, "ull,null,[252,175,62,255],null,null]}],[\"create\",\"w151\",\"rwt.widgets.GridItem\",{\"parent\"");
+    put(t, ":\"w99\",\"index\":43,\"texts\":[\"44\",\"Ru\",\"Ruthenium\",\"Transition metal\",\"8\",\"5\"],\"cellBackgr");
+    put(t, "ounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w152\",\"rwt.widgets.GridI");
+    put(t, "tem\",{\"parent\":\"w99\",\"index\":44,\"texts\":[\"45\",\"Rh\",\"Rhodium\",\"Transition metal\",\"9\",\"5\"]");
+    put(t, ",\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w153\",\"rwt.w");
+    put(t, "idgets.GridItem\",{\"parent\":\"w99\",\"index\":45,\"texts\":[\"46\",\"Pd\",\"Palladium\",\"Transition m");
+    put(t, "etal\",\"10\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create");
+    put(t, "\",\"w154\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":46,\"texts\":[\"47\",\"Ag\",\"Silver\",\"");
+    put(t, "Transition metal\",\"11\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null");
+    put(t, "]}],[\"create\",\"w155\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":47,\"texts\":[\"48\",\"Cd");
+    put(t, "\",\"Cadmium\",\"Transition metal\",\"12\",\"5\"],\"cellBackgrounds\":[null,null,null,[252,175,62,2");
+    put(t, "55],null,null]}],[\"create\",\"w156\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":48,\"tex");
+    put(t, "ts\":[\"49\",\"In\",\"Indium\",\"Poor metal\",\"13\",\"5\"],\"cellBackgrounds\":[null,null,null,[238,23");
+    put(t, "8,236,255],null,null]}],[\"create\",\"w157\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":");
+    put(t, "49,\"texts\":[\"50\",\"Sn\",\"Tin\",\"Poor metal\",\"14\",\"5\"],\"cellBackgrounds\":[null,null,null,[23");
+    put(t, "8,238,236,255],null,null]}],[\"create\",\"w158\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"ind");
+    put(t, "ex\":50,\"texts\":[\"51\",\"Sb\",\"Antimony\",\"Metalloid\",\"15\",\"5\"],\"cellBackgrounds\":[null,null,");
+    put(t, "null,[156,159,153,255],null,null]}],[\"create\",\"w159\",\"rwt.widgets.GridItem\",{\"parent\":\"w");
+    put(t, "99\",\"index\":51,\"texts\":[\"52\",\"Te\",\"Tellurium\",\"Metalloid\",\"16\",\"5\"],\"cellBackgrounds\":[n");
+    put(t, "ull,null,null,[156,159,153,255],null,null]}],[\"create\",\"w160\",\"rwt.widgets.GridItem\",{\"p");
+    put(t, "arent\":\"w99\",\"index\":52,\"texts\":[\"53\",\"I\",\"Iodine\",\"Halogen\",\"17\",\"5\"],\"cellBackgrounds\"");
+    put(t, ":[null,null,null,[252,233,79,255],null,null]}],[\"create\",\"w161\",\"rwt.widgets.GridItem\",{");
+    put(t, "\"parent\":\"w99\",\"index\":53,\"texts\":[\"54\",\"Xe\",\"Xenon\",\"Noble gas\",\"18\",\"5\"],\"cellBackgrou");
+    put(t, "nds\":[null,null,null,[114,159,207,255],null,null]}],[\"create\",\"w162\",\"rwt.widgets.GridIt");
+    put(t, "em\",{\"parent\":\"w99\",\"index\":54,\"texts\":[\"55\",\"Cs\",\"Caesium\",\"Alkali metal\",\"1\",\"6\"],\"cel");
+    put(t, "lBackgrounds\":[null,null,null,[239,41,41,255],null,null]}],[\"create\",\"w163\",\"rwt.widgets");
+    put(t, ".GridItem\",{\"parent\":\"w99\",\"index\":55,\"texts\":[\"56\",\"Ba\",\"Barium\",\"Alkaline earth metal\"");
+    put(t, ",\"2\",\"6\"],\"cellBackgrounds\":[null,null,null,[233,185,110,255],null,null]}],[\"create\",\"w1");
+    put(t, "64\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":56,\"texts\":[\"57\",\"La\",\"Lanthanum\",\"La");
+    put(t, "nthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"cr");
+    put(t, "eate\",\"w165\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":57,\"texts\":[\"58\",\"Ce\",\"Ceriu");
+    put(t, "m\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}");
+    put(t, "],[\"create\",\"w166\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":58,\"texts\":[\"59\",\"Pr\",");
+    put(t, "\"Praseodymium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255]");
+    put(t, ",null,null]}],[\"create\",\"w167\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":59,\"texts\"");
+    put(t, ":[\"60\",\"Nd\",\"Neodymium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127");
+    put(t, ",168,255],null,null]}],[\"create\",\"w168\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":6");
+    put(t, "0,\"texts\":[\"61\",\"Pm\",\"Promethium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,nul");
+    put(t, "l,[173,127,168,255],null,null]}],[\"create\",\"w169\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\"");
+    put(t, ",\"index\":61,\"texts\":[\"62\",\"Sm\",\"Samarium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,");
+    put(t, "null,null,[173,127,168,255],null,null]}],[\"create\",\"w170\",\"rwt.widgets.GridItem\",{\"paren");
+    put(t, "t\":\"w99\",\"index\":62,\"texts\":[\"63\",\"Eu\",\"Europium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds");
+    put(t, "\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w171\",\"rwt.widgets.GridItem\"");
+    put(t, ",{\"parent\":\"w99\",\"index\":63,\"texts\":[\"64\",\"Gd\",\"Gadolinium\",\"Lanthanide\",\"3\",\"6\"],\"cellB");
+    put(t, "ackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w172\",\"rwt.widgets");
+    put(t, ".GridItem\",{\"parent\":\"w99\",\"index\":64,\"texts\":[\"65\",\"Tb\",\"Terbium\",\"Lanthanide\",\"3\",\"6\"]");
+    put(t, ",\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w173\",\"rwt.");
+    put(t, "widgets.GridItem\",{\"parent\":\"w99\",\"index\":65,\"texts\":[\"66\",\"Dy\",\"Dysprosium\",\"Lanthanide");
+    put(t, "\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w");
+    put(t, "174\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":66,\"texts\":[\"67\",\"Ho\",\"Holmium\",\"Lan");
+    put(t, "thanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"cre");
+    put(t, "ate\",\"w175\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":67,\"texts\":[\"68\",\"Er\",\"Erbium");
+    put(t, "\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}]");
+    put(t, ",[\"create\",\"w176\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":68,\"texts\":[\"69\",\"Tm\",\"");
+    put(t, "Thulium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,");
+    put(t, "null]}],[\"create\",\"w177\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":69,\"texts\":[\"70\"");
+    put(t, ",\"Yb\",\"Ytterbium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,127,168,2");
+    put(t, "55],null,null]}],[\"create\",\"w178\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":70,\"tex");
+    put(t, "ts\":[\"71\",\"Lu\",\"Lutetium\",\"Lanthanide\",\"3\",\"6\"],\"cellBackgrounds\":[null,null,null,[173,1");
+    put(t, "27,168,255],null,null]}],[\"create\",\"w179\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\"");
+    put(t, ":71,\"texts\":[\"72\",\"Hf\",\"Hafnium\",\"Transition metal\",\"4\",\"6\"],\"cellBackgrounds\":[null,nul");
+    put(t, "l,null,[252,175,62,255],null,null]}],[\"create\",\"w180\",\"rwt.widgets.GridItem\",{\"parent\":\"");
+    put(t, "w99\",\"index\":72,\"texts\":[\"73\",\"Ta\",\"Tantalum\",\"Transition metal\",\"5\",\"6\"],\"cellBackgroun");
+    put(t, "ds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w181\",\"rwt.widgets.GridItem");
+    put(t, "\",{\"parent\":\"w99\",\"index\":73,\"texts\":[\"74\",\"W\",\"Tungsten\",\"Transition metal\",\"6\",\"6\"],\"c");
+    put(t, "ellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w182\",\"rwt.widg");
+    put(t, "ets.GridItem\",{\"parent\":\"w99\",\"index\":74,\"texts\":[\"75\",\"Re\",\"Rhenium\",\"Transition metal\"");
+    put(t, ",\"7\",\"6\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w18");
+    put(t, "3\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":75,\"texts\":[\"76\",\"Os\",\"Osmium\",\"Transi");
+    put(t, "tion metal\",\"8\",\"6\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"c");
+    put(t, "reate\",\"w184\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":76,\"texts\":[\"77\",\"Ir\",\"Irid");
+    put(t, "ium\",\"Transition metal\",\"9\",\"6\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null");
+    put(t, ",null]}],[\"create\",\"w185\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":77,\"texts\":[\"78");
+    put(t, "\",\"Pt\",\"Platinum\",\"Transition metal\",\"10\",\"6\"],\"cellBackgrounds\":[null,null,null,[252,17");
+    put(t, "5,62,255],null,null]}],[\"create\",\"w186\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":7");
+    put(t, "8,\"texts\":[\"79\",\"Au\",\"Gold\",\"Transition metal\",\"11\",\"6\"],\"cellBackgrounds\":[null,null,nu");
+    put(t, "ll,[252,175,62,255],null,null]}],[\"create\",\"w187\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\"");
+    put(t, ",\"index\":79,\"texts\":[\"80\",\"Hg\",\"Mercury\",\"Transition metal\",\"12\",\"6\"],\"cellBackgrounds\":");
+    put(t, "[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w188\",\"rwt.widgets.GridItem\",{\"");
+    put(t, "parent\":\"w99\",\"index\":80,\"texts\":[\"81\",\"Tl\",\"Thallium\",\"Poor metal\",\"13\",\"6\"],\"cellBackg");
+    put(t, "rounds\":[null,null,null,[238,238,236,255],null,null]}],[\"create\",\"w189\",\"rwt.widgets.Gri");
+    put(t, "dItem\",{\"parent\":\"w99\",\"index\":81,\"texts\":[\"82\",\"Pb\",\"Lead\",\"Poor metal\",\"14\",\"6\"],\"cell");
+    put(t, "Backgrounds\":[null,null,null,[238,238,236,255],null,null]}],[\"create\",\"w190\",\"rwt.widget");
+    put(t, "s.GridItem\",{\"parent\":\"w99\",\"index\":82,\"texts\":[\"83\",\"Bi\",\"Bismuth\",\"Poor metal\",\"15\",\"6");
+    put(t, "\"],\"cellBackgrounds\":[null,null,null,[238,238,236,255],null,null]}],[\"create\",\"w191\",\"rw");
+    put(t, "t.widgets.GridItem\",{\"parent\":\"w99\",\"index\":83,\"texts\":[\"84\",\"Po\",\"Polonium\",\"Metalloid\"");
+    put(t, ",\"16\",\"6\"],\"cellBackgrounds\":[null,null,null,[156,159,153,255],null,null]}],[\"create\",\"w");
+    put(t, "192\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":84,\"texts\":[\"85\",\"At\",\"Astatine\",\"Ha");
+    put(t, "logen\",\"17\",\"6\"],\"cellBackgrounds\":[null,null,null,[252,233,79,255],null,null]}],[\"creat");
+    put(t, "e\",\"w193\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":85,\"texts\":[\"86\",\"Rn\",\"Radon\",\"");
+    put(t, "Noble gas\",\"18\",\"6\"],\"cellBackgrounds\":[null,null,null,[114,159,207,255],null,null]}],[\"");
+    put(t, "create\",\"w194\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":86,\"texts\":[\"87\",\"Fr\",\"Fra");
+    put(t, "ncium\",\"Alkali metal\",\"1\",\"7\"],\"cellBackgrounds\":[null,null,null,[239,41,41,255],null,nu");
+    put(t, "ll]}],[\"create\",\"w195\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":87,\"texts\":[\"88\",\"");
+    put(t, "Ra\",\"Radium\",\"Alkaline earth metal\",\"2\",\"7\"],\"cellBackgrounds\":[null,null,null,[233,185,");
+    put(t, "110,255],null,null]}],[\"create\",\"w196\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":88");
+    put(t, ",\"texts\":[\"89\",\"Ac\",\"Actinium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,null,[17");
+    put(t, "3,127,168,255],null,null]}],[\"create\",\"w197\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"ind");
+    put(t, "ex\":89,\"texts\":[\"90\",\"Th\",\"Thorium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,nul");
+    put(t, "l,[173,127,168,255],null,null]}],[\"create\",\"w198\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\"");
+    put(t, ",\"index\":90,\"texts\":[\"91\",\"Pa\",\"Protactinium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[nul");
+    put(t, "l,null,null,[173,127,168,255],null,null]}],[\"create\",\"w199\",\"rwt.widgets.GridItem\",{\"par");
+    put(t, "ent\":\"w99\",\"index\":91,\"texts\":[\"92\",\"U\",\"Uranium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":");
+    put(t, "[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w200\",\"rwt.widgets.GridItem\",{");
+    put(t, "\"parent\":\"w99\",\"index\":92,\"texts\":[\"93\",\"Np\",\"Neptunium\",\"Actinide\",\"3\",\"7\"],\"cellBackgr");
+    put(t, "ounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w201\",\"rwt.widgets.Grid");
+    put(t, "Item\",{\"parent\":\"w99\",\"index\":93,\"texts\":[\"94\",\"Pu\",\"Plutonium\",\"Actinide\",\"3\",\"7\"],\"cel");
+    put(t, "lBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w202\",\"rwt.widge");
+    put(t, "ts.GridItem\",{\"parent\":\"w99\",\"index\":94,\"texts\":[\"95\",\"Am\",\"Americium\",\"Actinide\",\"3\",\"7");
+    put(t, "\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w203\",\"rw");
+    put(t, "t.widgets.GridItem\",{\"parent\":\"w99\",\"index\":95,\"texts\":[\"96\",\"Cm\",\"Curium\",\"Actinide\",\"3");
+    put(t, "\",\"7\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\",\"w204\"");
+    put(t, ",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":96,\"texts\":[\"97\",\"Bk\",\"Berkelium\",\"Actin");
+    put(t, "ide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],[\"create\"");
+    put(t, ",\"w205\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":97,\"texts\":[\"98\",\"Cf\",\"Californiu");
+    put(t, "m\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null,null]}],");
+    put(t, "[\"create\",\"w206\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":98,\"texts\":[\"99\",\"Es\",\"E");
+    put(t, "insteinium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255],null");
+    put(t, ",null]}],[\"create\",\"w207\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":99,\"texts\":[\"10");
+    put(t, "0\",\"Fm\",\"Fermium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,null,[173,127,168,255");
+    put(t, "],null,null]}],[\"create\",\"w208\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":100,\"text");
+    put(t, "s\":[\"101\",\"Md\",\"Mendelevium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,null,[173,");
+    put(t, "127,168,255],null,null]}],[\"create\",\"w209\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index");
+    put(t, "\":101,\"texts\":[\"102\",\"No\",\"Nobelium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[null,null,nu");
+    put(t, "ll,[173,127,168,255],null,null]}],[\"create\",\"w210\",\"rwt.widgets.GridItem\",{\"parent\":\"w99");
+    put(t, "\",\"index\":102,\"texts\":[\"103\",\"Lr\",\"Lawrencium\",\"Actinide\",\"3\",\"7\"],\"cellBackgrounds\":[nu");
+    put(t, "ll,null,null,[173,127,168,255],null,null]}],[\"create\",\"w211\",\"rwt.widgets.GridItem\",{\"pa");
+    put(t, "rent\":\"w99\",\"index\":103,\"texts\":[\"104\",\"Rf\",\"Rutherfordium\",\"Transition metal\",\"4\",\"7\"],");
+    put(t, "\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w212\",\"rwt.wi");
+    put(t, "dgets.GridItem\",{\"parent\":\"w99\",\"index\":104,\"texts\":[\"105\",\"Db\",\"Dubnium\",\"Transition me");
+    put(t, "tal\",\"5\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",");
+    put(t, "\"w213\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":105,\"texts\":[\"106\",\"Sg\",\"Seaborgiu");
+    put(t, "m\",\"Transition metal\",\"6\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,n");
+    put(t, "ull]}],[\"create\",\"w214\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":106,\"texts\":[\"107");
+    put(t, "\",\"Bh\",\"Bohrium\",\"Transition metal\",\"7\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,175,");
+    put(t, "62,255],null,null]}],[\"create\",\"w215\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":107");
+    put(t, ",\"texts\":[\"108\",\"Hs\",\"Hassium\",\"Transition metal\",\"8\",\"7\"],\"cellBackgrounds\":[null,null,");
+    put(t, "null,[252,175,62,255],null,null]}],[\"create\",\"w216\",\"rwt.widgets.GridItem\",{\"parent\":\"w9");
+    put(t, "9\",\"index\":108,\"texts\":[\"109\",\"Mt\",\"Meitnerium\",\"Transition metal\",\"9\",\"7\"],\"cellBackgro");
+    put(t, "unds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w217\",\"rwt.widgets.GridIt");
+    put(t, "em\",{\"parent\":\"w99\",\"index\":109,\"texts\":[\"110\",\"Ds\",\"Darmstadtium\",\"Transition metal\",\"1");
+    put(t, "0\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]}],[\"create\",\"w218\"");
+    put(t, ",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":110,\"texts\":[\"111\",\"Rg\",\"Roentgenium\",\"T");
+    put(t, "ransition metal\",\"11\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,175,62,255],null,null]");
+    put(t, "}],[\"create\",\"w219\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":111,\"texts\":[\"112\",\"U");
+    put(t, "ub\",\"Ununbium\",\"Transition metal\",\"12\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,175,6");
+    put(t, "2,255],null,null]}],[\"create\",\"w220\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":112,");
+    put(t, "\"texts\":[\"113\",\"Uut\",\"Ununtrium\",\"Poor metal\",\"13\",\"7\"],\"cellBackgrounds\":[null,null,nul");
+    put(t, "l,[238,238,236,255],null,null]}],[\"create\",\"w221\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\"");
+    put(t, ",\"index\":113,\"texts\":[\"114\",\"Uuq\",\"Ununquadium\",\"Poor metal\",\"14\",\"7\"],\"cellBackgrounds\"");
+    put(t, ":[null,null,null,[238,238,236,255],null,null]}],[\"create\",\"w222\",\"rwt.widgets.GridItem\",");
+    put(t, "{\"parent\":\"w99\",\"index\":114,\"texts\":[\"115\",\"Uup\",\"Ununpentium\",\"Poor metal\",\"15\",\"7\"],\"c");
+    put(t, "ellBackgrounds\":[null,null,null,[238,238,236,255],null,null]}],[\"create\",\"w223\",\"rwt.wid");
+    put(t, "gets.GridItem\",{\"parent\":\"w99\",\"index\":115,\"texts\":[\"116\",\"Uuh\",\"Ununhexium\",\"Poor metal");
+    put(t, "\",\"16\",\"7\"],\"cellBackgrounds\":[null,null,null,[238,238,236,255],null,null]}],[\"create\",\"");
+    put(t, "w224\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":116,\"texts\":[\"117\",\"Uus\",\"Ununsepti");
+    put(t, "um\",\"Halogen\",\"17\",\"7\"],\"cellBackgrounds\":[null,null,null,[252,233,79,255],null,null]}],");
+    put(t, "[\"create\",\"w225\",\"rwt.widgets.GridItem\",{\"parent\":\"w99\",\"index\":117,\"texts\":[\"118\",\"Uuo\"");
+    put(t, ",\"Ununoctium\",\"Noble gas\",\"18\",\"7\"],\"cellBackgrounds\":[null,null,null,[114,159,207,255],");
+    put(t, "null,null]}],[\"create\",\"w226\",\"rwt.widgets.Composite\",{\"parent\":\"w97\",\"style\":[\"BORDER\"]");
+    put(t, ",\"bounds\":[10,464,988,25],\"children\":[\"w227\"],\"tabIndex\":-1,\"clientArea\":[0,0,986,23]}],");
+    put(t, "[\"create\",\"w227\",\"rwt.widgets.Label\",{\"parent\":\"w226\",\"style\":[\"NONE\"],\"bounds\":[10,10,9");
+    put(t, "66,3],\"tabIndex\":-1,\"text\":\"Hydrogen (H)\"}],[\"create\",\"w228\",\"rwt.widgets.Label\",{\"paren");
+    put(t, "t\":\"w97\",\"style\":[\"WRAP\"],\"bounds\":[10,499,988,16],\"tabIndex\":-1,\"foreground\":[150,150,1");
+    put(t, "50,255],\"font\":[[\"Verdana\",\"Lucida Sans\",\"Arial\",\"Helvetica\",\"sans-serif\"],10,false,fals");
+    put(t, "e],\"text\":\"Shortcuts: [CTRL+F] - Filter | Sort by: [CTRL+R] - Number, [CTRL+Y] - Symbol,");
+    put(t, " [CTRL+N] - Name, [CTRL+S] - Series, [CTRL+G] - Group, [CTRL+E] - Period\"}],[\"set\",\"w1\",");
+    put(t, "{\"focusControl\":\"w99\"}],[\"call\",\"rwt.client.BrowserNavigation\",\"addToHistory\",{\"entries\"");
+    put(t, ":[[\"tableviewer\",\"TableViewer\"]]}]]}");
+}
+
+fn main() as i32 {
+    let is Buffer as text;
+    text.p = cast(*u8, 0);
+    text.n = 0;
+    text.cap = 0;
+    document(&text);
+    if (text.n != 25820) {
+        io.printf("json_parse: document is %d bytes\n", text.n);
+        return 1;
+    }
+    let is i32 as r with mut = 0;
+    while (r < ROUNDS) {
+        let is i32 as k with mut = 0;
+        while (k < INNER) {
+            let is *JsonValue as result = parse(&text);
+            let is i32 as ok = has_expected_content(result);
+            free_value(result);
+            if (ok == 0) {
+                io.printf("json_parse: unexpected content\n");
+                return 1;
+            }
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    io.printf("json_parse: 156 operations\n");
+    return 0;
+}

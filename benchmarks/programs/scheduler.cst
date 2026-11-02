@@ -1,0 +1,426 @@
+// An operating-system task scheduler simulation: an idle task, a worker, two
+// handlers and two devices exchange work and device packets through linked
+// queues, each task running its own function (called through a pointer held
+// in its control block) on its private data record, until the idle task has
+// counted down 10000 steps. The run is 10 rounds of 100 simulations; every
+// object of a simulation is tracked and freed at its end.
+// Self-check: every simulation queues 23246 packets and holds 9297 times.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as ROUNDS with imut = 10;
+let is i32 as INNER with imut = 100;
+
+let is i32 as IDLER with imut = 0;
+let is i32 as WORKER with imut = 1;
+let is i32 as HANDLER_A with imut = 2;
+let is i32 as HANDLER_B with imut = 3;
+let is i32 as DEVICE_A with imut = 4;
+let is i32 as DEVICE_B with imut = 5;
+let is i32 as NUM_TYPES with imut = 6;
+
+let is i32 as DEVICE_PACKET_KIND with imut = 0;
+let is i32 as WORK_PACKET_KIND with imut = 1;
+let is i32 as DATA_SIZE with imut = 4;
+
+struct Packet {
+    link as *Packet;
+    identity as i32;
+    kind as i32;
+    datum as i32;
+    data as *i32;       // DATA_SIZE entries
+}
+
+struct TaskState {
+    packet_pending as u8;
+    task_waiting as u8;
+    task_holding as u8;
+}
+
+// A task control block is a TaskState followed by the task's fields.
+struct Task {
+    packet_pending as u8;
+    task_waiting as u8;
+    task_holding as u8;
+    link as *Task;
+    identity as i32;
+    priority as i32;
+    input as *Packet;
+    function as *u8;    // fn(*Scheduler, *Packet, *u8) as *Task
+    handle as *u8;      // the task's data record
+}
+
+struct DeviceData { pending as *Packet; }
+struct HandlerData { work_in as *Packet; device_in as *Packet; }
+struct IdleData { control as i32; count as i32; }
+struct WorkerData { destination as i32; count as i32; }
+
+struct Scheduler {
+    task_list as *Task;
+    current_task as *Task;
+    current_task_identity as i32;
+    task_table as *Task;        // NUM_TYPES pointers, kept as a raw array
+    queue_packet_count as i32;
+    hold_count as i32;
+    layout as i32;
+}
+
+let is mem.bins.Bins as heap with mut;
+
+// Every object of one simulation, freed together at its end.
+let is [64]*u8 as tracked with mut;
+let is i32 as tracked_count with mut = 0;
+
+fn track(p as *u8) as *u8 {
+    if (tracked_count == 64) {
+        io.write_bytes(io.STDERR, "too many objects\n", 17);
+        io.exit(2);
+    }
+    tracked[tracked_count] = p;
+    tracked_count = tracked_count + 1;
+    return p;
+}
+
+fn new_object(size as i64) as *u8 {
+    return track(mem.bins.bins_alloc(&heap, size));
+}
+
+fn release_all() as void {
+    let is i32 as i with mut = 0;
+    while (i < tracked_count) { mem.bins.bins_free(&heap, tracked[i]); i = i + 1; }
+    tracked_count = 0;
+}
+
+fn fail(msg as *u8) as void {
+    io.write_bytes(io.STDERR, msg, io.strlen(msg));
+    io.exit(1);
+}
+
+// --- packets and queues ---
+
+fn new_packet(link as *Packet, identity as i32, kind as i32) as *Packet {
+    let is *Packet as p = cast(*Packet, new_object(sizeof(Packet)));
+    p.link = link;
+    p.identity = identity;
+    p.kind = kind;
+    p.datum = 0;
+    p.data = cast(*i32, new_object(cast(i64, DATA_SIZE) * 4));
+    let is i32 as i with mut = 0;
+    while (i < DATA_SIZE) { p.data[i] = 0; i = i + 1; }
+    return p;
+}
+
+// Appends packet to the queue starting at queue_head; returns the new head.
+fn append(packet as *Packet, queue_head as *Packet) as *Packet {
+    packet.link = cast(*Packet, 0);
+    if (cast(i64, queue_head) == 0) { return packet; }
+    let is *Packet as mouse with mut = queue_head;
+    let is *Packet as link with mut = mouse.link;
+    while (cast(i64, link) != 0) {
+        mouse = link;
+        link = mouse.link;
+    }
+    mouse.link = packet;
+    return queue_head;
+}
+
+// --- task states ---
+
+fn state_running(t as *TaskState) as void {
+    t.packet_pending = 0; t.task_waiting = 0; t.task_holding = 0;
+}
+
+fn state_waiting(t as *TaskState) as void {
+    t.packet_pending = 0; t.task_holding = 0; t.task_waiting = 1;
+}
+
+fn state_waiting_with_packet(t as *TaskState) as void {
+    t.task_holding = 0; t.task_waiting = 1; t.packet_pending = 1;
+}
+
+fn state_packet_pending(t as *TaskState) as void {
+    t.packet_pending = 1; t.task_waiting = 0; t.task_holding = 0;
+}
+
+fn is_task_holding_or_waiting(t as *TaskState) as i32 {
+    return t.task_holding != 0 || (t.packet_pending == 0 && t.task_waiting != 0);
+}
+
+fn is_waiting_with_packet(t as *TaskState) as i32 {
+    return t.packet_pending != 0 && t.task_waiting != 0 && t.task_holding == 0;
+}
+
+fn create_running() as *TaskState {
+    let is *TaskState as t = cast(*TaskState, new_object(sizeof(TaskState)));
+    state_running(t);
+    return t;
+}
+
+fn create_waiting() as *TaskState {
+    let is *TaskState as t = cast(*TaskState, new_object(sizeof(TaskState)));
+    state_waiting(t);
+    return t;
+}
+
+fn create_waiting_with_packet() as *TaskState {
+    let is *TaskState as t = cast(*TaskState, new_object(sizeof(TaskState)));
+    state_waiting_with_packet(t);
+    return t;
+}
+
+// --- task control blocks ---
+
+fn new_task(link as *Task, identity as i32, priority as i32, initial_work as *Packet,
+            initial_state as *TaskState, function as *u8, private_data as *u8) as *Task {
+    let is *Task as t = cast(*Task, new_object(sizeof(Task)));
+    t.link = link;
+    t.identity = identity;
+    t.priority = priority;
+    t.input = initial_work;
+    t.packet_pending = initial_state.packet_pending;
+    t.task_waiting = initial_state.task_waiting;
+    t.task_holding = initial_state.task_holding;
+    t.function = function;
+    t.handle = private_data;
+    return t;
+}
+
+fn add_input_and_check_priority(t as *Task, packet as *Packet, old_task as *Task) as *Task {
+    if (cast(i64, t.input) == 0) {
+        t.input = packet;
+        t.packet_pending = 1;
+        if (t.priority > old_task.priority) { return t; }
+    } else {
+        t.input = append(packet, t.input);
+    }
+    return old_task;
+}
+
+fn run_task(s as *Scheduler, t as *Task) as *Task {
+    let is *Packet as message with mut = cast(*Packet, 0);
+    if (is_waiting_with_packet(cast(*TaskState, t)) != 0) {
+        message = t.input;
+        t.input = message.link;
+        if (cast(i64, t.input) == 0) {
+            state_running(cast(*TaskState, t));
+        } else {
+            state_packet_pending(cast(*TaskState, t));
+        }
+    }
+    return cast(*Task, call(t.function, s, message, t.handle));
+}
+
+// --- the scheduler's services to task functions ---
+
+fn table(s as *Scheduler) as **Task { return cast(**Task, s.task_table); }
+
+fn find_task(s as *Scheduler, identity as i32) as *Task {
+    let is *Task as t = table(s)[identity];
+    if (cast(i64, t) == 0) { fail("findTask failed\n"); }
+    return t;
+}
+
+fn hold_self(s as *Scheduler) as *Task {
+    s.hold_count = s.hold_count + 1;
+    s.current_task.task_holding = 1;
+    return s.current_task.link;
+}
+
+fn queue_packet(s as *Scheduler, packet as *Packet) as *Task {
+    let is *Task as t = find_task(s, packet.identity);
+    if (cast(i64, t) == 0) { return t; }
+    s.queue_packet_count = s.queue_packet_count + 1;
+    packet.link = cast(*Packet, 0);
+    packet.identity = s.current_task_identity;
+    return add_input_and_check_priority(t, packet, s.current_task);
+}
+
+fn release(s as *Scheduler, identity as i32) as *Task {
+    let is *Task as t = find_task(s, identity);
+    if (cast(i64, t) == 0) { return t; }
+    t.task_holding = 0;
+    if (t.priority > s.current_task.priority) { return t; }
+    return s.current_task;
+}
+
+fn mark_waiting(s as *Scheduler) as *Task {
+    s.current_task.task_waiting = 1;
+    return s.current_task;
+}
+
+// --- the four task functions ---
+
+fn device_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
+    let is *DeviceData as data = cast(*DeviceData, word);
+    let is *Packet as function_work with mut = work;
+    if (cast(i64, function_work) == 0) {
+        function_work = data.pending;
+        if (cast(i64, function_work) == 0) { return mark_waiting(s); }
+        data.pending = cast(*Packet, 0);
+        return queue_packet(s, function_work);
+    }
+    data.pending = function_work;
+    return hold_self(s);
+}
+
+fn handler_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
+    let is *HandlerData as data = cast(*HandlerData, word);
+    if (cast(i64, work) != 0) {
+        if (work.kind == WORK_PACKET_KIND) {
+            data.work_in = append(work, data.work_in);
+        } else {
+            data.device_in = append(work, data.device_in);
+        }
+    }
+    let is *Packet as work_packet = data.work_in;
+    if (cast(i64, work_packet) == 0) { return mark_waiting(s); }
+    let is i32 as count = work_packet.datum;
+    if (count >= DATA_SIZE) {
+        data.work_in = work_packet.link;
+        return queue_packet(s, work_packet);
+    }
+    let is *Packet as device_packet = data.device_in;
+    if (cast(i64, device_packet) == 0) { return mark_waiting(s); }
+    data.device_in = device_packet.link;
+    device_packet.datum = work_packet.data[count];
+    work_packet.datum = count + 1;
+    return queue_packet(s, device_packet);
+}
+
+fn idler_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
+    let is *IdleData as data = cast(*IdleData, word);
+    data.count = data.count - 1;
+    if (data.count == 0) { return hold_self(s); }
+    if ((data.control & 1) == 0) {
+        data.control = data.control / 2;
+        return release(s, DEVICE_A);
+    }
+    data.control = (data.control / 2) ^ 53256;
+    return release(s, DEVICE_B);
+}
+
+fn worker_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
+    let is *WorkerData as data = cast(*WorkerData, word);
+    if (cast(i64, work) == 0) { return mark_waiting(s); }
+    if (data.destination == HANDLER_A) { data.destination = HANDLER_B; }
+    else { data.destination = HANDLER_A; }
+    work.identity = data.destination;
+    work.datum = 0;
+    let is i32 as i with mut = 0;
+    while (i < DATA_SIZE) {
+        data.count = data.count + 1;
+        if (data.count > 26) { data.count = 1; }
+        work.data[i] = 65 + data.count - 1;
+        i = i + 1;
+    }
+    return queue_packet(s, work);
+}
+
+// --- building the task set ---
+
+fn create_task(s as *Scheduler, identity as i32, priority as i32, work as *Packet,
+               state as *TaskState, function as *u8, data as *u8) as void {
+    let is *Task as t = new_task(s.task_list, identity, priority, work, state, function, data);
+    s.task_list = t;
+    table(s)[identity] = t;
+}
+
+fn create_device(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
+    let is *DeviceData as data = cast(*DeviceData, new_object(sizeof(DeviceData)));
+    data.pending = cast(*Packet, 0);
+    create_task(s, identity, priority, work, state, fn_ptr(device_fn), cast(*u8, data));
+}
+
+fn create_handler(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
+    let is *HandlerData as data = cast(*HandlerData, new_object(sizeof(HandlerData)));
+    data.work_in = cast(*Packet, 0);
+    data.device_in = cast(*Packet, 0);
+    create_task(s, identity, priority, work, state, fn_ptr(handler_fn), cast(*u8, data));
+}
+
+fn create_idler(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
+    let is *IdleData as data = cast(*IdleData, new_object(sizeof(IdleData)));
+    data.control = 1;
+    data.count = 10000;
+    create_task(s, identity, priority, work, state, fn_ptr(idler_fn), cast(*u8, data));
+}
+
+fn create_worker(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
+    let is *WorkerData as data = cast(*WorkerData, new_object(sizeof(WorkerData)));
+    data.destination = HANDLER_A;
+    data.count = 0;
+    create_task(s, identity, priority, work, state, fn_ptr(worker_fn), cast(*u8, data));
+}
+
+fn schedule(s as *Scheduler) as void {
+    s.current_task = s.task_list;
+    while (cast(i64, s.current_task) != 0) {
+        if (is_task_holding_or_waiting(cast(*TaskState, s.current_task)) != 0) {
+            s.current_task = s.current_task.link;
+        } else {
+            s.current_task_identity = s.current_task.identity;
+            s.current_task = run_task(s, s.current_task);
+        }
+    }
+}
+
+fn new_scheduler() as *Scheduler {
+    let is *Scheduler as s = cast(*Scheduler, new_object(sizeof(Scheduler)));
+    s.layout = 0;
+    s.queue_packet_count = 0;
+    s.hold_count = 0;
+    s.task_table = cast(*Task, new_object(cast(i64, NUM_TYPES) * 8));
+    let is i32 as i with mut = 0;
+    while (i < NUM_TYPES) { table(s)[i] = cast(*Task, 0); i = i + 1; }
+    s.task_list = cast(*Task, 0);
+    s.current_task = cast(*Task, 0);
+    s.current_task_identity = 0;
+    return s;
+}
+
+fn start(s as *Scheduler) as i32 {
+    let is *Packet as none = cast(*Packet, 0);
+    create_idler(s, IDLER, 0, none, create_running());
+    let is *Packet as work_q with mut = new_packet(none, WORKER, WORK_PACKET_KIND);
+    work_q = new_packet(work_q, WORKER, WORK_PACKET_KIND);
+    create_worker(s, WORKER, 1000, work_q, create_waiting_with_packet());
+
+    work_q = new_packet(none, DEVICE_A, DEVICE_PACKET_KIND);
+    work_q = new_packet(work_q, DEVICE_A, DEVICE_PACKET_KIND);
+    work_q = new_packet(work_q, DEVICE_A, DEVICE_PACKET_KIND);
+    create_handler(s, HANDLER_A, 2000, work_q, create_waiting_with_packet());
+
+    work_q = new_packet(none, DEVICE_B, DEVICE_PACKET_KIND);
+    work_q = new_packet(work_q, DEVICE_B, DEVICE_PACKET_KIND);
+    work_q = new_packet(work_q, DEVICE_B, DEVICE_PACKET_KIND);
+    create_handler(s, HANDLER_B, 3000, work_q, create_waiting_with_packet());
+
+    create_device(s, DEVICE_A, 4000, none, create_waiting());
+    create_device(s, DEVICE_B, 5000, none, create_waiting());
+
+    schedule(s);
+    return s.queue_packet_count == 23246 && s.hold_count == 9297;
+}
+
+fn benchmark() as i32 {
+    let is i32 as result = start(new_scheduler());
+    release_all();
+    return result;
+}
+
+fn main() as i32 {
+    let is i32 as r with mut = 0;
+    while (r < ROUNDS) {
+        let is i32 as k with mut = 0;
+        while (k < INNER) {
+            if (benchmark() == 0) {
+                io.printf("scheduler: wrong packet or hold count\n");
+                return 1;
+            }
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    io.printf("scheduler: 23246 packets queued, 9297 holds\n");
+    return 0;
+}

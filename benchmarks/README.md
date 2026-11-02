@@ -76,13 +76,52 @@ A single benchmark runs on its own like any program:
 | benchmark | measures |
 |---|---|
 | `binary_tree_sort` | binary search tree of 5000 keys built by recursive insertion and checked, 100 times |
+| `bounce_balls` | 100 balls bouncing in a box for 50 steps, 15000 times: small-record updates and branches |
 | `chomp_game_tree` | solves 8x7 chomp over linked lists of positions and moves with linear-search lookups, then plays it |
+| `collision` | collision detection for 250 aircraft over 200 frames, 10 times: red-black trees, voxel flood fill, records in vectors, callbacks, f64 |
+| `constraints` | incremental constraint solver on chains and projections of 12000, 10 times: method tables, vectors, visitor callbacks, hashing |
 | `expression_search` | iterative-deepening search for an arithmetic expression over three numbers |
 | `hash_table_strings` | chained hash table of 3.5M string keys: hashing, allocation, string compares |
 | `huffman_roundtrip` | Huffman encode and decode of 10 MB of text, 30 times: heaps, bit packing, table-driven decode |
+| `json_parse` | parses a 25 KB JSON document 1000 times: character tests, string copies, vectors of values |
 | `linked_lists` | building, copying, draining and reversing 100-node doubly linked lists, 3M times |
+| `list_tail` | the Takeuchi function on linked lists, 15000 times: allocation and recursive list walks |
+| `loopfind` | loop recognition on a 5213-block control-flow graph, 1551 passes, 10 times: union-find, sets, hash dictionary, callbacks |
+| `mandelbrot_sum` | 500x500 Mandelbrot set with packed escape bits, 10 times: f64 inner loop |
 | `method_calls` | 1G calls through function pointers stored in objects |
+| `nbody_energy` | 250000 steps of the five-body simulation through accessor functions, 10 times |
 | `object_alloc` | 140M allocate-initialise-free cycles of small objects |
+| `permute_count` | all permutations of 6 by recursive swaps in a heap array, 10000 times |
+| `queens_solve` | first eight-queens solution with heap-allocated flag arrays, 100000 times |
 | `record_ops_double` | the record and string rounds of `record_ops_int` with doubles for every integer, 100M times |
 | `record_ops_int` | synthetic integer workload of record fields, short strings, small arrays and calls, 100M rounds |
+| `scheduler` | operating-system task scheduler simulation, 1000 times: linked packet queues, task functions called through pointers |
+| `sieve_count` | sieve to 5000 in a fresh stack array, 30000 times |
+| `storage_tree` | trees of heap arrays seven levels deep, built and freed 10000 times: allocator throughput |
 | `string_append` | 10M appends to a doubling heap buffer |
+| `towers_moves` | Towers of Hanoi with heap-allocated disks on linked piles, 6000 times |
+
+## Deviations
+
+Where a program follows an object-oriented original, the language's lack of
+closures and virtual methods is bridged as follows; the work done is meant to
+stay the same.
+
+- A closure passed to `forEach` and friends is a function pointer plus a
+  pointer to a small context record, called with `call()` once per element.
+- Virtual methods are function pointers: `constraints` gives each kind of
+  constraint a table of them, and `scheduler` keeps the task function in the
+  control block. `json_parse`'s values carry a kind tag instead, tested with
+  an `if`, and so do `collision`'s red-black trees for their key comparison,
+  which the original specialises per key type at compile time. Entry
+  matching in the identity dictionaries is a direct call, as both kinds of
+  entry match the same way.
+- Sets are vectors searched linearly through a callback that compares
+  elements by identity, where the original calls an equality method that
+  compares the same thing.
+- `json_parse` keeps every captured string as a heap copy (no small-string
+  buffer), stores object names by pointer instead of copying them again, and
+  holds the current character as a one-character slice of the input.
+- `sieve_count` passes its flag array by pointer, not by value.
+- Objects the original frees through an object tracker are freed explicitly
+  at the same point, and a red-black tree node is freed when it is removed.

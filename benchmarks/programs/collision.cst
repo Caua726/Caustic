@@ -1,0 +1,813 @@
+// Aircraft collision detection over 200 frames of a simulation of 250
+// aircraft flying in pairs along sine and cosine tracks. Each frame updates
+// a red-black tree of positions by call sign, drops aircraft no longer seen,
+// spreads every motion over the 2x2 voxels it crosses (a recursive flood
+// kept in red-black trees keyed by voxel), and tests each pair of motions
+// sharing a voxel for a close approach by solving a quadratic. Motions and
+// collisions are records held by value in growable vectors, visited through
+// callbacks. Run 10 times.
+// Self-check: 10830 collisions are found.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+use "../../std/math.cst" as math;
+
+let is i32 as ROUNDS with imut = 10;
+let is i32 as INNER with imut = 250;
+
+let is mem.bins.Bins as heap with mut;
+
+fn alloc(n as i64) as *u8 { return mem.bins.bins_alloc(&heap, n); }
+fn release(p as *u8) as void { mem.bins.bins_free(&heap, p); }
+
+// ---------------------------------------------------------------------------
+// Growable vector of fixed-size records, each a whole number of words.
+
+let is i64 as INITIAL_SIZE with imut = 10;
+
+struct Vector {
+    storage as *i64;
+    words as i64;       // words per element
+    capacity as i64;
+    first as i64;
+    last as i64;
+}
+
+fn vec_init(v as *Vector, words as i64) as void {
+    v.storage = cast(*i64, 0);
+    v.words = words;
+    v.capacity = 0;
+    v.first = 0;
+    v.last = 0;
+}
+
+fn vec_new(words as i64) as *Vector {
+    let is *Vector as v = cast(*Vector, alloc(sizeof(Vector)));
+    vec_init(v, words);
+    return v;
+}
+
+fn vec_dispose(v as *Vector) as void {
+    if (cast(i64, v.storage) != 0) { release(cast(*u8, v.storage)); }
+}
+
+fn vec_free(v as *Vector) as void {
+    vec_dispose(v);
+    release(cast(*u8, v));
+}
+
+fn vec_append(v as *Vector, elem as *i64) as void {
+    let is i64 as w = v.words;
+    if (cast(i64, v.storage) == 0) {
+        v.storage = cast(*i64, alloc(INITIAL_SIZE * w * 8));
+        v.capacity = INITIAL_SIZE;
+    } else if (v.last >= v.capacity) {
+        v.capacity = v.capacity * 2;
+        let is *i64 as ns = cast(*i64, alloc(v.capacity * w * 8));
+        let is i64 as i with mut = 0;
+        while (i < v.last * w) { ns[i] = v.storage[i]; i = i + 1; }
+        release(cast(*u8, v.storage));
+        v.storage = ns;
+    }
+    let is *i64 as d = &v.storage[v.last * w];
+    let is i64 as k with mut = 0;
+    while (k < w) { d[k] = elem[k]; k = k + 1; }
+    v.last = v.last + 1;
+}
+
+fn vec_at(v as *Vector, idx as i64) as *i64 {
+    if (cast(i64, v.storage) == 0 || idx >= v.last - v.first) { return cast(*i64, 0); }
+    return &v.storage[(v.first + idx) * v.words];
+}
+
+fn vec_size(v as *Vector) as i64 { return v.last - v.first; }
+
+// f(ctx, pointer to the element) for every element, in order.
+fn vec_for_each(v as *Vector, f as *u8, ctx as *u8) as void {
+    let is i64 as i with mut = v.first;
+    while (i < v.last) {
+        call(f, ctx, &v.storage[i * v.words]);
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vectors in the plane and in space.
+
+struct Vector2D { x as f64; y as f64; }
+struct Vector3D { x as f64; y as f64; z as f64; }
+
+fn v2(x as f64, y as f64) as Vector2D {
+    let is Vector2D as r;
+    r.x = x;
+    r.y = y;
+    return r;
+}
+
+fn v2_plus(a as Vector2D, b as Vector2D) as Vector2D { return v2(a.x + b.x, a.y + b.y); }
+fn v2_minus(a as Vector2D, b as Vector2D) as Vector2D { return v2(a.x - b.x, a.y - b.y); }
+
+fn compare_numbers(a as f64, b as f64) as i32 {
+    if (a == b) { return 0; }
+    if (a < b) { return 0 - 1; }
+    if (a > b) { return 1; }
+    // a is NaN: it sorts after everything, b being NaN or not.
+    if (a == a) { return 1; }
+    return 0 - 1;
+}
+
+fn v2_compare(a as *Vector2D, b as *Vector2D) as i32 {
+    let is i32 as result = compare_numbers(a.x, b.x);
+    if (result != 0) { return result; }
+    return compare_numbers(a.y, b.y);
+}
+
+fn v3(x as f64, y as f64, z as f64) as Vector3D {
+    let is Vector3D as r;
+    r.x = x;
+    r.y = y;
+    r.z = z;
+    return r;
+}
+
+fn v3_plus(a as Vector3D, b as Vector3D) as Vector3D { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+fn v3_minus(a as Vector3D, b as Vector3D) as Vector3D { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+fn v3_dot(a as Vector3D, b as Vector3D) as f64 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+fn v3_squared_magnitude(a as Vector3D) as f64 { return v3_dot(a, a); }
+fn v3_magnitude(a as Vector3D) as f64 { return math.sqrt(v3_squared_magnitude(a)); }
+fn v3_times(a as Vector3D, amount as f64) as Vector3D { return v3(a.x * amount, a.y * amount, a.z * amount); }
+
+// ---------------------------------------------------------------------------
+// Red-black tree. Keys are either call signs or voxels (2-D vectors), fixed
+// per tree; values are up to three words.
+
+let is i32 as RED with imut = 0;
+let is i32 as BLACK with imut = 1;
+
+struct Value { a as i64; b as i64; c as i64; }
+
+struct Node {
+    key as Vector2D;        // a call sign sits in the first word
+    value as Value;
+    left as *Node;
+    right as *Node;
+    parent as *Node;
+    color as i32;
+}
+
+struct Tree {
+    root as *Node;
+    by_call_sign as i32;
+}
+
+fn tree_init(t as *Tree, by_call_sign as i32) as void {
+    t.root = cast(*Node, 0);
+    t.by_call_sign = by_call_sign;
+}
+
+fn free_nodes(n as *Node) as void {
+    if (cast(i64, n) == 0) { return; }
+    free_nodes(n.left);
+    free_nodes(n.right);
+    release(cast(*u8, n));
+}
+
+fn tree_dispose(t as *Tree) as void { free_nodes(t.root); }
+
+fn key_compare(t as *Tree, a as *Vector2D, b as *Vector2D) as i32 {
+    if (t.by_call_sign != 0) {
+        let is i64 as x = *cast(*i64, a);
+        let is i64 as y = *cast(*i64, b);
+        if (x == y) { return 0; }
+        if (x < y) { return 0 - 1; }
+        return 1;
+    }
+    return v2_compare(a, b);
+}
+
+fn tree_minimum(x as *Node) as *Node {
+    let is *Node as current with mut = x;
+    while (cast(i64, current.left) != 0) { current = current.left; }
+    return current;
+}
+
+fn successor(n as *Node) as *Node {
+    let is *Node as x with mut = n;
+    if (cast(i64, x.right) != 0) { return tree_minimum(x.right); }
+    let is *Node as y with mut = x.parent;
+    while (cast(i64, y) != 0 && x == y.right) {
+        x = y;
+        y = y.parent;
+    }
+    return y;
+}
+
+fn left_rotate(t as *Tree, x as *Node) as *Node {
+    let is *Node as y = x.right;
+    x.right = y.left;
+    if (cast(i64, y.left) != 0) { y.left.parent = x; }
+    y.parent = x.parent;
+    if (cast(i64, x.parent) == 0) {
+        t.root = y;
+    } else {
+        if (x == x.parent.left) { x.parent.left = y; } else { x.parent.right = y; }
+    }
+    y.left = x;
+    x.parent = y;
+    return y;
+}
+
+fn right_rotate(t as *Tree, y as *Node) as *Node {
+    let is *Node as x = y.left;
+    y.left = x.right;
+    if (cast(i64, x.right) != 0) { x.right.parent = y; }
+    x.parent = y.parent;
+    if (cast(i64, y.parent) == 0) {
+        t.root = x;
+    } else {
+        if (y == y.parent.left) { y.parent.left = x; } else { y.parent.right = x; }
+    }
+    x.right = y;
+    y.parent = x;
+    return x;
+}
+
+// Plain binary-tree insertion: the new node, or null when the key was there
+// (its old value then goes to *old and the node takes the new one).
+fn tree_insert(t as *Tree, key as *Vector2D, value as *Value, old as *Value) as *Node {
+    let is *Node as y with mut = cast(*Node, 0);
+    let is *Node as x with mut = t.root;
+    while (cast(i64, x) != 0) {
+        y = x;
+        let is i32 as comparison_result = key_compare(t, key, &x.key);
+        if (comparison_result < 0) {
+            x = x.left;
+        } else if (comparison_result > 0) {
+            x = x.right;
+        } else {
+            *old = x.value;
+            x.value = *value;
+            return cast(*Node, 0);
+        }
+    }
+    let is *Node as z = cast(*Node, alloc(sizeof(Node)));
+    z.key = *key;
+    z.value = *value;
+    z.left = cast(*Node, 0);
+    z.right = cast(*Node, 0);
+    z.color = RED;
+    z.parent = y;
+    if (cast(i64, y) == 0) {
+        t.root = z;
+    } else {
+        if (key_compare(t, key, &y.key) < 0) { y.left = z; } else { y.right = z; }
+    }
+    return z;
+}
+
+// Inserts or replaces; 1 when the key was already there, its old value in *old.
+fn tree_put(t as *Tree, key as *Vector2D, value as *Value, old as *Value) as i32 {
+    let is *Node as x with mut = tree_insert(t, key, value, old);
+    if (cast(i64, x) == 0) { return 1; }
+    while (x != t.root && x.parent.color == RED) {
+        if (x.parent == x.parent.parent.left) {
+            let is *Node as y = x.parent.parent.right;
+            if (cast(i64, y) != 0 && y.color == RED) {
+                x.parent.color = BLACK;
+                y.color = BLACK;
+                x.parent.parent.color = RED;
+                x = x.parent.parent;
+            } else {
+                if (x == x.parent.right) {
+                    x = x.parent;
+                    left_rotate(t, x);
+                }
+                x.parent.color = BLACK;
+                x.parent.parent.color = RED;
+                right_rotate(t, x.parent.parent);
+            }
+        } else {
+            let is *Node as y = x.parent.parent.left;
+            if (cast(i64, y) != 0 && y.color == RED) {
+                x.parent.color = BLACK;
+                y.color = BLACK;
+                x.parent.parent.color = RED;
+                x = x.parent.parent;
+            } else {
+                if (x == x.parent.left) {
+                    x = x.parent;
+                    right_rotate(t, x);
+                }
+                x.parent.color = BLACK;
+                x.parent.parent.color = RED;
+                left_rotate(t, x.parent.parent);
+            }
+        }
+    }
+    t.root.color = BLACK;
+    return 0;
+}
+
+fn find_node(t as *Tree, key as *Vector2D) as *Node {
+    let is *Node as current with mut = t.root;
+    while (cast(i64, current) != 0) {
+        let is i32 as comparison_result = key_compare(t, key, &current.key);
+        if (comparison_result == 0) { return current; }
+        if (comparison_result < 0) { current = current.left; } else { current = current.right; }
+    }
+    return cast(*Node, 0);
+}
+
+fn tree_get(t as *Tree, key as *Vector2D) as *Value {
+    let is *Node as node = find_node(t, key);
+    if (cast(i64, node) == 0) { return cast(*Value, 0); }
+    return &node.value;
+}
+
+fn is_black(n as *Node) as i32 { return cast(i64, n) == 0 || n.color == BLACK; }
+
+fn remove_fixup(t as *Tree, x0 as *Node, x_parent0 as *Node) as void {
+    let is *Node as x with mut = x0;
+    let is *Node as x_parent with mut = x_parent0;
+    while (x != t.root && is_black(x) != 0) {
+        if (x == x_parent.left) {
+            let is *Node as w with mut = x_parent.right;
+            if (w.color == RED) {
+                w.color = BLACK;
+                x_parent.color = RED;
+                left_rotate(t, x_parent);
+                w = x_parent.right;
+            }
+            if (is_black(w.left) != 0 && is_black(w.right) != 0) {
+                w.color = RED;
+                x = x_parent;
+                x_parent = x.parent;
+            } else {
+                if (is_black(w.right) != 0) {
+                    w.left.color = BLACK;
+                    w.color = RED;
+                    right_rotate(t, w);
+                    w = x_parent.right;
+                }
+                w.color = x_parent.color;
+                x_parent.color = BLACK;
+                if (cast(i64, w.right) != 0) { w.right.color = BLACK; }
+                left_rotate(t, x_parent);
+                x = t.root;
+                x_parent = x.parent;
+            }
+        } else {
+            let is *Node as w with mut = x_parent.left;
+            if (w.color == RED) {
+                w.color = BLACK;
+                x_parent.color = RED;
+                right_rotate(t, x_parent);
+                w = x_parent.left;
+            }
+            if (is_black(w.right) != 0 && is_black(w.left) != 0) {
+                w.color = RED;
+                x = x_parent;
+                x_parent = x.parent;
+            } else {
+                if (is_black(w.left) != 0) {
+                    w.right.color = BLACK;
+                    w.color = RED;
+                    left_rotate(t, w);
+                    w = x_parent.left;
+                }
+                w.color = x_parent.color;
+                x_parent.color = BLACK;
+                if (cast(i64, w.left) != 0) { w.left.color = BLACK; }
+                right_rotate(t, x_parent);
+                x = t.root;
+                x_parent = x.parent;
+            }
+        }
+    }
+    if (cast(i64, x) != 0) { x.color = BLACK; }
+}
+
+fn tree_remove(t as *Tree, key as *Vector2D) as void {
+    let is *Node as z = find_node(t, key);
+    if (cast(i64, z) == 0) { return; }
+    let is *Node as y with mut = z;
+    if (cast(i64, z.left) != 0 && cast(i64, z.right) != 0) { y = successor(z); }
+    let is *Node as x with mut = y.right;
+    if (cast(i64, y.left) != 0) { x = y.left; }
+    let is *Node as x_parent with mut = y.parent;
+    if (cast(i64, x) != 0) {
+        x.parent = y.parent;
+        x_parent = x.parent;
+    }
+    if (cast(i64, y.parent) == 0) {
+        t.root = x;
+    } else {
+        if (y == y.parent.left) { y.parent.left = x; } else { y.parent.right = x; }
+    }
+    if (y != z) {
+        if (y.color == BLACK) { remove_fixup(t, x, x_parent); }
+        y.parent = z.parent;
+        y.color = z.color;
+        y.left = z.left;
+        y.right = z.right;
+        if (cast(i64, z.left) != 0) { z.left.parent = y; }
+        if (cast(i64, z.right) != 0) { z.right.parent = y; }
+        if (cast(i64, z.parent) != 0) {
+            if (z.parent.left == z) { z.parent.left = y; } else { z.parent.right = y; }
+        } else {
+            t.root = y;
+        }
+    } else if (y.color == BLACK) {
+        remove_fixup(t, x, x_parent);
+    }
+    release(cast(*u8, z));
+}
+
+struct TreeEntry {
+    key as Vector2D;
+    value as Value;
+}
+
+// f(ctx, *TreeEntry) for every entry in key order; the entry is a copy.
+fn tree_for_each(t as *Tree, f as *u8, ctx as *u8) as void {
+    if (cast(i64, t.root) == 0) { return; }
+    let is *Node as current with mut = tree_minimum(t.root);
+    while (cast(i64, current) != 0) {
+        let is TreeEntry as entry;
+        entry.key = current.key;
+        entry.value = current.value;
+        call(f, ctx, &entry);
+        current = successor(current);
+    }
+}
+
+fn call_sign_key(cs as i64) as Vector2D {
+    let is Vector2D as k;
+    *cast(*i64, &k) = cs;
+    k.y = 0.0;
+    return k;
+}
+
+fn v3_value(v as Vector3D) as Value { return *cast(*Value, &v); }
+
+fn flag_value(b as i64) as Value {
+    let is Value as v;
+    v.a = b;
+    v.b = 0;
+    v.c = 0;
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// The simulation's records.
+
+let is f64 as MIN_X with imut = 0.0;
+let is f64 as MIN_Y with imut = 0.0;
+let is f64 as MAX_X with imut = 1000.0;
+let is f64 as MAX_Y with imut = 1000.0;
+let is f64 as MIN_Z with imut = 0.0;
+let is f64 as MAX_Z with imut = 10.0;
+let is f64 as PROXIMITY_RADIUS with imut = 1.0;
+let is f64 as GOOD_VOXEL_SIZE with imut = 2.0;
+
+struct Motion {
+    call_sign as i64;
+    pos_one as Vector3D;
+    pos_two as Vector3D;
+}
+
+struct Aircraft {
+    call_sign as i64;
+    position as Vector3D;
+}
+
+struct Collision {
+    aircraft_a as i64;
+    aircraft_b as i64;
+    position as Vector3D;
+}
+
+fn words_of(size as i64) as i64 { return size / 8; }
+
+fn motion_delta(m as *Motion) as Vector3D { return v3_minus(m.pos_two, m.pos_one); }
+
+// The midpoint of the closest approach of the two motions within the
+// proximity radius, if there is one inside the airspace, in *result.
+fn find_intersection(m as *Motion, other as *Motion, result as *Vector3D) as i32 {
+    let is Vector3D as init1 = m.pos_one;
+    let is Vector3D as init2 = other.pos_one;
+    let is Vector3D as vec1 = motion_delta(m);
+    let is Vector3D as vec2 = motion_delta(other);
+    let is f64 as radius = PROXIMITY_RADIUS;
+    let is f64 as a = v3_squared_magnitude(v3_minus(vec2, vec1));
+    if (a != 0.0) {
+        let is f64 as b = 2.0 * v3_dot(v3_minus(init1, init2), v3_minus(vec1, vec2));
+        let is f64 as c = (0.0 - radius) * radius + v3_squared_magnitude(v3_minus(init2, init1));
+        let is f64 as discr = b * b - 4.0 * a * c;
+        if (discr < 0.0) { return 0; }
+        let is f64 as v1 = (0.0 - b - math.sqrt(discr)) / (2.0 * a);
+        let is f64 as v2v = (0.0 - b + math.sqrt(discr)) / (2.0 * a);
+        if (v1 <= v2v && ((v1 <= 1.0 && 1.0 <= v2v) || (v1 <= 0.0 && 0.0 <= v2v) || (0.0 <= v1 && v2v <= 1.0))) {
+            let is f64 as v with mut = v1;
+            if (v1 <= 0.0) { v = 0.0; }
+            let is Vector3D as result1 = v3_plus(init1, v3_times(vec1, v));
+            let is Vector3D as result2 = v3_plus(init2, v3_times(vec2, v));
+            let is Vector3D as r = v3_times(v3_plus(result1, result2), 0.5);
+            if (r.x >= MIN_X && r.x <= MAX_X && r.y >= MIN_Y && r.y <= MAX_Y && r.z >= MIN_Z && r.z <= MAX_Z) {
+                *result = r;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    let is f64 as dist = v3_magnitude(v3_minus(init2, init1));
+    if (dist <= radius) {
+        *result = v3_times(v3_plus(init1, init2), 0.5);
+        return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// The collision detector.
+
+struct Detector {
+    state as Tree;      // call sign -> position
+}
+
+let is Vector2D as horizontal with mut;
+let is Vector2D as vertical with mut;
+
+fn is_in_voxel(voxel as *Vector2D, motion as *Motion) as i32 {
+    if (voxel.x > MAX_X || voxel.x < MIN_X || voxel.y > MAX_Y || voxel.y < MIN_Y) { return 0; }
+    let is *Vector3D as init = &motion.pos_one;
+    let is *Vector3D as fin = &motion.pos_two;
+    let is f64 as v_s = GOOD_VOXEL_SIZE;
+    let is f64 as r = PROXIMITY_RADIUS / 2.0;
+    let is f64 as v_x = voxel.x;
+    let is f64 as x0 = init.x;
+    let is f64 as xv = fin.x - init.x;
+    let is f64 as v_y = voxel.y;
+    let is f64 as y0 = init.y;
+    let is f64 as yv = fin.y - init.y;
+    let is f64 as low_x with mut = (v_x - r - x0) / xv;
+    let is f64 as high_x with mut = (v_x + v_s + r - x0) / xv;
+    if (xv < 0.0) {
+        let is f64 as tmp = low_x;
+        low_x = high_x;
+        high_x = tmp;
+    }
+    let is f64 as low_y with mut = (v_y - r - y0) / yv;
+    let is f64 as high_y with mut = (v_y + v_s + r - y0) / yv;
+    if (yv < 0.0) {
+        let is f64 as tmp = low_y;
+        low_y = high_y;
+        high_y = tmp;
+    }
+    return ((xv == 0.0 && v_x <= x0 + r && x0 - r <= v_x + v_s)
+            || (low_x <= 1.0 && 1.0 <= high_x) || (low_x <= 0.0 && 0.0 <= high_x)
+            || (0.0 <= low_x && high_x <= 1.0))
+        && ((yv == 0.0 && v_y <= y0 + r && y0 - r <= v_y + v_s)
+            || ((low_y <= 1.0 && 1.0 <= high_y) || (low_y <= 0.0 && 0.0 <= high_y)
+                || (0.0 <= low_y && high_y <= 1.0)))
+        && (xv == 0.0 || yv == 0.0
+            || (low_y <= high_x && high_x <= high_y)
+            || (low_y <= low_x && low_x <= high_y)
+            || (low_x <= low_y && high_y <= high_x));
+}
+
+fn put_into_map(voxel_map as *Tree, voxel as *Vector2D, motion as *Motion) as void {
+    let is *Value as array = tree_get(voxel_map, voxel);
+    if (cast(i64, array) == 0) {
+        let is *Vector as arr = vec_new(words_of(sizeof(Motion)));
+        vec_append(arr, cast(*i64, motion));
+        let is Value as v = flag_value(cast(i64, arr));
+        let is Value as old;
+        tree_put(voxel_map, voxel, &v, &old);
+    } else {
+        vec_append(cast(*Vector, array.a), cast(*i64, motion));
+    }
+}
+
+fn recurse(voxel_map as *Tree, seen as *Tree, next_voxel as Vector2D, motion as *Motion) as void {
+    let is Vector2D as nv with mut = next_voxel;
+    if (is_in_voxel(&nv, motion) == 0) { return; }
+    let is Value as yes = flag_value(1);
+    let is Value as old;
+    if (tree_put(seen, &nv, &yes, &old) != 0 && old.a != 0) { return; }
+    put_into_map(voxel_map, &nv, motion);
+    recurse(voxel_map, seen, v2_minus(nv, horizontal), motion);
+    recurse(voxel_map, seen, v2_plus(nv, horizontal), motion);
+    recurse(voxel_map, seen, v2_minus(nv, vertical), motion);
+    recurse(voxel_map, seen, v2_plus(nv, vertical), motion);
+    recurse(voxel_map, seen, v2_minus(v2_minus(nv, horizontal), vertical), motion);
+    recurse(voxel_map, seen, v2_plus(v2_minus(nv, horizontal), vertical), motion);
+    recurse(voxel_map, seen, v2_minus(v2_plus(nv, horizontal), vertical), motion);
+    recurse(voxel_map, seen, v2_plus(v2_plus(nv, horizontal), vertical), motion);
+}
+
+fn voxel_hash(position as Vector3D) as Vector2D {
+    let is i32 as x_div = cast(i32, position.x / GOOD_VOXEL_SIZE);
+    let is i32 as y_div = cast(i32, position.y / GOOD_VOXEL_SIZE);
+    let is f64 as x with mut = GOOD_VOXEL_SIZE * cast(f64, x_div);
+    let is f64 as y with mut = GOOD_VOXEL_SIZE * cast(f64, y_div);
+    if (position.x < 0.0) { x = x - GOOD_VOXEL_SIZE; }
+    if (position.y < 0.0) { y = y - GOOD_VOXEL_SIZE; }
+    return v2(x, y);
+}
+
+fn draw_motion_on_voxel_map(ctx as *u8, motion as *Motion) as i64 {
+    let is Tree as seen;
+    tree_init(&seen, 0);
+    recurse(cast(*Tree, ctx), &seen, voxel_hash(motion.pos_one), motion);
+    tree_dispose(&seen);
+    return 0;
+}
+
+fn keep_crowded_voxel(ctx as *u8, e as *TreeEntry) as i64 {
+    let is *Vector as motions = cast(*Vector, e.value.a);
+    if (vec_size(motions) > 1) {
+        let is i64 as p with mut = e.value.a;
+        vec_append(cast(*Vector, ctx), &p);
+    } else {
+        vec_free(motions);
+    }
+    return 0;
+}
+
+fn reduce_collision_set(motions as *Vector) as *Vector {
+    let is Tree as voxel_map;
+    tree_init(&voxel_map, 0);
+    vec_for_each(motions, fn_ptr(draw_motion_on_voxel_map), cast(*u8, &voxel_map));
+    let is *Vector as result = vec_new(1);
+    tree_for_each(&voxel_map, fn_ptr(keep_crowded_voxel), cast(*u8, result));
+    tree_dispose(&voxel_map);
+    return result;
+}
+
+struct FrameCtx {
+    detector as *Detector;
+    seen as *Tree;
+    motions as *Vector;
+}
+
+fn record_aircraft(ctx as *u8, aircraft as *Aircraft) as i64 {
+    let is *FrameCtx as k = cast(*FrameCtx, ctx);
+    let is Vector2D as key = call_sign_key(aircraft.call_sign);
+    let is Value as pos = v3_value(aircraft.position);
+    let is Value as old;
+    let is i32 as had_old = tree_put(&k.detector.state, &key, &pos, &old);
+    let is Vector3D as new_position = aircraft.position;
+    let is Value as yes = flag_value(1);
+    let is Value as ignored;
+    tree_put(k.seen, &key, &yes, &ignored);
+    let is Motion as m;
+    m.call_sign = aircraft.call_sign;
+    if (had_old != 0) { m.pos_one = *cast(*Vector3D, &old); } else { m.pos_one = new_position; }
+    m.pos_two = new_position;
+    vec_append(k.motions, cast(*i64, &m));
+    return 0;
+}
+
+struct UnseenCtx {
+    seen as *Tree;
+    to_remove as *Vector;
+}
+
+fn collect_unseen(ctx as *u8, e as *TreeEntry) as i64 {
+    let is *UnseenCtx as k = cast(*UnseenCtx, ctx);
+    let is *Value as was_seen = tree_get(k.seen, &e.key);
+    if (cast(i64, was_seen) == 0 || was_seen.a == 0) {
+        vec_append(k.to_remove, cast(*i64, &e.key));
+    }
+    return 0;
+}
+
+fn remove_state(ctx as *u8, call_sign as *i64) as i64 {
+    let is Vector2D as key = call_sign_key(*call_sign);
+    tree_remove(cast(*Tree, ctx), &key);
+    return 0;
+}
+
+fn check_pairs(ctx as *u8, reduced_slot as *i64) as i64 {
+    let is *Vector as collisions = cast(*Vector, ctx);
+    let is *Vector as reduced = cast(*Vector, *reduced_slot);
+    let is i64 as i with mut = 0;
+    while (i < vec_size(reduced)) {
+        let is *Motion as motion1 = cast(*Motion, vec_at(reduced, i));
+        let is i64 as j with mut = i + 1;
+        while (j < vec_size(reduced)) {
+            let is *Motion as motion2 = cast(*Motion, vec_at(reduced, j));
+            let is Vector3D as where;
+            if (find_intersection(motion1, motion2, &where) != 0) {
+                let is Collision as c;
+                c.aircraft_a = motion1.call_sign;
+                c.aircraft_b = motion2.call_sign;
+                c.position = where;
+                vec_append(collisions, cast(*i64, &c));
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn handle_new_frame(d as *Detector, frame as *Vector) as *Vector {
+    let is Vector as motions;
+    vec_init(&motions, words_of(sizeof(Motion)));
+    let is Tree as seen;
+    tree_init(&seen, 1);
+    let is FrameCtx as fc;
+    fc.detector = d;
+    fc.seen = &seen;
+    fc.motions = &motions;
+    vec_for_each(frame, fn_ptr(record_aircraft), cast(*u8, &fc));
+
+    let is Vector as to_remove;
+    vec_init(&to_remove, 1);
+    let is UnseenCtx as uc;
+    uc.seen = &seen;
+    uc.to_remove = &to_remove;
+    tree_for_each(&d.state, fn_ptr(collect_unseen), cast(*u8, &uc));
+    vec_for_each(&to_remove, fn_ptr(remove_state), cast(*u8, &d.state));
+
+    let is *Vector as all_reduced = reduce_collision_set(&motions);
+    let is *Vector as collisions = vec_new(words_of(sizeof(Collision)));
+    vec_for_each(all_reduced, fn_ptr(check_pairs), cast(*u8, collisions));
+
+    let is i64 as i with mut = 0;
+    while (i < vec_size(all_reduced)) {
+        vec_free(cast(*Vector, *vec_at(all_reduced, i)));
+        i = i + 1;
+    }
+    vec_free(all_reduced);
+    vec_dispose(&to_remove);
+    tree_dispose(&seen);
+    vec_dispose(&motions);
+    return collisions;
+}
+
+// ---------------------------------------------------------------------------
+// The simulator: aircraft in pairs, one on a cosine track and one on a sine.
+
+fn simulate(aircraft as *Vector, time as f64, frame as *Vector) as void {
+    vec_init(frame, words_of(sizeof(Aircraft)));
+    let is i64 as i with mut = 0;
+    while (i < vec_size(aircraft)) {
+        let is Aircraft as a;
+        a.call_sign = *vec_at(aircraft, i);
+        a.position = v3(time, math.cos(time) * 2.0 + cast(f64, i) * 3.0, 10.0);
+        vec_append(frame, cast(*i64, &a));
+        let is Aircraft as b;
+        b.call_sign = *vec_at(aircraft, i + 1);
+        b.position = v3(time, math.sin(time) * 2.0 + cast(f64, i) * 3.0, 10.0);
+        vec_append(frame, cast(*i64, &b));
+        i = i + 2;
+    }
+}
+
+fn benchmark(num_aircrafts as i32) as i64 {
+    let is i32 as num_frames = 200;
+    let is Vector as aircraft;
+    vec_init(&aircraft, 1);
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, num_aircrafts)) {
+        let is i64 as cs with mut = i;
+        vec_append(&aircraft, &cs);
+        i = i + 1;
+    }
+    let is Detector as detector;
+    tree_init(&detector.state, 1);
+    let is i64 as actual_collisions with mut = 0;
+    let is i32 as f with mut = 0;
+    while (f < num_frames) {
+        let is f64 as time = cast(f64, f) / 10.0;
+        let is Vector as frame;
+        simulate(&aircraft, time, &frame);
+        let is *Vector as collisions = handle_new_frame(&detector, &frame);
+        actual_collisions = actual_collisions + vec_size(collisions);
+        vec_free(collisions);
+        vec_dispose(&frame);
+        f = f + 1;
+    }
+    tree_dispose(&detector.state);
+    vec_dispose(&aircraft);
+    return actual_collisions;
+}
+
+fn main() as i32 {
+    horizontal = v2(GOOD_VOXEL_SIZE, 0.0);
+    vertical = v2(0.0, GOOD_VOXEL_SIZE);
+    let is i64 as result with mut = 0;
+    let is i32 as r with mut = 0;
+    while (r < ROUNDS) {
+        result = benchmark(INNER);
+        if (result != 10830) {
+            io.printf("collision: wrong result %d\n", result);
+            return 1;
+        }
+        r = r + 1;
+    }
+    io.printf("collision: %d collisions\n", result);
+    return 0;
+}
