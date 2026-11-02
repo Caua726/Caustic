@@ -260,8 +260,14 @@ fn _ax_load(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as *d.IRIn
 
 // Values the vector loop skips must not be needed after the loop: anything the
 // loop defines other than the IV and the pointer inductions. Returns 1 if so.
+// _ax_bad_read, also letting `keep` (a value the vector code finishes) be read.
+fn _ax_bad_read2(o as *d.Operand, iv as i32, keep as i32) as i32 {
+    if (o.op_type == d.OP_VREG && o.vreg == keep) { return 0; }
+    return _ax_bad_read(o, iv);
+}
+
 fn loop_values_private(func as *d.IRFunction, hb as *cfg.BasicBlock, lb as *cfg.BasicBlock,
-                       iv as i32, vc as i32) as i32 {
+                       iv as i32, keep as i32, vc as i32) as i32 {
     // Values the vector loop skips must not be needed after the loop. A value is
     // needed if something other than a copy reads it, or a copy into a needed value.
     let is *i8 as u = cast(*i8, d.opt_alloc(cast(i64, vc + 1)));
@@ -297,8 +303,8 @@ fn loop_values_private(func as *d.IRFunction, hb as *cfg.BasicBlock, lb as *cfg.
             let is i32 as reads with mut = 1;
             if (w.op == d.IR_MOV && (w.dest.op_type != d.OP_VREG || _ax_get(u, w.dest.vreg, vc) == 0)) { reads = 0; }
             if (reads == 1) {
-                if (_ax_bad_read(&w.src1, iv) == 1 || _ax_bad_read(&w.src2, iv) == 1) { ok = 0; }
-                if (_ax_reads_dest(w.op) == 1 && _ax_bad_read(&w.dest, iv) == 1) { ok = 0; }
+                if (_ax_bad_read2(&w.src1, iv, keep) == 1 || _ax_bad_read2(&w.src2, iv, keep) == 1) { ok = 0; }
+                if (_ax_reads_dest(w.op) == 1 && _ax_bad_read2(&w.dest, iv, keep) == 1) { ok = 0; }
             }
         }
         if (cast(i64, w) == cast(i64, lb.last)) { inside = 0; }
@@ -367,7 +373,7 @@ fn detect_axpy(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoo
     let is i32 as base_a with mut = 0;
     if (_ax_addr(def_inst, def_count, vc, iv, iv_step, xd.src1.vreg, &base_a) == 0) { return 0; }
 
-    if (loop_values_private(func, hb, lb, iv, vc) == 0) { return 0; }
+    if (loop_values_private(func, hb, lb, iv, cast(i32, 0 - 1), vc) == 0) { return 0; }
     out.base_c = base_c; out.base_a = base_a; out.base_b = base_b;
     out.kvreg = kvreg; out.kimm = kimm;
     return 1;
@@ -422,8 +428,153 @@ fn detect_fill(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoo
         if (cast(i32, ak.kind) != sc.AE_INVARIANT) { return 0; }
         kvreg = sv;
     }
-    if (loop_values_private(func, hb, lb, iv, vc) == 0) { return 0; }
+    if (loop_values_private(func, hb, lb, iv, cast(i32, 0 - 1), vc) == 0) { return 0; }
     out.base = ae.base; out.kvreg = kvreg; out.kimm = kimm;
     return 1;
 }
 
+// Byte count: `if (p[i] == k) { c = c + 1; }` (or !=), as the front end lays it
+// out after mem2reg:
+//
+//     x = LOAD [p + i] ; c = EQ/NE x, k ; JZ/JNZ c -> Lskip
+//     [CAST a = acc] ; s = ADD a, 1 ; MOV t = s ; JMP Ljoin
+//     Lskip: MOV t = acc
+//     Ljoin: ... MOV acc = t ...
+//
+// acc is the only value the loop carries besides the IV.
+struct CountDescriptor {
+    base as i32;
+    kimm as i64;
+    acc as i32;
+    inc as i64;         // the ADD a, 1 (its cast_to is acc's type)
+    count_eq as i32;    // 1: counts p[i] == k, 0: counts p[i] != k
+}
+
+fn _cn_next(i as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n with mut = i.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1) { n = n.next; }
+    return n;
+}
+
+// v through CASTs and MOVs to the value it copies.
+fn _cn_root(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
+    let is i32 as r with mut = v;
+    let is i32 as g with mut = 0;
+    while (g < 8) {
+        let is *d.IRInst as dd = sc.scev_sdef(def_inst, def_count, vc, r);
+        if (cast(i64, dd) == 0 || (dd.op != d.IR_CAST && dd.op != d.IR_MOV) || dd.src1.op_type != d.OP_VREG) { return r; }
+        r = dd.src1.vreg;
+        g = g + 1;
+    }
+    return r;
+}
+
+// Number of live in-loop instructions that define v.
+fn _cn_defs(hb as *cfg.BasicBlock, lb as *cfg.BasicBlock, v as i32) as i32 {
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as b with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, b) != 0) {
+        if (b.is_dead == 0 && b.dest.op_type == d.OP_VREG && b.dest.vreg == v
+            && b.op != d.IR_STORE && b.op != d.IR_COPY) { n = n + 1; }
+        if (cast(i64, b) == cast(i64, lb.last)) { stop = 1; } else { b = b.next; }
+    }
+    return n;
+}
+
+fn detect_count(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                iv as i32, iv_step as i64, def_inst as *i64, def_count as *i32, vc as i32,
+                out as *CountDescriptor) as i32 {
+    if (iv_step != 1) { return 0; }
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is *d.IRInst as ld with mut = cast(*d.IRInst, 0);
+    let is i32 as nloads with mut = 0;
+    let is i32 as nstores with mut = 0;
+    let is *d.IRInst as b with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, b) != 0) {
+        if (b.is_dead == 0) {
+            if (b.op == d.IR_LOAD) { ld = b; nloads = nloads + 1; }
+            if (b.op == d.IR_STORE || b.op == d.IR_COPY || b.op == d.IR_CMOV) { nstores = nstores + 1; }
+        }
+        if (cast(i64, b) == cast(i64, lb.last)) { stop = 1; } else { b = b.next; }
+    }
+    if (nloads != 1 || nstores != 0) { return 0; }
+    if (ld.src1.op_type != d.OP_VREG || ld.dest.op_type != d.OP_VREG || cast(i64, ld.cast_to) == 0) { return 0; }
+    let is i32 as tk = *cast(*i32, ld.cast_to);
+    if (tk != 1 && tk != 5) { return 0; }   // ast.TY_I8, ast.TY_U8
+    let is sc.AffineExpr as ae;
+    sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, ld.src1.vreg, &ae, 0);
+    if (cast(i32, ae.kind) != sc.AE_AFFINE || ae.base < 0 || ae.step != 1 || ae.base_imm != 0) { return 0; }
+    if (sc.ctx_piv(ae.base) != 0) { return 0; }
+    // the compare and its branch
+    let is *d.IRInst as cmp with mut = cast(*d.IRInst, 0);
+    b = hb.first; stop = 0;
+    while (stop == 0 && cast(i64, b) != 0) {
+        if (b.is_dead == 0 && (b.op == d.IR_EQ || b.op == d.IR_NE) && b.src1.op_type == d.OP_VREG
+            && _cn_root(def_inst, def_count, vc, b.src1.vreg) == ld.dest.vreg) {
+            if (cast(i64, cmp) != 0) { return 0; }
+            cmp = b;
+        }
+        if (cast(i64, b) == cast(i64, lb.last)) { stop = 1; } else { b = b.next; }
+    }
+    if (cast(i64, cmp) == 0) { return 0; }
+    // a widening CAST between the load and the compare keeps the byte's value
+    let is i64 as k with mut = 0;
+    if (cmp.src2.op_type == d.OP_IMM) { k = cmp.src2.imm; }
+    else if (cmp.src2.op_type == d.OP_VREG) {
+        let is *d.IRInst as kd = sc.scev_sdef(def_inst, def_count, vc, cmp.src2.vreg);
+        if (cast(i64, kd) == 0 || kd.op != d.IR_IMM || kd.src1.op_type != d.OP_IMM) { return 0; }
+        k = kd.src1.imm;
+    } else { return 0; }
+    if (tk == 5 && (k < 0 || k > 255)) { return 0; }
+    if (tk == 1 && (k < 0 - 128 || k > 127)) { return 0; }
+    let is *d.IRInst as br = _cn_next(cmp);
+    if (cast(i64, br) == 0 || (br.op != d.IR_JZ && br.op != d.IR_JNZ) || br.src1.op_type != d.OP_VREG
+        || br.src1.vreg != cmp.dest.vreg || br.dest.op_type != d.OP_LABEL) { return 0; }
+    let is i32 as lskip = br.dest.label;
+    let is i32 as count_eq with mut = 0;
+    if ((cmp.op == d.IR_EQ && br.op == d.IR_JZ) || (cmp.op == d.IR_NE && br.op == d.IR_JNZ)) { count_eq = 1; }
+    // the increment arm, up to its JMP
+    let is *d.IRInst as inc with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as mt with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as w with mut = _cn_next(br);
+    while (cast(i64, w) != 0 && w.op != d.IR_JMP) {
+        if (w.op == d.IR_ADD) {
+            if (cast(i64, inc) != 0) { return 0; }
+            inc = w;
+        } else if (w.op == d.IR_MOV) {
+            if (cast(i64, mt) != 0) { return 0; }
+            mt = w;
+        } else if (w.op != d.IR_CAST) { return 0; }
+        w = _cn_next(w);
+    }
+    if (cast(i64, w) == 0 || cast(i64, inc) == 0 || cast(i64, mt) == 0 || w.dest.op_type != d.OP_LABEL) { return 0; }
+    let is i32 as ljoin = w.dest.label;
+    if (inc.src1.op_type != d.OP_VREG || inc.src2.op_type != d.OP_IMM || inc.src2.imm != 1) { return 0; }
+    if (mt.src1.op_type != d.OP_VREG || mt.src1.vreg != inc.dest.vreg || mt.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as acc = _cn_root(def_inst, def_count, vc, inc.src1.vreg);
+    let is i32 as t = mt.dest.vreg;
+    // Lskip: MOV t = acc, then Ljoin
+    let is *d.IRInst as ls = _cn_next(w);
+    if (cast(i64, ls) == 0 || ls.op != d.IR_LABEL || ls.dest.label != lskip) { return 0; }
+    let is *d.IRInst as me = _cn_next(ls);
+    if (cast(i64, me) == 0 || me.op != d.IR_MOV || me.dest.op_type != d.OP_VREG || me.dest.vreg != t
+        || me.src1.op_type != d.OP_VREG || _cn_root(def_inst, def_count, vc, me.src1.vreg) != acc) { return 0; }
+    let is *d.IRInst as lj = _cn_next(me);
+    if (cast(i64, lj) == 0 || lj.op != d.IR_LABEL || lj.dest.label != ljoin) { return 0; }
+    // acc's only in-loop def is MOV acc = t; t has just the two
+    if (acc == iv || _cn_defs(hb, lb, t) != 2 || _cn_defs(hb, lb, acc) != 1) { return 0; }
+    let is i32 as found with mut = 0;
+    b = lj; stop = 0;
+    while (stop == 0 && cast(i64, b) != 0) {
+        if (b.is_dead == 0 && b.op == d.IR_MOV && b.dest.op_type == d.OP_VREG && b.dest.vreg == acc
+            && b.src1.op_type == d.OP_VREG && b.src1.vreg == t) { found = 1; }
+        if (cast(i64, b) == cast(i64, lb.last)) { stop = 1; } else { b = b.next; }
+    }
+    if (found == 0) { return 0; }
+    if (loop_values_private(func, hb, lb, iv, acc, vc) == 0) { return 0; }
+    out.base = ae.base; out.kimm = k; out.acc = acc; out.inc = cast(i64, inc); out.count_eq = count_eq;
+    return 1;
+}
