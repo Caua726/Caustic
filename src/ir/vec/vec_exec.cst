@@ -772,3 +772,156 @@ fn vectorize_axpy(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Vec
     hb.first.is_extern_call = cast(i8, 1);
     return 1;
 }
+
+// --- byte fill (rc.FillDescriptor): p[i] = k on bytes ---
+//
+//   jmp .Lvec                     (before the scalar loop)
+//   ...scalar loop...  jmp exit
+//   .Lvec: k ; if (!avx2) goto .Lsse
+//          lim = n - 31 ; v = splat32(k) ; .La: if (i >= lim) goto scalar ;
+//            [p + i] = v ; i += 32 ; goto .La
+//   .Lsse: lim = n - 15 ; v = splat16(k) ; same with 16
+// The scalar loop finishes the last iterations from where the vector loop
+// left i. One store, so nothing to alias.
+
+fn _fill_loop(func as *d.IRFunction, ip0 as *d.IRInst, fd as *rc.FillDescriptor, iv as i32, ivop as *d.Operand,
+              nn as i32, kv as i32, wide as i32, hlabel as i32, vc as i32,
+              def_inst as *i64, def_count as *i32, ln as i32) as *d.IRInst {
+    let is *d.IRInst as ip with mut = ip0;
+    let is i32 as op_spl with mut = d.IR_VSPLATB;
+    let is i32 as op_st with mut = d.IR_VSTOREQ;
+    if (wide == 32) { op_spl = d.IR_VSPLATB256; op_st = d.IR_VSTOREQ256; }
+    let is i32 as lim_vreg = new_vreg(func);
+    let is *d.IRInst as sub = d.new_inst(d.IR_SUB);
+    sub.dest.op_type = cast(i8, d.OP_VREG); sub.dest.vreg = lim_vreg;
+    sub.src1.op_type = cast(i8, d.OP_VREG); sub.src1.vreg = nn;
+    sub.src2.op_type = cast(i8, d.OP_IMM);  sub.src2.imm = cast(i64, wide - 1); sub.line = ln;
+    ip = emit(ip, sub);
+    let is i32 as vk with mut = 0;
+    ip = _ax_inst(func, ip, op_spl, kv, cast(i32, 0 - 1), ln, &vk);
+    let is i32 as lbl = new_label(func);
+    let is *d.IRInst as li = d.new_inst(d.IR_LABEL);
+    li.dest.op_type = cast(i8, d.OP_LABEL); li.dest.label = lbl; li.line = ln;
+    ip = emit(ip, li);
+    let is i32 as ivn with mut = 0;
+    ip = _ax_operand(func, ip, ivop, def_inst, def_count, vc, ln, &ivn);
+    let is i32 as cond with mut = 0;
+    ip = emit_vv(func, ip, d.IR_LT, ivn, lim_vreg, ln, &cond);
+    let is *d.IRInst as jz = d.new_inst(d.IR_JZ);
+    jz.src1.op_type = cast(i8, d.OP_VREG); jz.src1.vreg = cond;
+    jz.dest.op_type = cast(i8, d.OP_LABEL); jz.dest.label = hlabel; jz.line = ln;
+    ip = emit(ip, jz);
+    let is i32 as addr with mut = 0;
+    ip = emit_vv(func, ip, d.IR_ADD, fd.base, ivn, ln, &addr);
+    let is *d.IRInst as st = d.new_inst(op_st);
+    st.src1.op_type = cast(i8, d.OP_VREG); st.src1.vreg = addr;
+    st.src2.op_type = cast(i8, d.OP_VREG); st.src2.vreg = vk;
+    st.dest.op_type = cast(i8, d.OP_IMM);  st.dest.imm = 0; st.line = ln;
+    ip = emit(ip, st);
+    let is *d.IRInst as ia = d.new_inst(d.IR_ADD);
+    ia.dest.op_type = cast(i8, d.OP_VREG); ia.dest.vreg = iv;
+    ia.src1.op_type = cast(i8, d.OP_VREG); ia.src1.vreg = iv;
+    ia.src2.op_type = cast(i8, d.OP_IMM);  ia.src2.imm = cast(i64, wide); ia.line = ln;
+    ip = emit(ip, ia);
+    let is *d.IRInst as jb = d.new_inst(d.IR_JMP);
+    jb.dest.op_type = cast(i8, d.OP_LABEL); jb.dest.label = lbl; jb.line = ln;
+    return emit(ip, jb);
+}
+
+// The loop's exit test `iv < n` as (jz, lt); 0 when it is not that shape.
+fn _exit_test(blocks as *cfg.BasicBlock, L as *vl.VecLoop, iv as i32,
+              def_inst as *i64, def_count as *i32, vc as i32, out_jz as *i64) as *d.IRInst {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *d.IRInst as p with mut = hb.first;
+    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
+    while (cast(i64, p) != 0) {
+        if (p.is_dead == 0 && p.op == d.IR_JZ) { jz = p; }
+        if (cast(i64, p) == cast(i64, hb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+    }
+    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG || jz.dest.op_type != d.OP_LABEL) { return cast(*d.IRInst, 0); }
+    let is *d.IRInst as lt = sc.scev_sdef(def_inst, def_count, vc, jz.src1.vreg);
+    if (cast(i64, lt) == 0 || lt.op != d.IR_LT || lt.src1.op_type != d.OP_VREG) { return cast(*d.IRInst, 0); }
+    if (_ax_test_src(&lt.src1, iv, def_inst, def_count, vc) == 0) { return cast(*d.IRInst, 0); }
+    if (lt.src2.op_type != d.OP_IMM && _ax_test_src(&lt.src2, cast(i32, 0 - 1), def_inst, def_count, vc) == 0) { return cast(*d.IRInst, 0); }
+    *out_jz = cast(i64, jz);
+    return lt;
+}
+
+// The instruction right before `first` in the function's list.
+fn _inst_before(func as *d.IRFunction, first as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as q with mut = func.instructions;
+    while (cast(i64, q) != 0) {
+        if (cast(i64, q.next) == cast(i64, first)) { return q; }
+        q = q.next;
+    }
+    return cast(*d.IRInst, 0);
+}
+
+// IR_HASAVX2 once at function entry, after the arguments (cpuid is slow and
+// serializing, and the loop is often inner to others). Returns the flag vreg.
+fn _avx2_flag(func as *d.IRFunction, ln as i32) as i32 {
+    let is i32 as flag = new_vreg(func);
+    let is *d.IRInst as hav = d.new_inst(d.IR_HASAVX2);
+    hav.dest.op_type = cast(i8, d.OP_VREG); hav.dest.vreg = flag; hav.line = ln;
+    let is *d.IRInst as at with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as fw with mut = func.instructions;
+    while (cast(i64, fw) != 0 && (fw.op == d.IR_GET_ARG || fw.is_dead != 0)) { at = fw; fw = fw.next; }
+    if (cast(i64, at) == 0) { hav.next = func.instructions; func.instructions = hav; }
+    else { emit(at, hav); }
+    return flag;
+}
+
+fn vectorize_fill(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                  iv as i32, iv_step as i64, fd as *rc.FillDescriptor,
+                  def_inst as *i64, def_count as *i32, vc as i32) as i32 {
+    if (iv_step != 1) { return 0; }
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is i64 as jzp with mut = 0;
+    let is *d.IRInst as lt = _exit_test(blocks, L, iv, def_inst, def_count, vc, &jzp);
+    if (cast(i64, lt) == 0) { return 0; }
+    let is *d.IRInst as jz = cast(*d.IRInst, jzp);
+    let is i32 as exit_label = jz.dest.label;
+    let is i32 as hlabel = L.header_label;
+    if (hlabel < 0) { return 0; }
+    let is i32 as ln = hb.first.line;
+    let is *d.IRInst as prev = _inst_before(func, hb.first);
+    if (cast(i64, prev) == 0) { return 0; }
+
+    let is i32 as Lvec = new_label(func);
+    let is *d.IRInst as jv = d.new_inst(d.IR_JMP);
+    jv.dest.op_type = cast(i8, d.OP_LABEL); jv.dest.label = Lvec; jv.line = ln;
+    emit(prev, jv);
+
+    let is *d.IRInst as ip with mut = lb.last;
+    let is *d.IRInst as jskip = d.new_inst(d.IR_JMP);
+    jskip.dest.op_type = cast(i8, d.OP_LABEL); jskip.dest.label = exit_label; jskip.line = ln;
+    ip = emit(ip, jskip);
+    let is *d.IRInst as lblv = d.new_inst(d.IR_LABEL);
+    lblv.dest.op_type = cast(i8, d.OP_LABEL); lblv.dest.label = Lvec; lblv.line = ln;
+    ip = emit(ip, lblv);
+    let is i32 as nn with mut = 0;
+    ip = _ax_operand(func, ip, &lt.src2, def_inst, def_count, vc, ln, &nn);
+    let is i32 as kv with mut = fd.kvreg;
+    if (kv < 0) {
+        kv = new_vreg(func);
+        let is *d.IRInst as ki = d.new_inst(d.IR_IMM);
+        ki.dest.op_type = cast(i8, d.OP_VREG); ki.dest.vreg = kv;
+        ki.src1.op_type = cast(i8, d.OP_IMM); ki.src1.imm = fd.kimm; ki.line = ln;
+        ip = emit(ip, ki);
+    }
+    let is i32 as flag = _avx2_flag(func, ln);
+    let is i32 as Lsse = new_label(func);
+    let is *d.IRInst as jzs = d.new_inst(d.IR_JZ);
+    jzs.src1.op_type = cast(i8, d.OP_VREG); jzs.src1.vreg = flag;
+    jzs.dest.op_type = cast(i8, d.OP_LABEL); jzs.dest.label = Lsse; jzs.line = ln;
+    ip = emit(ip, jzs);
+    ip = _fill_loop(func, ip, fd, iv, &lt.src1, nn, kv, 32, hlabel, vc, def_inst, def_count, ln);
+    let is *d.IRInst as ls = d.new_inst(d.IR_LABEL);
+    ls.dest.op_type = cast(i8, d.OP_LABEL); ls.dest.label = Lsse; ls.line = ln;
+    ip = emit(ip, ls);
+    ip = _fill_loop(func, ip, fd, iv, &lt.src1, nn, kv, 16, hlabel, vc, def_inst, def_count, ln);
+
+    hb.first.is_extern_call = cast(i8, 1);
+    return 1;
+}
