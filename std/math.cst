@@ -198,6 +198,13 @@ let is f64 as RAD2DEG = 57.29577951308232;
 // exact in binary keeps the reduced argument accurate.
 let is f64 as PI_2_HI = 1.5707963267948966;
 let is f64 as PI_2_LO = 0.00000000000000006123233995736766;
+// pi/2 as three 24-bit pieces and what is left. A product of one piece and
+// an integer below 2^29 is exact, which is what lets the trig reduction take
+// many multiples of pi/2 off a large argument without losing the low bits.
+let is f64 as PIO2_1  = 1.570796251296997;
+let is f64 as PIO2_2  = 0.00000007549789415861596;
+let is f64 as PIO2_3  = 0.000000000000005390302529957765;
+let is f64 as PIO2_4  = 0.00000000000000000000032820035428735005;
 let is f64 as LN2_HI  = 0.6931471803691238;
 let is f64 as LN2_LO  = 0.0000000001908214929270588;
 
@@ -462,59 +469,85 @@ fn pow(b as f64, e as f64) as f64 {
 // --- Trigonometry ---
 
 // Reduce x to r in [-pi/4, pi/4] plus a quadrant, then read sin and cos off
-// the same reduction. Returns the quadrant; writes the reduced argument.
-fn _trig_reduce(x as f64, r_out as *f64) as i64 {
+// the same reduction. Returns the quadrant; writes r as a sum hi + lo.
+//
+// x - n*PIO2_1 is exact (the product is exact and the two terms are within a
+// factor of two), and the next piece is taken off with an error-free
+// two-sum, so r carries about 100 bits of pi/2 instead of 53. With only 53,
+// sin(355) came out wrong from the 11th digit: 355 is within 3e-5 of a
+// multiple of pi, and the lost bits are all that is left of the result.
+// Beyond |n| = 2^29 the products stop being exact; there the old two-piece
+// subtraction stays.
+fn _trig_reduce(x as f64, hi_out as *f64, lo_out as *f64) as i64 {
     let is f64 as nf = round(x * 0.6366197723675814);   // x / (pi/2)
-    *r_out = (x - nf * PI_2_HI) - nf * PI_2_LO;
+    if (abs_f64(nf) < 536870912.0) {
+        let is f64 as t = x - nf * PIO2_1;
+        let is f64 as b = 0.0 - nf * PIO2_2;
+        let is f64 as s = t + b;
+        let is f64 as bb = s - t;
+        let is f64 as err = (t - (s - bb)) + (b - bb);
+        let is f64 as lo = (err - nf * PIO2_3) - nf * PIO2_4;
+        let is f64 as hi = s + lo;
+        *hi_out = hi;
+        *lo_out = lo - (hi - s);
+    } else {
+        *hi_out = (x - nf * PI_2_HI) - nf * PI_2_LO;
+        *lo_out = 0.0;
+    }
     let is i64 as q = cast(i64, nf) & 3;
     if (q < 0) { return q + 4; }
     return q;
 }
 
-// sin on [-pi/4, pi/4]: r * (1 - z/3! + z^2/5! - ...), z = r^2.
-fn _sin_poly(r as f64) as f64 {
-    let is f64 as z = r * r;
-    let is f64 as p with mut = 0.00000000016059043836821613;   // 1/13!
-    p = z * p - 0.000000025052108385441718;                    // 1/11!
-    p = z * p + 0.0000027557319223985893;                      // 1/9!
-    p = z * p - 0.0001984126984126984;                         // 1/7!
-    p = z * p + 0.008333333333333333;                          // 1/5!
-    p = z * p - 0.16666666666666666;                           // 1/3!
-    p = z * p + 1.0;
-    return r * p;
+// sin(hi + lo) on [-pi/4, pi/4]: r * (1 - z/3! + z^2/5! - ...), z = r^2, with
+// lo folded in through the derivative.
+fn _sin_poly(hi as f64, lo as f64) as f64 {
+    let is f64 as z = hi * hi;
+    let is f64 as p with mut = 0.0000000000000028114572543455206;   // 1/17!
+    p = z * p - 0.0000000000007647163731819816;                    // 1/15!
+    p = z * p + 0.00000000016059043836821613;                      // 1/13!
+    p = z * p - 0.000000025052108385441718;                        // 1/11!
+    p = z * p + 0.0000027557319223985893;                          // 1/9!
+    p = z * p - 0.0001984126984126984;                             // 1/7!
+    p = z * p + 0.008333333333333333;                              // 1/5!
+    p = z * p - 0.16666666666666666;                               // 1/3!
+    return hi + (hi * z * p + lo * (1.0 - 0.5 * z));
 }
 
-// cos on [-pi/4, pi/4]: 1 - z/2! + z^2/4! - ...
-fn _cos_poly(r as f64) as f64 {
-    let is f64 as z = r * r;
-    let is f64 as p with mut = 0.0000000020876756987868098;   // 1/12!
-    p = z * p - 0.00000027557319223985893;                    // 1/10!
-    p = z * p + 0.0000248015873015873;                        // 1/8!
-    p = z * p - 0.001388888888888889;                         // 1/6!
-    p = z * p + 0.041666666666666664;                         // 1/4!
-    p = z * p - 0.5;                                          // 1/2!
-    p = z * p + 1.0;
-    return p;
+// cos(hi + lo) on [-pi/4, pi/4]: 1 - z/2! + z^2/4! - ...
+fn _cos_poly(hi as f64, lo as f64) as f64 {
+    let is f64 as z = hi * hi;
+    let is f64 as p with mut = 0.00000000000004779477332387385;   // 1/16!
+    p = z * p - 0.000000000011470745597729725;                    // 1/14!
+    p = z * p + 0.0000000020876756987868098;                      // 1/12!
+    p = z * p - 0.00000027557319223985893;                        // 1/10!
+    p = z * p + 0.0000248015873015873;                            // 1/8!
+    p = z * p - 0.001388888888888889;                             // 1/6!
+    p = z * p + 0.041666666666666664;                             // 1/4!
+    p = z * p - 0.5;                                              // 1/2!
+    return 1.0 + (z * p - hi * lo);
 }
 
 fn sin(x as f64) as f64 {
     if (is_finite(x) == 0) { return nan(); }
-    let is f64 as r with mut = 0.0;
-    let is i64 as q = _trig_reduce(x, &r);
-    if (q == 0) { return _sin_poly(r); }
-    if (q == 1) { return _cos_poly(r); }
-    if (q == 2) { return 0.0 - _sin_poly(r); }
-    return 0.0 - _cos_poly(r);
+    let is f64 as hi with mut = 0.0;
+    let is f64 as lo with mut = 0.0;
+    let is i64 as q = _trig_reduce(x, &hi, &lo);
+    if (q == 0) { return _sin_poly(hi, lo); }
+    if (q == 1) { return _cos_poly(hi, lo); }
+    if (q == 2) { return 0.0 - _sin_poly(hi, lo); }
+    return 0.0 - _cos_poly(hi, lo);
 }
 
 fn cos(x as f64) as f64 {
     if (is_finite(x) == 0) { return nan(); }
-    let is f64 as r with mut = 0.0;
-    let is i64 as q = _trig_reduce(x, &r);
-    if (q == 0) { return _cos_poly(r); }
-    if (q == 1) { return 0.0 - _sin_poly(r); }
-    if (q == 2) { return 0.0 - _cos_poly(r); }
-    return _sin_poly(r);
+    let is f64 as hi with mut = 0.0;
+    let is f64 as lo with mut = 0.0;
+    let is i64 as q = _trig_reduce(x, &hi, &lo);
+    if (q == 0) { return _cos_poly(hi, lo); }
+    if (q == 1) { return 0.0 - _sin_poly(hi, lo); }
+    if (q == 2) { return 0.0 - _cos_poly(hi, lo); }
+    return _sin_poly(hi, lo);
 }
 
 fn tan(x as f64) as f64 {
