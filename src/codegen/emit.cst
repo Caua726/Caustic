@@ -596,6 +596,9 @@ fn lz_cmp32(inst as *d.IRInst) as i32 {
     return 0;
 }
 
+fn _lzgi(a as *i32, i as i32) as i32 { return *(cast(*i32, cast(i64, a) + cast(i64, i) * 4)); }
+fn _lzpi(a as *i32, i as i32, v as i32) as void { let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4); *p = v; }
+
 fn _lz_init(func as *d.IRFunction, vc as i32) as void {
     if (cast(i64, lz_tol) != 0) { d.opt_free(lz_tol); d.opt_free(lz_i32v); d.opt_free(lz_pl); }
     lz_tol = cast(*u8, 0); lz_i32v = cast(*u8, 0); lz_pl = cast(*u8, 0);
@@ -641,30 +644,78 @@ fn _lz_init(func as *d.IRFunction, vc as i32) as void {
     // it is made, as before: one movsxd at the definition costs no more than
     // one at the widening, and keeps it off the address the widening feeds
     // (a plain copy is free, a movsxd is not). Mark every vreg whose value can
-    // reach a widening cast through copies and i32 casts, and keep it out.
-    let is *u8 as wid = d.opt_alloc(cast(i64, vc) + 1);
+    // reach a widening cast through copies and i32 casts, and keep it out --
+    // unless every such widening sits in fewer loops than a definition of the
+    // value: then the definition runs more often, and the widening pays.
+    // Loop depth: an instruction between a label and a later jump back to it.
+    let is i32 as ni with mut = 0;
+    let is i32 as nlab with mut = func.label_count + 1;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        ni = ni + 1;
+        if (inst.dest.op_type == d.OP_LABEL && inst.dest.label >= nlab) { nlab = inst.dest.label + 1; }
+        inst = inst.next;
+    }
+    let is *i32 as lpos = cast(*i32, d.opt_alloc(cast(i64, nlab) * 4));
+    let is *i32 as dep = cast(*i32, d.opt_alloc(cast(i64, ni + 1) * 4));
     i = 0;
-    while (i < vc) { wid[i] = cast(u8, 0); i = i + 1; }
+    while (i < nlab) { _lzpi(lpos, i, 0 - 1); i = i + 1; }
+    i = 0;
+    while (i <= ni) { _lzpi(dep, i, 0); i = i + 1; }
+    let is i32 as px with mut = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_LABEL && inst.dest.label >= 0 && inst.dest.label < nlab) { _lzpi(lpos, inst.dest.label, px); }
+        if (inst.is_dead == 0 && (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ)
+            && inst.dest.op_type == d.OP_LABEL && inst.dest.label >= 0 && inst.dest.label < nlab) {
+            let is i32 as q = _lzgi(lpos, inst.dest.label);
+            if (q >= 0 && q <= px) {
+                let is i32 as r with mut = q;
+                while (r <= px) { _lzpi(dep, r, _lzgi(dep, r) + 1); r = r + 1; }
+            }
+        }
+        px = px + 1;
+        inst = inst.next;
+    }
+    // defdep[v]: deepest definition of v; wdep[v]: deepest widening it reaches.
+    let is *i32 as defdep = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    let is *i32 as wdep = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    i = 0;
+    while (i <= vc) { _lzpi(defdep, i, 0); _lzpi(wdep, i, 0 - 1); i = i + 1; }
+    px = 0;
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+            && _lzgi(dep, px) > _lzgi(defdep, inst.dest.vreg)) { _lzpi(defdep, inst.dest.vreg, _lzgi(dep, px)); }
+        px = px + 1;
+        inst = inst.next;
+    }
     chg = 1;
     while (chg == 1) {
         chg = 0;
+        px = 0;
         inst = func.instructions;
         while (cast(i64, inst) != 0) {
-            if (inst.is_dead == 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc
-                && wid[inst.src1.vreg] == cast(u8, 0)) {
-                let is i32 as w with mut = 0;
+            if (inst.is_dead == 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc) {
+                let is i32 as w with mut = 0 - 1;
                 if (inst.op == d.IR_CAST && cast(i64, inst.cast_to) != 0 && is_float_type(inst.cast_to) == 0
-                    && get_type_size(inst.cast_to) == 8) { w = 1; }
+                    && get_type_size(inst.cast_to) == 8) { w = _lzgi(dep, px); }
                 if ((inst.op == d.IR_MOV || _lz_is_cast32(inst) == 1) && inst.dest.op_type == d.OP_VREG
-                    && inst.dest.vreg >= 0 && inst.dest.vreg < vc && wid[inst.dest.vreg] == cast(u8, 1)) { w = 1; }
-                if (w == 1) { wid[inst.src1.vreg] = cast(u8, 1); chg = 1; }
+                    && inst.dest.vreg >= 0 && inst.dest.vreg < vc) { w = _lzgi(wdep, inst.dest.vreg); }
+                if (w > _lzgi(wdep, inst.src1.vreg)) { _lzpi(wdep, inst.src1.vreg, w); chg = 1; }
             }
+            px = px + 1;
             inst = inst.next;
         }
     }
     i = 0;
-    while (i < vc) { if (wid[i] == cast(u8, 1)) { lz_tol[i] = cast(u8, 0); } i = i + 1; }
-    d.opt_free(wid);
+    while (i < vc) {
+        let is i32 as wd = _lzgi(wdep, i);
+        if (wd >= 0 && wd >= _lzgi(defdep, i)) { lz_tol[i] = cast(u8, 0); }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, lpos)); d.opt_free(cast(*u8, dep));
+    d.opt_free(cast(*u8, defdep)); d.opt_free(cast(*u8, wdep));
 
     // lz_tol: clear every vreg some reader needs whole.
     chg = 1;

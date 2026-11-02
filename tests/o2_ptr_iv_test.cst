@@ -1,0 +1,195 @@
+// tests/o2_ptr_iv_test.cst
+//
+// At -O2 an i32 loop index that provably never wraps addresses memory through
+// a pointer that steps with it (src/ir/opt_widen.cst, pass_widen): the index
+// of `while (j < hi)` itself, and a second index that starts equal to it and
+// grows by at most one per iteration (quicksort's `i`). A load of an address
+// already loaded with no store in between is a copy (pass_load_cse), and values
+// nobody reads are dropped (pass_drop_unread).
+//
+// Checked: empty and reversed ranges, a range ending at INT_MAX, a second
+// index that starts elsewhere (stays as it was), one that may step twice in an
+// iteration (stays), a decreasing loop, i == j in the swap, quicksort against
+// insertion sort, a store through another pointer to the same address between
+// two loads (must reload), and loads across a branch.
+//
+// Exit code 0 on success, else the number of the failing check.
+
+fn quicksort(arr as *i64, lo as i32, hi as i32) as void {
+    if (lo >= hi) { return; }
+    let is *i64 as ppiv = cast(*i64, cast(i64, arr) + cast(i64, hi) * 8);
+    let is i64 as pivot = *ppiv;
+    let is i32 as i with mut = lo;
+    let is i32 as j with mut = lo;
+    while (j < hi) {
+        let is *i64 as pj = cast(*i64, cast(i64, arr) + cast(i64, j) * 8);
+        if (*pj < pivot) {
+            let is *i64 as pi = cast(*i64, cast(i64, arr) + cast(i64, i) * 8);
+            let is i64 as tmp = *pi;
+            *pi = *pj;
+            *pj = tmp;
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    let is *i64 as pi = cast(*i64, cast(i64, arr) + cast(i64, i) * 8);
+    let is i64 as tmp = *pi;
+    *pi = *ppiv;
+    *ppiv = tmp;
+    quicksort(arr, lo, i - 1);
+    quicksort(arr, i + 1, hi);
+}
+
+fn isort(a as *i64, n as i32) as void {
+    let is i32 as k with mut = 1;
+    while (k < n) {
+        let is i64 as v = a[k];
+        let is i32 as m with mut = k - 1;
+        while (m >= 0 && a[m] > v) { a[m + 1] = a[m]; m = m - 1; }
+        a[m + 1] = v;
+        k = k + 1;
+    }
+}
+
+fn sum_range(a as *i64, lo as i32, hi as i32) as i64 {
+    let is i64 as s with mut = 0;
+    let is i32 as j with mut = lo;
+    while (j < hi) { s = s + a[j]; j = j + 1; }
+    return s;
+}
+
+// The index walks up to INT_MAX; the address is base - INT_MAX*8 + j*8.
+fn sum_top(a as *i64, n as i32) as i64 {
+    let is i64 as s with mut = 0;
+    let is i32 as hi = 2147483647;
+    let is i32 as j with mut = hi - n;
+    let is *i64 as base = cast(*i64, cast(i64, a) - cast(i64, hi - n) * 8);
+    while (j < hi) {
+        let is *i64 as p = cast(*i64, cast(i64, base) + cast(i64, j) * 8);
+        s = s + *p;
+        j = j + 1;
+    }
+    return s;
+}
+
+// i starts at 0, j at lo: i is not tied to j.
+fn copy_down(a as *i64, lo as i32, hi as i32) as i32 {
+    let is i32 as i with mut = 0;
+    let is i32 as j with mut = lo;
+    while (j < hi) {
+        let is *i64 as pj = cast(*i64, cast(i64, a) + cast(i64, j) * 8);
+        let is *i64 as pi = cast(*i64, cast(i64, a) + cast(i64, i) * 8);
+        *pi = *pj;
+        i = i + 1;
+        j = j + 1;
+    }
+    return i;
+}
+
+// i may step twice in one iteration.
+fn twice(a as *i64, n as i32) as i64 {
+    let is i32 as i with mut = 0;
+    let is i32 as j with mut = 0;
+    let is i64 as s with mut = 0;
+    while (j < n) {
+        let is *i64 as pi = cast(*i64, cast(i64, a) + cast(i64, i) * 8);
+        s = s + *pi;
+        if (a[j] > 0) { i = i + 1; }
+        if (a[j] > 5) { i = i + 1; }
+        if (i >= n) { i = 0; }
+        j = j + 1;
+    }
+    return s;
+}
+
+fn down(a as *i64, n as i32) as i64 {
+    let is i64 as s with mut = 0;
+    let is i32 as j with mut = n - 1;
+    while (j >= 0) {
+        let is *i64 as p = cast(*i64, cast(i64, a) + cast(i64, j) * 8);
+        s = s * 3 + *p;
+        j = j - 1;
+    }
+    return s;
+}
+
+// Two loads of *p with a store through q in between: q may be p.
+fn reload(p as *i64, q as *i64) as i64 {
+    let is i64 as a = *p;
+    *q = a + 100;
+    let is i64 as b = *p;
+    return a * 1000 + b;
+}
+
+// Loads across a branch fallthrough, and after a join (must not merge there).
+fn across(p as *i64, c as i64) as i64 {
+    let is i64 as a = *p;
+    let is i64 as r with mut = 0;
+    if (c > 0) {
+        r = *p + a;
+    } else {
+        *p = 7;
+    }
+    return r + *p;
+}
+
+fn main() as i32 {
+    let is [300]i64 as arr;
+    let is [300]i64 as ref;
+    let is i32 as n = 300;
+    let is i32 as k with mut = 0;
+    while (k < n) {
+        let is i64 as v = (cast(i64, k) * 7919 + 104729) % 97 - 40;
+        arr[k] = v; ref[k] = v;
+        k = k + 1;
+    }
+    quicksort(cast(*i64, &arr), 0, n - 1);
+    isort(cast(*i64, &ref), n);
+    k = 0;
+    while (k < n) { if (arr[k] != ref[k]) { return 1; } k = k + 1; }
+    // all equal, two values, sorted, reversed
+    k = 0;
+    while (k < 50) { arr[k] = 5; k = k + 1; }
+    quicksort(cast(*i64, &arr), 0, 49);
+    k = 0;
+    while (k < 50) { if (arr[k] != 5) { return 2; } k = k + 1; }
+    k = 0;
+    while (k < 50) { arr[k] = cast(i64, 49 - k); k = k + 1; }
+    quicksort(cast(*i64, &arr), 0, 49);
+    k = 0;
+    while (k < 50) { if (arr[k] != cast(i64, k)) { return 3; } k = k + 1; }
+    quicksort(cast(*i64, &arr), 0, 49);
+    k = 0;
+    while (k < 50) { if (arr[k] != cast(i64, k)) { return 4; } k = k + 1; }
+    quicksort(cast(*i64, &arr), 3, 3);
+    quicksort(cast(*i64, &arr), 5, 2);
+
+    // arr[k] = k for k < 50
+    if (sum_range(cast(*i64, &arr), 0, 50) != 1225) { return 5; }
+    if (sum_range(cast(*i64, &arr), 10, 10) != 0) { return 6; }
+    if (sum_range(cast(*i64, &arr), 20, 10) != 0) { return 7; }
+    if (sum_range(cast(*i64, &arr), 48, 50) != 97) { return 8; }
+    if (sum_top(cast(*i64, &arr), 10) != 45) { return 9; }
+    if (sum_top(cast(*i64, &arr), 0) != 0) { return 10; }
+    // copy_down: a[0..] = a[10..20]
+    if (copy_down(cast(*i64, &arr), 10, 20) != 10) { return 11; }
+    k = 0;
+    while (k < 10) { if (arr[k] != cast(i64, k + 10)) { return 12; } k = k + 1; }
+    // twice over 0, 1, 7, 0, 7: i steps 0,1,2(+2 at 7)...
+    arr[0] = 0; arr[1] = 1; arr[2] = 7; arr[3] = 0; arr[4] = 7;
+    // j=0: s+=a[0]=0, i=0 ; j=1: s+=a[0]=0, i=1 ; j=2: s+=a[1]=1, i=3 ;
+    // j=3: s+=a[3]=0, i=3 ; j=4: s+=a[3]=0, i=5 -> 0
+    if (twice(cast(*i64, &arr), 5) != 1) { return 13; }
+    arr[0] = 1; arr[1] = 2; arr[2] = 3;
+    // down: ((3)*3 + 2)*3 + 1 = 34
+    if (down(cast(*i64, &arr), 3) != 34) { return 14; }
+    let is i64 as x with mut = 5;
+    let is i64 as y with mut = 9;
+    if (reload(&x, &x) != 5105) { return 15; }
+    x = 5;
+    if (reload(&x, &y) != 5005 || y != 105) { return 16; }
+    x = 4;
+    if (across(&x, 1) != 12) { return 17; }
+    if (across(&x, 0) != 7) { return 18; }
+    return 0;
+}

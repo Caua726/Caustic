@@ -1,0 +1,699 @@
+use "defs.cst" as d;
+
+// === i32 loop indices become 64-bit pointers that step ===
+//
+// -O2 only. In
+//
+//     while (j < hi) { ... arr[j] ... ; j = j + 1; }
+//
+// with j and hi i32, every `arr + j*8` sign-extends j (`movsxd`) and rebuilds
+// the address (`lea`). When j + 1 provably never wraps, sext(j) steps by one
+// exactly as j does, so the address can be a pointer that starts at
+// `arr + sext(j0)*8` before the loop and moves by 8 after each `j = j + 1`:
+//
+//     before H:  X0 = sext(j) ; P = LEA8 arr, X0
+//     j = n      -> j = n ; P = P + 8
+//     LEA8 p = arr, sext(j)  ->  MOV p = P
+//
+// Never wraps, proved without relying on overflow being undefined:
+//   - kind A: the loop's own test is `j < hi` (signed i32, hi not written in
+//     the loop), j has one write in the loop, `j = j + 1`, after the test and
+//     not inside an inner loop. At that write j < hi <= INT_MAX, so j + 1 fits.
+//   - kind B: i has one write in the loop, `i = i + 1`, not inside an inner
+//     loop, and the loop has a kind A index j whose increment runs on every
+//     iteration (no branch in the loop jumps over it) and which starts from the
+//     same value as i. Then in iteration k, i <= i0 + k = j0 + k < hi at the
+//     test, so i + 1 <= hi fits as well.
+//
+// The loop: a label H, exactly one jump to it (the back-edge JMP at the end),
+// no jump from outside into the body. Only uses inside the body are rewritten.
+
+let is *i64 as wd_insts with mut;
+let is i32 as wd_n with mut = 0;
+let is *i32 as wd_uses with mut;
+let is i32 as wd_vc with mut = 0;
+let is *i32 as wd_lpos with mut;        // label -> index of its LABEL (or -1)
+let is i32 as wd_nl with mut = 0;
+
+// resolution result
+let is i32 as rs_v with mut = 0;
+let is i32 as rs_pos with mut = 0;
+
+fn _at(i as i32) as *d.IRInst {
+    let is *i64 as p = cast(*i64, cast(i64, wd_insts) + cast(i64, i) * 8);
+    return cast(*d.IRInst, *p);
+}
+
+fn _gi(a as *i32, i as i32) as i32 { return *(cast(*i32, cast(i64, a) + cast(i64, i) * 4)); }
+fn _pi(a as *i32, i as i32, v as i32) as void { let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4); *p = v; }
+
+fn _kind(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 4; }
+    let is i32 as k = *cast(*i32, tp);
+    return k;
+}
+
+fn _writes(i as *d.IRInst, v as i32) as i32 {
+    if (i.dest.op_type == d.OP_VREG && i.dest.vreg == v) { return 1; }
+    return 0;
+}
+
+fn _is_jump(i as *d.IRInst) as i32 {
+    if ((i.op == d.IR_JMP || i.op == d.IR_JZ || i.op == d.IR_JNZ) && i.dest.op_type == d.OP_LABEL) { return 1; }
+    return 0;
+}
+
+fn _target(i as *d.IRInst) as i32 {
+    let is i32 as L = i.dest.label;
+    if (L < 0 || L >= wd_nl) { return 0 - 1; }
+    return _gi(wd_lpos, L);
+}
+
+// Value copies that keep the value: MOV, and CAST between the same integer
+// kind (i32->i32) or pointer <-> i64.
+fn _is_copy(i as *d.IRInst) as i32 {
+    if (i.op == d.IR_MOV && i.src1.op_type == d.OP_VREG) { return 1; }
+    if (i.op == d.IR_CAST && i.src1.op_type == d.OP_VREG) {
+        let is i32 as kf = _kind(i.cast_from);
+        let is i32 as kt = _kind(i.cast_to);
+        if (kf == kt && kf >= 1 && kf <= 8) { return 1; }
+        // pointer (not an int kind) <-> i64/u64
+        if ((kf < 1 || kf > 8) && (kt == 4 || kt == 8)) { return 1; }
+        if ((kt < 1 || kt > 8) && (kf == 4 || kf == 8)) { return 1; }
+    }
+    return 0;
+}
+
+// Follow copies of v read at pos, walking back no further than lo and never
+// past a label or a jump. Stops at a vreg with no write in that straight line
+// or at a write that is not a copy.
+// rs_v = the vreg reached, rs_pos = where it is read.
+fn _resolve(v as i32, pos as i32, lo as i32) as void {
+    rs_v = v; rs_pos = pos;
+    let is i32 as hops with mut = 0;
+    while (hops < 8) {
+        // straight line only: a label or a jump means another path may write v
+        let is i32 as q with mut = rs_pos - 1;
+        while (q > lo && _writes(_at(q), rs_v) == 0) {
+            if (_at(q).op == d.IR_LABEL || _is_jump(_at(q)) == 1) { return; }
+            q = q - 1;
+        }
+        if (q <= lo) { return; }
+        let is *d.IRInst as w = _at(q);
+        if (_is_copy(w) == 0) { return; }
+        rs_v = w.src1.vreg; rs_pos = q;
+        hops = hops + 1;
+    }
+}
+
+fn _writes_in(v as i32, a as i32, b as i32) as i32 {
+    let is i32 as cnt with mut = 0;
+    let is i32 as q with mut = a + 1;
+    while (q < b) { if (_writes(_at(q), v) == 1) { cnt = cnt + 1; } q = q + 1; }
+    return cnt;
+}
+
+fn _first_write_in(v as i32, a as i32, b as i32) as i32 {
+    let is i32 as q with mut = a + 1;
+    while (q < b) { if (_writes(_at(q), v) == 1) { return q; } q = q + 1; }
+    return 0 - 1;
+}
+
+// Is index m inside an inner loop of (h, e): a backward jump at p in (h, e)
+// to a label at q with h < q <= m <= p.
+fn _in_inner(h as i32, e as i32, m as i32) as i32 {
+    let is i32 as p with mut = h + 1;
+    while (p < e) {
+        let is *d.IRInst as j = _at(p);
+        if (_is_jump(j) == 1) {
+            let is i32 as q = _target(j);
+            if (q > h && q <= p && q <= m && m <= p) { return 1; }
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+// Does some branch inside (h, e) jump forward over m (from before m to after m)?
+fn _skipped(h as i32, e as i32, m as i32) as i32 {
+    let is i32 as p with mut = h + 1;
+    while (p < m) {
+        let is *d.IRInst as j = _at(p);
+        if (_is_jump(j) == 1) {
+            let is i32 as q = _target(j);
+            // a jump out of the loop ends the iteration and the loop: fine
+            if (q > m && q <= e) { return 1; }
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+// The loop-level update of x in (h, e): one write, not inside an inner loop,
+// of x + 1 or of x itself (i32). Either `ADD x = w, 1` with w a copy of x, or
+// `MOV x = n` where every write of n in the loop (a phi's moves, at most 4) is
+// `n = w + 1` or `n = w`, w a copy of x. Returns the index of the write or -1;
+// ic_n / ic_cnt / ic_pos / ic_step describe the n-writes (ic_n = -1: direct).
+let is i32 as ic_n with mut = 0;
+let is i32 as ic_cnt with mut = 0;
+let is [4]i32 as ic_pos;
+let is [4]i32 as ic_step;
+let is i32 as ic_always with mut = 0;   // every path adds 1
+
+fn _step_of(w as *d.IRInst, wpos as i32, x as i32, h as i32) as i32 {
+    if (w.op == d.IR_ADD && w.src2.op_type == d.OP_IMM && w.src2.imm == 1
+        && w.src1.op_type == d.OP_VREG && _kind(w.cast_to) == 3) {
+        _resolve(w.src1.vreg, wpos, h);
+        if (rs_v == x) { return 1; }
+        return 0 - 1;
+    }
+    if (_is_copy(w) == 1) {
+        let is i32 as v = w.src1.vreg;
+        if (v == x) { return 0; }
+        // the source's write in the same straight line, if any
+        let is i32 as q with mut = wpos - 1;
+        while (q > h && _writes(_at(q), v) == 0) {
+            if (_at(q).op == d.IR_LABEL || _is_jump(_at(q)) == 1) { return 0 - 1; }
+            q = q - 1;
+        }
+        if (q <= h) { return 0 - 1; }
+        if (_writes_in(x, q, wpos) != 0) { return 0 - 1; }
+        return _step_of(_at(q), q, x, h);
+    }
+    return 0 - 1;
+}
+
+fn _incr(x as i32, h as i32, e as i32) as i32 {
+    if (_writes_in(x, h, e) != 1) { return 0 - 1; }
+    let is i32 as m = _first_write_in(x, h, e);
+    if (_in_inner(h, e, m) == 1) { return 0 - 1; }
+    let is *d.IRInst as w = _at(m);
+    ic_n = 0 - 1; ic_cnt = 0; ic_always = 1;
+    if (w.op == d.IR_MOV && w.src1.op_type == d.OP_VREG) {
+        let is i32 as n = w.src1.vreg;
+        let is i32 as cnt = _writes_in(n, h, e);
+        if (cnt < 1 || cnt > 4) { return 0 - 1; }
+        ic_n = n;
+        let is i32 as q with mut = h + 1;
+        while (q < e) {
+            if (_writes(_at(q), n) == 1) {
+                if (q > m) { return 0 - 1; }
+                if (_in_inner(h, e, q) == 1) { return 0 - 1; }
+                let is i32 as st = _step_of(_at(q), q, x, h);
+                if (st < 0) { return 0 - 1; }
+                if (st == 0) { ic_always = 0; }
+                ic_pos[ic_cnt] = q; ic_step[ic_cnt] = st;
+                ic_cnt = ic_cnt + 1;
+            }
+            q = q + 1;
+        }
+        return m;
+    }
+    if (_step_of(w, m, x, h) != 1) { return 0 - 1; }
+    return m;
+}
+
+// Root of the value v holds on entry to H (read at index h): copies are
+// followed back through the straight line before H.
+fn _entry_root(v as i32, h as i32) as void {
+    rs_v = v; rs_pos = h;
+    let is i32 as hops with mut = 0;
+    while (hops < 8) {
+        let is i32 as q with mut = rs_pos - 1;
+        while (q >= 0 && _writes(_at(q), rs_v) == 0 && _at(q).op != d.IR_LABEL && _is_jump(_at(q)) == 0) { q = q - 1; }
+        if (q < 0) { return; }
+        let is *d.IRInst as w = _at(q);
+        if (_writes(w, rs_v) == 0) { return; }
+        if (_is_copy(w) == 0) { return; }
+        rs_v = w.src1.vreg; rs_pos = q;
+        hops = hops + 1;
+    }
+}
+
+// A pointer IV: for x and base b, P walks b + sext(x)*scale.
+let is [16]i32 as pv_x;
+let is [16]i32 as pv_b;
+let is [16]i32 as pv_scale;
+let is [16]i32 as pv_p;
+let is i32 as pv_n with mut = 0;
+
+fn _lea_scale(op as i32) as i32 {
+    if (op == d.IR_LEA2) { return 2; }
+    if (op == d.IR_LEA4) { return 4; }
+    if (op == d.IR_LEA8) { return 8; }
+    return 0;
+}
+
+fn _insert_after(at as *d.IRInst, ni as *d.IRInst) as void {
+    ni.next = at.next;
+    at.next = ni;
+}
+
+fn _raw_prev(func as *d.IRFunction, t as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as w with mut = func.instructions;
+    if (cast(i64, w) == cast(i64, t)) { return cast(*d.IRInst, 0); }
+    while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, t)) { w = w.next; }
+    return w;
+}
+
+fn _new_vreg(func as *d.IRFunction) as i32 {
+    let is i32 as v = func.vreg_count;
+    func.vreg_count = func.vreg_count + 1;
+    return v;
+}
+
+// The update of each candidate index, saved from ic_* by _save.
+let is [8]i32 as xs_n;
+let is [8]i32 as xs_cnt;
+let is [32]i32 as xs_pos;
+let is [32]i32 as xs_step;
+
+fn _save(k as i32) as void {
+    xs_n[k] = ic_n; xs_cnt[k] = ic_cnt;
+    let is i32 as q with mut = 0;
+    while (q < ic_cnt) { xs_pos[k * 4 + q] = ic_pos[q]; xs_step[k * 4 + q] = ic_step[q]; q = q + 1; }
+}
+
+// Keep P = b + sext(x)*sc across x's update at m. One path of +1: P += sc
+// after m. A phi: each of its moves computes Pn (P + sc or P) and m's
+// MOV x = n is followed by P = Pn.
+fn _step_ptr(func as *d.IRFunction, k as i32, m as i32, pv as i32, sc as i32, ty as *u8) as void {
+    let is i32 as single with mut = 0;
+    if (xs_n[k] < 0) { single = 1; }
+    if (xs_n[k] >= 0 && xs_cnt[k] == 1 && xs_step[k * 4] == 1) { single = 1; }
+    if (single == 1) {
+        let is *d.IRInst as ai = d.new_inst(d.IR_ADD);
+        ai.dest = d.op_vreg(pv); ai.src1 = d.op_vreg(pv); ai.src2 = d.op_imm(cast(i64, sc));
+        ai.cast_to = ty; ai.line = _at(m).line;
+        _insert_after(_at(m), ai);
+        return;
+    }
+    let is i32 as pn = _new_vreg(func);
+    let is i32 as q with mut = 0;
+    while (q < xs_cnt[k]) {
+        let is *d.IRInst as at = _at(xs_pos[k * 4 + q]);
+        let is *d.IRInst as ni with mut = d.new_inst(d.IR_MOV);
+        if (xs_step[k * 4 + q] == 1) {
+            ni = d.new_inst(d.IR_ADD);
+            ni.src2 = d.op_imm(cast(i64, sc));
+        }
+        ni.dest = d.op_vreg(pn); ni.src1 = d.op_vreg(pv);
+        ni.cast_to = ty; ni.line = at.line;
+        _insert_after(at, ni);
+        q = q + 1;
+    }
+    let is *d.IRInst as mv = d.new_inst(d.IR_MOV);
+    mv.dest = d.op_vreg(pv); mv.src1 = d.op_vreg(pn);
+    mv.cast_to = ty; mv.line = _at(m).line;
+    _insert_after(_at(m), mv);
+}
+
+// Every read of p is in (s, m), with no label between s and it; p has no
+// other write in the function.
+fn _rename_ok(p as i32, s as i32, m as i32, e as i32) as i32 {
+    let is i32 as q with mut = 0;
+    let is i32 as label_seen with mut = 0;
+    while (q < wd_n) {
+        let is *d.IRInst as i = _at(q);
+        if (q > s && i.op == d.IR_LABEL) { label_seen = 1; }
+        if (q != s && _writes(i, p) == 1 && i.op != d.IR_STORE && i.op != d.IR_VSTOREQ && i.op != d.IR_VSTOREQ256) { return 0; }
+        let is i32 as reads with mut = 0;
+        if (i.src1.op_type == d.OP_VREG && i.src1.vreg == p) { reads = 1; }
+        if (i.src2.op_type == d.OP_VREG && i.src2.vreg == p) { reads = 1; }
+        if ((i.op == d.IR_STORE || i.op == d.IR_VSTOREQ || i.op == d.IR_VSTOREQ256 || i.op == d.IR_CMOV)
+            && i.dest.op_type == d.OP_VREG && i.dest.vreg == p) { reads = 1; }
+        if (reads == 1) {
+            if (q <= s || q >= m || label_seen == 1) { return 0; }
+        }
+        q = q + 1;
+    }
+    return 1;
+}
+
+fn _rename(p as i32, pv as i32, s as i32, m as i32) as void {
+    let is i32 as q with mut = s + 1;
+    while (q < m) {
+        let is *d.IRInst as i = _at(q);
+        if (i.src1.op_type == d.OP_VREG && i.src1.vreg == p) { i.src1.vreg = pv; }
+        if (i.src2.op_type == d.OP_VREG && i.src2.vreg == p) { i.src2.vreg = pv; }
+        if ((i.op == d.IR_STORE || i.op == d.IR_VSTOREQ || i.op == d.IR_VSTOREQ256)
+            && i.dest.op_type == d.OP_VREG && i.dest.vreg == p) { i.dest.vreg = pv; }
+        q = q + 1;
+    }
+}
+
+// Try loop (h, e). Returns 1 if it changed the IR (the arrays are stale then).
+fn _try_loop(func as *d.IRFunction, h as i32, e as i32) as i32 {
+    let is *d.IRInst as hl = _at(h);
+    let is i32 as H = hl.dest.label;
+    // exactly one jump to H: the back-edge
+    let is i32 as q with mut = 0;
+    while (q < wd_n) {
+        let is *d.IRInst as j = _at(q);
+        if (q != e && _is_jump(j) == 1 && j.dest.label == H) { return 0; }
+        // no jump from outside into the body
+        if ((q < h || q > e) && _is_jump(j) == 1) {
+            let is i32 as t = _target(j);
+            if (t > h && t <= e) { return 0; }
+        }
+        q = q + 1;
+    }
+    // the test: copies, then LT c = a, b (i32) ; JZ c -> out
+    let is i32 as t with mut = h + 1;
+    while (t < e && _is_copy(_at(t)) == 1) { t = t + 1; }
+    if (t + 1 >= e) { return 0; }
+    let is *d.IRInst as cmp = _at(t);
+    let is *d.IRInst as jz = _at(t + 1);
+    if (jz.op != d.IR_JZ || jz.src1.op_type != d.OP_VREG || cmp.dest.op_type != d.OP_VREG
+        || jz.src1.vreg != cmp.dest.vreg) { return 0; }
+    let is i32 as jt = _target(jz);
+    if (jt > h && jt <= e) { return 0; }
+    let is *d.Operand as xo with mut = &cmp.src1;
+    let is *d.Operand as ho with mut = &cmp.src2;
+    if (cmp.op == d.IR_GT) { xo = &cmp.src2; ho = &cmp.src1; }
+    else if (cmp.op != d.IR_LT) { return 0; }
+    if (_kind(cmp.cast_to) != 3) { return 0; }
+    if (xo.op_type != d.OP_VREG) { return 0; }
+    _resolve(xo.vreg, t, h);
+    let is i32 as jx = rs_v;
+    // the bound: a constant, or a value the loop does not write
+    if (ho.op_type == d.OP_VREG) {
+        _resolve(ho.vreg, t, h);
+        if (_writes_in(rs_v, h, e) != 0) { return 0; }
+    } else if (ho.op_type != d.OP_IMM || ho.imm > 2147483647) { return 0; }
+    let is i32 as jm = _incr(jx, h, e);
+    if (jm < 0 || jm < t) { return 0; }
+
+    // candidate indices: jx (kind A) and, if jx is incremented every
+    // iteration, every other x with a loop-level +1 and the same start (kind B).
+    let is [8]i32 as xs;
+    let is [8]i32 as xm;
+    let is i32 as nx with mut = 1;
+    xs[0] = jx; xm[0] = jm;
+    _save(0);
+    if (_skipped(h, e, jm) == 0 && ic_always == 1) {
+        _entry_root(jx, h);
+        let is i32 as jroot = rs_v;
+        let is i32 as jrpos = rs_pos;
+        // other sext'd i32 vregs used in the body
+        let is i32 as s with mut = h + 1;
+        while (s < e && nx < 8) {
+            let is *d.IRInst as c = _at(s);
+            if (c.op == d.IR_CAST && c.src1.op_type == d.OP_VREG && _kind(c.cast_from) == 3 && _kind(c.cast_to) == 4) {
+                _resolve(c.src1.vreg, s, h);
+                let is i32 as cx = rs_v;
+                let is i32 as dup with mut = 0;
+                let is i32 as k with mut = 0;
+                while (k < nx) { if (xs[k] == cx) { dup = 1; } k = k + 1; }
+                if (dup == 0 && _writes_in(cx, h, e) == 1) {
+                    let is i32 as cm = _incr(cx, h, e);
+                    if (cm >= 0) {
+                        _entry_root(cx, h);
+                        // same start: same root, not written between the two reads
+                        let is i32 as lo with mut = rs_pos;
+                        let is i32 as hi2 with mut = jrpos;
+                        if (lo > hi2) { lo = jrpos; hi2 = rs_pos; }
+                        if (rs_v == jroot && _writes_in(jroot, lo, hi2) == 0) {
+                            xs[nx] = cx; xm[nx] = cm; _save(nx); nx = nx + 1;
+                        }
+                    }
+                }
+            }
+            s = s + 1;
+        }
+    }
+
+    // rewrite: LEAk p = b, y with y = sext(x) used once, b invariant
+    pv_n = 0;
+    let is i32 as changed with mut = 0;
+    let is *d.IRInst as hprev with mut = _raw_prev(func, hl);
+    if (cast(i64, hprev) == 0) { return 0; }
+    let is i32 as s2 with mut = h + 1;
+    while (s2 < e) {
+        let is *d.IRInst as c = _at(s2);
+        let is i32 as sc = _lea_scale(c.op);
+        if (sc > 0 && c.src1.op_type == d.OP_VREG && c.src2.op_type == d.OP_VREG && c.dest.op_type == d.OP_VREG
+            && c.src2.vreg >= 0 && c.src2.vreg < wd_vc && _gi(wd_uses, c.src2.vreg) == 1) {
+            // y's def: CAST y = z (i32 -> i64), right in the body
+            let is i32 as y = c.src2.vreg;
+            let is i32 as yq with mut = s2 - 1;
+            while (yq > h && _writes(_at(yq), y) == 0) { yq = yq - 1; }
+            if (yq > h && _writes_in(y, h, e) == 1) {
+                let is *d.IRInst as sx = _at(yq);
+                // sext(z), or an i32 copy of x read whole by the LEA
+                let is i32 as sext with mut = 0;
+                if (sx.op == d.IR_CAST && sx.src1.op_type == d.OP_VREG && _kind(sx.cast_from) == 3 && _kind(sx.cast_to) == 4) { sext = 1; }
+                if (sx.op == d.IR_CAST && sx.src1.op_type == d.OP_VREG && _kind(sx.cast_from) == 3 && _kind(sx.cast_to) == 3) { sext = 1; }
+                if (sext == 1) {
+                    _resolve(sx.src1.vreg, yq, h);
+                    let is i32 as x = rs_v;
+                    let is i32 as xread = rs_pos;
+                    let is i32 as xi with mut = 0 - 1;
+                    let is i32 as k2 with mut = 0;
+                    while (k2 < nx) { if (xs[k2] == x) { xi = k2; } k2 = k2 + 1; }
+                    // x not written between where it is read and the LEA
+                    if (xi >= 0 && _writes_in(x, xread - 1, s2) == 0
+                        && (_kind(sx.cast_to) == 4 || _kind(c.cast_to) == 4)) {
+                        _resolve(c.src1.vreg, s2, h);
+                        let is i32 as b = rs_v;
+                        if (_writes_in(b, h, e) == 0 && b >= 0) {
+                            let is i32 as pi with mut = 0 - 1;
+                            let is i32 as k3 with mut = 0;
+                            while (k3 < pv_n) {
+                                if (pv_x[k3] == x && pv_b[k3] == b && pv_scale[k3] == sc) { pi = k3; }
+                                k3 = k3 + 1;
+                            }
+                            if (pi < 0 && pv_n < 16) {
+                                // before H: X0 = sext(x) ; P = LEAk b, X0
+                                let is i32 as x0 = _new_vreg(func);
+                                let is i32 as pv = _new_vreg(func);
+                                let is *d.IRInst as ci = d.new_inst(d.IR_CAST);
+                                ci.dest = d.op_vreg(x0); ci.src1 = d.op_vreg(x);
+                                ci.cast_from = sx.cast_from; ci.cast_to = sx.cast_to; ci.line = hl.line;
+                                // an i32 copy: X0 still has to be the sign extension
+                                if (_kind(sx.cast_to) != 4) { ci.cast_to = c.cast_to; }
+                                let is *d.IRInst as li = d.new_inst(c.op);
+                                li.dest = d.op_vreg(pv); li.src1 = d.op_vreg(b); li.src2 = d.op_vreg(x0);
+                                li.cast_to = c.cast_to; li.cast_from = c.cast_from; li.line = hl.line;
+                                _insert_after(hprev, ci);
+                                _insert_after(ci, li);
+                                hprev = li;
+                                _step_ptr(func, xi, xm[xi], pv, sc, c.cast_to);
+                                pv_x[pv_n] = x; pv_b[pv_n] = b; pv_scale[pv_n] = sc; pv_p[pv_n] = pv;
+                                pi = pv_n;
+                                pv_n = pv_n + 1;
+                            }
+                            if (pi >= 0) {
+                                // p read only in this straight line before x
+                                // moves: read P itself there. Else p = P.
+                                if (_rename_ok(c.dest.vreg, s2, xm[xi], e) == 1) {
+                                    _rename(c.dest.vreg, pv_p[pi], s2, xm[xi]);
+                                    c.is_dead = cast(i8, 1);
+                                    // and through the no-op casts that read it there
+                                    let is i32 as r with mut = s2 + 1;
+                                    while (r < xm[xi]) {
+                                        let is *d.IRInst as ri = _at(r);
+                                        if (ri.is_dead == 0 && _is_copy(ri) == 1 && ri.src1.vreg == pv_p[pi]
+                                            && ri.dest.op_type == d.OP_VREG && _rename_ok(ri.dest.vreg, r, xm[xi], e) == 1) {
+                                            _rename(ri.dest.vreg, pv_p[pi], r, xm[xi]);
+                                            ri.is_dead = cast(i8, 1);
+                                        }
+                                        r = r + 1;
+                                    }
+                                } else {
+                                    c.op = cast(i8, d.IR_MOV);
+                                    c.src1 = d.op_vreg(pv_p[pi]);
+                                    c.src2.op_type = cast(i8, d.OP_NONE);
+                                }
+                                sx.is_dead = cast(i8, 1);
+                                changed = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        s2 = s2 + 1;
+    }
+    return changed;
+}
+
+fn _build(func as *d.IRFunction) as void {
+    let is i32 as n with mut = 0;
+    let is i32 as nl with mut = func.label_count + 1;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            n = n + 1;
+            if (it.dest.op_type == d.OP_LABEL && it.dest.label >= nl) { nl = it.dest.label + 1; }
+        }
+        it = it.next;
+    }
+    wd_n = n;
+    wd_nl = nl;
+    wd_vc = func.vreg_count;
+    wd_insts = cast(*i64, d.opt_alloc(cast(i64, n + 1) * 8));
+    wd_lpos = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    wd_uses = cast(*i32, d.opt_alloc(cast(i64, wd_vc + 1) * 4));
+    let is i32 as k with mut = 0;
+    while (k < nl) { _pi(wd_lpos, k, 0 - 1); k = k + 1; }
+    k = 0;
+    while (k <= wd_vc) { _pi(wd_uses, k, 0); k = k + 1; }
+    let is i32 as x with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is *i64 as sp = cast(*i64, cast(i64, wd_insts) + cast(i64, x) * 8);
+            *sp = cast(i64, it);
+            if (it.op == d.IR_LABEL && it.dest.label >= 0 && it.dest.label < nl) { _pi(wd_lpos, it.dest.label, x); }
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < wd_vc) { _pi(wd_uses, it.src1.vreg, _gi(wd_uses, it.src1.vreg) + 1); }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < wd_vc) { _pi(wd_uses, it.src2.vreg, _gi(wd_uses, it.src2.vreg) + 1); }
+            // a STORE's address is a read
+            if ((it.op == d.IR_STORE || it.op == d.IR_VSTOREQ || it.op == d.IR_VSTOREQ256)
+                && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < wd_vc) {
+                _pi(wd_uses, it.dest.vreg, _gi(wd_uses, it.dest.vreg) + 1);
+            }
+            x = x + 1;
+        }
+        it = it.next;
+    }
+}
+
+fn _free() as void {
+    d.opt_free(cast(*u8, wd_insts));
+    d.opt_free(cast(*u8, wd_lpos));
+    d.opt_free(cast(*u8, wd_uses));
+}
+
+fn pass_widen(func as *d.IRFunction) as void {
+    let is i32 as rounds with mut = 0;
+    let is i32 as again with mut = 1;
+    while (again == 1 && rounds < 8) {
+        again = 0;
+        _build(func);
+        let is i32 as e with mut = 0;
+        while (e < wd_n && again == 0) {
+            let is *d.IRInst as j = _at(e);
+            if (j.op == d.IR_JMP && _is_jump(j) == 1) {
+                let is i32 as h = _target(j);
+                if (h >= 0 && h < e) {
+                    if (_try_loop(func, h, e) == 1) { again = 1; }
+                }
+            }
+            e = e + 1;
+        }
+        _free();
+        rounds = rounds + 1;
+    }
+}
+
+// === A load of an address already loaded, with no store between ===
+//
+// -O2. In one straight line (no label in between; a branch's fallthrough
+// continues it), `t2 = LOAD [a]` after `t1 = LOAD [a]` of the same type, with
+// nothing that writes memory in between (store, call, asm, atomic, copy) and
+// neither a nor t1 written again, becomes `t2 = MOV t1`.
+fn _lc_clobbers(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256 || op == d.IR_COPY
+        || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+        || op == d.IR_ASM || op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
+        || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE
+        || op == d.IR_VA_START || op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_RET
+        || op == d.IR_SET_CTX) { return 1; }
+    return 0;
+}
+
+fn pass_load_cse(func as *d.IRFunction) as void {
+    let is [8]i32 as la;      // address vreg
+    let is [8]i32 as lv;      // loaded value vreg
+    let is [8]i64 as lt;      // type
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (_lc_clobbers(it.op) == 1) { n = 0; }
+            else {
+                let is i32 as hit with mut = 0 - 1;
+                if (it.op == d.IR_LOAD && it.src1.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
+                    && it.dest.vreg != it.src1.vreg) {
+                    let is i32 as k with mut = 0;
+                    while (k < n) {
+                        if (la[k] == it.src1.vreg && lt[k] == cast(i64, it.cast_to)) { hit = k; }
+                        k = k + 1;
+                    }
+                }
+                let is i32 as hv with mut = 0 - 1;
+                if (hit >= 0) { hv = lv[hit]; }
+                // a write of any vreg drops the entries that name it
+                if (it.dest.op_type == d.OP_VREG) {
+                    let is i32 as w = it.dest.vreg;
+                    let is i32 as k2 with mut = 0;
+                    let is i32 as o with mut = 0;
+                    while (k2 < n) {
+                        if (la[k2] != w && lv[k2] != w) { la[o] = la[k2]; lv[o] = lv[k2]; lt[o] = lt[k2]; o = o + 1; }
+                        k2 = k2 + 1;
+                    }
+                    n = o;
+                }
+                if (hv >= 0) {
+                    it.op = cast(i8, d.IR_MOV);
+                    it.src1 = d.op_vreg(hv);
+                } else if (it.op == d.IR_LOAD && it.src1.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
+                    && it.dest.vreg != it.src1.vreg && n < 8) {
+                    la[n] = it.src1.vreg; lv[n] = it.dest.vreg; lt[n] = cast(i64, it.cast_to);
+                    n = n + 1;
+                }
+            }
+        }
+        it = it.next;
+    }
+}
+
+// === Values nobody reads ===
+//
+// -O2, after the passes above: a MOV, CAST, IMM or plain arithmetic whose
+// destination no live instruction reads is dropped, until nothing changes. The
+// copies a phi leaves for a block-local value (the `tmp` of a swap inside an if)
+// are what this mostly catches.
+fn _pure(op as i32) as i32 {
+    if (op == d.IR_MOV || op == d.IR_CAST || op == d.IR_IMM || op == d.IR_ADD || op == d.IR_SUB
+        || op == d.IR_MUL || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_SHL
+        || op == d.IR_SHR || op == d.IR_NEG || op == d.IR_NOT || op == d.IR_LEA2 || op == d.IR_LEA4
+        || op == d.IR_LEA8 || op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE
+        || op == d.IR_GT || op == d.IR_GE) { return 1; }
+    return 0;
+}
+
+fn pass_drop_unread(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i32 as rd = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    let is i32 as chg with mut = 1;
+    let is i32 as rounds with mut = 0;
+    while (chg == 1 && rounds < 8) {
+        chg = 0;
+        let is i32 as k with mut = 0;
+        while (k <= vc) { _pi(rd, k, 0); k = k + 1; }
+        let is *d.IRInst as it with mut = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0) {
+                if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc) { _pi(rd, it.src1.vreg, 1); }
+                if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) { _pi(rd, it.src2.vreg, 1); }
+                // anything but a pure op may read its dest (store address, cmov, ...)
+                if (_pure(it.op) == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc) { _pi(rd, it.dest.vreg, 1); }
+            }
+            it = it.next;
+        }
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0 && _pure(it.op) == 1 && it.dest.op_type == d.OP_VREG
+                && it.dest.vreg >= 0 && it.dest.vreg < vc && _gi(rd, it.dest.vreg) == 0) {
+                it.is_dead = cast(i8, 1);
+                chg = 1;
+            }
+            it = it.next;
+        }
+        rounds = rounds + 1;
+    }
+    d.opt_free(cast(*u8, rd));
+}
