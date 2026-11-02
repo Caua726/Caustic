@@ -1,0 +1,209 @@
+// tests/o2_select_test.cst
+//
+// At -O2 a small if/else whose arms only compute values (no memory, no
+// calls, nothing that can fault) and then hand one or more of them to the code
+// after it runs both arms and picks with cmov (src/ir/opt_ifconv.cst, ic2_try).
+// The compare that decides moves next to the cmovs, which then read its flags
+// directly as cmov<cc> (emit_inst.cst, cmov_users); every condition code is
+// exercised here, signed and unsigned, against an immediate, a register, an
+// i32 and an `x & k` test.
+//
+// Also checked, as cases that must stay branches or still be right: an arm
+// that stores, an arm that divides, a value read after the join that only one
+// arm writes, a float compare, and a phi whose source an arm rewrites.
+//
+// Exit code 0 on success, else the number of the failing check.
+
+fn collatz(n as i64) as i64 {
+    let is i64 as val with mut = n;
+    let is i64 as steps with mut = 0;
+    while (val != 1) {
+        if ((val & 1) == 0) { val = val / 2; }
+        else { val = (val * 3 + 1) / 2; steps = steps + 1; }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+fn collatz_ref(n as i64, two as i64) as i64 {
+    let is i64 as val with mut = n;
+    let is i64 as steps with mut = 0;
+    while (val != 1) {
+        if (val % two == 0) { val = val / two; } else { val = val * 3 + 1; }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+// Two values picked by each condition code; a, b signed.
+fn pick(op as i64, a as i64, b as i64) as i64 {
+    let is i64 as x with mut = 0;
+    let is i64 as y with mut = 0;
+    if (op == 0) { if (a == b) { x = a + 1; y = b * 2; } else { x = a - 1; y = b * 3; } }
+    if (op == 1) { if (a != b) { x = a + 1; y = b * 2; } else { x = a - 1; y = b * 3; } }
+    if (op == 2) { if (a < b) { x = a + 1; y = b * 2; } else { x = a - 1; y = b * 3; } }
+    if (op == 3) { if (a <= b) { x = a + 1; y = b * 2; } else { x = a - 1; y = b * 3; } }
+    if (op == 4) { if (a > b) { x = a + 1; y = b * 2; } else { x = a - 1; y = b * 3; } }
+    if (op == 5) { if (a >= b) { x = a + 1; y = b * 2; } else { x = a - 1; y = b * 3; } }
+    return x * 1000 + y;
+}
+
+fn pick_ref(op as i64, a as i64, b as i64) as i64 {
+    let is i64 as c with mut = 0;
+    if (op == 0 && a == b) { c = 1; }
+    if (op == 1 && a != b) { c = 1; }
+    if (op == 2 && a < b) { c = 1; }
+    if (op == 3 && a <= b) { c = 1; }
+    if (op == 4 && a > b) { c = 1; }
+    if (op == 5 && a >= b) { c = 1; }
+    if (c == 1) { return (a + 1) * 1000 + b * 2; }
+    return (a - 1) * 1000 + b * 3;
+}
+
+// Unsigned compares.
+fn upick(a as u64, b as u64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    if (a < b) { r = 1; s = 5; } else { r = 2; s = 6; }
+    let is i64 as t with mut = 0;
+    let is i64 as w with mut = 0;
+    if (a >= b) { t = 10; w = 7; } else { t = 20; w = 8; }
+    let is i64 as p with mut = 0;
+    let is i64 as q with mut = 0;
+    if (a > b) { p = 100; q = 9; } else { p = 200; q = 11; }
+    let is i64 as m with mut = 0;
+    let is i64 as k with mut = 0;
+    if (a <= b) { m = 1000; k = 13; } else { m = 2000; k = 17; }
+    return r + t + p + m + s * w * q * k;
+}
+
+fn upick_ref(a as u64, b as u64) as i64 {
+    let is i64 as lt with mut = 0;
+    let is i64 as gt with mut = 0;
+    if (a < b) { lt = 1; }
+    if (a > b) { gt = 1; }
+    let is i64 as r with mut = 2;
+    let is i64 as s with mut = 6;
+    if (lt == 1) { r = 1; s = 5; }
+    let is i64 as t with mut = 20;
+    let is i64 as w with mut = 8;
+    if (lt == 0) { t = 10; w = 7; }
+    let is i64 as p with mut = 200;
+    let is i64 as q with mut = 11;
+    if (gt == 1) { p = 100; q = 9; }
+    let is i64 as m with mut = 2000;
+    let is i64 as k with mut = 17;
+    if (gt == 0) { m = 1000; k = 13; }
+    return r + t + p + m + s * w * q * k;
+}
+
+// i32 compare against an immediate, and an `x & k` test.
+fn small(a as i32, x as i64) as i64 {
+    let is i64 as u with mut = 0;
+    let is i64 as v with mut = 0;
+    if (a < 7) { u = x + 3; v = x << 2; } else { u = x - 3; v = x >> 1; }
+    let is i64 as f with mut = 0;
+    let is i64 as g with mut = 0;
+    if ((x & 4) != 0) { f = u ^ 5; g = v + u; } else { f = u | 8; g = v - u; }
+    return f * 7 + g;
+}
+
+fn small_ref(a as i32, x as i64) as i64 {
+    let is i64 as u = x + 3;
+    let is i64 as v = x << 2;
+    let is i64 as u2 = x - 3;
+    let is i64 as v2 = x >> 1;
+    let is i64 as uu with mut = u2;
+    let is i64 as vv with mut = v2;
+    if (cast(i64, a) < 7) { uu = u; vv = v; }
+    let is i64 as f with mut = uu | 8;
+    let is i64 as g with mut = vv - uu;
+    let is i64 as bit = (x >> 2) & 1;
+    if (bit == 1) { f = uu ^ 5; g = vv + uu; }
+    return f * 7 + g;
+}
+
+// An arm that stores: must stay a branch.
+fn stores(p as *i64, c as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    if (c > 0) { *p = 5; r = 1; s = 2; } else { r = 3; s = 4; }
+    return r * 10 + s;
+}
+
+// An arm that divides: dividing by zero in the arm not taken must not happen.
+fn divides(a as i64, b as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    if (b != 0) { r = a / b; s = 1; } else { r = 0; s = 2; }
+    return r * 10 + s;
+}
+
+// Only one arm writes z; z is read after the join.
+fn one_side(a as i64, z0 as i64) as i64 {
+    let is i64 as z with mut = z0;
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    if (a > 0) { z = a * 2; r = 1; s = 5; } else { r = 2; s = 6; }
+    return z * 100 + r * 10 + s;
+}
+
+fn fpick(a as f64, b as f64, x as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as s with mut = 0;
+    if (a < b) { r = x + 1; s = x * 2; } else { r = x - 1; s = x * 3; }
+    return r * 1000 + s;
+}
+
+fn main() as i32 {
+    let is i64 as n with mut = 1;
+    while (n <= 3000) {
+        if (collatz(n) != collatz_ref(n, 2)) { return 1; }
+        n = n + 1;
+    }
+    let is i64 as op with mut = 0;
+    while (op < 6) {
+        let is i64 as a with mut = 0 - 3;
+        while (a <= 3) {
+            let is i64 as b with mut = 0 - 3;
+            while (b <= 3) {
+                if (pick(op, a, b) != pick_ref(op, a, b)) { return 2; }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        op = op + 1;
+    }
+    let is i64 as minv = (0 - 9223372036854775807) - 1;
+    if (pick(2, minv, 9223372036854775807) != pick_ref(2, minv, 9223372036854775807)) { return 3; }
+    if (pick(4, minv, 0) != pick_ref(4, minv, 0)) { return 4; }
+    // unsigned: a huge "negative" value compares above small ones
+    let is [5]u64 as uv;
+    uv[0] = 0; uv[1] = 1; uv[2] = 7; uv[3] = cast(u64, 0 - 1); uv[4] = cast(u64, 0 - 2);
+    let is i32 as i with mut = 0;
+    while (i < 5) {
+        let is i32 as j with mut = 0;
+        while (j < 5) {
+            if (upick(uv[i], uv[j]) != upick_ref(uv[i], uv[j])) { return 5; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    let is i32 as s32 with mut = 0 - 10;
+    while (s32 < 20) {
+        let is i64 as x with mut = 0 - 9;
+        while (x < 30) {
+            if (small(s32, x) != small_ref(s32, x)) { return 6; }
+            x = x + 1;
+        }
+        s32 = s32 + 1;
+    }
+    let is i64 as cell with mut = 0;
+    if (stores(&cell, 1) != 12 || cell != 5) { return 7; }
+    cell = 0;
+    if (stores(&cell, 0) != 34 || cell != 0) { return 8; }
+    if (divides(17, 5) != 31 || divides(17, 0) != 2) { return 9; }
+    if (one_side(4, 9) != 815 || one_side(0 - 1, 9) != 926) { return 10; }
+    if (fpick(1.0, 2.0, 5) != 6010 || fpick(2.0, 1.0, 5) != 4015 || fpick(2.0, 2.0, 5) != 4015) { return 11; }
+    return 0;
+}

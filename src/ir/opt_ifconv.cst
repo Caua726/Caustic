@@ -25,6 +25,9 @@ use "defs.cst" as d;
 // Conservative by construction: only fires when BOTH arms contain nothing but
 // MOV/IMM (side-effect-free, non-faulting), both write the same dest, and the
 // two labels are referenced by exactly this JZ/JMP (no shared merge points).
+//
+// At -O2, when that shape does not match, ic2_try (below) takes the wider one:
+// arms of a few arithmetic instructions each, any number of phi values.
 
 fn ic_next_live(inst as *d.IRInst) as *d.IRInst {
     let is *d.IRInst as p with mut = inst.next;
@@ -110,8 +113,318 @@ fn pass_ifconv(func as *d.IRFunction) as void {
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && inst.op == d.IR_JZ && inst.src1.op_type == d.OP_VREG
             && inst.dest.op_type == d.OP_LABEL) {
-            ic_try(func, inst);
+            if (ic_try(func, inst) == 0 && d.ir_opt_level >= 2) { ic2_try(func, inst); }
         }
         inst = inst.next;
     }
+}
+
+// === -O2: if-conversion of small arithmetic diamonds ===
+//
+//       JZ   cond -> Lelse
+//       T: pure arithmetic, ending in phi moves  MOV d_k = s_k
+//       JMP  -> Ljoin
+//     Lelse:
+//       E: pure arithmetic, ending in phi moves  MOV d_k = r_k
+//     Ljoin:
+//
+// becomes, with both arms' work run unconditionally:
+//
+//       T work ; E work
+//       MOV d_k = r_k ; CMOV d_k, cond, s_k      (for each k)
+//     Ljoin:
+//
+// A branch on data (collatz's `x & 1`) mispredicts often; the select does not.
+// Only when it is safe and small:
+//   - every instruction of both arms is one that cannot fault or write memory
+//     (MOV, IMM, ADD, SUB, MUL, AND, OR, XOR, SHL/SHR by a constant, NEG, NOT,
+//     LEA, integer CAST), at most IC2_MAX_WORK of them besides the phi moves;
+//   - a phi dest d_k is written exactly once in each arm, by a MOV, is read in
+//     neither arm, and the s_k / r_k / cond are none of the d_k;
+//   - every other value an arm writes is that arm's own: written only there and
+//     read only there (so running the other arm too changes nothing outside);
+//   - cond is written by neither arm; Lelse and Ljoin are referenced only by
+//     this JZ and JMP.
+
+let is i32 as IC2_MAX_WORK with imut = 6;
+
+fn ic2_pure(i as *d.IRInst) as i32 {
+    let is i32 as op = i.op;
+    if (op == d.IR_MOV || op == d.IR_IMM || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
+        || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_NEG || op == d.IR_NOT
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8 || op == d.IR_CAST) {
+        if (i.dest.op_type != d.OP_VREG) { return 0; }
+        if (op == d.IR_CAST) {
+            let is i32 as kf = ic2_kind(i.cast_from);
+            let is i32 as kt = ic2_kind(i.cast_to);
+            if (kf < 1 || kf > 8 || kt < 1 || kt > 8) { return 0; }
+        }
+        return 1;
+    }
+    if ((op == d.IR_SHL || op == d.IR_SHR) && i.src2.op_type == d.OP_IMM && i.dest.op_type == d.OP_VREG) { return 1; }
+    return 0;
+}
+
+fn ic2_kind(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 4; }
+    return *cast(*i32, tp);
+}
+
+fn ic2_reads(i as *d.IRInst, v as i32) as i32 {
+    if (i.src1.op_type == d.OP_VREG && i.src1.vreg == v) { return 1; }
+    if (i.src2.op_type == d.OP_VREG && i.src2.vreg == v) { return 1; }
+    // ops whose dest operand is read, not written (a store's address, a cmov)
+    if (i.dest.op_type == d.OP_VREG && i.dest.vreg == v
+        && (i.op == d.IR_STORE || i.op == d.IR_ATOMIC_STORE || i.op == d.IR_VSTOREQ || i.op == d.IR_VSTOREQ256
+            || i.op == d.IR_CMOV || i.op == d.IR_COPY)) { return 1; }
+    return 0;
+}
+
+// v is read or written by a live instruction outside [a, b).
+fn ic2_outside(func as *d.IRFunction, v as i32, a as *d.IRInst, b as *d.IRInst, writes as i32) as i32 {
+    let is i32 as inside with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (cast(i64, w) == cast(i64, a)) { inside = 1; }
+        if (cast(i64, w) == cast(i64, b)) { inside = 0; }
+        if (w.is_dead == 0 && inside == 0) {
+            if (ic2_reads(w, v) == 1) { return 1; }
+            if (writes == 1 && w.dest.op_type == d.OP_VREG && w.dest.vreg == v) { return 1; }
+        }
+        w = w.next;
+    }
+    return 0;
+}
+
+fn ic2_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
+    let is i32 as cond = jz.src1.vreg;
+    let is i32 as else_label = jz.dest.label;
+    // then arm
+    let is *d.IRInst as t0 = ic_next_live(jz);
+    let is *d.IRInst as t with mut = t0;
+    while (cast(i64, t) != 0 && t.op != d.IR_JMP) {
+        if (ic2_pure(t) == 0) { return 0; }
+        t = ic_next_live(t);
+    }
+    if (cast(i64, t) == 0) { return 0; }
+    let is *d.IRInst as jmp = t;
+    if (jmp.dest.op_type != d.OP_LABEL) { return 0; }
+    let is i32 as join_label = jmp.dest.label;
+    let is *d.IRInst as lel = ic_next_live(jmp);
+    if (cast(i64, lel) == 0 || lel.op != d.IR_LABEL || lel.dest.label != else_label) { return 0; }
+    let is *d.IRInst as e0 = ic_next_live(lel);
+    let is *d.IRInst as e with mut = e0;
+    while (cast(i64, e) != 0 && e.op != d.IR_LABEL) {
+        if (ic2_pure(e) == 0) { return 0; }
+        e = ic_next_live(e);
+    }
+    if (cast(i64, e) == 0 || e.dest.label != join_label) { return 0; }
+    let is *d.IRInst as ljoin = e;
+    if (ic_count_label_refs(func, else_label) != 1) { return 0; }
+    if (ic_count_label_refs(func, join_label) != 1) { return 0; }
+
+    // classify the then arm's writes: phi dests (also written in the else arm)
+    // and the arm's own values
+    let is [8]i32 as pd;            // phi dests
+    let is [8]i64 as pt;            // then-arm MOV
+    let is [8]i64 as pe;            // else-arm MOV
+    let is i32 as np with mut = 0;
+    let is i32 as work with mut = 0;
+    t = t0;
+    while (cast(i64, t) != cast(i64, jmp)) {
+        if (t.is_dead == 0) {
+            let is i32 as v = t.dest.vreg;
+            // written in the else arm too?
+            let is *d.IRInst as em with mut = cast(*d.IRInst, 0);
+            let is i32 as ecnt with mut = 0;
+            let is *d.IRInst as w with mut = e0;
+            while (cast(i64, w) != cast(i64, ljoin)) {
+                if (w.is_dead == 0 && w.dest.vreg == v) { em = w; ecnt = ecnt + 1; }
+                w = w.next;
+            }
+            if (ecnt > 0) {
+                if (ecnt != 1 || t.op != d.IR_MOV || em.op != d.IR_MOV) { return 0; }
+                if (t.src1.op_type != d.OP_VREG || em.src1.op_type != d.OP_VREG) { return 0; }
+                if (np >= 8) { return 0; }
+                pd[np] = v; pt[np] = cast(i64, t); pe[np] = cast(i64, em);
+                np = np + 1;
+            } else {
+                work = work + 1;
+                // the arm's own: no read or write outside the then arm
+                if (ic2_outside(func, v, t0, jmp, 1) == 1) { return 0; }
+            }
+        }
+        t = t.next;
+    }
+    if (np == 0) { return 0; }
+    // the else arm: phi moves already matched, the rest its own
+    e = e0;
+    while (cast(i64, e) != cast(i64, ljoin)) {
+        if (e.is_dead == 0) {
+            let is i32 as v = e.dest.vreg;
+            let is i32 as isphi with mut = 0;
+            let is i32 as k with mut = 0;
+            while (k < np) { if (pd[k] == v) { isphi = 1; } k = k + 1; }
+            if (isphi == 0) {
+                work = work + 1;
+                if (ic2_outside(func, v, e0, ljoin, 1) == 1) { return 0; }
+            }
+        }
+        e = e.next;
+    }
+    if (work > IC2_MAX_WORK) { return 0; }
+    // the phi moves end each arm: nothing after one rewrites what it copies
+    let is i32 as seenp with mut = 0;
+    t = t0;
+    while (cast(i64, t) != cast(i64, jmp)) {
+        if (t.is_dead == 0) {
+            let is i32 as isp with mut = 0;
+            let is i32 as q with mut = 0;
+            while (q < np) { if (pd[q] == t.dest.vreg) { isp = 1; } q = q + 1; }
+            if (isp == 1) { seenp = 1; } else if (seenp == 1) { return 0; }
+        }
+        t = t.next;
+    }
+    seenp = 0;
+    e = e0;
+    while (cast(i64, e) != cast(i64, ljoin)) {
+        if (e.is_dead == 0) {
+            let is i32 as isp with mut = 0;
+            let is i32 as q with mut = 0;
+            while (q < np) { if (pd[q] == e.dest.vreg) { isp = 1; } q = q + 1; }
+            if (isp == 1) { seenp = 1; } else if (seenp == 1) { return 0; }
+        }
+        e = e.next;
+    }
+    // phi dests: one write per arm (checked for else; then: count), not read in
+    // the arms, not a phi source, not cond
+    let is i32 as k2 with mut = 0;
+    while (k2 < np) {
+        let is i32 as v = pd[k2];
+        if (v == cond) { return 0; }
+        let is i32 as tw with mut = 0;
+        t = t0;
+        while (cast(i64, t) != cast(i64, jmp)) {
+            if (t.is_dead == 0) {
+                if (t.dest.vreg == v) { tw = tw + 1; }
+                if (ic2_reads(t, v) == 1) { return 0; }
+            }
+            t = t.next;
+        }
+        if (tw != 1) { return 0; }
+        e = e0;
+        while (cast(i64, e) != cast(i64, ljoin)) {
+            if (e.is_dead == 0 && ic2_reads(e, v) == 1) { return 0; }
+            e = e.next;
+        }
+        let is i32 as k3 with mut = 0;
+        while (k3 < np) {
+            let is *d.IRInst as a = cast(*d.IRInst, pt[k3]);
+            let is *d.IRInst as b = cast(*d.IRInst, pe[k3]);
+            if (a.src1.vreg == v || b.src1.vreg == v) { return 0; }
+            k3 = k3 + 1;
+        }
+        k2 = k2 + 1;
+    }
+    // cond is not written in either arm
+    t = t0;
+    while (cast(i64, t) != cast(i64, jmp)) { if (t.is_dead == 0 && t.dest.vreg == cond) { return 0; } t = t.next; }
+    e = e0;
+    while (cast(i64, e) != cast(i64, ljoin)) { if (e.is_dead == 0 && e.dest.vreg == cond) { return 0; } e = e.next; }
+
+    // The compare that makes cond (and an AND feeding only it), right before
+    // the JZ and read only by it, moves down to the selects: its flags are
+    // then still there for them (emit_inst.cst, cmov_cond). Its operands are
+    // none of the arms' own values (those are read only in their arm) and
+    // none of the phi dests (checked), so it computes the same there.
+    let is *d.IRInst as cmpi with mut = ic2_prev_live(func, jz);
+    let is *d.IRInst as andi with mut = cast(*d.IRInst, 0);
+    if (cast(i64, cmpi) != 0 && ic2_is_cmp(cmpi.op) == 1 && cmpi.dest.op_type == d.OP_VREG && cmpi.dest.vreg == cond
+        && ic2_uses(func, cond) == 1 && ic2_src_ok(cmpi, &pd[0], np) == 1) {
+        let is *d.IRInst as a = ic2_prev_live(func, cmpi);
+        if (cast(i64, a) != 0 && a.op == d.IR_AND && a.dest.op_type == d.OP_VREG && cmpi.src1.op_type == d.OP_VREG
+            && a.dest.vreg == cmpi.src1.vreg && ic2_uses(func, a.dest.vreg) == 1 && ic2_src_ok(a, &pd[0], np) == 1) {
+            andi = a;
+        }
+    } else {
+        cmpi = cast(*d.IRInst, 0);
+    }
+
+    // --- transform ---
+    jz.is_dead = 1;
+    jmp.is_dead = 1;
+    lel.is_dead = 1;
+    let is i32 as k4 with mut = 0;
+    let is *d.IRInst as tail with mut = ic_prev_of(func, ljoin);
+    if (cast(i64, cmpi) != 0) {
+        if (cast(i64, andi) != 0) {
+            let is *d.IRInst as pa = ic_prev_of(func, andi);
+            pa.next = andi.next;
+            andi.next = tail.next; tail.next = andi; tail = andi;
+        }
+        let is *d.IRInst as pc = ic_prev_of(func, cmpi);
+        pc.next = cmpi.next;
+        cmpi.next = tail.next; tail.next = cmpi; tail = cmpi;
+    }
+    while (k4 < np) {
+        let is *d.IRInst as a = cast(*d.IRInst, pt[k4]);
+        let is *d.IRInst as b = cast(*d.IRInst, pe[k4]);
+        a.is_dead = 1;
+        b.is_dead = 1;
+        let is *d.IRInst as mv = d.new_inst(d.IR_MOV);
+        mv.dest = b.dest; mv.src1 = b.src1; mv.cast_to = b.cast_to; mv.line = b.line;
+        let is *d.IRInst as cm = d.new_inst(d.IR_CMOV);
+        cm.dest.op_type = d.OP_VREG; cm.dest.vreg = pd[k4];
+        cm.src1.op_type = d.OP_VREG; cm.src1.vreg = cond;
+        cm.src2.op_type = d.OP_VREG; cm.src2.vreg = a.src1.vreg;
+        cm.line = b.line;
+        mv.next = cm;
+        cm.next = tail.next;
+        tail.next = mv;
+        tail = cm;
+        k4 = k4 + 1;
+    }
+    return 1;
+}
+
+fn ic_prev_of(func as *d.IRFunction, x as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, x)) { w = w.next; }
+    return w;
+}
+
+fn ic2_prev_live(func as *d.IRFunction, x as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as r with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0 && cast(i64, w) != cast(i64, x)) {
+        if (w.is_dead == 0) { r = w; }
+        w = w.next;
+    }
+    return r;
+}
+
+fn ic2_is_cmp(op as i32) as i32 {
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { return 1; }
+    return 0;
+}
+
+fn ic2_uses(func as *d.IRFunction, v as i32) as i32 {
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && ic2_reads(w, v) == 1) { n = n + 1; }
+        w = w.next;
+    }
+    return n;
+}
+
+// No operand of i is a phi dest.
+fn ic2_src_ok(i as *d.IRInst, pd as *i32, np as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < np) {
+        if (i.src1.op_type == d.OP_VREG && i.src1.vreg == pd[k]) { return 0; }
+        if (i.src2.op_type == d.OP_VREG && i.src2.vreg == pd[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
 }

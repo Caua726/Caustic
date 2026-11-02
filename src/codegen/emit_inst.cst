@@ -175,9 +175,61 @@ fn gen_inst_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 // (tests/float_cmov_test.cst).
 // No flag-clobbering instruction may sit between the test and the cmovne — the
 // only thing between them are mov/movq loads, which don't touch FLAGS.
+//
+// -O2: when the compare that makes cond comes right before, with only MOVs
+// and CMOVs reading cond after it (cmov_users), it leaves its flags and the
+// condition code in cmov_cc instead of a 0/1 value; each CMOV then is one
+// `cmov<cc>`, with no test.
+let is i32 as cmov_cond with mut = 0 - 1;
+let is i32 as cmov_left with mut = 0;
+let is *u8 as cmov_cc with mut;
+
+// How many CMOVs read c's dest right after it, with only MOVs (vreg to vreg,
+// not writing that dest) between them; 0 if anything else comes first or if
+// the dest is read anywhere else.
+fn cmov_users(c as *d.IRInst) as i32 {
+    if (al.al_opt_level < 2 || c.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as v = c.dest.vreg;
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as w with mut = _next_live(c);
+    let is i32 as go with mut = 1;
+    while (go == 1 && cast(i64, w) != 0) {
+        if (w.op == d.IR_CMOV && w.src1.op_type == d.OP_VREG && w.src1.vreg == v && w.dest.vreg != v) {
+            n = n + 1; w = _next_live(w);
+        } else if (w.op == d.IR_MOV && w.src1.op_type == d.OP_VREG && w.dest.op_type == d.OP_VREG && w.dest.vreg != v) {
+            w = _next_live(w);
+        } else { go = 0; }
+    }
+    if (n == 0 || e.isel_get_uses(v) != n) { return 0; }
+    return n;
+}
+
+fn _cc_of(op as i32, sgn as i32) as *u8 {
+    if (op == d.IR_EQ) { return "e"; }
+    if (op == d.IR_NE) { return "ne"; }
+    if (op == d.IR_LT) { if (sgn == 1) { return "l"; } return "b"; }
+    if (op == d.IR_LE) { if (sgn == 1) { return "le"; } return "be"; }
+    if (op == d.IR_GT) { if (sgn == 1) { return "g"; } return "a"; }
+    if (sgn == 1) { return "ge"; }
+    return "ae";
+}
+
 fn gen_inst_cmov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
-    e.load_op(inst.src1.vreg, ctx, "rcx");           // cond -> rcx
-    eo.out_str("  test rcx, rcx\n", 16);             // sets FLAGS; rcx now free
+    let is *u8 as cc with mut = "ne";
+    if (cmov_left > 0 && inst.src1.vreg == cmov_cond) {
+        cc = cmov_cc;
+        cmov_left = cmov_left - 1;
+        if (cmov_left == 0) { cmov_cond = 0 - 1; }
+    } else {
+        let is i32 as cl = al.get_loc(inst.src1.vreg, ctx);
+        if (al.al_opt_level >= 2 && cl >= 0 && cl < 16) {
+            let is *u8 as cr = eo.reg64(cl);
+            eo.out_str("  test ", 7); eo.out_cstr(cr); eo.out_str(", ", 2); eo.out_cstr(cr); eo.out_char(10);
+        } else {
+            e.load_op(inst.src1.vreg, ctx, "rcx");           // cond -> rcx
+            eo.out_str("  test rcx, rcx\n", 16);             // sets FLAGS; rcx now free
+        }
+    }
     // dest register (holds the preloaded false-value); must be a real register.
     let is i32 as dest_loc = al.get_loc(inst.dest.vreg, ctx);
     let is i32 as dest_gpr with mut = 0;
@@ -190,7 +242,7 @@ fn gen_inst_cmov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is *u8 as vr with mut = "rcx";
     if (vt_loc >= 0 && vt_loc < 16) { vr = eo.reg64(vt_loc); }
     else { e.load_op(inst.src2.vreg, ctx, "rcx"); vr = "rcx"; }
-    eo.out_str("  cmovne ", 9);
+    eo.out_str("  cmov", 6); eo.out_cstr(cc); eo.out_char(32);
     eo.out_cstr(dr);
     eo.out_str(", ", 2);
     eo.out_cstr(vr);
@@ -1114,8 +1166,8 @@ fn try_and_test(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     if (c.src1.op_type != d.OP_VREG || c.src1.vreg != inst.dest.vreg) { return 0; }
     if (c.src2.op_type != d.OP_IMM || c.src2.imm != 0) { return 0; }
     let is *d.IRInst as j = c.next;
-    if (cast(i64, j) == 0 || j.is_dead == 1 || (j.op != d.IR_JZ && j.op != d.IR_JNZ)
-        || j.src1.vreg != c.dest.vreg) { return 0; }
+    if ((cast(i64, j) == 0 || j.is_dead == 1 || (j.op != d.IR_JZ && j.op != d.IR_JNZ)
+        || j.src1.vreg != c.dest.vreg) && cmov_users(c) == 0) { return 0; }
     test_and_vreg = inst.dest.vreg;
     test_and_src = inst.src1.vreg;
     test_and_imm = inst.src2.imm;
@@ -1265,6 +1317,32 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 _float_label(inst.dest.vreg, "_skip"); eo.out_str(":\n", 2);
             }
             nx.is_dead = 1;
+            fused = 1;
+        }
+    }
+    if (fused == 0 && is_flt == 0 && ld_t < 0) {
+        let is i32 as nc = cmov_users(inst);
+        if (nc > 0) {
+            if (and_t >= 0 && inst.src1.op_type == d.OP_VREG && inst.src1.vreg == and_t) {
+                let is *u8 as xr = e.op_reg(test_and_src, ctx, 0);
+                eo.out_str("  test ", 7); eo.out_cstr(xr); eo.out_str(", ", 2);
+                eo.out_int(test_and_imm); eo.out_char(10);
+            } else if (e.lz_cmp32(inst) == 1) {
+                _cmp32_flags(inst, ctx, 0);
+            } else {
+                let is i64 as imm_c = cmp_try_inline_imm(inst);
+                let is *u8 as crc = e.op_reg(inst.src1.vreg, ctx, 0);
+                if (imm_c == 0) {
+                    eo.out_str("  test ", 7); eo.out_cstr(crc); eo.out_str(", ", 2); eo.out_cstr(crc); eo.out_char(10);
+                } else if (imm_c != cast(i64, 0) - cast(i64, 9999999999)) {
+                    eo.out_str("  cmp ", 6); eo.out_cstr(crc); eo.out_str(", ", 2); eo.out_int(imm_c); eo.out_char(10);
+                } else {
+                    eo.out_str("  cmp ", 6); eo.out_cstr(crc); eo.out_str(", ", 2); e.emit_src2(inst, ctx); eo.out_char(10);
+                }
+            }
+            cmov_cond = inst.dest.vreg;
+            cmov_left = nc;
+            cmov_cc = _cc_of(op, e.is_signed_type(inst.cast_to));
             fused = 1;
         }
     }
