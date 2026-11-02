@@ -1,0 +1,275 @@
+// A task scheduler simulation in the style of a systems-language program:
+// global registers, task control blocks in a linked list ordered by
+// priority, a dispatch loop that switches on each task's state, and task
+// functions called through pointers. An idle task releases two device tasks
+// alternately for 10M steps; a worker fills packets with letters and sends
+// them to two handlers, which feed the characters one at a time to their
+// devices. A handler's two queues live in its general registers, which hold
+// either a number or a packet pointer.
+// Self-check: 23263894 packets queued and 9305557 holds, as the program's
+// own last lines report; the printed lines hash to the expected value.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i64 as STEPS with imut = 10000000;
+let is i32 as BUF_LAST with imut = 3;    // a packet carries 4 data bytes
+
+let is i32 as T_IDLE with imut = 1;
+let is i32 as T_WORK with imut = 2;
+let is i32 as T_HANDLER_A with imut = 3;
+let is i32 as T_HANDLER_B with imut = 4;
+let is i32 as T_DEV_A with imut = 5;
+let is i32 as T_DEV_B with imut = 6;
+
+let is i32 as PKT_BIT with imut = 1;
+let is i32 as WAIT_BIT with imut = 2;
+let is i32 as HOLD_BIT with imut = 4;
+
+// States: 0 running, 1 running with a packet, 2 waiting, 3 waiting with a
+// packet; 4 to 7 the same four held.
+let is i32 as S_RUN with imut = 0;
+let is i32 as S_WAIT with imut = 2;
+let is i32 as S_WAITPKT with imut = 3;
+
+let is i32 as K_DEV with imut = 1000;
+let is i32 as K_WORK with imut = 1001;
+
+struct Packet {
+    link as *Packet;     // first, so any word that holds a pointer can head a queue
+    dest as i32;
+    kind as i32;
+    count as i32;
+    data as [4]u8;
+}
+
+struct Task {
+    link as *Task;
+    id as i32;
+    pri as i32;
+    queue as *Packet;
+    state as i32;
+    run as *u8;          // fn(*Packet) as *Task
+    r1 as i64;
+    r2 as i64;
+}
+
+let is [11]*Task as tasks with mut;
+let is *Task as task_list with mut;
+let is *Task as current with mut;
+let is i64 as cur_id with mut = 0;
+let is i64 as r1 with mut = 0;          // the running task's registers
+let is i64 as r2 with mut = 0;
+let is i32 as queued with mut = 0;
+let is i32 as holds with mut = 0;
+let is *u8 as letters = "0ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+let is mem.bins.Bins as heap with mut;
+let is u64 as out_hash with mut = 14695981039346656037;
+
+fn say(s as *u8) as void {
+    let is i64 as len = io.strlen(s);
+    io.write_bytes(io.STDOUT, s, len);
+    let is i64 as k with mut = 0;
+    while (k < len) { out_hash = (out_hash ^ cast(u64, s[k])) * 1099511628211; k = k + 1; }
+}
+
+fn new_task(id as i32, pri as i32, queue as *Packet, state as i32, run as *u8, v1 as i64, v2 as i64) as void {
+    let is *Task as t = cast(*Task, mem.bins.bins_alloc(&heap, sizeof(Task)));
+    tasks[id] = t;
+    t.link = task_list;
+    t.id = id;
+    t.pri = pri;
+    t.queue = queue;
+    t.state = state;
+    t.run = run;
+    t.r1 = v1;
+    t.r2 = v2;
+    task_list = t;
+}
+
+fn new_packet(link as *Packet, dest as i32, kind as i32) as *Packet {
+    let is *Packet as p = cast(*Packet, mem.bins.bins_alloc(&heap, sizeof(Packet)));
+    let is i32 as i with mut = 0;
+    while (i <= BUF_LAST) { p.data[i] = 0; i = i + 1; }
+    p.link = link;
+    p.dest = dest;
+    p.kind = kind;
+    p.count = 0;
+    return p;
+}
+
+// Appends pkt to the queue whose head pointer is the first word of `head`.
+fn append(pkt as *Packet, head as *Packet) as void {
+    pkt.link = cast(*Packet, 0);
+    let is *Packet as p with mut = head;
+    while (cast(i64, p.link) != 0) { p = p.link; }
+    p.link = pkt;
+}
+
+fn find_task(id as i32) as *Task {
+    let is *Task as t with mut = cast(*Task, 0);
+    if (1 <= id && id <= 10) { t = tasks[id]; }
+    if (cast(i64, t) == 0) { io.printf("\nBad task id %d\n", id); }
+    return t;
+}
+
+fn wait_self() as *Task {
+    current.state = current.state | WAIT_BIT;
+    return current;
+}
+
+fn hold_self() as *Task {
+    holds = holds + 1;
+    current.state = current.state | HOLD_BIT;
+    return current.link;
+}
+
+fn release(id as i32) as *Task {
+    let is *Task as t = find_task(id);
+    if (cast(i64, t) == 0) { return t; }
+    t.state = t.state & 0xFFFB;
+    if (t.pri > current.pri) { return t; }
+    return current;
+}
+
+fn send(pkt as *Packet) as *Task {
+    let is *Task as t = find_task(pkt.dest);
+    if (cast(i64, t) == 0) { return t; }
+    queued = queued + 1;
+    pkt.link = cast(*Packet, 0);
+    pkt.dest = cast(i32, cur_id);
+    if (cast(i64, t.queue) == 0) {
+        t.queue = pkt;
+        t.state = t.state | PKT_BIT;
+        if (t.pri > current.pri) { return t; }
+    } else {
+        append(pkt, cast(*Packet, &t.queue));
+    }
+    return current;
+}
+
+fn idle_fn(pkt as *Packet) as *Task {
+    r2 = r2 - 1;
+    if (r2 == 0) { return hold_self(); }
+    if ((r1 & 1) == 0) {
+        r1 = (r1 >> 1) & 32767;
+        return release(T_DEV_A);
+    }
+    r1 = ((r1 >> 1) & 32767) ^ 0xD008;
+    return release(T_DEV_B);
+}
+
+fn work_fn(pkt as *Packet) as *Task {
+    if (cast(i64, pkt) == 0) { return wait_self(); }
+    r1 = cast(i64, T_HANDLER_A + T_HANDLER_B) - r1;
+    pkt.dest = cast(i32, r1);
+    pkt.count = 0;
+    let is i32 as i with mut = 0;
+    while (i <= BUF_LAST) {
+        r2 = r2 + 1;
+        if (r2 > 26) { r2 = 1; }
+        pkt.data[i] = letters[r2];
+        i = i + 1;
+    }
+    return send(pkt);
+}
+
+// r1 heads the queue of work packets, r2 that of device packets.
+fn handler_fn(pkt as *Packet) as *Task {
+    if (cast(i64, pkt) != 0) {
+        if (pkt.kind == K_WORK) { append(pkt, cast(*Packet, &r1)); }
+        else { append(pkt, cast(*Packet, &r2)); }
+    }
+    if (r1 != 0) {
+        let is *Packet as work = cast(*Packet, r1);
+        let is i32 as n = work.count;
+        if (n > BUF_LAST) {
+            r1 = cast(i64, work.link);
+            return send(work);
+        }
+        if (r2 != 0) {
+            let is *Packet as dev = cast(*Packet, r2);
+            r2 = cast(i64, dev.link);
+            dev.count = cast(i32, work.data[n]);
+            work.count = n + 1;
+            return send(dev);
+        }
+    }
+    return wait_self();
+}
+
+// r1 holds the packet being sent back, if any.
+fn device_fn(pkt as *Packet) as *Task {
+    if (cast(i64, pkt) == 0) {
+        if (r1 == 0) { return wait_self(); }
+        let is *Packet as p = cast(*Packet, r1);
+        r1 = 0;
+        return send(p);
+    }
+    r1 = cast(i64, pkt);
+    return hold_self();
+}
+
+fn schedule() as void {
+    while (cast(i64, current) != 0) {
+        let is *Packet as pkt with mut = cast(*Packet, 0);
+        let is i32 as st = current.state;
+        if (st == S_WAITPKT) {
+            pkt = current.queue;
+            current.queue = pkt.link;
+            if (cast(i64, current.queue) == 0) { current.state = S_RUN; } else { current.state = 1; }
+        }
+        if (st <= S_WAITPKT && st != S_WAIT) {
+            cur_id = cast(i64, current.id);
+            r1 = current.r1;
+            r2 = current.r2;
+            let is *Task as next = cast(*Task, call(current.run, pkt));
+            current.r1 = r1;
+            current.r2 = r2;
+            current = next;
+        } else if (st <= 7) {
+            current = current.link;
+        } else {
+            return;
+        }
+    }
+}
+
+fn main() as i32 {
+    heap = mem.bins.bins_new(65536);
+    say("Bench mark starting\n");
+    let is *Packet as none = cast(*Packet, 0);
+    new_task(T_IDLE, 0, none, S_RUN, fn_ptr(idle_fn), 1, STEPS);
+    let is *Packet as q with mut = new_packet(none, 0, K_WORK);
+    q = new_packet(q, 0, K_WORK);
+    new_task(T_WORK, 1000, q, S_WAITPKT, fn_ptr(work_fn), cast(i64, T_HANDLER_A), 0);
+    q = new_packet(none, T_DEV_A, K_DEV);
+    q = new_packet(q, T_DEV_A, K_DEV);
+    q = new_packet(q, T_DEV_A, K_DEV);
+    new_task(T_HANDLER_A, 2000, q, S_WAITPKT, fn_ptr(handler_fn), 0, 0);
+    q = new_packet(none, T_DEV_B, K_DEV);
+    q = new_packet(q, T_DEV_B, K_DEV);
+    q = new_packet(q, T_DEV_B, K_DEV);
+    new_task(T_HANDLER_B, 3000, q, S_WAITPKT, fn_ptr(handler_fn), 0, 0);
+    new_task(T_DEV_A, 4000, none, S_WAIT, fn_ptr(device_fn), 0, 0);
+    new_task(T_DEV_B, 5000, none, S_WAIT, fn_ptr(device_fn), 0, 0);
+    current = task_list;
+    queued = 0;
+    holds = 0;
+    say("Starting\n");
+    schedule();
+    say("finished\n");
+    let is [96]u8 as buf;
+    io.sprintf(cast(*u8, &buf), 96, "qpkt count = %d  holdcount = %d\n", queued, holds);
+    say(cast(*u8, &buf));
+    say("These results are ");
+    let is i32 as rc with mut = 1;
+    if (queued == 23263894 && holds == 9305557) {
+        say("correct");
+        rc = 0;
+    } else {
+        say("incorrect");
+    }
+    say("\nend of run\n");
+    if (rc == 0 && out_hash != 5574934315567454652) { return 2; }
+    return rc;
+}

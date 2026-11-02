@@ -1,0 +1,374 @@
+// Reed-Solomon (204, 188) over GF(2^8), shortened from (255, 239) and
+// correcting up to 8 symbol errors: 150000 blocks of 188 random bytes are
+// encoded systematically by a feedback shift register over the generator
+// polynomial (alpha^1 .. alpha^16), hit by 0 to 127 random byte errors,
+// and decoded with syndromes, the Berlekamp iteration for the error locator,
+// a Chien search for its roots and Forney's formula for the error values.
+// A block with too many errors comes back as received. Bytes come from the
+// C library's default additive feedback generator (degree 31, seed 1),
+// rebuilt here. Nothing is printed.
+// Self-check: a hash of every decoded block.
+use "../../std/io.cst" as io;
+
+let is i32 as NN with imut = 255;     // codeword symbols
+let is i32 as KK with imut = 239;     // data symbols
+let is i32 as TT with imut = 8;       // correctable errors
+let is i32 as NP with imut = 16;      // parity symbols, NN - KK
+let is i32 as BLOCKS with imut = 150000;
+
+// GF(2^8) as powers of alpha (index form) and as bit polynomials.
+let is [256]i32 as pow_of with mut;
+let is [256]i32 as log_of with mut;
+let is [17]i32 as gpoly with mut;       // generator polynomial, index form
+let is [255]i32 as recd with mut;
+let is [239]i32 as data with mut;
+let is [16]i32 as parity with mut;
+
+// Decoder scratch. The locator table is flat, 16 per row, with room past its
+// last row: a row being built may run over into the next before the loop
+// that builds it gives up.
+let is [320]i32 as elp with mut;
+let is [18]i32 as disc with mut;
+let is [18]i32 as deg with mut;
+let is [18]i32 as gap with mut;
+let is [17]i32 as syn with mut;
+let is [8]i32 as root with mut;
+let is [8]i32 as loc with mut;
+let is [9]i32 as zp with mut;
+let is [255]i32 as errv with mut;
+let is [9]i32 as reg with mut;
+
+// The additive feedback generator: x[i] = x[i-31] + x[i-3], output x >> 1.
+let is [31]u32 as rstate with mut;
+let is i32 as rfront with mut = 3;
+let is i32 as rrear with mut = 0;
+
+fn rand_next() as i64 {
+    rstate[rfront] = rstate[rfront] + rstate[rrear];
+    let is i64 as out = cast(i64, rstate[rfront] >> 1);
+    rfront = rfront + 1;
+    if (rfront >= 31) {
+        rfront = 0;
+        rrear = rrear + 1;
+    } else {
+        rrear = rrear + 1;
+        if (rrear >= 31) { rrear = 0; }
+    }
+    return out;
+}
+
+fn rand_seed(seed as i64) as void {
+    let is i64 as w with mut = seed;
+    rstate[0] = cast(u32, w);
+    let is i32 as i with mut = 1;
+    while (i < 31) {
+        // 16807 * w mod (2^31 - 1), by Schrage's method
+        let is i64 as hi = w / 127773;
+        let is i64 as lo = w % 127773;
+        w = 16807 * lo - 2836 * hi;
+        if (w < 0) { w = w + 2147483647; }
+        rstate[i] = cast(u32, w);
+        i = i + 1;
+    }
+    rfront = 3;
+    rrear = 0;
+    i = 0;
+    while (i < 310) { rand_next(); i = i + 1; }
+}
+
+fn modn(v as i32) as i32 { return v % NN; }
+
+fn build_field() as void {
+    // alpha^8 = alpha^4 + alpha^3 + alpha^2 + 1
+    let is i32 as top = 0x1D;
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        pow_of[i] = 1 << i;
+        log_of[pow_of[i]] = i;
+        i = i + 1;
+    }
+    pow_of[8] = top;
+    log_of[top] = 8;
+    i = 9;
+    while (i < NN) {
+        if (pow_of[i - 1] >= 128) { pow_of[i] = top ^ ((pow_of[i - 1] ^ 128) << 1); }
+        else { pow_of[i] = pow_of[i - 1] << 1; }
+        log_of[pow_of[i]] = i;
+        i = i + 1;
+    }
+    log_of[0] = 0 - 1;
+}
+
+// g(x) = (x + alpha)(x + alpha^2)...(x + alpha^16), kept in index form.
+fn build_generator() as void {
+    gpoly[0] = 2;
+    gpoly[1] = 1;
+    let is i32 as i with mut = 2;
+    while (i <= NP) {
+        gpoly[i] = 1;
+        let is i32 as j with mut = i - 1;
+        while (j > 0) {
+            if (gpoly[j] != 0) { gpoly[j] = gpoly[j - 1] ^ pow_of[modn(log_of[gpoly[j]] + i)]; }
+            else { gpoly[j] = gpoly[j - 1]; }
+            j = j - 1;
+        }
+        gpoly[0] = pow_of[modn(log_of[gpoly[0]] + i)];
+        i = i + 1;
+    }
+    i = 0;
+    while (i <= NP) { gpoly[i] = log_of[gpoly[i]]; i = i + 1; }
+}
+
+// Parity of data[] into parity[], both in polynomial form.
+fn encode() as void {
+    let is i32 as i with mut = 0;
+    while (i < NP) { parity[i] = 0; i = i + 1; }
+    i = KK - 1;
+    while (i >= 0) {
+        let is i32 as fb = log_of[data[i] ^ parity[NP - 1]];
+        let is i32 as j with mut = NP - 1;
+        if (fb != 0 - 1) {
+            while (j > 0) {
+                if (gpoly[j] != 0 - 1) { parity[j] = parity[j - 1] ^ pow_of[modn(gpoly[j] + fb)]; }
+                else { parity[j] = parity[j - 1]; }
+                j = j - 1;
+            }
+            parity[0] = pow_of[modn(gpoly[0] + fb)];
+        } else {
+            while (j > 0) { parity[j] = parity[j - 1]; j = j - 1; }
+            parity[0] = 0;
+        }
+        i = i - 1;
+    }
+}
+
+fn recd_to_poly() as void {
+    let is i32 as i with mut = 0;
+    while (i < NN) {
+        if (recd[i] != 0 - 1) { recd[i] = pow_of[recd[i]]; } else { recd[i] = 0; }
+        i = i + 1;
+    }
+}
+
+fn el(r as i32, c as i32) as i32 { return elp[r * 16 + c]; }
+fn set_el(r as i32, c as i32, v as i32) as void { elp[r * 16 + c] = v; }
+
+// Corrects recd[] (index form in, polynomial form out) when it can.
+fn decode() as void {
+    let is i32 as any with mut = 0;
+    let is i32 as i with mut = 1;
+    while (i <= NP) {
+        let is i32 as acc with mut = 0;
+        let is i32 as j with mut = 0;
+        while (j < NN) {
+            if (recd[j] != 0 - 1) { acc = acc ^ pow_of[modn(recd[j] + i * j)]; }
+            j = j + 1;
+        }
+        if (acc != 0) { any = 1; }
+        syn[i] = log_of[acc];
+        i = i + 1;
+    }
+    if (any == 0) { recd_to_poly(); return; }
+
+    // Berlekamp: row u of elp is the locator after step u, deg[u] its
+    // degree, disc[u] the discrepancy (index form), gap[u] = u - deg[u].
+    disc[0] = 0;
+    disc[1] = syn[1];
+    set_el(0, 0, 0);
+    set_el(1, 0, 1);
+    i = 1;
+    while (i < NP) { set_el(0, i, 0 - 1); set_el(1, i, 0); i = i + 1; }
+    deg[0] = 0;
+    deg[1] = 0;
+    gap[0] = 0 - 1;
+    gap[1] = 0;
+    let is i32 as u with mut = 0;
+    while (true) {
+        u = u + 1;
+        if (disc[u] == 0 - 1) {
+            deg[u + 1] = deg[u];
+            i = 0;
+            while (i <= deg[u]) {
+                set_el(u + 1, i, el(u, i));
+                set_el(u, i, log_of[el(u, i)]);
+                i = i + 1;
+            }
+        } else {
+            // the earlier step q with a nonzero discrepancy and the
+            // largest gap
+            let is i32 as q with mut = u - 1;
+            while (disc[q] == 0 - 1 && q > 0) { q = q - 1; }
+            if (q > 0) {
+                let is i32 as j with mut = q;
+                while (j > 0) {
+                    j = j - 1;
+                    if (disc[j] != 0 - 1 && gap[q] < gap[j]) { q = j; }
+                }
+            }
+            if (deg[u] > deg[q] + u - q) { deg[u + 1] = deg[u]; }
+            else { deg[u + 1] = deg[q] + u - q; }
+            i = 0;
+            while (i < NP) { set_el(u + 1, i, 0); i = i + 1; }
+            i = 0;
+            while (i <= deg[q]) {
+                if (el(q, i) != 0 - 1) {
+                    set_el(u + 1, i + u - q, pow_of[modn(disc[u] + NN - disc[q] + el(q, i))]);
+                }
+                i = i + 1;
+            }
+            i = 0;
+            while (i <= deg[u]) {
+                set_el(u + 1, i, el(u + 1, i) ^ el(u, i));
+                set_el(u, i, log_of[el(u, i)]);
+                i = i + 1;
+            }
+        }
+        gap[u + 1] = u - deg[u + 1];
+        if (u < NP) {
+            let is i32 as dd with mut = 0;
+            if (syn[u + 1] != 0 - 1) { dd = pow_of[syn[u + 1]]; }
+            i = 1;
+            while (i <= deg[u + 1]) {
+                if (syn[u + 1 - i] != 0 - 1 && el(u + 1, i) != 0) {
+                    dd = dd ^ pow_of[modn(syn[u + 1 - i] + log_of[el(u + 1, i)])];
+                }
+                i = i + 1;
+            }
+            disc[u + 1] = log_of[dd];
+        }
+        if (u >= NP || deg[u + 1] > TT) { break; }
+    }
+    u = u + 1;
+    let is i32 as nl = deg[u];
+    if (nl > TT) { recd_to_poly(); return; }
+
+    i = 0;
+    while (i <= nl) { set_el(u, i, log_of[el(u, i)]); i = i + 1; }
+    // Chien search: try every alpha^i.
+    i = 1;
+    while (i <= nl) { reg[i] = el(u, i); i = i + 1; }
+    let is i32 as count with mut = 0;
+    i = 1;
+    while (i <= NN) {
+        let is i32 as sum with mut = 1;
+        let is i32 as j with mut = 1;
+        while (j <= nl) {
+            if (reg[j] != 0 - 1) {
+                reg[j] = modn(reg[j] + j);
+                sum = sum ^ pow_of[reg[j]];
+            }
+            j = j + 1;
+        }
+        if (sum == 0) {
+            root[count] = i;
+            loc[count] = NN - i;
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if (count != nl) { recd_to_poly(); return; }
+
+    // The evaluator z(x), then each error value by Forney's formula.
+    i = 1;
+    while (i <= nl) {
+        let is i32 as zi with mut = 0;
+        if (syn[i] != 0 - 1) { zi = pow_of[syn[i]]; }
+        if (el(u, i) != 0 - 1) { zi = zi ^ pow_of[el(u, i)]; }
+        let is i32 as j with mut = 1;
+        while (j < i) {
+            if (syn[j] != 0 - 1 && el(u, i - j) != 0 - 1) {
+                zi = zi ^ pow_of[modn(el(u, i - j) + syn[j])];
+            }
+            j = j + 1;
+        }
+        zp[i] = log_of[zi];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < NN) { errv[i] = 0; i = i + 1; }
+    recd_to_poly();
+    i = 0;
+    while (i < nl) {
+        let is i32 as at = loc[i];
+        let is i32 as e with mut = 1;
+        let is i32 as j with mut = 1;
+        while (j <= nl) {
+            if (zp[j] != 0 - 1) { e = e ^ pow_of[modn(zp[j] + j * root[i])]; }
+            j = j + 1;
+        }
+        errv[at] = e;
+        if (e != 0) {
+            let is i32 as num = log_of[e];
+            let is i32 as den with mut = 0;
+            j = 0;
+            while (j < nl) {
+                if (j != i) { den = den + log_of[1 ^ pow_of[modn(loc[j] + root[i])]]; }
+                j = j + 1;
+            }
+            den = modn(den);
+            errv[at] = pow_of[modn(num - den + NN)];
+            recd[at] = recd[at] ^ errv[at];
+        }
+        i = i + 1;
+    }
+}
+
+// 188 data bytes in, 188 data bytes and 16 parity bytes out.
+fn encode_block(out as *u8, input as *u8) as void {
+    let is i32 as i with mut = 0;
+    while (i < KK - 188) { data[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 188) { data[KK - 188 + i] = cast(i32, input[i]); i = i + 1; }
+    encode();
+    i = 0;
+    while (i < 188) { out[i] = input[i]; i = i + 1; }
+    i = 0;
+    while (i < NP) { out[188 + i] = cast(u8, parity[i]); i = i + 1; }
+}
+
+fn decode_block(out as *u8, input as *u8) as void {
+    let is i32 as i with mut = 0;
+    while (i < NP) { recd[i] = cast(i32, input[188 + i]); i = i + 1; }
+    i = 0;
+    while (i < NN - 204) { recd[NP + i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 188) { recd[NN - 188 + i] = cast(i32, input[i]); i = i + 1; }
+    i = 0;
+    while (i < NN) { recd[i] = log_of[recd[i]]; i = i + 1; }
+    decode();
+    i = 0;
+    while (i < 188) { out[i] = cast(u8, recd[NN - 188 + i]); i = i + 1; }
+}
+
+fn main() as i32 {
+    build_field();
+    build_generator();
+    rand_seed(1);
+    let is [204]u8 as bin;
+    let is [204]u8 as bout;
+    let is *u8 as msg = cast(*u8, &bin);
+    let is *u8 as code = cast(*u8, &bout);
+    let is u64 as h with mut = 14695981039346656037;
+    let is i32 as b with mut = 0;
+    while (b < BLOCKS) {
+        let is i32 as j with mut = 0;
+        while (j < 188) { msg[j] = cast(u8, rand_next() & 255); j = j + 1; }
+        encode_block(code, msg);
+        let is i64 as hits = rand_next() & 127;
+        let is i64 as k with mut = 0;
+        while (k < hits) {
+            let is u8 as v = cast(u8, rand_next() & 255);
+            code[rand_next() % 204] = v;
+            k = k + 1;
+        }
+        decode_block(msg, code);
+        j = 0;
+        while (j < 188) { h = (h ^ cast(u64, msg[j])) * 1099511628211; j = j + 1; }
+        b = b + 1;
+    }
+    if (h != 14282818755070234784) {
+        io.printf("%lu\n", h);
+        return 1;
+    }
+    return 0;
+}

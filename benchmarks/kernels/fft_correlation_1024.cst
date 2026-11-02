@@ -1,0 +1,323 @@
+// Circular correlation of two 1024-point complex sequences through a split
+// radix-4 FFT on interleaved f64 data, 150000 times: a forward transform,
+// a pointwise product with a fixed conjugated spectrum, an unscaled inverse
+// transform. The transform reorders by bit reversal, then runs radix-4
+// passes of growing length with twiddles read from a precomputed
+// cos/sin table (itself stored in bit-reversed order); the inverse
+// conjugates on the way in and out. Inputs come from a small linear
+// congruential generator, and a forward-inverse round trip is checked
+// against them first. Prints the 1024 results.
+// Self-check: the hash of the printed lines.
+use "../../std/io.cst" as io;
+use "../../std/math.cst" as math;
+
+let is i32 as N with imut = 1024;          // complex points
+let is i32 as NW with imut = 512;          // twiddle table size, in doubles
+let is i32 as TRIES with imut = 150000;
+
+let is [2048]f64 as ref_buf with mut;
+let is [2048]f64 as cmp_buf with mut;
+let is [2048]f64 as src_buf with mut;
+let is [512]f64 as tw_buf with mut;
+let is [1024]i32 as rev with mut;          // bit reversal of complex indices
+let is [256]i32 as rev_tw with mut;
+let is u64 as out_hash with mut = 14695981039346656037;
+
+let is [65536]u8 as obuf with mut;
+let is i64 as olen with mut = 0;
+
+fn emit(b as *u8, len as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < len) {
+        out_hash = (out_hash ^ cast(u64, b[k])) * 1099511628211;
+        if (olen == 65536) { io.write_bytes(io.STDOUT, cast(*u8, &obuf), olen); olen = 0; }
+        obuf[olen] = b[k];
+        olen = olen + 1;
+        k = k + 1;
+    }
+}
+
+// x = (7141 x + 54773) mod 259200, scaled into [0, 1).
+fn fill_random(a as *f64, first as i32, last as i32) as void {
+    let is i32 as seed with mut = 0;
+    let is i32 as j with mut = first;
+    while (j <= last) {
+        seed = (seed * 7141 + 54773) % 259200;
+        a[j] = cast(f64, seed) * (1.0 / 259200.0);
+        j = j + 1;
+    }
+}
+
+fn max_error(a as *f64, first as i32, last as i32, scale as f64) as f64 {
+    let is i32 as seed with mut = 0;
+    let is f64 as err with mut = 0.0;
+    let is i32 as j with mut = first;
+    while (j <= last) {
+        seed = (seed * 7141 + 54773) % 259200;
+        let is f64 as e = math.abs_f64(cast(f64, seed) * (1.0 / 259200.0) - a[j] * scale);
+        if (e > err) { err = e; }
+        j = j + 1;
+    }
+    return err;
+}
+
+fn make_reversal(table as *i32, count as i32) as void {
+    let is i32 as bits with mut = 0;
+    while ((1 << bits) < count) { bits = bits + 1; }
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is i32 as r with mut = 0;
+        let is i32 as b with mut = 0;
+        while (b < bits) {
+            if ((i & (1 << b)) != 0) { r = r | (1 << (bits - 1 - b)); }
+            b = b + 1;
+        }
+        table[i] = r;
+        i = i + 1;
+    }
+}
+
+// Swaps complex element i with its bit reversal.
+fn reorder(a as *f64, table as *i32, count as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is i32 as r = table[i];
+        if (i < r) {
+            let is f64 as xr = a[2 * i];
+            let is f64 as xi = a[2 * i + 1];
+            a[2 * i] = a[2 * r];
+            a[2 * i + 1] = a[2 * r + 1];
+            a[2 * r] = xr;
+            a[2 * r + 1] = xi;
+        }
+        i = i + 1;
+    }
+}
+
+// cos and sin of j * pi/1024 for even j up to 256 (angles to pi/4; the
+// table mirrors them for the rest of the eighth), in bit-reversed order.
+fn make_twiddles(w as *f64) as void {
+    let is i32 as half = NW >> 1;
+    let is f64 as delta = math.atan(1.0) / cast(f64, half);
+    w[0] = 1.0;
+    w[1] = 0.0;
+    w[half] = math.cos(delta * cast(f64, half));
+    w[half + 1] = w[half];
+    let is i32 as j with mut = 2;
+    while (j < half) {
+        let is f64 as x = math.cos(delta * cast(f64, j));
+        let is f64 as y = math.sin(delta * cast(f64, j));
+        w[j] = x;
+        w[j + 1] = y;
+        w[NW - j] = y;
+        w[NW - j + 1] = x;
+        j = j + 2;
+    }
+    reorder(w, cast(*i32, &rev_tw), half);
+}
+
+// Radix-4 butterfly on the complex values at j, j+l, j+2l, j+3l (offsets in
+// doubles) without twiddles.
+fn plain(a as *f64, j as i32, l as i32) as void {
+    let is i32 as j1 = j + l;
+    let is i32 as j2 = j1 + l;
+    let is i32 as j3 = j2 + l;
+    let is f64 as x0r = a[j] + a[j1];
+    let is f64 as x0i = a[j + 1] + a[j1 + 1];
+    let is f64 as x1r = a[j] - a[j1];
+    let is f64 as x1i = a[j + 1] - a[j1 + 1];
+    let is f64 as x2r = a[j2] + a[j3];
+    let is f64 as x2i = a[j2 + 1] + a[j3 + 1];
+    let is f64 as x3r = a[j2] - a[j3];
+    let is f64 as x3i = a[j2 + 1] - a[j3 + 1];
+    a[j] = x0r + x2r;
+    a[j + 1] = x0i + x2i;
+    a[j2] = x0r - x2r;
+    a[j2 + 1] = x0i - x2i;
+    a[j1] = x1r - x3i;
+    a[j1 + 1] = x1i + x3r;
+    a[j3] = x1r + x3i;
+    a[j3 + 1] = x1i - x3r;
+}
+
+// The butterfly whose twiddles are the eighth roots: c = cos(pi/4).
+fn eighth(a as *f64, j as i32, l as i32, c as f64) as void {
+    let is i32 as j1 = j + l;
+    let is i32 as j2 = j1 + l;
+    let is i32 as j3 = j2 + l;
+    let is f64 as x0r = a[j] + a[j1];
+    let is f64 as x0i = a[j + 1] + a[j1 + 1];
+    let is f64 as x1r = a[j] - a[j1];
+    let is f64 as x1i = a[j + 1] - a[j1 + 1];
+    let is f64 as x2r = a[j2] + a[j3];
+    let is f64 as x2i = a[j2 + 1] + a[j3 + 1];
+    let is f64 as x3r = a[j2] - a[j3];
+    let is f64 as x3i = a[j2 + 1] - a[j3 + 1];
+    a[j] = x0r + x2r;
+    a[j + 1] = x0i + x2i;
+    a[j2] = x2i - x0i;
+    a[j2 + 1] = x0r - x2r;
+    let is f64 as ur = x1r - x3i;
+    let is f64 as ui = x1i + x3r;
+    a[j1] = c * (ur - ui);
+    a[j1 + 1] = c * (ur + ui);
+    let is f64 as vr = x3i + x1r;
+    let is f64 as vi = x3r - x1i;
+    a[j3] = c * (vi - vr);
+    a[j3 + 1] = c * (vi + vr);
+}
+
+// The general butterfly: outputs 1, 2 and 3 multiplied by w1, w2 and w3.
+fn twiddled(a as *f64, j as i32, l as i32, w1r as f64, w1i as f64, w2r as f64, w2i as f64, w3r as f64, w3i as f64) as void {
+    let is i32 as j1 = j + l;
+    let is i32 as j2 = j1 + l;
+    let is i32 as j3 = j2 + l;
+    let is f64 as x0r = a[j] + a[j1];
+    let is f64 as x0i = a[j + 1] + a[j1 + 1];
+    let is f64 as x1r = a[j] - a[j1];
+    let is f64 as x1i = a[j + 1] - a[j1 + 1];
+    let is f64 as x2r = a[j2] + a[j3];
+    let is f64 as x2i = a[j2 + 1] + a[j3 + 1];
+    let is f64 as x3r = a[j2] - a[j3];
+    let is f64 as x3i = a[j2 + 1] - a[j3 + 1];
+    a[j] = x0r + x2r;
+    a[j + 1] = x0i + x2i;
+    let is f64 as dr = x0r - x2r;
+    let is f64 as di = x0i - x2i;
+    a[j2] = w2r * dr - w2i * di;
+    a[j2 + 1] = w2r * di + w2i * dr;
+    let is f64 as ur = x1r - x3i;
+    let is f64 as ui = x1i + x3r;
+    a[j1] = w1r * ur - w1i * ui;
+    a[j1 + 1] = w1r * ui + w1i * ur;
+    let is f64 as vr = x1r + x3i;
+    let is f64 as vi = x1i - x3r;
+    a[j3] = w3r * vr - w3i * vi;
+    a[j3 + 1] = w3r * vi + w3i * vr;
+}
+
+// One radix-4 pass over n doubles with butterflies l doubles wide.
+fn pass(n as i32, l as i32, a as *f64, w as *f64) as void {
+    let is i32 as m = l << 2;
+    let is i32 as j with mut = 0;
+    while (j < l) { plain(a, j, l); j = j + 2; }
+    j = m;
+    while (j < l + m) { eighth(a, j, l, w[2]); j = j + 2; }
+    let is i32 as k1 with mut = 0;
+    let is i32 as m2 = 2 * m;
+    let is i32 as k with mut = m2;
+    while (k < n) {
+        k1 = k1 + 2;
+        let is i32 as k2 = 2 * k1;
+        let is f64 as w2r = w[k1];
+        let is f64 as w2i = w[k1 + 1];
+        let is f64 as w1r with mut = w[k2];
+        let is f64 as w1i with mut = w[k2 + 1];
+        let is f64 as w3r with mut = w1r - 2.0 * w2i * w1i;
+        let is f64 as w3i with mut = 2.0 * w2i * w1r - w1i;
+        j = k;
+        while (j < l + k) { twiddled(a, j, l, w1r, w1i, w2r, w2i, w3r, w3i); j = j + 2; }
+        w1r = w[k2 + 2];
+        w1i = w[k2 + 3];
+        w3r = w1r - 2.0 * w2r * w1i;
+        w3i = 2.0 * w2r * w1r - w1i;
+        j = k + m;
+        while (j < l + (k + m)) { twiddled(a, j, l, w1r, w1i, 0.0 - w2i, w2r, w3r, w3i); j = j + 2; }
+        k = k + m2;
+    }
+}
+
+fn conjugate(a as *f64, n as i32) as void {
+    let is i32 as j with mut = 1;
+    while (j < n) { a[j] = 0.0 - a[j]; j = j + 2; }
+}
+
+// Forward (sign 1) or unscaled inverse (sign -1) transform of n doubles.
+fn transform(a as *f64, sign as i32) as void {
+    let is i32 as n = 2 * N;
+    let is *f64 as w = cast(*f64, &tw_buf);
+    if (sign < 0) { conjugate(a, n); }
+    reorder(a, cast(*i32, &rev), N);
+    let is i32 as l with mut = 2;
+    while ((l << 2) < n) {
+        pass(n, l, a, w);
+        l = l << 2;
+    }
+    let is i32 as j with mut = 0;
+    while (j < l) {
+        plain(a, j, l);
+        if (sign < 0) {
+            a[j + 1] = 0.0 - a[j + 1];
+            a[j + l + 1] = 0.0 - a[j + l + 1];
+            a[j + 2 * l + 1] = 0.0 - a[j + 2 * l + 1];
+            a[j + 3 * l + 1] = 0.0 - a[j + 3 * l + 1];
+        }
+        j = j + 2;
+    }
+}
+
+fn zero(a as *f64, n as i32) as void {
+    let is i32 as j with mut = 0;
+    while (j < n) { a[j] = 0.0; j = j + 1; }
+}
+
+fn shown(v as f64) as f64 {
+    if (math.abs_f64(v) > 0.000000001) { return v; }
+    return 0.0;
+}
+
+fn main() as i32 {
+    let is *f64 as ref = cast(*f64, &ref_buf);
+    let is *f64 as cmp = cast(*f64, &cmp_buf);
+    let is *f64 as src = cast(*f64, &src_buf);
+    make_reversal(cast(*i32, &rev), N);
+    make_reversal(cast(*i32, &rev_tw), NW >> 1);
+    make_twiddles(cast(*f64, &tw_buf));
+
+    fill_random(ref, 0, 2 * N - 1);
+    transform(ref, 1);
+    transform(ref, 0 - 1);
+    let is f64 as err = max_error(ref, 0, 2 * N - 1, 1.0 / cast(f64, N));
+    if (math.abs_f64(err) > 0.0000000001) {
+        io.printf("FFT sanity check failed! Difference is: %le\n", err);
+        return 3;
+    }
+
+    zero(ref, 2 * N);
+    fill_random(ref, 0, N - 1);
+    transform(ref, 1);
+    let is i32 as j with mut = 0;
+    while (j < N) { ref[2 * j + 1] = 0.0 - ref[2 * j + 1]; j = j + 1; }
+    zero(src, 2 * N);
+    fill_random(src, 0, N - 1);
+
+    let is i32 as t with mut = 0;
+    while (t < TRIES) {
+        j = 0;
+        while (j < 2 * N) { cmp[j] = src[j]; j = j + 1; }
+        transform(cmp, 1);
+        let is i32 as k with mut = 0;
+        while (k < N) {
+            let is f64 as re1 = cmp[2 * k];
+            let is f64 as re2 = ref[2 * k];
+            let is f64 as im1 = cmp[2 * k + 1];
+            let is f64 as im2 = ref[2 * k + 1];
+            cmp[2 * k] = re1 * re2 - im1 * im2;
+            cmp[2 * k + 1] = re1 * im2 + im1 * re2;
+            k = k + 1;
+        }
+        transform(cmp, 0 - 1);
+        t = t + 1;
+    }
+
+    let is [96]u8 as buf;
+    let is *u8 as bp = cast(*u8, &buf);
+    j = 0;
+    while (j < N) {
+        emit(bp, io.sprintf(bp, 96, "%e %e\n", shown(cmp[2 * j]), shown(cmp[2 * j + 1])));
+        j = j + 1;
+    }
+    io.write_bytes(io.STDOUT, cast(*u8, &obuf), olen);
+    if (out_hash != 16227777238786879974) { return 1; }
+    return 0;
+}

@@ -2,9 +2,12 @@
 // that it exits 0, and print the fastest of N wall-clock runs.
 //
 // From the repository root:
-//   ./caustic benchmarks/run.cst -o /tmp/bench-run && /tmp/bench-run [N] [filter]
+//   ./caustic benchmarks/run.cst -o /tmp/bench-run && /tmp/bench-run [N] [filter] [--no-O0 | --full]
 //
 // N defaults to 5. With a filter, only benchmarks whose path contains it run.
+// The -O2 build is timed as the fastest of N runs; the -O0 build runs once,
+// to check its result (its time is that one run). --full times -O0 as the
+// fastest of N as well; --no-O0 skips the -O0 build altogether.
 // Binaries go to /tmp/caustic-bench/. Benchmark output goes to /dev/null: the
 // programs check their own results and say so through the exit code.
 // Exit code: the number of benchmarks that failed to build or to pass.
@@ -29,6 +32,13 @@ fn str_lt(a as *u8, b as *u8) as i32 {
     let is i64 as k with mut = 0;
     while (a[k] != 0 && a[k] == b[k]) { k = k + 1; }
     if (a[k] < b[k]) { return 1; }
+    return 0;
+}
+
+fn same(a as *u8, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (a[k] != 0 && a[k] == b[k]) { k = k + 1; }
+    if (a[k] == b[k]) { return 1; }
     return 0;
 }
 
@@ -155,15 +165,32 @@ fn time_min(exe as *u8, runs as i32) as f64 {
 fn main(argc as i64, argv as *u8) as i32 {
     env.init(argc, argv);
     let is i32 as runs with mut = 5;
-    if (argc >= 2) {
-        let is *u8 as a = env.argv(1);
-        let is i32 as v with mut = 0;
-        let is i64 as k with mut = 0;
-        while (a[k] >= 48 && a[k] <= 57) { v = v * 10 + (cast(i32, a[k]) - 48); k = k + 1; }
-        if (v > 0) { runs = v; }
-    }
     let is *u8 as filter with mut = cast(*u8, 0);
-    if (argc >= 3) { filter = env.argv(2); }
+    let is i32 as o0_mode with mut = 1;      // 0 skip, 1 one run, 2 fastest of N
+    let is i32 as positional with mut = 0;
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as a = env.argv(ai);
+        if (a[0] == 45 && a[1] == 45) {
+            if (same(a, "--no-O0") == 1) { o0_mode = 0; }
+            else if (same(a, "--full") == 1) { o0_mode = 2; }
+            else {
+                io.fdprintf(io.STDERR, "unknown option %s (use --no-O0 or --full)\n", a);
+                return 1;
+            }
+        } else if (positional == 0) {
+            let is i32 as v with mut = 0;
+            let is i64 as k with mut = 0;
+            while (a[k] >= 48 && a[k] <= 57) { v = v * 10 + (cast(i32, a[k]) - 48); k = k + 1; }
+            if (v > 0) { runs = v; }
+            positional = 1;
+        } else {
+            filter = a;
+        }
+        ai = ai + 1;
+    }
+    let is i32 as runs0 with mut = 1;
+    if (o0_mode == 2) { runs0 = runs; }
 
     if (io.is_dir("benchmarks") != 1 || io.exists("./caustic") != 1) {
         io.fdprintf(io.STDERR, "run from the repository root (needs ./caustic and benchmarks/)\n");
@@ -173,7 +200,13 @@ fn main(argc as i64, argv as *u8) as i32 {
     walk("benchmarks", 0, filter);
     sort_paths();
 
-    io.printf("%d benchmarks, fastest of %d runs, wall-clock seconds\n\n", count, runs);
+    if (o0_mode == 0) {
+        io.printf("%d benchmarks, -O2 fastest of %d runs (no -O0), wall-clock seconds\n\n", count, runs);
+    } else if (o0_mode == 1) {
+        io.printf("%d benchmarks, -O2 fastest of %d runs, -O0 one run, wall-clock seconds\n\n", count, runs);
+    } else {
+        io.printf("%d benchmarks, fastest of %d runs, wall-clock seconds\n\n", count, runs);
+    }
     io.printf("%-32s %10s %10s %8s\n", "benchmark", "-O0", "-O2", "O2/O0");
     let is i32 as failed with mut = 0;
     let is f64 as log_o2 with mut = 0.0;
@@ -197,11 +230,11 @@ fn main(argc as i64, argv as *u8) as i32 {
         let is i32 as ok with mut = 1;
         io.unlink(cast(*u8, &exe0));
         io.unlink(cast(*u8, &exe2));
-        if (build(path_at(i), "-O0", cast(*u8, &exe0)) != 0 || build(path_at(i), "-O2", cast(*u8, &exe2)) != 0) {
+        if ((o0_mode != 0 && build(path_at(i), "-O0", cast(*u8, &exe0)) != 0) || build(path_at(i), "-O2", cast(*u8, &exe2)) != 0) {
             io.printf("%-32s  build failed\n", cast(*u8, &name));
             ok = 0;
         } else {
-            t0 = time_min(cast(*u8, &exe0), runs);
+            if (o0_mode != 0) { t0 = time_min(cast(*u8, &exe0), runs0); } else { t0 = 0.0; }
             t2 = time_min(cast(*u8, &exe2), runs);
             if (t0 < 0.0 || t2 < 0.0) {
                 let is *u8 as at with mut = "-O2";
@@ -210,7 +243,13 @@ fn main(argc as i64, argv as *u8) as i32 {
                 ok = 0;
             }
         }
-        if (ok == 1) {
+        if (ok == 1 && o0_mode == 0) {
+            io.printf("%-32s %10s %10.4f %8s\n", cast(*u8, &name), "-", t2, "-");
+            if (t2 > 0.000001) {
+                log_o2 = log_o2 + math.log(t2);
+                timed = timed + 1;
+            }
+        } else if (ok == 1) {
             io.printf("%-32s %10.4f %10.4f %8.3f\n", cast(*u8, &name), t0, t2, t2 / t0);
             // A run too short to time (below the clock's microsecond) would
             // put a log of zero into the mean.
@@ -224,7 +263,9 @@ fn main(argc as i64, argv as *u8) as i32 {
         }
         i = i + 1;
     }
-    if (timed > 0) {
+    if (timed > 0 && o0_mode == 0) {
+        io.printf("\ngeometric mean over %d: -O2 %.3f s\n", timed, math.exp(log_o2 / cast(f64, timed)));
+    } else if (timed > 0) {
         io.printf("\ngeometric mean over %d: -O2 %.3f s, -O2/-O0 %.3f\n",
                   timed, math.exp(log_o2 / cast(f64, timed)), math.exp(log_ratio / cast(f64, timed)));
     }

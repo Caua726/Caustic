@@ -1,0 +1,147 @@
+// Jacobi iteration for a 3-D Poisson equation on a 64x64x128 single-
+// precision grid: a 19-point stencil with per-point coefficient arrays
+// (four for the axes and the scale, three for the mixed second
+// derivatives, three for the backward neighbours), relaxation factor 0.8,
+// 64 sweeps, each followed by copying the new interior back. Prints the sum
+// of squared residuals of the last sweep.
+// Self-check: the hash of the printed lines.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as MI with imut = 64;
+let is i32 as MJ with imut = 64;
+let is i32 as MK with imut = 128;
+let is i64 as PLANE with imut = 524288;     // MI * MJ * MK
+let is u64 as out_hash with mut = 14695981039346656037;
+
+// Coefficient sets are stored one after the other, PLANE floats each.
+let is *f32 as ca with mut;      // 4 sets
+let is *f32 as cb with mut;      // 3 sets
+let is *f32 as cc with mut;      // 3 sets
+let is *f32 as pr with mut;
+let is *f32 as bnd with mut;
+let is *f32 as wrk1 with mut;
+let is *f32 as wrk2 with mut;
+
+fn emit(b as *u8, len as i64) as void {
+    io.write_bytes(io.STDOUT, b, len);
+    let is i64 as k with mut = 0;
+    while (k < len) { out_hash = (out_hash ^ cast(u64, b[k])) * 1099511628211; k = k + 1; }
+}
+
+fn grid(sets as i64) as *f32 { return cast(*f32, mem.core.mmap_anon(sets * PLANE * 4)); }
+
+fn at(i as i32, j as i32, k as i32) as i64 {
+    return (cast(i64, i) * cast(i64, MJ) + cast(i64, j)) * cast(i64, MK) + cast(i64, k);
+}
+
+fn fill(m as *f32, set as i64, v as f32) as void {
+    let is i64 as base = set * PLANE;
+    let is i64 as n with mut = 0;
+    while (n < PLANE) { m[base + n] = v; n = n + 1; }
+}
+
+fn jacobi(sweeps as i32) as f32 {
+    let is f32 as omega = 0.8;
+    let is f32 as gosa with mut = 0.0;
+    let is *f32 as a0 = ca;
+    let is *f32 as a1 = cast(*f32, cast(i64, ca) + PLANE * 4);
+    let is *f32 as a2 = cast(*f32, cast(i64, ca) + PLANE * 8);
+    let is *f32 as a3 = cast(*f32, cast(i64, ca) + PLANE * 12);
+    let is *f32 as b0 = cb;
+    let is *f32 as b1 = cast(*f32, cast(i64, cb) + PLANE * 4);
+    let is *f32 as b2 = cast(*f32, cast(i64, cb) + PLANE * 8);
+    let is *f32 as c0 = cc;
+    let is *f32 as c1 = cast(*f32, cast(i64, cc) + PLANE * 4);
+    let is *f32 as c2 = cast(*f32, cast(i64, cc) + PLANE * 8);
+    let is *f32 as p = pr;
+    let is i64 as di = cast(i64, MJ * MK);
+    let is i64 as dj = cast(i64, MK);
+    let is i32 as n with mut = 0;
+    while (n < sweeps) {
+        gosa = 0.0;
+        let is i32 as i with mut = 1;
+        while (i < MI - 1) {
+            let is i32 as j with mut = 1;
+            while (j < MJ - 1) {
+                let is i32 as k with mut = 1;
+                while (k < MK - 1) {
+                    let is i64 as x = at(i, j, k);
+                    let is f32 as s0 = a0[x] * p[x + di] + a1[x] * p[x + dj] + a2[x] * p[x + 1]
+                        + b0[x] * (p[x + di + dj] - p[x + di - dj] - p[x - di + dj] + p[x - di - dj])
+                        + b1[x] * (p[x + dj + 1] - p[x - dj + 1] - p[x + dj - 1] + p[x - dj - 1])
+                        + b2[x] * (p[x + di + 1] - p[x - di + 1] - p[x + di - 1] + p[x - di - 1])
+                        + c0[x] * p[x - di] + c1[x] * p[x - dj] + c2[x] * p[x - 1]
+                        + wrk1[x];
+                    let is f32 as ss = (s0 * a3[x] - p[x]) * bnd[x];
+                    gosa = gosa + ss * ss;
+                    wrk2[x] = p[x] + omega * ss;
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        i = 1;
+        while (i < MI - 1) {
+            let is i32 as j with mut = 1;
+            while (j < MJ - 1) {
+                let is i32 as k with mut = 1;
+                while (k < MK - 1) {
+                    let is i64 as x = at(i, j, k);
+                    p[x] = wrk2[x];
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        n = n + 1;
+    }
+    return gosa;
+}
+
+fn main() as i32 {
+    let is [96]u8 as buf;
+    let is *u8 as bp = cast(*u8, &buf);
+    emit(bp, io.sprintf(bp, 96, "mimax = %d mjmax = %d mkmax = %d\n", MI, MJ, MK));
+    emit(bp, io.sprintf(bp, 96, "imax = %d jmax = %d kmax =%d\n", MI - 1, MJ - 1, MK - 1));
+    pr = grid(1);
+    bnd = grid(1);
+    wrk1 = grid(1);
+    wrk2 = grid(1);
+    ca = grid(4);
+    cb = grid(3);
+    cc = grid(3);
+    let is f32 as span = cast(f32, (MI - 1) * (MI - 1));
+    let is i32 as i with mut = 0;
+    while (i < MI) {
+        let is f32 as v = cast(f32, i * i) / span;
+        let is i32 as j with mut = 0;
+        while (j < MJ) {
+            let is i32 as k with mut = 0;
+            while (k < MK) { pr[at(i, j, k)] = v; k = k + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    fill(bnd, 0, 1.0);
+    fill(wrk1, 0, 0.0);
+    fill(wrk2, 0, 0.0);
+    fill(ca, 0, 1.0);
+    fill(ca, 1, 1.0);
+    fill(ca, 2, 1.0);
+    fill(ca, 3, cast(f32, 1.0 / 6.0));
+    fill(cb, 0, 0.0);
+    fill(cb, 1, 0.0);
+    fill(cb, 2, 0.0);
+    fill(cc, 0, 1.0);
+    fill(cc, 1, 1.0);
+    fill(cc, 2, 1.0);
+    let is i32 as sweeps = 64;
+    let is f32 as gosa = jacobi(sweeps);
+    emit(bp, io.sprintf(bp, 96, " Loop executed for %d times\n", sweeps));
+    emit(bp, io.sprintf(bp, 96, " Gosa : %e \n", cast(f64, gosa)));
+    if (out_hash != 11584489160374391659) { return 1; }
+    return 0;
+}
