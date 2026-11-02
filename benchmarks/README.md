@@ -168,7 +168,7 @@ before printing one.
 | `expression_search` | iterative-deepening search for an arithmetic expression over three numbers |
 | `hash_table_strings` | chained hash table of 3.5M string keys: hashing, allocation, string compares |
 | `huffman_roundtrip` | Huffman encode and decode of 10 MB of text, 30 times: heaps, bit packing, table-driven decode |
-| `json_parse` | parses a 25 KB JSON document 1000 times: character tests, string copies, vectors of values |
+| `json_parse` | parses a generated 25 KB JSON document 1000 times: character tests, string copies, vectors of values |
 | `linked_lists` | building, copying, draining and reversing 100-node doubly linked lists, 3M times |
 | `list_tail` | the Takeuchi function on linked lists, 15000 times: allocation and recursive list walks |
 | `loopfind` | loop recognition on a 5213-block control-flow graph, 1551 passes, 10 times: union-find, sets, hash dictionary, callbacks |
