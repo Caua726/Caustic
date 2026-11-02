@@ -137,37 +137,42 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         ctx.call_positions = cast(*i32, 0);
         ctx.call_count = 0;
     }
+    if (al_opt_level >= 2) { let is i32 as zk with mut = 0; while (zk < 512) { setarg_bits[zk] = cast(u8, 0); zk = zk + 1; } }
     // Fused pass: collect call positions + scan instructions for intervals.
     pos = 0;
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
         // Call-position collection (mirrors pass 1's gates exactly so ci
         // tracks n_calls 1:1). Done even for dead insts to preserve prior
-        // semantics where dead calls remained in call_positions.
-        if (inst.op == d.IR_CALL || inst.op == d.IR_CALL_INDIRECT || inst.op == d.IR_FFI_CALL || inst.op == d.IR_SYSCALL) {
-            let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
-            *cp = pos;
-            ci = ci + 1;
-        }
-        if (inst.op == d.IR_SET_ARG) {
-            let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
-            *cp = pos;
-            ci = ci + 1;
-        }
-        if (inst.op == d.IR_SET_SYS_ARG) {
-            let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
-            *cp = pos;
-            ci = ci + 1;
-        }
-        if (inst.op == d.IR_SET_CTX) {
-            let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
-            *cp = pos;
-            ci = ci + 1;
-        }
-        if (inst.op == d.IR_COPY) {
-            let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
-            *cp = pos;
-            ci = ci + 1;
+        // semantics where dead calls remained in call_positions. -O2 leaves
+        // them out: a dead call is never emitted and clobbers nothing.
+        if (al_opt_level < 2 || inst.is_dead == 0) {
+            if (inst.op == d.IR_CALL || inst.op == d.IR_CALL_INDIRECT || inst.op == d.IR_FFI_CALL || inst.op == d.IR_SYSCALL) {
+                let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
+                *cp = pos;
+                ci = ci + 1;
+            }
+            if (inst.op == d.IR_SET_ARG) {
+                let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
+                *cp = pos;
+                ci = ci + 1;
+                if (al_opt_level >= 2 && ci <= 4096) { _setarg_mark(ctx, ci - 1); }
+            }
+            if (inst.op == d.IR_SET_SYS_ARG) {
+                let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
+                *cp = pos;
+                ci = ci + 1;
+            }
+            if (inst.op == d.IR_SET_CTX) {
+                let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
+                *cp = pos;
+                ci = ci + 1;
+            }
+            if (inst.op == d.IR_COPY) {
+                let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, ci) * 4);
+                *cp = pos;
+                ci = ci + 1;
+            }
         }
         if (inst.is_dead == 1) { inst = inst.next; pos = pos + 1; }
         else {
@@ -215,6 +220,7 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         inst = inst.next;
         }
     }
+    if (al_opt_level >= 2) { ctx.call_count = ci; }
     // Compute spill costs
     i = 0;
     while (i < vc) {
@@ -293,6 +299,47 @@ fn reg_to_slot(reg as i32) as i32 {
     if (reg == 5) { return 8; }
     if (reg == 15) { return 9; }
     return cast(i32, 0 - 1);
+}
+
+// -O2: which clobber points are SET_ARGs (bit per call_positions index, first
+// 4096). A SET_ARG reads its value and only then writes the argument register,
+// so a value whose last use is that SET_ARG does not live across it.
+let is [512]u8 as setarg_bits with mut;
+
+fn _setarg_mark(ctx as *AllocCtx, i as i32) as void {
+    setarg_bits[i >> 3] = cast(u8, cast(i32, setarg_bits[i >> 3]) | (1 << (i & 7)));
+}
+
+fn _is_setarg(ctx as *AllocCtx, i as i32) as i32 {
+    if (i >= 4096) { return 0; }
+    return (cast(i32, setarg_bits[i >> 3]) >> (i & 7)) & 1;
+}
+
+// -O2: does a value live across a clobber point? Not when the point defines it
+// (a call's result: start == cp), and not when its last use is the SET_ARG at
+// the point. Everything else as spans_call.
+fn spans_call_strict(start as i32, end_pos as i32, ctx as *AllocCtx) as i32 {
+    if (ctx.call_count == 0) { return 0; }
+    let is i32 as k with mut = 0;
+    // first clobber point > start
+    let is i32 as lo with mut = 0;
+    let is i32 as hi with mut = ctx.call_count - 1;
+    let is i32 as result with mut = ctx.call_count;
+    while (lo <= hi) {
+        let is i32 as mid = lo + (hi - lo) / 2;
+        let is *i32 as cp = cast(*i32, cast(i64, ctx.call_positions) + cast(i64, mid) * 4);
+        if (*cp > start) { result = mid; hi = mid - 1; } else { lo = mid + 1; }
+    }
+    k = result;
+    while (k < ctx.call_count) {
+        let is i32 as p = *(cast(*i32, cast(i64, ctx.call_positions) + cast(i64, k) * 4));
+        if (p > end_pos) { return 0; }
+        if (p < end_pos) { return 1; }
+        // p == end_pos
+        if (_is_setarg(ctx, k) == 0) { return 1; }
+        k = k + 1;
+    }
+    return 0;
 }
 
 // Check if interval [start, end] spans any call position (binary search)

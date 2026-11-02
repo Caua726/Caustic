@@ -1,0 +1,309 @@
+use "defs.cst" as d;
+
+// === Exact division by 2^k becomes a shift ===
+//
+// -O2 only. A signed `x / 2^k` needs a correction before `sar` so a negative x
+// rounds toward zero (`mov t,x; shr t,63; add x,t; sar x,1` for k = 1). When the
+// k low bits of x are known to be zero the division is exact, the correction
+// adds nothing, and the DIV becomes IR_SHR with the same signed type (`sar`).
+// Exact for every input, negative ones too: -6 / 2 = -6 >> 1 = -3.
+//
+// What is known about the low bits of a value comes from:
+//   - its definition: IMM, MOV, ADD, SUB, MUL (the low bits of a sum, difference
+//     or product depend only on the low bits of the operands), SHL by a constant,
+//     AND/OR with a constant;
+//   - the branch that leads to it: after `if ((x & m) == c)`, with m = 2^j - 1,
+//     the j low bits of x are c on the taken side; after `(x & 1) != c` the low
+//     bit is the other one.
+//
+// The IR here is not SSA (a variable is assigned in more than one place), so a
+// question about v at instruction p walks back from p to the latest write of v
+// inside the same straight line. A label is crossed only when exactly one jump
+// targets it and nothing falls into it, so the path in is the one jump. Any
+// instruction whose dest names v counts as a write (conservative for stores).
+// The walk is bounded (BITS_SCAN instructions, BITS_DEPTH nested questions), so
+// the pass stays linear in practice.
+//
+//     L0: AND v5 = v3, 1 ; EQ v6 = v5, 0 ; JZ L2 if !v6
+//         DIV v7 = v3, 2        -> SHR v7 = v3, 1   (fallthrough: v3 even)
+//         ...  JMP L3
+//     L2: MUL v10 = v3, 3       ; v3 odd (only entry: the JZ taken)
+//         ADD v11 = v10, 1      ; 3*odd + 1 is even
+//         DIV v12 = v11, 2      -> SHR v12 = v11, 1
+
+let is i32 as BITS_KN with imut = 8;      // low bits tracked
+let is i32 as BITS_SCAN with imut = 64;   // instructions walked back per question
+let is i32 as BITS_DEPTH with imut = 8;   // nested questions
+
+// Result of a question: the `kn` low bits of the value are `val`.
+let is i32 as bq_kn with mut = 0;
+let is i64 as bq_val with mut = 0;
+
+let is *i64 as bt_insts with mut;         // live instructions, in order
+let is i32 as bt_n with mut = 0;
+let is *i32 as bt_lref with mut;          // per label: number of jumps to it
+let is *i32 as bt_lsrc with mut;          // per label: index of the (last) jump to it
+let is i32 as bt_nlabels with mut = 0;
+
+fn _at(i as i32) as *d.IRInst {
+    let is *i64 as p = cast(*i64, cast(i64, bt_insts) + cast(i64, i) * 8);
+    return cast(*d.IRInst, *p);
+}
+
+fn _geti(a as *i32, i as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4);
+    return *p;
+}
+
+fn _puti(a as *i32, i as i32, v as i32) as void {
+    let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4);
+    *p = v;
+}
+
+fn _mask(kn as i32) as i64 {
+    return (cast(i64, 1) << cast(i64, kn)) - 1;
+}
+
+fn _writes(i as *d.IRInst, v as i32) as i32 {
+    if (i.dest.op_type == d.OP_VREG && i.dest.vreg == v) { return 1; }
+    return 0;
+}
+
+fn _set(kn as i32, val as i64) as void {
+    bq_kn = kn;
+    bq_val = val & _mask(kn);
+}
+
+fn _min(a as i32, b as i32) as i32 {
+    if (a < b) { return a; }
+    return b;
+}
+
+// Known low bits of operand `o` read at index p. Leaves the answer in bq_*.
+fn _op_bits(o as *d.Operand, p as i32, depth as i32) as void {
+    if (o.op_type == d.OP_IMM) { _set(BITS_KN, o.imm); return; }
+    if (o.op_type == d.OP_VREG) { _vbits(o.vreg, p, depth); return; }
+    _set(0, 0);
+}
+
+// Known low bits of the value `def` (at index q) writes.
+fn _def_bits(def as *d.IRInst, q as i32, depth as i32) as void {
+    let is i32 as op = def.op;
+    if (op == d.IR_IMM) { _op_bits(&def.src1, q, depth); return; }
+    if (op == d.IR_MOV) { _op_bits(&def.src1, q, depth); return; }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL) {
+        _op_bits(&def.src1, q, depth);
+        let is i32 as ka = bq_kn; let is i64 as va = bq_val;
+        if (ka == 0) { return; }
+        _op_bits(&def.src2, q, depth);
+        let is i32 as kb = bq_kn; let is i64 as vb = bq_val;
+        let is i32 as kn = _min(ka, kb);
+        if (op == d.IR_ADD) { _set(kn, va + vb); return; }
+        if (op == d.IR_SUB) { _set(kn, va - vb); return; }
+        _set(kn, va * vb);
+        return;
+    }
+    if (op == d.IR_SHL && def.src2.op_type == d.OP_IMM && def.src2.imm >= 0 && def.src2.imm < 64) {
+        let is i64 as s = def.src2.imm;
+        _op_bits(&def.src1, q, depth);
+        let is i64 as kn64 with mut = cast(i64, bq_kn) + s;
+        if (kn64 > cast(i64, BITS_KN)) { kn64 = cast(i64, BITS_KN); }
+        _set(cast(i32, kn64), bq_val << s);
+        return;
+    }
+    if ((op == d.IR_AND || op == d.IR_OR) && def.src2.op_type == d.OP_IMM) {
+        let is i64 as m = def.src2.imm;
+        _op_bits(&def.src1, q, depth);
+        let is i32 as ka = bq_kn; let is i64 as va = bq_val;
+        // Bit i is known when the constant decides it or the operand's bit is known.
+        let is i32 as kn with mut = 0;
+        let is i64 as val with mut = 0;
+        let is i32 as go with mut = 1;
+        while (go == 1 && kn < BITS_KN) {
+            let is i64 as bit = (m >> cast(i64, kn)) & 1;
+            let is i64 as known with mut = 0 - 1;
+            if (op == d.IR_AND && bit == 0) { known = 0; }
+            if (op == d.IR_OR && bit == 1) { known = 1; }
+            if (known < 0 && kn < ka) { known = (va >> cast(i64, kn)) & 1; }
+            if (known < 0) { go = 0; }
+            else { val = val | (known << cast(i64, kn)); kn = kn + 1; }
+        }
+        _set(kn, val);
+        return;
+    }
+    _set(0, 0);
+}
+
+// What the branch at index b says about vreg v when control leaves it on the
+// side `taken` (1 = jumped, 0 = fell through). Leaves bq_kn = 0 if nothing.
+fn _branch_fact(b as i32, v as i32, taken as i32) as void {
+    _set(0, 0);
+    let is *d.IRInst as br = _at(b);
+    if (br.src1.op_type != d.OP_VREG) { return; }
+    // cond_nonzero: what the branch outcome says about the condition vreg.
+    let is i32 as nonzero with mut = 0;
+    if (br.op == d.IR_JZ) { nonzero = 1 - taken; } else { nonzero = taken; }
+    // condition = EQ/NE(t, c), t = AND(x, 2^j - 1), x == v, x unchanged from the AND to b.
+    let is i32 as cv = br.src1.vreg;
+    let is i32 as q with mut = b - 1;
+    let is i32 as lim with mut = b - BITS_SCAN;
+    if (lim < 0) { lim = 0; }
+    while (q >= lim && _writes(_at(q), cv) == 0) {
+        if (_at(q).op == d.IR_LABEL) { return; }
+        q = q - 1;
+    }
+    if (q < lim) { return; }
+    let is *d.IRInst as cmp = _at(q);
+    if (cmp.op != d.IR_EQ && cmp.op != d.IR_NE) { return; }
+    if (cmp.src1.op_type != d.OP_VREG || cmp.src2.op_type != d.OP_IMM) { return; }
+    let is i32 as tv = cmp.src1.vreg;
+    let is i64 as c = cmp.src2.imm;
+    // eq: the branch outcome means t == c (1), t != c (0)
+    let is i32 as eq with mut = nonzero;
+    if (cmp.op == d.IR_NE) { eq = 1 - nonzero; }
+    let is i32 as r with mut = q - 1;
+    while (r >= lim && _writes(_at(r), tv) == 0) {
+        if (_at(r).op == d.IR_LABEL) { return; }
+        if (_writes(_at(r), v) == 1) { return; }
+        r = r - 1;
+    }
+    if (r < lim) { return; }
+    let is *d.IRInst as an = _at(r);
+    if (an.op != d.IR_AND || an.src1.op_type != d.OP_VREG || an.src1.vreg != v) { return; }
+    if (an.src2.op_type != d.OP_IMM) { return; }
+    let is i64 as m = an.src2.imm;
+    if (m <= 0 || (m & (m + 1)) != 0) { return; }       // m = 2^j - 1
+    let is i32 as j with mut = 0;
+    while ((m >> cast(i64, j)) != 0) { j = j + 1; }
+    if (j > BITS_KN) { return; }
+    if (c < 0 || c > m) { return; }
+    // v must not be written between the AND and the branch.
+    let is i32 as s with mut = r + 1;
+    while (s < b) { if (_writes(_at(s), v) == 1) { return; } s = s + 1; }
+    if (eq == 1) { _set(j, c); return; }
+    if (j == 1) { _set(1, 1 - c); }
+}
+
+// Known low bits of vreg v as read at index p.
+fn _vbits(v as i32, p as i32, depth as i32) as void {
+    _set(0, 0);
+    if (depth >= BITS_DEPTH) { return; }
+    let is i32 as q with mut = p - 1;
+    let is i32 as steps with mut = 0;
+    while (q >= 0 && steps < BITS_SCAN) {
+        let is *d.IRInst as i = _at(q);
+        if (_writes(i, v) == 1) { _def_bits(i, q, depth + 1); return; }
+        if (i.op == d.IR_JZ || i.op == d.IR_JNZ) {
+            _branch_fact(q, v, 0);
+            if (bq_kn > 0) { return; }
+        }
+        if (i.op == d.IR_LABEL) {
+            // Only entry must be one jump; nothing may fall through.
+            let is i32 as L = i.dest.label;
+            if (L < 0 || L >= bt_nlabels) { return; }
+            if (_geti(bt_lref, L) != 1) { return; }
+            if (q == 0) { return; }
+            let is *d.IRInst as prev = _at(q - 1);
+            if (prev.op != d.IR_JMP && prev.op != d.IR_RET) { return; }
+            let is i32 as src = _geti(bt_lsrc, L);
+            let is *d.IRInst as j = _at(src);
+            if (j.op == d.IR_JZ || j.op == d.IR_JNZ) {
+                _branch_fact(src, v, 1);
+                if (bq_kn > 0) { return; }
+            }
+            q = src;      // continue above the jump: same value of v
+        }
+        q = q - 1;
+        steps = steps + 1;
+    }
+    _set(0, 0);
+}
+
+fn _lref(o as *d.Operand, x as i32, w as i32) as void {
+    if (o.op_type != d.OP_LABEL) { return; }
+    let is i32 as L = o.label;
+    if (L < 0 || L >= bt_nlabels) { return; }
+    _puti(bt_lref, L, _geti(bt_lref, L) + w);
+    _puti(bt_lsrc, L, x);
+}
+
+// Only 64-bit divisions: a narrower value may sit in its register with upper
+// bits that are not its sign (lazy i32), and a 64-bit `sar` would shift them in.
+fn _wide(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 1; }
+    let is i32 as k = *cast(*i32, tp);
+    if (k == 4 || k == 8) { return 1; }
+    return 0;
+}
+
+fn pass_exact_div(func as *d.IRFunction) as void {
+    let is i32 as n with mut = 0;
+    let is i32 as has_div with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            n = n + 1;
+            if (it.op == d.IR_DIV) { has_div = 1; }
+        }
+        it = it.next;
+    }
+    if (has_div == 0) { return; }
+    bt_insts = cast(*i64, d.opt_alloc(cast(i64, n) * 8));
+    bt_n = n;
+    let is i32 as nl with mut = func.label_count + 1;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_LABEL || it.op == d.IR_JMP || it.op == d.IR_JZ || it.op == d.IR_JNZ)
+            && it.dest.op_type == d.OP_LABEL && it.dest.label >= nl) { nl = it.dest.label + 1; }
+        if (it.is_dead == 0 && it.op == d.IR_LABEL && it.dest.label >= nl) { nl = it.dest.label + 1; }
+        it = it.next;
+    }
+    bt_nlabels = nl;
+    bt_lref = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    bt_lsrc = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    let is i32 as k with mut = 0;
+    while (k < nl) { _puti(bt_lref, k, 0); _puti(bt_lsrc, k, 0); k = k + 1; }
+    let is i32 as x with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is *i64 as sp = cast(*i64, cast(i64, bt_insts) + cast(i64, x) * 8);
+            *sp = cast(i64, it);
+            if (it.op != d.IR_LABEL) {
+                // A jump counts once; any other reference to a label makes it
+                // never crossed.
+                let is i32 as w with mut = 1000;
+                if (it.op == d.IR_JMP || it.op == d.IR_JZ || it.op == d.IR_JNZ) { w = 1; }
+                _lref(&it.dest, x, w);
+                _lref(&it.src1, x, 1000);
+                _lref(&it.src2, x, 1000);
+            }
+            x = x + 1;
+        }
+        it = it.next;
+    }
+    // A label that is not a plain jump target (address taken, table) is never
+    // crossed: _vbits needs exactly one counted jump, and anything else that
+    // reaches a label is not an IR jump here.
+    x = 0;
+    while (x < n) {
+        let is *d.IRInst as dv = _at(x);
+        if (dv.op == d.IR_DIV && _wide(dv.cast_to) == 1
+            && dv.src2.op_type == d.OP_IMM && dv.src1.op_type == d.OP_VREG
+            && dv.src2.imm > 1 && (dv.src2.imm & (dv.src2.imm - 1)) == 0) {
+            let is i32 as sh with mut = 0;
+            while ((cast(i64, 1) << cast(i64, sh)) < dv.src2.imm) { sh = sh + 1; }
+            if (sh <= BITS_KN) {
+                _vbits(dv.src1.vreg, x, 0);
+                if (bq_kn >= sh && (bq_val & _mask(sh)) == 0) {
+                    dv.op = cast(i8, d.IR_SHR);
+                    dv.src2 = d.op_imm(cast(i64, sh));
+                }
+            }
+        }
+        x = x + 1;
+    }
+    d.opt_free(cast(*u8, bt_insts));
+    d.opt_free(cast(*u8, bt_lref));
+    d.opt_free(cast(*u8, bt_lsrc));
+}

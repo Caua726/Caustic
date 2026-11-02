@@ -1,0 +1,137 @@
+// tests/o2_shift_wrap_test.cst
+//
+// At -O2:
+//   - a signed division by 2^k whose k low bits are known zero becomes a plain
+//     `sar` (src/ir/opt_bits.cst): known from the branch `(x & 1) == 0`, from
+//     `3*odd + 1`, from `x << k`, from `x & ~mask`. Negative values, where the
+//     usual rounding correction would matter, must still divide exactly; a
+//     division whose low bits are NOT known (odd or unknown) keeps it.
+//   - `x * {3,5,9} + k` is one `lea` (emit_inst.cst, try_mul_lea), with wrap
+//     around on overflow like the plain multiply.
+//   - a function whose early return needs no frame runs it without one, through
+//     a preheader and a copied return (shrinkwrap.cst, sw_prepare), code after a
+//     return is dropped, and `jcc A; jmp B; A:` becomes one inverted branch.
+//   - a value defined by a call, or whose last use is the argument it passes,
+//     does not count as living across that call (alloc_core.cst).
+//
+// Exit code 0 on success, else the number of the failing check.
+
+fn collatz(n as i64) as i64 {
+    let is i64 as val with mut = n;
+    let is i64 as steps with mut = 0;
+    while (val != 1) {
+        if ((val & 1) == 0) { val = val / 2; }
+        else { val = (val * 3 + 1) / 2; steps = steps + 1; }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+// The same steps one division at a time through an opaque divisor.
+fn collatz_ref(n as i64, two as i64) as i64 {
+    let is i64 as val with mut = n;
+    let is i64 as steps with mut = 0;
+    while (val != 1) {
+        if (val % two == 0) { val = val / two; } else { val = val * 3 + 1; }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+fn half_even(x as i64) as i64 {
+    if ((x & 1) == 0) { return x / 2; }
+    return 0 - 999;
+}
+
+fn half_odd_step(x as i64) as i64 {
+    if ((x & 1) != 0) { return (x * 3 + 1) / 2; }
+    return 0 - 999;
+}
+
+fn quarter_masked(x as i64) as i64 {
+    let is i64 as y = x & (0 - 4);
+    return y / 4;
+}
+
+fn eighth_shifted(x as i64) as i64 {
+    let is i64 as y = x << 3;
+    return y / 8;
+}
+
+// Not known even: the correction must stay.
+fn half_any(x as i64) as i64 { return x / 2; }
+fn half_odd(x as i64) as i64 {
+    if ((x & 1) == 1) { return x / 2; }
+    return 0 - 999;
+}
+// Low bits 2 known zero only after the mask with 3: dividing by 8 needs more.
+fn eighth_masked(x as i64) as i64 {
+    let is i64 as y = x & (0 - 4);
+    return y / 8;
+}
+
+fn mla3(x as i64) as i64 { return x * 3 + 7; }
+fn mla5(x as i64) as i64 { return x * 5 - 2; }
+fn mla9(x as i64) as i64 { return x * 9 + 0; }
+fn mla9b(x as i64) as i64 { return x * 9 + 1; }
+
+fn fib(n as i64) as i64 {
+    if (n <= 1) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn sum3(a as i64, b as i64, c as i64) as i64 { return a * 100 + b * 10 + c; }
+
+// Arguments computed right before the call, a result read once after it.
+fn chain(n as i64) as i64 {
+    let is i64 as acc with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        acc = acc + sum3(i + 1, i - 1, i * 2);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() as i32 {
+    let is i64 as n with mut = 1;
+    while (n <= 3000) {
+        if (collatz(n) != collatz_ref(n, 2)) { return 1; }
+        n = n + 1;
+    }
+    let is i64 as x with mut = 0 - 41;
+    while (x <= 41) {
+        let is i64 as two = 2;
+        if ((x & 1) == 0 && half_even(x) != x / two) { return 2; }
+        if ((x & 1) != 0 && half_odd_step(x) != (x * 3 + 1) / two) { return 3; }
+        if (quarter_masked(x) != (x & (0 - 4)) / (two * 2)) { return 4; }
+        if (eighth_shifted(x) != x) { return 5; }
+        if (half_any(x) != x / two) { return 6; }
+        if ((x & 1) == 1 && half_odd(x) != x / two) { return 7; }
+        if (eighth_masked(x) != (x & (0 - 4)) / (two * 4)) { return 8; }
+        if (mla3(x) != x * two + x + 7) { return 9; }
+        if (mla5(x) != x * (two * 2) + x - 2) { return 10; }
+        if (mla9(x) != x * (two * 4) + x) { return 11; }
+        if (mla9b(x) != x * (two * 4) + x + 1) { return 12; }
+        x = x + 1;
+    }
+    // -7 / 2 = -3 (toward zero), -3 * 3 + 1 = -8 -> -4
+    if (half_any(0 - 7) != 0 - 3) { return 13; }
+    if (half_odd_step(0 - 3) != 0 - 4) { return 14; }
+    if (half_even(0 - 6) != 0 - 3) { return 15; }
+    // wrap around
+    let is i64 as big = 4611686018427387904;     // 2^62
+    if (mla3(big) != big * 2 + big + 7) { return 16; }
+    if (mla9(big + 1) != (big + 1) * 8 + (big + 1)) { return 17; }
+    let is i64 as minv = (0 - 9223372036854775807) - 1;
+    if (half_even(minv) != 0 - 4611686018427387904) { return 18; }
+    let is [8]i64 as want;
+    want[0] = 0; want[1] = 1; want[2] = 1; want[3] = 2; want[4] = 3; want[5] = 5; want[6] = 8; want[7] = 13;
+    let is i32 as k with mut = 0;
+    while (k < 8) { if (fib(cast(i64, k)) != want[k]) { return 19; } k = k + 1; }
+    if (fib(25) != 75025) { return 20; }
+    if (fib(0 - 5) != 0 - 5) { return 21; }
+    // sum over i<5 of (i+1)*100 + (i-1)*10 + 2i = 1500 + 50 + 20
+    if (chain(5) != 1570) { return 22; }
+    return 0;
+}
