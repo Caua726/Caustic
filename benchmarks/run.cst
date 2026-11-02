@@ -1,0 +1,227 @@
+// benchmarks/run.cst — build every benchmark at -O0 and -O2, run each, check
+// that it exits 0, and print the fastest of N wall-clock runs.
+//
+// From the repository root:
+//   ./caustic benchmarks/run.cst -o /tmp/bench-run && /tmp/bench-run [N] [filter]
+//
+// N defaults to 5. With a filter, only benchmarks whose path contains it run.
+// Binaries go to /tmp/caustic-bench/. Benchmark output goes to /dev/null: the
+// programs check their own results and say so through the exit code.
+// Exit code: the number of benchmarks that failed to build or to pass.
+use "../std/io.cst" as io;
+use "../std/time.cst" as time;
+use "../std/math.cst" as math;
+use "../std/process.cst" as process;
+use "../std/os/linux.cst" as linux;
+use "../std/env.cst" as env;
+
+let is i32 as MAX_BENCH with imut = 256;
+let is i64 as PATH_MAX with imut = 256;
+
+let is [65536]u8 as paths with mut;      // MAX_BENCH paths, PATH_MAX bytes each
+let is i32 as count with mut = 0;
+
+fn path_at(i as i32) as *u8 {
+    return cast(*u8, cast(i64, &paths) + cast(i64, i) * PATH_MAX);
+}
+
+fn str_lt(a as *u8, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (a[k] != 0 && a[k] == b[k]) { k = k + 1; }
+    if (a[k] < b[k]) { return 1; }
+    return 0;
+}
+
+fn contains(s as *u8, needle as *u8) as i32 {
+    let is i64 as n = io.strlen(needle);
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        let is i64 as k with mut = 0;
+        while (k < n && s[i + k] == needle[k]) { k = k + 1; }
+        if (k == n) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ends_with_cst(name as *u8) as i32 {
+    let is i64 as n = io.strlen(name);
+    if (n < 5) { return 0; }
+    if (name[n - 4] == 46 && name[n - 3] == 99 && name[n - 2] == 115 && name[n - 1] == 116) { return 1; }
+    return 0;
+}
+
+// Collects the .cst files below `dir`, at any depth (not those in
+// benchmarks/ itself, which is where this runner lives).
+fn walk(dir as *u8, depth as i32, filter as *u8) as void {
+    let is [256]io.DirEntry as ents;
+    let is i32 as n = io.list_dir(dir, cast(*io.DirEntry, &ents), 256);
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as name = ents[i].name_ptr;
+        let is [256]u8 as full;
+        io.sprintf(cast(*u8, &full), PATH_MAX, "%s/%s", dir, name);
+        if (io.is_dir(cast(*u8, &full)) == 1) {
+            walk(cast(*u8, &full), depth + 1, filter);
+        } else if (depth > 0 && ends_with_cst(name) == 1 && count < MAX_BENCH) {
+            if (cast(i64, filter) == 0 || contains(cast(*u8, &full), filter) == 1) {
+                io.sprintf(path_at(count), PATH_MAX, "%s", cast(*u8, &full));
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn sort_paths() as void {
+    let is [256]u8 as tmp;
+    let is i32 as i with mut = 1;
+    while (i < count) {
+        let is i32 as j with mut = i;
+        while (j > 0 && str_lt(path_at(j), path_at(j - 1)) == 1) {
+            io.sprintf(cast(*u8, &tmp), PATH_MAX, "%s", path_at(j));
+            io.sprintf(path_at(j), PATH_MAX, "%s", path_at(j - 1));
+            io.sprintf(path_at(j - 1), PATH_MAX, "%s", cast(*u8, &tmp));
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Runs argv[0] with its output thrown away; returns the exit code.
+fn run_quiet(argv as *i64) as i32 {
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        let is i64 as fd = linux.open("/dev/null", linux.O_WRONLY, 0);
+        linux.dup2(fd, 1);
+        linux.dup2(fd, 2);
+        linux.execve(cast(*u8, argv[0]), cast(*u8, argv), env.envp());
+        linux.exit(127);
+    }
+    if (pid < 0) { return 0 - 1; }
+    return process.wait_pid(pid);
+}
+
+// "benchmarks/kernels/sieve.cst" -> "kernels/sieve"
+fn short_name(path as *u8, out as *u8) as void {
+    let is i64 as start with mut = 0;
+    let is i64 as k with mut = 0;
+    while (path[k] != 0 && path[k] != 47) { k = k + 1; }
+    if (path[k] == 47) { start = k + 1; }
+    let is i64 as len = io.strlen(path) - 4 - start;
+    k = 0;
+    while (k < len) { out[k] = path[start + k]; k = k + 1; }
+    out[len] = 0;
+}
+
+// Builds `src` at `opt` into `exe`; returns the compiler's exit code.
+fn build(src as *u8, opt as *u8, exe as *u8) as i32 {
+    let is [8]i64 as av;
+    av[0] = cast(i64, "./caustic");
+    av[1] = cast(i64, "-q");
+    av[2] = cast(i64, opt);
+    av[3] = cast(i64, src);
+    av[4] = cast(i64, "-o");
+    av[5] = cast(i64, exe);
+    av[6] = 0;
+    return run_quiet(cast(*i64, &av));
+}
+
+// The fastest of `runs` runs in seconds, or a negative number if any run
+// exited non-zero.
+fn time_min(exe as *u8, runs as i32) as f64 {
+    let is [2]i64 as av;
+    av[0] = cast(i64, exe);
+    av[1] = 0;
+    let is i64 as best with mut = 0 - 1;
+    let is i32 as r with mut = 0;
+    while (r < runs) {
+        let is i64 as t0 = time.now_ns();
+        let is i32 as rc = run_quiet(cast(*i64, &av));
+        let is i64 as dt = time.now_ns() - t0;
+        if (rc != 0) { return 0.0 - 1.0; }
+        if (best < 0 || dt < best) { best = dt; }
+        r = r + 1;
+    }
+    return cast(f64, best) / 1000000000.0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as runs with mut = 5;
+    if (argc >= 2) {
+        let is *u8 as a = env.argv(1);
+        let is i32 as v with mut = 0;
+        let is i64 as k with mut = 0;
+        while (a[k] >= 48 && a[k] <= 57) { v = v * 10 + (cast(i32, a[k]) - 48); k = k + 1; }
+        if (v > 0) { runs = v; }
+    }
+    let is *u8 as filter with mut = cast(*u8, 0);
+    if (argc >= 3) { filter = env.argv(2); }
+
+    if (io.is_dir("benchmarks") != 1 || io.exists("./caustic") != 1) {
+        io.fdprintf(io.STDERR, "run from the repository root (needs ./caustic and benchmarks/)\n");
+        return 1;
+    }
+    linux.mkdir("/tmp/caustic-bench", 493);
+    walk("benchmarks", 0, filter);
+    sort_paths();
+
+    io.printf("%d benchmarks, fastest of %d runs, wall-clock seconds\n\n", count, runs);
+    io.printf("%-32s %10s %10s %8s\n", "benchmark", "-O0", "-O2", "O2/O0");
+    let is i32 as failed with mut = 0;
+    let is f64 as log_o2 with mut = 0.0;
+    let is f64 as log_ratio with mut = 0.0;
+    let is i32 as timed with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is [128]u8 as name;
+        short_name(path_at(i), cast(*u8, &name));
+        let is [256]u8 as exe0;
+        let is [256]u8 as exe2;
+        let is [128]u8 as flat;
+        io.sprintf(cast(*u8, &flat), 128, "%s", cast(*u8, &name));
+        let is i64 as k with mut = 0;
+        while (flat[k] != 0) { if (flat[k] == 47) { flat[k] = 95; } k = k + 1; }
+        io.sprintf(cast(*u8, &exe0), PATH_MAX, "/tmp/caustic-bench/%s-O0", cast(*u8, &flat));
+        io.sprintf(cast(*u8, &exe2), PATH_MAX, "/tmp/caustic-bench/%s-O2", cast(*u8, &flat));
+
+        let is f64 as t0 with mut = 0.0 - 1.0;
+        let is f64 as t2 with mut = 0.0 - 1.0;
+        let is i32 as ok with mut = 1;
+        io.unlink(cast(*u8, &exe0));
+        io.unlink(cast(*u8, &exe2));
+        if (build(path_at(i), "-O0", cast(*u8, &exe0)) != 0 || build(path_at(i), "-O2", cast(*u8, &exe2)) != 0) {
+            io.printf("%-32s  build failed\n", cast(*u8, &name));
+            ok = 0;
+        } else {
+            t0 = time_min(cast(*u8, &exe0), runs);
+            t2 = time_min(cast(*u8, &exe2), runs);
+            if (t0 < 0.0 || t2 < 0.0) {
+                let is *u8 as at with mut = "-O2";
+                if (t0 < 0.0) { at = "-O0"; }
+                io.printf("%-32s  wrong result (exit code not 0) at %s\n", cast(*u8, &name), at);
+                ok = 0;
+            }
+        }
+        if (ok == 1) {
+            io.printf("%-32s %10.4f %10.4f %8.3f\n", cast(*u8, &name), t0, t2, t2 / t0);
+            // A run too short to time (below the clock's microsecond) would
+            // put a log of zero into the mean.
+            if (t2 > 0.000001 && t0 > 0.000001) {
+                log_o2 = log_o2 + math.log(t2);
+                log_ratio = log_ratio + math.log(t2 / t0);
+                timed = timed + 1;
+            }
+        } else {
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    if (timed > 0) {
+        io.printf("\ngeometric mean over %d: -O2 %.3f s, -O2/-O0 %.3f\n",
+                  timed, math.exp(log_o2 / cast(f64, timed)), math.exp(log_ratio / cast(f64, timed)));
+    }
+    if (failed > 0) { io.printf("%d failed\n", failed); }
+    return failed;
+}

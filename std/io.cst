@@ -653,8 +653,17 @@ fn print_ptr(ptr as *u8) as void {
 }
 
 // --- Formatted Output (printf) ---
-
-// --- Formatted Output (printf) ---
+//
+// printf / sprintf / fdprintf / writer_printf share one formatter (_vformat)
+// that follows C's printf: flags `- + 0 space #`, width and precision (also
+// `*`), length modifiers, and the conversions d i u x X o c s p f F e E g G,
+// plus Caustic's %S (a *string.String). Floats print the exact binary value
+// rounded to nearest, ties to even, so the text matches glibc byte for byte.
+//
+// Every variadic argument travels as a 64-bit slot: %d, %u, %x and %o print
+// the whole slot whatever the length modifier (l, ll, z, j, t, L are accepted
+// and change nothing), while h and hh narrow to 16 and 8 bits as in C. A float
+// argument (f32 or f64) arrives as f64.
 
 struct VaList {
     gp_offset as i32;
@@ -683,209 +692,455 @@ fn _pad(count as i64, ch as u8) as void {
     while (k < count) { _write_fd(STDOUT, &c, 1); k = k + 1; }
 }
 
-fn printf(fmt as *u8, ...) as void {
-    let is VaList as va;
-    __builtin_va_start(&va);
-    let is i64 as i with mut = 0;
+// The next 64-bit variadic slot.
+fn _va_next(va as *VaList) as i64 {
     let is i32 as gp_limit with mut = 48;
     if (__target_is_aarch64 == 1) { gp_limit = 64; }
+    let is *i64 as p with mut = cast(*i64, 0);
+    if (va.gp_offset < gp_limit) {
+        p = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
+        va.gp_offset = va.gp_offset + 8;
+    } else {
+        p = cast(*i64, va.overflow_arg_area);
+        va.overflow_arg_area = va.overflow_arg_area + 8;
+    }
+    return *p;
+}
 
+// Formatter output goes to a Writer. A negative fd marks a fixed buffer
+// (sprintf): bytes past `cap` are dropped instead of flushed.
+fn _fo(o as *Writer, c as u8) as void {
+    if (o.fd < 0) {
+        if (o.len < o.cap) {
+            let is i64 as l = o.len;
+            o.buf[l] = c;
+            o.len = l + 1;
+        }
+        return;
+    }
+    put(o, c);
+}
+
+fn _fo_rep(o as *Writer, c as u8, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { _fo(o, c); k = k + 1; }
+}
+
+fn _fo_mem(o as *Writer, p as *u8, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { _fo(o, p[k]); k = k + 1; }
+}
+
+struct _FSpec {
+    left as i32;
+    plus as i32;
+    space as i32;
+    zero as i32;
+    alt as i32;
+    width as i64;
+    prec as i64;     // -1 = not given
+}
+
+// One field: [spaces] prefix [zeros] body [spaces], `width` wide.
+fn _fo_field(o as *Writer, sp as *_FSpec, pre as *u8, plen as i64, zeros as i64, body as *u8, blen as i64) as void {
+    let is i64 as pad = sp.width - (plen + zeros + blen);
+    if (sp.left == 0 && pad > 0) { _fo_rep(o, 32, pad); }
+    _fo_mem(o, pre, plen);
+    _fo_rep(o, 48, zeros);
+    _fo_mem(o, body, blen);
+    if (sp.left == 1 && pad > 0) { _fo_rep(o, 32, pad); }
+}
+
+fn _fmt_int(o as *Writer, sp as *_FSpec, v as i64, conv as u8, lenmod as i32) as void {
+    let is i32 as signed with mut = 0;
+    if (conv == 100 || conv == 105) { signed = 1; }   // d i
+    let is i64 as x with mut = v;
+    // h / hh narrow, as C does with the promoted argument.
+    if (lenmod == 1) {
+        if (signed == 1) { x = cast(i64, cast(i16, x & 0xFFFF)); } else { x = x & 0xFFFF; }
+    } else if (lenmod == 2) {
+        if (signed == 1) { x = cast(i64, cast(i8, x & 0xFF)); } else { x = x & 0xFF; }
+    }
+    let is i32 as neg with mut = 0;
+    let is u64 as u with mut = cast(u64, x);
+    if (signed == 1 && x < 0) { neg = 1; u = cast(u64, 0 - x); }
+
+    let is u64 as base with mut = 10;
+    if (conv == 120 || conv == 88 || conv == 112) { base = 16; }
+    if (conv == 111) { base = 8; }
+    let is *u8 as dchars with mut = "0123456789abcdef";
+    if (conv == 88) { dchars = "0123456789ABCDEF"; }
+
+    let is [24]u8 as db;
+    let is i64 as dpos with mut = 24;
+    let is u64 as t with mut = u;
+    while (t != 0) {
+        dpos = dpos - 1;
+        db[dpos] = dchars[cast(i64, t % base)];
+        t = t / base;
+    }
+    let is i64 as prec with mut = sp.prec;
+    if (prec < 0) { prec = 1; }
+    let is i64 as nd = 24 - dpos;
+    let is i64 as zeros with mut = 0;
+    if (prec > nd) { zeros = prec - nd; }
+    // %#o: the first digit printed is a 0.
+    if (conv == 111 && sp.alt == 1 && zeros == 0) {
+        if (nd == 0 || db[dpos] != 48) { zeros = 1; }
+    }
+
+    let is [2]u8 as pre;
+    let is i64 as plen with mut = 0;
+    if (signed == 1) {
+        if (neg == 1) { pre[0] = 45; plen = 1; }
+        else if (sp.plus == 1) { pre[0] = 43; plen = 1; }
+        else if (sp.space == 1) { pre[0] = 32; plen = 1; }
+    }
+    if ((conv == 120 || conv == 88) && sp.alt == 1 && u != 0) {
+        pre[0] = 48; pre[1] = conv; plen = 2;
+    }
+    if (conv == 112) {
+        if (u == 0) {
+            _fo_field(o, sp, "", 0, 0, "(nil)", 5);
+            return;
+        }
+        pre[0] = 48; pre[1] = 120; plen = 2;
+    }
+    if (sp.zero == 1 && sp.left == 0 && sp.prec < 0) {
+        let is i64 as fill = sp.width - (plen + zeros + nd);
+        if (fill > 0) { zeros = zeros + fill; }
+    }
+    _fo_field(o, sp, cast(*u8, &pre), plen, zeros, cast(*u8, cast(i64, &db) + dpos), nd);
+}
+
+// Exact decimal digits of a finite, nonzero double's magnitude: the value is
+// 0.d0 d1 ... d(n-1) x 10^dp. Returns n (no trailing zeros); dp via *dpp.
+// Works with a big integer in base 10^9 limbs: m * 2^e when e >= 0, and
+// m * 5^-e (= m * 2^e * 10^-e) when e < 0, so every digit is exact.
+fn _fdigits(bits as i64, dg as *u8, dpp as *i32) as i32 {
+    let is i64 as bexp = (bits >> 52) & 0x7FF;
+    let is i64 as m with mut = bits & 0xFFFFFFFFFFFFF;
+    let is i64 as e with mut = 0;
+    if (bexp == 0) { e = 0 - 1074; } else { m = m | 0x10000000000000; e = bexp - 1075; }
+    while ((m & 1) == 0) { m = m >> 1; e = e + 1; }
+
+    let is [100]i64 as L;
+    let is i32 as nl with mut = 0;
+    let is i64 as mm with mut = m;
+    while (mm != 0) { L[nl] = mm % 1000000000; mm = mm / 1000000000; nl = nl + 1; }
+
+    let is i64 as left with mut = e;
+    let is i64 as mul with mut = 0;
+    if (e < 0) { left = 0 - e; }
+    while (left > 0) {
+        if (e > 0) {
+            let is i64 as k with mut = left;
+            if (k > 29) { k = 29; }
+            mul = 1 << k;
+            left = left - k;
+        } else {
+            if (left >= 13) { mul = 1220703125; left = left - 13; }
+            else {
+                mul = 1;
+                while (left > 0) { mul = mul * 5; left = left - 1; }
+            }
+        }
+        let is i64 as carry with mut = 0;
+        let is i32 as j with mut = 0;
+        while (j < nl) {
+            let is i64 as tv = L[j] * mul + carry;
+            L[j] = tv % 1000000000;
+            carry = tv / 1000000000;
+            j = j + 1;
+        }
+        while (carry != 0) { L[nl] = carry % 1000000000; carry = carry / 1000000000; nl = nl + 1; }
+    }
+
+    // Limbs to digits, most significant first.
+    let is i32 as n with mut = 0;
+    let is [9]u8 as tmp;
+    let is i32 as li with mut = nl - 1;
+    while (li >= 0) {
+        let is i64 as v with mut = L[li];
+        let is i32 as q with mut = 0;
+        while (q < 9) { tmp[8 - q] = cast(u8, v % 10); v = v / 10; q = q + 1; }
+        let is i32 as s with mut = 0;
+        if (li == nl - 1) { while (s < 8 && tmp[s] == 0) { s = s + 1; } }
+        while (s < 9) { dg[n] = tmp[s]; n = n + 1; s = s + 1; }
+        li = li - 1;
+    }
+    let is i32 as dp with mut = n;
+    if (e < 0) { dp = n + cast(i32, e); }
+    while (n > 0 && dg[n - 1] == 0) { n = n - 1; }
+    *dpp = dp;
+    return n;
+}
+
+// Keep the first `keep` digits, rounding to nearest with ties to even (the
+// digits are exact, so a tie is a 5 with nothing after it).
+fn _fround(dg as *u8, np as *i32, dpp as *i32, keep as i32) as void {
+    let is i32 as n with mut = *np;
+    if (keep >= n) { return; }
+    if (keep < 0) { *np = 0; return; }
+    let is u8 as r = dg[keep];
+    let is i32 as up with mut = 0;
+    if (r > 5) { up = 1; }
+    else if (r == 5) {
+        if (keep + 1 < n) { up = 1; }
+        else if (keep > 0 && (dg[keep - 1] & 1) == 1) { up = 1; }
+    }
+    n = keep;
+    if (up == 1) {
+        let is i32 as idx with mut = keep - 1;
+        while (idx >= 0 && dg[idx] == 9) { idx = idx - 1; }
+        if (idx < 0) {
+            dg[0] = 1;
+            *np = 1;
+            *dpp = *dpp + 1;
+            return;
+        }
+        dg[idx] = dg[idx] + 1;
+        n = idx + 1;
+    }
+    while (n > 0 && dg[n - 1] == 0) { n = n - 1; }
+    *np = n;
+}
+
+fn _fdig(dg as *u8, n as i32, k as i64) as u8 {
+    if (k < 0 || k >= cast(i64, n)) { return 48; }
+    return dg[k] + 48;
+}
+
+fn _fmt_float(o as *Writer, sp as *_FSpec, bits as i64, conv as u8) as void {
+    let is i32 as upper with mut = 0;
+    let is u8 as lc with mut = conv;
+    if (conv == 70 || conv == 69 || conv == 71) { upper = 1; lc = conv + 32; }
+
+    let is [1]u8 as pre;
+    let is i64 as plen with mut = 0;
+    if (bits < 0) { pre[0] = 45; plen = 1; }
+    else if (sp.plus == 1) { pre[0] = 43; plen = 1; }
+    else if (sp.space == 1) { pre[0] = 32; plen = 1; }
+
+    if (((bits >> 52) & 0x7FF) == 0x7FF) {
+        let is *u8 as word with mut = "inf";
+        if ((bits & 0xFFFFFFFFFFFFF) != 0) { word = "nan"; }
+        if (upper == 1) {
+            word = "INF";
+            if ((bits & 0xFFFFFFFFFFFFF) != 0) { word = "NAN"; }
+        }
+        _fo_field(o, sp, cast(*u8, &pre), plen, 0, word, 3);
+        return;
+    }
+
+    let is i64 as prec with mut = sp.prec;
+    if (prec < 0) { prec = 6; }
+    if (prec > 800) { prec = 800; }
+
+    let is [800]u8 as dg;
+    let is i32 as n with mut = 0;
+    let is i32 as dp with mut = 0;
+    if ((bits & 0x7FFFFFFFFFFFFFFF) != 0) { n = _fdigits(bits, cast(*u8, &dg), &dp); }
+
+    let is i32 as estyle with mut = 0;
+    let is i64 as fprec with mut = prec;
+    if (lc == 102) {
+        _fround(cast(*u8, &dg), &n, &dp, dp + cast(i32, prec));
+    } else if (lc == 101) {
+        estyle = 1;
+        _fround(cast(*u8, &dg), &n, &dp, cast(i32, prec) + 1);
+    } else {
+        let is i64 as P with mut = prec;
+        if (P == 0) { P = 1; }
+        let is i64 as X0 = cast(i64, dp) - 1;
+        _fround(cast(*u8, &dg), &n, &dp, cast(i32, P));
+        let is i64 as X with mut = 0;
+        if (n > 0) { X = cast(i64, dp) - 1; }
+        if (X < P && X >= 0 - 4) { fprec = P - 1 - X; }
+        else if (n > 0 && X0 == P - 1 && X == P) {
+            // glibc picks the style before rounding: 999999.5 under %#g is
+            // fixed-point with no fraction digits, then carries to 1e+06 and
+            // prints "1.e+06". Match it.
+            estyle = 1; fprec = 0;
+        }
+        else { estyle = 1; fprec = P - 1; }
+        if (sp.alt == 0) {
+            let is i64 as have with mut = 0;
+            if (estyle == 1) { have = cast(i64, n) - 1; }
+            else { have = cast(i64, n) - cast(i64, dp); }
+            if (have < 0) { have = 0; }
+            if (fprec > have) { fprec = have; }
+        }
+    }
+
+    let is [1200]u8 as body;
+    let is i64 as bl with mut = 0;
+    if (estyle == 0) {
+        if (dp <= 0) { body[bl] = 48; bl = bl + 1; }
+        else {
+            let is i64 as k with mut = 0;
+            while (k < cast(i64, dp)) { body[bl] = _fdig(cast(*u8, &dg), n, k); bl = bl + 1; k = k + 1; }
+        }
+        if (fprec > 0 || sp.alt == 1) { body[bl] = 46; bl = bl + 1; }
+        let is i64 as j with mut = 0;
+        while (j < fprec) { body[bl] = _fdig(cast(*u8, &dg), n, cast(i64, dp) + j); bl = bl + 1; j = j + 1; }
+    } else {
+        body[bl] = _fdig(cast(*u8, &dg), n, 0); bl = bl + 1;
+        if (fprec > 0 || sp.alt == 1) { body[bl] = 46; bl = bl + 1; }
+        let is i64 as j with mut = 1;
+        while (j <= fprec) { body[bl] = _fdig(cast(*u8, &dg), n, j); bl = bl + 1; j = j + 1; }
+        if (upper == 1) { body[bl] = 69; } else { body[bl] = 101; }
+        bl = bl + 1;
+        let is i64 as X with mut = 0;
+        if (n > 0) { X = cast(i64, dp) - 1; }
+        if (X < 0) { body[bl] = 45; X = 0 - X; } else { body[bl] = 43; }
+        bl = bl + 1;
+        if (X >= 100) { body[bl] = cast(u8, 48 + X / 100); bl = bl + 1; }
+        body[bl] = cast(u8, 48 + (X / 10) % 10); bl = bl + 1;
+        body[bl] = cast(u8, 48 + X % 10); bl = bl + 1;
+    }
+
+    let is i64 as zeros with mut = 0;
+    if (sp.zero == 1 && sp.left == 0) {
+        let is i64 as fill = sp.width - (plen + bl);
+        if (fill > 0) { zeros = fill; }
+    }
+    _fo_field(o, sp, cast(*u8, &pre), plen, zeros, cast(*u8, &body), bl);
+}
+
+fn _vformat(o as *Writer, fmt as *u8, va as *VaList) as void {
+    let is i64 as i with mut = 0;
     while (fmt[i] != 0) {
         if (fmt[i] != 37) {
-            _write_fd(STDOUT, &fmt[i], 1);
+            _fo(o, fmt[i]);
+            i = i + 1;
+            continue;
+        }
+        i = i + 1;   // '%'
+        if (fmt[i] == 0) { break; }
+        if (fmt[i] == 37) { _fo(o, 37); i = i + 1; continue; }
+
+        let is _FSpec as sp;
+        sp.left = 0; sp.plus = 0; sp.space = 0; sp.zero = 0; sp.alt = 0;
+        sp.width = 0; sp.prec = 0 - 1;
+        let is i32 as more with mut = 1;
+        while (more == 1) {
+            let is u8 as f = fmt[i];
+            if (f == 45) { sp.left = 1; }
+            else if (f == 43) { sp.plus = 1; }
+            else if (f == 32) { sp.space = 1; }
+            else if (f == 48) { sp.zero = 1; }
+            else if (f == 35) { sp.alt = 1; }
+            else { more = 0; }
+            if (more == 1) { i = i + 1; }
+        }
+        if (fmt[i] == 42) {
+            let is i64 as wv = cast(i64, cast(i32, _va_next(va) & 0xFFFFFFFF));
+            if (wv < 0) { sp.left = 1; sp.width = 0 - wv; } else { sp.width = wv; }
             i = i + 1;
         } else {
-            i = i + 1; // skip '%'
-            if (fmt[i] == 0) { break; }
-
-            if (fmt[i] == 37) { // '%%'
-                let is u8 as pct = 37;
-                _write_fd(STDOUT, &pct, 1);
-                i = i + 1;
-            } else {
-                // Parse flags
-                let is i32 as left with mut = 0;
-                if (fmt[i] == 45) { left = 1; i = i + 1; } // '-'
-
-                // Parse width
-                let is i32 as width with mut = 0;
-                while (fmt[i] >= 48 && fmt[i] <= 57) {
-                    width = width * 10 + (cast(i32, fmt[i]) - 48);
-                    i = i + 1;
-                }
-
-                // Skip optional 'l' length modifier
-                if (fmt[i] == 108) { i = i + 1; }
-                if (fmt[i] == 0) { break; }
-
-                // Known specifiers that consume an arg
-                if (fmt[i] == 100 || fmt[i] == 117 || fmt[i] == 115 || fmt[i] == 83 || fmt[i] == 120 || fmt[i] == 99 || fmt[i] == 112) {
-                    let is *i64 as arg_ptr with mut = cast(*i64, 0);
-                    if (va.gp_offset < gp_limit) {
-                        arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
-                        va.gp_offset = va.gp_offset + 8;
-                    } else {
-                        arg_ptr = cast(*i64, va.overflow_arg_area);
-                        va.overflow_arg_area = va.overflow_arg_area + 8;
-                    }
-
-                    if (fmt[i] == 100) { // %d
-                        let is [21]u8 as dbuf;
-                        let is i32 as dpos with mut = 20;
-                        let is i64 as dval with mut = *arg_ptr;
-                        let is i32 as neg with mut = 0;
-                        if (dval < 0) { neg = 1; dval = 0 - dval; }
-                        if (dval == 0) { dbuf[dpos] = 48; dpos = dpos - 1; }
-                        else { while (dval > 0) { dbuf[dpos] = cast(u8, 48 + cast(i32, dval % 10)); dval = dval / 10; dpos = dpos - 1; } }
-                        if (neg == 1) { dbuf[dpos] = 45; dpos = dpos - 1; }
-                        let is i32 as dstart = dpos + 1;
-                        let is i64 as dlen = 21 - cast(i64, dstart);
-                        let is i64 as pad = cast(i64, width) - dlen;
-                        if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        _write_fd(STDOUT, cast(*u8, cast(i64, &dbuf) + cast(i64, dstart)), dlen);
-                        if (left == 1 && pad > 0) { _pad(pad, 32); }
-                    } else if (fmt[i] == 117) { // %u
-                        let is [21]u8 as ubuf;
-                        let is i32 as upos with mut = 20;
-                        let is u64 as uval with mut = cast(u64, *arg_ptr);
-                        if (uval == 0) { ubuf[upos] = 48; upos = upos - 1; }
-                        else { while (uval > 0) { ubuf[upos] = cast(u8, 48 + cast(i32, uval % 10)); uval = uval / 10; upos = upos - 1; } }
-                        let is i32 as ustart = upos + 1;
-                        let is i64 as ulen = 21 - cast(i64, ustart);
-                        let is i64 as pad = cast(i64, width) - ulen;
-                        if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        _write_fd(STDOUT, cast(*u8, cast(i64, &ubuf) + cast(i64, ustart)), ulen);
-                        if (left == 1 && pad > 0) { _pad(pad, 32); }
-                    } else if (fmt[i] == 115) { // %s
-                        let is *u8 as val = cast(*u8, *arg_ptr);
-                        let is i64 as slen with mut = 0;
-                        while (val[slen] != 0) { slen = slen + 1; }
-                        let is i64 as pad = cast(i64, width) - slen;
-                        if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        _write_fd(STDOUT, val, slen);
-                        if (left == 1 && pad > 0) { _pad(pad, 32); }
-                    } else if (fmt[i] == 83) { // %S
-                        let is *string.String as s_ptr = cast(*string.String, *arg_ptr);
-                        let is i64 as pad = cast(i64, width) - cast(i64, s_ptr.len);
-                        if (left == 0 && pad > 0) { _pad(pad, 32); }
-                        _write_fd(STDOUT, s_ptr.ptr, cast(i64, s_ptr.len));
-                        if (left == 1 && pad > 0) { _pad(pad, 32); }
-                    } else if (fmt[i] == 120) { // %x
-                        print_hex(*arg_ptr);
-                    } else if (fmt[i] == 99) { // %c
-                        let is u8 as ch = cast(u8, *arg_ptr);
-                        _write_fd(STDOUT, &ch, 1);
-                    } else if (fmt[i] == 112) { // %p
-                        print_hex(*arg_ptr);
-                    }
-                } else {
-                    // Unknown specifier — print literal, do NOT consume arg
-                    let is u8 as pct = 37;
-                    _write_fd(STDOUT, &pct, 1);
-                    _write_fd(STDOUT, &fmt[i], 1);
-                }
+            while (fmt[i] >= 48 && fmt[i] <= 57) {
+                sp.width = sp.width * 10 + (cast(i64, fmt[i]) - 48);
                 i = i + 1;
             }
+        }
+        if (fmt[i] == 46) {
+            i = i + 1;
+            sp.prec = 0;
+            if (fmt[i] == 42) {
+                let is i64 as pv = cast(i64, cast(i32, _va_next(va) & 0xFFFFFFFF));
+                if (pv < 0) { sp.prec = 0 - 1; } else { sp.prec = pv; }
+                i = i + 1;
+            } else {
+                while (fmt[i] >= 48 && fmt[i] <= 57) {
+                    sp.prec = sp.prec * 10 + (cast(i64, fmt[i]) - 48);
+                    i = i + 1;
+                }
+            }
+        }
+        // Length modifiers: 1 = h, 2 = hh; the 64-bit ones change nothing.
+        let is i32 as lenmod with mut = 0;
+        let is i32 as lmore with mut = 1;
+        while (lmore == 1) {
+            let is u8 as c = fmt[i];
+            if (c == 104) {
+                if (lenmod == 1) { lenmod = 2; } else { lenmod = 1; }
+                i = i + 1;
+            } else if (c == 108 || c == 76 || c == 113 || c == 106 || c == 122 || c == 116) {
+                i = i + 1;
+            } else { lmore = 0; }
+        }
+        let is u8 as cv = fmt[i];
+        if (cv == 0) { break; }
+        i = i + 1;
+
+        if (cv == 100 || cv == 105 || cv == 117 || cv == 120 || cv == 88 || cv == 111 || cv == 112) {
+            _fmt_int(o, &sp, _va_next(va), cv, lenmod);
+        } else if (cv == 102 || cv == 70 || cv == 101 || cv == 69 || cv == 103 || cv == 71) {
+            _fmt_float(o, &sp, _va_next(va), cv);
+        } else if (cv == 99) {
+            let is u8 as ch = cast(u8, _va_next(va) & 0xFF);
+            _fo_field(o, &sp, "", 0, 0, &ch, 1);
+        } else if (cv == 115) {
+            let is *u8 as s with mut = cast(*u8, _va_next(va));
+            if (cast(i64, s) == 0) {
+                s = "(null)";
+                if (sp.prec >= 0 && sp.prec < 6) { s = ""; }
+            }
+            let is i64 as sl with mut = 0;
+            while (s[sl] != 0 && (sp.prec < 0 || sl < sp.prec)) { sl = sl + 1; }
+            _fo_field(o, &sp, "", 0, 0, s, sl);
+        } else if (cv == 83) {
+            let is *string.String as sp_s = cast(*string.String, _va_next(va));
+            let is i64 as sl with mut = cast(i64, sp_s.len);
+            if (sp.prec >= 0 && sl > sp.prec) { sl = sp.prec; }
+            _fo_field(o, &sp, "", 0, 0, sp_s.ptr, sl);
+        } else {
+            // Unknown conversion: print it as written, consume nothing.
+            _fo(o, 37);
+            _fo(o, cv);
         }
     }
 }
 
+// Formatted output to stdout. One write per call.
+fn printf(fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    let is [512]u8 as ob;
+    let is Writer as w with mut = Writer(STDOUT, cast(*u8, &ob), 512);
+    _vformat(&w, fmt, &va);
+    flush(&w);
+}
+
+// Formatted output to a file descriptor (STDERR, a file).
+fn fdprintf(fd as i64, fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    let is [512]u8 as ob;
+    let is Writer as w with mut = Writer(fd, cast(*u8, &ob), 512);
+    _vformat(&w, fmt, &va);
+    flush(&w);
+}
+
+// Formatted output appended to a buffered Writer; nothing is written until the
+// Writer flushes.
+fn writer_printf(w as *Writer, fmt as *u8, ...) as void {
+    let is VaList as va;
+    __builtin_va_start(&va);
+    _vformat(w, fmt, &va);
+}
+
+// Formats into buf (NUL-terminated, at most cap-1 bytes kept). Returns the
+// number of bytes stored, not counting the NUL.
 fn sprintf(buf as *u8, cap as i64, fmt as *u8, ...) as i64 {
     let is VaList as va;
     __builtin_va_start(&va);
-    let is i64 as i with mut = 0;
-    let is i64 as pos with mut = 0;
-    let is i64 as lim = cap - 1;
-    let is i32 as gp_limit with mut = 48;
-    if (__target_is_aarch64 == 1) { gp_limit = 64; }
-
-    while (fmt[i] != 0 && pos < lim) {
-        if (fmt[i] != 37) {
-            buf[pos] = fmt[i]; pos = pos + 1;
-            i = i + 1;
-        } else {
-            i = i + 1;
-            if (fmt[i] == 0) { break; }
-
-            if (fmt[i] == 37) {
-                buf[pos] = 37; pos = pos + 1;
-                i = i + 1;
-            } else {
-                // Parse flags
-                let is i32 as left with mut = 0;
-                if (fmt[i] == 45) { left = 1; i = i + 1; }
-
-                // Parse width
-                let is i32 as width with mut = 0;
-                while (fmt[i] >= 48 && fmt[i] <= 57) {
-                    width = width * 10 + (cast(i32, fmt[i]) - 48);
-                    i = i + 1;
-                }
-
-                if (fmt[i] == 108) { i = i + 1; }
-                if (fmt[i] == 0) { break; }
-
-                if (fmt[i] == 100 || fmt[i] == 117 || fmt[i] == 115 || fmt[i] == 99) {
-                    let is *i64 as arg_ptr with mut = cast(*i64, 0);
-                    if (va.gp_offset < gp_limit) {
-                        arg_ptr = cast(*i64, va.reg_save_area + cast(i64, va.gp_offset));
-                        va.gp_offset = va.gp_offset + 8;
-                    } else {
-                        arg_ptr = cast(*i64, va.overflow_arg_area);
-                        va.overflow_arg_area = va.overflow_arg_area + 8;
-                    }
-
-                    if (fmt[i] == 100) { // %d
-                        let is [21]u8 as dbuf;
-                        let is i32 as dpos with mut = 20;
-                        let is i64 as dval with mut = *arg_ptr;
-                        let is i32 as neg with mut = 0;
-                        if (dval < 0) { neg = 1; dval = 0 - dval; }
-                        if (dval == 0) { dbuf[dpos] = 48; dpos = dpos - 1; }
-                        else { while (dval > 0) { dbuf[dpos] = cast(u8, 48 + cast(i32, dval % 10)); dval = dval / 10; dpos = dpos - 1; } }
-                        if (neg == 1) { dbuf[dpos] = 45; dpos = dpos - 1; }
-                        let is i32 as dstart = dpos + 1;
-                        let is i64 as dlen = 21 - cast(i64, dstart);
-                        let is i64 as pad = cast(i64, width) - dlen;
-                        if (left == 0 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
-                        let is i64 as di with mut = cast(i64, dstart);
-                        while (di < 21 && pos < lim) { buf[pos] = dbuf[di]; pos = pos + 1; di = di + 1; }
-                        if (left == 1 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
-                    } else if (fmt[i] == 117) { // %u
-                        let is [21]u8 as ubuf;
-                        let is i32 as upos with mut = 20;
-                        let is u64 as uval with mut = cast(u64, *arg_ptr);
-                        if (uval == 0) { ubuf[upos] = 48; upos = upos - 1; }
-                        else { while (uval > 0) { ubuf[upos] = cast(u8, 48 + cast(i32, uval % 10)); uval = uval / 10; upos = upos - 1; } }
-                        let is i32 as ustart = upos + 1;
-                        let is i64 as ulen = 21 - cast(i64, ustart);
-                        let is i64 as pad = cast(i64, width) - ulen;
-                        if (left == 0 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
-                        let is i64 as ui with mut = cast(i64, ustart);
-                        while (ui < 21 && pos < lim) { buf[pos] = ubuf[ui]; pos = pos + 1; ui = ui + 1; }
-                        if (left == 1 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
-                    } else if (fmt[i] == 115) { // %s
-                        let is *u8 as val = cast(*u8, *arg_ptr);
-                        let is i64 as slen with mut = 0;
-                        while (val[slen] != 0) { slen = slen + 1; }
-                        let is i64 as pad = cast(i64, width) - slen;
-                        if (left == 0 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
-                        let is i64 as si with mut = 0;
-                        while (si < slen && pos < lim) { buf[pos] = val[si]; pos = pos + 1; si = si + 1; }
-                        if (left == 1 && pad > 0) { let is i64 as pi with mut = 0; while (pi < pad && pos < lim) { buf[pos] = 32; pos = pos + 1; pi = pi + 1; } }
-                    } else if (fmt[i] == 99) { // %c
-                        buf[pos] = cast(u8, *arg_ptr); pos = pos + 1;
-                    }
-                } else {
-                    buf[pos] = 37; pos = pos + 1;
-                    if (pos < lim) { buf[pos] = fmt[i]; pos = pos + 1; }
-                }
-                i = i + 1;
-            }
-        }
-    }
-    buf[pos] = 0;
-    return pos;
+    if (cap <= 0) { return 0; }
+    let is Writer as w with mut = Writer(0 - 1, buf, cap - 1);
+    _vformat(&w, fmt, &va);
+    buf[w.len] = 0;
+    return w.len;
 }
 
 struct File {

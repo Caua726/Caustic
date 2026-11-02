@@ -1,0 +1,151 @@
+// A chained hash table from strings to ints: insert the hex spellings of
+// 1..3500000, then look up the decimal spellings of 3500000..1 and count the
+// hits. Keys are copied to the heap; the table size is the first prime in a
+// fixed list not below the item count; hash = 5*h + byte.
+// Self-check: the hit count equals the number of i in 1..n whose decimal
+// digits, read as hex, give a number in 1..n.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+struct Node {
+    key as *u8;
+    val as i32;
+    next as *Node;
+}
+
+struct Table {
+    size as i64;
+    tbl as **Node;
+    items as i32;
+}
+
+let is mem.bins.Bins as heap with mut;
+
+fn prime_at(i as i32) as i64 {
+    let is [28]i64 as p;
+    p[0] = 53; p[1] = 97; p[2] = 193; p[3] = 389; p[4] = 769;
+    p[5] = 1543; p[6] = 3079; p[7] = 6151; p[8] = 12289; p[9] = 24593;
+    p[10] = 49157; p[11] = 98317; p[12] = 196613; p[13] = 393241; p[14] = 786433;
+    p[15] = 1572869; p[16] = 3145739; p[17] = 6291469; p[18] = 12582917; p[19] = 25165843;
+    p[20] = 50331653; p[21] = 100663319; p[22] = 201326611; p[23] = 402653189; p[24] = 805306457;
+    p[25] = 1610612741; p[26] = 3221225473; p[27] = 4294967291;
+    return p[i];
+}
+
+fn hashcode(t as *Table, key as *u8) as i64 {
+    let is u64 as h with mut = 0;
+    let is i64 as k with mut = 0;
+    while (key[k] != 0) { h = 5 * h + cast(u64, key[k]); k = k + 1; }
+    return cast(i64, h % cast(u64, t.size));
+}
+
+fn str_eq(a as *u8, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (a[k] == b[k]) {
+        if (a[k] == 0) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn node_new(key as *u8) as *Node {
+    let is *Node as node = cast(*Node, mem.bins.bins_alloc(&heap, sizeof(Node)));
+    let is i64 as len = io.strlen(key);
+    let is *u8 as copy = mem.bins.bins_alloc(&heap, len + 1);
+    mem.memcpy(copy, key, len + 1);
+    node.key = copy;
+    node.val = 0;
+    node.next = cast(*Node, 0);
+    return node;
+}
+
+fn table_new(size as i32) as *Table {
+    let is *Table as t = cast(*Table, mem.bins.bins_alloc(&heap, sizeof(Table)));
+    let is i32 as i with mut = 0;
+    while (prime_at(i) < cast(i64, size)) { i = i + 1; }
+    t.size = prime_at(i);
+    let is i64 as bytes = t.size * 8;
+    t.tbl = cast(**Node, mem.bins.bins_alloc(&heap, bytes));
+    mem.memzero(cast(*u8, t.tbl), bytes);
+    t.items = 0;
+    return t;
+}
+
+fn table_free(t as *Table) as void {
+    let is i64 as i with mut = 0;
+    while (i < t.size) {
+        let is *Node as cur with mut = t.tbl[i];
+        while (cast(i64, cur) != 0) {
+            let is *Node as next = cur.next;
+            mem.bins.bins_free(&heap, cur.key);
+            mem.bins.bins_free(&heap, cast(*u8, cur));
+            cur = next;
+        }
+        i = i + 1;
+    }
+    mem.bins.bins_free(&heap, cast(*u8, t.tbl));
+    mem.bins.bins_free(&heap, cast(*u8, t));
+}
+
+fn find(t as *Table, key as *u8) as *Node {
+    let is *Node as node with mut = t.tbl[hashcode(t, key)];
+    while (cast(i64, node) != 0) {
+        if (str_eq(key, node.key) == 1) { return node; }
+        node = node.next;
+    }
+    return node;
+}
+
+fn find_new(t as *Table, key as *u8) as *Node {
+    let is i64 as h = hashcode(t, key);
+    let is *Node as prev with mut = cast(*Node, 0);
+    let is *Node as node with mut = t.tbl[h];
+    while (cast(i64, node) != 0) {
+        if (str_eq(key, node.key) == 1) { return node; }
+        prev = node;
+        node = node.next;
+    }
+    t.items = t.items + 1;
+    let is *Node as fresh = node_new(key);
+    if (cast(i64, prev) != 0) { prev.next = fresh; } else { t.tbl[h] = fresh; }
+    return fresh;
+}
+
+fn main() as i32 {
+    // 4 MiB slabs: freeing searches a size class's slabs one by one, and with
+    // the default 64 KiB ones the 7 million frees at the end would walk
+    // thousands of them each.
+    heap = mem.bins.bins_new(4194304);
+    let is i32 as n = 3500000;
+    let is [32]u8 as kb;
+    let is *u8 as buf = cast(*u8, &kb);
+    let is *Table as t = table_new(n);
+    let is i32 as i with mut = 1;
+    while (i <= n) {
+        io.sprintf(buf, 32, "%x", i);
+        find_new(t, buf).val = i;
+        i = i + 1;
+    }
+    let is i32 as c with mut = 0;
+    i = n;
+    while (i > 0) {
+        io.sprintf(buf, 32, "%d", i);
+        if (cast(i64, find(t, buf)) != 0) { c = c + 1; }
+        i = i - 1;
+    }
+    table_free(t);
+    io.printf("%d\n", c);
+
+    let is i32 as want with mut = 0;
+    i = 1;
+    while (i <= n) {
+        let is i64 as h with mut = 0;
+        let is i64 as place with mut = 1;
+        let is i32 as d with mut = i;
+        while (d > 0) { h = h + cast(i64, d % 10) * place; place = place * 16; d = d / 10; }
+        if (h <= cast(i64, n)) { want = want + 1; }
+        i = i + 1;
+    }
+    if (c != want) { return 1; }
+    return 0;
+}
