@@ -19,8 +19,8 @@ From the repository root:
 /tmp/bench-run 5 kernels/ # only paths containing "kernels/"
 ```
 
-`run.cst` builds every `.cst` in the subdirectories of `benchmarks/` at -O0
-and -O2 into `/tmp/caustic-bench/`, runs it with its output discarded, and
+`run.cst` builds every `.cst` in the subdirectories of `benchmarks/` (except
+`lib/`, which holds support modules) at -O0 and -O2 into `/tmp/caustic-bench/`, runs it with its output discarded, and
 prints the fastest wall-clock time of N runs at each level, the -O2/-O0 ratio,
 and the geometric means of the -O2 times and of the ratios. A benchmark that
 fails to build or exits non-zero is reported and left out of the means; the
@@ -70,6 +70,49 @@ A single benchmark runs on its own like any program:
 | `sieve_8192` | byte-per-number sieve to 8192, 170K times |
 | `signature_register` | two 10-bit linked-list signature registers fed noisy inputs, 100000 trials of a 48-bit generator |
 | `spectral_norm` | power method on a 2000x2000 implicit matrix: nested f64 loops |
+
+Dense-array kernels, in `kernels/stats/`, `kernels/linalg/`,
+`kernels/solver/`, `kernels/image/`, `kernels/dp/` and `kernels/stencil/`.
+They share `lib/arrays.cst`: zeroed arrays from the page allocator, and an
+output that prints each result array to stderr, 16 characters per element
+(the low four bits of each byte of the double, plus `'0'`, twice), or as
+`%0.2f` text for a few. Sizes run from tens to thousands per dimension; most
+are dominated by n^3 loops over row-major `f64` arrays. Several compute their
+result twice, into two copies, and check that the copies agree within 1e-5
+before printing one.
+
+| benchmark | measures |
+|---|---|
+| `stats/correlation` | correlation matrix of 1200 variables over 1400 samples: column statistics, sqrt, then column dot products |
+| `stats/covariance` | covariance matrix of 80 variables over 100 samples |
+| `linalg/gemm` | C = aAB + bC, 1000x1200 by 1200x1100, i-k-j order, done twice |
+| `linalg/gemver` | rank-two update of a 2000x2000 matrix, then two matrix-vector products (one down columns) |
+| `linalg/gesummv` | y = aAx + bBx on 90x90 matrices |
+| `linalg/symm` | C = aAB + bC with A symmetric (lower triangle), 60x80 |
+| `linalg/syr2k` | symmetric rank-2k update of a 1200x1200 lower triangle, k = 1000, done twice |
+| `linalg/syrk` | symmetric rank-k update of a 1200x1200 lower triangle, k = 1000, done twice |
+| `linalg/trmm` | B = aA'B with A 1000x1000 unit lower triangular, B 1000x1200 |
+| `linalg/two_matmuls` | D = aABC + bD through a temporary, 40 to 80 per side |
+| `linalg/three_matmuls` | G = (AB)(CD) with sides from 800 to 1200, inner loop down a column |
+| `linalg/normal_matvec` | y = A'(Ax) for A 1900x2100, one row at a time |
+| `linalg/bicg_step` | s = A'r and q = Ap for A 2100x1900 in one sweep |
+| `linalg/tensor_contract` | each 160-entry row of a 150x140x160 array times a 160x160 matrix, done twice |
+| `linalg/matvec_pair` | x1 += Ay1 along rows and x2 += A'y2 down columns, 2000x2000, done twice |
+| `solver/cholesky` | Cholesky factorization of a 2000x2000 matrix built as LL' by a triple loop, factorized twice |
+| `solver/levinson_durbin` | Levinson-Durbin recursion for a Toeplitz system of order 2000, done twice |
+| `solver/gram_schmidt` | modified Gram-Schmidt QR of a 1000x1200 matrix; prints 2.6M values as text |
+| `solver/lu_substitute` | LU factorization of a 2000x2000 matrix, then forward and back substitution, matrix built and solved twice |
+| `solver/lu_doolittle` | LU factorization in place of a 2000x2000 matrix, matrix built and factorized twice |
+| `solver/forward_substitution` | lower triangular solve, 2000x2000 |
+| `image/deriche` | Deriche recursive edge filter on a 4096x2160 `f32` image: four directional recursions, done twice |
+| `dp/floyd_warshall` | all-pairs shortest paths on 2800 nodes of `i32` weights, done twice |
+| `dp/nussinov` | RNA base-pair maximization by dynamic programming over a 2500x2500 `i32` table, done twice |
+| `stencil/adi` | alternating-direction implicit heat solver, 1000x1000, 500 steps of tridiagonal solves |
+| `stencil/fdtd_2d` | 2-D finite-difference time-domain fields, 1000x1200, 500 steps, done twice |
+| `stencil/heat_3d` | 7-point heat stencil on 120^3, 500 steps |
+| `stencil/jacobi_1d` | 3-point Jacobi stencil on 2000 points, 500 steps, done twice |
+| `stencil/jacobi_2d` | 5-point Jacobi stencil on 1300x1300, 500 steps, done twice |
+| `stencil/seidel_2d` | 9-point Gauss-Seidel stencil in place on 2000x2000, 500 steps, done twice |
 
 `programs/` — data structures, strings and dispatch through function pointers:
 

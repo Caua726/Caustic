@@ -1,0 +1,198 @@
+// benchmarks/lib/arrays.cst — support shared by the dense-array kernels in
+// kernels/linalg, kernels/solver, kernels/stencil, kernels/stats,
+// kernels/dp and kernels/image. Not a benchmark: run.cst skips lib/.
+//
+// - Allocation: zeroed arrays straight from the page allocator.
+// - Output: everything goes to stderr through one buffer. An array is
+//   dumped in a compact text code, 16 characters per element: for each of
+//   the 8 bytes of the f64 value, low byte first, the low four bits plus '0'
+//   (a printable character from '0' to '?'), written twice. Rows follow
+//   each other with no separator. A few kernels print their results as
+//   "%0.2f " text between dump markers instead.
+// - Self-check: a 64-bit FNV-1a checksum of what was printed (the four
+//   bits per byte a coded element shows, or the bytes of text), compared at
+//   the end with the value a kernel carries.
+// - The tolerance check a kernel uses to compare two runs of itself.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i64 as OUT_CAP with imut = 1048576;
+let is *u8 as out_buf with mut;
+let is i64 as out_len with mut = 0;
+let is u64 as out_hash with mut = 14695981039346656037;
+
+fn alloc_f64(count as i64) as *f64 { return cast(*f64, mem.core.mmap_anon(count * 8)); }
+fn alloc_f32(count as i64) as *f32 { return cast(*f32, mem.core.mmap_anon(count * 4)); }
+fn alloc_i32(count as i64) as *i32 { return cast(*i32, mem.core.mmap_anon(count * 4)); }
+fn alloc_u8(count as i64) as *u8 { return mem.core.mmap_anon(count); }
+fn free_f64(p as *f64, count as i64) as void { mem.core.munmap(cast(*u8, p), count * 8); }
+
+fn flush() as void {
+    if (out_len > 0) { io.write_bytes(io.STDERR, out_buf, out_len); }
+    out_len = 0;
+}
+
+fn room(n as i64) as void {
+    if (cast(i64, out_buf) == 0) { out_buf = mem.core.mmap_anon(OUT_CAP); }
+    if (out_len + n > OUT_CAP) { flush(); }
+}
+
+fn mix(v as u64) as void {
+    out_hash = (out_hash ^ v) * 1099511628211;
+}
+
+// Plain text, counted byte by byte.
+fn text(s as *u8, len as i64) as void {
+    room(len);
+    let is i64 as k with mut = 0;
+    while (k < len) {
+        let is u8 as c = s[k];
+        out_buf[out_len + k] = c;
+        mix(cast(u64, c));
+        k = k + 1;
+    }
+    out_len = out_len + len;
+}
+
+fn text_z(s as *u8) as void { text(s, io.strlen(s)); }
+
+// The 16-character code of one value at `dst`; returns the four bits per byte
+// it shows.
+fn encode(dst as *u8, v as f64) as u64 {
+    let is u64 as nib = cast(u64, mem_bits(v)) & 1085102592571150095;   // 0x0F0F0F0F0F0F0F0F
+    // Each byte of the low and the high half, doubled into 8 bytes.
+    let is *u64 as d = cast(*u64, dst);
+    d[0] = spread(nib & 4294967295) + 3472328296227680304;               // + "00000000"
+    d[1] = spread(nib >> 32) + 3472328296227680304;
+    return nib;
+}
+
+// Bytes b0 b1 b2 b3 (low first) -> b0 b0 b1 b1 b2 b2 b3 b3.
+fn spread(x as u64) as u64 {
+    let is u64 as t with mut = (x | (x << 16)) & 281470681808895;        // 0x0000FFFF0000FFFF
+    t = (t | (t << 8)) & 71777214294589695;                               // 0x00FF00FF00FF00FF
+    return t | (t << 8);
+}
+
+fn mem_bits(v as f64) as i64 {
+    return *cast(*i64, &v);
+}
+
+// One coded element.
+fn element(v as f64) as void {
+    room(16);
+    mix(encode(cast(*u8, cast(i64, out_buf) + out_len), v));
+    out_len = out_len + 16;
+}
+
+fn row_f64(p as *f64, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { element(p[k]); k = k + 1; }
+}
+
+fn row_f32(p as *f32, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { element(cast(f64, p[k])); k = k + 1; }
+}
+
+fn row_i32(p as *i32, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { element(cast(f64, p[k])); k = k + 1; }
+}
+
+// Only the first `chars` characters of the code of p[0], p[1], ...
+fn row_f64_prefix(p as *f64, chars as i64) as void {
+    let is i64 as whole = chars / 16;
+    row_f64(p, whole);
+    let is i64 as rest = chars - whole * 16;
+    if (rest > 0) {
+        let is [16]u8 as tmp;
+        mix(encode(cast(*u8, &tmp), p[whole]));
+        room(rest);
+        let is i64 as k with mut = 0;
+        while (k < rest) { out_buf[out_len + k] = tmp[k]; k = k + 1; }
+        out_len = out_len + rest;
+    }
+}
+
+// rows x cols, row after row.
+fn matrix_f64(p as *f64, rows as i64, cols as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < rows) {
+        row_f64(cast(*f64, cast(i64, p) + i * cols * 8), cols);
+        i = i + 1;
+    }
+}
+
+// --- Text dumps ---
+
+fn dump_start() as void { text_z("==BEGIN DUMP_ARRAYS==\n"); }
+fn dump_finish() as void { text_z("==END   DUMP_ARRAYS==\n"); }
+
+fn dump_begin(name as *u8) as void {
+    let is [64]u8 as b;
+    text(cast(*u8, &b), io.sprintf(cast(*u8, &b), 64, "begin dump: %s", name));
+}
+
+fn dump_end(name as *u8) as void {
+    let is [64]u8 as b;
+    text(cast(*u8, &b), io.sprintf(cast(*u8, &b), 64, "\nend   dump: %s\n", name));
+}
+
+// The value at position `index` of a text dump: a line break before every
+// 20th, then the value with two decimals and a space.
+fn dump_value(v as f64, index as i64) as void {
+    if (index % 20 == 0) { text("\n", 1); }
+    let is [64]u8 as b;
+    text(cast(*u8, &b), io.sprintf(cast(*u8, &b), 64, "%0.2f ", v));
+}
+
+fn dump_vector(name as *u8, p as *f64, n as i64) as void {
+    dump_start();
+    dump_begin(name);
+    let is i64 as i with mut = 0;
+    while (i < n) { dump_value(p[i], i); i = i + 1; }
+    dump_end(name);
+    dump_finish();
+}
+
+// --- Checks ---
+
+// 1 when every pair differs by at most 1e-5.
+fn close_f64(a as *f64, b as *f64, n as i64) as i32 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is f64 as d with mut = a[k] - b[k];
+        if (d < 0.0) { d = -d; }
+        if (d > 0.00001) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn close_f32(a as *f32, b as *f32, n as i64) as i32 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is f64 as d with mut = cast(f64, a[k]) - cast(f64, b[k]);
+        if (d < 0.0) { d = -d; }
+        if (d > 0.00001) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn same_i32(a as *i32, b as *i32, n as i64) as i32 {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (a[k] != b[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+// Flushes the output; the exit code: 0 when its checksum is `expected`.
+fn finish(expected as u64) as i32 {
+    flush();
+    if (out_hash != expected) { return 1; }
+    return 0;
+}
