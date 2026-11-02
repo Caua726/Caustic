@@ -680,3 +680,179 @@ fn sw_flip_branches(func as *d.IRFunction) as void {
         it = it.next;
     }
 }
+
+// -O2: a loop rotated to test at the bottom often leaves
+//
+//         JNZ  A if c        ; leave the loop
+//         JMP  H             ; next iteration
+//     ...
+//     A:  x = ...            ; a small exit block placed elsewhere
+//         JMP  C
+//
+// The exit block (at most SW_DUP_MAX pure instructions) is copied right there:
+// `JZ H if c; x = ...; JMP C`, one taken branch per iteration instead of two,
+// and when C comes next the JMP goes too. A value the block computes and only
+// the block reads gets a fresh vreg in the copy; one read elsewhere keeps its
+// vreg (written in both copies, as a phi move is).
+let is i32 as SW_DUP_MAX with imut = 4;
+
+fn _sw_reads(i as *d.IRInst, v as i32) as i32 {
+    let is i32 as n with mut = 0;
+    if (i.src1.op_type == d.OP_VREG && i.src1.vreg == v) { n = n + 1; }
+    if (i.src2.op_type == d.OP_VREG && i.src2.vreg == v) { n = n + 1; }
+    if (i.op == d.IR_STORE && i.dest.op_type == d.OP_VREG && i.dest.vreg == v) { n = n + 1; }
+    return n;
+}
+
+fn sw_dup_exit(func as *d.IRFunction) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_JZ || it.op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL) {
+            let is *d.IRInst as j = _sw_live_next(it);
+            if (cast(i64, j) != 0 && j.op == d.IR_JMP && j.dest.op_type == d.OP_LABEL && j.dest.label != it.dest.label) {
+                // find label A, skip the labels after it, then the block
+                let is i32 as A = it.dest.label;
+                let is *d.IRInst as la with mut = func.instructions;
+                while (cast(i64, la) != 0 && (la.is_dead == 1 || la.op != d.IR_LABEL || la.dest.label != A)) { la = la.next; }
+                let is i32 as ok with mut = 0;
+                let is *d.IRInst as b0 with mut = cast(*d.IRInst, 0);
+                let is *d.IRInst as bj with mut = cast(*d.IRInst, 0);
+                if (cast(i64, la) != 0) {
+                    let is *d.IRInst as s with mut = _sw_live_next(la);
+                    while (cast(i64, s) != 0 && s.op == d.IR_LABEL) { s = _sw_live_next(s); }
+                    b0 = s;
+                    let is i32 as cnt with mut = 0;
+                    ok = 1;
+                    while (ok == 1 && cast(i64, s) != 0 && s.op != d.IR_JMP) {
+                        if (_sw_pure(s.op) == 0 || s.dest.op_type != d.OP_VREG || cnt >= SW_DUP_MAX) { ok = 0; }
+                        else { cnt = cnt + 1; s = _sw_live_next(s); }
+                    }
+                    if (cast(i64, s) == 0 || cnt == 0) { ok = 0; }
+                    if (ok == 1 && s.dest.op_type != d.OP_LABEL) { ok = 0; }
+                    bj = s;
+                }
+                if (ok == 1) {
+                    // copy the block after the branch
+                    let is [8]i32 as from;
+                    let is [8]i32 as to;
+                    let is i32 as nm with mut = 0;
+                    let is *d.IRInst as tail with mut = it;
+                    let is *d.IRInst as s with mut = b0;
+                    while (cast(i64, s) != cast(i64, bj)) {
+                        if (s.is_dead == 0) {
+                            let is *d.IRInst as c = d.new_inst(s.op);
+                            c.dest = s.dest; c.src1 = s.src1; c.src2 = s.src2;
+                            c.line = s.line; c.cast_to = s.cast_to; c.cast_from = s.cast_from;
+                            let is i32 as q with mut = 0;
+                            while (q < nm) {
+                                if (c.src1.op_type == d.OP_VREG && c.src1.vreg == from[q]) { c.src1.vreg = to[q]; }
+                                if (c.src2.op_type == d.OP_VREG && c.src2.vreg == from[q]) { c.src2.vreg = to[q]; }
+                                q = q + 1;
+                            }
+                            // read only inside the block, and written once there: fresh
+                            let is i32 as v = s.dest.vreg;
+                            let is i32 as rin with mut = 0;
+                            let is i32 as win with mut = 0;
+                            let is *d.IRInst as w with mut = b0;
+                            while (cast(i64, w) != cast(i64, bj)) {
+                                if (w.is_dead == 0) {
+                                    rin = rin + _sw_reads(w, v);
+                                    if (w.dest.op_type == d.OP_VREG && w.dest.vreg == v && w.op != d.IR_STORE) { win = win + 1; }
+                                }
+                                w = w.next;
+                            }
+                            let is i32 as rall with mut = 0;
+                            w = func.instructions;
+                            while (cast(i64, w) != 0) {
+                                if (w.is_dead == 0) { rall = rall + _sw_reads(w, v); }
+                                w = w.next;
+                            }
+                            if (rall == rin && win == 1 && nm < 8) {
+                                from[nm] = v; to[nm] = func.vreg_count;
+                                c.dest.vreg = func.vreg_count;
+                                func.vreg_count = func.vreg_count + 1;
+                                nm = nm + 1;
+                            }
+                            c.next = tail.next; tail.next = c; tail = c;
+                        }
+                        s = s.next;
+                    }
+                    let is *d.IRInst as cj = d.new_inst(d.IR_JMP);
+                    cj.dest = bj.dest; cj.line = bj.line;
+                    cj.next = tail.next; tail.next = cj;
+                    // the branch now stays in the loop
+                    if (it.op == d.IR_JZ) { it.op = cast(i8, d.IR_JNZ); } else { it.op = cast(i8, d.IR_JZ); }
+                    it.dest.label = j.dest.label;
+                    j.is_dead = cast(i8, 1);
+                    // a jump to the label that follows is no jump
+                    let is *d.IRInst as nx with mut = _sw_live_next(cj);
+                    while (cast(i64, nx) != 0 && nx.op == d.IR_LABEL) {
+                        if (nx.dest.label == cj.dest.label) { cj.is_dead = cast(i8, 1); }
+                        nx = _sw_live_next(nx);
+                    }
+                    it = cj;
+                }
+            }
+        }
+        it = it.next;
+    }
+}
+
+// -O2: the one instruction that reads a call's result is moved up to right
+// after the call when only a few instructions that neither touch its operands
+// nor its destination stand between them, so the result can be used from rax
+// (emit_inst.cst, try_call_add). Only an ADD is moved; nothing it passes reads
+// or writes memory or control flow.
+fn _sw_touches(i as *d.IRInst, v as i32) as i32 {
+    if (_sw_reads(i, v) > 0) { return 1; }
+    if (i.dest.op_type == d.OP_VREG && i.dest.vreg == v) { return 1; }
+    return 0;
+}
+
+fn sw_hoist_call_use(func as *d.IRFunction) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.op == d.IR_CALL && it.dest.op_type == d.OP_VREG && it.is_extern_call == 0) {
+            let is i32 as v = it.dest.vreg;
+            let is *d.IRInst as prevl with mut = it;
+            let is *d.IRInst as s with mut = _sw_live_next(it);
+            let is i32 as k with mut = 0;
+            let is i32 as go with mut = 1;
+            while (go == 1 && cast(i64, s) != 0 && k < 4) {
+                if (s.op == d.IR_ADD && s.dest.op_type == d.OP_VREG
+                    && ((s.src1.op_type == d.OP_VREG && s.src1.vreg == v) || (s.src2.op_type == d.OP_VREG && s.src2.vreg == v))) {
+                    if (k > 0) {
+                        // every instruction passed must leave the ADD's operands and dest alone
+                        let is i32 as ok with mut = 1;
+                        let is *d.IRInst as w with mut = _sw_live_next(it);
+                        while (cast(i64, w) != cast(i64, s)) {
+                            if (w.is_dead == 0) {
+                                if (_sw_touches(w, s.dest.vreg) == 1) { ok = 0; }
+                                if (w.dest.op_type == d.OP_VREG && s.src1.op_type == d.OP_VREG && w.dest.vreg == s.src1.vreg) { ok = 0; }
+                                if (w.dest.op_type == d.OP_VREG && s.src2.op_type == d.OP_VREG && w.dest.vreg == s.src2.vreg) { ok = 0; }
+                            }
+                            w = w.next;
+                        }
+                        if (ok == 1) {
+                            // unlink s (prevl is its previous in the raw list)
+                            let is *d.IRInst as pr with mut = it;
+                            while (cast(i64, pr.next) != cast(i64, s)) { pr = pr.next; }
+                            pr.next = s.next;
+                            s.next = it.next;
+                            it.next = s;
+                        }
+                    }
+                    go = 0;
+                } else if (s.op == d.IR_LABEL || _sw_is_jump(s) == 1 || s.op == d.IR_RET || _sw_pure(s.op) == 0
+                    || s.dest.op_type != d.OP_VREG || _sw_reads(s, v) > 0 || s.dest.vreg == v) {
+                    go = 0;
+                } else {
+                    k = k + 1;
+                    prevl = s;
+                    s = _sw_live_next(s);
+                }
+            }
+        }
+        it = it.next;
+    }
+}

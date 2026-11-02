@@ -237,6 +237,80 @@ fn try_mul_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     return 1;
 }
 
+// -O2: `t = x +/- k` read only by the SET_ARG right after it is one
+// `lea argreg, [x +/- k]`; the SET_ARG is then skipped (arg_skip).
+let is *d.IRInst as arg_skip with mut;
+
+fn _arg_reg_idx(idx as i32) as i32 {
+    if (idx == 0) { return 5; }
+    if (idx == 1) { return 4; }
+    if (idx == 2) { return 2; }
+    if (idx == 3) { return 1; }
+    if (idx == 4) { return 6; }
+    return 7;
+}
+
+fn try_arg_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    if (al.al_opt_level < 2) { return 0; }
+    if (inst.src2.op_type != d.OP_IMM || inst.src1.op_type != d.OP_VREG || inst.dest.op_type != d.OP_VREG) { return 0; }
+    if (inst.src2.imm > 2147483647 || inst.src2.imm < 0 - 2147483647) { return 0; }
+    if (_wide64(inst.cast_to) == 0) { return 0; }
+    let is *d.IRInst as n with mut = inst.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1) { n = n.next; }
+    if (cast(i64, n) == 0 || n.op != d.IR_SET_ARG || n.src1.op_type != d.OP_VREG || n.src1.vreg != inst.dest.vreg) { return 0; }
+    if (n.dest.imm < 0 || n.dest.imm >= 6 || e.is_float_type(n.cast_to) == 1) { return 0; }
+    if (e.isel_get_uses(inst.dest.vreg) != 1) { return 0; }
+    let is i32 as loc = al.get_loc(inst.src1.vreg, ctx);
+    if (loc < 0 || loc >= 16) { return 0; }
+    let is i64 as k with mut = inst.src2.imm;
+    if (inst.op == d.IR_SUB) { k = 0 - k; }
+    let is i32 as ai = cast(i32, n.dest.imm);
+    eo.out_str("  lea ", 6); eo.out_cstr(eo.arg_reg64(ai)); eo.out_str(", [", 3);
+    eo.out_cstr(eo.reg64(loc));
+    if (k >= 0) { eo.out_str(" + ", 3); eo.out_int(k); }
+    else { eo.out_str(" - ", 3); eo.out_int(0 - k); }
+    eo.out_str("]\n", 2);
+    eo.rc_invalidate_reg(_arg_reg_idx(ai));
+    arg_skip = n;
+    return 1;
+}
+
+// -O2: a call's result read only by the ADD right after it is added straight
+// from rax: `add d, rax` instead of `mov t, rax; add d, t`. The ADD is then
+// skipped (mla_skip).
+fn try_call_add(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    if (al.al_opt_level < 2 || inst.dest.op_type != d.OP_VREG) { return 0; }
+    if (cast(i64, inst.cast_to) != 0 && _wide64(inst.cast_to) == 0) { return 0; }
+    let is i32 as v = inst.dest.vreg;
+    if (e.isel_get_uses(v) != 1) { return 0; }
+    let is *d.IRInst as n with mut = inst.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1) { n = n.next; }
+    if (cast(i64, n) == 0 || n.op != d.IR_ADD || n.dest.op_type != d.OP_VREG) { return 0; }
+    if (_wide64(n.cast_to) == 0) { return 0; }
+    let is d.Operand as o with mut;
+    if (n.src2.op_type == d.OP_VREG && n.src2.vreg == v) { o = n.src1; }
+    else if (n.src1.op_type == d.OP_VREG && n.src1.vreg == v) { o = n.src2; }
+    else { return 0; }
+    if (o.op_type == d.OP_VREG && o.vreg == v) { return 0; }
+    if (o.op_type != d.OP_VREG && o.op_type != d.OP_IMM) { return 0; }
+    if (o.op_type == d.OP_IMM && (o.imm > 2147483647 || o.imm < 0 - 2147483647)) { return 0; }
+    let is i32 as dl = al.get_loc(n.dest.vreg, ctx);
+    if (dl <= 0 || dl >= 16) { return 0; }
+    let is *u8 as dr = eo.reg64(dl);
+    if (o.op_type == d.OP_VREG) {
+        e.load_op(o.vreg, ctx, dr);
+        eo.out_str("  add ", 6); eo.out_cstr(dr); eo.out_str(", rax\n", 6);
+    } else {
+        eo.out_str("  lea ", 6); eo.out_cstr(dr); eo.out_str(", [rax", 6);
+        if (o.imm >= 0) { eo.out_str(" + ", 3); eo.out_int(o.imm); }
+        else { eo.out_str(" - ", 3); eo.out_int(0 - o.imm); }
+        eo.out_str("]\n", 2);
+    }
+    eo.rc_invalidate_reg(dl);
+    mla_skip = n;
+    return 1;
+}
+
 // === gen_inst: ADD, SUB, MUL, DIV, MOD, NEG ===
 
 fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
@@ -252,6 +326,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         e.emit_vreg_copy(inst.dest.vreg, inst.src1.vreg, ctx, inst.cast_to);
         return;
     }
+    if ((op == d.IR_ADD || op == d.IR_SUB) && try_arg_lea(inst, ctx) == 1) { return; }
     if (op == d.IR_ADD && e.try_addr_add(inst, ctx) == 1) { return; }
     if (op == d.IR_ADD) { e.gen_binop(inst, ctx, "add"); return; }
     if (op == d.IR_SUB) { e.gen_binop(inst, ctx, "sub"); return; }
@@ -1890,6 +1965,11 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     if (op == d.IR_SET_ARG) {
+        if (cast(i64, arg_skip) != 0) {
+            let is i32 as skip = cast(i32, cast(i64, arg_skip) == cast(i64, inst));
+            arg_skip = cast(*d.IRInst, 0);
+            if (skip == 1) { return; }
+        }
         let is i32 as idx = cast(i32, inst.dest.imm);
         if (e.is_float_type(inst.cast_to) == 1) {
             // Extern float arg: load to rax/eax then move to xmmN
@@ -2009,6 +2089,7 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 else { eo.out_line("movzx eax, ax"); }
             }
         }
+        if (inst.is_extern_call == 0 && try_call_add(inst, ctx) == 1) { return; }
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
     }

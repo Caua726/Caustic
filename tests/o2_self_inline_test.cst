@@ -1,0 +1,133 @@
+// tests/o2_self_inline_test.cst
+//
+// At -O2:
+//   - a small recursive function expands one level into itself
+//     (src/ir/opt_selfinline.cst): the copy starts with the base-case test, so
+//     a call that would only return at once is not made;
+//   - a loop's small exit block, placed elsewhere by rotation, is copied to
+//     where the loop leaves (shrinkwrap.cst, sw_dup_exit);
+//   - `x +/- k` passed straight as an argument is one `lea` into the argument
+//     register, and a call's result added right away is added from rax
+//     (emit_inst.cst, try_arg_lea / try_call_add, sw_hoist_call_use).
+//
+// Exit code 0 on success, else the number of the failing check.
+
+fn fib(n as i64) as i64 {
+    if (n <= 1) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn fib_ref(n as i64) as i64 {
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 1;
+    let is i64 as k with mut = 0;
+    while (k < n) { let is i64 as t = a + b; a = b; b = t; k = k + 1; }
+    return a;
+}
+
+// i32 parameters and result.
+fn tri(n as i32) as i32 {
+    if (n <= 0) { return 0; }
+    return n + tri(n - 1);
+}
+
+// Base case returns a constant; two parameters, one passed through.
+fn count_down(n as i64, step as i64) as i64 {
+    if (n < step) { return 7; }
+    return 1 + count_down(n - step, step);
+}
+
+// No result: writes through a pointer.
+fn fill(p as *i64, n as i64) as void {
+    if (n <= 0) { return; }
+    p[n - 1] = n * n;
+    fill(p, n - 1);
+}
+
+// Two self calls in one body: left as it is (too many sites).
+fn tree(n as i64) as i64 {
+    if (n <= 0) { return 1; }
+    return tree(n - 1) + tree(n - 2) + tree(n - 3);
+}
+
+// The result added to a constant, and to a parameter.
+fn plus_k(n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    return plus_k(n - 1) + 1000000;
+}
+
+fn depth_sum(n as i64, acc as i64) as i64 {
+    if (n == 0) { return acc; }
+    let is i64 as r = depth_sum(n - 1, acc + n);
+    return r + n;
+}
+
+// Argument with a large negative offset.
+fn far(n as i64) as i64 {
+    if (n < 0 - 2000000000) { return n; }
+    return far(n - 2000000000) + 1;
+}
+
+// Loop whose exit computes a value the code after reads.
+fn first_neg(a as *i64, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as r with mut = 0 - 1;
+    while (i < n) {
+        if (a[i] < 0) { r = i * 10 + 3; i = n; }
+        i = i + 1;
+    }
+    return r;
+}
+
+// The call result's register must not be confused with a value added later.
+fn mix(n as i64) as i64 {
+    if (n <= 2) { return n * 3; }
+    let is i64 as x = n * 7;
+    let is i64 as r = mix(n - 2);
+    let is i64 as y = x + r;
+    return y - mix(n - 3);
+}
+
+fn mix_ref(n as i64) as i64 {
+    let is [64]i64 as m;
+    let is i64 as k with mut = 0;
+    while (k < 64) {
+        if (k <= 2) { m[k] = k * 3; }
+        else { m[k] = k * 7 + m[k - 2] - m[k - 3]; }
+        k = k + 1;
+    }
+    return m[n];
+}
+
+fn main() as i32 {
+    let is i64 as k with mut = 0;
+    while (k < 30) { if (fib(k) != fib_ref(k)) { return 1; } k = k + 1; }
+    if (fib(0 - 3) != 0 - 3) { return 2; }
+    let is i32 as t with mut = 0;
+    while (t < 50) { if (tri(t) != t * (t + 1) / 2) { return 3; } t = t + 1; }
+    if (tri(0 - 4) != 0) { return 4; }
+    if (count_down(10, 3) != 10) { return 5; }   // 10,7,4,1 -> 3 steps + 7
+    if (count_down(2, 3) != 7) { return 6; }
+    let is [20]i64 as buf;
+    k = 0;
+    while (k < 20) { buf[k] = 0; k = k + 1; }
+    fill(cast(*i64, &buf), 20);
+    k = 0;
+    while (k < 20) { if (buf[k] != (k + 1) * (k + 1)) { return 7; } k = k + 1; }
+    // tree(n) = tree(n-1)+tree(n-2)+tree(n-3), tree(<=0) = 1
+    if (tree(0) != 1 || tree(1) != 3 || tree(2) != 5 || tree(3) != 9 || tree(10) != 653) { return 8; }
+    if (plus_k(37) != 37000000) { return 9; }
+    if (depth_sum(10, 0) != 110) { return 10; }   // acc 55, plus 55 on the way back
+    // far(0) = far(-2e9) + 1 = (far(-4e9) + 1) + 1 = -4e9 + 2
+    if (far(0) != 0 - 4000000000 + 2) { return 11; }
+    let is [8]i64 as a;
+    k = 0;
+    while (k < 8) { a[k] = k; k = k + 1; }
+    if (first_neg(cast(*i64, &a), 8) != 0 - 1) { return 12; }
+    a[5] = 0 - 1;
+    if (first_neg(cast(*i64, &a), 8) != 53) { return 13; }
+    if (first_neg(cast(*i64, &a), 0) != 0 - 1) { return 14; }
+    k = 0;
+    while (k < 40) { if (mix(k) != mix_ref(k)) { return 15; } k = k + 1; }
+    return 0;
+}
