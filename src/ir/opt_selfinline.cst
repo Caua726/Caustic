@@ -1,4 +1,5 @@
 use "defs.cst" as d;
+use "../parser/ast.cst" as ast;
 
 // === A small recursive function expands one level into itself ===
 //
@@ -21,6 +22,8 @@ use "defs.cst" as d;
 
 let is i32 as SI_MAX_INSTS with imut = 32;
 let is i32 as SI_MAX_SITES with imut = 1;
+let is i32 as SI_ROUNDS with imut = 2;
+let is i32 as SI_SEED_MAX with imut = 512;
 
 fn _si_self(func as *d.IRFunction, i as *d.IRInst) as i32 {
     if (i.op != d.IR_CALL || i.is_variadic_call != 0) { return 0; }
@@ -39,7 +42,7 @@ fn _si_link(head as **d.IRInst, tail as **d.IRInst, x as *d.IRInst) as void {
     *tail = x;
 }
 
-fn pass_self_inline(func as *d.IRFunction) as i32 {
+fn pass_self_inline(func as *d.IRFunction, round as i32) as i32 {
     // The flags cached on the function may describe the body before its first
     // optimization (deferred mode); what matters is the body as it is now.
     if (func.is_variadic != 0 || func.is_naked != 0) { return 0; }
@@ -64,7 +67,7 @@ fn pass_self_inline(func as *d.IRFunction) as i32 {
         }
         w = w.next;
     }
-    if (nsite == 0 || nsite > SI_MAX_SITES || n > SI_MAX_INSTS) { return 0; }
+    if (nsite == 0 || nsite > SI_MAX_SITES || n > (SI_MAX_INSTS << round)) { return 0; }
     let is **d.IRInst as body = cast(**d.IRInst, d.opt_alloc(cast(i64, n) * 8));
     let is i32 as k with mut = 0;
     w = func.instructions;
@@ -180,5 +183,179 @@ fn pass_self_inline(func as *d.IRFunction) as i32 {
         site = nx;
     }
     d.opt_free(cast(*u8, body));
+    return done;
+}
+
+// === An inner sum starts from the outer one ===
+//
+// After the expansion, each level of the copy keeps its own running sum:
+//
+//     B = 0
+//     ... B = B + x ... (a loop, with calls)
+//     R = B + y
+//     D = A + R          (Q: the outer sum takes the inner one)
+//
+// When B's value reaches nothing but such sums and then Q, and A does not change
+// between B = 0 and Q, the inner sum can start from A instead (B = A) and Q
+// becomes a copy (D = R): two's-complement addition is associative, so the
+// result is the same, and two values that lived across every call are now one.
+// For fib that is the register that decides whether a second level of
+// expansion fits in the callee-saved registers or spills.
+//
+// Region rule (P = the `B = 0`, Q after it in the list): no instruction strictly
+// between writes A, every jump there lands in (P, Q], and nothing outside jumps
+// into (P, Q] - so every path from P meets Q once, through the region only.
+
+fn _as_wide(tp as *u8) as i32 {
+    if (cast(i64, tp) == 0) { return 1; }
+    let is *ast.Type as ty = cast(*ast.Type, tp);
+    if (ty.kind == ast.TY_I64 || ty.kind == ast.TY_U64) { return 1; }
+    return 0;
+}
+
+fn _as_label_of(i as *d.IRInst) as i32 {
+    if (i.op == d.IR_LABEL) { return 0 - 1; }
+    if (i.dest.op_type == d.OP_LABEL) { return i.dest.label; }
+    if (i.src1.op_type == d.OP_LABEL) { return i.src1.label; }
+    if (i.src2.op_type == d.OP_LABEL) { return i.src2.label; }
+    return 0 - 1;
+}
+
+// Instructions that read their dest operand.
+fn _as_reads_dest(i as *d.IRInst) as i32 {
+    let is i32 as op = i.op;
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+        || op == d.IR_CMOV || op == d.IR_COPY) { return 1; }
+    return 0;
+}
+
+fn _as_reads(i as *d.IRInst, v as i32) as i32 {
+    let is i32 as c with mut = 0;
+    if (i.src1.op_type == d.OP_VREG && i.src1.vreg == v) { c = c + 1; }
+    if (i.src2.op_type == d.OP_VREG && i.src2.vreg == v) { c = c + 1; }
+    if (i.dest.op_type == d.OP_VREG && i.dest.vreg == v && _as_reads_dest(i) == 1) { c = c + 1; }
+    return c;
+}
+
+fn _as_writes(i as *d.IRInst, v as i32) as i32 {
+    if (i.dest.op_type == d.OP_VREG && i.dest.vreg == v && _as_reads_dest(i) == 0) { return 1; }
+    return 0;
+}
+
+// The chain step `x` makes: 1 for MOV X = s / ADD X = s + o with s in the set
+// and o outside it; 0 otherwise.
+fn _as_step(i as *d.IRInst, in_s as *u8) as i32 {
+    if (i.dest.op_type != d.OP_VREG) { return 0; }
+    if (i.op == d.IR_MOV && i.src1.op_type == d.OP_VREG && in_s[i.src1.vreg] == cast(u8, 1)) { return 1; }
+    if (i.op == d.IR_ADD && _as_wide(i.cast_to) == 1 && i.src1.op_type == d.OP_VREG && i.src2.op_type == d.OP_VREG) {
+        let is i32 as a = cast(i32, in_s[i.src1.vreg]);
+        let is i32 as b = cast(i32, in_s[i.src2.vreg]);
+        if (a + b == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn _as_try(func as *d.IRFunction, ins as **d.IRInst, n as i32, pi as i32, qi as i32, in_s as *u8) as i32 {
+    let is *d.IRInst as P = ins[pi];
+    let is *d.IRInst as Q = ins[qi];
+    let is i32 as vc = func.vreg_count;
+    let is i32 as v with mut = 0;
+    while (v < vc) { in_s[v] = cast(u8, 0); v = v + 1; }
+    let is i32 as bv = P.dest.vreg;
+    in_s[bv] = cast(u8, 1);
+    // forward closure through MOV/ADD steps, Q excluded
+    let is i32 as grew with mut = 1;
+    while (grew == 1) {
+        grew = 0;
+        let is i32 as k with mut = 0;
+        while (k < n) {
+            let is *d.IRInst as x = ins[k];
+            if (k != qi && _as_step(x, in_s) == 1 && in_s[x.dest.vreg] == cast(u8, 0)) { in_s[x.dest.vreg] = cast(u8, 1); grew = 1; }
+            k = k + 1;
+        }
+    }
+    // Q: D = A + R with R in the set, A and D outside
+    if (Q.op != d.IR_ADD || _as_wide(Q.cast_to) == 0 || Q.dest.op_type != d.OP_VREG
+        || Q.src1.op_type != d.OP_VREG || Q.src2.op_type != d.OP_VREG) { return 0; }
+    let is i32 as av with mut = Q.src1.vreg;
+    let is i32 as rv with mut = Q.src2.vreg;
+    if (in_s[av] == cast(u8, 1)) { av = Q.src2.vreg; rv = Q.src1.vreg; }
+    if (in_s[rv] == cast(u8, 0) || in_s[av] == cast(u8, 1) || in_s[Q.dest.vreg] == cast(u8, 1)) { return 0; }
+    // every member: written only by P or a chain step; read only by a chain
+    // step or (once) by Q
+    let is i32 as k2 with mut = 0;
+    while (k2 < n) {
+        let is *d.IRInst as x = ins[k2];
+        if (k2 != pi && k2 != qi) {
+            let is i32 as step = _as_step(x, in_s);
+            let is i32 as dm with mut = 0;
+            if (x.dest.op_type == d.OP_VREG && in_s[x.dest.vreg] == cast(u8, 1)) { dm = 1; }
+            if (dm == 1 && (step == 0 || _as_reads_dest(x) == 1)) { return 0; }
+            if (dm == 0) {
+                // a non-step reading a member leaks the seed
+                if (x.src1.op_type == d.OP_VREG && in_s[x.src1.vreg] == cast(u8, 1)) { return 0; }
+                if (x.src2.op_type == d.OP_VREG && in_s[x.src2.vreg] == cast(u8, 1)) { return 0; }
+            }
+        }
+        k2 = k2 + 1;
+    }
+    // region (P, Q)
+    let is i32 as k3 with mut = 0;
+    while (k3 < n) {
+        let is *d.IRInst as x = ins[k3];
+        let is i32 as inside with mut = 0;
+        if (k3 > pi && k3 < qi) { inside = 1; }
+        if (inside == 1 && _as_writes(x, av) == 1) { return 0; }
+        if (inside == 1 && x.op == d.IR_ASM) { return 0; }
+        let is i32 as L = _as_label_of(x);
+        if (L >= 0) {
+            // where the label sits
+            let is i32 as at with mut = 0 - 1;
+            let is i32 as m with mut = 0;
+            while (m < n) { if (ins[m].op == d.IR_LABEL && ins[m].dest.label == L) { at = m; } m = m + 1; }
+            let is i32 as tin with mut = 0;
+            if (at > pi && at <= qi) { tin = 1; }
+            if (inside == 1 && tin == 0) { return 0; }
+            if (inside == 0 && tin == 1) { return 0; }
+        }
+        k3 = k3 + 1;
+    }
+    // P: B = A ; Q: D = R
+    P.op = d.IR_MOV;
+    P.src1 = d.op_vreg(av);
+    Q.op = d.IR_MOV;
+    Q.src1 = d.op_vreg(rv);
+    Q.src2.op_type = d.OP_NONE;
+    return 1;
+}
+
+fn pass_acc_seed(func as *d.IRFunction) as i32 {
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) { if (w.is_dead == 0) { n = n + 1; } w = w.next; }
+    if (n == 0 || n > SI_SEED_MAX) { return 0; }
+    let is **d.IRInst as ins = cast(**d.IRInst, d.opt_alloc(cast(i64, n) * 8));
+    let is *u8 as in_s = d.opt_alloc(cast(i64, func.vreg_count) + 1);
+    let is i32 as k with mut = 0;
+    w = func.instructions;
+    while (cast(i64, w) != 0) { if (w.is_dead == 0) { ins[k] = w; k = k + 1; } w = w.next; }
+    let is i32 as done with mut = 0;
+    let is i32 as pi with mut = 0;
+    while (pi < n) {
+        let is *d.IRInst as P = ins[pi];
+        if (P.op == d.IR_IMM && P.dest.op_type == d.OP_VREG && P.src1.op_type == d.OP_IMM && P.src1.imm == 0
+            && _as_wide(P.cast_to) == 1) {
+            let is i32 as qi with mut = pi + 1;
+            let is i32 as hit with mut = 0;
+            while (qi < n && hit == 0) {
+                if (ins[qi].op == d.IR_ADD) { hit = _as_try(func, ins, n, pi, qi, in_s); }
+                qi = qi + 1;
+            }
+            done = done + hit;
+        }
+        pi = pi + 1;
+    }
+    d.opt_free(in_s);
+    d.opt_free(cast(*u8, ins));
     return done;
 }
