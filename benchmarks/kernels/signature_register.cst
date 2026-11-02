@@ -1,0 +1,150 @@
+// Two 10-bit multiple-input signature registers (linked lists of cells, end
+// fed back to the start) clocked with the same random input bits for 10
+// cycles, where each bit reaching the second register is flipped with
+// probability 0.25; over 100000 trials, the fraction in which the two still
+// end equal (errors that cancelled out). Random bits come from a 48-bit
+// linear congruential generator (a = 0x5DEECE66D, c = 11, top 31 bits out),
+// seeded with 1.
+// Self-check: the printed fraction (99 of 100000) and the hash of the output.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as REG_LEN with imut = 10;
+let is i32 as NUM_VECT with imut = 10;
+let is i32 as NUM_TIMES with imut = 100000;
+
+struct Cell {
+    f_free as i32;      // fault-free register bit
+    faulty as i32;      // the register that sees flipped inputs
+    next as *Cell;
+}
+
+let is mem.bins.Bins as heap with mut;
+let is u64 as rstate with mut = 0;
+let is u64 as out_hash with mut = 14695981039346656037;
+
+fn say(b as *u8, len as i64) as void {
+    io.write_bytes(io.STDOUT, b, len);
+    let is i64 as k with mut = 0;
+    while (k < len) { out_hash = (out_hash ^ cast(u64, b[k])) * 1099511628211; k = k + 1; }
+}
+
+fn seed3(s0 as u64, s1 as u64, s2 as u64) as void {
+    rstate = (s2 << 32) | (s1 << 16) | s0;
+}
+
+fn rand31() as i64 {
+    rstate = (rstate * 25214903917 + 11) & 281474976710655;
+    return cast(i64, rstate >> 17);
+}
+
+// One input cell feeding the next: shift both registers by one position.
+fn step(c as *Cell, randv as *i64, prob as f64, scale as i64) as void {
+    c.f_free = cast(i32, (cast(i64, c.next.f_free) + randv[0]) & 1);
+    let is f64 as p = cast(f64, rand31() % scale) / cast(f64, scale);
+    if (prob > p) { randv[0] = randv[0] ^ 1; }
+    c.faulty = cast(i32, (cast(i64, c.next.faulty) + randv[0]) & 1);
+}
+
+fn simulate(iterations as i32, present as *Cell, prob as f64, structure as *u8) as i32 {
+    let is i32 as quot = (REG_LEN - 1) / 31;
+    let is i32 as rem = (REG_LEN - 1) % 31;
+    let is *Cell as c with mut = present;
+    let is i64 as randv with mut = 0;
+    let is i32 as h with mut = 0;
+    while (h < iterations) {
+        let is i32 as save_free with mut = 0;
+        let is i32 as save_faulty with mut = 0;
+        let is i32 as i with mut = 0;
+        while (i < quot) {
+            randv = rand31();
+            let is i32 as j with mut = 0;
+            while (j < 31) {
+                if (structure[i * 31 + j] == 49) {
+                    save_free = save_free + c.f_free;
+                    save_faulty = save_faulty + c.faulty;
+                }
+                step(c, &randv, prob, 1000);
+                c = c.next;
+                randv = randv >> 1;
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        randv = rand31();
+        let is i32 as j with mut = 0;
+        while (j < rem) {
+            if (structure[quot * 31 + j] == 49) {
+                save_free = save_free + c.f_free;
+                save_faulty = save_faulty + c.faulty;
+            }
+            step(c, &randv, prob, 1000);
+            c = c.next;
+            randv = randv >> 1;
+            j = j + 1;
+        }
+        randv = rand31();
+        if (structure[REG_LEN - 1] == 49) {
+            save_free = save_free + c.f_free;
+            save_faulty = save_faulty + c.faulty;
+        }
+        c.f_free = cast(i32, (cast(i64, save_free) + randv) & 1);
+        let is f64 as p = cast(f64, rand31() % 10000) / 10000.0;
+        if (prob > p) { randv = randv ^ 1; }
+        c.faulty = cast(i32, (cast(i64, save_faulty) + randv) & 1);
+        c = present;
+        h = h + 1;
+    }
+    let is i32 as different with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < REG_LEN) {
+        if (c.f_free != c.faulty) { different = 1; }
+        c = c.next;
+        i = i + 1;
+    }
+    return different;
+}
+
+fn main() as i32 {
+    let is f64 as prob = 0.25;
+    let is [101]u8 as structure;
+    let is *u8 as st = cast(*u8, &structure);
+    let is i32 as i with mut = 1;
+    while (i < REG_LEN) { st[i] = 48; i = i + 1; }
+    st[0] = 49;
+    st[REG_LEN] = 0;
+    seed3(1, 0, 0);
+
+    // A zeroed head cell, then REG_LEN + 1 cells starting at 1.
+    let is Cell as head;
+    head.f_free = 0;
+    head.faulty = 0;
+    let is *Cell as last with mut = &head;
+    i = 0;
+    while (i < REG_LEN + 1) {
+        let is *Cell as c = cast(*Cell, mem.bins.bins_alloc(&heap, sizeof(Cell)));
+        c.f_free = 1;
+        c.faulty = 1;
+        c.next = cast(*Cell, 0);
+        last.next = c;
+        last = c;
+        i = i + 1;
+    }
+
+    let is i32 as num_true with mut = 0;
+    i = 0;
+    while (i < NUM_TIMES) {
+        let is *Cell as c with mut = &head;
+        while (cast(i64, c.next) != 0) { c.faulty = c.f_free; c = c.next; }
+        num_true = num_true + simulate(NUM_VECT, &head, prob, st);
+        i = i + 1;
+    }
+
+    let is [256]u8 as buf;
+    let is *u8 as b = cast(*u8, &buf);
+    say(b, io.sprintf(b, 256, "reg_len\t#_vect\tprob      #_tms\tstruct\tseed1\tseed2\tseed3\tProb same output\n "));
+    let is f64 as same = cast(f64, NUM_TIMES - num_true) / cast(f64, NUM_TIMES);
+    say(b, io.sprintf(b, 256, "%d\t%d\t%.3e %d\t%s\t%d\t%d\t%d\t%.8e\n", REG_LEN, NUM_VECT, prob, NUM_TIMES, st, 1, 0, 0, same));
+    if (NUM_TIMES - num_true != 99 || out_hash != 2743741577340588835) { return 1; }
+    return 0;
+}

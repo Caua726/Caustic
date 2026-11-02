@@ -1,0 +1,244 @@
+// Huffman coding round trip, 30 times over the same 10 million bytes drawn
+// from a 32-letter alphabet by a Park-Miller generator (seed 1325, xored with
+// a mask around each step): count frequencies, build the code tree with an
+// indirect heap of frequencies, assign codes by walking parent links, pack
+// the bits, then decode through a table of tree positions sorted by
+// insertion sort, writing the bytes back over the input. Prints a fixed
+// report line.
+// Self-check: the decoded data equals what was generated, and the report.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as NUM_LOOPS with imut = 30;
+let is i64 as TEST_SIZE with imut = 10000000;
+
+let is mem.bins.Bins as heap with mut;
+let is i64 as seed with mut = 1325;
+
+fn random32() as i64 {
+    seed = seed ^ 123459876;
+    let is i64 as k = seed / 127773;
+    seed = 16807 * (seed - k * 127773) - 2836 * k;
+    if (seed < 0) { seed = seed + 2147483647; }
+    let is i64 as result = seed % 32;
+    seed = seed ^ 123459876;
+    return result;
+}
+
+fn generate(n as i64) as *u8 {
+    let is *u8 as codes = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+    let is *u8 as data = mem.bins.bins_alloc(&heap, n);
+    let is i64 as i with mut = 0;
+    while (i < n) { data[i] = codes[random32()]; i = i + 1; }
+    return data;
+}
+
+// Sifts heap[k-1] down a 1-based min-heap of n symbols ordered by freq.
+fn heap_adjust(freq as *u64, hp as *u64, n as i64, k0 as i64) as void {
+    let is i64 as k with mut = k0;
+    let is u64 as v = hp[k - 1];
+    while (k <= n / 2) {
+        let is i64 as j with mut = k + k;
+        if (j < n && freq[hp[j - 1]] > freq[hp[j]]) { j = j + 1; }
+        if (freq[v] < freq[hp[j - 1]]) { break; }
+        hp[k - 1] = hp[j - 1];
+        k = j;
+    }
+    hp[k - 1] = v;
+}
+
+fn fail(msg as *u8) as void {
+    io.write_bytes(io.STDERR, msg, io.strlen(msg));
+    io.exit(1);
+}
+
+fn round_trip(data as *u8, len as i64) as void {
+    let is *u8 as comp = mem.bins.bins_alloc(&heap, len + 1);
+    mem.memset(comp, 0, len + 1);
+    let is [512]u64 as freq;
+    let is [256]u64 as hp;
+    let is [512]i32 as link;
+    let is [256]u64 as code;
+    let is [256]u8 as clen;
+    mem.memset(cast(*u8, &freq), 0, 512 * 8);
+    mem.memset(cast(*u8, &hp), 0, 256 * 8);
+    mem.memset(cast(*u8, &link), 0, 512 * 4);
+    mem.memset(cast(*u8, &code), 0, 256 * 8);
+    mem.memset(cast(*u8, &clen), 0, 256);
+    let is *u64 as fq = cast(*u64, &freq);
+    let is *u64 as h = cast(*u64, &hp);
+
+    let is i64 as i with mut = 0;
+    while (i < len) { freq[data[i]] = freq[data[i]] + 1; i = i + 1; }
+
+    let is i64 as n with mut = 0;
+    i = 0;
+    while (i < 256) {
+        if (freq[i] != 0) { hp[n] = cast(u64, i); n = n + 1; }
+        i = i + 1;
+    }
+    i = n;
+    while (i > 0) { heap_adjust(fq, h, n, i); i = i - 1; }
+
+    // Merge the two rarest until one tree is left; internal nodes are
+    // 256 + n, a node's link is its parent, negated for a left child.
+    while (n > 1) {
+        n = n - 1;
+        let is u64 as temp = hp[0];
+        hp[0] = hp[n];
+        heap_adjust(fq, h, n, 1);
+        freq[256 + n] = freq[hp[0]] + freq[temp];
+        link[temp] = cast(i32, 256 + n);
+        link[hp[0]] = cast(i32, 0 - 256 - n);
+        hp[0] = cast(u64, 256 + n);
+        heap_adjust(fq, h, n, 1);
+    }
+    link[256 + n] = 0;
+
+    let is u64 as maxx with mut = 0;
+    let is i64 as maxi with mut = 0;
+    let is i64 as m with mut = 0;
+    while (m < 256) {
+        if (freq[m] == 0) {
+            code[m] = 0;
+            clen[m] = 0;
+        } else {
+            let is i64 as bits with mut = 0;
+            let is u64 as bitv with mut = 1;
+            let is u64 as x with mut = 0;
+            let is i32 as l with mut = link[m];
+            while (l != 0) {
+                if (l < 0) { x = x + bitv; l = 0 - l; }
+                l = link[l];
+                bitv = bitv << 1;
+                bits = bits + 1;
+            }
+            code[m] = x;
+            clen[m] = cast(u8, bits);
+            if (x > maxx) { maxx = x; }
+            if (bits > maxi) { maxi = bits; }
+        }
+        m = m + 1;
+    }
+    if (maxi > 64) { fail("error: bit code overflow\n"); }
+    if (maxx == 0) { fail("error: file has only one value!\n"); }
+
+    // Pack the codes, most significant bit first.
+    let is i64 as comp_len with mut = 0;
+    let is u8 as bout with mut = 0;
+    let is i32 as bit with mut = 0 - 1;
+    let is i64 as j with mut = 0;
+    while (j < len) {
+        let is u8 as c = data[j];
+        let is i32 as cl = cast(i32, clen[c]);
+        let is u64 as cd = code[c];
+        let is u64 as mask with mut = cast(u64, cast(i64, 1 << (cl - 1)));
+        let is i32 as b with mut = 0;
+        while (b < cl) {
+            if (bit == 7) {
+                comp[comp_len] = bout;
+                comp_len = comp_len + 1;
+                if (comp_len == len) { fail("error: no compression\n"); }
+                bit = 0;
+                bout = 0;
+            } else {
+                bit = bit + 1;
+                bout = bout << 1;
+            }
+            if ((cd & mask) != 0) { bout = bout | 1; }
+            mask = mask >> 1;
+            b = b + 1;
+        }
+        j = j + 1;
+    }
+    bout = cast(u8, cast(i32, bout) << (7 - bit));
+    comp[comp_len] = bout;
+    comp_len = comp_len + 1;
+
+    // Decode table: each symbol's position in the implicit tree (root 0,
+    // children 2k+1 and 2k+2), sorted with the symbols alongside.
+    let is [256]u64 as heap2;
+    let is [256]u8 as outc;
+    mem.memset(cast(*u8, &heap2), 0, 256 * 8);
+    j = 0;
+    while (j < 256) {
+        outc[j] = cast(u8, j);
+        if ((code[j] | cast(u64, clen[j])) != 0) {
+            let is u64 as k with mut = 0;
+            let is u64 as mask with mut = cast(u64, cast(i64, 1 << (cast(i32, clen[j]) - 1)));
+            let is i32 as b with mut = 0;
+            while (b < cast(i32, clen[j])) {
+                k = k * 2 + 1;
+                if ((code[j] & mask) != 0) { k = k + 1; }
+                mask = mask >> 1;
+                b = b + 1;
+            }
+            heap2[j] = k;
+        }
+        j = j + 1;
+    }
+    i = 1;
+    while (i < 256) {
+        let is u64 as t = heap2[i];
+        let is u8 as c = outc[i];
+        j = i;
+        while (j != 0 && heap2[j - 1] > t) {
+            heap2[j] = heap2[j - 1];
+            outc[j] = outc[j - 1];
+            j = j - 1;
+        }
+        heap2[j] = t;
+        outc[j] = c;
+        i = i + 1;
+    }
+    j = 0;
+    while (heap2[j] == 0) { j = j + 1; }
+
+    let is u64 as k with mut = 0;
+    i = j;
+    let is u8 as mask8 with mut = 128;
+    let is i64 as done with mut = 0;
+    let is i64 as cp with mut = 0;
+    let is i64 as dp with mut = 0;
+    while (done < len) {
+        k = k * 2 + 1;
+        if ((comp[cp] & mask8) != 0) { k = k + 1; }
+        while (heap2[i] < k) { i = i + 1; }
+        if (k == heap2[i]) {
+            data[dp] = outc[i];
+            dp = dp + 1;
+            done = done + 1;
+            k = 0;
+            i = j;
+        }
+        if (mask8 > 1) { mask8 = mask8 >> 1; }
+        else {
+            mask8 = 128;
+            cp = cp + 1;
+        }
+    }
+    mem.bins.bins_free(&heap, comp);
+}
+
+fn checksum(p as *u8, n as i64) as u64 {
+    let is u64 as h with mut = 14695981039346656037;
+    let is i64 as i with mut = 0;
+    while (i < n) { h = (h ^ cast(u64, p[i])) * 1099511628211; i = i + 1; }
+    return h;
+}
+
+fn main() as i32 {
+    let is *u8 as data = generate(TEST_SIZE);
+    let is u64 as before = checksum(data, TEST_SIZE);
+    let is i32 as r with mut = 0;
+    while (r < NUM_LOOPS) { round_trip(data, TEST_SIZE); r = r + 1; }
+    let is u64 as after = checksum(data, TEST_SIZE);
+    mem.bins.bins_free(&heap, data);
+
+    let is [128]u8 as buf;
+    let is *u8 as b = cast(*u8, &buf);
+    let is i64 as len = io.sprintf(b, 128, "\nhuffbench (Std. C) run time: %f\n\n", 0.0);
+    io.write_bytes(io.STDOUT, b, len);
+    if (before != after || checksum(b, len) != 17573274583152012083) { return 1; }
+    return 0;
+}

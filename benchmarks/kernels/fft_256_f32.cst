@@ -1,0 +1,154 @@
+// Single-precision FFT of 256 complex points: a twiddle table built from a
+// truncated Taylor cosine and half-angle bisection, inputs from a 13-bit
+// linear congruential generator (x = (4855x + 1731) mod 8192, scaled to
+// [-10, 10)), 20 forward transforms in a row (each scaled by 1/16 and
+// conjugated); 10 rounds, each printing 16 of the results.
+// Self-check: the 10 printed blocks hash to the expected value.
+use "../../std/io.cst" as io;
+
+let is i32 as N with imut = 256;
+let is i64 as OCAP with imut = 8192;
+
+struct Complex {
+    rp as f32;
+    ip as f32;
+}
+
+let is [257]Complex as z with mut;      // 1-based
+let is [257]Complex as w with mut;
+let is [130]Complex as e with mut;
+let is i64 as seed with mut = 0;
+
+let is [8192]u8 as obuf with mut;
+let is i64 as olen with mut = 0;
+
+fn ocur() as *u8 { return cast(*u8, cast(i64, &obuf) + olen); }
+
+// Writes what was collected; 1 unless it hashes (FNV-1a) to `want`.
+fn flush_check(want as u64) as i32 {
+    let is *u8 as b = cast(*u8, &obuf);
+    io.write_bytes(io.STDOUT, b, olen);
+    let is u64 as h with mut = 14695981039346656037;
+    let is i64 as k with mut = 0;
+    while (k < olen) { h = (h ^ cast(u64, b[k])) * 1099511628211; k = k + 1; }
+    if (h != want) { return 1; }
+    return 0;
+}
+
+// cos x from the Taylor series up to x^10, in single precision.
+fn taylor_cos(x as f32) as f32 {
+    let is f32 as result with mut = 1.0;
+    let is i32 as factor with mut = 1;
+    let is f32 as power with mut = x;
+    let is i32 as i with mut = 2;
+    while (i <= 10) {
+        factor = factor * i;
+        power = power * x;
+        if ((i & 1) == 0) {
+            if ((i & 3) == 0) { result = result + power / cast(f32, factor); }
+            else { result = result - power / cast(f32, factor); }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn twiddles(n as i32) as void {
+    let is [26]f32 as h;
+    let is f32 as theta = 3.1415926536;
+    let is f32 as divisor with mut = 4.0;
+    let is i32 as i with mut = 1;
+    while (i <= 25) {
+        h[i] = 1.0 / (2.0 * taylor_cos(theta / divisor));
+        divisor = divisor + divisor;
+        i = i + 1;
+    }
+    let is i32 as m = n / 2;
+    let is i32 as l with mut = m / 2;
+    let is i32 as j with mut = 1;
+    e[1].rp = 1.0;
+    e[1].ip = 0.0;
+    e[l + 1].rp = 0.0;
+    e[l + 1].ip = 1.0;
+    e[m + 1].rp = 0.0 - 1.0;
+    e[m + 1].ip = 0.0;
+    while (l > 1) {
+        let is i32 as half = l / 2;
+        let is i32 as k with mut = half;
+        while (k <= m) {
+            e[k + 1].rp = h[j] * (e[k + half + 1].rp + e[k - half + 1].rp);
+            e[k + 1].ip = h[j] * (e[k + half + 1].ip + e[k - half + 1].ip);
+            k = k + l;
+        }
+        j = j + 1;
+        if (j > 25) { j = 25; }
+        l = half;
+    }
+}
+
+fn fft(n as i32, scale as f32) as void {
+    let is i32 as m = n / 2;
+    let is i32 as l with mut = 1;
+    while (l <= m) {
+        let is i32 as k with mut = 0;
+        let is i32 as j with mut = l;
+        let is i32 as i with mut = 1;
+        while (j <= m) {
+            while (i <= j) {
+                let is f32 as dr = z[i].rp - z[i + m].rp;
+                let is f32 as di = z[i].ip - z[i + m].ip;
+                w[i + k].rp = z[i].rp + z[m + i].rp;
+                w[i + k].ip = z[i].ip + z[m + i].ip;
+                w[i + j].rp = e[k + 1].rp * dr - e[k + 1].ip * di;
+                w[i + j].ip = e[k + 1].rp * di + e[k + 1].ip * dr;
+                i = i + 1;
+            }
+            k = j;
+            j = k + l;
+        }
+        let is i32 as c with mut = 1;
+        while (c <= n) { z[c] = w[c]; c = c + 1; }
+        l = l + l;
+    }
+    let is i32 as i with mut = 1;
+    while (i <= n) {
+        z[i].rp = scale * z[i].rp;
+        z[i].ip = (0.0 - scale) * z[i].ip;
+        i = i + 1;
+    }
+}
+
+fn uniform() as f32 {
+    seed = (4855 * seed + 1731) & 8191;
+    return cast(f32, seed) / 8192.0;
+}
+
+fn round() as void {
+    twiddles(N);
+    seed = 5767;
+    let is i32 as i with mut = 1;
+    while (i <= N) {
+        let is f32 as zr = uniform();
+        let is f32 as zi = uniform();
+        z[i].rp = 20.0 * zr - 10.0;
+        z[i].ip = 20.0 * zi - 10.0;
+        i = i + 1;
+    }
+    i = 1;
+    while (i <= 20) { fft(N, 0.0625); i = i + 1; }
+
+    olen = olen + io.sprintf(ocur(), OCAP - olen, "\n");
+    i = 1;
+    while (i <= N) {
+        olen = olen + io.sprintf(ocur(), OCAP - olen, "  %15.3f%15.3f", cast(f64, z[i].rp), cast(f64, z[i].ip));
+        i = i + 17;
+        olen = olen + io.sprintf(ocur(), OCAP - olen, "  %15.3f%15.3f\n", cast(f64, z[i].rp), cast(f64, z[i].ip));
+        i = i + 17;
+    }
+}
+
+fn main() as i32 {
+    let is i32 as r with mut = 0;
+    while (r < 10) { round(); r = r + 1; }
+    return flush_check(3109382342744161087);
+}

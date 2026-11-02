@@ -1,0 +1,311 @@
+// Single-precision LU factorization with partial pivoting and the matching
+// solve, on a 100x100 system built by a 16-bit generator (x = 3125x mod
+// 65536, entries (x - 32768) / 16384, right side the row sums so the answer
+// is all ones), stored by columns with leading dimension 201 and then 200.
+// After one checked solve (residual, machine epsilon, error at both ends) it
+// runs the calibration passes and 2 x 5 x 1000 timed factor/solve rounds;
+// the times themselves print as zero. Everything goes to stderr.
+// Self-check: the whole report hashes to the expected value.
+use "../../std/io.cst" as io;
+
+let is i32 as N with imut = 100;
+let is i32 as LDA with imut = 201;
+let is i32 as LDAA with imut = 200;
+
+let is [40000]f32 as aa with mut;
+let is [40200]f32 as a with mut;
+let is [200]f32 as b with mut;
+let is [200]f32 as x with mut;
+let is [200]i32 as ipvt with mut;
+let is i32 as info with mut = 0;
+
+let is [4096]u8 as obuf with mut;
+let is i64 as olen with mut = 0;
+
+fn ocur() as *u8 { return cast(*u8, cast(i64, &obuf) + olen); }
+
+fn at(p as *f32, off as i32) as *f32 { return cast(*f32, cast(i64, p) + cast(i64, off) * 4); }
+
+fn absf(v as f32) as f32 {
+    if (v < 0.0) { return 0.0 - v; }
+    return v;
+}
+
+// Fills m (column j at m + lda*j) and sets b to its row sums; returns the
+// largest entry.
+fn matgen(m as *f32, lda as i32, n as i32, rhs as *f32) as f32 {
+    let is i32 as init with mut = 1325;
+    let is f32 as norma with mut = 0.0;
+    let is i32 as j with mut = 0;
+    while (j < n) {
+        let is i32 as i with mut = 0;
+        while (i < n) {
+            init = 3125 * init % 65536;
+            let is f32 as v = cast(f32, (cast(f64, init) - 32768.0) / 16384.0);
+            m[lda * j + i] = v;
+            if (v > norma) { norma = v; }
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    let is i32 as i with mut = 0;
+    while (i < n) { rhs[i] = 0.0; i = i + 1; }
+    j = 0;
+    while (j < n) {
+        i = 0;
+        while (i < n) { rhs[i] = rhs[i] + m[lda * j + i]; i = i + 1; }
+        j = j + 1;
+    }
+    return norma;
+}
+
+// dy += da * dx over n entries.
+fn axpy(n as i32, da as f32, dx as *f32, dy as *f32) as void {
+    if (n <= 0) { return; }
+    if (da == 0.0) { return; }
+    let is i32 as i with mut = 0;
+    while (i < n) { dy[i] = dy[i] + da * dx[i]; i = i + 1; }
+}
+
+fn scale(n as i32, da as f32, dx as *f32) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) { dx[i] = da * dx[i]; i = i + 1; }
+}
+
+// Index of the entry of largest magnitude (the first of equals).
+fn amax(n as i32, dx as *f32) as i32 {
+    if (n < 1) { return 0 - 1; }
+    if (n == 1) { return 0; }
+    let is i32 as best with mut = 0;
+    let is f32 as big with mut = absf(dx[0]);
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is f32 as v = absf(dx[i]);
+        if (v > big) { best = i; big = v; }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn factor(m as *f32, lda as i32, n as i32, piv as *i32) as void {
+    info = 0;
+    let is i32 as nm1 = n - 1;
+    let is i32 as k with mut = 0;
+    while (k < nm1) {
+        let is *f32 as col_k = at(m, lda * k);
+        let is i32 as l = amax(n - k, at(col_k, k)) + k;
+        piv[k] = l;
+        if (col_k[l] != 0.0) {
+            if (l != k) {
+                let is f32 as t = col_k[l];
+                col_k[l] = col_k[k];
+                col_k[k] = t;
+            }
+            // The multiplier is formed in double, then rounded.
+            let is f32 as t = cast(f32, (0.0 - 1.0) / cast(f64, col_k[k]));
+            scale(n - (k + 1), t, at(col_k, k + 1));
+            let is i32 as j with mut = k + 1;
+            while (j < n) {
+                let is *f32 as col_j = at(m, lda * j);
+                let is f32 as tj = col_j[l];
+                if (l != k) {
+                    col_j[l] = col_j[k];
+                    col_j[k] = tj;
+                }
+                axpy(n - (k + 1), tj, at(col_k, k + 1), at(col_j, k + 1));
+                j = j + 1;
+            }
+        } else {
+            info = k;
+        }
+        k = k + 1;
+    }
+    piv[n - 1] = n - 1;
+    if (m[lda * (n - 1) + (n - 1)] == 0.0) { info = n - 1; }
+}
+
+fn solve(m as *f32, lda as i32, n as i32, piv as *i32, rhs as *f32) as void {
+    let is i32 as nm1 = n - 1;
+    let is i32 as k with mut = 0;
+    while (k < nm1) {
+        let is i32 as l = piv[k];
+        let is f32 as t = rhs[l];
+        if (l != k) {
+            rhs[l] = rhs[k];
+            rhs[k] = t;
+        }
+        axpy(n - (k + 1), t, at(m, lda * k + k + 1), at(rhs, k + 1));
+        k = k + 1;
+    }
+    let is i32 as kb with mut = 0;
+    while (kb < n) {
+        k = n - (kb + 1);
+        rhs[k] = rhs[k] / m[lda * k + k];
+        let is f32 as t = 0.0 - rhs[k];
+        axpy(k, t, at(m, lda * k), rhs);
+        kb = kb + 1;
+    }
+}
+
+// y += m * x over columns j - g + 1 .. j, added one column at a time.
+fn mxpy_group(n1 as i32, y as *f32, ldm as i32, xv as *f32, m as *f32, j as i32, g as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < n1) {
+        let is f32 as s with mut = y[i];
+        let is i32 as c with mut = j - g + 1;
+        while (c <= j) { s = s + xv[c] * m[ldm * c + i]; c = c + 1; }
+        y[i] = s;
+        i = i + 1;
+    }
+}
+
+// y += m * x, columns taken in groups of 1, 2, 4, 8 and then 16.
+fn mxpy(n1 as i32, y as *f32, n2 as i32, ldm as i32, xv as *f32, m as *f32) as void {
+    let is i32 as j with mut = n2 % 2;
+    if (j >= 1) { mxpy_group(n1, y, ldm, xv, m, j - 1, 1); }
+    j = n2 % 4;
+    if (j >= 2) { mxpy_group(n1, y, ldm, xv, m, j - 1, 2); }
+    j = n2 % 8;
+    if (j >= 4) { mxpy_group(n1, y, ldm, xv, m, j - 1, 4); }
+    j = n2 % 16;
+    if (j >= 8) { mxpy_group(n1, y, ldm, xv, m, j - 1, 8); }
+    j = n2 % 16 + 16 - 1;
+    while (j < n2) {
+        mxpy_group(n1, y, ldm, xv, m, j, 16);
+        j = j + 16;
+    }
+}
+
+// Unit roundoff: 4/3 rounded, less one, tripled, less one.
+fn epsilon() as f32 {
+    let is f32 as q = cast(f32, 4.0 / 3.0);
+    let is f32 as eps with mut = 0.0;
+    while (eps == 0.0) {
+        let is f32 as r = cast(f32, cast(f64, q) - 1.0);
+        let is f32 as c = r + r + r;
+        let is f64 as diff = cast(f64, c) - 1.0;
+        if (diff < 0.0) { eps = cast(f32, 0.0 - diff); } else { eps = cast(f32, diff); }
+    }
+    return eps;
+}
+
+fn say(s as *u8) as void {
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "%s", s);
+}
+
+fn table_head() as void {
+    say("      dgefa      dgesl      total     Mflops       unit");
+    say("      ratio\n");
+}
+
+// Five rounds of `times` factorizations, then `times` solves, on m.
+fn timed_rounds(m as *f32, lda as i32, times as i32) as void {
+    let is i32 as j with mut = 0;
+    while (j < 5) {
+        let is i32 as i with mut = 0;
+        while (i < times) {
+            matgen(m, lda, N, cast(*f32, &b));
+            factor(m, lda, N, cast(*i32, &ipvt));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < times) {
+            solve(m, lda, N, cast(*i32, &ipvt), cast(*f32, &b));
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+}
+
+fn main() as i32 {
+    let is *f32 as am = cast(*f32, &a);
+    let is *f32 as aam = cast(*f32, &aa);
+    let is *f32 as bv = cast(*f32, &b);
+    let is *f32 as xv = cast(*f32, &x);
+    let is *i32 as pv = cast(*i32, &ipvt);
+
+    say("Rolled ");
+    say("Single ");
+    say("Precision Linpack Benchmark - PC Version in 'C/C++'\n\n");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Compiler     %s\n", "INSERT COMPILER NAME HERE");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Optimisation %s\n\n", "INSERT OPTIMISATION OPTIONS HERE");
+
+    let is f32 as norma with mut = matgen(am, LDA, N, bv);
+    factor(am, LDA, N, pv);
+    solve(am, LDA, N, pv, bv);
+
+    // Residual of the solution against a fresh copy of the system.
+    let is i32 as i with mut = 0;
+    while (i < N) { x[i] = b[i]; i = i + 1; }
+    norma = matgen(am, LDA, N, bv);
+    i = 0;
+    while (i < N) { b[i] = 0.0 - b[i]; i = i + 1; }
+    mxpy(N, bv, N, LDA, xv, am);
+    let is f32 as resid with mut = 0.0;
+    let is f32 as normx with mut = 0.0;
+    i = 0;
+    while (i < N) {
+        let is f32 as rb = absf(b[i]);
+        if (!(resid > rb)) { resid = rb; }
+        let is f32 as rx = absf(x[i]);
+        if (!(normx > rx)) { normx = rx; }
+        i = i + 1;
+    }
+    let is f32 as eps = epsilon();
+    let is f32 as residn = resid / (cast(f32, N) * norma * normx * eps);
+    let is f32 as x1 = x[0] - 1.0;
+    let is f32 as x2 = x[N - 1] - 1.0;
+    say("norm resid      resid           machep");
+    say("         x[0]-1          x[n-1]-1\n");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "%6.1f %17.8e%17.8e%17.8e%17.8e\n\n",
+        cast(f64, residn), cast(f64, resid), cast(f64, eps), cast(f64, x1), cast(f64, x2));
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Times are reported for matrices of order        %5d\n", N);
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "1 pass times for array with leading dimension of%5d\n\n", LDA);
+    table_head();
+
+    say("\nCalculating matgen overhead\n");
+    let is i32 as pass with mut = 0 - 3;
+    let is i32 as loop with mut = 100;
+    while (pass < 0) {
+        pass = pass + 1;
+        i = 0;
+        while (i < loop) { matgen(am, LDA, N, bv); i = i + 1; }
+        olen = olen + io.sprintf(ocur(), 4096 - olen, "%10d times %6.2f seconds\n", loop, 0.0);
+        if (pass < 0) { loop = loop * 2; }
+    }
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Overhead for 1 matgen %12.5f seconds\n\n", 0.0);
+
+    say("Calculating matgen/dgefa passes for 5 seconds\n");
+    pass = 0 - 3;
+    let is i32 as ntimes with mut = 100;
+    while (pass < 0) {
+        pass = pass + 1;
+        i = 0;
+        while (i < ntimes) { matgen(am, LDA, N, bv); factor(am, LDA, N, pv); i = i + 1; }
+        olen = olen + io.sprintf(ocur(), 4096 - olen, "%10d times %6.2f seconds\n", ntimes, 0.0);
+        if (pass < 0) { ntimes = ntimes * 2; }
+    }
+    ntimes = 1000;
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Passes used %10d \n\n", 0);
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Times for array with leading dimension of%4d\n\n", LDA);
+    table_head();
+    timed_rounds(am, LDA, ntimes);
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Average                          %11.2f\n", 0.0);
+
+    say("\nCalculating matgen2 overhead\n");
+    i = 0;
+    while (i < loop) { matgen(aam, LDAA, N, bv); i = i + 1; }
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Overhead for 1 matgen %12.5f seconds\n\n", 0.0);
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Times for array with leading dimension of%4d\n\n", LDAA);
+    table_head();
+    timed_rounds(aam, LDAA, ntimes);
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Average                          %11.2f\n", 0.0);
+
+    let is *u8 as o = cast(*u8, &obuf);
+    io.write_bytes(io.STDERR, o, olen);
+    let is u64 as h with mut = 14695981039346656037;
+    let is i64 as k with mut = 0;
+    while (k < olen) { h = (h ^ cast(u64, o[k])) * 1099511628211; k = k + 1; }
+    if (h != 12581534414825668975) { return 1; }
+    return 0;
+}

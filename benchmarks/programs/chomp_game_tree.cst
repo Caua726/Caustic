@@ -1,0 +1,233 @@
+// Solves the game of chomp on a board of 7 columns by 8 rows and plays it
+// out. Every reachable position (a non-increasing column profile) is listed
+// with all the moves out of it in linked lists; a position is winning when
+// some move reaches a losing one, looked up by linear search of the positions
+// already solved. Then both players play the first winning move each turn
+// from the full board, printing every move.
+// Self-check: the game's transcript hashes to the expected value.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+struct Move {
+    data as *i32;
+    next as *Move;
+}
+
+struct Play {
+    value as i32;       // 1 = the player to move wins
+    state as *i32;
+    first as *Move;
+    next as *Play;
+}
+
+let is mem.bins.Bins as heap with mut;
+let is i32 as nrow with mut = 0;
+let is i32 as ncol with mut = 0;
+let is *Play as game_tree with mut;
+
+let is [4096]u8 as obuf with mut;
+let is i64 as olen with mut = 0;
+
+fn ocur() as *u8 { return cast(*u8, cast(i64, &obuf) + olen); }
+
+fn alloc(n as i64) as *u8 { return mem.bins.bins_alloc(&heap, n); }
+fn release(p as *u8) as void { mem.bins.bins_free(&heap, p); }
+
+fn new_data() as *i32 { return cast(*i32, alloc(cast(i64, ncol) * 4)); }
+
+fn copy_data(data as *i32) as *i32 {
+    let is *i32 as d = new_data();
+    let is i32 as c with mut = ncol;
+    while (c > 0) { c = c - 1; d[c] = data[c]; }
+    return d;
+}
+
+// Steps to the next profile, counting with column 0 as the lowest digit;
+// 0 when it wraps past the last one.
+fn next_data(data as *i32) as i32 {
+    let is i32 as c with mut = 0;
+    while (c != ncol) {
+        if (data[c] == nrow) {
+            data[c] = 0;
+            c = c + 1;
+        } else {
+            data[c] = data[c] + 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn melt_data(a as *i32, b as *i32) as void {
+    let is i32 as c with mut = ncol;
+    while (c > 0) {
+        c = c - 1;
+        if (a[c] > b[c]) { a[c] = b[c]; }
+    }
+}
+
+fn equal_data(a as *i32, b as *i32) as i32 {
+    let is i32 as c with mut = ncol;
+    while (c > 0) {
+        c = c - 1;
+        if (a[c] != b[c]) { return 0; }
+    }
+    return 1;
+}
+
+// A position can occur only if no column is taller than the one before it.
+fn valid_data(data as *i32) as i32 {
+    let is i32 as low with mut = nrow;
+    let is i32 as c with mut = 0;
+    while (c != ncol) {
+        if (data[c] > low) { return 0; }
+        low = data[c];
+        c = c + 1;
+    }
+    return 1;
+}
+
+fn dump_moves(m as *Move) as void {
+    if (cast(i64, m) != 0) {
+        dump_moves(m.next);
+        release(cast(*u8, m.data));
+        release(cast(*u8, m));
+    }
+}
+
+fn dump_play(p as *Play) as void {
+    if (cast(i64, p) != 0) {
+        dump_play(p.next);
+        dump_moves(p.first);
+        release(cast(*u8, p.state));
+        release(cast(*u8, p));
+    }
+}
+
+fn get_value(data as *i32) as i32 {
+    let is *Play as p with mut = game_tree;
+    while (equal_data(p.state, data) == 0) { p = p.next; }
+    return p.value;
+}
+
+// Columns before `col` full height, the rest cut to `row`: what eating the
+// square at (row, col) leaves of a full board.
+fn make_data(row as i32, col as i32) as *i32 {
+    let is *i32 as d = new_data();
+    let is i32 as c with mut = 0;
+    while (c != col) { d[c] = nrow; c = c + 1; }
+    while (c != ncol) { d[c] = row; c = c + 1; }
+    return d;
+}
+
+fn new_move(data as *i32) as *Move {
+    let is *Move as m = cast(*Move, alloc(sizeof(Move)));
+    m.data = data;
+    m.next = cast(*Move, 0);
+    return m;
+}
+
+// Every move out of `data`, in board order; *value gets whether the player
+// to move wins.
+fn make_moves(data as *i32, value as *i32) as *Move {
+    value[0] = 1;
+    let is Move as head;
+    head.next = cast(*Move, 0);
+    let is *Move as tail with mut = &head;
+    let is i32 as row with mut = 0;
+    while (row != nrow) {
+        let is i32 as col with mut = 0;
+        while (col != ncol) {
+            let is *i32 as t = make_data(row, col);
+            melt_data(t, data);
+            if (equal_data(t, data) == 0) {
+                tail.next = new_move(copy_data(t));
+                tail = tail.next;
+                if (value[0] == 1) { value[0] = get_value(t); }
+            } else {
+                // Nothing to eat from here on in this row (or, at column 0,
+                // in any row above it).
+                if (col == 0) { row = nrow - 1; }
+                col = ncol - 1;
+            }
+            release(cast(*u8, t));
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    if (cast(i64, head.next) != 0) { value[0] = 1 - value[0]; }
+    return head.next;
+}
+
+fn make_play() as *Play {
+    let is Play as head;
+    head.next = cast(*Play, 0);
+    let is *Play as tail with mut = &head;
+    game_tree = cast(*Play, 0);
+    let is *i32 as t = make_data(0, 0);
+    t[0] = t[0] - 1;
+    while (next_data(t) == 1) {
+        if (valid_data(t) == 1) {
+            let is *Play as p = cast(*Play, alloc(sizeof(Play)));
+            p.next = cast(*Play, 0);
+            tail.next = p;
+            if (cast(i64, game_tree) == 0) { game_tree = p; }
+            p.state = copy_data(t);
+            let is i32 as val with mut = 0;
+            p.first = make_moves(t, &val);
+            p.value = val;
+            tail = p;
+        }
+    }
+    release(cast(*u8, t));
+    return head.next;
+}
+
+fn good_move(list as *Move) as *i32 {
+    if (cast(i64, list) == 0) { return cast(*i32, 0); }
+    let is *Move as m with mut = list;
+    while (cast(i64, m.next) != 0 && get_value(m.data) != 0) { m = m.next; }
+    return copy_data(m.data);
+}
+
+fn moves_of(data as *i32, p0 as *Play) as *Move {
+    let is *Play as p with mut = p0;
+    while (equal_data(p.state, data) == 0) { p = p.next; }
+    return p.first;
+}
+
+fn main() as i32 {
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Mode : 1 -> multiple first moves\n");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "       2 -> report game\n");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "       3 -> good positions\n");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, " Selection : ");
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Enter number of Columns : ");
+    ncol = 7;
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "Enter number of Rows    : ");
+    nrow = 8;
+
+    let is *Play as tree = make_play();
+    let is i32 as player with mut = 0;
+    let is *i32 as current with mut = make_data(nrow, ncol);
+    while (cast(i64, current) != 0) {
+        let is *i32 as next = good_move(moves_of(current, tree));
+        if (cast(i64, next) != 0) {
+            let is i32 as col with mut = 0;
+            while (next[col] == current[col]) { col = col + 1; }
+            olen = olen + io.sprintf(ocur(), 4096 - olen, "player %d plays at (%d,%d)\n", player, next[col], col);
+            player = 1 - player;
+            release(cast(*u8, current));
+        }
+        current = next;
+    }
+    dump_play(tree);
+    olen = olen + io.sprintf(ocur(), 4096 - olen, "player %d loses\n", 1 - player);
+
+    let is *u8 as b = cast(*u8, &obuf);
+    io.write_bytes(io.STDOUT, b, olen);
+    let is u64 as h with mut = 14695981039346656037;
+    let is i64 as k with mut = 0;
+    while (k < olen) { h = (h ^ cast(u64, b[k])) * 1099511628211; k = k + 1; }
+    if (h != 16479708745855897407) { return 1; }
+    return 0;
+}
