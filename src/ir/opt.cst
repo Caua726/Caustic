@@ -5,6 +5,7 @@ use "ssa.cst" as ssa;
 use "phi.cst" as phi;
 use "opt_sccp.cst" as sccp;
 use "opt_adce.cst" as adce;
+use "opt_licm.cst" as licm;
 use "opt_helpers.cst" as helpers;
 use "opt_prop.cst" as prop;
 use "opt_loop.cst" as loop;
@@ -129,7 +130,6 @@ fn optimize_func(func as *d.IRFunction) as void {
     sccp.pass_sccp(func);
     // Code with no effect, and the loops that provably end around it.
     adce.pass_adce(func);
-    phi.ssa_destroy(func);
     if (opt_prof_on == 1) { opt_prof_times[1] = opt_prof_times[1] + opt_prof_time() - t0; }
 
     vc = func.vreg_count;
@@ -171,11 +171,32 @@ fn optimize_func(func as *d.IRFunction) as void {
     reassoc.pass_reassoc(func, vc);
     prop.pass_const_copy_prop(func, is_const, imm_val, copy_of, vc);
 
-    loop.pass_addr_hoist(func);
-
+    // Invariant pure work out of loops, from any block of the loop.
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
-    loop.pass_licm(func);
+    licm.pass_licm_ssa(func);
     if (opt_prof_on == 1) { opt_prof_times[5] = opt_prof_times[5] + opt_prof_time() - t0; }
+
+    // End of the SSA form. Strength reduction finds its induction variables
+    // as vregs with several definitions and matches the copies a header phi
+    // becomes at the latch; LEA fusion, local copy propagation, GVN, DCE,
+    // exact division and TRE come after it and are written for that form
+    // too. Destruction renames vregs, so every use goes through copy_of first
+    // and copy_of starts over.
+    helpers.pass_final_resolve(func, copy_of);
+    phi.resolve_phi_args(func, copy_of, vc_alloc);
+    i = 0;
+    while (i < vc_alloc) { copy_of[i] = 0 - 1; i = i + 1; }
+    phi.ssa_destroy(func);
+    if (func.vreg_count + 16 > vc_alloc) {
+        // destruction may add vregs (a copy cycle broken through a temporary)
+        let is i32 as nva = func.vreg_count + 512;
+        let is *i32 as nco = cast(*i32, d.opt_alloc(cast(i64, nva) * 4));
+        let is i32 as ci with mut = 0;
+        while (ci < nva) { if (ci < vc_alloc) { nco[ci] = copy_of[ci]; } else { nco[ci] = 0 - 1; } ci = ci + 1; }
+        d.opt_free(cast(*u8, copy_of));
+        copy_of = nco;
+        vc_alloc = nva;
+    }
 
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     sr.pass_strength_reduction(func);

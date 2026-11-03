@@ -192,6 +192,106 @@ fn unreachable_tail(x as i64) as i64 {
     return y + 1;
 }
 
+// --- loop-invariant code motion on the SSA form ---
+
+// The cast and the float product depend only on values from outside the
+// loop, but sit in a block of the loop that runs on some iterations only.
+fn licm_cond(n as i32, a as i64, f as f64) as f64 {
+    let is f64 as acc with mut = 0.0;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (i % 3 == 1) {
+            let is f64 as k = cast(f64, a) * f;
+            acc = acc + k;
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+// Invariant in the inner loop, not in the outer one: it must stay in the
+// outer loop (it reads the outer counter), and zero-trip loops must still
+// give the right answer.
+fn licm_nested(n as i64, m as i64) as i64 {
+    let is i64 as s with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as j with mut = 0;
+        while (j < m) {
+            let is i64 as t = i * 7 + 3;
+            s = s + t * j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// What LICM exposes downstream: loop bodies whose invariants now sit in the
+// preheader. A column walk m[ld * c + i] from a column other than 0 (the
+// strength-reduced index must start at ld * c0 + i, not i); several reads
+// around one index c (c stays alive for the reads strength reduction does
+// not take over); a float negation next to a pointer copy hoisted out of
+// the loops (the negation's scratch register must not pass for the copy).
+fn col_walk(ld as i32, xv as *f32, m as *f32, c0 as i32, c1 as i32, i as i32) as f32 {
+    let is f32 as s with mut = 0.0;
+    let is i32 as c with mut = c0;
+    while (c <= c1) { s = s + xv[c] * m[ld * c + i]; c = c + 1; }
+    return s;
+}
+
+fn stencil(src as *f64, n as i32) as f64 {
+    let is f64 as acc with mut = 0.0;
+    let is i32 as i with mut = 1;
+    while (i < n - 1) {
+        let is i32 as k with mut = 1;
+        while (k < n - 1) {
+            let is i32 as c = i * n + k;
+            acc = acc + src[c + n] - 2.0 * src[c] + src[c - n] + src[c + 1] + src[c - 1];
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn neg_then_loop(r as *f64, y as *f64, n as i32) as f64 {
+    y[0] = 0.0 - r[0];
+    let is f64 as alpha with mut = 0.0 - r[0];
+    let is i32 as k with mut = 1;
+    while (k < n) {
+        let is f64 as sum with mut = 0.0;
+        let is i32 as i with mut = 0;
+        while (i < k) { sum = sum + r[k - i - 1] * y[i]; i = i + 1; }
+        alpha = 0.0 - (r[k] + sum) / 8.0;
+        y[k] = alpha;
+        k = k + 1;
+    }
+    return y[n - 1];
+}
+
+// A float accumulator that starts at a constant each time the inlined
+// helper runs, inside an outer loop: once a vreg with several definitions,
+// its start must stay a copy into the register the loop adds into.
+fn dot_into(res as *f64, a as *f64, row as i32, n as i32) as void {
+    let is f64 as s with mut = 0.0;
+    let is i32 as i with mut = 0;
+    while (i < n) { s = s + a[row * n + i]; i = i + 1; }
+    res[0] = s;
+}
+
+fn row_sums(a as *f64, out as *f64, n as i32) as f64 {
+    let is i32 as r with mut = 0;
+    while (r < n) { dot_into(cast(*f64, cast(i64, out) + cast(i64, r) * 8), a, r, n); r = r + 1; }
+    return out[n - 1] * 1000.0 + out[0];
+}
+
+let is [64]f32 as lm with mut;
+let is [8]f32 as lx with mut;
+let is [64]f64 as lg with mut;
+let is [16]f64 as lr with mut;
+let is [16]f64 as ly with mut;
+
 fn main() as i32 {
     if (swap_loop(0) != 12) { return 1; }
     if (swap_loop(3) != 21) { return 2; }
@@ -216,5 +316,20 @@ fn main() as i32 {
     if (dead_arm_phi(3) != 52) { return 21; }
     if (unsigned_fold() != 1004115) { return 22; }
     if (unreachable_tail(41) != 42) { return 23; }
+    if (licm_cond(10, 3, 1.5) != 13.5) { return 24; }
+    if (licm_cond(0, 3, 1.5) != 0.0) { return 25; }
+    if (licm_nested(4, 5) != 540) { return 26; }
+    if (licm_nested(4, 0) != 0) { return 27; }
+    if (licm_nested(0, 5) != 0) { return 28; }
+    let is i32 as q with mut = 0;
+    while (q < 64) { lm[q] = cast(f32, q % 7); lg[q] = cast(f64, (q * 5) % 11); q = q + 1; }
+    q = 0;
+    while (q < 8) { lx[q] = cast(f32, q + 1); q = q + 1; }
+    q = 0;
+    while (q < 16) { lr[q] = cast(f64, 16 - q); q = q + 1; }
+    if (col_walk(8, cast(*f32, &lx), cast(*f32, &lm), 2, 5, 3) != 45.0) { return 29; }
+    if (stencil(cast(*f64, &lg), 8) != 373.0) { return 30; }
+    if (neg_then_loop(cast(*f64, &lr), cast(*f64, &ly), 12) != 54.286228179931641) { return 31; }
+    if (row_sums(cast(*f64, &lg), cast(*f64, &ly), 8) != 48041.0) { return 32; }
     return 0;
 }

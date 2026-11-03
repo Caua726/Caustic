@@ -1,0 +1,282 @@
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "dom.cst" as dom;
+
+// === LICM on the SSA form ===
+//
+// A pure computation that cannot trap and reads only values defined outside a
+// loop gives the same result on every iteration: it moves to the loop's
+// preheader, from whichever block of the loop it sits in. Not out of a loop
+// that calls (the value would have to live through every call), and not a
+// base plus a constant (the addressing mode adds it for free). Moving it off a
+// conditional path is safe because it cannot fault — integer arithmetic other
+// than division, casts (a float conversion out of range gives the "integer
+// indefinite" value, it does not trap), float arithmetic (exceptions are
+// masked), addresses. Loads, divisions, calls, compares (they are fused with
+// their branch) and phis stay.
+//
+// A loop is its header h with the blocks that reach a latch (a predecessor h
+// dominates) without passing h. Its preheader is h's one predecessor outside
+// it, which must have h as its only successor. Loops are taken innermost
+// first, so what leaves an inner loop can leave the outer one too. Within a
+// loop the blocks are visited in reverse postorder: an instruction is seen
+// after the definitions it reads, and one hoisted before counts as outside.
+
+struct Licm {
+    blocks as *cfg.BasicBlock;
+    nb as i32;
+    preds as *i32;
+    pred_start as *i32;
+    pred_count as *i32;
+    rpo as *i32;
+    rpo_n as i32;
+    defblk as *i32;   // block of each vreg's definition (-1: none or several)
+    nv as i32;
+}
+
+fn _blk(l as *Licm, b as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, l.blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+}
+
+fn _dominates(l as *Licm, x as i32, y0 as i32) as i32 {
+    let is i32 as y with mut = y0;
+    while (y >= 0) {
+        if (y == x) { return 1; }
+        let is i32 as id = _blk(l, y).idom;
+        if (id == y) { return 0; }
+        y = id;
+    }
+    return 0;
+}
+
+fn _hoistable(it as *d.IRInst) as i32 {
+    if (it.is_dead == 1 || it.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = it.op;
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_AND || op == d.IR_OR
+        || op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR || op == d.IR_NEG || op == d.IR_NOT
+        || op == d.IR_CAST || op == d.IR_MOV
+        || op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG
+        || op == d.IR_FSQRT || op == d.IR_ADDR_GLOBAL || op == d.IR_FN_ADDR
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { return 1; }
+    if (op == d.IR_ADDR && it.src1.op_type == d.OP_IMM) { return 1; }
+    return 0;
+}
+
+// Worth a register across the loop? Not a base plus a constant: the
+// addressing mode of the load or store that reads it adds the constant for
+// free, while the hoisted sum would hold a register for the whole loop.
+fn _profitable(it as *d.IRInst) as i32 {
+    if ((it.op == d.IR_ADD || it.op == d.IR_SUB) && it.src2.op_type == d.OP_IMM) { return 0; }
+    return 1;
+}
+
+fn _opnd_out(l as *Licm, o as *d.Operand, inl as *u8) as i32 {
+    if (o.op_type == d.OP_NONE || o.op_type == d.OP_IMM || o.op_type == d.OP_LABEL) { return 1; }
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= l.nv) { return 0; }
+    let is i32 as db = l.defblk[o.vreg];
+    if (db < 0) { return 0; }
+    return cast(i32, inl[db] == cast(u8, 0));
+}
+
+// Hoist out of the loop headed by h with body inl[]; returns the count.
+fn _hoist_loop(l as *Licm, func as *d.IRFunction, h as i32, inl as *u8) as i32 {
+    // the preheader
+    let is i32 as ph with mut = 0 - 1;
+    let is i32 as k with mut = 0;
+    while (k < l.pred_count[h]) {
+        let is i32 as p = l.preds[l.pred_start[h] + k];
+        if (inl[p] == cast(u8, 0)) {
+            if (ph >= 0 && ph != p) { return 0; }
+            ph = p;
+        }
+        k = k + 1;
+    }
+    if (ph < 0) { return 0; }
+    // A value hoisted out of a loop that calls would have to survive every
+    // call: in a callee-saved register (saved and restored by the function)
+    // or on the stack. Recomputing it is cheaper.
+    let is i32 as cb with mut = 0;
+    while (cb < l.nb) {
+        if (inl[cb] == cast(u8, 1)) {
+            let is *cfg.BasicBlock as cbb = _blk(l, cb);
+            let is *d.IRInst as ci with mut = cbb.first;
+            let is i32 as cdone with mut = 0;
+            while (cdone == 0) {
+                let is i32 as cop = ci.op;
+                if (ci.is_dead == 0 && (cop == d.IR_CALL || cop == d.IR_CALL_INDIRECT || cop == d.IR_FFI_CALL
+                    || cop == d.IR_SYSCALL)) { return 0; }
+                if (cast(i64, ci) == cast(i64, cbb.last)) { cdone = 1; } else { ci = ci.next; }
+            }
+        }
+        cb = cb + 1;
+    }
+    let is *cfg.BasicBlock as pb = _blk(l, ph);
+    let is *d.IRInst as pterm with mut = pb.last;
+    let is *d.IRInst as at with mut = pterm;
+    if (pterm.op == d.IR_JMP) {
+        if (pb.succ0 != h) { return 0; }
+        if (cast(i64, pb.first) == cast(i64, pterm)) { return 0; }
+        at = pb.first;
+        while (cast(i64, at.next) != cast(i64, pterm)) { at = at.next; }
+    } else if (pterm.op == d.IR_JZ || pterm.op == d.IR_JNZ || pterm.op == d.IR_RET) {
+        return 0;
+    } else if (pb.succ0 != h) {
+        return 0;
+    }
+    let is i32 as moved with mut = 0;
+    let is i32 as ri with mut = 0;
+    while (ri < l.rpo_n) {
+        let is i32 as b = l.rpo[ri];
+        if (inl[b] == cast(u8, 1)) {
+            let is *cfg.BasicBlock as bb = _blk(l, b);
+            let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+            let is *d.IRInst as it with mut = bb.first;
+            let is i32 as done with mut = 0;
+            while (done == 0) {
+                let is *d.IRInst as nx = it.next;
+                let is i32 as last = cast(i32, cast(i64, it) == cast(i64, bb.last));
+                let is i32 as hoist with mut = 0;
+                if (_hoistable(it) == 1 && _profitable(it) == 1 && cast(i64, prev) != 0 && last == 0
+                    && it.dest.vreg >= 0 && it.dest.vreg < l.nv && l.defblk[it.dest.vreg] == b
+                    && _opnd_out(l, &it.src1, inl) == 1 && _opnd_out(l, &it.src2, inl) == 1) {
+                    hoist = 1;
+                }
+                if (hoist == 1) {
+                    prev.next = nx;
+                    it.next = at.next;
+                    at.next = it;
+                    at = it;
+                    if (cast(i64, pterm) == cast(i64, pb.last) && pterm.op != d.IR_JMP) { pb.last = it; pterm = it; }
+                    l.defblk[it.dest.vreg] = ph;
+                    moved = moved + 1;
+                } else {
+                    prev = it;
+                }
+                if (last == 1) { done = 1; } else { it = nx; }
+            }
+        }
+        ri = ri + 1;
+    }
+    return moved;
+}
+
+fn pass_licm_ssa(func as *d.IRFunction) as i32 {
+    let is i32 as nv = func.vreg_count;
+    if (nv == 0 || cast(i64, func.instructions) == 0) { return 0; }
+    let is Licm as L;
+    let is *Licm as l = &L;
+    l.nv = nv;
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    l.blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    let is i32 as nlab = func.label_count + 1;
+    let is *i32 as l2b = cast(*i32, d.opt_alloc(cast(i64, nlab) * 4));
+    let is i32 as i with mut = 0;
+    while (i < nlab) { l2b[i] = 0 - 1; i = i + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, l.blocks, cap, &nb, l2b);
+    l.nb = nb;
+    if (nb < 2) { d.opt_free(cast(*u8, l.blocks)); d.opt_free(cast(*u8, l2b)); return 0; }
+    l.preds = cast(*i32, d.opt_alloc(cast(i64, nb * 2 + 4) * 4));
+    l.pred_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    l.pred_count = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    cfg.build_preds(l.blocks, nb, l.preds, l.pred_start, l.pred_count);
+    l.rpo = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as rn with mut = 0;
+    cfg.compute_rpo(l.blocks, nb, l.rpo, &rn);
+    l.rpo_n = rn;
+    dom.compute_idom(l.blocks, nb, l.rpo, rn, l.preds, l.pred_start, l.pred_count);
+
+    // definition blocks
+    l.defblk = cast(*i32, d.opt_alloc(cast(i64, nv + 1) * 4));
+    let is *i32 as ndef = cast(*i32, d.opt_alloc(cast(i64, nv + 1) * 4));
+    let is i32 as v with mut = 0;
+    while (v < nv) { l.defblk[v] = 0 - 1; ndef[v] = 0; v = v + 1; }
+    let is i32 as b with mut = 0;
+    while (b < nb) {
+        let is *cfg.BasicBlock as bb = _blk(l, b);
+        let is *d.IRInst as it with mut = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0) {
+            if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.op != d.IR_STORE && it.op != d.IR_COPY
+                && it.dest.vreg >= 0 && it.dest.vreg < nv) {
+                ndef[it.dest.vreg] = ndef[it.dest.vreg] + 1;
+                l.defblk[it.dest.vreg] = b;
+            }
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        b = b + 1;
+    }
+    v = 0;
+    while (v < nv) { if (ndef[v] != 1) { l.defblk[v] = 0 - 1; } v = v + 1; }
+
+    // loops, smallest first
+    let is *i32 as hdr = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as size = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *u8 as reach = d.opt_alloc(cast(i64, nb + 1));
+    b = 0;
+    while (b < nb) { reach[b] = cast(u8, 0); b = b + 1; }
+    i = 0;
+    while (i < rn) { reach[l.rpo[i]] = cast(u8, 1); i = i + 1; }
+    let is *u8 as inl = d.opt_alloc(cast(i64, nb + 1));
+    let is *i32 as stk = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as nh with mut = 0;
+    let is i32 as h with mut = 0;
+    while (h < nb) {
+        if (reach[h] == cast(u8, 1) && _loop_body(l, h, inl, stk, reach) > 0) {
+            let is i32 as sz with mut = 0;
+            let is i32 as x with mut = 0;
+            while (x < nb) { if (inl[x] == cast(u8, 1)) { sz = sz + 1; } x = x + 1; }
+            // insertion sort by size
+            let is i32 as j with mut = nh - 1;
+            while (j >= 0 && size[j] > sz) { size[j + 1] = size[j]; hdr[j + 1] = hdr[j]; j = j - 1; }
+            size[j + 1] = sz; hdr[j + 1] = h;
+            nh = nh + 1;
+        }
+        h = h + 1;
+    }
+    let is i32 as moved with mut = 0;
+    i = 0;
+    while (i < nh) {
+        _loop_body(l, hdr[i], inl, stk, reach);
+        moved = moved + _hoist_loop(l, func, hdr[i], inl);
+        i = i + 1;
+    }
+
+    d.opt_free(cast(*u8, hdr)); d.opt_free(cast(*u8, size)); d.opt_free(reach);
+    d.opt_free(inl); d.opt_free(cast(*u8, stk)); d.opt_free(cast(*u8, ndef));
+    d.opt_free(cast(*u8, l.defblk)); d.opt_free(cast(*u8, l.rpo));
+    d.opt_free(cast(*u8, l.preds)); d.opt_free(cast(*u8, l.pred_start)); d.opt_free(cast(*u8, l.pred_count));
+    d.opt_free(cast(*u8, l.blocks)); d.opt_free(cast(*u8, l2b));
+    return moved;
+}
+
+// inl[] = the loop headed by h (empty when h heads none); returns its latches.
+fn _loop_body(l as *Licm, h as i32, inl as *u8, stk as *i32, reach as *u8) as i32 {
+    let is i32 as nb = l.nb;
+    let is i32 as k with mut = 0;
+    while (k < nb) { inl[k] = cast(u8, 0); k = k + 1; }
+    let is i32 as nl with mut = 0;
+    let is i32 as sp with mut = 0;
+    inl[h] = cast(u8, 1);
+    k = 0;
+    while (k < l.pred_count[h]) {
+        let is i32 as p = l.preds[l.pred_start[h] + k];
+        if (reach[p] == cast(u8, 1) && _dominates(l, h, p) == 1) {
+            nl = nl + 1;
+            if (inl[p] == cast(u8, 0)) { inl[p] = cast(u8, 1); stk[sp] = p; sp = sp + 1; }
+        }
+        k = k + 1;
+    }
+    if (nl == 0) { inl[h] = cast(u8, 0); return 0; }
+    while (sp > 0) {
+        sp = sp - 1;
+        let is i32 as x = stk[sp];
+        let is i32 as j with mut = 0;
+        while (j < l.pred_count[x]) {
+            let is i32 as p = l.preds[l.pred_start[x] + j];
+            if (reach[p] == cast(u8, 1) && inl[p] == cast(u8, 0)) { inl[p] = cast(u8, 1); stk[sp] = p; sp = sp + 1; }
+            j = j + 1;
+        }
+    }
+    return nl;
+}
