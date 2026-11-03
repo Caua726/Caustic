@@ -1,6 +1,7 @@
 use "defs.cst" as d;
 use "cfg.cst" as cfg;
 use "dom.cst" as dom;
+use "phi.cst" as phi;
 
 // === SSA mem2reg pass ===
 // Promotes scalar stack variables (accessed via IR_LOAD/IR_STORE with IMM offsets)
@@ -681,84 +682,54 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
     d.opt_free(cast(*u8, phi_order));
 }
 
-// === Step 6: SSA Destruction — resolve phis to copies ===
+// === Step 6: phi instructions ===
+// Every block gets a label (a phi names its predecessors by label); each phi
+// goes right after its block's label, in creation order, with one argument per
+// distinct predecessor. A narrow slot's phi carries the slot type, which the
+// copies made from it keep.
 
-fn destroy_ssa(blocks as *cfg.BasicBlock, nblocks as i32,
-               func as *d.IRFunction,
-               phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
-               phi_args as *i32, max_preds as i32, nphi as i32,
-               preds as *i32, pred_starts as *i32, pred_counts as *i32,
-               slots as *SlotInfo, nslots as i32) as void {
-    // For each phi, insert MOV at end of each predecessor (before terminator)
+fn place_phis(blocks as *cfg.BasicBlock, nblocks as i32,
+              func as *d.IRFunction,
+              phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
+              phi_args as *i32, max_preds as i32, nphi as i32,
+              preds as *i32, pred_starts as *i32, pred_counts as *i32,
+              slots as *SlotInfo) as void {
+    phi.ssa_begin(func);
+    phi.ssa_label_blocks(func, blocks, nblocks);
+    let is *i64 as tailp = cast(*i64, d.opt_alloc(cast(i64, nblocks) * 8));
+    let is i32 as b with mut = 0;
+    while (b < nblocks) {
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+        tailp[b] = cast(i64, bb.first);
+        b = b + 1;
+    }
     let is i32 as pi with mut = 0;
     while (pi < nphi) {
-        let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, pi) * 4);
-        let is i32 as b = *pbp;
-        let is *i32 as pvp = cast(*i32, cast(i64, phi_vreg) + cast(i64, pi) * 4);
-        let is i32 as phi_dst = *pvp;
-
-        let is *i32 as psp = cast(*i32, cast(i64, pred_starts) + cast(i64, b) * 4);
-        let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, b) * 4);
-
+        let is i32 as pb = phi_block[pi];
+        let is i32 as ps = pred_starts[pb];
+        let is i32 as pc = pred_counts[pb];
+        let is *d.IRInst as p = phi.phi_new(phi_vreg[pi], pc);
+        let is *SlotInfo as slot = cast(*SlotInfo, cast(i64, slots) + cast(i64, phi_slot[pi]) * sizeof(SlotInfo));
+        if (cast(i64, slot.type_ptr) != 0) {
+            let is *i32 as szp = cast(*i32, cast(i64, slot.type_ptr) + 28);
+            if (*szp < 8) { p.cast_to = slot.type_ptr; p.cast_from = slot.type_ptr; }
+        }
         let is i32 as ai with mut = 0;
-        while (ai < *pcp) {
-            let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + ai) * 4);
-            let is i32 as arg_vreg = *pap;
-            if (arg_vreg >= 0) {
-                // Insert MOV phi_dst = arg_vreg before terminator of predecessor
-                let is *i32 as pp = cast(*i32, cast(i64, preds) + cast(i64, *psp + ai) * 4);
-                let is i32 as pred = *pp;
-                let is *cfg.BasicBlock as pbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(cfg.BasicBlock));
-
-                let is *d.IRInst as mov = d.new_inst(d.IR_MOV);
-                mov.dest.op_type = d.OP_VREG;
-                mov.dest.vreg = phi_dst;
-                mov.src1.op_type = d.OP_VREG;
-                mov.src1.vreg = arg_vreg;
-
-                // Annotate with slot type for i32 safety
-                let is *i32 as pslp = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                let is i32 as slot_idx = *pslp;
-                let is *SlotInfo as slot = cast(*SlotInfo, cast(i64, slots) + cast(i64, slot_idx) * sizeof(SlotInfo));
-                if (cast(i64, slot.type_ptr) != 0) {
-                    let is *i32 as szp = cast(*i32, cast(i64, slot.type_ptr) + 28);
-                    if (*szp < 8) {
-                        mov.cast_to = slot.type_ptr;
-                        mov.cast_from = slot.type_ptr;
-                    }
-                }
-
-                // Find instruction before terminator
-                let is *d.IRInst as term = pbb.last;
-                if (term.op == d.IR_JMP || term.op == d.IR_JZ || term.op == d.IR_JNZ) {
-                    // Insert before terminator
-                    let is *d.IRInst as prev with mut = pbb.first;
-                    if (cast(i64, prev) == cast(i64, term)) {
-                        // Block has only the terminator — insert before it
-                        mov.next = term;
-                        let is *d.IRInst as scan with mut = func.instructions;
-                        if (cast(i64, scan) == cast(i64, term)) {
-                            func.instructions = mov;
-                        } else {
-                            while (cast(i64, scan) != 0 && cast(i64, scan.next) != cast(i64, term)) {
-                                scan = scan.next;
-                            }
-                            if (cast(i64, scan) != 0) { scan.next = mov; }
-                        }
-                        pbb.first = mov;
-                    } else {
-                        while (cast(i64, prev.next) != cast(i64, term)) { prev = prev.next; }
-                        cfg.insert_after(prev, mov);
-                    }
-                } else {
-                    // No terminator branch — insert after last instruction
-                    cfg.insert_after(term, mov);
-                }
+        while (ai < pc) {
+            let is i32 as pred = preds[ps + ai];
+            let is *cfg.BasicBlock as pbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(cfg.BasicBlock));
+            let is i32 as pl = pbb.first.dest.label;
+            if (phi.phi_find(p, pl) < 0) {
+                phi.phi_add(p, pl, phi_args[pi * max_preds + ai]);
             }
             ai = ai + 1;
         }
+        let is *d.IRInst as at = cast(*d.IRInst, tailp[pb]);
+        cfg.insert_after(at, p);
+        tailp[pb] = cast(i64, p);
         pi = pi + 1;
     }
+    d.opt_free(cast(*u8, tailp));
 }
 
 // === Main entry point ===
@@ -894,12 +865,13 @@ fn mem2reg(func as *d.IRFunction) as void {
                phi_block, phi_slot, phi_vreg, phi_args, max_preds, nphi,
                preds_arr, pred_starts, pred_counts);
 
-    // Step 6: SSA destruction (phi → copies)
+    // Step 6: the phis become IR_PHI instructions, then copies again
     if (nphi > 0) {
-        destroy_ssa(blocks, nblocks, func,
-                    phi_block, phi_slot, phi_vreg, phi_args, max_preds, nphi,
-                    preds_arr, pred_starts, pred_counts,
-                    slots, nslots);
+        place_phis(blocks, nblocks, func,
+                   phi_block, phi_slot, phi_vreg, phi_args, max_preds, nphi,
+                   preds_arr, pred_starts, pred_counts,
+                   slots);
+        phi.ssa_destroy(func);
     }
 
     // Cleanup

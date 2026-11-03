@@ -1,0 +1,607 @@
+use "../../std/io.cst" as io;
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+
+// === Phi instructions and SSA destruction ===
+//
+// While the mid-end holds the IR in SSA form, a join is an IR_PHI instruction:
+// dest = the phi vreg, and one (predecessor label, incoming vreg) pair per
+// predecessor in a side array. The array lives behind asm_str_ptr:
+//   a[0]            capacity, in pairs
+//   a[1 + 2i]       label of the i-th predecessor block
+//   a[2 + 2i]       vreg flowing in from it (-1: undefined on that path)
+// and asm_str_len is the number of pairs. src1/src2 stay OP_NONE, so a pass
+// that does not know about phis sees a definition with no operands.
+// cast_to/cast_from carry the width annotation the copies made at
+// destruction keep (a narrow local's copies always carried its type).
+//
+// A predecessor is named by its label, so every block starts with one while
+// SSA is live: ssa_label_blocks gives a label to the blocks that have none
+// (the entry, a fall-through after a conditional branch). Those labels are
+// numbered from ssa_label_base up; ssa_destroy drops the ones no jump names.
+//
+// Phis sit right after their block's label, before any other instruction.
+
+fn phi_args(p as *d.IRInst) as *i32 { return cast(*i32, p.asm_str_ptr); }
+fn phi_nargs(p as *d.IRInst) as i32 { return p.asm_str_len; }
+fn phi_label(p as *d.IRInst, i as i32) as i32 { let is *i32 as a = phi_args(p); return a[1 + 2 * i]; }
+fn phi_val(p as *d.IRInst, i as i32) as i32 { let is *i32 as a = phi_args(p); return a[2 + 2 * i]; }
+fn phi_set_val(p as *d.IRInst, i as i32, v as i32) as void { let is *i32 as a = phi_args(p); a[2 + 2 * i] = v; }
+fn phi_set_label(p as *d.IRInst, i as i32, l as i32) as void { let is *i32 as a = phi_args(p); a[1 + 2 * i] = l; }
+
+fn phi_new(dest as i32, cap as i32) as *d.IRInst {
+    let is *d.IRInst as p = d.new_inst(d.IR_PHI);
+    p.dest = d.op_vreg(dest);
+    let is i32 as c with mut = cap;
+    if (c < 2) { c = 2; }
+    let is *i32 as a = cast(*i32, d.opt_alloc(cast(i64, 1 + 2 * c) * 4));
+    a[0] = c;
+    p.asm_str_ptr = cast(*u8, a);
+    p.asm_str_len = 0;
+    return p;
+}
+
+fn phi_add(p as *d.IRInst, label as i32, v as i32) as void {
+    let is *i32 as a with mut = phi_args(p);
+    let is i32 as n = p.asm_str_len;
+    if (n >= a[0]) {
+        let is i32 as nc = a[0] * 2;
+        let is *i32 as b = cast(*i32, d.opt_alloc(cast(i64, 1 + 2 * nc) * 4));
+        b[0] = nc;
+        let is i32 as k with mut = 0;
+        while (k < 2 * n) { b[1 + k] = a[1 + k]; k = k + 1; }
+        d.opt_free(cast(*u8, a));
+        p.asm_str_ptr = cast(*u8, b);
+        a = b;
+    }
+    a[1 + 2 * n] = label;
+    a[2 + 2 * n] = v;
+    p.asm_str_len = n + 1;
+}
+
+// Remove argument i, keeping the order of the others.
+fn phi_del(p as *d.IRInst, i as i32) as void {
+    let is *i32 as a = phi_args(p);
+    let is i32 as n = p.asm_str_len;
+    let is i32 as k with mut = i;
+    while (k + 1 < n) {
+        a[1 + 2 * k] = a[1 + 2 * (k + 1)];
+        a[2 + 2 * k] = a[2 + 2 * (k + 1)];
+        k = k + 1;
+    }
+    p.asm_str_len = n - 1;
+}
+
+fn phi_find(p as *d.IRInst, label as i32) as i32 {
+    let is i32 as n = p.asm_str_len;
+    let is i32 as i with mut = 0;
+    while (i < n) { if (phi_label(p, i) == label) { return i; } i = i + 1; }
+    return 0 - 1;
+}
+
+fn phi_free(p as *d.IRInst) as void {
+    if (cast(i64, p.asm_str_ptr) != 0) { d.opt_free(p.asm_str_ptr); }
+    p.asm_str_ptr = cast(*u8, 0);
+    p.asm_str_len = 0;
+}
+
+fn ssa_fail(msg as *u8, func as *d.IRFunction) as void {
+    io.write_str(io.STDERR, "error: internal: SSA: ");
+    io.write_str(io.STDERR, msg);
+    io.write_str(io.STDERR, " in ");
+    io._write_fd(io.STDERR, func.asm_name_ptr, cast(i64, func.asm_name_len));
+    io.write_str(io.STDERR, "\n");
+    io.exit(1);
+}
+
+// === Block labels ===
+
+let is i32 as ssa_label_base with mut = 0;
+let is i32 as ssa_active with mut = 0;
+
+// Start an SSA region in func: labels made from here on are synthetic.
+fn ssa_begin(func as *d.IRFunction) as void {
+    if (ssa_active == 1) { return; }
+    ssa_active = 1;
+    ssa_label_base = func.label_count;
+}
+
+fn new_label(func as *d.IRFunction) as i32 {
+    let is i32 as l = func.label_count;
+    func.label_count = func.label_count + 1;
+    return l;
+}
+
+fn make_label(l as i32) as *d.IRInst {
+    let is *d.IRInst as li = d.new_inst(d.IR_LABEL);
+    li.dest = d.op_label(l);
+    return li;
+}
+
+// Give every block of the CFG `blocks` that starts without a label one.
+// Blocks are contiguous in list order, so the instruction before block b's
+// first is block b-1's last.
+fn ssa_label_blocks(func as *d.IRFunction, blocks as *cfg.BasicBlock, nblocks as i32) as void {
+    let is i32 as b with mut = 0;
+    while (b < nblocks) {
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+        if (bb.first.op != d.IR_LABEL) {
+            let is *d.IRInst as li = make_label(new_label(func));
+            li.next = bb.first;
+            if (b == 0) { func.instructions = li; }
+            else {
+                let is *cfg.BasicBlock as pb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b - 1) * sizeof(cfg.BasicBlock));
+                pb.last.next = li;
+            }
+            bb.first = li;
+        }
+        b = b + 1;
+    }
+}
+
+// Unlink the synthetic labels nothing jumps to and give back their numbers.
+fn ssa_drop_labels(func as *d.IRFunction) as void {
+    let is i32 as base = ssa_label_base;
+    let is i32 as lc = func.label_count;
+    if (lc <= base) { return; }
+    let is i32 as n = lc - base;
+    let is *u8 as refd = d.opt_alloc(cast(i64, n));
+    let is i32 as k with mut = 0;
+    while (k < n) { refd[k] = cast(u8, 0); k = k + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_JMP || it.op == d.IR_JZ || it.op == d.IR_JNZ)
+            && it.dest.label >= base && it.dest.label < lc) {
+            refd[it.dest.label - base] = cast(u8, 1);
+        }
+        it = it.next;
+    }
+    let is i32 as top with mut = base;
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as drop with mut = 0;
+        if (it.op == d.IR_LABEL && it.dest.label >= base && it.dest.label < lc) {
+            if (refd[it.dest.label - base] == cast(u8, 0)) { drop = 1; }
+            else if (it.dest.label + 1 > top) { top = it.dest.label + 1; }
+        }
+        if (drop == 1) {
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    func.label_count = top;
+    d.opt_free(refd);
+}
+
+fn ssa_end(func as *d.IRFunction) as void {
+    if (ssa_active == 0) { return; }
+    ssa_drop_labels(func);
+    ssa_active = 0;
+}
+
+// === CFG view used by destruction ===
+
+struct DCfg {
+    blocks as *cfg.BasicBlock;
+    nblocks as i32;
+    label_to_bb as *i32;
+    nlabels as i32;
+    preds as *i32;
+    pred_start as *i32;
+    pred_count as *i32;
+}
+
+fn bb_at(g as *DCfg, b as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, g.blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+}
+
+fn dcfg_build(func as *d.IRFunction) as *DCfg {
+    let is *DCfg as g = cast(*DCfg, d.opt_alloc(sizeof(DCfg)));
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    g.blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    g.nlabels = func.label_count + 1;
+    g.label_to_bb = cast(*i32, d.opt_alloc(cast(i64, g.nlabels) * 4));
+    let is i32 as i with mut = 0;
+    while (i < g.nlabels) { g.label_to_bb[i] = 0 - 1; i = i + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, g.blocks, cap, &nb, g.label_to_bb);
+    g.nblocks = nb;
+    g.preds = cast(*i32, d.opt_alloc(cast(i64, nb * 2 + 4) * 4));
+    g.pred_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    g.pred_count = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    cfg.build_preds(g.blocks, nb, g.preds, g.pred_start, g.pred_count);
+    return g;
+}
+
+fn dcfg_free(g as *DCfg) as void {
+    d.opt_free(cast(*u8, g.blocks));
+    d.opt_free(cast(*u8, g.label_to_bb));
+    d.opt_free(cast(*u8, g.preds));
+    d.opt_free(cast(*u8, g.pred_start));
+    d.opt_free(cast(*u8, g.pred_count));
+    d.opt_free(cast(*u8, g));
+}
+
+fn block_label(g as *DCfg, b as i32) as i32 {
+    let is *cfg.BasicBlock as bb = bb_at(g, b);
+    if (bb.first.op == d.IR_LABEL) { return bb.first.dest.label; }
+    return 0 - 1;
+}
+
+// The first phi of block b, or null.
+fn first_phi(g as *DCfg, b as i32) as *d.IRInst {
+    let is *cfg.BasicBlock as bb = bb_at(g, b);
+    let is *d.IRInst as it with mut = bb.first;
+    if (it.op == d.IR_LABEL) {
+        if (cast(i64, it) == cast(i64, bb.last)) { return cast(*d.IRInst, 0); }
+        it = it.next;
+    }
+    while (1 == 1) {
+        if (it.is_dead == 0) {
+            if (it.op == d.IR_PHI) { return it; }
+            return cast(*d.IRInst, 0);
+        }
+        if (cast(i64, it) == cast(i64, bb.last)) { return cast(*d.IRInst, 0); }
+        it = it.next;
+    }
+    return cast(*d.IRInst, 0);
+}
+
+fn _uses_vreg(it as *d.IRInst, x as i32) as i32 {
+    if (it.src1.op_type == d.OP_VREG && it.src1.vreg == x) { return 1; }
+    if (it.src2.op_type == d.OP_VREG && it.src2.vreg == x) { return 1; }
+    if ((it.op == d.IR_STORE || it.op == d.IR_COPY) && it.dest.op_type == d.OP_VREG && it.dest.vreg == x) { return 1; }
+    return 0;
+}
+
+// Does some phi of block s read x on the edge from the block labelled pl?
+fn _edge_uses(g as *DCfg, s as i32, pl as i32, x as i32) as i32 {
+    let is *cfg.BasicBlock as sb = bb_at(g, s);
+    let is *d.IRInst as it with mut = first_phi(g, s);
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.op != d.IR_PHI) { return 0; }
+            let is i32 as k = phi_find(it, pl);
+            if (k >= 0 && phi_val(it, k) == x) { return 1; }
+        }
+        if (cast(i64, it) == cast(i64, sb.last)) { return 0; }
+        it = it.next;
+    }
+    return 0;
+}
+
+// Is x, defined by a phi of block s, live on entry to block t when control
+// comes from the block labelled pl? Forward search from t that never enters s
+// (x's definition): a use in a reached block, or a phi argument naming x on an
+// edge leaving one, keeps x live. The phis of t reading x on the edge from pl
+// count too — their copies run on that edge.
+fn _live_in(g as *DCfg, x as i32, t as i32, s as i32, pl as i32, mark as *u8, stack as *i32) as i32 {
+    if (_edge_uses(g, t, pl, x) == 1) { return 1; }
+    let is i32 as nb = g.nblocks;
+    let is i32 as i with mut = 0;
+    while (i < nb) { mark[i] = cast(u8, 0); i = i + 1; }
+    let is i32 as sp with mut = 0;
+    let is i32 as live with mut = 0;
+    stack[0] = t; sp = 1; mark[t] = cast(u8, 1);
+    while (sp > 0 && live == 0) {
+        sp = sp - 1;
+        let is i32 as b = stack[sp];
+        let is *cfg.BasicBlock as bb = bb_at(g, b);
+        let is *d.IRInst as it with mut = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0) {
+            if (it.is_dead == 0 && it.op != d.IR_PHI && _uses_vreg(it, x) == 1) { live = 1; }
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        let is i32 as bl = block_label(g, b);
+        let is i32 as si with mut = 0;
+        while (si < 2 && live == 0) {
+            let is i32 as su with mut = bb.succ0;
+            if (si == 1) { su = bb.succ1; }
+            if (su >= 0) {
+                if (bl >= 0 && _edge_uses(g, su, bl, x) == 1) { live = 1; }
+                if (su != s && mark[su] == cast(u8, 0)) {
+                    mark[su] = cast(u8, 1);
+                    stack[sp] = su; sp = sp + 1;
+                }
+            }
+            si = si + 1;
+        }
+    }
+    return live;
+}
+
+// === Parallel copies ===
+
+let is *i32 as pc_dst with mut = cast(*i32, 0);
+let is *i32 as pc_src with mut = cast(*i32, 0);
+let is *i64 as pc_ty with mut = cast(*i64, 0);
+let is *i64 as pc_tyf with mut = cast(*i64, 0);
+let is *u8 as pc_done with mut = cast(*u8, 0);
+let is i32 as pc_n with mut = 0;
+let is i32 as pc_cap with mut = 0;
+
+fn pc_reset() as void { pc_n = 0; }
+
+fn pc_push(dst as i32, src as i32, ty as *u8, tyf as *u8) as void {
+    if (pc_n >= pc_cap) {
+        let is i32 as nc with mut = pc_cap * 2;
+        if (nc < 16) { nc = 16; }
+        let is *i32 as nd = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is *i32 as ns = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is *i64 as nt = cast(*i64, d.opt_alloc(cast(i64, nc) * 8));
+        let is *i64 as nf = cast(*i64, d.opt_alloc(cast(i64, nc) * 8));
+        let is *u8 as nn = d.opt_alloc(cast(i64, nc));
+        let is i32 as k with mut = 0;
+        while (k < pc_n) { nd[k] = pc_dst[k]; ns[k] = pc_src[k]; nt[k] = pc_ty[k]; nf[k] = pc_tyf[k]; k = k + 1; }
+        if (pc_cap > 0) {
+            d.opt_free(cast(*u8, pc_dst)); d.opt_free(cast(*u8, pc_src));
+            d.opt_free(cast(*u8, pc_ty)); d.opt_free(cast(*u8, pc_tyf)); d.opt_free(pc_done);
+        }
+        pc_dst = nd; pc_src = ns; pc_ty = nt; pc_tyf = nf; pc_done = nn; pc_cap = nc;
+    }
+    pc_dst[pc_n] = dst; pc_src[pc_n] = src;
+    pc_ty[pc_n] = cast(i64, ty); pc_tyf[pc_n] = cast(i64, tyf);
+    pc_n = pc_n + 1;
+}
+
+fn pc_reverse() as void {
+    let is i32 as i with mut = 0;
+    let is i32 as j with mut = pc_n - 1;
+    while (i < j) {
+        let is i32 as t1 = pc_dst[i]; pc_dst[i] = pc_dst[j]; pc_dst[j] = t1;
+        let is i32 as t2 = pc_src[i]; pc_src[i] = pc_src[j]; pc_src[j] = t2;
+        let is i64 as t3 = pc_ty[i]; pc_ty[i] = pc_ty[j]; pc_ty[j] = t3;
+        let is i64 as t4 = pc_tyf[i]; pc_tyf[i] = pc_tyf[j]; pc_tyf[j] = t4;
+        i = i + 1; j = j - 1;
+    }
+}
+
+fn _mk_mov(dst as i32, src as i32, ty as i64, tyf as i64) as *d.IRInst {
+    let is *d.IRInst as m = d.new_inst(d.IR_MOV);
+    m.dest = d.op_vreg(dst);
+    m.src1 = d.op_vreg(src);
+    m.cast_to = cast(*u8, ty);
+    m.cast_from = cast(*u8, tyf);
+    return m;
+}
+
+// Emit the pending parallel copy as a sequence of MOVs placed after `at`
+// (or at the list head when at is null). Returns the last MOV written (or at).
+// A copy is written once its destination is no longer read by another pending
+// copy; a cycle is broken by saving one destination in a fresh vreg.
+fn pc_emit(func as *d.IRFunction, at as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as cur with mut = at;
+    let is i32 as k with mut = 0;
+    while (k < pc_n) { pc_done[k] = cast(u8, 0); k = k + 1; }
+    let is i32 as left with mut = 0;
+    k = 0;
+    while (k < pc_n) { if (pc_done[k] == cast(u8, 0)) { left = left + 1; } k = k + 1; }
+    while (left > 0) {
+        let is i32 as progress with mut = 0;
+        let is i32 as i with mut = 0;
+        while (i < pc_n) {
+            if (pc_done[i] == cast(u8, 0)) {
+                let is i32 as blocked with mut = 0;
+                let is i32 as j with mut = 0;
+                while (j < pc_n && blocked == 0) {
+                    if (j != i && pc_done[j] == cast(u8, 0) && pc_src[j] == pc_dst[i]) { blocked = 1; }
+                    j = j + 1;
+                }
+                if (blocked == 0) {
+                    let is *d.IRInst as m = _mk_mov(pc_dst[i], pc_src[i], pc_ty[i], pc_tyf[i]);
+                    if (cast(i64, cur) == 0) { m.next = func.instructions; func.instructions = m; }
+                    else { cfg.insert_after(cur, m); }
+                    cur = m;
+                    pc_done[i] = cast(u8, 1);
+                    left = left - 1;
+                    progress = 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (progress == 0) {
+            // Only cycles remain: save the first pending destination.
+            let is i32 as c with mut = 0;
+            while (pc_done[c] != cast(u8, 0)) { c = c + 1; }
+            let is i32 as t = func.vreg_count;
+            func.vreg_count = func.vreg_count + 1;
+            let is *d.IRInst as m = _mk_mov(t, pc_dst[c], pc_ty[c], pc_tyf[c]);
+            if (cast(i64, cur) == 0) { m.next = func.instructions; func.instructions = m; }
+            else { cfg.insert_after(cur, m); }
+            cur = m;
+            let is i32 as j with mut = 0;
+            while (j < pc_n) {
+                if (pc_done[j] == cast(u8, 0) && pc_src[j] == pc_dst[c]) { pc_src[j] = t; }
+                j = j + 1;
+            }
+        }
+    }
+    return cur;
+}
+
+// The instruction right before `target` in block bb (target != bb.first).
+fn _prev_in(bb as *cfg.BasicBlock, target as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as p with mut = bb.first;
+    while (cast(i64, p.next) != cast(i64, target)) { p = p.next; }
+    return p;
+}
+
+fn _is_branch(it as *d.IRInst) as i32 {
+    return cast(i32, it.op == d.IR_JZ || it.op == d.IR_JNZ);
+}
+
+// The instruction a new block can follow without breaking a fall-through:
+// the last instruction of the function.
+fn _list_tail(func as *d.IRFunction) as *d.IRInst {
+    let is *d.IRInst as t with mut = func.instructions;
+    while (cast(i64, t.next) != 0) { t = t.next; }
+    return t;
+}
+
+// === SSA destruction ===
+//
+// Each phi becomes copies on its incoming edges: the copies of one edge form
+// a parallel copy, sequentialized by pc_emit. They go at the end of the
+// predecessor P (before its jump) when that is the only place they can run
+// on that edge alone — P has one successor — or when running them on P's
+// other edge too changes nothing: no destination is read by P's branch or
+// live into the other successor. Otherwise the edge is split: a new block
+// holds the copies, between P and its fall-through successor, or reached by
+// P's branch.
+fn ssa_destroy(func as *d.IRFunction) as void {
+    let is i32 as nphi with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0) { nphi = nphi + 1; }
+        it = it.next;
+    }
+    if (nphi > 0) {
+        let is *DCfg as g = dcfg_build(func);
+        let is i32 as nb = g.nblocks;
+        let is *u8 as mark = d.opt_alloc(cast(i64, nb + 1));
+        let is *i32 as stack = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+        let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
+        // ft_free[b]: no instruction falls into b, so a split block may sit
+        // right before it and fall in itself (one per block).
+        let is *u8 as ft_free = d.opt_alloc(cast(i64, nb + 1));
+        let is i32 as fb with mut = 0;
+        while (fb < nb) {
+            ft_free[fb] = cast(u8, 0);
+            if (fb > 0) {
+                let is *cfg.BasicBlock as pbb0 = bb_at(g, fb - 1);
+                let is *d.IRInst as pll = pbb0.last;
+                if (pll.op == d.IR_JMP || pll.op == d.IR_RET) { ft_free[fb] = cast(u8, 1); }
+            }
+            fb = fb + 1;
+        }
+        let is i32 as s with mut = 0;
+        while (s < nb) {
+            let is *d.IRInst as phi0 = first_phi(g, s);
+            if (cast(i64, phi0) != 0) {
+                let is i32 as ps = g.pred_start[s];
+                let is i32 as pn = g.pred_count[s];
+                let is i32 as pi with mut = 0;
+                while (pi < pn) {
+                    let is i32 as p = g.preds[ps + pi];
+                    // each predecessor once (both edges of a branch may come here)
+                    let is i32 as dup with mut = 0;
+                    let is i32 as q with mut = 0;
+                    while (q < pi) { if (g.preds[ps + q] == p) { dup = 1; } q = q + 1; }
+                    if (dup == 0) {
+                        let is i32 as pl = block_label(g, p);
+                        if (pl < 0) { ssa_fail("a predecessor of a phi block has no label", func); }
+                        pc_reset();
+                        let is *cfg.BasicBlock as sb = bb_at(g, s);
+                        let is *d.IRInst as ph with mut = phi0;
+                        let is i32 as pdone with mut = 0;
+                        while (pdone == 0) {
+                            if (ph.is_dead == 0) {
+                                if (ph.op != d.IR_PHI) { pdone = 1; }
+                                else {
+                                    let is i32 as k = phi_find(ph, pl);
+                                    if (k >= 0) {
+                                        let is i32 as v = phi_val(ph, k);
+                                        // a self-copy is written too: the passes after
+                                        // this one have always seen it
+                                        if (v >= 0) { pc_push(ph.dest.vreg, v, ph.cast_to, ph.cast_from); }
+                                    }
+                                }
+                            }
+                            if (pdone == 0) {
+                                if (cast(i64, ph) == cast(i64, sb.last)) { pdone = 1; } else { ph = ph.next; }
+                            }
+                        }
+                        if (pc_n > 0) {
+                            let is *cfg.BasicBlock as pb = bb_at(g, p);
+                            let is *d.IRInst as term = pb.last;
+                            let is i32 as two with mut = 0;
+                            if (_is_branch(term) == 1 && pb.succ0 >= 0 && pb.succ1 >= 0 && pb.succ0 != pb.succ1) { two = 1; }
+                            let is i32 as split with mut = 0;
+                            if (two == 1) {
+                                let is i32 as other with mut = pb.succ0;
+                                if (other == s) { other = pb.succ1; }
+                                let is i32 as c with mut = 0;
+                                while (c < pc_n && split == 0) {
+                                    let is i32 as x = pc_dst[c];
+                                    if (term.src1.op_type == d.OP_VREG && term.src1.vreg == x) { split = 1; }
+                                    else if (_live_in(g, x, other, s, pl, mark, stack) == 1) { split = 1; }
+                                    c = c + 1;
+                                }
+                            }
+                            if (split == 0) {
+                                if (term.op == d.IR_JMP || _is_branch(term) == 1) {
+                                    pc_emit(func, _prev_in(pb, term));
+                                } else {
+                                    // after a fall-through block's last instruction the
+                                    // copies come in reverse order, as mem2reg always
+                                    // wrote them (the late passes match on that shape)
+                                    pc_reverse();
+                                    pc_emit(func, term);
+                                }
+                            } else {
+                                // Split the edge p -> s.
+                                let is i32 as le = new_label(func);
+                                let is *d.IRInst as lbl = make_label(le);
+                                let is i32 as sl = block_label(g, s);
+                                if (pb.succ0 == s) {
+                                    // fall-through edge: the new block goes between p and s
+                                    cfg.insert_after(term, lbl);
+                                    pc_emit(func, lbl);
+                                } else {
+                                    // branch edge: p's branch goes to the new block, which
+                                    // falls into s when nothing else does, else jumps to it
+                                    if (sl < 0) { ssa_fail("a phi block has no label", func); }
+                                    term.dest.label = le;
+                                    let is *d.IRInst as before_s with mut = cast(*d.IRInst, 0);
+                                    if (s > 0 && ft_free[s] == cast(u8, 1)) {
+                                        let is *cfg.BasicBlock as prevb = bb_at(g, s - 1);
+                                        before_s = prevb.last;
+                                    }
+                                    if (cast(i64, before_s) != 0) {
+                                        // nothing falls into s: the new block goes right before it
+                                        ft_free[s] = cast(u8, 0);
+                                        cfg.insert_after(before_s, lbl);
+                                        pc_emit(func, lbl);
+                                    } else {
+                                        if (cast(i64, tail) == 0) { tail = _list_tail(func); }
+                                        cfg.insert_after(tail, lbl);
+                                        let is *d.IRInst as last_mov = pc_emit(func, lbl);
+                                        let is *d.IRInst as j = d.new_inst(d.IR_JMP);
+                                        j.dest = d.op_label(sl);
+                                        cfg.insert_after(last_mov, j);
+                                        tail = j;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    pi = pi + 1;
+                }
+            }
+            s = s + 1;
+        }
+        d.opt_free(mark);
+        d.opt_free(cast(*u8, stack));
+        d.opt_free(ft_free);
+        dcfg_free(g);
+    }
+    // Unlink every phi (dead ones included) and free its arguments.
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        if (it.op == d.IR_PHI) {
+            phi_free(it);
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    ssa_end(func);
+}
