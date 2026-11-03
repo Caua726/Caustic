@@ -1,0 +1,503 @@
+// === Generic SIMD lowering: IR_VOP / IR_VOPG (src/ir/vec/vec_ops.cst) ===
+//
+// Every instruction here is written as raw bytes through one encoder that
+// knows the two forms the loop widener needs:
+//   legacy SSE  [66|F3|F2] [REX] 0F [38|3A] op modrm [disp] [imm8]
+//   VEX         C4 RXBm Wvvvv1Lpp op modrm [disp] [imm8]   (always 3 bytes)
+// The VEX form is used for the whole AVX2 path, including its 128-bit and
+// scalar steps, so the loop never mixes legacy SSE with dirty upper halves.
+// Memory operands are always [rcx + disp]; general registers are rax.
+//
+// Vector vregs must sit in xmm2..xmm15: xmm0 and xmm1 are the scratch the
+// sequences below clobber. A vector the allocator spilled would be silently
+// wrong, so it stops the compile instead (vec_widen keeps pressure in budget).
+
+use "../../std/io.cst" as io;
+use "../ir/defs.cst" as d;
+use "../ir/vec/vec_ops.cst" as vo;
+use "alloc_core.cst" as al;
+use "emit_output.cst" as eo;
+use "emit.cst" as e;
+
+let is i32 as _bf with mut = 0;
+
+fn _bo() as void { eo.out_str("  .byte ", 8); _bf = 1; }
+fn _bb(x as i32) as void {
+    if (_bf == 0) { eo.out_str(", ", 2); }
+    eo.out_int(cast(i64, x & 255));
+    _bf = 0;
+}
+fn _be() as void { eo.out_char(10); }
+
+// pp: 0 none, 1 66, 2 F3, 3 F2. map: 1 0F, 2 0F38, 3 0F3A. rmk: 0 register
+// rm, 1 memory [rcx + disp]. imm < 0: none.
+fn enc(vex as i32, pp as i32, map as i32, w as i32, l as i32, opc as i32,
+       reg as i32, vvvv as i32, rmk as i32, rm as i32, disp as i64, imm as i32) as void {
+    let is i32 as r3 = (reg >> 3) & 1;
+    let is i32 as b3 with mut = 0;
+    if (rmk == 0) { b3 = (rm >> 3) & 1; }
+    _bo();
+    if (vex == 1) {
+        _bb(196);
+        _bb(((1 - r3) << 7) | 64 | ((1 - b3) << 5) | map);
+        _bb((w << 7) | ((15 - (vvvv & 15)) << 3) | (l << 2) | pp);
+    } else {
+        if (pp == 1) { _bb(102); } else if (pp == 2) { _bb(243); } else if (pp == 3) { _bb(242); }
+        if (w == 1 || r3 == 1 || b3 == 1) { _bb(64 | (w << 3) | (r3 << 2) | b3); }
+        _bb(15);
+        if (map == 2) { _bb(56); } else if (map == 3) { _bb(58); }
+    }
+    _bb(opc);
+    if (rmk == 0) {
+        _bb(192 | ((reg & 7) << 3) | (rm & 7));
+    } else if (disp == 0) {
+        _bb(((reg & 7) << 3) | 1);
+    } else if (disp >= 0 - 128 && disp <= 127) {
+        _bb(64 | ((reg & 7) << 3) | 1);
+        _bb(cast(i32, disp & 255));
+    } else {
+        _bb(128 | ((reg & 7) << 3) | 1);
+        _bb(cast(i32, disp & 255)); _bb(cast(i32, (disp >> 8) & 255));
+        _bb(cast(i32, (disp >> 16) & 255)); _bb(cast(i32, (disp >> 24) & 255));
+    }
+    if (imm >= 0) { _bb(imm); }
+    _be();
+}
+
+// Register number (0..15) of a vector vreg; a spilled vector stops the compile.
+fn vnum(vreg as i32, ctx as *al.AllocCtx) as i32 {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 16 && loc <= 31) { return loc - 16; }
+    io.write_str(io.STDERR, "caustic: internal error: a SIMD value was spilled (vectorizer register budget)\n");
+    io.exit(70);
+    return 0;
+}
+
+// movaps d, s (any width: the whole register; VEX.L picks ymm).
+fn mov_v(vex as i32, l as i32, dn as i32, sn as i32) as void {
+    if (dn == sn) { return; }
+    enc(vex, 0, 1, 0, l, 40, dn, 0, 0, sn, 0, 0 - 1);
+}
+
+// d = op(a, b) for a packed op given as (pp, map, opc). Legacy SSE has two
+// operands: d = a first (or b when commutative); if d is b, work in xmm0.
+fn bin(vex as i32, l as i32, pp as i32, map as i32, opc as i32, commut as i32,
+       dn as i32, an as i32, bn as i32, imm as i32) as void {
+    if (vex == 1) { enc(1, pp, map, 0, l, opc, dn, an, 0, bn, 0, imm); return; }
+    if (dn == an) { enc(0, pp, map, 0, 0, opc, dn, 0, 0, bn, 0, imm); return; }
+    if (dn == bn && commut == 1) { enc(0, pp, map, 0, 0, opc, dn, 0, 0, an, 0, imm); return; }
+    if (dn != bn) { mov_v(0, 0, dn, an); enc(0, pp, map, 0, 0, opc, dn, 0, 0, bn, 0, imm); return; }
+    mov_v(0, 0, 0, an);
+    enc(0, pp, map, 0, 0, opc, 0, 0, 0, bn, 0, imm);
+    mov_v(0, 0, dn, 0);
+}
+
+// Shift by immediate, 66 0F 71/72/73 /ext ib: d = a shifted.
+fn shift_imm(vex as i32, l as i32, opc as i32, ext as i32, dn as i32, an as i32, cnt as i32) as void {
+    if (vex == 1) { enc(1, 1, 1, 0, l, opc, ext, dn, 0, an, 0, cnt); return; }
+    mov_v(0, 0, dn, an);
+    enc(0, 1, 1, 0, 0, opc, ext, 0, 0, dn, 0, cnt);
+}
+
+// Byte shift right of a whole xmm (psrldq /3): d = a >> (cnt bytes).
+fn psrldq(vex as i32, dn as i32, an as i32, cnt as i32) as void { shift_imm(vex, 0, 115, 3, dn, an, cnt); }
+
+// Opcode of a lane-wise integer op for lane size ls: (map << 8) | opc, 0 when
+// there is none in SSE4.2/AVX2.
+fn int_opc(code as i32, ls as i32) as i32 {
+    if (code == vo.VO_ADD) {
+        if (ls == 1) { return 256 + 252; } if (ls == 2) { return 256 + 253; }
+        if (ls == 4) { return 256 + 254; } return 256 + 212;
+    }
+    if (code == vo.VO_SUB) {
+        if (ls == 1) { return 256 + 248; } if (ls == 2) { return 256 + 249; }
+        if (ls == 4) { return 256 + 250; } return 256 + 251;
+    }
+    if (code == vo.VO_AND) { return 256 + 219; }
+    if (code == vo.VO_OR) { return 256 + 235; }
+    if (code == vo.VO_XOR) { return 256 + 239; }
+    if (code == vo.VO_ANDN) { return 256 + 223; }
+    if (code == vo.VO_CMPEQ) {
+        if (ls == 1) { return 256 + 116; } if (ls == 2) { return 256 + 117; }
+        if (ls == 4) { return 256 + 118; } return 512 + 41;      // pcmpeqq 0F38 29
+    }
+    if (code == vo.VO_CMPGT) {
+        if (ls == 1) { return 256 + 100; } if (ls == 2) { return 256 + 101; }
+        if (ls == 4) { return 256 + 102; } return 512 + 55;      // pcmpgtq 0F38 37
+    }
+    if (code == vo.VO_MUL) {
+        if (ls == 2) { return 256 + 213; }                       // pmullw
+        if (ls == 4) { return 512 + 64; }                        // pmulld 0F38 40
+    }
+    return 0;
+}
+
+fn _commut(code as i32) as i32 {
+    if (code == vo.VO_ADD || code == vo.VO_AND || code == vo.VO_OR || code == vo.VO_XOR
+        || code == vo.VO_CMPEQ || code == vo.VO_MUL || code == vo.VO_FADD || code == vo.VO_FMUL) { return 1; }
+    return 0;
+}
+
+// Can the SSE2 path (no SSE3/SSSE3/SSE4) lower this op? The widener asks
+// before it commits to an SSE2 loop; anything else stays for AVX2 only.
+fn sse2_ok(code as i32, ls as i32, imm as i32) as i32 {
+    if (code == vo.VO_CMPGT && ls == 8) { return 0; }
+    if (code == vo.VO_MUL && ls == 1) { return 0; }
+    if ((code == vo.VO_SHL || code == vo.VO_SHR) && ls == 1) { return 0; }
+    if (code == vo.VO_SAR && ls != 2 && ls != 4) { return 0; }
+    return 1;
+}
+
+// i32 lane multiply without pmulld (SSE2): the even and the odd lanes through
+// pmuludq, low dwords put back together. dest is written last.
+fn _mul32_sse2(dn as i32, an as i32, bn as i32) as void {
+    enc(0, 1, 1, 0, 0, 112, 1, 0, 0, an, 0, 245);      // pshufd xmm1, a, 0xF5  [a1 a1 a3 a3]
+    enc(0, 1, 1, 0, 0, 112, 0, 0, 0, bn, 0, 245);      // pshufd xmm0, b, 0xF5
+    enc(0, 1, 1, 0, 0, 244, 1, 0, 0, 0, 0, 0 - 1);     // pmuludq xmm1, xmm0
+    enc(0, 1, 1, 0, 0, 112, 1, 0, 0, 1, 0, 8);         // pshufd xmm1, xmm1, 0x08
+    mov_v(0, 0, 0, an);
+    enc(0, 1, 1, 0, 0, 244, 0, 0, 0, bn, 0, 0 - 1);    // pmuludq xmm0, b
+    enc(0, 1, 1, 0, 0, 112, 0, 0, 0, 0, 0, 8);         // pshufd xmm0, xmm0, 0x08
+    enc(0, 1, 1, 0, 0, 98, 0, 0, 0, 1, 0, 0 - 1);      // punpckldq xmm0, xmm1
+    mov_v(0, 0, dn, 0);
+}
+
+// pcmpeqq without SSE4.1: equal dwords, then each qword lane needs both halves.
+fn _cmpeq64_sse2(dn as i32, an as i32, bn as i32) as void {
+    mov_v(0, 0, 0, an);
+    enc(0, 1, 1, 0, 0, 118, 0, 0, 0, bn, 0, 0 - 1);    // pcmpeqd xmm0, b
+    enc(0, 1, 1, 0, 0, 112, 1, 0, 0, 0, 0, 177);       // pshufd xmm1, xmm0, 0xB1
+    enc(0, 1, 1, 0, 0, 219, 0, 0, 0, 1, 0, 0 - 1);     // pand xmm0, xmm1
+    mov_v(0, 0, dn, 0);
+}
+
+fn _gpr_inval() as void {
+    if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
+}
+
+// xmm[dn] = the integer in rax (low ls bytes matter), w = 1 for movq.
+fn _movd_to_x(vex as i32, dn as i32, w as i32) as void { enc(vex, 1, 1, w, 0, 110, dn, 0, 0, 0, 0, 0 - 1); }
+// rax (eax for w 0) = low lane of xmm[sn].
+fn _movd_from_x(vex as i32, sn as i32, w as i32) as void { enc(vex, 1, 1, w, 0, 126, sn, 0, 0, 0, 0, 0 - 1); }
+
+// A float scalar vreg into xmm[dst] as binary32 (want_f32 1) or f64 bits.
+// Its own form: an xmm register holds binary32 when e.f32s says so, else f64;
+// a spill slot likewise (4 or 8 bytes); a general register holds f64 bits.
+// Only VEX instructions and general moves when vex is 1.
+fn fs_load(vreg as i32, ctx as *al.AllocCtx, dst as i32, want_f32 as i32, vex as i32) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    let is i32 as single with mut = e.f32s_is(vreg);
+    if (loc >= 16 && loc <= 31) {
+        let is i32 as sx = loc - 16;
+        if (single == want_f32) { mov_v(vex, 0, dst, sx); }
+        else if (want_f32 == 1) { enc(vex, 3, 1, 0, 0, 90, dst, dst, 0, sx, 0, 0 - 1); }   // cvtsd2ss
+        else { enc(vex, 2, 1, 0, 0, 90, dst, dst, 0, sx, 0, 0 - 1); }                      // cvtss2sd
+        return;
+    }
+    e.load_op(vreg, ctx, "rax");
+    _gpr_inval();
+    if (loc >= 0) { single = 0; }
+    if (single == 1) { _movd_to_x(vex, dst, 0); } else { _movd_to_x(vex, dst, 1); }
+    if (single != want_f32) {
+        if (want_f32 == 1) { enc(vex, 3, 1, 0, 0, 90, dst, dst, 0, dst, 0, 0 - 1); }
+        else { enc(vex, 2, 1, 0, 0, 90, dst, dst, 0, dst, 0, 0 - 1); }
+    }
+}
+
+// xmm0 (binary32 when is_f32, else f64) into a float scalar vreg in its form.
+fn fs_store(vreg as i32, ctx as *al.AllocCtx, is_f32 as i32, vex as i32) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    let is i32 as single with mut = e.f32s_is(vreg);
+    if (loc >= 0 && loc < 16) { single = 0; }
+    if (is_f32 == 1 && single == 0) { enc(vex, 2, 1, 0, 0, 90, 0, 0, 0, 0, 0, 0 - 1); }   // cvtss2sd xmm0, xmm0
+    if (loc >= 16 && loc <= 31) { mov_v(vex, 0, loc - 16, 0); return; }
+    if (is_f32 == 1 && single == 1) { _movd_from_x(vex, 0, 0); } else { _movd_from_x(vex, 0, 1); }
+    _gpr_inval();
+    e.store_op(vreg, ctx, "rax");
+}
+
+fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as s = inst.dest.label;
+    let is i32 as code = vo.vo_code(s);
+    let is i32 as ls = vo.vo_ls(s);
+    let is i32 as vex = vo.vo_vex(s);
+    let is i32 as lanes = vo.vo_lanes(s);
+    let is i32 as imm = vo.vo_imm(s);
+    let is i32 as nbytes = ls * lanes;
+    let is i32 as l with mut = 0;
+    if (vex == 1 && nbytes == 32) { l = 1; }
+
+    if (code == vo.VO_VZU) { eo.out_line(".byte 197, 248, 119"); return; }
+
+    if (inst.op == d.IR_VOPG) {
+        // VO_HRED: fold the lanes into lane 0 (halving), then into rax.
+        let is i32 as sn = vnum(inst.src1.vreg, ctx);
+        let is i32 as kind = imm & 15;
+        let is i32 as sgn = (imm >> 4) & 1;
+        let is i32 as opc with mut = int_opc(vo.VO_ADD, ls) & 255;
+        if (kind == 1) { opc = 239; } else if (kind == 2) { opc = 235; } else if (kind == 3) { opc = 219; }
+        let is i32 as w with mut = nbytes;
+        if (nbytes == 32) {
+            enc(1, 1, 3, 0, 1, 57, sn, 0, 0, 1, 0, 1);           // vextracti128 xmm1, ymm_s, 1
+            bin(1, 0, 1, 1, opc, 1, 0, sn, 1, 0 - 1);            // xmm0 = s.lo op xmm1
+            w = 16;
+        } else {
+            mov_v(vex, 0, 0, sn);
+        }
+        while (w > ls) {
+            w = w / 2;
+            psrldq(vex, 1, 0, w);
+            bin(vex, 0, 1, 1, opc, 1, 0, 0, 1, 0 - 1);
+        }
+        if (ls == 8) { _movd_from_x(vex, 0, 1); }
+        else {
+            _movd_from_x(vex, 0, 0);
+            if (ls == 4 && sgn == 1) { eo.out_line("movsxd rax, eax"); }
+            else if (ls == 2) { if (sgn == 1) { eo.out_line("movsx rax, ax"); } else { eo.out_line("movzx rax, ax"); } }
+            else if (ls == 1) { if (sgn == 1) { eo.out_line("movsx rax, al"); } else { eo.out_line("movzx rax, al"); } }
+        }
+        _gpr_inval();
+        e.store_op(inst.dest.vreg, ctx, "rax");
+        return;
+    }
+
+    if (code == vo.VO_FOLD) {
+        // In order: acc = acc + lane0, + lane1, ... (each step rounded as the
+        // scalar loop rounds it). acc works in xmm0, a lane at a time in xmm1.
+        let is i32 as sn = vnum(inst.src2.vreg, ctx);
+        let is i32 as sop with mut = 88; if (imm == 1) { sop = 89; }   // add / mul
+        let is i32 as spp with mut = 3; if (ls == 4) { spp = 2; }      // F2 sd / F3 ss
+        // In the AVX2 loop everything moves with VEX: a legacy SSE write while
+        // the upper halves are dirty costs hundreds of cycles.
+        let is i32 as isf32 with mut = 0; if (ls == 4) { isf32 = 1; }
+        fs_load(inst.src1.vreg, ctx, 0, isf32, vex);
+        let is i32 as per = 16 / ls;
+        let is i32 as k with mut = 0;
+        while (k < lanes) {
+            if (k % per == 0) {
+                if (k == 0) { mov_v(vex, 0, 1, sn); }
+                else { enc(1, 1, 3, 0, 1, 25, sn, 0, 0, 1, 0, 1); }   // vextractf128 xmm1, ymm_s, 1
+            } else if (ls == 8) {
+                enc(vex, 0, 1, 0, 0, 18, 1, 1, 0, 1, 0, 0 - 1);        // movhlps xmm1, xmm1
+            } else {
+                enc(vex, 1, 1, 0, 0, 112, 1, 0, 0, 1, 0, 57);          // pshufd xmm1, xmm1, 0x39
+            }
+            enc(vex, spp, 1, 0, 0, sop, 0, 0, 0, 1, 0, 0 - 1);         // addsd/addss xmm0, xmm1
+            k = k + 1;
+        }
+        fs_store(inst.dest.vreg, ctx, isf32, vex);
+        return;
+    }
+
+    let is i32 as dn = vnum(inst.dest.vreg, ctx);
+
+    if (code == vo.VO_LOAD) {
+        e.load_op(inst.src1.vreg, ctx, "rcx");
+        let is i64 as disp with mut = 0;
+        if (inst.src2.op_type == d.OP_IMM) { disp = inst.src2.imm; }
+        if (nbytes == 2) {
+            eo.out_str("  movzx eax, WORD PTR [rcx", 26);
+            if (disp != 0) { eo.out_str(" + ", 3); eo.out_int(disp); }
+            eo.out_str("]\n", 2);
+            _movd_to_x(vex, dn, 0);
+            _gpr_inval();
+        } else if (nbytes == 4) { enc(vex, 1, 1, 0, 0, 110, dn, 0, 1, 1, disp, 0 - 1); }     // movd
+        else if (nbytes == 8) { enc(vex, 2, 1, 0, 0, 126, dn, 0, 1, 1, disp, 0 - 1); }       // movq
+        else { enc(vex, 2, 1, 0, l, 111, dn, 0, 1, 1, disp, 0 - 1); }                        // movdqu
+        return;
+    }
+    if (code == vo.VO_ZERO) { enc(vex, 1, 1, 0, 0, 239, dn, dn, 0, dn, 0, 0 - 1); return; }       // pxor
+    if (code == vo.VO_ONES) { enc(vex, 1, 1, 0, l, 118, dn, dn, 0, dn, 0, 0 - 1); return; }       // pcmpeqd
+    if (code == vo.VO_SPLAT) {
+        e.load_op(inst.src1.vreg, ctx, "rax");
+        let is i32 as w with mut = 0; if (ls == 8) { w = 1; }
+        _movd_to_x(vex, dn, w);
+        _gpr_inval();
+        if (vex == 1) {
+            let is i32 as bo with mut = 88;                                 // vpbroadcastd
+            if (ls == 1) { bo = 120; } else if (ls == 2) { bo = 121; } else if (ls == 8) { bo = 89; }
+            enc(1, 1, 2, 0, l, bo, dn, 0, 0, dn, 0, 0 - 1);
+            return;
+        }
+        if (ls == 8) { enc(0, 1, 1, 0, 0, 108, dn, 0, 0, dn, 0, 0 - 1); return; }   // punpcklqdq
+        if (ls == 1) { enc(0, 1, 1, 0, 0, 96, dn, 0, 0, dn, 0, 0 - 1); }            // punpcklbw
+        if (ls <= 2) { enc(0, 3, 1, 0, 0, 112, dn, 0, 0, dn, 0, 0); }               // pshuflw 0
+        enc(0, 1, 1, 0, 0, 112, dn, 0, 0, dn, 0, 0);                                // pshufd 0
+        return;
+    }
+    if (code == vo.VO_SPLATF) {
+        // the scalar into xmm1 in the lane's form, then into every lane
+        let is i32 as isf32 with mut = 0; if (ls == 4) { isf32 = 1; }
+        fs_load(inst.src1.vreg, ctx, 1, isf32, vex);
+        if (vex == 1) {
+            if (ls == 4) { enc(1, 1, 2, 0, l, 24, dn, 0, 0, 1, 0, 0 - 1); }      // vbroadcastss
+            else if (l == 1) { enc(1, 1, 2, 0, 1, 25, dn, 0, 0, 1, 0, 0 - 1); }  // vbroadcastsd ymm
+            else { enc(1, 3, 1, 0, 0, 18, dn, 0, 0, 1, 0, 0 - 1); }              // vmovddup xmm
+            return;
+        }
+        mov_v(0, 0, dn, 1);
+        if (ls == 4) { enc(0, 0, 1, 0, 0, 198, dn, 0, 0, dn, 0, 0); }           // shufps 0
+        else { enc(0, 1, 1, 0, 0, 20, dn, 0, 0, dn, 0, 0 - 1); }                // unpcklpd
+        return;
+    }
+    if (code == vo.VO_IOTA) {
+        // The lanes as qwords of immediates, put together through rax.
+        let is i32 as nq with mut = nbytes / 8; if (nq == 0) { nq = 1; }
+        let is i32 as q with mut = 0;
+        while (q < nq) {
+            let is i64 as v with mut = 0;
+            let is i32 as k with mut = 0;
+            while (k < lanes) {
+                let is i32 as bytepos = k * ls;
+                if (bytepos / 8 == q) { v = v | (cast(i64, k) << cast(i64, (bytepos % 8) * 8)); }
+                k = k + 1;
+            }
+            eo.out_str("  mov rax, ", 11); eo.out_int(v); eo.out_char(10);
+            // qword 0 -> dest, 1 -> xmm0 then joined; 2 -> xmm1, 3 -> xmm0 joined into xmm1
+            let is i32 as tgt with mut = dn;
+            if (q == 1 || q == 3) { tgt = 0; } else if (q == 2) { tgt = 1; }
+            _movd_to_x(vex, tgt, 1);
+            if (q == 1) { bin(vex, 0, 1, 1, 108, 0, dn, dn, 0, 0 - 1); }              // punpcklqdq d, d, xmm0
+            if (q == 3) { bin(vex, 0, 1, 1, 108, 0, 1, 1, 0, 0 - 1); }                // punpcklqdq xmm1, xmm1, xmm0
+            q = q + 1;
+        }
+        if (nq == 4) { enc(1, 1, 3, 0, 1, 56, dn, dn, 0, 1, 0, 1); }                 // vinserti128 d, d, xmm1, 1
+        _gpr_inval();
+        return;
+    }
+
+    let is i32 as an = vnum(inst.src1.vreg, ctx);
+
+    if (code == vo.VO_SHL || code == vo.VO_SHR || code == vo.VO_SAR) {
+        let is i32 as opc with mut = 113; if (ls == 4) { opc = 114; } else if (ls == 8) { opc = 115; }
+        let is i32 as ext with mut = 6; if (code == vo.VO_SHR) { ext = 2; } else if (code == vo.VO_SAR) { ext = 4; }
+        shift_imm(vex, l, opc, ext, dn, an, imm);
+        return;
+    }
+    if (code == vo.VO_FSQRT) {
+        let is i32 as pp with mut = 0; if (ls == 8) { pp = 1; }
+        enc(vex, pp, 1, 0, l, 81, dn, 0, 0, an, 0, 0 - 1);
+        return;
+    }
+    if (code == vo.VO_I2F) {
+        if (ls == 4) { enc(vex, 0, 1, 0, l, 91, dn, 0, 0, an, 0, 0 - 1); }             // cvtdq2ps
+        else { enc(vex, 2, 1, 0, l, 230, dn, 0, 0, an, 0, 0 - 1); }                   // cvtdq2pd (ymm <- xmm)
+        return;
+    }
+    if (code == vo.VO_F2F) {
+        if (ls == 8) { enc(vex, 0, 1, 0, l, 90, dn, 0, 0, an, 0, 0 - 1); return; }    // cvtps2pd (ymm <- xmm)
+        // cvtpd2ps: the source is lanes * 8 bytes; L follows the source
+        let is i32 as ls_src with mut = 0; if (vex == 1 && lanes * 8 == 32) { ls_src = 1; }
+        enc(vex, 1, 1, 0, ls_src, 90, dn, 0, 0, an, 0, 0 - 1);
+        return;
+    }
+    if (code == vo.VO_ZEXT || code == vo.VO_SEXT) {
+        let is i32 as half = ls / 2;
+        if (vex == 1) {
+            let is i32 as po with mut = 48;                     // vpmovzxbw
+            if (half == 2) { po = 51; } else if (half == 4) { po = 53; }
+            if (code == vo.VO_SEXT) { po = po - 16; }
+            enc(1, 1, 2, 0, l, po, dn, 0, 0, an, 0, 0 - 1);
+            return;
+        }
+        let is i32 as unp with mut = 96;                        // punpcklbw
+        if (half == 2) { unp = 97; } else if (half == 4) { unp = 98; }
+        if (code == vo.VO_ZEXT) {
+            enc(0, 1, 1, 0, 0, 239, 0, 0, 0, 0, 0, 0 - 1);      // pxor xmm0, xmm0
+            mov_v(0, 0, dn, an);
+            enc(0, 1, 1, 0, 0, unp, dn, 0, 0, 0, 0, 0 - 1);
+            return;
+        }
+        if (half == 4) {
+            mov_v(0, 0, 0, an);
+            enc(0, 1, 1, 0, 0, 114, 4, 0, 0, 0, 0, 31);         // psrad xmm0, 31
+            mov_v(0, 0, dn, an);
+            enc(0, 1, 1, 0, 0, unp, dn, 0, 0, 0, 0, 0 - 1);
+            return;
+        }
+        mov_v(0, 0, dn, an);
+        enc(0, 1, 1, 0, 0, unp, dn, 0, 0, dn, 0, 0 - 1);        // each lane next to itself
+        if (half == 1) { enc(0, 1, 1, 0, 0, 113, 4, 0, 0, dn, 0, 8); }    // psraw 8
+        else { enc(0, 1, 1, 0, 0, 114, 4, 0, 0, dn, 0, 16); }             // psrad 16
+        return;
+    }
+    if (code == vo.VO_TRUNC) {
+        // source lanes are 2*ls bytes: lanes*2*ls bytes, a ymm when that is 32
+        let is i32 as srcb = lanes * ls * 2;
+        let is i32 as hi with mut = 0 - 1;
+        if (srcb == 32) { enc(1, 1, 3, 0, 1, 57, an, 0, 0, 1, 0, 1); hi = 1; }        // vextracti128 xmm1, ymm_a, 1
+        if (ls == 4) {
+            let is i32 as other with mut = an; if (hi >= 0) { other = hi; }
+            if (vex == 1) { enc(1, 0, 1, 0, 0, 198, dn, an, 0, other, 0, 136); }      // vshufps d, a, other, 0x88
+            else { enc(0, 1, 1, 0, 0, 112, dn, 0, 0, an, 0, 8); }                     // pshufd d, a, 0x08
+            return;
+        }
+        // 4 -> 2: shift each dword's low half up and arithmetically back down so
+        // packssdw does not saturate; 2 -> 1: clear each word's high byte for
+        // packuswb.
+        let is i32 as sopc with mut = 114; let is i32 as pk with mut = 107;           // pslld/psrad, packssdw
+        let is i32 as cnt with mut = 16; let is i32 as back with mut = 4;
+        if (ls == 1) { sopc = 113; pk = 103; cnt = 8; back = 2; }                    // psllw/psrlw, packuswb
+        shift_imm(vex, 0, sopc, 6, 0, an, cnt);
+        shift_imm(vex, 0, sopc, back, 0, 0, cnt);
+        if (hi >= 0) {
+            shift_imm(1, 0, sopc, 6, 1, 1, cnt);
+            shift_imm(1, 0, sopc, back, 1, 1, cnt);
+            enc(1, 1, 1, 0, 0, pk, dn, 0, 0, 1, 0, 0 - 1);                           // vpack d, xmm0, xmm1
+            return;
+        }
+        if (vex == 1) { enc(1, 1, 1, 0, 0, pk, dn, 0, 0, 0, 0, 0 - 1); return; }
+        enc(0, 1, 1, 0, 0, pk, 0, 0, 0, 0, 0, 0 - 1);
+        mov_v(0, 0, dn, 0);
+        return;
+    }
+
+    let is i32 as bn = vnum(inst.src2.vreg, ctx);
+
+    if (code == vo.VO_FADD || code == vo.VO_FSUB || code == vo.VO_FMUL || code == vo.VO_FDIV || code == vo.VO_FCMP) {
+        let is i32 as pp with mut = 0; if (ls == 8) { pp = 1; }
+        let is i32 as opc with mut = 88;
+        if (code == vo.VO_FSUB) { opc = 92; } else if (code == vo.VO_FMUL) { opc = 89; }
+        else if (code == vo.VO_FDIV) { opc = 94; } else if (code == vo.VO_FCMP) { opc = 194; }
+        let is i32 as im with mut = 0 - 1; if (code == vo.VO_FCMP) { im = imm; }
+        bin(vex, l, pp, 1, opc, _commut(code), dn, an, bn, im);
+        return;
+    }
+    if (vex == 0 && code == vo.VO_MUL && ls == 4) { _mul32_sse2(dn, an, bn); return; }
+    if (code == vo.VO_MUL && ls == 8) {
+        // low 64 bits: lo(a)*lo(b) + ((hi(a)*lo(b) + lo(a)*hi(b)) << 32),
+        // pmuludq doing each 32x32->64; dest written last
+        shift_imm(vex, l, 115, 2, 0, an, 32);                    // x0 = a >> 32
+        bin(vex, l, 1, 1, 244, 1, 0, 0, bn, 0 - 1);              // x0 = hi(a) * lo(b)
+        shift_imm(vex, l, 115, 2, 1, bn, 32);                    // x1 = b >> 32
+        bin(vex, l, 1, 1, 244, 1, 1, 1, an, 0 - 1);              // x1 = hi(b) * lo(a)
+        bin(vex, l, 1, 1, 212, 1, 0, 0, 1, 0 - 1);               // x0 += x1
+        shift_imm(vex, l, 115, 6, 0, 0, 32);                     // x0 <<= 32
+        if (vex == 1) { bin(1, l, 1, 1, 244, 1, 1, an, bn, 0 - 1); }
+        else { mov_v(0, 0, 1, an); enc(0, 1, 1, 0, 0, 244, 1, 0, 0, bn, 0, 0 - 1); }   // x1 = lo(a)*lo(b)
+        bin(vex, l, 1, 1, 212, 1, dn, 1, 0, 0 - 1);              // d = x1 + x0
+        return;
+    }
+    if (vex == 0 && code == vo.VO_CMPEQ && ls == 8) { _cmpeq64_sse2(dn, an, bn); return; }
+    let is i32 as mo = int_opc(code, ls);
+    bin(vex, l, 1, mo >> 8, mo & 255, _commut(code), dn, an, bn, 0 - 1);
+}
+
+// IR_VSTOREQ with a size: [src1 + dest.imm] = src2's low bytes.
+fn gen_vstore(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as nb with mut = inst.dest.label & 255;
+    let is i32 as vex = (inst.dest.label >> 8) & 1;
+    if (nb == 0) { nb = 16; }
+    e.load_op(inst.src1.vreg, ctx, "rcx");
+    let is i64 as disp = inst.dest.imm;
+    let is i32 as sn = vnum(inst.src2.vreg, ctx);
+    if (nb == 2) {
+        _movd_from_x(vex, sn, 0);
+        eo.out_str("  mov WORD PTR [rcx", 19);
+        if (disp != 0) { eo.out_str(" + ", 3); eo.out_int(disp); }
+        eo.out_str("], ax\n", 6);
+        _gpr_inval();
+    } else if (nb == 4) { enc(vex, 1, 1, 0, 0, 126, sn, 0, 1, 1, disp, 0 - 1); }      // movd
+    else if (nb == 8) { enc(vex, 1, 1, 0, 0, 214, sn, 0, 1, 1, disp, 0 - 1); }        // movq
+    else { enc(vex, 2, 1, 0, 0, 127, sn, 0, 1, 1, disp, 0 - 1); }                    // movdqu
+}

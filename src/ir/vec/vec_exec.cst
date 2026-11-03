@@ -17,6 +17,7 @@ use "../cfg.cst" as cfg;
 use "vec_loops.cst" as vl;
 use "vec_scev.cst" as sc;
 use "vec_recur.cst" as rc;
+use "vec_ops.cst" as vo;
 
 fn new_vreg(func as *d.IRFunction) as i32 { let is i32 as v = func.vreg_count; func.vreg_count = func.vreg_count + 1; return v; }
 fn new_label(func as *d.IRFunction) as i32 { let is i32 as v = func.label_count; func.label_count = func.label_count + 1; return v; }
@@ -40,6 +41,46 @@ fn emit_vv(func as *d.IRFunction, ip as *d.IRInst, op as i32, a as i32, b as i32
     ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = b; ni.line = ln;
     *out = nv; return emit(ip, ni);
 }
+// The way out of an AVX2 loop: label lz, vzeroupper, jump to the scalar loop
+// (lab). Legacy SSE run with the upper halves dirty costs hundreds of cycles
+// an instruction on some CPUs (Zen 3 among them).
+fn emit_vzu_exit(ip as *d.IRInst, lz as i32, lab as i32, ln as i32) as *d.IRInst {
+    let is *d.IRInst as l = d.new_inst(d.IR_LABEL);
+    l.dest.op_type = cast(i8, d.OP_LABEL); l.dest.label = lz; l.line = ln;
+    let is *d.IRInst as ip2 with mut = emit(ip, l);
+    let is *d.IRInst as z = d.new_inst(d.IR_VOP);
+    z.dest.label = vo.vo_pack(vo.VO_VZU, 8, 1, 4, 0); z.line = ln;
+    ip2 = emit(ip2, z);
+    let is *d.IRInst as j = d.new_inst(d.IR_JMP);
+    j.dest.op_type = cast(i8, d.OP_LABEL); j.dest.label = lab; j.line = ln;
+    return emit(ip2, j);
+}
+
+// base + off as a fresh vreg (base itself when off is 0); advance cursor. A
+// field array inside a struct sits at a constant offset from the pointer the
+// loop indexes.
+fn emit_adj_base(func as *d.IRFunction, ip as *d.IRInst, base as i32, off as i64, ln as i32, out as *i32) as *d.IRInst {
+    if (off == 0) { *out = base; return ip; }
+    let is i32 as nv = new_vreg(func);
+    let is *d.IRInst as ni = d.new_inst(d.IR_ADD);
+    ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = nv;
+    ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = base;
+    ni.src2.op_type = cast(i8, d.OP_IMM);  ni.src2.imm = off; ni.line = ln;
+    *out = nv; return emit(ip, ni);
+}
+
+// Does the loop body write memory?
+fn _body_writes(hb as *cfg.BasicBlock, lb as *cfg.BasicBlock) as i32 {
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, p) != 0) {
+        if (p.is_dead == 0 && (p.op == d.IR_STORE || p.op == d.IR_COPY || p.op == d.IR_CMOV
+            || p.op == d.IR_VSTOREQ || p.op == d.IR_VSTOREQ256)) { return 1; }
+        if (cast(i64, p) == cast(i64, lb.last)) { stop = 1; } else { p = p.next; }
+    }
+    return 0;
+}
+
 // out = base + N*elem (overlap-check end address): ADD imm when N const, else LEA.
 fn emit_end_addr(func as *d.IRFunction, ip as *d.IRInst, base as i32,
                  n_is_imm as i32, n_imm as i64, n_vreg as i32, elem as i64, lea_op as i32, ln as i32, out as *i32) as *d.IRInst {
@@ -57,14 +98,21 @@ fn emit_end_addr(func as *d.IRFunction, ip as *d.IRInst, base as i32,
 fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
                        iv as i32, iv_step as i64, red as *rc.RecurrenceDescriptor,
                        def_inst as *i64, def_count as *i32, vc as i32) as i32 {
-    if (red.load_addr < 0 || red.start < 0) { return 0; }
+    // The sum starts from the accumulator itself where the vector loop begins
+    // (the copy that set it before the loop may since have been folded into
+    // a constant or renamed), so no start value is needed.
+    if (red.load_addr < 0) { return 0; }
     if (iv_step != 1) { return 0; }   // M3: unit IV step
     // affine address of the reduction input load -> array base + byte stride
     let is sc.AffineExpr as ae;
     sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, red.load_addr, &ae, 0);
-    if (cast(i32, ae.kind) != sc.AE_AFFINE || ae.base < 0 || ae.step == 0) { return 0; }
-    let is i64 as elem with mut = ae.step; if (elem < 0) { elem = 0 - elem; }
-    let is i32 as base = ae.base;
+    if (cast(i32, ae.kind) != sc.AE_AFFINE || ae.base < 0 || ae.step <= 0) { return 0; }
+    let is i64 as elem = ae.step;
+    if (red.load_size != elem) { return 0; }   // a strided walk (a[2*i]) is not a packed load
+    // A float sum in lanes would add in another order; the widener folds the
+    // lanes in sequence instead.
+    if (cast(i32, red.is_float) == 1) { return 0; }
+    let is i32 as base with mut = ae.base;
     let is i32 as is_f = cast(i32, red.is_float);
     let is i32 as wide with mut = 0;
     let is i32 as lea_op with mut = d.IR_LEA8;
@@ -79,23 +127,23 @@ fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *v
         wide = 4; lea_op = d.IR_LEA4; vadd = d.IR_VADDD; vred = d.IR_VREDUCED; fin_op = d.IR_ADD;
     } else { return 0; }
 
-    // bound N from the header's exit test (JZ -> LT -> src2)
     let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
-    let is *d.IRInst as p with mut = hb.first;
-    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
-    while (cast(i64, p) != 0) {
-        if (p.is_dead == 0 && p.op == d.IR_JZ) { jz = p; }
-        if (cast(i64, p) == cast(i64, hb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
-    }
-    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG) { return 0; }
-    let is *d.IRInst as lt = sc.scev_sdef(def_inst, def_count, vc, jz.src1.vreg);
-    if (cast(i64, lt) == 0 || lt.op != d.IR_LT) { return 0; }
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    // The vector loop does the sum and nothing else: a loop that also stores
+    // (a prefix sum `st[k] = tot; tot = tot + c[k]`) or leaves another value
+    // behind is not a plain reduction.
+    if (_body_writes(hb, lb) == 1) { return 0; }
+    if (rc.loop_values_private(func, hb, lb, iv, red.phi, vc) == 0) { return 0; }
+    // bound N: `iv < n` with n from outside the loop, read through its own
+    // cast before the loop (an in-loop reload is not there yet, and an i32
+    // may sit unextended in its register)
+    let is i64 as jzp with mut = 0;
+    let is *d.IRInst as lt = _exit_test(blocks, L, iv, def_inst, def_count, vc, &jzp);
+    if (cast(i64, lt) == 0) { return 0; }
     let is i32 as n_is_imm with mut = 0;
     let is i64 as n_imm with mut = 0;
     let is i32 as n_vreg with mut = cast(i32, 0 - 1);
     if (lt.src2.op_type == d.OP_IMM) { n_is_imm = 1; n_imm = lt.src2.imm; }
-    else if (lt.src2.op_type == d.OP_VREG) { n_vreg = sc.scev_resolve(def_inst, def_count, vc, lt.src2.vreg); if (n_vreg < 0 || n_vreg >= vc) { return 0; } }
-    else { return 0; }
 
     // insertion point: the instruction immediately before the header LABEL (must fall
     // through to it — if it is a jump the inserted code is simply unreachable and the
@@ -109,6 +157,8 @@ fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *v
 
     let is i32 as ln = hb.first.line;
     let is *d.IRInst as ip with mut = prev;
+    ip = emit_adj_base(func, ip, ae.base, ae.base_imm, ln, &base);
+    if (n_is_imm == 0) { ip = _ax_operand(func, ip, &lt.src2, def_inst, def_count, vc, ln, &n_vreg); }
 
     // --- AVX2 dispatch: 256-bit (2x wider) reduction when the CPU has AVX2, else the
     //     SSE2 loop below; both fold into the accumulator, then fall to the remainder ---
@@ -195,7 +245,7 @@ fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *v
     ip = emit(ip, vrA);
     let is *d.IRInst as finA = d.new_inst(fin_op);
     finA.dest.op_type = cast(i8, d.OP_VREG); finA.dest.vreg = red.phi;
-    finA.src1.op_type = cast(i8, d.OP_VREG); finA.src1.vreg = red.start;
+    finA.src1.op_type = cast(i8, d.OP_VREG); finA.src1.vreg = red.phi; finA.cast_to = red.op_ty;
     finA.src2.op_type = cast(i8, d.OP_VREG); finA.src2.vreg = hvA; finA.line = ln;
     ip = emit(ip, finA);
     let is *d.IRInst as jmpAf = d.new_inst(d.IR_JMP);
@@ -281,7 +331,7 @@ fn vectorize_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *v
     ip = emit(ip, vr);
     let is *d.IRInst as fin = d.new_inst(fin_op);
     fin.dest.op_type = cast(i8, d.OP_VREG); fin.dest.vreg = red.phi;
-    fin.src1.op_type = cast(i8, d.OP_VREG); fin.src1.vreg = red.start;
+    fin.src1.op_type = cast(i8, d.OP_VREG); fin.src1.vreg = red.phi; fin.cast_to = red.op_ty;
     fin.src2.op_type = cast(i8, d.OP_VREG); fin.src2.vreg = hv; fin.line = ln;
     ip = emit(ip, fin);
 
@@ -304,22 +354,18 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     if (iv_step != 1) { return 0; }
     let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
     let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
-    let is *d.IRInst as p with mut = hb.first;
-    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
-    while (cast(i64, p) != 0) {
-        if (p.is_dead == 0 && p.op == d.IR_JZ) { jz = p; }
-        if (cast(i64, p) == cast(i64, hb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
-    }
-    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG || jz.dest.op_type != d.OP_LABEL) { return 0; }
+    // nothing the loop computes besides the store may be needed after it
+    if (rc.loop_values_private(func, hb, lb, iv, cast(i32, 0 - 1), vc) == 0) { return 0; }
+    // bound: `iv < n`, n from outside the loop, read through its own cast
+    let is i64 as jzp with mut = 0;
+    let is *d.IRInst as lt = _exit_test(blocks, L, iv, def_inst, def_count, vc, &jzp);
+    if (cast(i64, lt) == 0) { return 0; }
+    let is *d.IRInst as jz = cast(*d.IRInst, jzp);
     let is i32 as exit_label = jz.dest.label;
-    let is *d.IRInst as lt = sc.scev_sdef(def_inst, def_count, vc, jz.src1.vreg);
-    if (cast(i64, lt) == 0 || lt.op != d.IR_LT) { return 0; }
     let is i32 as n_is_imm with mut = 0;
     let is i64 as n_imm with mut = 0;
     let is i32 as n_vreg with mut = cast(i32, 0 - 1);
     if (lt.src2.op_type == d.OP_IMM) { n_is_imm = 1; n_imm = lt.src2.imm; }
-    else if (lt.src2.op_type == d.OP_VREG) { n_vreg = sc.scev_resolve(def_inst, def_count, vc, lt.src2.vreg); if (n_vreg < 0 || n_vreg >= vc) { return 0; } }
-    else { return 0; }
     let is i32 as hlabel = L.header_label;
     if (hlabel < 0) { return 0; }
 
@@ -335,7 +381,7 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
         else if (opk == 3) { vop = d.IR_VDIVPD; } else { vop = d.IR_VADDPD; }
     } else if (elem == 8) { if (opk == 1) { vop = d.IR_VSUBQ; } else { vop = d.IR_VADDQ; } }
     else { if (opk == 1) { vop = d.IR_VSUBD; } else { vop = d.IR_VADDD; } }
-    let is i32 as base_c = mp.base_c; let is i32 as base_a = mp.base_a; let is i32 as base_b = mp.base_b;
+    let is i32 as base_c with mut = mp.base_c; let is i32 as base_a with mut = mp.base_a; let is i32 as base_b with mut = mp.base_b;
     let is i32 as ln = hb.first.line;
 
     let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
@@ -347,6 +393,10 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
 
     // (1) alias check at prev: any = overlap(c,a) | overlap(c,b); JZ any -> .Lvec
     let is *d.IRInst as ip with mut = prev;
+    if (n_is_imm == 0) { ip = _ax_operand(func, ip, &lt.src2, def_inst, def_count, vc, ln, &n_vreg); }
+    ip = emit_adj_base(func, ip, mp.base_c, mp.off_c, ln, &base_c);
+    ip = emit_adj_base(func, ip, mp.base_a, mp.off_a, ln, &base_a);
+    if (cast(i32, mp.is_bcast) == 0) { ip = emit_adj_base(func, ip, mp.base_b, mp.off_b, ln, &base_b); }
     let is i32 as a_end with mut = 0; ip = emit_end_addr(func, ip, base_a, n_is_imm, n_imm, n_vreg, elem, lea_op, ln, &a_end);
     let is i32 as c_end with mut = 0; ip = emit_end_addr(func, ip, base_c, n_is_imm, n_imm, n_vreg, elem, lea_op, ln, &c_end);
     let is i32 as t1 with mut = 0; ip = emit_vv(func, ip, d.IR_LT, base_c, a_end, ln, &t1);
@@ -419,7 +469,11 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     ip2 = emit(ip2, ltAm);
     let is *d.IRInst as jzAm = d.new_inst(d.IR_JZ);
     jzAm.src1.op_type = cast(i8, d.OP_VREG); jzAm.src1.vreg = vcondAm;
-    jzAm.dest.op_type = cast(i8, d.OP_LABEL); jzAm.dest.label = hlabel; jzAm.line = ln;
+    // a float map leaves through vzeroupper: the scalar loop it falls back to
+    // is SSE arithmetic (integer maps run on general registers after it)
+    let is i32 as LzM with mut = hlabel;
+    if (isf == 1) { LzM = new_label(func); }
+    jzAm.dest.op_type = cast(i8, d.OP_LABEL); jzAm.dest.label = LzM; jzAm.line = ln;
     ip2 = emit(ip2, jzAm);
     let is i32 as aaA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_a, iv, ln, &aaA);
     let is i32 as vlaA = new_vreg(func);
@@ -464,6 +518,7 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     let is *d.IRInst as jmpAm = d.new_inst(d.IR_JMP);
     jmpAm.dest.op_type = cast(i8, d.OP_LABEL); jmpAm.dest.label = LvAm; jmpAm.line = ln;
     ip2 = emit(ip2, jmpAm);
+    if (isf == 1) { ip2 = emit_vzu_exit(ip2, LzM, hlabel, ln); }
     let is *d.IRInst as lblSseM = d.new_inst(d.IR_LABEL);
     lblSseM.dest.op_type = cast(i8, d.OP_LABEL); lblSseM.dest.label = LsseM; lblSseM.line = ln;
     ip2 = emit(ip2, lblSseM);
