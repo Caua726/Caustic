@@ -164,19 +164,33 @@ fn sqrtf(x as f32) as f32 {
 //
 // Everything below is computed here, in Caustic: there is no libm to call
 // and sqrt is the only float operation the hardware gives us outright. The
-// transcendentals follow the usual shape — reduce the argument to a small
-// interval, evaluate a truncated series on it by Horner's method, then undo
-// the reduction. Series lengths are chosen so the truncation error lands
-// below the last bit of an f64 over the reduced interval.
+// transcendentals reduce the argument to a small interval, evaluate a short
+// polynomial on it and undo the reduction. The polynomial coefficients are
+// minimax fits made for this file (Remez exchange in high precision), not
+// Taylor coefficients, and the reductions carry the parts that a double would
+// round away as a second double ("hi + lo"), so that the only rounding that
+// matters is the last addition. The error bounds quoted below are measured
+// against a high-precision reference; "ulp" is a unit in the last place of the
+// exact result.
 //
-// Two constraints from the compiler shape this code, and both are deliberate
-// rather than stylistic:
+// Three tools recur:
+//   - Splitting: a double is split into two halves of 26 bits
+//     (s = a * (2^27 + 1); hi = s - (s - a); lo = a - hi), whose products
+//     with another 26-bit half are exact. That gives the exact product of
+//     two doubles as p + e (p = a*b, e the rounding error), without an FMA.
+//   - Exact sums: s = a + b; e = (a - s) + b recovers the rounding error of
+//     the sum when |a| >= |b|. Without that guarantee the longer form
+//     bb = s - a; e = (a - (s - bb)) + (b - bb) does the same.
+//   - Tables: the per-interval constants live in string literals of
+//     little-endian doubles, indexed by the bits of the argument.
 //
-//   - The lexer has no exponent notation, so 1e-17 is spelled out in full.
-//   - Float comparison ignores the parity flag, so every comparison against
-//     a NaN answers as though NaN were an ordinary number (`x != x` is
-//     false). Nothing here may test for NaN that way; is_nan reads the bit
-//     pattern, and callers that care are expected to do the same.
+// The hot paths are written out in full instead of calling small helpers:
+// calls into another module are not inlined by the compiler today, and a
+// call per polynomial cost more than the polynomial.
+//
+// Float comparisons see NaN: `x != x` is true only for NaN and every ordered
+// comparison with a NaN is false, so `if (x < LIMIT)` style range tests also
+// send NaN down the slow path. The code relies on that.
 // =======================================================
 
 // --- Constants ---
@@ -193,14 +207,10 @@ let is f64 as SQRT2   = 1.4142135623730951;
 let is f64 as DEG2RAD = 0.017453292519943295;
 let is f64 as RAD2DEG = 57.29577951308232;
 
-// Cody-Waite splits. Subtracting n*PI_2 in one step would lose the low bits
-// of the product for large n; splitting the constant so the high half is
-// exact in binary keeps the reduced argument accurate.
+// pi/2 as a sum of two doubles, and as pieces with trailing zeros (kept for
+// code that used them; the reductions below use their own splits).
 let is f64 as PI_2_HI = 1.5707963267948966;
 let is f64 as PI_2_LO = 0.00000000000000006123233995736766;
-// pi/2 as three 24-bit pieces and what is left. A product of one piece and
-// an integer below 2^29 is exact, which is what lets the trig reduction take
-// many multiples of pi/2 off a large argument without losing the low bits.
 let is f64 as PIO2_1  = 1.570796251296997;
 let is f64 as PIO2_2  = 0.00000007549789415861596;
 let is f64 as PIO2_3  = 0.000000000000005390302529957765;
@@ -233,8 +243,7 @@ fn nan() as f64 {
     return bits_f64(9221120237041090560);   // 0x7FF8000000000000
 }
 
-// exponent all ones and a non-zero mantissa. Read from the bits because
-// comparison operators cannot see NaN (see the header).
+// exponent all ones and a non-zero mantissa.
 fn is_nan(x as f64) as i32 {
     let is i64 as b = f64_bits(x);
     let is i64 as exp = (b >> 52) & 2047;
@@ -290,8 +299,7 @@ fn lerp(a as f64, b as f64, t as f64) as f64 {
     return a + (b - a) * t;
 }
 
-// 2^n as a power of two built straight from the exponent field. Used to undo
-// the range reduction in exp() without a multiply loop.
+// 2^n as a power of two built straight from the exponent field.
 fn exp2i(n as i64) as f64 {
     if (n > 1023) { return inf(); }
     if (n < 0 - 1022) { return 0.0; }
@@ -299,337 +307,1124 @@ fn exp2i(n as i64) as f64 {
 }
 
 // --- Rounding ---
+//
+// Below 2^52 in magnitude the conversion to i64 and back truncates exactly;
+// at or above it every double is already an integer and is returned as is,
+// and so is NaN, which fails the range test. A zero result takes the sign of
+// x (x * 0.0), as C's functions do: trunc(-0.5) is -0.0.
 
-// Anything at or above 2^52 has no fractional bits left, so it is already
-// integral and must be returned untouched — converting it through i64 would
-// overflow rather than round.
 fn trunc(x as f64) as f64 {
-    if (is_finite(x) == 0) { return x; }
-    if (abs_f64(x) >= 4503599627370496.0) { return x; }
-    return cast(f64, cast(i64, x));
+    if (x > -4503599627370496.0 && x < 4503599627370496.0) {
+        let is f64 as t = cast(f64, cast(i64, x));
+        if (t == 0.0) { return x * 0.0; }
+        return t;
+    }
+    return x;
 }
 
 fn floor(x as f64) as f64 {
-    let is f64 as t = trunc(x);
-    if (x < 0.0 && t != x) { return t - 1.0; }
-    return t;
+    if (x > -4503599627370496.0 && x < 4503599627370496.0) {
+        let is f64 as t = cast(f64, cast(i64, x));
+        if (t > x) { return t - 1.0; }
+        if (t == 0.0) { return x * 0.0; }
+        return t;
+    }
+    return x;
 }
 
 fn ceil(x as f64) as f64 {
-    let is f64 as t = trunc(x);
-    if (x > 0.0 && t != x) { return t + 1.0; }
-    return t;
+    if (x > -4503599627370496.0 && x < 4503599627370496.0) {
+        let is f64 as t = cast(f64, cast(i64, x));
+        if (t < x) { return t + 1.0; }
+        if (t == 0.0) { return x * 0.0; }
+        return t;
+    }
+    return x;
 }
 
 // Half away from zero, matching C's round() rather than banker's rounding.
+// x - trunc(x) is exact, so 0.49999999999999994 stays at 0.
 fn round(x as f64) as f64 {
-    if (x >= 0.0) { return floor(x + 0.5); }
-    return ceil(x - 0.5);
+    if (x > -4503599627370496.0 && x < 4503599627370496.0) {
+        let is f64 as t = cast(f64, cast(i64, x));
+        let is f64 as d = x - t;
+        if (d >= 0.5) { return t + 1.0; }
+        if (d <= -0.5) { return t - 1.0; }
+        if (t == 0.0) { return x * 0.0; }
+        return t;
+    }
+    return x;
 }
 
-// Remainder with the sign of x. Subtracting y scaled by powers of two is
-// exact in binary floating point, so this loses nothing the way
-// x - trunc(x/y)*y does once x/y grows large.
+// Remainder with the sign of x, exact. The quotient is taken from x / y and
+// the product q*y is formed exactly as two doubles, so x - q*y needs no
+// rounding; a quotient one off (x / y rounded across an integer) shows as a
+// remainder outside [0, |y|) and is corrected. Quotients past 2^52, and
+// operands so small or large that the exact product would underflow or
+// overflow, go through integer long division of the mantissas instead.
 fn fmod(x as f64, y as f64) as f64 {
-    if (is_nan(x) == 1 || is_nan(y) == 1 || y == 0.0 || is_inf(x) == 1) { return nan(); }
-    if (is_inf(y) == 1) { return x; }
-    let is f64 as ax with mut = abs_f64(x);
-    let is f64 as ay = abs_f64(y);
+    let is i64 as ix = *cast(*i64, &x);
+    let is i64 as iy = *cast(*i64, &y);
+    let is i64 as ax = ix & 9223372036854775807;
+    let is i64 as ay = iy & 9223372036854775807;
+    // NaN operands, an infinite x or a zero y have no remainder.
+    if (ax >= 9218868437227405312 || ay > 9218868437227405312 || ay == 0) { return (x * y) / (x * y); }
     if (ax < ay) { return x; }
-    while (ax >= ay) {
-        let is f64 as d with mut = ay;
-        while (d + d <= ax) { d = d + d; }
-        ax = ax - d;
+    if (ax == ay) { return x * 0.0; }
+    let is f64 as fx = *cast(*f64, &ax);
+    let is f64 as fy = *cast(*f64, &ay);
+    // 2^-900 < |y|, |x| < 2^900 and |x| / |y| < 2^52
+    if (ay > 553942754166571008 && ax < 8660422083433463808 && ax - ay < 234187180623265792) {
+        let is f64 as qf = cast(f64, cast(i64, fx / fy));
+        let is f64 as sq = qf * 134217729.0;
+        let is f64 as q1 = sq - (sq - qf);
+        let is f64 as q2 = qf - q1;
+        let is f64 as sy = fy * 134217729.0;
+        let is f64 as y1 = sy - (sy - fy);
+        let is f64 as y2 = fy - y1;
+        let is f64 as p = qf * fy;
+        let is f64 as r = (fx - p) - (((q1 * y1 - p) + q1 * y2 + q2 * y1) + q2 * y2);
+        if (r >= 0.0 && r < fy) {
+            if (ix < 0) { return -r; }
+            return r;
+        }
+        let is f64 as r2 = _fmod_rem(fx, fy, qf - 1.0);
+        if (r < 0.0) {
+            if (ix < 0) { return -r2; }
+            return r2;
+        }
+        let is f64 as r3 = _fmod_rem(fx, fy, qf + 1.0);
+        if (ix < 0) { return -r3; }
+        return r3;
     }
-    if (x < 0.0) { return 0.0 - ax; }
-    return ax;
+    let is f64 as res = _fmod_int(ax, ay);
+    if (ix < 0) { return -res; }
+    return res;
 }
 
-// --- Exponential and logarithm ---
+// fx - q*fy, with q*fy formed exactly; exact whenever the true value is a
+// double, which it is for the right q.
+fn _fmod_rem(fx as f64, fy as f64, q as f64) as f64 {
+    let is f64 as sq = q * 134217729.0;
+    let is f64 as q1 = sq - (sq - q);
+    let is f64 as q2 = q - q1;
+    let is f64 as sy = fy * 134217729.0;
+    let is f64 as y1 = sy - (sy - fy);
+    let is f64 as y2 = fy - y1;
+    let is f64 as p = q * fy;
+    let is f64 as pe = ((q1 * y1 - p) + q1 * y2 + q2 * y1) + q2 * y2;
+    return (fx - p) - pe;
+}
 
-// exp(x) = 2^n * exp(r), with n = round(x/ln2) and r = x - n*ln2 landing in
-// [-ln2/2, ln2/2]. The Taylor series for exp is accurate to the last bit
-// there by the r^14 term.
+// |x| mod |y| by long division on the integer mantissas, ten bits at a time.
+fn _fmod_int(ax as i64, ay as i64) as f64 {
+    let is i64 as ex with mut = ax >> 52;
+    let is i64 as ey with mut = ay >> 52;
+    let is i64 as mx with mut = ax & 4503599627370495;
+    let is i64 as my with mut = ay & 4503599627370495;
+    if (ex == 0) { ex = 1; } else { mx = mx | 4503599627370496; }
+    if (ey == 0) { ey = 1; } else { my = my | 4503599627370496; }
+    // |x| = mx * 2^(ex - 1075); r = mx * 2^(ex - ey) mod my, with r < 2^53
+    // so that r << 10 stays inside an i64.
+    let is i64 as r with mut = mx % my;
+    let is i64 as d with mut = ex - ey;
+    while (d > 10) {
+        r = (r << 10) % my;
+        d = d - 10;
+    }
+    r = (r << d) % my;
+    // r * 2^(ey - 1075) is a double; when that power is below the normal
+    // range, go through 2^(ey - 475) and 2^-600 so both factors are normal
+    // and only the exact final product is formed.
+    if (ey >= 53) {
+        let is i64 as sb = (ey - 52) << 52;
+        return cast(f64, r) * (*cast(*f64, &sb));
+    }
+    let is i64 as sb2 = (ey + 548) << 52;
+    return (cast(f64, r) * (*cast(*f64, &sb2))) * 2.409919865102884e-181;
+}
+
+// --- Exponential ---
+//
+// exp(x) = 2^k * 2^(j/128) * exp(r): x = (128k + j) * ln2/128 + r with
+// |r| <= ln2/256. 2^(j/128) comes from a table as hi + lo; exp(r) - 1 is
+// r + r^2/2 + a degree-5 fit (relative error 2^-63.9). The reduction rounds
+// x * 128/ln2 to an integer by adding and subtracting 1.5 * 2^52, and
+// ln2/128 is split so that n * hi part is exact for every n reached.
+// Max error 0.51 ulp (0.74 when the result is subnormal and is rounded a
+// second time); exp(0) is exactly 1.
+
+// 2^(j/128), j = 0..127, as (hi, lo) pairs.
+let is *u8 as _EXP_T with imut = "\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x35\x33\xfb\xa9\x3d\x16\xf0\x3f\xb7\xcd\xb8\x9a\x29\x61\x9b\x3c\x61\x80\x77\x3e\x9a\x2c\xf0\x3f\x5d\x08\x5b\x53\x83\x90\x71\xbc\x85\x7f\x6e\xe8\x15\x43\xf0\x3f\x6e\xc9\x77\x19\x1c\xa3\x90\xbc\x74\x85\x15\xd3\xb0\x59\xf0\x3f\x65\xb4\x75\xa4\xe2\x73\x8d\x3c\xde\xf6\xdd\x29\x6b\x70\xf0\x3f\x27\x3c\xb1\xe2\xdf\x91\x8c\xbc\xc8\x9b\x75\x18\x45\x87\xf0\x3f\xff\x84\xb2\x4b\xbe\x86\x61\x3c\x83\xf3\xc6\xca\x3e\x9e\xf0\x3f\x36\x61\x31\x18\x78\x48\x91\x3c\x0f\x89\xf9\x6c\x58\xb5\xf0\x3f\x0b\x61\xdc\x4a\x2e\xa6\x98\x3c\xf7\x47\x72\x2b\x92\xcc\xf0\x3f\x71\x4f\xe2\x16\xdc\x1e\x90\x3c\xa2\xd1\xd3\x32\xec\xe3\xf0\x3f\x53\x7b\xc5\x27\x17\x3a\x40\x3c\x1b\xd3\xfe\xaf\x66\xfb\xf0\x3f\x7b\xbd\x4e\xc4\xed\x9b\x6b\xbc\x51\x5b\x12\xd0\x01\x13\xf1\x3f\x3a\x9b\x44\x39\x10\xc5\x96\xbc\xcc\x31\x6c\xc0\xbd\x2a\xf1\x3f\xc7\xa5\x6c\xb3\x14\xb5\x51\xbc\xe0\x2d\xa9\xae\x9a\x42\xf1\x3f\x9e\x36\xf1\x9a\xbf\x2f\x93\xbc\x51\x8e\xa5\xc8\x98\x5a\xf1\x3f\x0a\xab\xee\xb9\x6a\x40\x82\x3c\x7b\x51\x7d\x3c\xb8\x72\xf1\x3f\x76\x8a\xd7\xb9\x41\x90\x81\xbc\xea\x8d\x8c\x38\xf9\x8a\xf1\x3f\x6c\x0f\x97\xd1\x23\x10\x91\xbc\x75\xcb\x6f\xeb\x5b\xa3\xf1\x3f\xe4\x68\x49\x7b\x4c\x5b\x8e\x3c\xd4\x5c\x04\x84\xe0\xbb\xf1\x3f\x07\xf6\x2e\x35\x86\x53\x99\xbc\xaa\xb9\x68\x31\x87\xd4\xf1\x3f\x3c\x64\xa2\x00\x6e\x01\x9e\x3c\x1d\xd9\xfc\x22\x50\xed\xf1\x3f\x8c\xb7\x7b\x02\x98\xdf\x91\xbc\xd6\x8c\x62\x88\x3b\x06\xf2\x3f\x95\x84\x4a\x81\x75\xc7\x8d\x3c\x96\xdc\x7d\x91\x49\x1f\xf2\x3f\xee\xa5\x94\x94\x7e\xa9\x82\x3c\x38\x62\x75\x6e\x7a\x38\xf2\x3f\x73\x05\xc7\xb6\x7e\xb0\x99\x3c\x3f\xa6\xb2\x4f\xce\x51\xf2\x3f\xa4\xf4\xf4\xbe\x55\xc1\x8a\x3c\xdd\x7c\xe2\x65\x45\x6b\xf2\x3f\xd9\xe9\x40\x99\x33\xbd\x82\x3c\x81\x63\xf5\xe1\xdf\x84\xf2\x3f\x7e\x0d\x3f\x8c\x3a\x4c\x9a\xbc\xe1\xde\x1f\xf5\x9d\x9e\xf2\x3f\x55\x12\xad\xaf\xe8\x12\x86\x3c\x90\xd9\xda\xd0\x7f\xb8\xf2\x3f\xa4\x1a\x38\xd6\xdc\x0a\x41\xbc\x0b\x03\xe4\xa6\x85\xd2\xf2\x3f\xd5\x41\xdb\x54\x47\x02\x90\x3c\x56\x2f\x3e\xa9\xaf\xec\xf2\x3f\x83\x23\xd5\x45\x0f\xca\x71\x3c\x15\xb7\x31\x0a\xfe\x06\xf3\x3f\xe4\x82\x31\xd2\x6a\xf4\x86\x3c\x31\xd8\x4c\xfc\x70\x21\xf3\x3f\x7c\x04\x18\x8e\xe7\x9c\x8a\x3c\xff\x16\x64\xb2\x08\x3c\xf3\x3f\xa6\x59\x36\x84\x21\x27\x93\x3c\xf1\x9f\x92\x5f\xc5\x56\xf3\x3f\x28\x46\x4e\x5c\xee\x5c\x8b\xbc\xcb\xa9\x3a\x37\xa7\x71\xf3\x3f\xe2\xea\x42\xbf\xea\x3a\x96\xbc\x66\xd8\x05\x6d\xae\x8c\xf3\x3f\xbd\x04\x99\x3c\x8d\x95\x9e\xbc\xf7\x9f\xe5\x34\xdb\xa7\xf3\x3f\xe3\xf5\x61\xd6\x36\xe4\x75\xbc\xe5\xa8\x13\xc3\x2d\xc3\xf3\x3f\xc3\x29\x5d\x37\xf8\xff\x9e\xbc\x22\x34\x12\x4c\xa6\xde\xf3\x3f\xbc\x9e\xf0\x11\x09\xda\x8a\x3c\x1c\x80\xac\x04\x45\xfa\xf3\x3f\xf3\xf9\x56\xf9\x23\xd0\x97\xbc\x2a\x2e\xf7\x21\x0a\x16\xf4\x3f\x78\x92\x30\x1c\x69\xf3\x5e\xbc\x97\xa8\x50\xd9\xf5\x31\xf4\x3f\x99\x79\x5f\xe3\xdd\xc7\x81\xbc\x2d\x89\x61\x60\x08\x4e\xf4\x3f\xd0\x80\xef\x04\x7a\x9b\x48\x3c\x57\x00\x1d\xed\x41\x6a\xf4\x3f\x76\x8a\x64\xd1\x4b\x94\x9c\x3c\xd0\x3c\xc1\xb5\xa2\x86\xf4\x3f\xf0\x62\x90\xb6\xa3\xc1\x73\x3c\xde\xd3\xd7\xf0\x2a\xa3\xf4\x3f\x56\xbe\xd1\xf3\x62\xcb\x99\x3c\x27\x2a\x36\xd5\xda\xbf\xf4\x3f\xe2\x42\xec\xaf\x97\x43\x7d\x3c\x0d\xdd\xfd\x99\xb2\xdc\xf4\x3f\x33\x78\x6a\xbc\xdb\xec\x98\x3c\xa7\x2c\x9d\x76\xb2\xf9\xf4\x3f\xe3\x57\x59\xd2\x09\xb3\x94\xbc\x42\x66\xcf\xa2\xda\x16\xf5\x3f\xef\x93\xbd\x69\x85\x76\x8f\xbc\x82\x4f\x9d\x56\x2b\x34\xf5\x3f\xad\x3c\xb1\x1d\xbe\x7a\x80\xbc\x0f\x92\x5d\xca\xa4\x51\xf5\x3f\x9b\xe5\xed\xef\x9c\x68\x8d\xbc\xda\x27\xb5\x36\x47\x6f\xf5\x3f\xad\x93\x1d\x01\x2c\xbb\x99\x3c\xfd\xc7\x97\xd4\x12\x8d\xf5\x3f\xe8\x1d\x9a\x5b\xe1\x95\x82\x3c\x29\x54\x48\xdd\x07\xab\xf5\x3f\xad\x47\x46\x05\x4c\x32\x96\x3c\xb7\x46\x59\x8a\x26\xc9\xf5\x3f\xa2\x86\x69\x81\x1b\x4b\x3c\x3c\x48\x21\xad\x15\x6f\xe7\xf5\x3f\x5e\xe6\x80\x30\xf9\xa6\x9b\x3c\x09\xdc\x76\xb9\xe1\x05\xf6\x3f\x47\xde\x56\x9b\x42\xe2\x93\xbc\x85\x55\x3a\xb0\x7e\x24\xf6\x3f\x97\xb4\x40\x7e\xc1\x83\x93\xbc\x20\xc3\xcc\x34\x46\x43\xf6\x3f\x33\x89\x9d\x75\x3c\x48\x8c\xbc\x25\x22\x55\x82\x38\x62\xf6\x3f\x34\x1c\x59\x87\x09\xb6\x9b\xbc\x73\xa9\x4c\xd4\x55\x81\xf6\x3f\x65\x3e\xf7\x44\xae\x38\x60\x3c\xcd\x3b\x7f\x66\x9e\xa0\xf6\x3f\x56\x64\xb2\x13\x34\xdd\x9b\xbc\xbf\xda\x0b\x75\x12\xc0\xf6\x3f\x0d\x0b\xff\x67\x56\x89\x72\xbc\x2f\x1a\x65\x3c\xb2\xdf\xf6\x3f\xab\x88\x3c\x68\x3a\xbe\x6b\xbc\x84\x94\x51\xf9\x7d\xff\xf6\x3f\xf6\x0e\x86\x25\x0f\x3c\x88\xbc\x74\x5f\xec\xe8\x75\x1f\xf7\x3f\x99\x7a\x88\x86\x47\x6e\x81\xbc\x74\x81\xa5\x48\x9a\x3f\xf7\x3f\x3c\xd5\x65\x6c\xd9\xa8\x90\xbc\xc9\x67\x42\x56\xeb\x5f\xf7\x3f\xd3\x6d\x31\x57\x59\x24\x90\xbc\x3f\x5d\xde\x4f\x69\x80\xf7\x3f\x2d\x16\x02\x0a\xb8\x66\x98\x3c\x87\x01\xeb\x73\x14\xa1\xf7\x3f\x2f\x99\x04\xee\x77\x15\x84\xbc\x32\xc1\x30\x01\xed\xc1\xf7\x3f\xd6\x4d\x16\xd1\x4c\x12\x9f\x3c\x62\x4e\xcf\x36\xf3\xe2\xf7\x3f\x7e\x79\x15\xba\x02\x5d\x70\x3c\x12\x1a\x3e\x54\x27\x04\xf8\x3f\x2b\x97\x6d\x62\x86\x7c\x92\xbc\x13\xce\x4c\x99\x89\x25\xf8\x3f\xd8\x32\x15\xd4\x1d\x4c\x9d\xbc\xad\xc7\x23\x46\x1a\x47\xf8\x3f\xfb\xcd\x41\xa3\x84\xd6\x88\xbc\xed\x92\x44\x9b\xd9\x68\xf8\x3f\xba\xf6\xd4\x9b\xf8\xc6\x9f\xbc\x99\x66\x8a\xd9\xc7\x8a\xf8\x3f\x3a\xb5\x7c\xf3\xc2\x94\x99\x3c\xdb\xa0\x2a\x42\xe5\xac\xf8\x3f\x27\x4b\x86\x56\xf1\xe9\x96\x3c\x8c\x44\xb5\x16\x32\xcf\xf8\x3f\xaa\xe3\xe9\x32\x5e\xd5\x70\xbc\x36\x77\x15\x99\xae\xf1\xf8\x3f\x6c\x97\xe3\xa2\x13\xcc\x85\x3c\xc6\xff\x91\x0b\x5b\x14\xf9\x3f\x24\x25\x58\x2e\x79\xd6\x9d\xbc\xe5\xc5\xcd\xb0\x37\x37\xf9\x3f\xbc\x7e\xb5\x81\xc7\x5f\x67\xbc\x0f\x52\xc8\xcb\x44\x5a\xf9\x3f\x39\xf0\xa5\x96\x7c\x4b\x76\xbc\x50\x4e\xde\x9f\x82\x7d\xf9\x3f\xd1\x85\x1b\x7c\x5b\x18\x9d\xbc\xba\x07\xca\x70\xf1\xa0\xf9\x3f\x32\xe6\xce\x91\xbd\x73\x91\xbc\x90\xf0\xa3\x82\x91\xc4\xf9\x3f\xbe\xf2\x71\xb0\x46\x7c\x7c\x3c\x23\x23\xe3\x19\x63\xe8\xf9\x3f\x6e\x4c\xe6\x78\xca\x24\x78\x3c\x65\xe5\x5d\x7b\x66\x0c\xfa\x3f\x33\xd5\x1c\x5d\x49\x59\x93\xbc\x33\x2d\x4a\xec\x9b\x30\xfa\x3f\xab\x36\xdc\x7d\x5c\x30\x96\x3c\x5d\x25\x3e\xb2\x03\x55\xfa\x3f\xe1\x41\x8d\xdb\x6e\x2f\x9d\xbc\x58\xb3\x30\x13\x9e\x79\xfa\x3f\xc7\x63\xc5\xca\x7e\xcb\x9b\x3c\xbf\xfd\x79\x55\x6b\x9e\xfa\x3f\x31\xfd\xf7\x0e\xc9\xfa\x90\x3c\x7a\xf3\xd3\xbf\x6b\xc3\xfa\x3f\xd0\x6c\xe7\xca\x34\x92\x8f\xbc\xad\xd3\x5a\x99\x9f\xe8\xfa\x3f\x81\xcc\x5d\x34\xcd\xa1\x97\x3c\x66\xb6\x8d\x29\x07\x0e\xfb\x3f\x25\xe4\x80\x4c\xf5\xde\x9b\xbc\xfb\x15\x4f\xb8\xa2\x33\xfb\x3f\x08\xd7\x84\x30\x5e\x80\x62\xbc\x3a\x59\xe5\x8d\x72\x59\xfb\x3f\xe3\x6d\xba\xbb\xdf\x71\x9c\xbc\x47\x5e\xfb\xf2\x76\x7f\xfb\x3f\x3b\xac\x54\x7e\x4f\x58\x75\xbc\x4a\x06\xa1\x30\xb0\xa5\xfb\x3f\x2e\x29\x54\x0e\xd3\xfc\x9e\xbc\xd2\xc1\x4b\x90\x1e\xcc\xfb\x3f\x84\x9e\x2d\x7a\xd0\x3d\x82\x3c\x09\x1e\xd7\x5b\xc2\xf2\xfb\x3f\x73\x9c\x6b\x3f\xca\xfd\x9e\xbc\x9c\x52\x85\xdd\x9b\x19\xfc\x3f\xdd\x48\x50\x89\x65\x10\x81\x3c\x7a\xd0\xff\x5f\xab\x40\xfc\x3f\x0a\xc6\x83\xe0\x37\x45\x9b\x3c\x4b\xd1\x57\x2e\xf1\x67\xfc\x3f\xad\x3c\x48\xff\x4d\x88\x92\x3c\xb5\xe7\x06\x94\x6d\x8f\xfc\x3f\x44\x5c\x80\x48\xbc\xac\x71\x3c\x69\x90\xef\xdc\x20\xb7\xfc\x3f\xdb\x49\xe9\xd1\xcb\x03\x75\x3c\xfa\xc3\x5d\x55\x0b\xdf\xfc\x3f\x72\x9d\x82\x53\x3b\xd8\x8d\xbc\x7c\x89\x07\x4a\x2d\x07\xfd\x3f\x9c\x7a\x79\x43\x37\xbc\x9c\xbc\xf2\x89\x0d\x08\x87\x2f\xfd\x3f\x78\x85\x9d\x71\x7b\x48\x9d\xbc\x87\xa4\xfb\xdc\x18\x58\xfd\x3f\x07\x37\x5b\xd7\x02\xed\x82\x3c\x98\x83\xc9\x16\xe3\x80\xfd\x3f\xe8\xdf\xed\x8b\xc1\x1e\x91\xbc\x85\x32\xdb\x03\xe6\xa9\xfd\x3f\x32\xb5\x6d\x69\x00\x23\x9c\x3c\x60\xb4\x01\xf3\x21\xd3\xfd\x3f\xc3\x18\xf0\x78\x57\xda\x92\x3c\x5f\x9b\x7b\x33\x97\xfc\xfd\x3f\x5c\x4b\x18\x4f\xcd\xa5\x91\xbc\x29\xa1\xf5\x14\x46\x26\xfe\x3f\x96\x14\x7a\x81\x27\xb6\x97\xbc\xf6\x3f\x8b\xe7\x2e\x50\xfe\x3f\x8f\xcc\xa9\x80\x89\x9e\x83\x3c\x83\x4c\xc7\xfb\x51\x7a\xfe\x3f\xe2\x8d\x0c\xca\x22\xd5\x92\x3c\xda\x90\xa4\xa2\xaf\xa4\xfe\x3f\x93\x28\x9c\x17\x23\x9c\x9e\xbc\xf1\x67\x8e\x2d\x48\xcf\xfe\x3f\x8c\xad\x11\xb4\xf3\x93\x9c\xbc\x27\x5a\x61\xee\x1b\xfa\xfe\x3f\xb0\xb6\xa4\x86\xf4\xc7\x9d\x3c\x97\xba\x6b\x37\x2b\x25\xff\x3f\x43\x8e\x0d\xbf\xa5\xa1\x93\x3c\x40\x45\x6e\x5b\x76\x50\xff\x3f\x8b\xa1\xd8\x2d\xe1\xd3\x99\x3c\x14\xbe\x9c\xad\xfd\x7b\xff\x3f\x0a\x35\x06\xd0\x12\xbb\x9d\xbc\xd8\x90\x9e\x81\xc1\xa7\xff\x3f\x1e\x93\xa5\xf3\x53\x48\x87\x3c\xf1\x71\x8f\x2b\xc2\xd3\xff\x3f\xe7\x79\x65\x96\x74\xeb\x62\x3c";
+
 fn exp(x as f64) as f64 {
-    if (is_nan(x) == 1) { return x; }
-    if (is_inf(x) == 1) {
-        if (x > 0.0) { return x; }
-        return 0.0;
+    if (x > -708.0 && x < 708.0) {
+        let is f64 as kd = x * 184.6649652337873 + 6755399441055744.0;
+        let is f64 as nf = kd - 6755399441055744.0;
+        let is f64 as r = (x - nf * 0.005415212348452769) + nf * 3.2819649005320973e-13;
+        let is i64 as n = cast(i64, nf);
+        let is *u8 as tp = _EXP_T + (n & 127) * 16;
+        let is f64 as th = *cast(*f64, tp);
+        let is f64 as r2 = r * r;
+        let is f64 as p = r + r2 * ((0.5 + r * 0.16666666666670482) + r2 * (0.041666675772402524 + r * 0.008333328506356978));
+        let is i64 as sb = ((n >> 7) + 1023) << 52;
+        return (th + (th * p + *cast(*f64, tp + 8))) * (*cast(*f64, &sb));
     }
-    if (x > 709.782712893384) { return inf(); }
-    if (x < 0.0 - 745.1332191019411) { return 0.0; }
-
-    let is f64 as nf = round(x * LOG2E);
-    let is i64 as n = cast(i64, nf);
-    let is f64 as r = (x - nf * LN2_HI) - nf * LN2_LO;
-
-    let is f64 as p with mut = 0.000000000011470745597729725;   // 1/14!
-    p = 0.00000000016059043836821613 + r * p;                   // 1/13!
-    p = 0.0000000020876756987868098 + r * p;                    // 1/12!
-    p = 0.000000025052108385441718 + r * p;                     // 1/11!
-    p = 0.00000027557319223985893 + r * p;                      // 1/10!
-    p = 0.0000027557319223985893 + r * p;                       // 1/9!
-    p = 0.0000248015873015873 + r * p;                          // 1/8!
-    p = 0.0001984126984126984 + r * p;                          // 1/7!
-    p = 0.001388888888888889 + r * p;                           // 1/6!
-    p = 0.008333333333333333 + r * p;                           // 1/5!
-    p = 0.041666666666666664 + r * p;                           // 1/4!
-    p = 0.16666666666666666 + r * p;                            // 1/3!
-    p = 0.5 + r * p;                                            // 1/2!
-    p = 1.0 + r * p;
-    p = 1.0 + r * p;
-
-    return p * exp2i(n);
+    return _exp_tail(x, 0.0);
 }
 
-// log(x) = e*ln2 + log(m), splitting x into m * 2^e with m in
-// [sqrt(2)/2, sqrt(2)). On that interval s = (m-1)/(m+1) stays under 0.172
-// in magnitude, where the atanh series converges quickly.
+// exp(x + xl) where the result may overflow, underflow or be subnormal, or
+// x is NaN or infinite. The scale 2^k is applied in two steps so that each
+// factor is a normal double and at most one rounding happens.
+fn _exp_tail(x as f64, xl as f64) as f64 {
+    if (x != x) { return x + x; }
+    if (x > 709.8) { return 1.0e308 * 10.0; }
+    if (x < -745.2) { return 0.0; }
+    let is f64 as kd = x * 184.6649652337873 + 6755399441055744.0;
+    let is f64 as nf = kd - 6755399441055744.0;
+    let is f64 as r = ((x - nf * 0.005415212348452769) + nf * 3.2819649005320973e-13) + xl;
+    let is i64 as n = cast(i64, nf);
+    let is *u8 as tp = _EXP_T + (n & 127) * 16;
+    let is f64 as th = *cast(*f64, tp);
+    let is f64 as r2 = r * r;
+    let is f64 as p = r + r2 * ((0.5 + r * 0.16666666666670482) + r2 * (0.041666675772402524 + r * 0.008333328506356978));
+    let is f64 as y = th + (th * p + *cast(*f64, tp + 8));
+    let is i64 as k = n >> 7;
+    if (k > 0) {
+        let is i64 as sb = (k + 1022) << 52;
+        return (y * (*cast(*f64, &sb))) * 2.0;
+    }
+    let is i64 as sb2 = (k + 1623) << 52;
+    return (y * (*cast(*f64, &sb2))) * 2.409919865102884e-181;
+}
+
+// --- Logarithms ---
+//
+// x = 2^e * m with m in [0.709, 1.418); the bits of m pick one of 128
+// intervals, each with a 26-bit 1/c and log(c) (as hi + lo, hi on a 2^-42
+// grid so that e*ln2_hi + log(c)_hi is exact). Then
+//   log(x) = e*ln2 + log(c) + log1p(r),  r = m/c - 1 = m * (1/c) - 1,
+// |r| < 0.0039, with r formed exactly: m is split into 26-bit halves, each
+// product with the 26-bit 1/c is exact, and the sum of the two is kept as
+// hi + lo. The interval holding 1.0 has c = 1, so x near 1 loses nothing.
+// log1p(r) = r - r^2/2 + r^3 * (degree-4 fit), relative error 2^-58.
+// Max error 0.51 ulp.
+
+// (1/c, log(c) hi, log(c) lo) per interval.
+let is *u8 as _LOG_T with imut = "\x00\x00\x00\x18\x68\x81\xf6\x3f\x00\x60\x99\xe3\xbd\xd5\xd5\xbf\xaf\x32\xa4\x08\xae\x0f\x0a\x3d\x00\x00\x00\x68\xec\x61\xf6\x3f\x00\xd0\x28\x4d\xf7\x7b\xd5\xbf\x02\xe0\x5c\x6e\x71\xa8\x1f\xbd\x00\x00\x00\x58\xc8\x42\xf6\x3f\x00\xa0\x38\x04\xae\x22\xd5\xbf\xd9\xc2\x64\x81\xe0\xbd\x2e\xbd\x00\x00\x00\x78\xfa\x23\xf6\x3f\x00\x30\xf7\xa0\xe0\xc9\xd4\xbf\xae\xd4\x0a\x5b\x0d\x21\x2e\x3d\x00\x00\x00\x60\x81\x05\xf6\x3f\x00\xc0\x71\xc1\x8d\x71\xd4\xbf\xb0\x14\x4c\xfb\x10\x6c\x30\xbd\x00\x00\x00\xb8\x5b\xe7\xf5\x3f\x00\xf0\x75\x21\xb4\x19\xd4\xbf\x0a\xe5\x6d\x42\xa6\xe3\x3c\x3d\x00\x00\x00\x28\x88\xc9\xf5\x3f\x00\x30\xb3\x6c\x52\xc2\xd3\xbf\x7c\x3b\x05\xb6\x8c\x2d\x18\xbd\x00\x00\x00\x68\x05\xac\xf5\x3f\x00\x10\xde\x6d\x67\x6b\xd3\xbf\xc4\x8e\xf0\x30\xf5\x64\x11\xbd\x00\x00\x00\x30\xd2\x8e\xf5\x3f\x00\x60\x53\xe0\xf1\x14\xd3\xbf\x48\x3d\x21\xd3\x9e\xe2\x28\x3d\x00\x00\x00\x40\xed\x71\xf5\x3f\x00\x90\xdc\x87\xf0\xbe\xd2\xbf\xc9\xe2\x50\x4a\x6a\x95\x2a\xbd\x00\x00\x00\x58\x55\x55\xf5\x3f\x00\xe0\x34\x19\x62\x69\xd2\xbf\x7a\xfb\x51\x10\x1f\xb8\x31\x3d\x00\x00\x00\x48\x09\x39\xf5\x3f\x00\xc0\x2e\x6a\x45\x14\xd2\xbf\x9e\x2a\xb7\x48\x46\xaf\x3c\x3d\x00\x00\x00\xe8\x07\x1d\xf5\x3f\x00\x70\x9a\x5a\x99\xbf\xd1\xbf\xf8\x58\x5c\xd7\xed\xae\x31\x3d\x00\x00\x00\x18\x50\x01\xf5\x3f\x00\x00\xcd\xd4\x5c\x6b\xd1\xbf\x6e\x35\x2d\x24\x33\x35\x32\x3d\x00\x00\x00\xa8\xe0\xe5\xf4\x3f\x00\xe0\xa7\x84\x8e\x17\xd1\xbf\x3f\x09\x2d\xce\x46\xef\x31\xbd\x00\x00\x00\x88\xb8\xca\xf4\x3f\x00\x60\x01\x6a\x2d\xc4\xd0\xbf\xec\xed\x3c\xd6\x1c\x18\x27\xbd\x00\x00\x00\xa0\xd6\xaf\xf4\x3f\x00\x60\x4d\x5f\x38\x71\xd0\xbf\x2c\x2b\x91\x4e\x3a\x76\x3e\x3d\x00\x00\x00\xe0\x39\x95\xf4\x3f\x00\xc0\xa6\x4a\xae\x1e\xd0\xbf\xf0\x06\xde\xfa\xba\x3f\x3a\xbd\x00\x00\x00\x48\xe1\x7a\xf4\x3f\x00\xc0\xb3\x6e\x1c\x99\xcf\xbf\x1f\xc8\x7c\xcd\x0c\x0d\x39\x3d\x00\x00\x00\xc8\xcb\x60\xf4\x3f\x00\x00\x1d\xe5\xad\xf5\xce\xbf\x0c\x8e\xbb\x65\x25\x21\xca\x3c\x00\x00\x00\x68\xf8\x46\xf4\x3f\x00\x20\x67\x10\x0f\x53\xce\xbf\x4d\x4d\x3f\x31\xfc\xdd\x3f\x3d\x00\x00\x00\x28\x66\x2d\xf4\x3f\x00\x80\x94\xbe\x3d\xb1\xcd\xbf\xfa\x42\x75\x64\xf0\x7e\x32\xbd\x00\x00\x00\x18\x14\x14\xf4\x3f\x00\x60\x65\x0b\x38\x10\xcd\xbf\xce\xe0\xb1\x75\x8e\x71\x08\x3d\x00\x00\x00\x40\x01\xfb\xf3\x3f\x00\x00\xf0\xc8\xfb\x6f\xcc\xbf\x58\x9d\xa6\xd3\x30\xe1\x3e\xbd\x00\x00\x00\xc0\x2c\xe2\xf3\x3f\x00\xe0\x3b\x4c\x87\xd0\xcb\xbf\x0b\x6c\x53\x59\x04\x52\x2d\x3d\x00\x00\x00\xa8\x95\xc9\xf3\x3f\x00\xc0\x1b\x6e\xd8\x31\xcb\xbf\x72\xde\x2a\x36\x43\x75\x3c\xbd\x00\x00\x00\x10\x3b\xb1\xf3\x3f\x00\xe0\x8a\x24\xed\x93\xca\xbf\x69\x41\x57\x50\x43\x7b\x28\x3d\x00\x00\x00\x30\x1c\x99\xf3\x3f\x00\xa0\x88\x20\xc4\xf6\xc9\xbf\x8a\x92\xcc\xcb\xed\x3c\x33\x3d\x00\x00\x00\x10\x38\x81\xf3\x3f\x00\x00\xf7\xc5\x5a\x5a\xc9\xbf\x85\x09\x9d\x58\x18\xd1\x07\xbd\x00\x00\x00\xf0\x8d\x69\xf3\x3f\x00\x00\xb9\xd1\xaf\xbe\xc8\xbf\x99\x92\xee\xaa\xf8\x65\x07\x3d\x00\x00\x00\xf8\x1c\x52\xf3\x3f\x00\xa0\x51\x50\xc1\x23\xc8\xbf\xa3\x9c\x61\x9a\x13\x00\x1e\xbd\x00\x00\x00\x58\xe4\x3a\xf3\x3f\x00\x40\x04\x6f\x8d\x89\xc7\xbf\x81\x3c\xdb\xc3\x9d\xe2\x38\xbd\x00\x00\x00\x48\xe3\x23\xf3\x3f\x00\x60\xf5\x7c\x12\xf0\xc6\xbf\x4e\xcf\x31\x8d\x94\x75\x35\xbd\x00\x00\x00\x00\x19\x0d\xf3\x3f\x00\x20\x8c\xb6\x4e\x57\xc6\xbf\xb7\xf9\xf0\x34\x9d\x8c\x39\x3d\x00\x00\x00\xc0\x84\xf6\xf2\x3f\x00\x40\x54\x7b\x40\xbf\xc5\xbf\x71\xed\x67\xeb\x23\x78\x12\x3d\x00\x00\x00\xc0\x25\xe0\xf2\x3f\x00\xc0\xa1\xe2\xe5\x27\xc5\xbf\x32\x41\x4b\x8d\x13\xe6\x34\x3d\x00\x00\x00\x50\xfb\xc9\xf2\x3f\x00\xc0\x33\x94\x3d\x91\xc4\xbf\x96\xf1\x80\x55\x85\x40\x35\x3d\x00\x00\x00\xb0\x04\xb4\xf2\x3f\x00\x20\x19\xba\x45\xfb\xc3\xbf\x17\x3f\xcb\x40\xcb\x93\x31\xbd\x00\x00\x00\x28\x41\x9e\xf2\x3f\x00\xa0\x15\xa3\xfc\x65\xc3\xbf\xfe\x7f\xb9\xaf\xf2\xd4\x3f\x3d\x00\x00\x00\x10\xb0\x88\xf2\x3f\x00\x80\x06\xfb\x60\xd1\xc2\xbf\x03\xf6\x7f\xcb\x48\x8a\x03\xbd\x00\x00\x00\xb8\x50\x73\xf2\x3f\x00\xc0\xc9\x26\x71\x3d\xc2\xbf\x93\xdd\xd3\x8f\xc1\x0c\x10\xbd\x00\x00\x00\x70\x22\x5e\xf2\x3f\x00\x00\xa4\x7a\x2b\xaa\xc1\xbf\xd8\xb3\xe3\x5d\x51\xac\x31\x3d\x00\x00\x00\x90\x24\x49\xf2\x3f\x00\xe0\x27\x72\x8e\x17\xc1\xbf\x9c\xb2\x2c\xce\x78\xeb\x21\xbd\x00\x00\x00\x78\x56\x34\xf2\x3f\x00\x40\x5e\xb1\x98\x85\xc0\xbf\xc5\x91\x09\xb0\x25\xe6\x27\x3d\x00\x00\x00\x80\xb7\x1f\xf2\x3f\x00\xc0\xdb\x29\x91\xe8\xbf\xbf\x2c\x75\x2f\xd8\x14\x65\x35\xbd\x00\x00\x00\x10\x47\x0b\xf2\x3f\x00\x00\x0a\xb6\x39\xc7\xbe\xbf\xc9\x89\x0d\x28\xb7\x1a\x31\xbd\x00\x00\x00\x80\x04\xf7\xf1\x3f\x00\x40\x84\x83\x27\xa7\xbd\xbf\xde\xc1\xa7\x1f\x40\x81\x1a\xbd\x00\x00\x00\x38\xef\xe2\xf1\x3f\x00\x40\x3c\xd3\x57\x88\xbc\xbf\xfd\xa6\x59\x86\x5f\x3e\x26\xbd\x00\x00\x00\xb0\x06\xcf\xf1\x3f\x00\x40\xad\xaf\xc8\x6a\xbb\xbf\xf4\x58\x02\xf5\x9d\x19\x3b\xbd\x00\x00\x00\x40\x4a\xbb\xf1\x3f\x00\xc0\xb1\x3c\x76\x4e\xba\xbf\x73\x08\x44\xb9\xf6\x42\x0e\x3d\x00\x00\x00\x60\xb9\xa7\xf1\x3f\x00\x40\x59\x4d\x5e\x33\xb9\xbf\x2f\x3d\xbd\x3a\x5c\x10\x23\xbd\x00\x00\x00\x80\x53\x94\xf1\x3f\x00\x00\x41\x27\x7e\x19\xb8\xbf\xec\x00\xd2\x60\x04\x10\x3c\x3d\x00\x00\x00\x10\x18\x81\xf1\x3f\x00\xc0\xea\xf4\xd2\x00\xb7\xbf\x88\x31\x9c\xa9\x4d\x00\xec\xbc\x00\x00\x00\x88\x06\x6e\xf1\x3f\x00\x80\x17\x3b\x5a\xe9\xb5\xbf\x33\x69\xd1\xc1\xd1\xca\x31\xbd\x00\x00\x00\x60\x1e\x5b\xf1\x3f\x00\x80\x20\x65\x11\xd3\xb4\xbf\x45\xd7\xf4\x82\x25\x3c\xf5\x3c\x00\x00\x00\x10\x5f\x48\xf1\x3f\x00\x00\xd2\xc4\xf5\xbd\xb3\xbf\xd3\x38\x12\x2d\x75\x9d\x31\x3d\x00\x00\x00\x10\xc8\x35\xf1\x3f\x00\x00\x47\x92\x04\xaa\xb2\xbf\xa9\xc3\xb1\xa8\xe9\xa3\x37\xbd\x00\x00\x00\xe8\x58\x23\xf1\x3f\x00\x40\xc6\xda\x3b\x97\xb1\xbf\xd0\x31\xf9\x34\xa4\x66\x35\xbd\x00\x00\x00\x10\x11\x11\xf1\x3f\x00\x40\x9e\xa5\x98\x85\xb0\xbf\x81\xa5\x09\x70\xdd\xe7\x17\x3d\x00\x00\x00\x10\xf0\xfe\xf0\x3f\x00\x80\x06\xa2\x31\xea\xae\xbf\x2c\xd4\x06\xb6\x67\x3d\x3c\xbd\x00\x00\x00\x68\xf5\xec\xf0\x3f\x00\x80\xdd\x57\x73\xcb\xac\xbf\x92\xea\x08\xee\xf6\x5e\x39\xbd\x00\x00\x00\xa8\x20\xdb\xf0\x3f\x00\x00\xfb\xbf\xf2\xae\xaa\xbf\x95\xb2\x3b\xf5\xd1\xfb\x20\xbd\x00\x00\x00\x50\x71\xc9\xf0\x3f\x00\x80\x9f\x1c\xaa\x94\xa8\xbf\x76\x76\xe9\x8b\x92\xa1\x39\xbd\x00\x00\x00\xf0\xe6\xb7\xf0\x3f\x00\x80\xd4\x68\x95\x7c\xa6\xbf\x77\xd5\x7d\x02\x54\xa5\x3d\xbd\x00\x00\x00\x08\x81\xa6\xf0\x3f\x00\x00\x2e\x8a\xae\x66\xa4\xbf\x11\x81\xbe\x75\xcc\x1b\x2c\x3d\x00\x00\x00\x38\x3f\x95\xf0\x3f\x00\x00\x8d\x10\xf3\x52\xa2\xbf\xc8\xac\x21\xa0\xaa\x3d\x28\xbd\x00\x00\x00\x08\x21\x84\xf0\x3f\x00\x80\xe7\x81\x5d\x41\xa0\xbf\x2b\xc5\x61\xf4\xcf\xdd\x3d\x3d\x00\x00\x00\x08\x26\x73\xf0\x3f\x00\x00\x15\x5e\xd2\x63\x9c\xbf\xc8\xe0\x30\x00\x13\x46\x35\x3d\x00\x00\x00\xd0\x4d\x62\xf0\x3f\x00\x00\xc9\x70\x24\x49\x98\xbf\xaf\x09\x5b\x32\xfe\xa8\x2a\x3d\x00\x00\x00\xf8\x97\x51\xf0\x3f\x00\x00\x98\x2f\xa9\x32\x94\xbf\x28\x38\x86\x92\x20\x81\x09\xbd\x00\x00\x00\x10\x04\x41\xf0\x3f\x00\x00\x93\x48\x56\x20\x90\xbf\x02\x84\x8e\x7c\xca\x11\x36\xbd\x00\x00\x00\xb8\x91\x30\xf0\x3f\x00\x00\x88\x0f\x4a\x24\x88\xbf\x87\xff\xc5\xf2\x38\x51\x34\xbd\x00\x00\x00\x80\x40\x20\xf0\x3f\x00\x00\x88\xf5\x14\x10\x80\xbf\xb1\xaf\x98\x19\xa5\xcd\x3b\xbd\x00\x00\x00\x10\x10\x10\xf0\x3f\x00\x00\x58\x49\x05\x08\x70\xbf\x7a\xc6\x31\xcb\xae\x66\x21\xbd\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x7f\xc0\xef\x3f\x00\x00\x10\x6b\x2b\xe0\x7f\x3f\x3a\x56\xda\x0d\x3f\xe4\x19\x3d\x00\x00\x00\x20\xf8\x81\xef\x3f\x00\x00\xfc\x90\xa8\xc0\x8f\x3f\x47\xa1\xd3\xf6\x7c\x20\xdf\x3c\x00\x00\x00\xa0\x65\x44\xef\x3f\x00\x00\xd6\xcf\x1a\xb9\x97\x3f\x76\xb0\x02\xb6\xf3\xb8\x33\xbd\x00\x00\x00\xf0\xc1\x07\xef\x3f\x00\x00\x78\x1e\x9b\x82\x9f\x3f\x0f\x0a\x7e\x7c\x36\x80\x29\x3d\x00\x00\x00\xb0\x07\xcc\xee\x3f\x00\x80\xfe\xeb\x87\x9e\xa3\x3f\x6e\xa4\xad\x00\x0d\xb1\x3e\x3d\x00\x00\x00\xa8\x31\x91\xee\x3f\x00\x00\x33\x38\x59\x74\xa7\x3f\x3e\x80\x86\x65\xbc\x7f\x31\xbd\x00\x00\x00\xc8\x3a\x57\xee\x3f\x00\x80\x19\x82\xdd\x42\xab\x3f\x19\x6d\xd6\x65\xea\x81\x1c\xbd\x00\x00\x00\x20\x1e\x1e\xee\x3f\x00\x80\x11\xa0\x30\x0a\xaf\x3f\x3c\x99\x36\x83\x9e\x58\x2d\xbd\x00\x00\x00\xe0\xd6\xe5\xed\x3f\x00\x80\xa3\x10\x37\x65\xb1\x3f\x53\xd6\x8e\x76\x56\x73\x14\xbd\x00\x00\x00\x78\x60\xae\xed\x3f\x00\xc0\x1b\x8b\xd7\x41\xb3\x3f\x55\x74\x83\x19\xcf\xd0\x31\x3d\x00\x00\x00\x58\xb6\x77\xed\x3f\x00\x00\x86\x22\x07\x1b\xb5\x3f\x46\x4a\x8e\x47\xff\x40\x38\x3d\x00\x00\x00\x20\xd4\x41\xed\x3f\x00\x80\xe5\x72\xd2\xf0\xb6\x3f\x13\x58\x66\x1b\x44\xb3\x34\xbd\x00\x00\x00\x90\xb5\x0c\xed\x3f\x00\x80\x31\xd1\x45\xc3\xb8\x3f\x3c\x2a\xb4\x2c\x02\x21\x3b\x3d\x00\x00\x00\x88\x56\xd8\xec\x3f\x00\xc0\x4a\x43\x6d\x92\xba\x3f\x8f\x2b\xd2\x8b\x8d\x63\x35\x3d\x00\x00\x00\x08\xb3\xa4\xec\x3f\x00\xc0\xdb\x77\x54\x5e\xbc\x3f\x6e\x7a\x5f\xd8\xa7\x10\x1d\x3d\x00\x00\x00\x20\xc7\x71\xec\x3f\x00\x00\x2b\x4e\x07\x27\xbe\x3f\x91\x55\xf0\x2a\x2c\x30\x2a\xbd\x00\x00\x00\x00\x8f\x3f\xec\x3f\x00\x00\xdc\x41\x91\xec\xbf\x3f\xb1\x60\xae\xd1\xd5\x44\x35\xbd\x00\x00\x00\x00\x07\x0e\xec\x3f\x00\x80\xd0\x8c\x7e\xd7\xc0\x3f\x2c\x1f\xe3\x2e\xcd\xb4\x3c\x3d\x00\x00\x00\x88\x2b\xdd\xeb\x3f\x00\x60\x6f\xdc\x2a\xb7\xc1\x3f\x87\xab\x11\x58\x76\x81\x2e\x3d\x00\x00\x00\x18\xf9\xac\xeb\x3f\x00\x00\x20\xe9\x52\x95\xc2\x3f\x24\x41\x47\xf4\xa5\xb7\x35\xbd\x00\x00\x00\x40\x6c\x7d\xeb\x3f\x00\x80\x1e\x16\xfc\x71\xc3\x3f\x52\x80\x2d\x9b\x3f\xe9\x3e\x3d\x00\x00\x00\xb8\x81\x4e\xeb\x3f\x00\x80\x4b\x5e\x2b\x4d\xc4\x3f\x43\xf7\x35\x61\x2f\x06\x17\xbd\x00\x00\x00\x40\x36\x20\xeb\x3f\x00\xc0\xa1\xe5\xe5\x26\xc5\x3f\x23\x52\xfc\x37\xb2\x90\x37\xbd\x00\x00\x00\xc0\x86\xf2\xea\x3f\x00\xa0\xa7\x60\x30\xff\xc5\x3f\x9c\x16\x3c\x18\x6f\x56\x38\xbd\x00\x00\x00\x18\x70\xc5\xea\x3f\x00\xe0\x59\xf4\x0f\xd6\xc6\x3f\x2b\x2f\x13\x37\x86\xc5\x3b\xbd\x00\x00\x00\x60\xef\x98\xea\x3f\x00\xe0\x10\x04\x89\xab\xc7\x3f\x2d\x4a\x53\x72\x80\xdb\x2b\xbd\x00\x00\x00\xa8\x01\x6d\xea\x3f\x00\xc0\x60\x5f\xa0\x7f\xc8\x3f\x01\x01\x12\x60\x62\x21\x32\x3d\x00\x00\x00\x18\xa4\x41\xea\x3f\x00\x60\xf4\xa7\x5a\x52\xc9\x3f\xb1\x07\x9f\x7d\x21\x96\x32\xbd\x00\x00\x00\xf8\xd3\x16\xea\x3f\x00\xc0\x22\x27\xbc\x23\xca\x3f\x13\x9b\xdc\x71\x64\x39\x35\xbd\x00\x00\x00\x98\x8e\xec\xe9\x3f\x00\xc0\x00\x40\xc9\xf3\xca\x3f\x11\x52\xed\x3f\xe3\xa9\xb8\xbc\x00\x00\x00\x50\xd1\xc2\xe9\x3f\x00\x80\xad\x6e\x86\xc2\xcb\x3f\x61\x10\x9d\x73\x90\xac\x39\x3d\x00\x00\x00\x98\x99\x99\xe9\x3f\x00\xa0\x9a\xcf\xf7\x8f\xcc\x3f\x89\x79\x9f\x68\x4f\x78\x27\xbd\x00\x00\x00\xf8\xe4\x70\xe9\x3f\x00\xc0\x8f\x6b\x21\x5c\xcd\x3f\x1b\x68\xca\x7b\x91\xba\x21\xbd\x00\x00\x00\x00\xb1\x48\xe9\x3f\x00\x00\x2b\x5e\x07\x27\xce\x3f\xe7\x2a\xf0\x2a\x2c\x32\x3a\xbd\x00\x00\x00\x48\xfb\x20\xe9\x3f\x00\x60\x1c\xd5\xad\xf0\xce\x3f\xa7\x9e\x86\x5c\x61\x25\x2b\xbd\x00\x00\x00\x90\xc1\xf9\xe8\x3f\x00\x40\x5e\x6b\x18\xb9\xcf\x3f\x31\x3d\x99\xab\xea\x56\x0d\xbd\x00\x00\x00\x90\x01\xd3\xe8\x3f\x00\xd0\x74\x8d\x25\x40\xd0\x3f\x64\x31\xf2\x9e\x00\x51\xf0\x3c\x00\x00\x00\x10\xb9\xac\xe8\x3f\x00\x90\xf3\xe0\x24\xa3\xd0\x3f\xce\x00\xf4\x7e\x7e\x6c\x0c\x3d\x00\x00\x00\xf0\xe5\x86\xe8\x3f\x00\x50\x6e\xfb\x8b\x05\xd1\x3f\x5b\x52\x7d\x01\x85\xab\x34\xbd\x00\x00\x00\x18\x86\x61\xe8\x3f\x00\xa0\xab\xac\x5c\x67\xd1\x3f\xd9\x55\x1f\x73\x16\x38\x38\x3d\x00\x00\x00\x78\x97\x3c\xe8\x3f\x00\xa0\x89\xc8\x98\xc8\xd1\x3f\xdb\x0c\xc6\xc5\x7a\x12\x38\xbd\x00\x00\x00\x18\x18\x18\xe8\x3f\x00\x80\x0f\xfc\x41\x29\xd2\x3f\x62\x09\xeb\x75\x76\x69\x3a\xbd\x00\x00\x00\x00\x06\xf4\xe7\x3f\x00\x80\xde\x0b\x5a\x89\xd2\x3f\x46\xe9\x4b\xd2\x7a\x8f\x3a\x3d\x00\x00\x00\x40\x5f\xd0\xe7\x3f\x00\x20\xe1\xbe\xe2\xe8\xd2\x3f\x2d\x21\xb7\x99\x1e\x7a\x26\xbd\x00\x00\x00\x08\x22\xad\xe7\x3f\x00\x80\xf8\x9c\xdd\x47\xd3\x3f\x56\x7e\xc5\x94\xf3\x58\x25\xbd\x00\x00\x00\x80\x4c\x8a\xe7\x3f\x00\x40\x69\x59\x4c\xa6\xd3\x3f\x26\x3b\xd7\xbc\x9c\xa7\x37\x3d\x00\x00\x00\xe8\xdc\x67\xe7\x3f\x00\xa0\x26\x7c\x30\x04\xd4\x3f\xc3\x9a\x49\x50\x51\x92\x3f\x3d\x00\x00\x00\x78\xd1\x45\xe7\x3f\x00\x60\x1c\xb8\x8b\x61\xd4\x3f\x22\xd2\x4d\x48\xaf\xcb\x13\xbd\x00\x00\x00\x80\x28\x24\xe7\x3f\x00\x80\x77\x93\x5f\xbe\xd4\x3f\xcf\xd8\x9a\xcd\x72\x7c\x3d\xbd\x00\x00\x00\x60\xe0\x02\xe7\x3f\x00\x00\x2e\x7c\xad\x1a\xd5\x3f\xac\xeb\x0a\xdb\x10\x48\x3f\xbd\x00\x00\x00\x68\xf7\xe1\xe6\x3f\x00\x60\x65\x20\x77\x76\xd5\x3f\x79\x98\x24\x75\x13\x4c\x36\xbd\x00\x00\x00\x18\x6c\xc1\xe6\x3f\x00\x10\xd8\xbb\xbd\xd1\xd5\x3f\xcb\xc5\xc7\xc9\x5b\xd6\x38\xbd\x00\x00\x00\xd0\x3c\xa1\xe6\x3f\x00\xc0\x79\xf6\x82\x2c\xd6\x3f\xfd\x8e\x7c\x3d\x2e\x55\x3e\x3d";
+
 fn log(x as f64) as f64 {
-    if (is_nan(x) == 1) { return x; }
+    let is i64 as ix = *cast(*i64, &x);
+    if (ix >= 4503599627370496 && ix < 9218868437227405312) {
+        let is i64 as tmp = ix - 4604561183079399424;
+        let is i64 as e = tmp >> 52;
+        let is *u8 as tp = _LOG_T + ((tmp >> 45) & 127) * 24;
+        let is i64 as mb = ix - (e << 52);
+        let is f64 as m = *cast(*f64, &mb);
+        let is f64 as invc = *cast(*f64, tp);
+        let is f64 as sp = m * 134217729.0;
+        let is f64 as mh = sp - (sp - m);
+        let is f64 as a = mh * invc - 1.0;
+        let is f64 as b = (m - mh) * invc;
+        let is f64 as rh = a + b;
+        let is f64 as bb = rh - a;
+        let is f64 as rl = (a - (rh - bb)) + (b - bb);
+        let is f64 as ef = cast(f64, e);
+        let is f64 as t = ef * 0.6931471805598903 + *cast(*f64, tp + 8);
+        let is f64 as hi = t + rh;
+        let is f64 as r2 = rh * rh;
+        let is f64 as q = rh * r2 * ((0.3333333333333327 + rh * -0.25000000000123185)
+                        + r2 * ((0.20000000023116724 + rh * -0.16666512276027132) + r2 * 0.14282413444730427)) - 0.5 * r2;
+        let is f64 as lo = ((ef * 5.497923018708371e-14 + *cast(*f64, tp + 16)) + (((t - hi) + rh) + rl)) + q;
+        return hi + lo;
+    }
+    return _log_special(x, 0);
+}
+
+// log(x) as hi + lo (returned, and written to lo_out) for x with bits ix,
+// positive, normal and finite, minus eadj * ln2. Shared by log2, log10 and
+// the subnormal path of log.
+fn _log_core(ix as i64, eadj as i64, lo_out as *f64) as f64 {
+    let is i64 as tmp = ix - 4604561183079399424;
+    let is i64 as e = tmp >> 52;
+    let is *u8 as tp = _LOG_T + ((tmp >> 45) & 127) * 24;
+    let is i64 as mb = ix - (e << 52);
+    let is f64 as m = *cast(*f64, &mb);
+    let is f64 as invc = *cast(*f64, tp);
+    let is f64 as sp = m * 134217729.0;
+    let is f64 as mh = sp - (sp - m);
+    let is f64 as a = mh * invc - 1.0;
+    let is f64 as b = (m - mh) * invc;
+    let is f64 as rh = a + b;
+    let is f64 as bb = rh - a;
+    let is f64 as rl = (a - (rh - bb)) + (b - bb);
+    let is f64 as ef = cast(f64, e - eadj);
+    let is f64 as t = ef * 0.6931471805598903 + *cast(*f64, tp + 8);
+    let is f64 as hi = t + rh;
+    let is f64 as r2 = rh * rh;
+    let is f64 as q = rh * r2 * ((0.3333333333333327 + rh * -0.25000000000123185)
+                    + r2 * ((0.20000000023116724 + rh * -0.16666512276027132) + r2 * 0.14282413444730427)) - 0.5 * r2;
+    let is f64 as lo = ((ef * 5.497923018708371e-14 + *cast(*f64, tp + 16)) + (((t - hi) + rh) + rl)) + q;
+    let is f64 as h = hi + lo;
+    *lo_out = (hi - h) + lo;
+    return h;
+}
+
+// Everything log-like that is not a positive normal number: NaN, negative,
+// zero, infinity, and subnormals (scaled by 2^54 first). which: 0 = log,
+// 1 = log2, 2 = log10.
+fn _log_special(x as f64, which as i32) as f64 {
+    if (x != x) { return x + x; }
     if (x < 0.0) { return nan(); }
     if (x == 0.0) { return neg_inf(); }
-    if (is_inf(x) == 1) { return x; }
-
-    let is i64 as b with mut = f64_bits(x);
-    let is i64 as e with mut = ((b >> 52) & 2047) - 1023;
-    // Subnormals carry no implicit leading 1; scale into the normal range
-    // first and pay for it in the exponent.
-    if (((b >> 52) & 2047) == 0) {
-        let is f64 as scaled = x * 18014398509481984.0;   // 2^54
-        let is i64 as sb = f64_bits(scaled);
-        e = ((sb >> 52) & 2047) - 1023 - 54;
-        b = sb;
-    }
-    // Clear the exponent to 1023, leaving the mantissa as m in [1, 2).
-    let is f64 as m with mut = bits_f64((b & 4503599627370495) + 4607182418800017408);
-    if (m > SQRT2) {
-        m = m * 0.5;
-        e = e + 1;
-    }
-
-    let is f64 as s = (m - 1.0) / (m + 1.0);
-    let is f64 as z = s * s;
-    let is f64 as p with mut = 0.047619047619047616;   // 1/21
-    p = 0.05263157894736842 + z * p;                   // 1/19
-    p = 0.058823529411764705 + z * p;                  // 1/17
-    p = 0.06666666666666667 + z * p;                   // 1/15
-    p = 0.07692307692307693 + z * p;                   // 1/13
-    p = 0.09090909090909091 + z * p;                   // 1/11
-    p = 0.1111111111111111 + z * p;                    // 1/9
-    p = 0.14285714285714285 + z * p;                   // 1/7
-    p = 0.2 + z * p;                                   // 1/5
-    p = 0.3333333333333333 + z * p;                    // 1/3
-    p = 1.0 + z * p;
-
-    return cast(f64, e) * LN2 + 2.0 * s * p;
+    if (x > 1.7976931348623157e308) { return x; }
+    let is f64 as xs = x * 18014398509481984.0;
+    let is [1]f64 as lo;
+    let is f64 as hi = _log_core(*cast(*i64, &xs), 54, cast(*f64, &lo));
+    if (which == 1) { return _mul_dd(hi, lo[0], 1.4426950408889634, 2.0355273740931033e-17, 1.4426950514316559, -1.0542692496784412e-08); }
+    if (which == 2) { return _mul_dd(hi, lo[0], 0.4342944819032518, 1.098319650216765e-17, 0.4342944845557213, -2.652469466291052e-09); }
+    return hi + lo[0];
 }
 
+// (hi + lo) * (c + cl) rounded once; c1 + c2 is c split into 26-bit halves.
+fn _mul_dd(hi as f64, lo as f64, c as f64, cl as f64, c1 as f64, c2 as f64) as f64 {
+    let is f64 as sp = hi * 134217729.0;
+    let is f64 as h1 = sp - (sp - hi);
+    let is f64 as h2 = hi - h1;
+    let is f64 as p = hi * c;
+    let is f64 as pe = ((h1 * c1 - p) + h1 * c2 + h2 * c1) + h2 * c2;
+    return p + (pe + (hi * cl + lo * c));
+}
+
+// log(x) / ln2 and log(x) / ln10 from log(x) as hi + lo, the division done as
+// a multiplication in double-double: powers of 2 (and 10) come out exact.
+// Max error 0.51 ulp.
 fn log2(x as f64) as f64 {
-    return log(x) * LOG2E;
+    let is i64 as ix = *cast(*i64, &x);
+    if (ix >= 4503599627370496 && ix < 9218868437227405312) {
+        let is i64 as tmp = ix - 4604561183079399424;
+        let is i64 as e = tmp >> 52;
+        let is *u8 as tp = _LOG_T + ((tmp >> 45) & 127) * 24;
+        let is i64 as mb = ix - (e << 52);
+        let is f64 as m = *cast(*f64, &mb);
+        let is f64 as invc = *cast(*f64, tp);
+        let is f64 as sp = m * 134217729.0;
+        let is f64 as mh = sp - (sp - m);
+        let is f64 as a = mh * invc - 1.0;
+        let is f64 as b = (m - mh) * invc;
+        let is f64 as rh = a + b;
+        let is f64 as bb = rh - a;
+        let is f64 as rl = (a - (rh - bb)) + (b - bb);
+        let is f64 as ef = cast(f64, e);
+        let is f64 as t = ef * 0.6931471805598903 + *cast(*f64, tp + 8);
+        let is f64 as hi0 = t + rh;
+        let is f64 as r2 = rh * rh;
+        let is f64 as q = rh * r2 * ((0.3333333333333327 + rh * -0.25000000000123185)
+                        + r2 * ((0.20000000023116724 + rh * -0.16666512276027132) + r2 * 0.14282413444730427)) - 0.5 * r2;
+        let is f64 as lo0 = ((ef * 5.497923018708371e-14 + *cast(*f64, tp + 16)) + (((t - hi0) + rh) + rl)) + q;
+        let is f64 as hi = hi0 + lo0;
+        let is f64 as lo = (hi0 - hi) + lo0;
+        let is f64 as sh = hi * 134217729.0;
+        let is f64 as h1 = sh - (sh - hi);
+        let is f64 as h2 = hi - h1;
+        let is f64 as p = hi * 1.4426950408889634;
+        let is f64 as pe = ((h1 * 1.4426950514316559 - p) + h1 * -1.0542692496784412e-08 + h2 * 1.4426950514316559) + h2 * -1.0542692496784412e-08;
+        return p + (pe + (hi * 2.0355273740931033e-17 + lo * 1.4426950408889634));
+    }
+    return _log_special(x, 1);
 }
 
 fn log10(x as f64) as f64 {
-    return log(x) / LN10;
+    let is i64 as ix = *cast(*i64, &x);
+    if (ix >= 4503599627370496 && ix < 9218868437227405312) {
+        let is i64 as tmp = ix - 4604561183079399424;
+        let is i64 as e = tmp >> 52;
+        let is *u8 as tp = _LOG_T + ((tmp >> 45) & 127) * 24;
+        let is i64 as mb = ix - (e << 52);
+        let is f64 as m = *cast(*f64, &mb);
+        let is f64 as invc = *cast(*f64, tp);
+        let is f64 as sp = m * 134217729.0;
+        let is f64 as mh = sp - (sp - m);
+        let is f64 as a = mh * invc - 1.0;
+        let is f64 as b = (m - mh) * invc;
+        let is f64 as rh = a + b;
+        let is f64 as bb = rh - a;
+        let is f64 as rl = (a - (rh - bb)) + (b - bb);
+        let is f64 as ef = cast(f64, e);
+        let is f64 as t = ef * 0.6931471805598903 + *cast(*f64, tp + 8);
+        let is f64 as hi0 = t + rh;
+        let is f64 as r2 = rh * rh;
+        let is f64 as q = rh * r2 * ((0.3333333333333327 + rh * -0.25000000000123185)
+                        + r2 * ((0.20000000023116724 + rh * -0.16666512276027132) + r2 * 0.14282413444730427)) - 0.5 * r2;
+        let is f64 as lo0 = ((ef * 5.497923018708371e-14 + *cast(*f64, tp + 16)) + (((t - hi0) + rh) + rl)) + q;
+        let is f64 as hi = hi0 + lo0;
+        let is f64 as lo = (hi0 - hi) + lo0;
+        let is f64 as sh = hi * 134217729.0;
+        let is f64 as h1 = sh - (sh - hi);
+        let is f64 as h2 = hi - h1;
+        let is f64 as p = hi * 0.4342944819032518;
+        let is f64 as pe = ((h1 * 0.4342944845557213 - p) + h1 * -2.652469466291052e-09 + h2 * 0.4342944845557213) + h2 * -2.652469466291052e-09;
+        return p + (pe + (hi * 1.098319650216765e-17 + lo * 0.4342944819032518));
+    }
+    return _log_special(x, 2);
 }
 
-// pow(b, e). Integer exponents go through repeated squaring, which is exact
-// for exactly representable results and is the only way to reach a negative
-// base at all — exp(e*log(b)) has no answer there.
-fn pow(b as f64, e as f64) as f64 {
-    if (e == 0.0) { return 1.0; }
-    if (is_nan(b) == 1) { return b; }
-    if (is_nan(e) == 1) { return e; }
-    if (b == 1.0) { return 1.0; }
+// --- Power ---
+//
+// pow(x, y) = exp(y * log(x)). For the result to be right to the last bit,
+// y * log(x) (up to 745 in magnitude) needs about 64 correct bits, so log(x)
+// is computed here to about 2^-72 relative (the r^2/2 term exactly, a
+// degree-5 fit for the rest), the product with y is formed exactly, and the
+// low part is carried into exp's reduced argument. Max error 0.51 ulp (0.75
+// for subnormal results); exactly representable results (2^10, 3^2, 0.5^-3,
+// ...) come out exact. Special values follow C99 Annex F.
 
-    if (e == trunc(e) && abs_f64(e) <= 4503599627370496.0) {
-        let is i64 as n with mut = cast(i64, abs_f64(e));
-        let is f64 as acc with mut = 1.0;
-        let is f64 as base with mut = b;
-        while (n > 0) {
-            if ((n & 1) == 1) { acc = acc * base; }
-            base = base * base;
-            n = n >> 1;
-        }
-        if (e < 0.0) {
-            if (acc == 0.0) { return inf(); }
-            return 1.0 / acc;
-        }
-        return acc;
+fn pow(x as f64, y as f64) as f64 {
+    let is i64 as ix = *cast(*i64, &x);
+    let is i64 as ay = *cast(*i64, &y) & 9223372036854775807;
+    // x positive, normal and finite; |y| < 2^64
+    if (ix >= 4503599627370496 && ix < 9218868437227405312 && ay < 4895412794951729152) {
+        if (y == 2.0) { return x * x; }
+        return _pow_core(ix, 0, y);
     }
+    return _pow_special(x, y);
+}
 
-    if (b < 0.0) { return nan(); }   // non-integer power of a negative base
-    if (b == 0.0) {
-        if (e > 0.0) { return 0.0; }
+// pow(m, y) for the positive normal m with bits ix, times 2^(-eadj * y).
+fn _pow_core(ix as i64, eadj as i64, y as f64) as f64 {
+    // log(m) as hi + lo
+    let is i64 as tmp = ix - 4604561183079399424;
+    let is i64 as e = tmp >> 52;
+    let is *u8 as tp = _LOG_T + ((tmp >> 45) & 127) * 24;
+    let is i64 as mb = ix - (e << 52);
+    let is f64 as m = *cast(*f64, &mb);
+    let is f64 as invc = *cast(*f64, tp);
+    let is f64 as sp = m * 134217729.0;
+    let is f64 as mh = sp - (sp - m);
+    let is f64 as a = mh * invc - 1.0;
+    let is f64 as b = (m - mh) * invc;
+    let is f64 as rh = a + b;
+    let is f64 as bb = rh - a;
+    let is f64 as rl = (a - (rh - bb)) + (b - bb);
+    // rh^2 exactly
+    let is f64 as sr = rh * 134217729.0;
+    let is f64 as r1 = sr - (sr - rh);
+    let is f64 as r2 = rh - r1;
+    let is f64 as sq = rh * rh;
+    let is f64 as sqe = ((r1 * r1 - sq) + 2.0 * r1 * r2) + r2 * r2;
+    let is f64 as hs = -0.5 * sq;
+    let is f64 as ef = cast(f64, e - eadj);
+    let is f64 as t = ef * 0.6931471805598903 + *cast(*f64, tp + 8);
+    let is f64 as s1 = t + rh;
+    let is f64 as e1 = (t - s1) + rh;
+    let is f64 as s2 = s1 + hs;
+    let is f64 as e2 = (s1 - s2) + hs;
+    let is f64 as q4 = sq * sq;
+    let is f64 as poly = rh * sq * (((0.3333333333333334 + rh * -0.2499999999999987)
+                       + sq * (0.1999999999680209 + rh * -0.1666666671859302))
+                       + q4 * (0.14286053253423286 + rh * -0.12496140898332057));
+    let is f64 as lo = ((ef * 5.497923018708371e-14 + *cast(*f64, tp + 16)) + (e1 + e2))
+                     + ((rl - rh * rl) - 0.5 * sqe + poly);
+    let is f64 as lh = s2 + lo;
+    let is f64 as ll = (s2 - lh) + lo;
+    // y * (lh + ll) as zh + zl, the leading product exact
+    let is f64 as sy = y * 134217729.0;
+    let is f64 as y1 = sy - (sy - y);
+    let is f64 as y2 = y - y1;
+    let is f64 as sl = lh * 134217729.0;
+    let is f64 as l1 = sl - (sl - lh);
+    let is f64 as l2 = lh - l1;
+    let is f64 as zh = y * lh;
+    let is f64 as zl = (((y1 * l1 - zh) + y1 * l2 + y2 * l1) + y2 * l2) + y * ll;
+    if (zh > -708.0 && zh < 708.0) {
+        let is f64 as kd = zh * 184.6649652337873 + 6755399441055744.0;
+        let is f64 as nf = kd - 6755399441055744.0;
+        let is f64 as r = ((zh - nf * 0.005415212348452769) + nf * 3.2819649005320973e-13) + zl;
+        let is i64 as n = cast(i64, nf);
+        let is *u8 as xp = _EXP_T + (n & 127) * 16;
+        let is f64 as th = *cast(*f64, xp);
+        let is f64 as rr = r * r;
+        let is f64 as p = r + rr * ((0.5 + r * 0.16666666666670482) + rr * (0.041666675772402524 + r * 0.008333328506356978));
+        let is i64 as eb = ((n >> 7) + 1023) << 52;
+        return (th + (th * p + *cast(*f64, xp + 8))) * (*cast(*f64, &eb));
+    }
+    return _exp_tail(zh, zl);
+}
+
+fn _pow_special(x as f64, y as f64) as f64 {
+    if (y == 0.0) { return 1.0; }
+    if (x == 1.0) { return 1.0; }
+    if (x != x || y != y) { return x + y; }
+    let is f64 as ax with mut = x;
+    if (x < 0.0) { ax = 0.0 - x; }
+    let is f64 as ayv with mut = y;
+    if (y < 0.0) { ayv = 0.0 - y; }
+    if (ayv > 1.7976931348623157e308) {
+        if (ax == 1.0) { return 1.0; }
+        if ((ax > 1.0) == (y > 0.0)) { return inf(); }
+        return 0.0;
+    }
+    // y: 0 = not an integer, 1 = odd integer, 2 = even integer
+    let is i32 as yint with mut = 0;
+    if (ayv >= 9007199254740992.0) { yint = 2; }
+    else {
+        let is i64 as yi = cast(i64, y);
+        if (cast(f64, yi) == y) { yint = 2 - cast(i32, yi & 1); }
+    }
+    if (x == 0.0) {
+        if (y < 0.0) {
+            if (yint == 1) { return 1.0 / x; }
+            return inf();
+        }
+        if (yint == 1) { return x; }
+        return 0.0;
+    }
+    if (ax > 1.7976931348623157e308) {
+        if (y < 0.0) {
+            if (yint == 1 && x < 0.0) { return -0.0; }
+            return 0.0;
+        }
+        if (yint == 1 && x < 0.0) { return neg_inf(); }
         return inf();
     }
-    return exp(e * log(b));
+    let is f64 as sign with mut = 1.0;
+    if (x < 0.0) {
+        if (yint == 0) { return nan(); }
+        if (yint == 1) { sign = -1.0; }
+    }
+    if (ayv >= 18446744073709551616.0) {
+        if (ax == 1.0) { return sign; }
+        if ((ax > 1.0) == (y > 0.0)) { return sign * inf(); }
+        return sign * 0.0;
+    }
+    if (ax < 2.2250738585072014e-308) {
+        let is f64 as xs = ax * 18014398509481984.0;
+        return sign * _pow_core(*cast(*i64, &xs), 54, y);
+    }
+    return sign * _pow_core(*cast(*i64, &ax), 0, y);
 }
 
 // --- Trigonometry ---
-
-// Reduce x to r in [-pi/4, pi/4] plus a quadrant, then read sin and cos off
-// the same reduction. Returns the quadrant; writes r as a sum hi + lo.
 //
-// x - n*PIO2_1 is exact (the product is exact and the two terms are within a
-// factor of two), and the next piece is taken off with an error-free
-// two-sum, so r carries about 100 bits of pi/2 instead of 53. With only 53,
-// sin(355) came out wrong from the 11th digit: 355 is within 3e-5 of a
-// multiple of pi, and the lost bits are all that is left of the result.
-// Beyond |n| = 2^29 the products stop being exact; there the old two-piece
-// subtraction stays.
-fn _trig_reduce(x as f64, hi_out as *f64, lo_out as *f64) as i64 {
-    let is f64 as nf = round(x * 0.6366197723675814);   // x / (pi/2)
-    if (abs_f64(nf) < 536870912.0) {
-        let is f64 as t = x - nf * PIO2_1;
-        let is f64 as b = 0.0 - nf * PIO2_2;
-        let is f64 as s = t + b;
-        let is f64 as bb = s - t;
-        let is f64 as err = (t - (s - bb)) + (b - bb);
-        let is f64 as lo = (err - nf * PIO2_3) - nf * PIO2_4;
-        let is f64 as hi = s + lo;
-        *hi_out = hi;
-        *lo_out = lo - (hi - s);
-    } else {
-        *hi_out = (x - nf * PI_2_HI) - nf * PI_2_LO;
-        *lo_out = 0.0;
+// x = n * pi/2 + r with |r| <= pi/4 and r kept as hi + lo; sin and cos of r
+// come from minimax polynomials and the quadrant n mod 4 picks which one and
+// its sign. Three reductions:
+//   - |x| < pi/4: none.
+//   - |x| < 1.6e6: pi/2 is split into P1 and P2 of 33 bits and the rest
+//     P3, so n*P1 and n*P2 are exact for n < 2^20 and the subtractions are
+//     carried out exactly; r is good to about 2^-98 absolute. That is not
+//     enough when r itself is tiny (45.553093477052 is within 2^-60.5 of
+//     29*pi/2), so below |r| = 2^-30 the large reduction is used instead.
+//   - otherwise: x's 53-bit mantissa times a 192-bit window of the bits of
+//     2/pi, in 32-bit integer limbs (Payne-Hanek). The bits that would only
+//     add multiples of 4 to x*2/pi are never fetched; what remains gives the
+//     quadrant and the fraction to 2^-128.
+// Max error at any finite x: sin 0.72 ulp, cos 0.72 ulp, tan 0.84 ulp.
+
+// 2/pi as 32-bit words: two zero words, then bits 1..32, 33..64, ...
+let is *u8 as _TWO_OVER_PI with imut = "\x00\x00\x00\x00\x00\x00\x00\x00\x6e\x83\xf9\xa2\x29\x15\x44\x4e\xd1\x57\x27\xfc\xc0\xdd\x34\xf5\x99\x95\x62\xdb\x41\x90\x43\x3c\xab\x63\x51\xfe\x61\xc5\xbb\xde\x3a\x6e\x24\xb7\xe0\xd2\x4d\x42\xea\x2e\x49\x06\x1c\x92\xd1\x09\x1c\xeb\x1d\xfe\x3e\xa7\x29\xb1\xf5\x35\x82\xe8\x84\x44\xbb\x2e\x26\x70\x9c\xe9\x41\x7e\x5f\xb4\x39\xd6\x91\x39\xf4\x39\x53\x83\x8b\x5f\x84\x9c\x3b\x28\xf9\xbd\xff\x97\xf8\x1f\x0f\x98\x05\xde\x8b\x11\x2f\xef\x1f\x6d\x0a\x5a\xcf\x7e\x36\x6d\xb7\x09\xcb\x27\x66\x3f\x46\x4f\x2d\xea\x5f\x9e\xc7\xba\x27\x75\x7b\xf1\xe5\xeb\xf7\x39\x07\x3d\xea\x92\x52\x8a\xb1\x5f\xfb\x6b\x08\x5d\x8d\x1f\x46\x30\x03\x56\xab\x6b\x7b\xfc\x20\xbc\xcf\xf0\x1d\x36\xf4\x9a\x61\x91\xe3\xa9\x08\x1b\xe6\x5e\x5f\x85\x99\x65\x40\x68\xa0\x14\x80\xd8\xff\x8d\x31\x27\x73\x4d";
+
+// Reduction of any finite x by pi/2 (Payne-Hanek). Returns n mod 4 and
+// writes r as out[0] + out[1].
+fn _rem_pio2_big(x as f64, out as *f64) as i64 {
+    let is i64 as ix = *cast(*i64, &x) & 9223372036854775807;
+    let is i64 as ex = (ix >> 52) - 1023;
+    let is u64 as m = cast(u64, (ix & 4503599627370495) | 4503599627370496);
+    // x = m * 2^(ex - 52). Bits b_i of 2/pi with i < ex - 53 contribute
+    // multiples of 4 and are skipped: the window starts at i = ex - 53,
+    // which is bit ex + 10 of the word table (two zero words in front).
+    let is i64 as g = ex + 10;
+    let is i64 as wi = g >> 5;
+    let is u64 as o = cast(u64, g & 31);
+    let is u64 as mask = 4294967295;
+    let is [6]u64 as v;            // the window, least significant limb first
+    let is i64 as j with mut = 0;
+    while (j < 6) {
+        let is i64 as k = wi + 5 - j;
+        let is u64 as w0 = cast(u64, *cast(*u32, _TWO_OVER_PI + k * 4));
+        let is u64 as w1 = cast(u64, *cast(*u32, _TWO_OVER_PI + k * 4 + 4));
+        v[j] = ((w0 << o) | (w1 >> (32 - o))) & mask;
+        j = j + 1;
     }
-    let is i64 as q = cast(i64, nf) & 3;
-    if (q < 0) { return q + 4; }
+    // p = m * window mod 2^192, m taken as a low 32-bit and a high 21-bit limb
+    let is u64 as ml = m & mask;
+    let is u64 as mh = m >> 32;
+    let is [6]u64 as p;
+    let is u64 as c with mut = 0;
+    j = 0;
+    while (j < 6) {
+        let is u64 as t = ml * v[j] + c;
+        p[j] = t & mask;
+        c = t >> 32;
+        j = j + 1;
+    }
+    c = 0;
+    j = 1;
+    while (j < 6) {
+        let is u64 as t2 = mh * v[j - 1] + p[j] + c;
+        p[j] = t2 & mask;
+        c = t2 >> 32;
+        j = j + 1;
+    }
+    // p * 2^-190 = x * 2/pi mod 4: two integer bits, then the fraction. Read
+    // the top 64 fraction bits as signed, which rounds the quotient to the
+    // nearest integer and leaves the fraction in [-1/2, 1/2).
+    let is u64 as a64 = (p[5] << 34) | (p[4] << 2) | (p[3] >> 30);
+    let is u64 as b64 = ((p[3] & 1073741823) << 34) | (p[2] << 2) | (p[1] >> 30);
+    let is i64 as q = cast(i64, ((p[5] >> 30) + (a64 >> 63)) & 3);
+    let is i64 as sa = cast(i64, a64);
+    // fraction = sa * 2^-64 + b64 * 2^-128, as four exact doubles summed to hi + lo
+    let is f64 as fa = cast(f64, sa >> 11) * 1.1102230246251565e-16;
+    let is f64 as fb = cast(f64, sa & 2047) * 5.421010862427522e-20;
+    let is f64 as fc = cast(f64, cast(i64, b64 >> 11)) * 6.018531076210112e-36;
+    let is f64 as fd = cast(f64, cast(i64, b64 & 2047)) * 2.938735877055719e-39;
+    let is f64 as s1 = fa + fb;
+    let is f64 as e1 = (fa - s1) + fb;
+    let is f64 as s2 = s1 + fc;
+    let is f64 as e2 = (s1 - s2) + fc;
+    let is f64 as tl = (e1 + e2) + fd;
+    let is f64 as fh = s2 + tl;
+    let is f64 as fl = (s2 - fh) + tl;
+    // times pi/2, the leading product exact
+    let is f64 as sp = fh * 134217729.0;
+    let is f64 as h1 = sp - (sp - fh);
+    let is f64 as h2 = fh - h1;
+    let is f64 as ph = fh * 1.5707963267948966;
+    let is f64 as pe = ((h1 * 1.5707963407039642 - ph) + h1 * -1.3909067675399456e-08 + h2 * 1.5707963407039642) + h2 * -1.3909067675399456e-08;
+    let is f64 as pl = pe + (fh * 6.123233995736766e-17 + fl * 1.5707963267948966);
+    let is f64 as hi = ph + pl;
+    let is f64 as lo = (ph - hi) + pl;
+    if (x < 0.0) {
+        out[0] = 0.0 - hi;
+        out[1] = 0.0 - lo;
+        return (4 - q) & 3;
+    }
+    out[0] = hi;
+    out[1] = lo;
     return q;
 }
 
-// sin(hi + lo) on [-pi/4, pi/4]: r * (1 - z/3! + z^2/5! - ...), z = r^2, with
-// lo folded in through the derivative.
-fn _sin_poly(hi as f64, lo as f64) as f64 {
+// sin(hi + lo) for |hi| <= pi/4: hi + hi^3 * S(hi^2), S a degree-6 fit
+// (relative error 2^-63), plus lo * cos(hi) to first order.
+fn _sin_k(hi as f64, lo as f64) as f64 {
     let is f64 as z = hi * hi;
-    let is f64 as p with mut = 0.0000000000000028114572543455206;   // 1/17!
-    p = z * p - 0.0000000000007647163731819816;                    // 1/15!
-    p = z * p + 0.00000000016059043836821613;                      // 1/13!
-    p = z * p - 0.000000025052108385441718;                        // 1/11!
-    p = z * p + 0.0000027557319223985893;                          // 1/9!
-    p = z * p - 0.0001984126984126984;                             // 1/7!
-    p = z * p + 0.008333333333333333;                              // 1/5!
-    p = z * p - 0.16666666666666666;                               // 1/3!
-    return hi + (hi * z * p + lo * (1.0 - 0.5 * z));
+    let is f64 as z2 = z * z;
+    let is f64 as s = ((-0.16666666666666666 + z * 0.00833333333333304)
+                    + z2 * (-0.00019841269840959285 + z * 2.7557319071880116e-06))
+                    + (z2 * z2) * ((-2.505207028341921e-08 + z * 1.6054220479718531e-10) + z2 * -7.384541172483793e-13);
+    return hi + (hi * z * s + lo * (1.0 - 0.5 * z));
 }
 
-// cos(hi + lo) on [-pi/4, pi/4]: 1 - z/2! + z^2/4! - ...
-fn _cos_poly(hi as f64, lo as f64) as f64 {
+// cos(hi + lo) for |hi| <= pi/4: 1 - z/2 + z^2 * C(z), z = hi^2, C a degree-5
+// fit (relative error 2^-64). z is formed exactly (z + zl) and 1 - z/2 keeps
+// its rounding error, which near pi/4 would otherwise cost a third of an ulp.
+fn _cos_k(hi as f64, lo as f64) as f64 {
     let is f64 as z = hi * hi;
-    let is f64 as p with mut = 0.00000000000004779477332387385;   // 1/16!
-    p = z * p - 0.000000000011470745597729725;                    // 1/14!
-    p = z * p + 0.0000000020876756987868098;                      // 1/12!
-    p = z * p - 0.00000027557319223985893;                        // 1/10!
-    p = z * p + 0.0000248015873015873;                            // 1/8!
-    p = z * p - 0.001388888888888889;                             // 1/6!
-    p = z * p + 0.041666666666666664;                             // 1/4!
-    p = z * p - 0.5;                                              // 1/2!
-    return 1.0 + (z * p - hi * lo);
+    let is f64 as sp = hi * 134217729.0;
+    let is f64 as h1 = sp - (sp - hi);
+    let is f64 as h2 = hi - h1;
+    let is f64 as zl = ((h1 * h1 - z) + 2.0 * h1 * h2) + h2 * h2;
+    let is f64 as hz = 0.5 * z;
+    let is f64 as w = 1.0 - hz;
+    let is f64 as z2 = z * z;
+    let is f64 as c = z2 * (((0.041666666666666595 + z * -0.0013888888888873342)
+                    + z2 * (2.480158728900208e-05 + z * -2.755731421703886e-07))
+                    + (z2 * z2) * (2.0875705396029103e-09 + z * -1.1358749239915389e-11));
+    return w + ((((1.0 - w) - hz) - (0.5 * zl + hi * lo)) + c);
 }
 
+// The quadrant picks sin or cos of r and the sign. Both kernels are
+// evaluated and the right one is read back from a two-element array: x
+// spread over a few periods would otherwise mispredict the quadrant branch
+// about half the time, which costs more than the second polynomial.
 fn sin(x as f64) as f64 {
-    if (is_finite(x) == 0) { return nan(); }
-    let is f64 as hi with mut = 0.0;
-    let is f64 as lo with mut = 0.0;
-    let is i64 as q = _trig_reduce(x, &hi, &lo);
-    if (q == 0) { return _sin_poly(hi, lo); }
-    if (q == 1) { return _cos_poly(hi, lo); }
-    if (q == 2) { return 0.0 - _sin_poly(hi, lo); }
-    return 0.0 - _cos_poly(hi, lo);
+    let is i64 as ia = *cast(*i64, &x) & 9223372036854775807;
+    if (ia < 4605249457297304856) {
+        if (ia < 4485585228861014016) { return x; }
+        let is f64 as z = x * x;
+        let is f64 as z2 = z * z;
+        return x + x * z * (((-0.16666666666666666 + z * 0.00833333333333304)
+                    + z2 * (-0.00019841269840959285 + z * 2.7557319071880116e-06))
+                    + (z2 * z2) * ((-2.505207028341921e-08 + z * 1.6054220479718531e-10) + z2 * -7.384541172483793e-13));
+    }
+    if (ia < 4699622759393656832) {
+        let is f64 as kd = x * 0.6366197723675814 + 6755399441055744.0;
+        let is f64 as nf = kd - 6755399441055744.0;
+        let is f64 as t1 = x - nf * 1.5707963267341256;
+        let is f64 as w = nf * 6.077100506303966e-11;
+        let is f64 as s = t1 - w;
+        let is f64 as bb = s - t1;
+        let is f64 as e = (t1 - (s - bb)) - (w + bb);
+        let is f64 as v = nf * 2.0222662487959506e-21;
+        let is f64 as hi = s - v;
+        let is f64 as lo = ((s - hi) - v) + e;
+        if (hi > 9.313225746154785e-10 || hi < -9.313225746154785e-10) {
+            let is i64 as q = cast(i64, nf);
+            if ((q & 1) == 0) {
+                let is f64 as sz = hi * hi;
+                let is f64 as sz2 = sz * sz;
+                let is f64 as sp = ((-0.16666666666666666 + sz * 0.00833333333333304)
+                    + sz2 * (-0.00019841269840959285 + sz * 2.7557319071880116e-06))
+                    + (sz2 * sz2) * ((-2.505207028341921e-08 + sz * 1.6054220479718531e-10) + sz2 * -7.384541172483793e-13);
+                let is f64 as rs = hi + (hi * sz * sp + lo * (1.0 - 0.5 * sz));
+                if ((q & 2) == 0) { return rs; }
+                return 0.0 - rs;
+            }
+            let is f64 as cz = hi * hi;
+            let is f64 as cs = hi * 134217729.0;
+            let is f64 as ch1 = cs - (cs - hi);
+            let is f64 as ch2 = hi - ch1;
+            let is f64 as czl = ((ch1 * ch1 - cz) + 2.0 * ch1 * ch2) + ch2 * ch2;
+            let is f64 as chz = 0.5 * cz;
+            let is f64 as cw = 1.0 - chz;
+            let is f64 as cz2 = cz * cz;
+            let is f64 as cc = cz2 * (((0.041666666666666595 + cz * -0.0013888888888873342)
+                    + cz2 * (2.480158728900208e-05 + cz * -2.755731421703886e-07))
+                    + (cz2 * cz2) * (2.0875705396029103e-09 + cz * -1.1358749239915389e-11));
+            let is f64 as rc = cw + ((((1.0 - cw) - chz) - (0.5 * czl + hi * lo)) + cc);
+            if ((q & 2) == 0) { return rc; }
+            return 0.0 - rc;
+        }
+    }
+    return _sincos_big(x, 0);
 }
 
 fn cos(x as f64) as f64 {
-    if (is_finite(x) == 0) { return nan(); }
-    let is f64 as hi with mut = 0.0;
-    let is f64 as lo with mut = 0.0;
-    let is i64 as q = _trig_reduce(x, &hi, &lo);
-    if (q == 0) { return _cos_poly(hi, lo); }
-    if (q == 1) { return 0.0 - _sin_poly(hi, lo); }
-    if (q == 2) { return 0.0 - _cos_poly(hi, lo); }
-    return _sin_poly(hi, lo);
+    let is i64 as ia = *cast(*i64, &x) & 9223372036854775807;
+    if (ia < 4605249457297304856) {
+        if (ia < 4485585228861014016) { return 1.0; }
+        let is f64 as cz = x * x;
+        let is f64 as cs = x * 134217729.0;
+        let is f64 as ch1 = cs - (cs - x);
+        let is f64 as ch2 = x - ch1;
+        let is f64 as czl = ((ch1 * ch1 - cz) + 2.0 * ch1 * ch2) + ch2 * ch2;
+        let is f64 as chz = 0.5 * cz;
+        let is f64 as cw = 1.0 - chz;
+        let is f64 as cz2 = cz * cz;
+        let is f64 as cc = cz2 * (((0.041666666666666595 + cz * -0.0013888888888873342)
+                    + cz2 * (2.480158728900208e-05 + cz * -2.755731421703886e-07))
+                    + (cz2 * cz2) * (2.0875705396029103e-09 + cz * -1.1358749239915389e-11));
+        let is f64 as c0 = cw + ((((1.0 - cw) - chz) - 0.5 * czl) + cc);
+        return c0;
+    }
+    if (ia < 4699622759393656832) {
+        let is f64 as kd = x * 0.6366197723675814 + 6755399441055744.0;
+        let is f64 as nf = kd - 6755399441055744.0;
+        let is f64 as t1 = x - nf * 1.5707963267341256;
+        let is f64 as w = nf * 6.077100506303966e-11;
+        let is f64 as s = t1 - w;
+        let is f64 as bb = s - t1;
+        let is f64 as e = (t1 - (s - bb)) - (w + bb);
+        let is f64 as v = nf * 2.0222662487959506e-21;
+        let is f64 as hi = s - v;
+        let is f64 as lo = ((s - hi) - v) + e;
+        if (hi > 9.313225746154785e-10 || hi < -9.313225746154785e-10) {
+            let is i64 as q = cast(i64, nf) + 1;
+            if ((q & 1) == 0) {
+                let is f64 as sz = hi * hi;
+                let is f64 as sz2 = sz * sz;
+                let is f64 as sp = ((-0.16666666666666666 + sz * 0.00833333333333304)
+                    + sz2 * (-0.00019841269840959285 + sz * 2.7557319071880116e-06))
+                    + (sz2 * sz2) * ((-2.505207028341921e-08 + sz * 1.6054220479718531e-10) + sz2 * -7.384541172483793e-13);
+                let is f64 as rs = hi + (hi * sz * sp + lo * (1.0 - 0.5 * sz));
+                if ((q & 2) == 0) { return rs; }
+                return 0.0 - rs;
+            }
+            let is f64 as cz = hi * hi;
+            let is f64 as cs = hi * 134217729.0;
+            let is f64 as ch1 = cs - (cs - hi);
+            let is f64 as ch2 = hi - ch1;
+            let is f64 as czl = ((ch1 * ch1 - cz) + 2.0 * ch1 * ch2) + ch2 * ch2;
+            let is f64 as chz = 0.5 * cz;
+            let is f64 as cw = 1.0 - chz;
+            let is f64 as cz2 = cz * cz;
+            let is f64 as cc = cz2 * (((0.041666666666666595 + cz * -0.0013888888888873342)
+                    + cz2 * (2.480158728900208e-05 + cz * -2.755731421703886e-07))
+                    + (cz2 * cz2) * (2.0875705396029103e-09 + cz * -1.1358749239915389e-11));
+            let is f64 as rc = cw + ((((1.0 - cw) - chz) - (0.5 * czl + hi * lo)) + cc);
+            if ((q & 2) == 0) { return rc; }
+            return 0.0 - rc;
+        }
+    }
+    return _sincos_big(x, 1);
 }
 
+// sin (which = 0) or cos (which = 1) of x when the reduction above does not
+// apply: NaN and infinities, |x| >= 1.6e6, and x close to a multiple of pi/2.
+fn _sincos_big(x as f64, which as i64) as f64 {
+    if (!(x - x == 0.0)) { return x - x; }
+    let is [2]f64 as rr;
+    let is i64 as q = _rem_pio2_big(x, cast(*f64, &rr)) + which;
+    let is f64 as res with mut = 0.0;
+    if ((q & 1) == 0) { res = _sin_k(rr[0], rr[1]); } else { res = _cos_k(rr[0], rr[1]); }
+    if ((q & 2) != 0) { return 0.0 - res; }
+    return res;
+}
+
+// tan = sin/cos of the reduced argument (or -cos/sin in odd quadrants), with
+// both kept unrounded as hi + lo and the quotient corrected by its exact
+// residual, so the result is rounded once.
 fn tan(x as f64) as f64 {
-    let is f64 as c = cos(x);
-    if (c == 0.0) { return inf(); }
-    return sin(x) / c;
+    let is i64 as ia = *cast(*i64, &x) & 9223372036854775807;
+    if (ia < 4605249457297304856) {
+        if (ia < 4485585228861014016) { return x; }
+        return _tan_k(x, 0.0, 0);
+    }
+    if (ia < 4699622759393656832) {
+        let is f64 as kd = x * 0.6366197723675814 + 6755399441055744.0;
+        let is f64 as nf = kd - 6755399441055744.0;
+        let is f64 as t1 = x - nf * 1.5707963267341256;
+        let is f64 as w = nf * 6.077100506303966e-11;
+        let is f64 as s = t1 - w;
+        let is f64 as bb = s - t1;
+        let is f64 as e = (t1 - (s - bb)) - (w + bb);
+        let is f64 as v = nf * 2.0222662487959506e-21;
+        let is f64 as hi = s - v;
+        let is f64 as lo = ((s - hi) - v) + e;
+        if (hi > 9.313225746154785e-10 || hi < -9.313225746154785e-10) {
+            return _tan_k(hi, lo, cast(i64, nf) & 1);
+        }
+    }
+    if (!(x - x == 0.0)) { return x - x; }
+    let is [2]f64 as rr;
+    let is i64 as q = _rem_pio2_big(x, cast(*f64, &rr));
+    return _tan_k(rr[0], rr[1], q & 1);
 }
 
-// atan via the halving identity atan(a) = 2*atan(a / (1 + sqrt(1 + a^2))).
-// Four applications pull a below 0.05, where the series is exact to the last
-// bit by the a^13 term — cheaper in constants than a minimax rational, and
-// each step costs one hardware sqrt.
+// tan(hi + lo) (odd == 0) or -1/tan(hi + lo) (odd == 1) for |hi| <= pi/4.
+fn _tan_k(hi as f64, lo as f64, odd as i64) as f64 {
+    // sin(r) as sh + sl, cos(r) as ch + cl, each a normalised pair
+    let is f64 as z = hi * hi;
+    let is f64 as z2 = z * z;
+    let is f64 as ss = ((-0.16666666666666666 + z * 0.00833333333333304)
+                     + z2 * (-0.00019841269840959285 + z * 2.7557319071880116e-06))
+                     + (z2 * z2) * ((-2.505207028341921e-08 + z * 1.6054220479718531e-10) + z2 * -7.384541172483793e-13);
+    let is f64 as st = hi * z * ss + lo * (1.0 - 0.5 * z);
+    let is f64 as sh = hi + st;
+    let is f64 as sl = (hi - sh) + st;
+    let is f64 as sp = hi * 134217729.0;
+    let is f64 as h1 = sp - (sp - hi);
+    let is f64 as h2 = hi - h1;
+    let is f64 as zl = ((h1 * h1 - z) + 2.0 * h1 * h2) + h2 * h2;
+    let is f64 as hz = 0.5 * z;
+    let is f64 as cw = 1.0 - hz;
+    let is f64 as cc = z2 * (((0.041666666666666595 + z * -0.0013888888888873342)
+                     + z2 * (2.480158728900208e-05 + z * -2.755731421703886e-07))
+                     + (z2 * z2) * (2.0875705396029103e-09 + z * -1.1358749239915389e-11));
+    let is f64 as ct = (((1.0 - cw) - hz) - (0.5 * zl + hi * lo)) + cc;
+    let is f64 as ch = cw + ct;
+    let is f64 as cl = (cw - ch) + ct;
+    // the quotient q0 corrected by the residual n - q0*d, with q0*d's
+    // leading product exact: tan = s/c, or -cot = -c/s
+    // (1/d is taken once and used for both the quotient and its correction)
+    if (odd == 0) {
+        let is f64 as ri = 1.0 / ch;
+        let is f64 as q0 = sh * ri;
+        let is f64 as sq = q0 * 134217729.0;
+        let is f64 as q1 = sq - (sq - q0);
+        let is f64 as q2 = q0 - q1;
+        let is f64 as sd = ch * 134217729.0;
+        let is f64 as d1 = sd - (sd - ch);
+        let is f64 as d2 = ch - d1;
+        let is f64 as pp = q0 * ch;
+        let is f64 as pe = ((q1 * d1 - pp) + q1 * d2 + q2 * d1) + q2 * d2;
+        return q0 + (((sh - pp) - pe) + (sl - q0 * cl)) * ri;
+    }
+    let is f64 as rk = 1.0 / sh;
+    let is f64 as k0 = ch * rk;
+    let is f64 as sk = k0 * 134217729.0;
+    let is f64 as k1 = sk - (sk - k0);
+    let is f64 as k2 = k0 - k1;
+    let is f64 as ss2 = sh * 134217729.0;
+    let is f64 as e1 = ss2 - (ss2 - sh);
+    let is f64 as e2 = sh - e1;
+    let is f64 as kp = k0 * sh;
+    let is f64 as ke = ((k1 * e1 - kp) + k1 * e2 + k2 * e1) + k2 * e2;
+    return 0.0 - (k0 + (((ch - kp) - ke) + (cl - k0 * sl)) * rk);
+}
+
+// --- Inverse trigonometry ---
+//
+// atan: |x| < 2^-5 directly; |x| >= 32 as pi/2 - atan(1/x); in between, the
+// exponent and top four mantissa bits of |x| pick one of 160 points c (the
+// middle of that sixteenth of a binade) with atan(c) tabulated as hi + lo, and
+//   atan(x) = atan(c) + atan(t),  t = (x - c) / (1 + x*c),  |t| < 1/64.
+// atan(t) = t + t^3 * (degree-3 fit in t^2), relative error 2^-62 for
+// |t| <= 1/32. Max error 0.53 ulp.
+
+// (c, atan(c) hi, atan(c) lo) for the sixteenths of the binades 2^-5 .. 2^5.
+let is *u8 as _ATAN_T with imut = "\x00\x00\x00\x00\x00\x80\xa0\x3f\x7e\xee\xab\xe3\x89\x7e\xa0\x3f\x23\xf5\xf8\x8e\xba\x87\x14\xbc\x00\x00\x00\x00\x00\x80\xa1\x3f\x61\xeb\xbd\xb2\x41\x7e\xa1\x3f\x60\x18\x94\xe6\x08\xc8\x2e\xbc\x00\x00\x00\x00\x00\x80\xa2\x3f\xdf\x94\x0b\xc7\xf0\x7d\xa2\x3f\x98\x32\x7f\xc4\x1f\xdc\x3e\x3c\x00\x00\x00\x00\x00\x80\xa3\x3f\x50\x5a\x87\xa1\x96\x7d\xa3\x3f\xc7\x54\xe3\xca\x30\x46\x41\x3c\x00\x00\x00\x00\x00\x80\xa4\x3f\xb4\x3c\x3f\xc3\x32\x7d\xa4\x3f\x7d\x71\x26\x07\xdb\x00\x4a\x3c\x00\x00\x00\x00\x00\x80\xa5\x3f\xd1\x46\x5e\xad\xc4\x7c\xa5\x3f\x8c\x20\xe5\x92\xb6\xf5\x4a\x3c\x00\x00\x00\x00\x00\x80\xa6\x3f\x76\x04\x2e\xe1\x4b\x7c\xa6\x3f\x35\x94\x78\xc2\xef\xdb\x2e\x3c\x00\x00\x00\x00\x00\x80\xa7\x3f\xdb\xf8\x17\xe0\xc7\x7b\xa7\x3f\xa3\xa6\x8f\x6d\x74\xb2\x31\xbc\x00\x00\x00\x00\x00\x80\xa8\x3f\x14\x14\xa7\x2b\x38\x7b\xa8\x3f\xd9\xdb\xba\x47\xcb\x38\x34\x3c\x00\x00\x00\x00\x00\x80\xa9\x3f\x8d\x27\x89\x45\x9c\x7a\xa9\x3f\xc3\xed\xed\xac\xd9\xa5\x43\xbc\x00\x00\x00\x00\x00\x80\xaa\x3f\x7c\x59\x90\xaf\xf3\x79\xaa\x3f\xd2\x16\x18\xde\x9b\xc1\x2f\x3c\x00\x00\x00\x00\x00\x80\xab\x3f\x50\x97\xb4\xeb\x3d\x79\xab\x3f\xd1\x39\xd7\x4c\x65\xad\x2a\x3c\x00\x00\x00\x00\x00\x80\xac\x3f\xfd\x06\x15\x7c\x7a\x78\xac\x3f\x32\x05\x7d\x6d\xff\x93\xf9\x3b\x00\x00\x00\x00\x00\x80\xad\x3f\x2c\x77\xf9\xe2\xa8\x77\xad\x3f\xa4\x1b\x7d\x81\x1e\x36\x1f\xbc\x00\x00\x00\x00\x00\x80\xae\x3f\x3c\xce\xd3\xa2\xc8\x76\xae\x3f\xb8\xc8\xad\xcd\xa3\xd1\x4d\xbc\x00\x00\x00\x00\x00\x80\xaf\x3f\x09\x78\x41\x3e\xd9\x75\xaf\x3f\x8d\x8a\xf3\x84\x53\x1c\x49\x3c\x00\x00\x00\x00\x00\x80\xb0\x3f\x6f\xc1\xa0\x58\x2a\x7a\xb0\x3f\xd2\xbf\x8f\xaa\xa0\x86\x52\x3c\x00\x00\x00\x00\x00\x80\xb1\x3f\x31\xa9\xac\x88\x0a\x79\xb1\x3f\x08\x10\x28\x08\xfd\x57\x5c\x3c\x00\x00\x00\x00\x00\x80\xb2\x3f\x4d\xec\x02\x0c\xc8\x77\xb2\x3f\xf0\xd7\xc4\x03\xbe\x69\x58\x3c\x00\x00\x00\x00\x00\x80\xb3\x3f\xd8\xb5\xa6\xf1\x60\x76\xb3\x3f\xf0\x5e\x11\xea\x2b\x0c\x50\x3c\x00\x00\x00\x00\x00\x80\xb4\x3f\x9d\xbb\x4b\x4a\xd3\x74\xb4\x3f\x34\xaf\x10\x59\x96\xd3\x10\xbc\x00\x00\x00\x00\x00\x80\xb5\x3f\xcb\x4e\x6c\x28\x1d\x73\xb5\x3f\xd0\x9f\x5c\x4b\x75\x6e\x4e\xbc\x00\x00\x00\x00\x00\x80\xb6\x3f\xb3\x38\x5f\xa0\x3c\x71\xb6\x3f\x9b\x08\xe0\xe8\x4b\x84\x28\x3c\x00\x00\x00\x00\x00\x80\xb7\x3f\x3d\x61\x6d\xc8\x2f\x6f\xb7\x3f\xb9\xcd\x67\x62\x7b\x51\x40\xbc\x00\x00\x00\x00\x00\x80\xb8\x3f\xbf\x3c\xe7\xb8\xf4\x6c\xb8\x3f\x6b\x73\xcf\x15\xd9\xcd\x5d\xbc\x00\x00\x00\x00\x00\x80\xb9\x3f\xfb\xfe\x39\x8c\x89\x6a\xb9\x3f\xce\x07\xf4\xee\xa6\xcf\x51\xbc\x00\x00\x00\x00\x00\x80\xba\x3f\x0a\x91\x04\x5f\xec\x67\xba\x3f\x82\x20\xd1\x1b\xa5\xed\x59\x3c\x00\x00\x00\x00\x00\x80\xbb\x3f\x0a\x48\x2c\x50\x1b\x65\xbb\x3f\xa0\x1b\x33\x87\xfc\x46\x5c\xbc\x00\x00\x00\x00\x00\x80\xbc\x3f\x6a\x5a\xf1\x80\x14\x62\xbc\x3f\x70\x68\xf6\xa3\xca\xfc\x3c\xbc\x00\x00\x00\x00\x00\x80\xbd\x3f\xdc\x11\x03\x15\xd6\x5e\xbd\x3f\x6c\x28\x55\x68\xfd\xb3\x4e\x3c\x00\x00\x00\x00\x00\x80\xbe\x3f\xcf\xb7\x93\x32\x5e\x5b\xbe\x3f\xd5\x2f\xff\x80\xae\x4a\x4d\x3c\x00\x00\x00\x00\x00\x80\xbf\x3f\x90\x3a\x6c\x02\xab\x57\xbf\x3f\x7a\xb1\xc8\xaf\xc3\x26\x4c\xbc\x00\x00\x00\x00\x00\x80\xc0\x3f\x3e\x2b\x21\x84\xd5\x68\xc0\x3f\xfd\x9b\x01\x83\xd2\xe2\x69\xbc\x00\x00\x00\x00\x00\x80\xc1\x3f\x50\x08\x06\x41\x65\x64\xc1\x3f\x92\xea\xe7\x8a\xee\xbc\x66\x3c\x00\x00\x00\x00\x00\x80\xc2\x3f\x5c\x53\x1a\x17\x6e\x5f\xc2\x3f\x10\xa3\xe1\xbd\xd7\xc6\x67\x3c\x00\x00\x00\x00\x00\x80\xc3\x3f\xa4\x99\xeb\xed\xe8\x59\xc3\x3f\xc6\x04\x46\x4e\xd7\x5f\x6a\xbc\x00\x00\x00\x00\x00\x80\xc4\x3f\x9e\x2a\x09\xc6\xce\x53\xc4\x3f\x8b\xa7\xa5\xb3\x53\xf6\x61\x3c\x00\x00\x00\x00\x00\x80\xc5\x3f\x0a\x57\x11\xba\x18\x4d\xc5\x3f\x73\x40\x88\xf2\x82\x82\x61\x3c\x00\x00\x00\x00\x00\x80\xc6\x3f\x74\xaa\xb3\xff\xbf\x45\xc6\x3f\xb4\x2c\x7c\x67\x6b\x53\x3f\xbc\x00\x00\x00\x00\x00\x80\xc7\x3f\x02\xd2\xa7\xe8\xbd\x3d\xc7\x3f\x5d\x66\x4a\x6d\x0f\xad\x55\xbc\x00\x00\x00\x00\x00\x80\xc8\x3f\xc8\xeb\x98\xe3\x0b\x35\xc8\x3f\x0d\xc9\xb9\x32\x13\xa9\x55\xbc\x00\x00\x00\x00\x00\x80\xc9\x3f\x72\x02\x05\x7d\xa3\x2b\xc9\x3f\x64\x47\xff\xd0\xde\xd3\x60\xbc\x00\x00\x00\x00\x00\x80\xca\x3f\xa6\x81\x10\x60\x7e\x21\xca\x3f\x74\xf3\x0a\xa6\xf8\xde\x60\xbc\x00\x00\x00\x00\x00\x80\xcb\x3f\x0c\x78\x4d\x57\x96\x16\xcb\x3f\x73\xa6\x15\xfc\xb8\x5a\x58\xbc\x00\x00\x00\x00\x00\x80\xcc\x3f\x67\x84\x76\x4d\xe5\x0a\xcc\x3f\xdc\x26\x5f\xf5\xdb\x4c\x60\xbc\x00\x00\x00\x00\x00\x80\xcd\x3f\x95\x53\x1d\x4e\x65\xfe\xcc\x3f\xfb\xea\x71\x3f\x9a\x7b\x64\x3c\x00\x00\x00\x00\x00\x80\xce\x3f\x9e\x9d\x4c\x86\x10\xf1\xcd\x3f\x81\x47\xbf\x53\x8b\x81\x35\xbc\x00\x00\x00\x00\x00\x80\xcf\x3f\x0d\x98\x1d\x45\xe1\xe2\xce\x3f\x91\xba\x46\x8c\x70\xa7\x59\xbc\x00\x00\x00\x00\x00\x80\xd0\x3f\xb6\x65\x06\x51\xfa\x25\xd0\x3f\x48\xfa\x32\x68\xdf\x72\x76\xbc\x00\x00\x00\x00\x00\x80\xd1\x3f\xca\x31\x24\x36\x1a\x15\xd1\x3f\x9f\x7b\x07\xc9\x8d\xdc\x74\xbc\x00\x00\x00\x00\x00\x80\xd2\x3f\x96\x7c\xe4\x67\x55\x02\xd2\x3f\x0e\x29\xf4\x28\x23\x83\x61\xbc\x00\x00\x00\x00\x00\x80\xd3\x3f\xfe\x3c\x82\x7a\x98\xed\xd2\x3f\xca\x12\xa0\x8e\x25\x91\x6b\x3c\x00\x00\x00\x00\x00\x80\xd4\x3f\x34\x11\x27\x29\xd1\xd6\xd3\x3f\x8a\x95\xcc\x41\xca\x37\x71\x3c\x00\x00\x00\x00\x00\x80\xd5\x3f\xe7\x90\x68\x58\xee\xbd\xd4\x3f\x57\xa7\x22\x7c\xc7\x4d\x6e\xbc\x00\x00\x00\x00\x00\x80\xd6\x3f\x4e\x0f\x5e\x17\xe0\xa2\xd5\x3f\x57\xe4\x82\x8f\x7a\x3b\x71\x3c\x00\x00\x00\x00\x00\x80\xd7\x3f\xfe\xa6\x5f\x9f\x97\x85\xd6\x3f\x9c\xda\x1a\x4d\x81\x57\x42\xbc\x00\x00\x00\x00\x00\x80\xd8\x3f\x02\x75\x81\x52\x07\x66\xd7\x3f\x00\x76\xcc\x91\x17\xd1\x4d\xbc\x00\x00\x00\x00\x00\x80\xd9\x3f\xd7\x95\xdf\xb8\x22\x44\xd8\x3f\xb6\x41\x9b\x29\xa0\x76\x7d\x3c\x00\x00\x00\x00\x00\x80\xda\x3f\x62\xc6\xd0\x7c\xde\x1f\xd9\x3f\x53\x4b\x05\x88\x41\x07\x71\x3c\x00\x00\x00\x00\x00\x80\xdb\x3f\x02\x80\x16\x66\x30\xf9\xd9\x3f\x9a\x43\xc9\x47\x70\x82\x7c\xbc\x00\x00\x00\x00\x00\x80\xdc\x3f\x8b\x05\x22\x54\x0f\xd0\xda\x3f\xe8\xd2\x91\x38\xc3\xc4\x7f\x3c\x00\x00\x00\x00\x00\x80\xdd\x3f\xa5\x24\x86\x37\x73\xa4\xdb\x3f\xff\x4a\x6e\xb4\xa1\x19\x75\x3c\x00\x00\x00\x00\x00\x80\xde\x3f\xf9\x71\xad\x0a\x55\x76\xdc\x3f\xe4\x43\x70\xff\x8b\x4b\x77\xbc\x00\x00\x00\x00\x00\x80\xdf\x3f\x2b\x86\xec\xc9\xae\x45\xdd\x3f\x2d\xf9\x3e\x16\x21\x94\x68\x3c\x00\x00\x00\x00\x00\x80\xe0\x3f\x34\x5a\x17\x7f\xeb\x77\xde\x3f\x35\x34\xbf\xc1\x3d\xe5\x70\x3c\x00\x00\x00\x00\x00\x80\xe1\x3f\x0c\xa4\xc1\x73\x9c\x03\xe0\x3f\x93\xd5\xc9\x49\xc9\x32\x8b\xbc\x00\x00\x00\x00\x00\x80\xe2\x3f\xda\x43\x5b\x5b\x14\xc6\xe0\x3f\x4f\x40\xb5\x13\xfa\x74\x59\x3c\x00\x00\x00\x00\x00\x80\xe3\x3f\x13\x7c\xbe\x88\x5a\x83\xe1\x3f\x01\xc3\x00\xec\x1c\x62\x8c\x3c\x00\x00\x00\x00\x00\x80\xe4\x3f\x6a\x9e\xcc\xe2\x71\x3b\xe2\x3f\x4e\x22\x38\x9f\x1c\x42\x6c\x3c\x00\x00\x00\x00\x00\x80\xe5\x3f\xca\xcb\x06\x84\x62\xee\xe2\x3f\x8d\xcf\xf0\x9f\x5e\x5d\x8c\x3c\x00\x00\x00\x00\x00\x80\xe6\x3f\x1a\x17\xd4\x1c\x39\x9c\xe3\x3f\x46\xbf\xd8\x31\x43\x30\x82\xbc\x00\x00\x00\x00\x00\x80\xe7\x3f\x56\x5b\x79\x5b\x06\x45\xe4\x3f\xc8\x79\x3f\x16\xd0\x76\x7f\xbc\x00\x00\x00\x00\x00\x80\xe8\x3f\x04\xec\xb6\x5b\xde\xe8\xe4\x3f\x6c\x79\xb3\xbe\x3d\xa3\x84\x3c\x00\x00\x00\x00\x00\x80\xe9\x3f\xbb\x2f\x73\x1f\xd8\x87\xe5\x3f\x50\xa9\xc5\xd8\xc9\xe5\x75\xbc\x00\x00\x00\x00\x00\x80\xea\x3f\x8e\x7b\x5d\x11\x0d\x22\xe6\x3f\xc1\xe8\x0e\x35\x85\xb7\x62\xbc\x00\x00\x00\x00\x00\x80\xeb\x3f\x99\x3d\x0b\x92\x98\xb7\xe6\x3f\x0e\xc5\x88\x61\x38\x80\x8a\xbc\x00\x00\x00\x00\x00\x80\xec\x3f\x0f\x8e\xba\x8f\x97\x48\xe7\x3f\xa1\x84\x58\x16\xa6\xb2\x47\x3c\x00\x00\x00\x00\x00\x80\xed\x3f\x93\xa0\x9f\x28\x28\xd5\xe7\x3f\xa9\x3a\x2f\x1e\x82\x60\x85\x3c\x00\x00\x00\x00\x00\x80\xee\x3f\xc5\xc2\x6c\x57\x69\x5d\xe8\x3f\xc3\xb8\xc8\x7f\x6e\xb6\x66\x3c\x00\x00\x00\x00\x00\x80\xef\x3f\x5e\xc0\x9c\xa9\x7a\xe1\xe8\x3f\x61\x2f\x04\xab\x82\xc1\x7e\xbc\x00\x00\x00\x00\x00\x80\xf0\x3f\x8e\xbd\x35\xa9\x00\xa0\xe9\x3f\xef\xcc\x0d\xdf\x11\x94\x75\x3c\x00\x00\x00\x00\x00\x80\xf1\x3f\x4a\x1d\x5b\xfa\x8a\x90\xea\x3f\x8b\x80\x5f\x5d\xbe\xd7\x75\xbc\x00\x00\x00\x00\x00\x80\xf2\x3f\xda\x5b\xe2\xb4\x91\x72\xeb\x3f\x60\x36\xe6\x26\xcc\x49\x7c\xbc\x00\x00\x00\x00\x00\x80\xf3\x3f\x01\x3d\x2d\xbf\x0a\x47\xec\x3f\x79\x94\x19\xbf\x1d\xa6\x76\x3c\x00\x00\x00\x00\x00\x80\xf4\x3f\xa6\x86\x38\x25\xe2\x0e\xed\x3f\xed\xdd\x93\x37\xf7\xc9\x82\x3c\x00\x00\x00\x00\x00\x80\xf5\x3f\xf4\xa6\xc1\x2d\xf8\xca\xed\x3f\x90\x47\xdd\x3d\xcb\x99\x8f\xbc\x00\x00\x00\x00\x00\x80\xf6\x3f\x87\x0f\x35\x42\x20\x7c\xee\x3f\xd8\x7d\x5a\x8d\x4d\xe1\x60\xbc\x00\x00\x00\x00\x00\x80\xf7\x3f\x72\xb1\xae\x73\x20\x23\xef\x3f\x2c\xfc\xcd\xa2\xb3\xf5\x85\xbc\x00\x00\x00\x00\x00\x80\xf8\x3f\x6c\x92\xec\x71\xb1\xc0\xef\x3f\x4f\x33\xaf\x69\x73\x33\x53\xbc\x00\x00\x00\x00\x00\x80\xf9\x3f\x0c\x6d\x2f\x69\xbf\x2a\xf0\x3f\x05\x1e\x35\x29\x3a\xe0\x97\xbc\x00\x00\x00\x00\x00\x80\xfa\x3f\x21\x3a\xa9\xc6\x13\x71\xf0\x3f\x9f\xe6\xa3\xd3\xc4\x2b\x7c\x3c\x00\x00\x00\x00\x00\x80\xfb\x3f\xae\x23\xca\x4e\x9f\xb3\xf0\x3f\x6c\x01\x5c\x54\x34\x59\x92\x3c\x00\x00\x00\x00\x00\x80\xfc\x3f\x26\xf0\xff\xd9\xa5\xf2\xf0\x3f\x19\x17\x16\xe9\xc2\x6a\x8e\x3c\x00\x00\x00\x00\x00\x80\xfd\x3f\xed\xaa\x32\xfa\x65\x2e\xf1\x3f\xd6\xd8\x14\x8b\xb0\x25\x9f\xbc\x00\x00\x00\x00\x00\x80\xfe\x3f\x65\x32\x20\x5a\x19\x67\xf1\x3f\xae\xc6\x05\xa1\xac\xa5\x91\x3c\x00\x00\x00\x00\x00\x80\xff\x3f\xdd\x03\x06\x1b\xf5\x9c\xf1\x3f\x3d\x50\x2e\xf1\x9c\xb7\x84\xbc\x00\x00\x00\x00\x00\x80\x00\x40\xca\xd5\xc5\x73\xd4\xe8\xf1\x3f\x43\xc1\x05\x25\x5b\x0b\x94\x3c\x00\x00\x00\x00\x00\x80\x01\x40\x11\x31\xf2\xfa\xb4\x45\xf2\x3f\x8b\x31\xfe\xa0\xdb\xca\x9b\xbc\x00\x00\x00\x00\x00\x80\x02\x40\xea\xdb\x7b\xf9\x33\x9a\xf2\x3f\x8d\x02\x2d\xf8\x68\x07\x92\x3c\x00\x00\x00\x00\x00\x80\x03\x40\x54\x3a\x83\x28\x57\xe7\xf2\x3f\xda\x6b\x32\xf7\x3e\x6e\x71\x3c\x00\x00\x00\x00\x00\x80\x04\x40\x21\x1c\xc1\x01\xfe\x2d\xf3\x3f\xb5\x5e\xd7\x39\xaf\xb1\x9c\x3c\x00\x00\x00\x00\x00\x80\x05\x40\x44\x46\xa2\xf2\xe7\x6e\xf3\x3f\xfb\x21\x56\x97\x20\xc8\x92\xbc\x00\x00\x00\x00\x00\x80\x06\x40\x6b\xf2\x41\x86\xb9\xaa\xf3\x3f\xc7\x5b\x17\xcc\x49\xc3\x8d\xbc\x00\x00\x00\x00\x00\x80\x07\x40\x99\x0d\xa0\xae\x00\xe2\xf3\x3f\xfb\xc8\x3d\xda\x4d\x79\x94\xbc\x00\x00\x00\x00\x00\x80\x08\x40\x98\x2f\x1b\x52\x38\x15\xf4\x3f\x98\xee\xb2\xed\x24\x0a\x6b\x3c\x00\x00\x00\x00\x00\x80\x09\x40\x0c\x78\x7d\x3d\xcb\x44\xf4\x3f\x3f\x96\xe1\xda\xdb\x4e\x98\x3c\x00\x00\x00\x00\x00\x80\x0a\x40\xe2\xdd\xfe\x95\x16\x71\xf4\x3f\x2c\x16\x89\x20\xe2\x69\x83\xbc\x00\x00\x00\x00\x00\x80\x0b\x40\x52\x3a\x0c\xe2\x6b\x9a\xf4\x3f\xab\xe1\xda\xcb\x86\x1f\x96\x3c\x00\x00\x00\x00\x00\x80\x0c\x40\x63\x7c\x9f\xbb\x12\xc1\xf4\x3f\x33\x6c\x00\x50\x66\x74\x6f\x3c\x00\x00\x00\x00\x00\x80\x0d\x40\xf8\x6c\x8e\x3b\x4a\xe5\xf4\x3f\xf0\x75\xfb\x3b\x67\x46\x85\xbc\x00\x00\x00\x00\x00\x80\x0e\x40\xc3\x2a\x61\x2a\x4a\x07\xf5\x3f\x90\xb3\x46\x00\x6f\x0b\x87\xbc\x00\x00\x00\x00\x00\x80\x0f\x40\x2b\xa7\xee\x00\x44\x27\xf5\x3f\x38\x43\x84\x64\xa2\x8c\x9c\xbc\x00\x00\x00\x00\x00\x80\x10\x40\x65\x47\xa0\x48\xce\x53\xf5\x3f\x76\xaf\x01\x5b\xa1\xb2\x8f\xbc\x00\x00\x00\x00\x00\x80\x11\x40\x9b\xfc\x4d\x97\x90\x89\xf5\x3f\x56\xdf\x7f\x87\x24\x87\x93\xbc\x00\x00\x00\x00\x00\x80\x12\x40\x73\x0d\x4c\x49\xc9\xb9\xf5\x3f\xae\x72\x1f\xb1\x3c\xbb\x7d\xbc\x00\x00\x00\x00\x00\x80\x13\x40\xc8\xa4\xb1\xb9\x45\xe5\xf5\x3f\x1d\xd3\x3d\xfb\x8a\x1f\x9b\xbc\x00\x00\x00\x00\x00\x80\x14\x40\x4d\x44\x3e\xf0\xad\x0c\xf6\x3f\x6b\xe7\x09\x72\xfc\xca\x91\xbc\x00\x00\x00\x00\x00\x80\x15\x40\x29\xee\xa1\xa2\x8c\x30\xf6\x3f\xdc\xc2\x88\xaa\xfb\x9a\x86\x3c\x00\x00\x00\x00\x00\x80\x16\x40\x5b\xf3\xad\x42\x55\x51\xf6\x3f\x55\xc6\x17\x61\xca\xab\x91\x3c\x00\x00\x00\x00\x00\x80\x17\x40\xd7\xec\xe6\x9f\x68\x6f\xf6\x3f\xda\xb6\x3a\xad\xb3\x96\x72\x3c\x00\x00\x00\x00\x00\x80\x18\x40\x61\x2c\x9d\x7b\x18\x8b\xf6\x3f\xe6\x6a\xd7\x4e\x41\x65\x9e\xbc\x00\x00\x00\x00\x00\x80\x19\x40\x49\xc4\xaa\x53\xaa\xa4\xf6\x3f\xa7\xc2\xcd\x18\x1a\x37\x84\xbc\x00\x00\x00\x00\x00\x80\x1a\x40\xb1\xf3\x2b\x95\x59\xbc\xf6\x3f\x9c\x20\x3d\xc1\xd7\x77\x79\x3c\x00\x00\x00\x00\x00\x80\x1b\x40\x43\x59\x4f\x5b\x59\xd2\xf6\x3f\x7e\x46\x39\x51\xe4\xd3\x96\x3c\x00\x00\x00\x00\x00\x80\x1c\x40\x4b\xd2\xf4\xd4\xd5\xe6\xf6\x3f\x3f\xe9\x1e\xdd\xda\xc3\x5b\x3c\x00\x00\x00\x00\x00\x80\x1d\x40\xef\xd3\x0f\x65\xf5\xf9\xf6\x3f\xe4\x43\x3f\xed\x70\xb0\x99\x3c\x00\x00\x00\x00\x00\x80\x1e\x40\x33\x64\xd9\x8c\xd9\x0b\xf7\x3f\xa8\x24\x10\x98\x5f\x96\x5a\x3c\x00\x00\x00\x00\x00\x80\x1f\x40\xb2\x14\x44\xab\x9f\x1c\xf7\x3f\xbc\x91\x9c\xbd\x2a\xd2\x9e\x3c\x00\x00\x00\x00\x00\x80\x20\x40\xf3\x5f\xc9\x3e\xe8\x33\xf7\x3f\xaf\xb5\x41\xb7\x1c\xaa\x9d\x3c\x00\x00\x00\x00\x00\x80\x21\x40\x78\x85\xf0\xc2\xe3\x4f\xf7\x3f\x77\xe7\x1d\x97\x02\x57\x88\xbc\x00\x00\x00\x00\x00\x80\x22\x40\xfc\xc6\xae\x50\xe2\x68\xf7\x3f\x1b\x48\xf7\x45\xc9\xd3\x87\x3c\x00\x00\x00\x00\x00\x80\x23\x40\x1c\xf1\x48\xd1\x57\x7f\xf7\x3f\x2d\xf4\x1f\x4a\x3a\x11\x72\xbc\x00\x00\x00\x00\x00\x80\x24\x40\x14\x6d\xa5\xf5\xa1\x93\xf7\x3f\x50\xec\xc1\x17\xa3\x36\x94\xbc\x00\x00\x00\x00\x00\x80\x25\x40\xda\xe3\x28\x47\x0d\xa6\xf7\x3f\x83\x16\xaf\x6f\xc3\xcc\x93\xbc\x00\x00\x00\x00\x00\x80\x26\x40\x5e\xad\x30\xe6\xd8\xb6\xf7\x3f\x5b\xfe\xf4\xe4\xb0\xa1\x88\x3c\x00\x00\x00\x00\x00\x80\x27\x40\x02\x5d\xa0\x58\x39\xc6\xf7\x3f\x78\xf3\x6f\x61\xce\x7c\x94\xbc\x00\x00\x00\x00\x00\x80\x28\x40\x33\x66\x9c\xab\x5a\xd4\xf7\x3f\x32\xb8\xf2\x0b\xa1\xec\x98\xbc\x00\x00\x00\x00\x00\x80\x29\x40\x25\x06\xf8\x16\x62\xe1\xf7\x3f\x3d\x59\xb6\x46\xf3\xf2\x7d\x3c\x00\x00\x00\x00\x00\x80\x2a\x40\x6f\x59\x1b\x43\x6f\xed\xf7\x3f\x2e\x19\x22\x0c\xff\xc4\x6c\xbc\x00\x00\x00\x00\x00\x80\x2b\x40\x43\x7f\xcc\x48\x9d\xf8\xf7\x3f\x13\x7f\x9c\xc9\x4a\xb2\x7e\x3c\x00\x00\x00\x00\x00\x80\x2c\x40\x35\x71\xd1\x7b\x03\x03\xf8\x3f\xed\xed\xe8\x3b\xa0\x61\x9d\xbc\x00\x00\x00\x00\x00\x80\x2d\x40\xed\xf7\xd9\x0c\xb6\x0c\xf8\x3f\xac\x62\x0d\x15\x11\x36\x9e\xbc\x00\x00\x00\x00\x00\x80\x2e\x40\x81\xc6\xea\x8b\xc6\x15\xf8\x3f\xc0\xa1\xc0\x41\xb9\x33\x97\x3c\x00\x00\x00\x00\x00\x80\x2f\x40\x3d\x97\x33\x52\x44\x1e\xf8\x3f\xad\x80\xbe\x16\x31\x94\x85\xbc\x00\x00\x00\x00\x00\x80\x30\x40\xff\xf9\xee\xe7\x0a\x2a\xf8\x3f\xea\x85\x93\x69\xd9\x66\x7a\x3c\x00\x00\x00\x00\x00\x80\x31\x40\x43\x89\x69\xca\x2d\x38\xf8\x3f\xb2\xe6\x1f\x8c\x9a\x05\x97\xbc\x00\x00\x00\x00\x00\x80\x32\x40\x76\x61\xe3\xa6\xca\x44\xf8\x3f\xd4\x2c\x7e\xac\xe5\x87\x8b\xbc\x00\x00\x00\x00\x00\x80\x33\x40\x44\xc7\xde\x43\x1d\x50\xf8\x3f\x71\xab\x4b\x9c\x34\x78\x99\xbc\x00\x00\x00\x00\x00\x80\x34\x40\x84\x03\x2f\xcb\x55\x5a\xf8\x3f\xf2\x0f\xf2\xa6\xb0\x0f\x8f\x3c\x00\x00\x00\x00\x00\x80\x35\x40\x72\x11\xe2\x79\x9b\x63\xf8\x3f\x11\x9f\x08\x24\xb5\x89\x9e\x3c\x00\x00\x00\x00\x00\x80\x36\x40\xa8\x4a\xb5\x99\x0e\x6c\xf8\x3f\xbd\xcd\x6d\x98\xfd\xfd\x90\x3c\x00\x00\x00\x00\x00\x80\x37\x40\x82\x3b\x1e\xfa\xc9\x73\xf8\x3f\xfb\x6e\x23\x79\xaf\xe6\x91\x3c\x00\x00\x00\x00\x00\x80\x38\x40\xb3\x5c\x67\x0d\xe4\x7a\xf8\x3f\x04\xc3\xad\x1d\xa7\x61\x9d\x3c\x00\x00\x00\x00\x00\x80\x39\x40\x7a\x65\xfd\xc2\x6f\x81\xf8\x3f\x5e\x10\x56\xa0\xd9\x90\x98\x3c\x00\x00\x00\x00\x00\x80\x3a\x40\x95\x19\x7f\x30\x7d\x87\xf8\x3f\x8d\xda\x86\x2c\xd8\xe5\x9e\xbc\x00\x00\x00\x00\x00\x80\x3b\x40\x8f\x26\x0b\x16\x1a\x8d\xf8\x3f\xc2\x31\x0f\x82\x44\x74\x8a\xbc\x00\x00\x00\x00\x00\x80\x3c\x40\x4c\x8b\xca\x46\x52\x92\xf8\x3f\x8b\xba\x2b\x28\x3d\x37\x91\x3c\x00\x00\x00\x00\x00\x80\x3d\x40\x72\x23\x48\xfc\x2f\x97\xf8\x3f\x60\x72\xab\x1d\xc7\x05\x7b\xbc\x00\x00\x00\x00\x00\x80\x3e\x40\xfe\xc7\x6e\x19\xbc\x9b\xf8\x3f\x8f\xe8\x96\xb6\x2a\x23\x9c\x3c\x00\x00\x00\x00\x00\x80\x3f\x40\x6e\x47\xcd\x60\xfe\x9f\xf8\x3f\x64\xd5\xb7\x50\xa2\x3c\x8f\xbc";
+
 fn atan(x as f64) as f64 {
-    if (is_nan(x) == 1) { return x; }
-    if (is_inf(x) == 1) {
-        if (x > 0.0) { return PI_2; }
-        return 0.0 - PI_2;
+    let is i64 as bx = *cast(*i64, &x);
+    let is i64 as ia = bx & 9223372036854775807;
+    if (ia < 4584664420663164928) {
+        if (ia < 4485585228861014016) { return x; }
+        let is f64 as z = x * x;
+        return x + x * z * ((-0.3333333333333276 + z * 0.199999999942812) + (z * z) * (-0.14285696579278487 + z * 0.1108950942697157));
     }
-    let is i32 as neg with mut = 0;
-    let is f64 as a with mut = x;
-    if (a < 0.0) { a = 0.0 - a; neg = 1; }
-
-    let is i32 as inv with mut = 0;
-    if (a > 1.0) { a = 1.0 / a; inv = 1; }
-
-    let is i32 as k with mut = 0;
-    while (k < 4) {
-        a = a / (1.0 + sqrt(1.0 + a * a));
-        k = k + 1;
+    let is f64 as ax = *cast(*f64, &ia);
+    if (ia < 4629700416936869888) {
+        let is *u8 as tp = _ATAN_T + ((ia >> 48) - 16288) * 24;
+        let is f64 as c = *cast(*f64, tp);
+        let is f64 as t = (ax - c) / (1.0 + ax * c);
+        let is f64 as z = t * t;
+        let is f64 as r = *cast(*f64, tp + 8) + (*cast(*f64, tp + 16) + (t + t * z * ((-0.3333333333333276 + z * 0.199999999942812) + (z * z) * (-0.14285696579278487 + z * 0.1108950942697157))));
+        if (bx < 0) { return 0.0 - r; }
+        return r;
     }
+    if (ia > 9218868437227405312) { return x + x; }
+    let is f64 as u = -1.0 / ax;
+    let is f64 as u2 = u * u;
+    let is f64 as r2 = 1.5707963267948966 + (6.123233995736766e-17 + (u + u * u2 * ((-0.3333333333333276 + u2 * 0.199999999942812) + (u2 * u2) * (-0.14285696579278487 + u2 * 0.1108950942697157))));
+    if (bx < 0) { return 0.0 - r2; }
+    return r2;
+}
 
-    let is f64 as z = a * a;
-    let is f64 as p with mut = 0.07692307692307693;   // 1/13
-    p = z * p - 0.09090909090909091;                  // 1/11
-    p = z * p + 0.1111111111111111;                   // 1/9
-    p = z * p - 0.14285714285714285;                  // 1/7
-    p = z * p + 0.2;                                  // 1/5
-    p = z * p - 0.3333333333333333;                   // 1/3
-    p = z * p + 1.0;
-    let is f64 as r with mut = a * p * 16.0;          // undo the four halvings
+// atan(z + zl) for z >= 0 (zl a correction far below z) as hi + lo: returns
+// hi, writes lo.
+fn _atan_dd(z as f64, zl as f64, lo_out as *f64) as f64 {
+    if (z < 0.03125) {
+        let is f64 as z2 = z * z;
+        *lo_out = zl + z * z2 * ((-0.3333333333333276 + z2 * 0.199999999942812) + (z2 * z2) * (-0.14285696579278487 + z2 * 0.1108950942697157));
+        return z;
+    }
+    if (z < 32.0) {
+        let is *u8 as tp = _ATAN_T + ((*cast(*i64, &z) >> 48) - 16288) * 24;
+        let is f64 as c = *cast(*f64, tp);
+        let is f64 as rd = 1.0 / (1.0 + z * c);
+        let is f64 as t = (z - c) * rd;
+        let is f64 as t2 = t * t;
+        *lo_out = *cast(*f64, tp + 16) + (zl * rd + (t + t * t2 * ((-0.3333333333333276 + t2 * 0.199999999942812) + (t2 * t2) * (-0.14285696579278487 + t2 * 0.1108950942697157))));
+        return *cast(*f64, tp + 8);
+    }
+    let is f64 as u = -1.0 / z;
+    let is f64 as u2 = u * u;
+    *lo_out = 6.123233995736766e-17 + (zl * u2 + (u + u * u2 * ((-0.3333333333333276 + u2 * 0.199999999942812) + (u2 * u2) * (-0.14285696579278487 + u2 * 0.1108950942697157))));
+    return 1.5707963267948966;
+}
 
-    if (inv == 1) { r = PI_2 - r; }
-    if (neg == 1) { r = 0.0 - r; }
+// atan2(y, x) = atan(|y| / |x|) folded into the right quadrant. The quotient
+// is carried as zh + zl (its rounding error, from the exact product zh*|x|),
+// which keeps the rounding of y/x out of the result. Max error 0.53 ulp.
+// Signed zeros and infinities follow C99.
+fn atan2(y as f64, x as f64) as f64 {
+    let is i64 as bx = *cast(*i64, &x);
+    let is i64 as by = *cast(*i64, &y);
+    let is i64 as ix = bx & 9223372036854775807;
+    let is i64 as iy = by & 9223372036854775807;
+    // both in [2^-450, 2^450]: the exact product below stays normal
+    if (ix > 2580562586483294208 && ix < 6633802251116740608 && iy > 2580562586483294208 && iy < 6633802251116740608) {
+        let is f64 as ax = *cast(*f64, &ix);
+        let is f64 as ay = *cast(*f64, &iy);
+        let is f64 as zh = ay / ax;
+        let is f64 as sz = zh * 134217729.0;
+        let is f64 as z1 = sz - (sz - zh);
+        let is f64 as z2 = zh - z1;
+        let is f64 as sa = ax * 134217729.0;
+        let is f64 as a1 = sa - (sa - ax);
+        let is f64 as a2 = ax - a1;
+        let is f64 as p = zh * ax;
+        let is f64 as zl = ((ay - p) - (((z1 * a1 - p) + z1 * a2 + z2 * a1) + z2 * a2)) / ax;
+        // atan(zh + zl) as hi + lo, the three ranges of atan()
+        let is f64 as hi with mut = 0.0;
+        let is f64 as lo with mut = 0.0;
+        if (zh < 0.03125) {
+            let is f64 as t2 = zh * zh;
+            hi = zh;
+            lo = zl + zh * t2 * ((-0.3333333333333276 + t2 * 0.199999999942812) + (t2 * t2) * (-0.14285696579278487 + t2 * 0.1108950942697157));
+        } else if (zh < 32.0) {
+            let is *u8 as tp = _ATAN_T + ((*cast(*i64, &zh) >> 48) - 16288) * 24;
+            let is f64 as c = *cast(*f64, tp);
+            let is f64 as rd = 1.0 / (1.0 + zh * c);
+            let is f64 as t = (zh - c) * rd;
+            let is f64 as t2 = t * t;
+            hi = *cast(*f64, tp + 8);
+            lo = *cast(*f64, tp + 16) + (zl * rd + (t + t * t2 * ((-0.3333333333333276 + t2 * 0.199999999942812) + (t2 * t2) * (-0.14285696579278487 + t2 * 0.1108950942697157))));
+        } else {
+            let is f64 as t = -1.0 / zh;
+            let is f64 as t2 = t * t;
+            hi = 1.5707963267948966;
+            lo = 6.123233995736766e-17 + (zl * t2 + (t + t * t2 * ((-0.3333333333333276 + t2 * 0.199999999942812) + (t2 * t2) * (-0.14285696579278487 + t2 * 0.1108950942697157))));
+        }
+        if (bx >= 0) {
+            if (by < 0) { return 0.0 - (hi + lo); }
+            return hi + lo;
+        }
+        let is f64 as u = 3.141592653589793 - hi;
+        let is f64 as r = u + (((3.141592653589793 - u) - hi) + (1.2246467991473532e-16 - lo));
+        if (by < 0) { return 0.0 - r; }
+        return r;
+    }
+    return _atan2_slow(y, x);
+}
+
+// atan2 for NaN, zero or infinite operands and magnitudes outside
+// [2^-450, 2^450]. Finite non-zero pairs are scaled by a common power of two
+// into range (which leaves the angle alone) unless their ratio is beyond
+// 2^+-60, where the rounding of y/x no longer matters.
+fn _atan2_slow(y as f64, x as f64) as f64 {
+    if (x != x || y != y) { return x + y; }
+    let is i64 as bx = *cast(*i64, &x);
+    let is i64 as by = *cast(*i64, &y);
+    let is i64 as ix = bx & 9223372036854775807;
+    let is i64 as iy = by & 9223372036854775807;
+    let is f64 as ax = *cast(*f64, &ix);
+    let is f64 as ay = *cast(*f64, &iy);
+    let is f64 as r with mut = 0.0;
+    if (iy == 0) {
+        if (bx >= 0) { return y; }
+        r = 3.141592653589793;
+    } else if (ix == 0) {
+        r = 1.5707963267948966;
+    } else if (iy == 9218868437227405312) {
+        if (ix == 9218868437227405312) {
+            if (bx < 0) { r = 2.356194490192345; } else { r = 0.7853981633974483; }
+        } else {
+            r = 1.5707963267948966;
+        }
+    } else if (ix == 9218868437227405312) {
+        if (bx < 0) { r = 3.141592653589793; } else { return y * 0.0; }
+    } else if (iy - ix < 270215977642229760 && ix - iy < 270215977642229760) {
+        // |y/x| within 2^+-60: scale both so that x has exponent 1
+        let is i64 as sb = (2047 - (ix >> 52)) << 52;
+        let is f64 as sc = *cast(*f64, &sb);
+        if ((ix >> 52) == 0 || (iy >> 52) == 0) {
+            // subnormal: scale by 2^600 first so the exponent field is meaningful
+            return atan2(y * 4.149515568880993e+180, x * 4.149515568880993e+180);
+        }
+        return atan2(y * sc, x * sc);
+    } else {
+        let is [1]f64 as lo;
+        let is f64 as hi = _atan_dd(ay / ax, 0.0, cast(*f64, &lo));
+        if (bx >= 0) {
+            r = hi + lo[0];
+        } else {
+            let is f64 as u = 3.141592653589793 - hi;
+            r = u + (((3.141592653589793 - u) - hi) + (1.2246467991473532e-16 - lo[0]));
+        }
+        if (r == 0.0) { return y * 0.0; }
+    }
+    if (by < 0) { return 0.0 - r; }
     return r;
 }
 
-fn atan2(y as f64, x as f64) as f64 {
-    if (is_nan(x) == 1) { return x; }
-    if (is_nan(y) == 1) { return y; }
-    if (x == 0.0) {
-        if (y > 0.0) { return PI_2; }
-        if (y < 0.0) { return 0.0 - PI_2; }
-        return 0.0;
-    }
-    let is f64 as a = atan(y / x);
-    if (x > 0.0) { return a; }
-    if (y >= 0.0) { return a + PI; }
-    return a - PI;
-}
-
+// asin(x) = x + x^3 * R(x^2) on |x| <= 1/2, R a degree-14 fit (relative error
+// 2^-64). Above 1/2, asin(x) = pi/2 - 2*asin(s) with s = sqrt((1 - |x|)/2):
+// 1 - |x| is exact there, s^2 is exactly that w (so R takes w itself), and s
+// is carried as sh + sl. acos uses the same pieces. Max error 0.61 ulp
+// (asin), 0.58 ulp (acos).
 fn asin(x as f64) as f64 {
-    if (is_nan(x) == 1) { return x; }
-    if (x > 1.0 || x < 0.0 - 1.0) { return nan(); }
-    if (x == 1.0) { return PI_2; }
-    if (x == 0.0 - 1.0) { return 0.0 - PI_2; }
-    return atan(x / sqrt(1.0 - x * x));
+    let is i64 as bx = *cast(*i64, &x);
+    let is i64 as ia = bx & 9223372036854775807;
+    if (ia <= 4602678819172646912) {
+        if (ia < 4485585228861014016) { return x; }
+        let is f64 as z = x * x;
+        let is f64 as z2 = z * z;
+        let is f64 as z4 = z2 * z2;
+        return x + x * z * (((0.16666666666666669 + z * 0.07499999999999293) + z2 * (0.04464285714380321 + z * 0.03038194438033414))
+            + z4 * (((0.022372161649327673 + z * 0.01735269876560315) + z2 * (0.013965989964724371 + z * 0.011537687229234405))
+            + z4 * (((0.009886895150607937 + z * 0.007580495008852893) + z2 * (0.01111799788313778 + z * -0.006347163847998537))
+            + z4 * ((0.035378943085785985 + z * -0.03849025109798936) + z2 * 0.038035916133267976))));
+    }
+    if (ia >= 4607182418800017408) {
+        if (ia == 4607182418800017408) { return x * 1.5707963267948966; }
+        return (x - x) / (x - x);
+    }
+    let is f64 as ax = *cast(*f64, &ia);
+    let is f64 as w = (1.0 - ax) * 0.5;
+    let is f64 as sh = __builtin_sqrt(w);
+    let is f64 as sp = sh * 134217729.0;
+    let is f64 as s1 = sp - (sp - sh);
+    let is f64 as s2 = sh - s1;
+    let is f64 as sq = sh * sh;
+    let is f64 as sl = ((w - sq) - (((s1 * s1 - sq) + 2.0 * s1 * s2) + s2 * s2)) / (sh + sh);
+    let is f64 as u = 1.5707963267948966 - 2.0 * sh;
+    let is f64 as w2 = w * w;
+    let is f64 as w4 = w2 * w2;
+    let is f64 as rw = (((0.16666666666666669 + w * 0.07499999999999293) + w2 * (0.04464285714380321 + w * 0.03038194438033414))
+            + w4 * (((0.022372161649327673 + w * 0.01735269876560315) + w2 * (0.013965989964724371 + w * 0.011537687229234405))
+            + w4 * (((0.009886895150607937 + w * 0.007580495008852893) + w2 * (0.01111799788313778 + w * -0.006347163847998537))
+            + w4 * ((0.035378943085785985 + w * -0.03849025109798936) + w2 * 0.038035916133267976))));
+    let is f64 as res = u + (((1.5707963267948966 - u) - 2.0 * sh) + (6.123233995736766e-17 - 2.0 * (sl + sh * w * rw)));
+    if (bx < 0) { return 0.0 - res; }
+    return res;
 }
 
 fn acos(x as f64) as f64 {
-    if (is_nan(x) == 1) { return x; }
-    if (x > 1.0 || x < 0.0 - 1.0) { return nan(); }
-    return PI_2 - asin(x);
+    let is i64 as bx = *cast(*i64, &x);
+    let is i64 as ia = bx & 9223372036854775807;
+    if (ia <= 4602678819172646912) {
+        let is f64 as z = x * x;
+        let is f64 as z2 = z * z;
+        let is f64 as z4 = z2 * z2;
+        let is f64 as rz = (((0.16666666666666669 + z * 0.07499999999999293) + z2 * (0.04464285714380321 + z * 0.03038194438033414))
+            + z4 * (((0.022372161649327673 + z * 0.01735269876560315) + z2 * (0.013965989964724371 + z * 0.011537687229234405))
+            + z4 * (((0.009886895150607937 + z * 0.007580495008852893) + z2 * (0.01111799788313778 + z * -0.006347163847998537))
+            + z4 * ((0.035378943085785985 + z * -0.03849025109798936) + z2 * 0.038035916133267976))));
+        let is f64 as u = 1.5707963267948966 - x;
+        return u + (((1.5707963267948966 - u) - x) + (6.123233995736766e-17 - x * z * rz));
+    }
+    if (ia >= 4607182418800017408) {
+        if (ia == 4607182418800017408) {
+            if (bx < 0) { return 3.141592653589793; }
+            return 0.0;
+        }
+        return (x - x) / (x - x);
+    }
+    let is f64 as ax = *cast(*f64, &ia);
+    let is f64 as w = (1.0 - ax) * 0.5;
+    let is f64 as sh = __builtin_sqrt(w);
+    let is f64 as sp = sh * 134217729.0;
+    let is f64 as s1 = sp - (sp - sh);
+    let is f64 as s2 = sh - s1;
+    let is f64 as sq = sh * sh;
+    let is f64 as sl = ((w - sq) - (((s1 * s1 - sq) + 2.0 * s1 * s2) + s2 * s2)) / (sh + sh);
+    let is f64 as w2 = w * w;
+    let is f64 as w4 = w2 * w2;
+    let is f64 as tail = sl + sh * w * (((0.16666666666666669 + w * 0.07499999999999293) + w2 * (0.04464285714380321 + w * 0.03038194438033414))
+            + w4 * (((0.022372161649327673 + w * 0.01735269876560315) + w2 * (0.013965989964724371 + w * 0.011537687229234405))
+            + w4 * (((0.009886895150607937 + w * 0.007580495008852893) + w2 * (0.01111799788313778 + w * -0.006347163847998537))
+            + w4 * ((0.035378943085785985 + w * -0.03849025109798936) + w2 * 0.038035916133267976))));
+    if (bx >= 0) { return 2.0 * sh + 2.0 * tail; }
+    let is f64 as u = 3.141592653589793 - 2.0 * sh;
+    return u + (((3.141592653589793 - u) - 2.0 * sh) + (1.2246467991473532e-16 - 2.0 * tail));
 }
 
-// sqrt(x^2 + y^2) without letting the intermediate square overflow or flush
-// to zero when the operands are extreme.
+// sqrt(x^2 + y^2). When the sum of squares lands in [2^-968, DBL_MAX] it is
+// used as is: a square that underflowed there is far below the last bit of
+// the other, and nothing overflowed. Outside that range (and for NaN or
+// infinite operands) the operands are scaled by a power of two first. Max
+// error 1.11 ulp. This is a deliberate trade: a version with the squares
+// and the square root corrected by their exact residuals (0.5 ulp) measured
+// four times slower, and hypot is typically called in a loop's escape test.
 fn hypot(x as f64, y as f64) as f64 {
-    let is f64 as ax = abs_f64(x);
-    let is f64 as ay = abs_f64(y);
-    let is f64 as hi = max_f64(ax, ay);
-    let is f64 as lo = min_f64(ax, ay);
-    if (hi == 0.0) { return 0.0; }
-    let is f64 as t = lo / hi;
-    return hi * sqrt(1.0 + t * t);
+    let is f64 as s = x * x + y * y;
+    if (s >= 4.008336720017946e-292 && s <= 1.7976931348623157e308) { return __builtin_sqrt(s); }
+    return _hypot_slow(x, y);
+}
+
+// hypot for NaN, infinite or zero operands and sums of squares outside
+// [2^-968, DBL_MAX]. An infinite operand gives inf even if the other is NaN.
+fn _hypot_slow(x as f64, y as f64) as f64 {
+    let is i64 as ix = *cast(*i64, &x) & 9223372036854775807;
+    let is i64 as iy = *cast(*i64, &y) & 9223372036854775807;
+    if (ix == 9218868437227405312 || iy == 9218868437227405312) { return inf(); }
+    if (ix > 9218868437227405312 || iy > 9218868437227405312) { return x + y; }
+    let is i64 as ia with mut = ix;
+    let is i64 as ib with mut = iy;
+    if (iy > ix) {
+        ia = iy;
+        ib = ix;
+    }
+    // b zero, or below 2^-60 of a: the result rounds to a
+    if (ib == 0 || ia - ib > 270215977642229760) { return *cast(*f64, &ia); }
+    if (ia > 6633802251116740608) {
+        let is f64 as xs = x * 2.409919865102884e-181;
+        let is f64 as ys = y * 2.409919865102884e-181;
+        return __builtin_sqrt(xs * xs + ys * ys) * 4.149515568880993e+180;
+    }
+    let is f64 as xt = x * 5.260135901548374e+210;
+    let is f64 as yt = y * 5.260135901548374e+210;
+    return __builtin_sqrt(xt * xt + yt * yt) * 1.90109156629516e-211;
 }
