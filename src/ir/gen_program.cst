@@ -309,6 +309,35 @@ fn _ret_kind(node as *ast.Node) as i64 {
     return 2;
 }
 
+// The System V places of a function's arguments (g.abi_codes), the hidden
+// sret pointer first when there is one, or null when its arguments keep
+// their positions: a target other than x86_64, a variadic or naked
+// function, or no float parameter.
+fn _param_codes(node as *ast.Node, has_sret as i32, n as i32) as *i32 {
+    if (g.xmm_args_abi() == 0 || node.is_variadic == 1 || ast.nx_is_naked(node) == 1 || n <= 0) { return cast(*i32, 0); }
+    let is *u8 as is_flt = d.opt_alloc(cast(i64, n) + 8);
+    let is i32 as k with mut = 0;
+    let is i32 as any with mut = 0;
+    if (has_sret == 1) { is_flt[0] = cast(u8, 0); k = 1; }
+    let is *ast.Node as p with mut = node.params;
+    while (cast(i64, p) != 0 && k < n) {
+        is_flt[k] = cast(u8, 0);
+        if (cast(i64, p.ty) != 0 && g.is_float_kind(p.ty.kind) == 1) { is_flt[k] = cast(u8, 1); any = 1; }
+        k = k + 1;
+        p = p.next;
+    }
+    if (any == 0) { d.opt_free(is_flt); return cast(*i32, 0); }
+    let is *i32 as codes = cast(*i32, d.opt_alloc(cast(i64, n) * 4 + 8));
+    g.abi_codes(is_flt, n, codes);
+    d.opt_free(is_flt);
+    return codes;
+}
+
+fn _param_get_arg(codes as *i32, idx as i32, line as i32) as i32 {
+    if (cast(i64, codes) == 0) { return g.emit_get_arg(idx, line); }
+    return g.emit_get_arg_at(idx, *(cast(*i32, cast(i64, codes) + cast(i64, idx) * 4)), line);
+}
+
 fn regen_func_ir(func as *d.IRFunction) as void {
     let is *ast.Node as node = cast(*ast.Node, func.ast_node);
     if (cast(i64, node) == 0 || cast(i64, node.body) == 0) { return; }
@@ -328,6 +357,7 @@ fn regen_func_ir(func as *d.IRFunction) as void {
     g.ctx_func = func;
     func.alloc_stack_size = 0;
     func.ret_kind = _ret_kind(node);
+    g.set_ret_float(node.return_type);
 
     if (node.body.kind == ast.NK_BLOCK) {
         let is i32 as param_count with mut = 0;
@@ -349,12 +379,14 @@ fn regen_func_ir(func as *d.IRFunction) as void {
         let is i64 as av_bytes with mut = cast(i64, param_count) * 4;
         if (av_bytes < 8) { av_bytes = 8; }
         let is *i32 as arg_vregs = cast(*i32, d.opt_alloc(av_bytes));
+        let is *i32 as pcodes = _param_codes(node, g.ctx_has_sret, param_count);
         let is i32 as avi with mut = 0;
         p = node.params;
         while (cast(i64, p) != 0) {
-            arg_vregs[avi] = g.emit_get_arg(arg_idx, g.tok_line(p.tok_idx));
+            arg_vregs[avi] = _param_get_arg(pcodes, arg_idx, g.tok_line(p.tok_idx));
             avi = avi + 1; arg_idx = arg_idx + 1; p = p.next;
         }
+        if (cast(i64, pcodes) != 0) { d.opt_free(cast(*u8, pcodes)); }
         avi = 0; p = node.params;
         while (cast(i64, p) != 0) {
             let is i32 as av = arg_vregs[avi];
@@ -498,6 +530,7 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
 
                 g.ctx_func = func;
                 func.ret_kind = _ret_kind(node);
+                g.set_ret_float(node.return_type);
 
                 if (node.body.kind == ast.NK_BLOCK && func.is_naked == 1) {
                     // Naked: NO parameter materialization (the asm body reads args
@@ -522,14 +555,16 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                     let is i64 as avf_bytes with mut = cast(i64, func.num_args) * 4;
                     if (avf_bytes < 8) { avf_bytes = 8; }
                     let is *i32 as arg_vregs_fn = cast(*i32, d.opt_alloc(avf_bytes));
+                    let is *i32 as pcodes_fn = _param_codes(node, g.ctx_has_sret, func.num_args);
                     let is i32 as arg_vi with mut = 0;
                     p = node.params;
                     while (cast(i64, p) != 0) {
-                        arg_vregs_fn[arg_vi] = g.emit_get_arg(arg_idx, g.tok_line(p.tok_idx));
+                        arg_vregs_fn[arg_vi] = _param_get_arg(pcodes_fn, arg_idx, g.tok_line(p.tok_idx));
                         arg_vi = arg_vi + 1;
                         arg_idx = arg_idx + 1;
                         p = p.next;
                     }
+                    if (cast(i64, pcodes_fn) != 0) { d.opt_free(cast(*u8, pcodes_fn)); }
                     // Now store/copy args to local vars
                     arg_vi = 0;
                     p = node.params;

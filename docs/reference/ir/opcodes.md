@@ -161,19 +161,20 @@ Codegen restores callee-saved registers and emits `ret`.
 Reads a function argument by index into a destination vreg.
 
 - `dest`: V(d) -- destination vreg
-- `src1`: I(idx) -- argument index (0-based)
-- `src2`: unused
+- `src1`: I(idx) -- argument index (0-based position)
+- `src2`: I(place) -- on x86_64, for a non-variadic function with a float parameter, where the argument lives: 0-5 an integer register, 100+k `xmmk`, 6+s stack slot s. Unused (`OP_NONE`) otherwise, and then the position is the place.
 
-For indices 0-5, reads from the System V ABI registers (rdi, rsi, rdx, rcx, r8, r9). For index 6+, reads from the stack at `[rbp + 16 + (idx-6)*8]`.
+Place 0-5 reads from the System V ABI registers (rdi, rsi, rdx, rcx, r8, r9); place 100+k from xmm0-xmm7; place 6+ from the stack at `[rbp + 16 + (place-6)*8]`. Integers and floats are numbered separately, the System V way, and arguments that do not fit go on the stack in argument order. Inlining and tail calls match SET_ARG to GET_ARG by position.
 
 ### IR_SET_ARG (32) -- Set Call Argument
 Prepares an argument for a subsequent IR_CALL.
 
 - `dest`: I(idx) -- argument index
 - `src1`: V(s) -- the value vreg
-- `cast_to`: argument type pointer (currently unused in codegen)
+- `src2`: I(place) -- as for IR_GET_ARG, when the call has a float argument on x86_64
+- `cast_to`: the argument type for a float argument of an extern call (System V, f32 narrowed), else unused
 
-For indices 0-5, moves the value into the corresponding ABI register. For index 6+, pushes the value onto the stack.
+Place 0-5 moves the value into the corresponding ABI register, 100+k into `xmmk` (an f64 value), 6+ pushes it onto the stack. A float result of a Caustic function comes back in xmm0 (IR_RET carries the float return type in `cast_to`).
 
 ### IR_SET_SYS_ARG (33) -- Set Syscall Argument
 Prepares an argument for a subsequent IR_SYSCALL.

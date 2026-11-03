@@ -191,6 +191,44 @@ fn gen_bitwise(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i
     return r;
 }
 
+// Any argument a float (one byte per argument)?
+fn _any_flt(is_flt as *u8, n as i32) as i32 {
+    let is i32 as j with mut = 0;
+    while (j < n) { if (is_flt[j] == cast(u8, 1)) { return 1; } j = j + 1; }
+    return 0;
+}
+
+// SET_ARGs of an x86_64 call with a float argument, System V places
+// (g.abi_codes): the stack ones last argument first (push order) after the
+// `sub rsp, 8` an odd count needs, then the registers. Returns the stack count.
+fn _emit_xmm_abi_args(arg_vregs as *u8, is_flt as *u8, n as i32, line as i32) as i32 {
+    let is *i32 as codes = cast(*i32, d.opt_alloc(cast(i64, n) * 4 + 8));
+    let is i32 as st = g.abi_codes(is_flt, n, codes);
+    if (st % 2 != 0) {
+        let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
+        pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
+        pa.asm_str_len = 10;
+        pa.line = line;
+        g.emit(pa);
+    }
+    let is i32 as j with mut = n - 1;
+    while (j >= 0) {
+        if (codes[j] >= 6 && codes[j] < 100) {
+            g.emit_set_arg_at(j, codes[j], *(cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4)), line);
+        }
+        j = j - 1;
+    }
+    j = 0;
+    while (j < n) {
+        if (codes[j] < 6 || codes[j] >= 100) {
+            g.emit_set_arg_at(j, codes[j], *(cast(*i32, cast(i64, arg_vregs) + cast(i64, j) * 4)), line);
+        }
+        j = j + 1;
+    }
+    d.opt_free(cast(*u8, codes));
+    return st;
+}
+
 fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
     let is i32 as arg_count with mut = 0;
     let is *ast.Node as a with mut = node.args;
@@ -347,6 +385,9 @@ fn gen_fncall(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
         }
         d.opt_free(cast(*u8, arg_on_stk));
         d.opt_free(cast(*u8, arg_stack_slot));
+    } else if (node.is_variadic == 0 && g.xmm_args_abi() == 1 && _any_flt(arg_is_flt, arg_count) == 1) {
+        // x86_64 with a float argument: System V places (g.abi_codes).
+        stack_args = _emit_xmm_abi_args(arg_vregs, arg_is_flt, arg_count, line);
     } else {
         // Internal Caustic ABI: all args in GPRs
         if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
@@ -1039,11 +1080,14 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is i64 as av_bytes with mut = cast(i64, arg_count) * 4;
         if (av_bytes < 8) { av_bytes = 8; }
         let is *u8 as arg_vregs = d.opt_alloc(av_bytes);
+        let is *u8 as arg_is_flt_i = d.opt_alloc(cast(i64, arg_count) + 8);
         let is i32 as ai with mut = 0;
         a = node.args;
         while (cast(i64, a) != 0) {
             let is *i32 as av = cast(*i32, cast(i64, arg_vregs) + cast(i64, ai) * 4);
             *av = gen_expr(a);
+            arg_is_flt_i[ai] = cast(u8, 0);
+            if (cast(i64, a.ty) != 0 && g.is_float_kind(a.ty.kind) == 1) { arg_is_flt_i[ai] = cast(u8, 1); }
             ai = ai + 1;
             a = a.next;
         }
@@ -1055,9 +1099,15 @@ fn gen_expr(node as *ast.Node) as i32 {
         if (tgt.target_get().arch == tgt.ARCH_AARCH64) { a64 = 1; }
         let is i32 as gpr_limit with mut = 6;
         if (a64 == 1) { gpr_limit = 8; }
+        let is i32 as xmm_abi_i with mut = 0;
+        if (g.xmm_args_abi() == 1 && _any_flt(arg_is_flt_i, arg_count) == 1) { xmm_abi_i = 1; }
+        if (xmm_abi_i == 1) {
+            stack_args = _emit_xmm_abi_args(arg_vregs, arg_is_flt_i, arg_count, line);
+            arg_count = 0;
+        }
         if (arg_count > gpr_limit) { stack_args = arg_count - gpr_limit; }
         if (stack_args % 2 != 0) { padding = 1; }
-        if (padding == 1 && a64 == 0) {
+        if (padding == 1 && a64 == 0 && xmm_abi_i == 0) {
             let is *d.IRInst as pa = d.new_inst(d.IR_ASM);
             pa.asm_str_ptr = d.str_dup("sub rsp, 8", 10);
             pa.asm_str_len = 10;
@@ -1077,6 +1127,7 @@ fn gen_expr(node as *ast.Node) as i32 {
             j = j + 1;
         }
         d.opt_free(arg_vregs);
+        d.opt_free(arg_is_flt_i);
 
         let is i32 as ret_reg = g.emit_call_indirect(fn_ptr_vreg, line);
         // Attach return type for float handling in codegen

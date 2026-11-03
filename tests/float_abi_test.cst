@@ -1,0 +1,99 @@
+// tests/float_abi_test.cst
+//
+// On x86_64 a non-variadic call between Caustic functions passes float
+// arguments in xmm0-xmm7 and returns a float in xmm0, the System V way;
+// integers keep rdi..r9 and whatever does not fit goes on the stack in
+// argument order. These functions mix both kinds past every register limit,
+// return floats directly and through function pointers (which used to read
+// xmm0 while the callee returned in rax), pass an sret pointer alongside
+// floats, recurse with float arguments, and call a variadic function with
+// floats. The wide and single-precision calls are made directly (which the
+// inliner may absorb) and through function pointers (which stay calls).
+//
+// Exit code 0 on success, else the number of the failing check.
+use "../std/io.cst" as io;
+
+struct Big { a as f64; b as i64; c as f64; }
+
+type Mix = fn(i64, f64, i64, f32) as f64;
+type Single = fn(f32, f32) as f32;
+type Wide = fn(i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, i64, f64, f64, f64) as f64;
+
+fn keep(x as i64) as i64 {
+    let is [2]i64 as box;
+    box[0] = x;
+    return box[0];
+}
+
+fn half(x as f64) as f64 {
+    let is [1]f64 as b;
+    b[0] = x * 0.5;
+    return b[0];
+}
+
+fn single(x as f32, y as f32) as f32 {
+    let is [1]f32 as b;
+    b[0] = x * y + 0.25;
+    return b[0];
+}
+
+fn mix(a as i64, b as f64, c as i64, d as f32) as f64 {
+    let is [1]i64 as k;
+    k[0] = a + c;
+    return cast(f64, k[0]) + b * 2.0 + cast(f64, d);
+}
+
+// 8 ints (two on the stack) and 10 floats (two on the stack), interleaved.
+fn wide(i0 as i64, f0 as f64, i1 as i64, f1 as f64, i2 as i64, f2 as f64, i3 as i64, f3 as f64,
+        i4 as i64, f4 as f64, i5 as i64, f5 as f64, i6 as i64, f6 as f64, i7 as i64, f7 as f64,
+        f8 as f64, f9 as f64) as f64 {
+    let is [1]i64 as k;
+    k[0] = i0 + i1 * 2 + i2 * 3 + i3 * 4 + i4 * 5 + i5 * 6 + i6 * 7 + i7 * 8;
+    return cast(f64, k[0]) + f0 + f1 * 2.0 + f2 * 3.0 + f3 * 4.0 + f4 * 5.0 + f5 * 6.0
+        + f6 * 7.0 + f7 * 8.0 + f8 * 9.0 + f9 * 10.0;
+}
+
+fn make(x as f64, n as i64, y as f64) as Big {
+    let is Big as r;
+    r.a = x + y;
+    r.b = n * 2;
+    r.c = x - y;
+    return r;
+}
+
+fn fsum(n as i64, x as f64) as f64 {
+    if (n == 0) { return x; }
+    return fsum(n - 1, x + cast(f64, n) * 0.5);
+}
+
+fn main() as i32 {
+    if (half(9.0) != 4.5) { return 1; }
+    if (single(cast(f32, 1.5), cast(f32, 2.0)) != cast(f32, 3.25)) { return 2; }
+    if (mix(keep(1), 2.5, 3, cast(f32, 0.25)) != 9.25) { return 3; }
+
+    let is Mix as m = fn_ptr(mix);
+    if (call(m, 1, 2.5, 3, cast(f32, 0.25)) != 9.25) { return 4; }
+
+    // ints: 1..8 weighted 1..8 -> 204; floats 0.5 * (1+2+...+10 weighted by itself)
+    let is f64 as w = wide(1, 0.5, 2, 0.5, 3, 0.5, 4, 0.5, 5, 0.5, 6, 0.5, 7, 0.5, 8, 0.5, 0.5, 0.5);
+    if (w != 204.0 + 27.5) { return 5; }
+    let is Wide as wp = fn_ptr(wide);
+    let is f64 as w2 = call(wp, 1, 0.5, 2, 0.5, 3, 0.5, 4, 0.5, 5, 0.5, 6, 0.5, 7, 0.5, 8, 0.5, 0.5, 0.5);
+    if (w2 != 204.0 + 27.5) { return 10; }
+    let is Single as sp = fn_ptr(single);
+    if (call(sp, cast(f32, 1.5), cast(f32, 2.0)) != cast(f32, 3.25)) { return 11; }
+
+    let is Big as b = make(2.0, keep(21), 0.5);
+    if (b.a != 2.5 || b.b != 42 || b.c != 1.5) { return 6; }
+
+    // 0.5 * (1 + 2 + ... + 10) = 27.5
+    if (fsum(10, 0.0) != 27.5) { return 7; }
+
+    let is [64]u8 as buf;
+    let is i64 as n = io.sprintf(cast(*u8, &buf), 64, "%f %d %f", 1.25, 7, half(5.0));
+    let is *u8 as want = "1.250000 7 2.500000";
+    let is i64 as i with mut = 0;
+    while (i < 19) { if (buf[i] != want[i]) { return 8; } i = i + 1; }
+    if (n != 19) { return 9; }
+    return 0;
+}

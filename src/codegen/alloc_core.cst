@@ -389,9 +389,45 @@ fn is_xmm_reg(reg as i32) as i32 {
 // Callee-saved regs for allocation: rbx(3), r12(10), r13(11), r14(12), r15(15)
 // Caller-saved regs (only between calls): rsi(4), rdi(5), r8(6), r9(7), r10(8)
 
+// -O0: ls_argpos[r] is the position of the GET_ARG that reads argument
+// register r (-1 when none). An interval starting before it may not take r:
+// a parameter's vreg written there would overwrite an argument still unread
+// (with float arguments in xmm, an integer parameter's register is no longer
+// the next one in line).
+let is [16]i32 as ls_argpos with mut;
+
+fn _ls_arg_blocked(reg as i32, pos as i32) as i32 {
+    if (reg < 0 || reg >= 16) { return 0; }
+    if (ls_argpos[reg] > pos) { return 1; }
+    return 0;
+}
+
+fn _ls_init_argpos(func as *d.IRFunction) as void {
+    let is i32 as i with mut = 0;
+    while (i < 16) { ls_argpos[i] = cast(i32, 0 - 1); i = i + 1; }
+    let is i32 as pos with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_GET_ARG) {
+            let is i64 as code with mut = inst.src1.imm;
+            if (inst.src2.op_type == d.OP_IMM) { code = inst.src2.imm; }
+            let is i32 as r with mut = cast(i32, 0 - 1);
+            if (code == 0) { r = 5; }
+            if (code == 1) { r = 4; }
+            if (code == 2) { r = 2; }
+            if (code == 3) { r = 1; }
+            if (code == 4) { r = 6; }
+            if (code == 5) { r = 7; }
+            if (r >= 0) { ls_argpos[r] = pos; }
+        }
+        pos = pos + 1;
+        inst = inst.next;
+    }
+}
+
 fn find_free_reg(ctx as *AllocCtx, pos as i32, iv_end as i32, hint as i32) as i32 {
     // Try hint register first (for coalescing MOVs)
-    if (hint >= 0) {
+    if (hint >= 0 && _ls_arg_blocked(hint, pos) == 0) {
         let is i32 as hs = reg_to_slot(hint);
         if (hs >= 0) {
             let is i32 as crosses_call = spans_call(pos, iv_end, ctx);
@@ -422,7 +458,7 @@ fn find_free_reg(ctx as *AllocCtx, pos as i32, iv_end as i32, hint as i32) as i3
     let is i32 as ki with mut = 0;
     while (ki < 10) {
         let is i32 as ri = allowed[ki];
-        if (crosses_call == 1 && is_caller_saved(ri) == 1) {
+        if ((crosses_call == 1 && is_caller_saved(ri) == 1) || _ls_arg_blocked(ri, pos) == 1) {
             ki = ki + 1;
         } else {
             let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ki) * 4);
@@ -459,7 +495,7 @@ fn spill_register(ctx as *AllocCtx, pos as i32, crosses_call as i32) as i32 {
         let is *i32 as ap = cast(*i32, cast(i64, ctx.active_idx) + cast(i64, ki) * 4);
         let is i32 as ai = *ap;
         if (ai >= 0) {
-            if (crosses_call == 1 && is_caller_saved(allowed[ki]) == 1) {
+            if ((crosses_call == 1 && is_caller_saved(allowed[ki]) == 1) || _ls_arg_blocked(allowed[ki], pos) == 1) {
                 ki = ki + 1;
             } else {
                 let is *LiveInterval as aiv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, ai) * sizeof(LiveInterval));
@@ -523,6 +559,7 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
         }
         minst = minst.next;
     }
+    _ls_init_argpos(func);
     // Init active set
     ctx.used_callee_mask = 0;
     ctx.active_idx = cast(*i32, d.opt_alloc(10 * 4));
@@ -590,6 +627,8 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
     }
     ctx.stack_slots = ctx.next_spill - 1;
     d.opt_free(cast(*u8, mov_partner));
+    let is i32 as ci with mut = 0;
+    while (ci < 16) { ls_argpos[ci] = cast(i32, 0 - 1); ci = ci + 1; }
 }
 
 // === get_operand_loc ===

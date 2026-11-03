@@ -90,7 +90,7 @@ Source (.cst) → Lexer → Parser → Semantic → IR → Codegen → Assembly 
 
 ### Key Conventions
 
-- System V AMD64 ABI for function calls (args: rdi, rsi, rdx, rcx, r8, r9)
+- System V AMD64 ABI for function calls (int args: rdi, rsi, rdx, rcx, r8, r9; float args: xmm0-xmm7 and float results in xmm0 for non-variadic calls; variadic calls between Caustic functions keep every argument in general registers)
 - 10 allocatable registers: rbx, r12, r13, r14, r15 (callee-saved) + rsi, rdi, r8, r9, r10 (caller-saved between calls)
 - Module caching to avoid re-parsing imports
 - Manual memory management via `std/mem.cst` heap allocator (5 submodule allocators)

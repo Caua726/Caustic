@@ -1617,7 +1617,9 @@ fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is *d.IRFunction as cf = cast(*d.IRFunction, ctx.func);
         if (cast(i64, cf) != 0 && cf.is_naked == 1) { return; }
         if (inst.src1.op_type != d.OP_NONE) {
-            e.load_op(inst.src1.vreg, ctx, "rax");
+            // A float result goes back in xmm0 (g.set_ret_float).
+            if (e.is_float_type(inst.cast_to) == 1) { e.load_op_xmm(inst.src1.vreg, ctx, "xmm0"); }
+            else { e.load_op(inst.src1.vreg, ctx, "rax"); }
         }
         if (ctx.sw_frameless == 1) { eo.out_line("ret"); return; }
         if (ctx.aligned_stack_size > 0) {
@@ -2255,7 +2257,14 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             arg_skip = cast(*d.IRInst, 0);
             if (skip == 1) { return; }
         }
-        let is i32 as idx = cast(i32, inst.dest.imm);
+        let is i32 as idx with mut = cast(i32, inst.dest.imm);
+        // A System V place (g.abi_codes): xmm k, or the register/stack slot
+        // the position used to name.
+        if (inst.src2.op_type == d.OP_IMM) {
+            let is i32 as code = cast(i32, inst.src2.imm);
+            if (code >= 100) { e.load_op_xmm(inst.src1.vreg, ctx, eo.reg_xmm(16 + code - 100)); return; }
+            idx = code;
+        }
         if (e.is_float_type(inst.cast_to) == 1) {
             // Extern float arg: load to rax/eax then move to xmmN
             e.load_op(inst.src1.vreg, ctx, "rax");
@@ -2285,7 +2294,12 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_GET_ARG) {
-        let is i32 as idx = cast(i32, inst.src1.imm);
+        let is i32 as idx with mut = cast(i32, inst.src1.imm);
+        if (inst.src2.op_type == d.OP_IMM) {
+            let is i32 as gcode = cast(i32, inst.src2.imm);
+            if (gcode >= 100) { e.store_op_xmm(inst.dest.vreg, ctx, eo.reg_xmm(16 + gcode - 100)); return; }
+            idx = gcode;
+        }
         if (idx < 6) {
             e.store_op(inst.dest.vreg, ctx, eo.arg_reg64(idx));
             // An i32 parameter read only through i32 casts is sign-extended
@@ -2373,6 +2387,11 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 if (e.is_signed_type(inst.cast_to) == 1) { eo.out_line("movsx rax, ax"); }
                 else { eo.out_line("movzx eax, ax"); }
             }
+        }
+        // A Caustic function returns a float in xmm0 on x86_64 (g.set_ret_float).
+        if (inst.is_extern_call == 0 && cast(i64, inst.cast_to) != 0 && e.is_float_type(inst.cast_to) == 1) {
+            e.store_op_xmm(inst.dest.vreg, ctx, "xmm0");
+            return;
         }
         if (inst.is_extern_call == 0 && try_call_add(inst, ctx) == 1) { return; }
         e.store_op(inst.dest.vreg, ctx, "rax");
@@ -2533,9 +2552,10 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         e.load_op(inst.src2.vreg, ctx, "rax");
         if (al.al_opt_level >= 1) { eo.ph_invalidate(); }
         eo.out_line("call rax");
-        // Float return: callee returns in xmm0, move to rax for internal ABI
+        // Float return: the callee returns it in xmm0.
         if (cast(i64, inst.cast_to) != 0 && e.is_float_type(inst.cast_to) == 1) {
-            eo.out_line("movq rax, xmm0");
+            e.store_op_xmm(inst.dest.vreg, ctx, "xmm0");
+            return;
         }
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
