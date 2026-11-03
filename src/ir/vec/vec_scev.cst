@@ -195,12 +195,25 @@ fn scev_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32
         let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
         let is *d.IRInst as di = cast(*d.IRInst, *dip);
         if (cast(i64, di) == 0) { return cur; }
-        if (di.op == d.IR_MOV && di.src1.op_type == d.OP_VREG) { cur = di.src1.vreg; }
-        else if (di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && cast(i64, di.cast_to) == cast(i64, di.cast_from)) { cur = di.src1.vreg; }
+        let is i32 as src with mut = cast(i32, 0 - 1);
+        if (di.op == d.IR_MOV && di.src1.op_type == d.OP_VREG) { src = di.src1.vreg; }
+        else if (di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && cast(i64, di.cast_to) == cast(i64, di.cast_from)) { src = di.src1.vreg; }
         else { return cur; }
+        // A copy made before the loop of a variable assigned more than once
+        // holds the value it had then: the variable itself may have changed
+        // by the time the loop (or the code put before it) reads it.
+        if (_scev_def1(def_count, vc, src) == 0 && ctx_inloop(cur) == 0) { return cur; }
+        cur = src;
         guard = guard + 1;
     }
     return cur;
+}
+
+fn _scev_def1(def_count as *i32, vc as i32, v as i32) as i32 {
+    if (v < 0 || v >= vc) { return 0; }
+    let is *i32 as dcp = cast(*i32, cast(i64, def_count) + cast(i64, v) * 4);
+    if (*dcp == 1) { return 1; }
+    return 0;
 }
 
 fn ae_set(out as *AffineExpr, kind as i32, base as i32, base_imm as i64, step as i64, nowrap as i32) as void {
@@ -239,8 +252,27 @@ fn scev_of_operand(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv
 }
 
 // The recursive affine walk. iv is the loop's induction vreg (step iv_step).
+// A value computed before the loop from a variable assigned more than once is
+// its own base: folding that variable into the base would read it again where
+// the loop starts, after it may have changed.
 fn scev_of_vreg(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_step as i64,
                 v as i32, out as *AffineExpr, depth as i32) as void {
+    _scev_core(def_inst, def_count, vc, iv, iv_step, v, out, depth);
+    let is i32 as r = scev_resolve(def_inst, def_count, vc, v);
+    if (cast(i32, out.kind) == AE_INVARIANT && out.base >= 0 && out.base != r && r >= 0 && r < vc
+        && _scev_def1(def_count, vc, out.base) == 0 && ctx_inloop(r) == 0) {
+        ae_set(out, AE_INVARIANT, r, 0, 0, 0);
+    }
+    // Whatever the loop does not assign keeps one value through it (and where
+    // the vector code starts): an opaque base when nothing finer is known.
+    // LICM leaves such address arithmetic before the loop.
+    if (cast(i32, out.kind) == AE_UNKNOWN && cast(i64, sc_inloop) != 0 && r >= 0 && r < vc && ctx_inloop(r) == 0) {
+        ae_set(out, AE_INVARIANT, r, 0, 0, 0);
+    }
+}
+
+fn _scev_core(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_step as i64,
+              v as i32, out as *AffineExpr, depth as i32) as void {
     if (depth > 32) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
     let is i32 as r = scev_resolve(def_inst, def_count, vc, v);
     if (r == iv) { ae_set(out, AE_AFFINE, cast(i32, 0 - 1), 0, iv_step, 1); return; }
@@ -301,6 +333,14 @@ fn scev_of_vreg(def_inst as *i64, def_count as *i32, vc as i32, iv as i32, iv_st
         scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src1.op_type), di.src1.vreg, di.src1.imm, &ab, depth + 1);
         scev_of_operand(def_inst, def_count, vc, iv, iv_step, cast(i32, di.src2.op_type), di.src2.vreg, di.src2.imm, &ai, depth + 1);
         if (cast(i32, ab.kind) == AE_UNKNOWN || cast(i32, ai.kind) == AE_UNKNOWN || ab.step != 0) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+        // An index with a variable part (base + k*scale, k fixed in the loop):
+        // the sum is not one base plus a constant. Computed before the loop it
+        // is a fixed address of its own; inside, it is not representable.
+        if (ai.base != cast(i32, 0 - 1)) {
+            if (ctx_inloop(r) == 1 || cast(i32, ai.kind) != AE_INVARIANT) { ae_set(out, AE_UNKNOWN, cast(i32, 0 - 1), 0, 0, 0); return; }
+            ae_set(out, AE_INVARIANT, r, 0, 0, 0);
+            return;
+        }
         let is i64 as ni = ab.base_imm + scale * ai.base_imm;
         let is i64 as ns = scale * ai.step;
         let is i32 as nw with mut = 0; if (cast(i32, ab.nowrap) == 1 && cast(i32, ai.nowrap) == 1) { nw = 1; }
