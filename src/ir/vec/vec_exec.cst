@@ -17,6 +17,7 @@ use "../cfg.cst" as cfg;
 use "vec_loops.cst" as vl;
 use "vec_scev.cst" as sc;
 use "vec_recur.cst" as rc;
+use "vec_ops.cst" as vo;
 
 fn new_vreg(func as *d.IRFunction) as i32 { let is i32 as v = func.vreg_count; func.vreg_count = func.vreg_count + 1; return v; }
 fn new_label(func as *d.IRFunction) as i32 { let is i32 as v = func.label_count; func.label_count = func.label_count + 1; return v; }
@@ -40,6 +41,21 @@ fn emit_vv(func as *d.IRFunction, ip as *d.IRInst, op as i32, a as i32, b as i32
     ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = b; ni.line = ln;
     *out = nv; return emit(ip, ni);
 }
+// The way out of an AVX2 loop: label lz, vzeroupper, jump to the scalar loop
+// (lab). Legacy SSE run with the upper halves dirty costs hundreds of cycles
+// an instruction on some CPUs (Zen 3 among them).
+fn emit_vzu_exit(ip as *d.IRInst, lz as i32, lab as i32, ln as i32) as *d.IRInst {
+    let is *d.IRInst as l = d.new_inst(d.IR_LABEL);
+    l.dest.op_type = cast(i8, d.OP_LABEL); l.dest.label = lz; l.line = ln;
+    let is *d.IRInst as ip2 with mut = emit(ip, l);
+    let is *d.IRInst as z = d.new_inst(d.IR_VOP);
+    z.dest.label = vo.vo_pack(vo.VO_VZU, 8, 1, 4, 0); z.line = ln;
+    ip2 = emit(ip2, z);
+    let is *d.IRInst as j = d.new_inst(d.IR_JMP);
+    j.dest.op_type = cast(i8, d.OP_LABEL); j.dest.label = lab; j.line = ln;
+    return emit(ip2, j);
+}
+
 // base + off as a fresh vreg (base itself when off is 0); advance cursor. A
 // field array inside a struct sits at a constant offset from the pointer the
 // loop indexes.
@@ -440,7 +456,11 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     ip2 = emit(ip2, ltAm);
     let is *d.IRInst as jzAm = d.new_inst(d.IR_JZ);
     jzAm.src1.op_type = cast(i8, d.OP_VREG); jzAm.src1.vreg = vcondAm;
-    jzAm.dest.op_type = cast(i8, d.OP_LABEL); jzAm.dest.label = hlabel; jzAm.line = ln;
+    // a float map leaves through vzeroupper: the scalar loop it falls back to
+    // is SSE arithmetic (integer maps run on general registers after it)
+    let is i32 as LzM with mut = hlabel;
+    if (isf == 1) { LzM = new_label(func); }
+    jzAm.dest.op_type = cast(i8, d.OP_LABEL); jzAm.dest.label = LzM; jzAm.line = ln;
     ip2 = emit(ip2, jzAm);
     let is i32 as aaA with mut = 0; ip2 = emit_lea(func, ip2, lea_op, base_a, iv, ln, &aaA);
     let is i32 as vlaA = new_vreg(func);
@@ -485,6 +505,7 @@ fn vectorize_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
     let is *d.IRInst as jmpAm = d.new_inst(d.IR_JMP);
     jmpAm.dest.op_type = cast(i8, d.OP_LABEL); jmpAm.dest.label = LvAm; jmpAm.line = ln;
     ip2 = emit(ip2, jmpAm);
+    if (isf == 1) { ip2 = emit_vzu_exit(ip2, LzM, hlabel, ln); }
     let is *d.IRInst as lblSseM = d.new_inst(d.IR_LABEL);
     lblSseM.dest.op_type = cast(i8, d.OP_LABEL); lblSseM.dest.label = LsseM; lblSseM.line = ln;
     ip2 = emit(ip2, lblSseM);
