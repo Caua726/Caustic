@@ -29,12 +29,14 @@ struct RecurrenceDescriptor {
     kind as i8;         // RK_ADD / RK_FADD
     is_float as i8;     // 1 if FP recurrence
     load_addr as i32;   // address vreg of the reduction's input load (s += a[i]), or -1
+    load_size as i64;   // byte size of that load's element type
 }
 
 // Elementwise map: c[i] = a[i] OP b[i] (two-array) or c[i] = a[i] OP k (broadcast,
 // k a loop-invariant f64 scalar). opk: 0=add 1=sub 2=mul 3=div.
 struct MapDescriptor {
     base_c as i32; base_a as i32; base_b as i32;
+    off_c as i64; off_a as i64; off_b as i64;   // constant byte offset of each array
     elem as i64; opk as i8; is_float as i8;
     is_bcast as i8; kvreg as i32;   // broadcast: k scalar vreg (base_b unused)
 }
@@ -60,7 +62,9 @@ fn detect_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop
     let is sc.AffineExpr as aec;
     sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, store.dest.vreg, &aec, 0);
     if (cast(i32, aec.kind) != sc.AE_AFFINE || aec.base < 0 || aec.step == 0) { return 0; }
-    let is i64 as elem with mut = aec.step; if (elem < 0) { elem = 0 - elem; }
+    if (aec.step < 0) { return 0; }
+    let is i64 as elem with mut = aec.step;
+    if (sc.ty_size(store.cast_to) != elem) { return 0; }
     let is i32 as val = sc.scev_resolve(def_inst, def_count, vc, store.src1.vreg);
     let is *d.IRInst as od = sc.scev_sdef(def_inst, def_count, vc, val);
     if (cast(i64, od) == 0) { return 0; }
@@ -79,6 +83,7 @@ fn detect_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop
     let is sc.AffineExpr as aea;
     sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, xd.src1.vreg, &aea, 0);
     if (cast(i32, aea.kind) != sc.AE_AFFINE || aea.base < 0 || aea.step != elem) { return 0; }
+    if (sc.ty_size(xd.cast_to) != elem) { return 0; }
     // global type/op constraints (match v1)
     if (isf == 1 && elem != 8) { return 0; }
     if (isf == 0 && opk != 0 && opk != 1) { return 0; }
@@ -90,10 +95,14 @@ fn detect_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop
     let is i32 as is_bcast with mut = 0;
     let is i32 as kvreg with mut = cast(i32, 0 - 1);
     let is i32 as yd_load with mut = 0;
+    let is i64 as off_b with mut = 0;
     if (cast(i64, yd) != 0 && yd.op == d.IR_LOAD && yd.src1.op_type == d.OP_VREG) {
         let is sc.AffineExpr as aeb;
         sc.scev_of_vreg(def_inst, def_count, vc, iv, iv_step, yd.src1.vreg, &aeb, 0);
-        if (cast(i32, aeb.kind) == sc.AE_AFFINE && aeb.base >= 0 && aeb.step == elem) { base_b = aeb.base; yd_load = 1; }
+        if (cast(i32, aeb.kind) == sc.AE_AFFINE && aeb.base >= 0 && aeb.step == elem) {
+            if (sc.ty_size(yd.cast_to) != elem) { return 0; }
+            base_b = aeb.base; off_b = aeb.base_imm; yd_load = 1;
+        }
     }
     if (yd_load == 0) {
         // broadcast: f64 only, src2 must be loop-invariant
@@ -105,6 +114,7 @@ fn detect_map(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop
         is_bcast = 1; kvreg = r2;
     }
     out.base_c = aec.base; out.base_a = aea.base; out.base_b = base_b;
+    out.off_c = aec.base_imm; out.off_a = aea.base_imm; out.off_b = off_b;
     out.elem = elem; out.opk = cast(i8, opk); out.is_float = cast(i8, isf);
     out.is_bcast = cast(i8, is_bcast); out.kvreg = kvreg;
     return 1;
@@ -187,8 +197,9 @@ fn detect_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.V
     // (s += a[i]) so the executor knows the array base + element stride.
     let is i32 as x_raw with mut = add.src2.vreg; if (a1 != s_acc) { x_raw = add.src1.vreg; }
     let is i32 as load_addr with mut = cast(i32, 0 - 1);
+    let is i64 as load_size with mut = 0;
     let is *d.IRInst as xd = sc.scev_sdef(def_inst, def_count, vc, x_raw);
-    if (cast(i64, xd) != 0 && xd.op == d.IR_LOAD && xd.src1.op_type == d.OP_VREG) { load_addr = xd.src1.vreg; }
+    if (cast(i64, xd) != 0 && xd.op == d.IR_LOAD && xd.src1.op_type == d.OP_VREG) { load_addr = xd.src1.vreg; load_size = sc.ty_size(xd.cast_to); }
 
     // start: pre-loop value feeding s (MOV s = start before the header)
     let is i32 as start_vreg with mut = cast(i32, 0 - 1);
@@ -202,6 +213,7 @@ fn detect_reduction(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.V
     out.kind = cast(i8, RK_ADD); if (is_float == 1) { out.kind = cast(i8, RK_FADD); }
     out.is_float = cast(i8, is_float);
     out.load_addr = load_addr;
+    out.load_size = load_size;
     return 1;
 }
 
