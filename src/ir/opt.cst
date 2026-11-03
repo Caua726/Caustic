@@ -12,6 +12,7 @@ use "opt_gvn.cst" as gvn;
 use "opt_tre.cst" as tre;
 use "opt_bits.cst" as bits;
 use "opt_selfinline.cst" as si;
+use "opt_inline.cst" as inl;
 use "../codegen/target.cst" as tgt;
 
 let is *u8 as opt_prog_ptr with mut;
@@ -224,6 +225,8 @@ fn optimize_func(func as *d.IRFunction) as void {
 fn optimize(prog as *u8) as void {
     d.opt_bins_init();
     opt_prog_ptr = prog;
+    inl.reset();
+    inl.set_optimizer(fn_ptr(optimize_func));
     // Phase 1 now runs per-function inside gen_ir (gen_program.cst)
 }
 
@@ -252,7 +255,10 @@ fn compute_inline_meta(func as *d.IRFunction) as void {
 fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
     let is i64 as ti with mut = 0;
     if (opt_prof_on == 1) { ti = opt_prof_time(); }
-    loop.pass_inline(func, prog);
+    // -O2 decides by cost and copies callees that keep a frame (opt_inline.cst);
+    // -O1, the fast tier, keeps the fixed limits of opt_loop.cst.
+    if (d.ir_opt_level >= 2) { inl.pass_inline_o2(func, prog); }
+    else { loop.pass_inline(func, prog); }
     if (opt_prof_on == 1) { opt_prof_times[9] = opt_prof_times[9] + opt_prof_time() - ti; }
 
     // Phase 3: re-optimize after inlining
@@ -261,11 +267,25 @@ fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
     // -O2: a small recursive function expands one level into itself, off its
     // optimized body (tail recursion already a loop), and is optimized again.
     if (d.ir_opt_level >= 2) {
+        // The copies' frame regions nothing references any more go away first:
+        // the expansion below leaves a function with a frame alone.
+        inl.compact_frame(func);
         let is i32 as round with mut = 0;
         while (round < si.SI_ROUNDS && si.pass_self_inline(func, round) > 0) {
             optimize_func(func);
             if (si.pass_acc_seed(func) > 0) { optimize_func(func); }
             round = round + 1;
         }
+        // Whatever was measured of this body as a callee no longer holds.
+        inl.forget(func);
     }
+}
+
+// Bodies stay unoptimized until their function is emitted (parallel path):
+// the -O2 inliner copies callees from optimized copies of them.
+fn set_raw_bodies(v as i32) as void { inl.set_raw_bodies(v); }
+
+// Whole-program inline order at -O2: callees before callers.
+fn inline_order(prog as *u8, out_n as *i32) as **d.IRFunction {
+    return inl.inline_order(prog, out_n);
 }

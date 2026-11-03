@@ -1,0 +1,196 @@
+// tests/inline_frame_test.cst
+//
+// The -O2 inliner copies callees that keep part of their frame in memory: a
+// local array, a local whose address is taken, a struct local, a struct
+// parameter or result, an rvalue whose field is read (the alloca area). Each
+// copy gets a region of the caller's frame of its own, past the caller's
+// locals, and regions nothing reads any more are squeezed out afterwards.
+// These callees are small and called from loops, so at -O2 they are inlined,
+// several times into one caller and through chains of callees; the results
+// must be what the calls compute. The same file runs at -O0 and -O1, where
+// nothing (or less) is inlined, as the reference.
+//
+// Exit code 0 on success, else the number of the failing check.
+
+struct Vec3 { x as f64; y as f64; z as f64; }
+struct Pair { a as i32; b as i32; }
+struct Rec { tag as i64; vals as [4]i64; }
+
+// --- arrays ---
+
+fn sum_squares(n as i32) as i64 {
+    let is [16]i64 as t;
+    let is i32 as i with mut = 0;
+    while (i < 16) { t[i] = cast(i64, (i + n) * (i + n)); i = i + 1; }
+    let is i64 as s with mut = 0;
+    i = 0;
+    while (i < 16) { s = s + t[i]; i = i + 1; }
+    return s;
+}
+
+// The caller keeps its own array live across copies that write theirs.
+fn arrays_side_by_side() as i64 {
+    let is [8]i64 as mine;
+    let is i32 as i with mut = 0;
+    while (i < 8) { mine[i] = cast(i64, 1000 + i); i = i + 1; }
+    let is i64 as acc with mut = 0;
+    i = 0;
+    while (i < 8) {
+        acc = acc + sum_squares(i) + sum_squares(i + 1) - mine[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+// --- address-taken locals ---
+
+fn bump(p as *i64, by as i64) as void { p[0] = p[0] + by; }
+
+fn via_pointer(x as i64) as i64 {
+    let is i64 as v with mut = x;
+    bump(&v, 3);
+    bump(&v, 4);
+    return v;
+}
+
+fn bits_of(x as f64) as i64 { return *cast(*i64, &x); }
+fn from_bits(b as i64) as f64 { return *cast(*f64, &b); }
+
+// --- structs ---
+
+fn vadd(a as Vec3, b as Vec3) as Vec3 {
+    let is Vec3 as r;
+    r.x = a.x + b.x; r.y = a.y + b.y; r.z = a.z + b.z;
+    return r;
+}
+
+fn vscale(a as Vec3, k as f64) as Vec3 {
+    let is Vec3 as r;
+    r.x = a.x * k; r.y = a.y * k; r.z = a.z * k;
+    return r;
+}
+
+fn vdot(a as Vec3, b as Vec3) as f64 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+fn mkvec(x as f64, y as f64, z as f64) as Vec3 {
+    let is Vec3 as r; r.x = x; r.y = y; r.z = z; return r;
+}
+
+fn mkpair(a as i32, b as i32) as Pair {
+    let is Pair as p; p.a = a; p.b = b; return p;
+}
+
+// Reads a field straight off a call result: the alloca area.
+fn pair_sum(i as i32) as i32 { return mkpair(i, 2 * i).a + mkpair(i, 3).b; }
+
+// Written out rather than as a loop: a summing loop over an array field is
+// vectorized at -O2, which is not what this file is about.
+fn rec_total(r as Rec) as i64 {
+    return r.tag + r.vals[0] + r.vals[1] + r.vals[2] + r.vals[3];
+}
+
+fn fill_rec(t as i64) as Rec {
+    let is Rec as r;
+    r.tag = t;
+    let is i32 as k with mut = 0;
+    while (k < 4) { r.vals[k] = t * cast(i64, k + 1); k = k + 1; }
+    return r;
+}
+
+// --- chains: each level keeps a frame ---
+
+fn leaf(a as i64) as i64 {
+    let is [2]i64 as w;
+    w[0] = a; w[1] = a + 1;
+    return w[0] * w[1];
+}
+
+fn mid(a as i64) as i64 {
+    let is i64 as t with mut = leaf(a);
+    bump(&t, leaf(a + 1));
+    return t;
+}
+
+fn top(a as i64) as i64 {
+    let is [3]i64 as u;
+    u[0] = mid(a); u[1] = mid(a + 2); u[2] = leaf(a);
+    return u[0] + u[1] - u[2];
+}
+
+// Mutual recursion through small functions: the chain must stop.
+fn ping(n as i32) as i32 {
+    if (n <= 0) { return 0; }
+    let is [2]i32 as k; k[0] = n; k[1] = 1;
+    return pong(k[0] - k[1]) + 1;
+}
+
+fn pong(n as i32) as i32 {
+    if (n <= 0) { return 0; }
+    return ping(n - 1) + 2;
+}
+
+fn main() as i32 {
+    // sum over i of (sum_squares(i) + sum_squares(i+1) - (1000 + i))
+    let is i64 as want with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        let is i64 as s1 with mut = 0;
+        let is i64 as s2 with mut = 0;
+        let is i32 as j with mut = 0;
+        while (j < 16) {
+            s1 = s1 + cast(i64, (j + i) * (j + i));
+            s2 = s2 + cast(i64, (j + i + 1) * (j + i + 1));
+            j = j + 1;
+        }
+        want = want + s1 + s2 - cast(i64, 1000 + i);
+        i = i + 1;
+    }
+    if (arrays_side_by_side() != want) { return 1; }
+
+    let is i64 as vp with mut = 0;
+    i = 0;
+    while (i < 10) { vp = vp + via_pointer(cast(i64, i)); i = i + 1; }
+    if (vp != 45 + 70) { return 2; }
+
+    let is f64 as f with mut = 0.0;
+    i = 0;
+    while (i < 5) { f = from_bits(bits_of(f + 1.5)); i = i + 1; }
+    if (f != 7.5) { return 3; }
+
+    let is Vec3 as acc with mut = mkvec(0.0, 0.0, 0.0);
+    i = 1;
+    while (i <= 4) {
+        let is f64 as k = cast(f64, i);
+        acc = vadd(acc, vscale(mkvec(1.0, 2.0, 3.0), k));
+        i = i + 1;
+    }
+    if (acc.x != 10.0 || acc.y != 20.0 || acc.z != 30.0) { return 4; }
+    if (vdot(acc, mkvec(1.0, 1.0, 1.0)) != 60.0) { return 5; }
+
+    let is i32 as ps with mut = 0;
+    i = 0;
+    while (i < 6) { ps = ps + pair_sum(i); i = i + 1; }
+    if (ps != 15 + 18) { return 6; }
+
+    let is i64 as rt with mut = 0;
+    i = 1;
+    while (i <= 3) { rt = rt + rec_total(fill_rec(cast(i64, i))); i = i + 1; }
+    // rec_total(fill_rec(t)) = t + t*(1+2+3+4) = 11t
+    if (rt != 66) { return 7; }
+
+    // top(a) = mid(a) + mid(a+2) - leaf(a), mid(a) = leaf(a) + leaf(a+1),
+    // leaf(a) = a(a+1)
+    let is i64 as tt with mut = 0;
+    i = 0;
+    while (i < 4) { tt = tt + top(cast(i64, i)); i = i + 1; }
+    let is i64 as tw with mut = 0;
+    let is i64 as a with mut = 0;
+    while (a < 4) {
+        tw = tw + (a + 1) * (a + 2) + (a + 2) * (a + 3) + (a + 3) * (a + 4);
+        a = a + 1;
+    }
+    if (tt != tw) { return 8; }
+
+    if (ping(9) != 13) { return 9; }
+    return 0;
+}
