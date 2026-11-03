@@ -111,31 +111,70 @@ fn find_promotable(func as *d.IRFunction, slots as *SlotInfo, out_count as *i32)
     *out_count = count;
 }
 
-// Fast O(1) slot lookup by offset using direct-mapped table
-// off_map[off] = slot_index (or -1). Max offset tracked = 8192.
+// Offset -> promotable-slot-index lookup. Offsets below OFF_MAP_MAX go through
+// a direct-mapped table; the rest through a list sorted by offset. Every
+// promotable slot is reachable, whatever its offset: a slot past the table
+// used to read as "not promotable" here while insert_phis still placed phis
+// for it, so a scalar declared after a large local array stayed in memory.
 let is i32 as OFF_MAP_MAX with imut = 8192;
 
-fn build_off_map(slots as *SlotInfo, count as i32, off_map as *i32) as void {
+struct OffMap {
+    map as *i32;
+    far_off as *i64;
+    far_idx as *i32;
+    nfar as i32;
+}
+
+fn build_off_map(slots as *SlotInfo, count as i32) as *OffMap {
+    let is *OffMap as m = cast(*OffMap, d.opt_alloc(sizeof(OffMap)));
+    m.map = cast(*i32, d.opt_alloc(cast(i64, OFF_MAP_MAX) * 4));
+    m.far_off = cast(*i64, d.opt_alloc(cast(i64, count + 1) * 8));
+    m.far_idx = cast(*i32, d.opt_alloc(cast(i64, count + 1) * 4));
+    m.nfar = 0;
     let is i32 as i with mut = 0;
     while (i < OFF_MAP_MAX) {
-        let is *i32 as p = cast(*i32, cast(i64, off_map) + cast(i64, i) * 4);
+        let is *i32 as p = cast(*i32, cast(i64, m.map) + cast(i64, i) * 4);
         *p = cast(i32, 0 - 1);
         i = i + 1;
     }
     i = 0;
     while (i < count) {
         let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, i) * sizeof(SlotInfo));
-        if (s.promotable == 1 && s.offset >= 0 && s.offset < cast(i64, OFF_MAP_MAX)) {
-            let is *i32 as p = cast(*i32, cast(i64, off_map) + cast(i64, s.offset) * 4);
-            *p = i;
+        if (s.promotable == 1 && s.offset >= 0) {
+            if (s.offset < cast(i64, OFF_MAP_MAX)) {
+                let is *i32 as p = cast(*i32, cast(i64, m.map) + cast(i64, s.offset) * 4);
+                *p = i;
+            } else {
+                // insertion sort by offset (count <= MAX_SLOTS)
+                let is i32 as b with mut = m.nfar - 1;
+                while (b >= 0 && *(cast(*i64, cast(i64, m.far_off) + cast(i64, b) * 8)) > s.offset) {
+                    let is *i64 as d_off = cast(*i64, cast(i64, m.far_off) + cast(i64, b + 1) * 8);
+                    *d_off = *(cast(*i64, cast(i64, m.far_off) + cast(i64, b) * 8));
+                    let is *i32 as d_idx = cast(*i32, cast(i64, m.far_idx) + cast(i64, b + 1) * 4);
+                    *d_idx = *(cast(*i32, cast(i64, m.far_idx) + cast(i64, b) * 4));
+                    b = b - 1;
+                }
+                let is *i64 as ko = cast(*i64, cast(i64, m.far_off) + cast(i64, b + 1) * 8); *ko = s.offset;
+                let is *i32 as ki = cast(*i32, cast(i64, m.far_idx) + cast(i64, b + 1) * 4); *ki = i;
+                m.nfar = m.nfar + 1;
+            }
         }
         i = i + 1;
     }
+    return m;
 }
 
-fn fast_slot_index(off_map as *i32, off as i64) as i32 {
-    if (off < 0 || off >= cast(i64, OFF_MAP_MAX)) { return cast(i32, 0 - 1); }
-    let is *i32 as p = cast(*i32, cast(i64, off_map) + cast(i64, off) * 4);
+fn free_off_map(m as *OffMap) as void {
+    d.opt_free(cast(*u8, m.map));
+    d.opt_free(cast(*u8, m.far_off));
+    d.opt_free(cast(*u8, m.far_idx));
+    d.opt_free(cast(*u8, m));
+}
+
+fn fast_slot_index(m as *OffMap, off as i64) as i32 {
+    if (off < 0) { return cast(i32, 0 - 1); }
+    if (off >= cast(i64, OFF_MAP_MAX)) { return slot_bsearch(m.far_off, m.far_idx, m.nfar, off); }
+    let is *i32 as p = cast(*i32, cast(i64, m.map) + cast(i64, off) * 4);
     return *p;
 }
 
@@ -335,8 +374,7 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
               phi_args as *i32, max_preds as i32, nphi as i32,
               preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
     // Build fast offset→slot map
-    let is *i32 as off_map = cast(*i32, d.opt_alloc(cast(i64, OFF_MAP_MAX) * 4));
-    build_off_map(slots, nslots, off_map);
+    let is *OffMap as off_map = build_off_map(slots, nslots);
 
     // Build per-block phi index: phi_by_block_start[b], phi_by_block_count[b], phi_order[i]
     let is *i32 as pb_count = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
@@ -637,7 +675,7 @@ fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
     d.opt_free(cast(*u8, rn_stack));
     d.opt_free(cast(*u8, rn_child_idx));
     d.opt_free(cast(*u8, rn_save_tops));
-    d.opt_free(cast(*u8, off_map));
+    free_off_map(off_map);
     d.opt_free(cast(*u8, pb_count));
     d.opt_free(cast(*u8, pb_start));
     d.opt_free(cast(*u8, phi_order));
@@ -758,17 +796,8 @@ fn mem2reg(func as *d.IRFunction) as void {
     cfg.build_cfg(func, blocks, cfg_cap, &nblocks, label_to_bb);
     if (nblocks <= 1) {
         // Fast path: single basic block — no phis needed, simple linear forwarding
-        let is *i32 as sb_off_map = cast(*i32, d.opt_alloc(cast(i64, OFF_MAP_MAX) * 4));
+        let is *OffMap as sb_off_map = build_off_map(slots, nslots);
         let is i32 as oi with mut = 0;
-        while (oi < OFF_MAP_MAX) { let is *i32 as op = cast(*i32, cast(i64, sb_off_map) + cast(i64, oi) * 4); *op = cast(i32, 0 - 1); oi = oi + 1; }
-        oi = 0;
-        while (oi < nslots) {
-            let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, oi) * sizeof(SlotInfo));
-            if (s.promotable == 1 && s.offset >= 0 && s.offset < cast(i64, OFF_MAP_MAX)) {
-                let is *i32 as op = cast(*i32, cast(i64, sb_off_map) + cast(i64, s.offset) * 4); *op = oi;
-            }
-            oi = oi + 1;
-        }
         // cur_def[slot] tracks current vreg holding the slot's value
         let is *i32 as cur_def = cast(*i32, d.opt_alloc(cast(i64, nslots) * 4));
         oi = 0;
@@ -813,7 +842,7 @@ fn mem2reg(func as *d.IRFunction) as void {
             sb_inst = sb_inst.next;
         }
         d.opt_free(cast(*u8, cur_def));
-        d.opt_free(cast(*u8, sb_off_map));
+        free_off_map(sb_off_map);
         d.opt_free(cast(*u8, slots));
         d.opt_free(cast(*u8, blocks));
         d.opt_free(cast(*u8, label_to_bb));

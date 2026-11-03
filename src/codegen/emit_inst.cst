@@ -1016,15 +1016,34 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     }
 }
 
+// A scalar conversion (cvtsi2sd, cvtsd2ss, ...) writes only the low lane of
+// its destination and keeps the rest, so it waits for whatever last wrote that
+// register. Inside a loop that chains every iteration to the previous one.
+// Zeroing the register first is recognized by the CPU as dependency-free.
+fn _same_name(a as *u8, b as *u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (a[i] == b[i]) {
+        if (a[i] == cast(u8, 0)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _xmm_break_dep(x as *u8) as void {
+    eo.out_str("  pxor ", 7); eo.out_cstr(x); eo.out_str(", ", 2); eo.out_cstr(x); eo.out_char(10);
+}
+
 // Float vregs retain widened f64 bits. Narrow directly from their assigned
 // XMM register or spill; a GPR bitpattern needs the existing movq bridge.
 fn _load_f32_xmm(vreg as i32, ctx as *al.AllocCtx, dst as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     if (loc < 0) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        _xmm_break_dep(dst);
         eo.out_str("  cvtsd2ss ", 11); eo.out_cstr(dst);
         eo.out_str(", QWORD PTR [", 13); eo.out_fp(off); eo.out_str("]\n", 2);
     } else if (loc >= 16 && loc <= 31) {
+        if (_same_name(eo.reg_xmm(loc), dst) == 0) { _xmm_break_dep(dst); }
         eo.out_str("  cvtsd2ss ", 11); eo.out_cstr(dst);
         eo.out_str(", ", 2); eo.out_cstr(eo.reg_xmm(loc)); eo.out_char(10);
     } else {
@@ -2004,11 +2023,13 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             eo.out_line("shr rcx, 1");
             eo.out_str("  and ", 6); eo.out_cstr(scr); eo.out_str(", 1\n", 4);
             eo.out_str("  or ", 5); eo.out_cstr(scr); eo.out_str(", rcx\n", 6);
+            _xmm_break_dep("xmm0");
             eo.out_str("  ", 2); eo.out_cstr(convert); eo.out_str(" xmm0, ", 7); eo.out_cstr(scr); eo.out_char(10);
             eo.out_str("  ", 2); eo.out_cstr(double_op); eo.out_str(" xmm0, xmm0\n", 12);
             eo.out_str("  jmp ", 6); _float_label(inst.dest.vreg, "_converted"); eo.out_char(10);
             _float_label(inst.dest.vreg, "_small"); eo.out_str(":\n", 2);
         }
+        _xmm_break_dep("xmm0");
         eo.out_str("  ", 2); eo.out_cstr(convert); eo.out_str(" xmm0, ", 7); eo.out_cstr(scr); eo.out_char(10);
         if (wide_unsigned == 1) { _float_label(inst.dest.vreg, "_converted"); eo.out_str(":\n", 2); }
         if (single == 1) { eo.out_line("cvtss2sd xmm0, xmm0"); }
