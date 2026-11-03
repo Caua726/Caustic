@@ -1,0 +1,655 @@
+use "defs.cst" as d;
+use "../parser/ast.cst" as ast;
+
+// === Unroll and jam: U iterations of an outer loop share one inner loop ===
+//
+// -O2, in code generation (the IR is out of SSA form, as pass_unroll sees
+// it), before the vectorizer. The shape is a loop whose body holds one inner
+// loop that sums floats:
+//
+//     while (j <= n) {
+//         pre                       (no stores)
+//         while (i <= m) { body }   (no stores; the same trips for every j)
+//         post                      (the stores)
+//         j = j + c;
+//     }
+//
+// Every addition of the inner body waits for the one before it: one chain,
+// as slow as the latency of an addss. Here U = 4 iterations of j run at once:
+// their pre, inner header and body instruction by instruction, one copy per
+// iteration of what depends on j and a single one of what does not (the
+// inner counter, an address that only follows i), then the four posts in
+// order. Four independent chains in one inner loop, and each one still adds
+// in its own order: the results are the ones the loop computed.
+//
+//   L_j:   j1 = j + c ...   (each variable the loop steps, at j+k)
+//          if (j + (U-1)c > n, compared in 64 bits) goto L_orig
+//          pre x U ; L_ji: inner test ; body x U ; goto L_ji
+//   L_je:  post, post+1, ... ; j = j + Uc ... ; goto L_j
+//   L_orig: the loop as it was, for the iterations left over.
+//
+// What makes the order change safe: the variables the loop carries from one
+// iteration to the next are all stepped by constants (j, a pointer that walks
+// with it); nothing computed in an iteration is read after the loop; the
+// inner trip count reads nothing that depends on j; the only stores are in
+// post, and none of them can reach memory the loop reads before it (each
+// address is one of different named objects: globals or frame slots).
+
+let is i32 as UJ_U with imut = 4;
+let is i32 as UJ_MAX_BODY with imut = 32;
+let is i32 as UJ_MAX_REST with imut = 48;
+
+// per-candidate state
+let is *i64 as uj_a with mut = cast(*i64, 0);     // live instructions in order
+let is i32 as uj_n with mut = 0;
+let is *i32 as uj_lpos with mut = cast(*i32, 0);  // label -> position
+let is *i32 as uj_lref with mut = cast(*i32, 0);  // label -> references
+let is i32 as uj_nl with mut = 0;
+let is i32 as uj_nv with mut = 0;
+let is *u8 as uj_ind with mut = cast(*u8, 0);     // defined in the loop
+let is *u8 as uj_isc with mut = cast(*u8, 0);     // carried: stepped by a constant
+let is *i64 as uj_step with mut = cast(*i64, 0);
+let is *i64 as uj_sadd with mut = cast(*i64, 0);  // the step's ADD (its type)
+let is *i64 as uj_cdef with mut = cast(*i64, 0);  // the carried variable's def in the loop
+let is *u8 as uj_dep with mut = cast(*u8, 0);     // depends on j
+let is *u8 as uj_need with mut = cast(*u8, 0);    // per position in the loop
+let is *i32 as uj_map with mut = cast(*i32, 0);   // vreg * U + k -> its copy
+// labels from uj_lbase up are this pass's own: a loop it built is not jammed again
+let is *d.IRFunction as uj_fn with mut = cast(*d.IRFunction, 0);
+let is i32 as uj_lbase with mut = 0;
+
+fn _I(p as i32) as *d.IRInst { return cast(*d.IRInst, uj_a[p]); }
+
+fn _rd(o as *d.Operand, v as i32) as i32 {
+    return cast(i32, o.op_type == d.OP_VREG && o.vreg == v);
+}
+
+// v read by inst
+fn _reads(it as *d.IRInst, v as i32) as i32 {
+    if (_rd(&it.src1, v) == 1 || _rd(&it.src2, v) == 1) { return 1; }
+    if (it.op == d.IR_STORE && _rd(&it.dest, v) == 1) { return 1; }
+    return 0;
+}
+
+// the vreg inst writes, -1 when none
+fn _def(it as *d.IRInst) as i32 {
+    if (it.op == d.IR_STORE || it.op == d.IR_LABEL || it.op == d.IR_JMP || it.op == d.IR_JZ
+        || it.op == d.IR_JNZ || it.op == d.IR_RET) { return 0 - 1; }
+    if (it.dest.op_type != d.OP_VREG) { return 0 - 1; }
+    return it.dest.vreg;
+}
+
+fn _ok_op(op as i32) as i32 {
+    if (op == d.IR_IMM || op == d.IR_MOV || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
+        || op == d.IR_NEG || op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE
+        || op == d.IR_GT || op == d.IR_GE || op == d.IR_CAST || op == d.IR_SHL || op == d.IR_SHR
+        || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_NOT || op == d.IR_LOAD
+        || op == d.IR_STORE || op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL
+        || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT || op == d.IR_LEA2
+        || op == d.IR_LEA4 || op == d.IR_LEA8 || op == d.IR_ADDR || op == d.IR_ADDR_GLOBAL
+        || op == d.IR_LABEL) { return 1; }
+    return 0;
+}
+
+// The one def of v in the whole function, else 0.
+fn _only_def(v as i32) as *d.IRInst {
+    let is *d.IRInst as r with mut = cast(*d.IRInst, 0);
+    let is i32 as p with mut = 0;
+    while (p < uj_n) {
+        let is *d.IRInst as it = _I(p);
+        if (_def(it) == v) {
+            if (cast(i64, r) != 0) { return cast(*d.IRInst, 0); }
+            r = it;
+        }
+        p = p + 1;
+    }
+    return r;
+}
+
+// The named object an address points into: a hash of a global's name, or of
+// a frame slot; 0 when it cannot be told. Through copies, casts, constant
+// offsets, an index added to a base, and a pointer stepped by a constant.
+fn _base(v as i32, depth as i32) as i64 {
+    if (depth > 8 || v < 0) { return 0; }
+    let is i64 as r with mut = 0;
+    let is i32 as p with mut = 0;
+    let is i32 as seen with mut = 0;
+    while (p < uj_n) {
+        let is *d.IRInst as it = _I(p);
+        if (_def(it) == v) {
+            let is i64 as b with mut = 0;
+            let is i32 as op = it.op;
+            if (op == d.IR_ADD && _rd(&it.src1, v) == 1 && it.src2.op_type == d.OP_IMM) { b = 0 - 1; }
+            else if (op == d.IR_ADDR_GLOBAL) {
+                let is i64 as h with mut = 1469598103;
+                let is i32 as q with mut = 0;
+                while (q < it.global_name_len) {
+                    h = (h ^ cast(i64, it.global_name_ptr[q])) * 16777619;
+                    h = h & 1099511627775;
+                    q = q + 1;
+                }
+                b = h * 2 + 2;
+            } else if (op == d.IR_ADDR && it.src1.op_type == d.OP_IMM) { b = it.src1.imm * 2 + 1; }
+            else if ((op == d.IR_MOV || op == d.IR_CAST) && it.src1.op_type == d.OP_VREG) { b = _base(it.src1.vreg, depth + 1); }
+            else if ((op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) && it.src1.op_type == d.OP_VREG) {
+                b = _base(it.src1.vreg, depth + 1);
+            } else if ((op == d.IR_ADD || op == d.IR_SUB) && it.src1.op_type == d.OP_VREG) {
+                if (it.src2.op_type == d.OP_IMM) { b = _base(it.src1.vreg, depth + 1); }
+                else if (it.src2.op_type == d.OP_VREG) {
+                    let is i64 as b1 = _base(it.src1.vreg, depth + 1);
+                    let is i64 as b2 with mut = 0;
+                    if (op == d.IR_ADD) { b2 = _base(it.src2.vreg, depth + 1); }
+                    if (b1 > 0 && b2 <= 0) { b = b1; } else if (b2 > 0 && b1 <= 0) { b = b2; }
+                }
+            }
+            if (b == 0) { return 0; }
+            if (b > 0) {
+                if (seen == 1 && b != r) { return 0; }
+                r = b; seen = 1;
+            }
+        }
+        p = p + 1;
+    }
+    return r;
+}
+
+// An address the loop reads through.
+fn _ld_ok(it as *d.IRInst, sb as *i64, ns as i32) as i32 {
+    if (it.op != d.IR_LOAD) { return 1; }
+    if (it.src1.op_type != d.OP_VREG) { return 0; }
+    let is i64 as b = _base(it.src1.vreg, 0);
+    if (b <= 0) { return 0; }
+    let is i32 as q with mut = 0;
+    while (q < ns) { if (sb[q] == b) { return 0; } q = q + 1; }
+    return 1;
+}
+
+fn _vk(v as i32, k as i32) as i32 {
+    if (k == 0 || v < 0 || v >= uj_nv) { return v; }
+    if (uj_ind[v] == cast(u8, 0) || uj_dep[v] == cast(u8, 0)) { return v; }
+    let is *i32 as m = cast(*i32, cast(i64, uj_map) + (cast(i64, v) * cast(i64, UJ_U) + cast(i64, k)) * 4);
+    return *m;
+}
+
+fn _ren(o as *d.Operand, k as i32) as void {
+    if (o.op_type == d.OP_VREG) { o.vreg = _vk(o.vreg, k); }
+}
+
+fn _link(head as **d.IRInst, tail as **d.IRInst, x as *d.IRInst) as void {
+    if (cast(i64, *head) == 0) { *head = x; } else { let is *d.IRInst as t = *tail; t.next = x; }
+    *tail = x;
+}
+
+fn _emit_copy(it as *d.IRInst, k as i32, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is *d.IRInst as c = d.clone_inst(it);
+    _ren(&c.dest, k);
+    _ren(&c.src1, k);
+    _ren(&c.src2, k);
+    _link(head, tail, c);
+}
+
+// copies of the positions [a, b): each instruction for every iteration in turn
+fn _emit_ilv(a as i32, b as i32, h as i32, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is i32 as p with mut = a;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1) && it.op != d.IR_LABEL) {
+            _emit_copy(it, 0, head, tail);
+            let is i32 as dv = _def(it);
+            if (dv >= 0 && uj_dep[dv] == cast(u8, 1)) {
+                let is i32 as k with mut = 1;
+                while (k < UJ_U) { _emit_copy(it, k, head, tail); k = k + 1; }
+            }
+        }
+        p = p + 1;
+    }
+}
+
+// byte size of a scalar type (its kind is the first field), 0 when not one
+fn _tsz(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    if (k == 1 || k == 5 || k == 11 || k == 12) { return 1; }
+    if (k == 2 || k == 6) { return 2; }
+    if (k == 3 || k == 7 || k == 9) { return 4; }
+    if (k == 4 || k == 8 || k == 10 || k == 14) { return 8; }
+    return 0;
+}
+
+// a signed integer type
+fn _i64t(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as kd = *cast(*i32, t);
+    return cast(i32, kd >= 1 && kd <= 4);
+}
+
+fn _try(func as *d.IRFunction, h as i32, b as i32) as i32 {
+    let is *d.IRInst as hl = _I(h);
+    let is i32 as lh = hl.dest.label;
+    if (uj_lref[lh] != 1 || lh >= uj_lbase) { return 0; }
+    if (h == 0) { return 0; }
+    let is *d.IRInst as before = _I(h - 1);
+    if (before.op == d.IR_JMP || before.op == d.IR_RET) { return 0; }
+    // the outer test: the first branch after the header label
+    let is i32 as z with mut = h + 1;
+    while (z < b && _I(z).op != d.IR_JZ) {
+        let is i32 as op = _I(z).op;
+        if (op == d.IR_JMP || op == d.IR_JNZ || op == d.IR_LABEL || op == d.IR_RET) { return 0; }
+        z = z + 1;
+    }
+    if (z >= b) { return 0; }
+    let is *d.IRInst as oz = _I(z);
+    if (oz.src1.op_type != d.OP_VREG || oz.dest.op_type != d.OP_LABEL) { return 0; }
+    let is i32 as xp = uj_lpos[oz.dest.label];
+    if (xp >= h && xp <= b) { return 0; }
+    // the one inner loop
+    let is i32 as ih with mut = 0 - 1;
+    let is i32 as ib with mut = 0 - 1;
+    let is i32 as iz with mut = 0 - 1;
+    let is i32 as p with mut = z + 1;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (it.op == d.IR_JMP) {
+            if (ib >= 0 || it.dest.op_type != d.OP_LABEL) { return 0; }
+            let is i32 as tp = uj_lpos[it.dest.label];
+            if (tp <= z || tp >= p) { return 0; }
+            ib = p; ih = tp;
+        } else if (it.op == d.IR_JNZ || it.op == d.IR_RET) { return 0; }
+        p = p + 1;
+    }
+    if (ib < 0) { return 0; }
+    if (uj_lref[_I(ih).dest.label] != 1) { return 0; }
+    p = ih + 1;
+    while (p < ib && _I(p).op != d.IR_JZ) { p = p + 1; }
+    if (p >= ib) { return 0; }
+    iz = p;
+    let is *d.IRInst as izi = _I(iz);
+    if (izi.src1.op_type != d.OP_VREG || izi.dest.op_type != d.OP_LABEL) { return 0; }
+    let is i32 as ie = ib + 1;
+    if (ie >= b || _I(ie).op != d.IR_LABEL || uj_lpos[izi.dest.label] != ie || uj_lref[izi.dest.label] != 1) { return 0; }
+    // every other branch in the body is gone; other labels unreferenced
+    p = z + 1;
+    let is i32 as nbody with mut = 0;
+    let is i32 as nrest with mut = 0;
+    let is i32 as hasf with mut = 0;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        let is i32 as op = it.op;
+        if (p != iz && p != ib) {
+            if (op == d.IR_JZ || op == d.IR_JMP) { return 0; }
+            if (_ok_op(op) == 0) { return 0; }
+            if (op == d.IR_LABEL && p != ih && p != ie && uj_lref[it.dest.label] != 0) { return 0; }
+            if (op == d.IR_STORE && p < ie) { return 0; }
+            if (p > iz && p < ib) {
+                nbody = nbody + 1;
+                if (op == d.IR_FADD || op == d.IR_FSUB) { hasf = 1; }
+            } else { nrest = nrest + 1; }
+        }
+        p = p + 1;
+    }
+    p = h + 1;
+    while (p < z) { if (_ok_op(_I(p).op) == 0 || _I(p).op == d.IR_STORE) { return 0; } nrest = nrest + 1; p = p + 1; }
+    if (hasf == 0 || nbody > UJ_MAX_BODY || nrest > UJ_MAX_REST) { return 0; }
+
+    // what the loop defines, and what it carries
+    let is i32 as nv = func.vreg_count;
+    let is i32 as v with mut = 0;
+    while (v < nv) { uj_ind[v] = 0; uj_isc[v] = 0; uj_dep[v] = 0; uj_step[v] = 0; uj_sadd[v] = 0; uj_cdef[v] = 0; v = v + 1; }
+    p = h;
+    while (p <= b) {
+        let is i32 as dv = _def(_I(p));
+        if (dv >= 0) { uj_ind[dv] = 1; }
+        p = p + 1;
+    }
+    // first def and first read in the loop: a read not after the first def
+    // means the value comes from the iteration before
+    v = 0;
+    while (v < nv) {
+        if (uj_ind[v] == cast(u8, 1)) {
+            let is i32 as fd with mut = 0 - 1;
+            let is i32 as fr with mut = 0 - 1;
+            let is i32 as ndef with mut = 0;
+            let is *d.IRInst as dd with mut = cast(*d.IRInst, 0);
+            p = h;
+            while (p <= b) {
+                let is *d.IRInst as it = _I(p);
+                if (fr < 0 && _reads(it, v) == 1) { fr = p; }
+                if (_def(it) == v) { if (fd < 0) { fd = p; } ndef = ndef + 1; dd = it; }
+                p = p + 1;
+            }
+            let is i32 as outside with mut = 0;
+            p = 0;
+            while (p < uj_n) {
+                if ((p < h || p > b) && _reads(_I(p), v) == 1) { outside = 1; }
+                p = p + 1;
+            }
+            if (fr >= 0 && fr <= fd) {
+                // carried: one def, after every read, a constant step
+                if (ndef != 1 || fd <= ie) { return 0; }
+                p = fd + 1;
+                while (p <= b) { if (_reads(_I(p), v) == 1) { return 0; } p = p + 1; }
+                let is *d.IRInst as sa with mut = cast(*d.IRInst, 0);
+                if ((dd.op == d.IR_ADD || dd.op == d.IR_SUB) && _rd(&dd.src1, v) == 1 && dd.src2.op_type == d.OP_IMM) { sa = dd; }
+                else if (dd.op == d.IR_MOV && dd.src1.op_type == d.OP_VREG) {
+                    let is *d.IRInst as t = _only_def(dd.src1.vreg);
+                    if (cast(i64, t) != 0 && (t.op == d.IR_ADD || t.op == d.IR_SUB) && t.src2.op_type == d.OP_IMM
+                        && t.src1.op_type == d.OP_VREG) {
+                        if (t.src1.vreg == v) { sa = t; }
+                        else {
+                            let is *d.IRInst as cx = _only_def(t.src1.vreg);
+                            if (cast(i64, cx) != 0 && cx.op == d.IR_CAST && _rd(&cx.src1, v) == 1
+                                && _tsz(cx.cast_to) == _tsz(cx.cast_from)) { sa = t; }
+                        }
+                    }
+                }
+                if (cast(i64, sa) == 0) { return 0; }
+                let is i64 as st with mut = sa.src2.imm;
+                if (sa.op == d.IR_SUB) { st = 0 - st; }
+                if (st == 0 || st > 1048576 || st < 0 - 1048576) { return 0; }
+                uj_isc[v] = 1; uj_dep[v] = 1; uj_step[v] = st; uj_sadd[v] = cast(i64, sa); uj_cdef[v] = cast(i64, dd);
+            } else if (outside == 1) { return 0; }
+        }
+        v = v + 1;
+    }
+    // what depends on j
+    let is i32 as ch with mut = 1;
+    while (ch == 1) {
+        ch = 0;
+        p = h;
+        while (p <= b) {
+            let is *d.IRInst as it = _I(p);
+            let is i32 as dv = _def(it);
+            if (dv >= 0 && uj_dep[dv] == cast(u8, 0)) {
+                if ((it.src1.op_type == d.OP_VREG && uj_dep[it.src1.vreg] == cast(u8, 1))
+                    || (it.src2.op_type == d.OP_VREG && uj_dep[it.src2.vreg] == cast(u8, 1))) {
+                    uj_dep[dv] = 1; ch = 1;
+                }
+            }
+            p = p + 1;
+        }
+    }
+    // the inner trip count: the same for every j
+    if (uj_dep[izi.src1.vreg] == cast(u8, 1)) { return 0; }
+    // a float chain that depends on j
+    let is i32 as chain with mut = 0;
+    p = iz + 1;
+    while (p < ib) {
+        let is *d.IRInst as it = _I(p);
+        if ((it.op == d.IR_FADD || it.op == d.IR_FSUB) && uj_dep[it.dest.vreg] == cast(u8, 1)) { chain = 1; }
+        p = p + 1;
+    }
+    if (chain == 0) { return 0; }
+    // the outer test: j op bound, j counting up, signed
+    let is *d.IRInst as cmp = _only_def(oz.src1.vreg);
+    if (cast(i64, cmp) == 0 || (cmp.op != d.IR_LT && cmp.op != d.IR_LE) || cmp.src1.op_type != d.OP_VREG) { return 0; }
+    if (_i64t(cmp.cast_to) == 0) { return 0; }
+    let is i32 as jv with mut = cmp.src1.vreg;
+    let is i32 as hops with mut = 0;
+    while (hops < 4 && jv >= 0 && uj_isc[jv] == cast(u8, 0)) {
+        let is *d.IRInst as cx = _only_def(jv);
+        if (cast(i64, cx) == 0 || (cx.op != d.IR_CAST && cx.op != d.IR_MOV) || cx.src1.op_type != d.OP_VREG) { return 0; }
+        if (cx.op == d.IR_CAST && (_i64t(cx.cast_to) == 0 || _i64t(cx.cast_from) == 0
+            || _tsz(cx.cast_to) != _tsz(cx.cast_from))) { return 0; }
+        jv = cx.src1.vreg;
+        hops = hops + 1;
+    }
+    if (jv < 0 || uj_isc[jv] == cast(u8, 0) || uj_step[jv] <= 0) { return 0; }
+    if (cmp.src2.op_type == d.OP_VREG && uj_ind[cmp.src2.vreg] == cast(u8, 1)) { return 0; }
+    if (cmp.src2.op_type != d.OP_VREG && cmp.src2.op_type != d.OP_IMM) { return 0; }
+    // stores against what the loop reads
+    let is [16]i64 as sb;
+    let is i32 as ns with mut = 0;
+    p = ie + 1;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (it.op == d.IR_STORE) {
+            if (ns >= 16 || it.dest.op_type != d.OP_VREG) { return 0; }
+            let is i64 as bs = _base(it.dest.vreg, 0);
+            if (bs <= 0) { return 0; }
+            sb[ns] = bs; ns = ns + 1;
+        }
+        p = p + 1;
+    }
+    p = h + 1;
+    while (p < ie) { if (_ld_ok(_I(p), cast(*i64, &sb), ns) == 0) { return 0; } p = p + 1; }
+
+    // which instructions the copies need: stores, the inner test, and what
+    // they read; not the outer test (the copies have their own) nor the steps
+    let is i32 as span = b - h + 1;
+    p = 0;
+    while (p < span) { uj_need[p] = 0; p = p + 1; }
+    p = ie + 1;
+    while (p < b) { if (_I(p).op == d.IR_STORE) { uj_need[p - h] = 1; } p = p + 1; }
+    uj_need[iz - h] = 1;
+    ch = 1;
+    while (ch == 1) {
+        ch = 0;
+        p = h + 1;
+        while (p < b) {
+            if (uj_need[p - h] == cast(u8, 1)) {
+                let is *d.IRInst as it = _I(p);
+                let is i32 as r with mut = 0;
+                while (r < 3) {
+                    let is i32 as rv with mut = 0 - 1;
+                    if (r == 0 && it.src1.op_type == d.OP_VREG) { rv = it.src1.vreg; }
+                    if (r == 1 && it.src2.op_type == d.OP_VREG) { rv = it.src2.vreg; }
+                    if (r == 2 && it.op == d.IR_STORE && it.dest.op_type == d.OP_VREG) { rv = it.dest.vreg; }
+                    if (rv >= 0 && uj_ind[rv] == cast(u8, 1) && uj_isc[rv] == cast(u8, 0)) {
+                        let is i32 as q with mut = h + 1;
+                        while (q < b) {
+                            if (_def(_I(q)) == rv && uj_need[q - h] == cast(u8, 0)) { uj_need[q - h] = 1; ch = 1; }
+                            q = q + 1;
+                        }
+                    }
+                    r = r + 1;
+                }
+            }
+            p = p + 1;
+        }
+    }
+
+    // the copies' registers
+    v = 0;
+    while (v < nv) {
+        if (uj_ind[v] == cast(u8, 1) && uj_dep[v] == cast(u8, 1)) {
+            let is i32 as k with mut = 1;
+            while (k < UJ_U) {
+                let is *i32 as m = cast(*i32, cast(i64, uj_map) + (cast(i64, v) * cast(i64, UJ_U) + cast(i64, k)) * 4);
+                *m = func.vreg_count;
+                func.vreg_count = func.vreg_count + 1;
+                k = k + 1;
+            }
+        }
+        v = v + 1;
+    }
+
+    let is i32 as l_j = func.label_count;
+    let is i32 as l_ji = l_j + 1;
+    let is i32 as l_je = l_j + 2;
+    func.label_count = func.label_count + 3;
+    let is *d.IRInst as head with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as x with mut = d.new_inst(d.IR_LABEL);
+    x.dest = d.op_label(l_j);
+    _link(&head, &tail, x);
+    // the carried variables at j + k
+    v = 0;
+    while (v < nv) {
+        if (uj_isc[v] == cast(u8, 1)) {
+            let is *d.IRInst as sa = cast(*d.IRInst, uj_sadd[v]);
+            let is i32 as k with mut = 1;
+            while (k < UJ_U) {
+                x = d.new_inst(d.IR_ADD);
+                x.dest = d.op_vreg(_vk(v, k));
+                x.src1 = d.op_vreg(v);
+                x.src2 = d.op_imm(uj_step[v] * cast(i64, k));
+                x.cast_to = sa.cast_to;
+                x.line = sa.line;
+                _link(&head, &tail, x);
+                k = k + 1;
+            }
+        }
+        v = v + 1;
+    }
+    // the last of the U iterations still runs: j + (U-1)c, in 64 bits
+    let is i32 as jw with mut = jv;
+    if (_tsz(cmp.cast_to) != 8) {
+        jw = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+        x = d.new_inst(d.IR_CAST);
+        x.dest = d.op_vreg(jw); x.src1 = d.op_vreg(jv);
+        x.cast_from = cmp.cast_to; x.cast_to = cast(*u8, ast.type_i64);
+        _link(&head, &tail, x);
+    }
+    let is i32 as jt = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+    x = d.new_inst(d.IR_ADD);
+    x.dest = d.op_vreg(jt); x.src1 = d.op_vreg(jw); x.src2 = d.op_imm(uj_step[jv] * cast(i64, UJ_U - 1));
+    x.cast_to = cast(*u8, ast.type_i64);
+    _link(&head, &tail, x);
+    let is d.Operand as bnd with mut = cmp.src2;
+    if (cmp.src2.op_type == d.OP_VREG && _tsz(cmp.cast_to) != 8) {
+        let is i32 as bw = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+        x = d.new_inst(d.IR_CAST);
+        x.dest = d.op_vreg(bw); x.src1 = cmp.src2;
+        x.cast_from = cmp.cast_to; x.cast_to = cast(*u8, ast.type_i64);
+        _link(&head, &tail, x);
+        bnd = d.op_vreg(bw);
+    }
+    let is i32 as jc = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+    x = d.new_inst(cmp.op);
+    x.dest = d.op_vreg(jc); x.src1 = d.op_vreg(jt); x.src2 = bnd;
+    x.cast_to = cast(*u8, ast.type_i64);
+    x.line = cmp.line;
+    _link(&head, &tail, x);
+    x = d.new_inst(d.IR_JZ);
+    x.src1 = d.op_vreg(jc); x.dest = d.op_label(lh);
+    _link(&head, &tail, x);
+    // header, pre: interleaved
+    _emit_ilv(h + 1, z, h, &head, &tail);
+    _emit_ilv(z + 1, ih, h, &head, &tail);
+    x = d.new_inst(d.IR_LABEL);
+    x.dest = d.op_label(l_ji);
+    _link(&head, &tail, x);
+    _emit_ilv(ih + 1, iz, h, &head, &tail);
+    x = d.clone_inst(izi);
+    x.dest = d.op_label(l_je);
+    _link(&head, &tail, x);
+    _emit_ilv(iz + 1, ib, h, &head, &tail);
+    x = d.new_inst(d.IR_JMP);
+    x.dest = d.op_label(l_ji);
+    _link(&head, &tail, x);
+    x = d.new_inst(d.IR_LABEL);
+    x.dest = d.op_label(l_je);
+    _link(&head, &tail, x);
+    // the posts, one iteration after the other
+    let is i32 as k with mut = 0;
+    while (k < UJ_U) {
+        p = ie + 1;
+        while (p < b) {
+            let is *d.IRInst as it = _I(p);
+            if (uj_need[p - h] == cast(u8, 1) && it.op != d.IR_LABEL) {
+                let is i32 as dv = _def(it);
+                let is i32 as isdep with mut = 0;
+                if (dv >= 0 && uj_dep[dv] == cast(u8, 1)) { isdep = 1; }
+                if (it.op == d.IR_STORE) {
+                    if ((it.dest.op_type == d.OP_VREG && uj_dep[it.dest.vreg] == cast(u8, 1))
+                        || (it.src1.op_type == d.OP_VREG && uj_dep[it.src1.vreg] == cast(u8, 1))) { isdep = 1; }
+                }
+                if (k == 0 || isdep == 1) { _emit_copy(it, k, &head, &tail); }
+            }
+            p = p + 1;
+        }
+        k = k + 1;
+    }
+    // the steps, U at once
+    v = 0;
+    while (v < nv) {
+        if (uj_isc[v] == cast(u8, 1)) {
+            let is *d.IRInst as sa = cast(*d.IRInst, uj_sadd[v]);
+            x = d.new_inst(d.IR_ADD);
+            x.dest = d.op_vreg(v);
+            x.src1 = d.op_vreg(v);
+            x.src2 = d.op_imm(uj_step[v] * cast(i64, UJ_U));
+            x.cast_to = sa.cast_to;
+            x.line = sa.line;
+            _link(&head, &tail, x);
+        }
+        v = v + 1;
+    }
+    x = d.new_inst(d.IR_JMP);
+    x.dest = d.op_label(l_j);
+    _link(&head, &tail, x);
+    // in front of the loop
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, hl)) { w = w.next; }
+    if (cast(i64, w) == 0) { return 0; }
+    tail.next = hl;
+    w.next = head;
+    return 1;
+}
+
+fn pass_unroll_jam(func as *d.IRFunction) as i32 {
+    if (func.vreg_count <= 0 || func.label_count <= 0) { return 0; }
+    if (cast(i64, uj_fn) != cast(i64, func)) { uj_fn = func; uj_lbase = func.label_count; }
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            if (w.op == d.IR_ASM) { return 0; }
+            n = n + 1;
+        }
+        w = w.next;
+    }
+    if (n < 8) { return 0; }
+    uj_a = cast(*i64, d.opt_alloc(cast(i64, n) * 8));
+    uj_n = n;
+    n = 0;
+    w = func.instructions;
+    while (cast(i64, w) != 0) { if (w.is_dead == 0) { uj_a[n] = cast(i64, w); n = n + 1; } w = w.next; }
+    uj_nl = func.label_count;
+    uj_lpos = cast(*i32, d.opt_alloc(cast(i64, uj_nl) * 4));
+    uj_lref = cast(*i32, d.opt_alloc(cast(i64, uj_nl) * 4));
+    let is i32 as q with mut = 0;
+    while (q < uj_nl) { uj_lpos[q] = 0 - 1; uj_lref[q] = 0; q = q + 1; }
+    let is i32 as bad with mut = 0;
+    q = 0;
+    while (q < uj_n) {
+        let is *d.IRInst as it = _I(q);
+        if (it.op == d.IR_LABEL) {
+            if (it.dest.label >= 0 && it.dest.label < uj_nl) { uj_lpos[it.dest.label] = q; } else { bad = 1; }
+        } else {
+            if (it.dest.op_type == d.OP_LABEL) { if (it.dest.label >= 0 && it.dest.label < uj_nl) { uj_lref[it.dest.label] = uj_lref[it.dest.label] + 1; } else { bad = 1; } }
+            if (it.src1.op_type == d.OP_LABEL) { if (it.src1.label >= 0 && it.src1.label < uj_nl) { uj_lref[it.src1.label] = uj_lref[it.src1.label] + 1; } else { bad = 1; } }
+            if (it.src2.op_type == d.OP_LABEL) { if (it.src2.label >= 0 && it.src2.label < uj_nl) { uj_lref[it.src2.label] = uj_lref[it.src2.label] + 1; } else { bad = 1; } }
+        }
+        q = q + 1;
+    }
+    let is i32 as done with mut = 0;
+    if (bad == 0) {
+        uj_nv = func.vreg_count;
+        uj_ind = d.opt_alloc(cast(i64, uj_nv) + 8);
+        uj_isc = d.opt_alloc(cast(i64, uj_nv) + 8);
+        uj_dep = d.opt_alloc(cast(i64, uj_nv) + 8);
+        uj_step = cast(*i64, d.opt_alloc(cast(i64, uj_nv) * 8 + 8));
+        uj_sadd = cast(*i64, d.opt_alloc(cast(i64, uj_nv) * 8 + 8));
+        uj_cdef = cast(*i64, d.opt_alloc(cast(i64, uj_nv) * 8 + 8));
+        uj_need = d.opt_alloc(cast(i64, uj_n) + 8);
+        uj_map = cast(*i32, d.opt_alloc(cast(i64, uj_nv) * cast(i64, UJ_U) * 4 + 8));
+        // back edges, innermost first does not matter: one transform per call
+        q = 0;
+        while (q < uj_n && done == 0) {
+            let is *d.IRInst as it = _I(q);
+            if (it.op == d.IR_JMP && it.dest.op_type == d.OP_LABEL) {
+                let is i32 as tp = uj_lpos[it.dest.label];
+                if (tp >= 0 && tp < q && _I(tp).op == d.IR_LABEL) {
+                    if (_try(func, tp, q) == 1) { done = 1; }
+                }
+            }
+            q = q + 1;
+        }
+        d.opt_free(uj_ind); d.opt_free(uj_isc); d.opt_free(uj_dep);
+        d.opt_free(cast(*u8, uj_step)); d.opt_free(cast(*u8, uj_sadd)); d.opt_free(cast(*u8, uj_cdef));
+        d.opt_free(uj_need); d.opt_free(cast(*u8, uj_map));
+    }
+    d.opt_free(cast(*u8, uj_a)); d.opt_free(cast(*u8, uj_lpos)); d.opt_free(cast(*u8, uj_lref));
+    return done;
+}

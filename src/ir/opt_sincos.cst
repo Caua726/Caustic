@@ -1,0 +1,207 @@
+use "defs.cst" as d;
+use "../parser/ast.cst" as ast;
+
+// === sin(v) and cos(v) of one value: one call of math.sincos ===
+//
+// -O2, after inlining and one round of optimize_func (a variable read twice
+// is one value by then). In a straight run of code, a call of std/math's sin
+// and a call of its cos with the same argument (v not written in between)
+// share their argument reduction: the first becomes
+//
+//     ADDR p = &[slot] ; SET_ARG x = v ; SET_ARG c = p ; CALL s = sincos
+//     LOAD c = [slot]
+//
+// and the second a copy of whichever result it wanted. sincos returns sin(v)
+// and writes cos(v), bit for bit what the two calls returned. It is kept in
+// the program when both sin and cos are (gen_program), and the pass only
+// runs when it finds it there. System V float arguments only (a SET_ARG with
+// an xmm place: x86_64).
+
+let is i32 as SC_MAX with imut = 32;
+
+// 1 = sin, 2 = cos, 0 = neither; *plen gets the length of the prefix before
+// "std_math_cst_".
+fn _sc_kind(i as *d.IRInst, plen as *i32) as i32 {
+    let is *u8 as p = i.call_name_ptr;
+    let is i32 as n = cast(i32, i.call_name_len);
+    let is i32 as k with mut = 0;
+    if (n >= 16 && d.str_eq(p + cast(i64, n - 16), 16, "std_math_cst_sin", 16) == 1) { k = 1; }
+    if (n >= 16 && d.str_eq(p + cast(i64, n - 16), 16, "std_math_cst_cos", 16) == 1) { k = 2; }
+    if (k == 0) { return 0; }
+    // the module prefix ends in '_' (or is empty)
+    if (n > 16 && p[n - 17] != cast(u8, 95)) { return 0; }
+    *plen = n - 16;
+    return k;
+}
+
+fn _sc_live_prev(func as *d.IRFunction, x as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as w with mut = func.instructions;
+    let is *d.IRInst as last with mut = cast(*d.IRInst, 0);
+    while (cast(i64, w) != 0 && cast(i64, w) != cast(i64, x)) {
+        if (w.is_dead == 0) { last = w; }
+        w = w.next;
+    }
+    return last;
+}
+
+fn _sc_prev(func as *d.IRFunction, x as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as w with mut = func.instructions;
+    if (cast(i64, w) == cast(i64, x)) { return cast(*d.IRInst, 0); }
+    while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, x)) { w = w.next; }
+    return w;
+}
+
+// The function named prefix + "std_math_cst_sincos", reachable, else 0.
+fn _sc_find(prog as *d.IRProgram, pre as *u8, plen as i32) as *d.IRFunction {
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        let is *u8 as fp with mut = f.name_ptr;
+        let is i32 as fl with mut = f.name_len;
+        if (f.asm_name_len > 0) { fp = f.asm_name_ptr; fl = f.asm_name_len; }
+        if (f.is_reachable == 1 && fl == plen + 19 && d.str_eq(fp, plen, pre, plen) == 1
+            && d.str_eq(fp + cast(i64, plen), 19, "std_math_cst_sincos", 19) == 1) { return f; }
+        f = f.next;
+    }
+    return cast(*d.IRFunction, 0);
+}
+
+// The one SET_ARG of call c: the live instruction before it, arg 0 in xmm0,
+// with no other SET_ARG before it. 0 when the call does not look like that.
+fn _sc_arg(func as *d.IRFunction, c as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as a = _sc_live_prev(func, c);
+    if (cast(i64, a) == 0 || a.op != d.IR_SET_ARG || a.src1.op_type != d.OP_VREG) { return cast(*d.IRInst, 0); }
+    if (a.dest.op_type != d.OP_IMM || a.dest.imm != 0 || a.src2.op_type != d.OP_IMM || a.src2.imm != 100) { return cast(*d.IRInst, 0); }
+    let is *d.IRInst as b = _sc_live_prev(func, a);
+    if (cast(i64, b) != 0 && b.op == d.IR_SET_ARG) { return cast(*d.IRInst, 0); }
+    return a;
+}
+
+fn _sc_pair(func as *d.IRFunction, prog as *d.IRProgram, f as *d.IRInst, fa as *d.IRInst, fk as i32,
+            s as *d.IRInst, plen as i32) as i32 {
+    let is *d.IRFunction as sc = _sc_find(prog, f.call_name_ptr, plen);
+    // sincos itself calls sin and cos for the inputs it does not handle
+    if (cast(i64, sc) == 0 || cast(i64, sc) == cast(i64, func)) { return 0; }
+    let is *d.IRInst as sa = _sc_arg(func, s);
+    if (cast(i64, sa) == 0) { return 0; }
+    // the slot cos(v) is written to, past the frame's
+    let is i64 as base = ((cast(i64, func.stack_size) + 15) / 8) * 8;
+    func.stack_size = cast(i32, base);
+    let is i32 as p = func.vreg_count;
+    let is i32 as ts = p + 1;
+    let is i32 as tc = p + 2;
+    func.vreg_count = func.vreg_count + 3;
+    // ADDR p before the first call's sequence (its SET_CTX, if any, then fa)
+    let is *d.IRInst as start with mut = fa;
+    let is *d.IRInst as pv = _sc_live_prev(func, fa);
+    if (cast(i64, pv) != 0 && pv.op == d.IR_SET_CTX) { start = pv; }
+    let is *d.IRInst as ad = d.new_inst(d.IR_ADDR);
+    ad.dest = d.op_vreg(p);
+    ad.src1 = d.op_imm(base);
+    ad.line = f.line;
+    let is *d.IRInst as before = _sc_prev(func, start);
+    if (cast(i64, before) == 0) { return 0; }
+    ad.next = start;
+    before.next = ad;
+    // the pointer argument after fa
+    let is *d.IRInst as a2 = d.new_inst(d.IR_SET_ARG);
+    a2.dest = d.op_imm(1);
+    a2.src1 = d.op_vreg(p);
+    a2.src2 = d.op_imm(0);
+    a2.line = f.line;
+    a2.next = fa.next;
+    fa.next = a2;
+    // the call: sincos, sin into ts; cos read back into tc
+    let is i32 as fdest = f.dest.vreg;
+    f.call_name_ptr = d.str_dup(sc.asm_name_ptr, sc.asm_name_len);
+    f.call_name_len = cast(i16, sc.asm_name_len);
+    if (sc.asm_name_len == 0) {
+        f.call_name_ptr = d.str_dup(sc.name_ptr, sc.name_len);
+        f.call_name_len = cast(i16, sc.name_len);
+    }
+    f.dest = d.op_vreg(ts);
+    let is *d.IRInst as ld = d.new_inst(d.IR_LOAD);
+    ld.dest = d.op_vreg(tc);
+    ld.src1 = d.op_imm(base);
+    ld.cast_to = cast(*u8, ast.type_f64);
+    ld.line = f.line;
+    let is *d.IRInst as m1 = d.new_inst(d.IR_MOV);
+    m1.dest = d.op_vreg(fdest);
+    if (fk == 1) { m1.src1 = d.op_vreg(ts); } else { m1.src1 = d.op_vreg(tc); }
+    m1.src2 = d.op_none();
+    m1.cast_to = f.cast_to;
+    m1.line = f.line;
+    m1.next = f.next;
+    ld.next = m1;
+    f.next = ld;
+    // the second call: its argument and context go, the call is a copy
+    sa.is_dead = 1;
+    let is *d.IRInst as sx = _sc_live_prev(func, sa);
+    if (cast(i64, sx) != 0 && sx.op == d.IR_SET_CTX) { sx.is_dead = 1; }
+    s.op = d.IR_MOV;
+    if (fk == 1) { s.src1 = d.op_vreg(tc); } else { s.src1 = d.op_vreg(ts); }
+    s.src2 = d.op_none();
+    s.call_name_ptr = cast(*u8, 0);
+    s.call_name_len = cast(i16, 0);
+    return 1;
+}
+
+fn pass_sincos(func as *d.IRFunction, progp as *u8) as i32 {
+    if (cast(i64, progp) == 0) { return 0; }
+    let is i32 as changed with mut = 0;
+    let is *d.IRProgram as prog = cast(*d.IRProgram, progp);
+    let is [32]i64 as cs;     // candidate calls in the current run
+    let is [32]i32 as cv;     // their argument vreg
+    let is [32]i32 as ck;     // 1 sin, 2 cos
+    let is [32]i32 as cl;     // prefix length
+    let is i32 as nc with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        let is *d.IRInst as nx = w.next;
+        if (w.is_dead == 0) {
+            let is i32 as op = w.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET
+                || op == d.IR_ASM) {
+                nc = 0;
+            } else if (op == d.IR_CALL && w.dest.op_type == d.OP_VREG && w.is_variadic_call == 0
+                       && w.is_extern_call == 0 && w.call_name_len > 0) {
+                let is i32 as plen with mut = 0;
+                let is i32 as k = _sc_kind(w, &plen);
+                let is *d.IRInst as a with mut = cast(*d.IRInst, 0);
+                if (k != 0) { a = _sc_arg(func, w); }
+                let is i32 as done with mut = 0;
+                if (cast(i64, a) != 0) {
+                    let is i32 as v = a.src1.vreg;
+                    let is i32 as j with mut = 0;
+                    while (j < nc && done == 0) {
+                        let is *d.IRInst as f = cast(*d.IRInst, cs[j]);
+                        if (cv[j] == v && ck[j] != k && cl[j] == plen && f.is_dead == 0 && f.op == d.IR_CALL
+                            && d.str_eq(f.call_name_ptr, plen, w.call_name_ptr, plen) == 1) {
+                            let is *d.IRInst as fa = _sc_arg(func, f);
+                            if (cast(i64, fa) != 0 && fa.src1.vreg == v
+                                && _sc_pair(func, prog, f, fa, ck[j], w, plen) == 1) {
+                                done = 1;
+                                changed = 1;
+                                // both used up
+                                cv[j] = 0 - 1;
+                            }
+                        }
+                        j = j + 1;
+                    }
+                    if (done == 0 && nc < SC_MAX) {
+                        cs[nc] = cast(i64, w); cv[nc] = v; ck[nc] = k; cl[nc] = plen;
+                        nc = nc + 1;
+                    }
+                }
+                // the call itself writes its dest
+                let is i32 as j2 with mut = 0;
+                while (j2 < nc) { if (done == 0 && cv[j2] == w.dest.vreg) { cv[j2] = 0 - 1; } j2 = j2 + 1; }
+            } else if (op != d.IR_STORE && op != d.IR_COPY && op != d.IR_CMOV && w.dest.op_type == d.OP_VREG) {
+                // a value written: calls of it are of an older value
+                let is i32 as j with mut = 0;
+                while (j < nc) { if (cv[j] == w.dest.vreg) { cv[j] = 0 - 1; } j = j + 1; }
+            }
+        }
+        w = nx;
+    }
+    return changed;
+}

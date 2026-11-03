@@ -93,6 +93,8 @@ let is *u8 as W_why with mut = cast(*u8, 0);
 let is i32 as W_sse_bad with mut = 0;
 let is i32 as W_maxls with mut = 0;
 let is i32 as W_iv with mut = 0;
+let is i32 as W_desc with mut = 0;       // the loop counts down by one
+let is i32 as W_ivb with mut = 0;        // counting down: the lowest index of the vector iteration
 let is i32 as W_iv_dead with mut = 0;
 let is i32 as W_ivdefs with mut = 0;
 let is i32 as W_vc with mut = 0;
@@ -281,6 +283,23 @@ fn _vop(sel as i32, code as i32, ls as i32, imm as i32, s1 as i32, s2 as i32) as
     return dv;
 }
 
+// A splat of a constant: the constant rides in the instruction itself, so no
+// general register holds it on the way.
+fn _vop_imm(sel as i32, code as i32, ls as i32, key as i64) as i32 {
+    if (W_fail == 1) { return 0; }
+    if (_sse2_ok(code, ls) == 0) { W_sse_bad = 1; }
+    if (ls > W_maxls) { W_maxls = ls; }
+    let is i32 as dv = _nv();
+    if (W_dry == 0) {
+        let is *d.IRInst as ni = d.new_inst(d.IR_VOP);
+        ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = dv;
+        ni.dest.label = vo.vo_pack(code, ls, W_vex, W_vf, 0);
+        ni.src1 = d.op_imm(key);
+        _app(sel, ni);
+    }
+    return dv;
+}
+
 // dest (an existing vreg) = VOP code(dest, s2): a value carried around the loop.
 fn _vop_into(sel as i32, code as i32, ls as i32, imm as i32, dv as i32, s1 as i32, s2 as i32) as void {
     if (W_fail == 1 || W_dry == 1) { return; }
@@ -338,12 +357,13 @@ fn _splat(kind as i32, key as i64, ls as i32) as i32 {
              || (ls == 4 && (key & 4294967295) == 4294967295))) {
         r = _vop(sel, vo.VO_ONES, ls, 0, cast(i32, 0 - 1), cast(i32, 0 - 1));
     } else if (kind == 0) {
-        let is i32 as t = _sop(sel, d.IR_IMM, cast(i32, 0 - 1), cast(i32, 0 - 1), 0, key, cast(*u8, 0));
-        r = _vop(sel, vo.VO_SPLAT, ls, 0, t, cast(i32, 0 - 1));
+        r = _vop_imm(sel, vo.VO_SPLAT, ls, key);
     } else if (kind == 1) {
-        let is i32 as t = _sop(sel, d.IR_IMM, cast(i32, 0 - 1), cast(i32, 0 - 1), 0, key, cast(*u8, 0));
-        if (ls == 8) { r = _vop(sel, vo.VO_SPLAT, 8, 0, t, cast(i32, 0 - 1)); }
-        else { r = _vop(sel, vo.VO_SPLATF, 4, 0, t, cast(i32, 0 - 1)); }
+        if (ls == 8) { r = _vop_imm(sel, vo.VO_SPLAT, 8, key); }
+        else {
+            let is i32 as t = _sop(sel, d.IR_IMM, cast(i32, 0 - 1), cast(i32, 0 - 1), 0, key, cast(*u8, 0));
+            r = _vop(sel, vo.VO_SPLATF, 4, 0, t, cast(i32, 0 - 1));
+        }
     } else if (kind == 2) {
         r = _vop(0, vo.VO_SPLAT, ls, 0, cast(i32, key), cast(i32, 0 - 1));
     } else {
@@ -359,6 +379,7 @@ fn _ones(ls as i32) as i32 { return _splat(0, 0 - 1, ls); }
 // The vector IV in lanes of ls bytes: lane k = i + k, advanced by VF at the
 // end of every vector iteration.
 fn _viv(ls as i32) as i32 {
+    if (W_desc == 1) { _fail("induction value counting down"); return 0; }
     if (W_viv[ls] >= 0) { return W_viv[ls]; }
     let is i32 as s = _vop(0, vo.VO_SPLAT, ls, 0, W_iv, cast(i32, 0 - 1));
     let is i32 as io = _vop(0, vo.VO_IOTA, ls, 0, cast(i32, 0 - 1), cast(i32, 0 - 1));
@@ -928,12 +949,19 @@ fn _addr(base as i32, ls as i32) as i32 {
         if (W_ad_base[i] == base && W_ad_ls[i] == ls) { return W_ad_v[i]; }
         i = i + 1;
     }
+    // counting down, iteration i's vector holds i - VF + 1 .. i: its lanes
+    // start at the lowest of those indices
+    let is i32 as ix with mut = W_iv;
+    if (W_desc == 1) {
+        if (W_ivb < 0) { W_ivb = _sop(1, d.IR_ADD, W_iv, cast(i32, 0 - 1), 1, cast(i64, 1 - W_vf), cast(*u8, 0)); }
+        ix = W_ivb;
+    }
     let is i32 as r with mut = 0;
-    if (ls == 1) { r = _sop(1, d.IR_ADD, base, W_iv, 0, 0, cast(*u8, 0)); }
+    if (ls == 1) { r = _sop(1, d.IR_ADD, base, ix, 0, 0, cast(*u8, 0)); }
     else {
         let is i32 as lop with mut = d.IR_LEA8;
         if (ls == 2) { lop = d.IR_LEA2; } else if (ls == 4) { lop = d.IR_LEA4; }
-        r = _sop(1, lop, base, W_iv, 0, 0, cast(*u8, 0));
+        r = _sop(1, lop, base, ix, 0, 0, cast(*u8, 0));
     }
     if (W_nad < MAXCACHE) { W_ad_base[W_nad] = base; W_ad_ls[W_nad] = ls; W_ad_v[W_nad] = r; W_nad = W_nad + 1; }
     return r;
@@ -1221,7 +1249,7 @@ fn _prescan(func as *d.IRFunction, hb as *cfg.BasicBlock, lb as *cfg.BasicBlock,
 // One walk over the body (dry or emitting). Returns 1 when it went through.
 fn _walk(hb as *cfg.BasicBlock, lb as *cfg.BasicBlock, jz as *d.IRInst) as i32 {
     W_np = 0; W_natom = 0; W_nmk = 0; W_nsp = 0; W_nad = 0; W_nacc = 0; W_nstore = 0;
-    W_iv_dead = 0; W_ivdefs = 0; W_pred = ALL; W_nocse = 0; W_nua = 0; W_nld = 0;
+    W_iv_dead = 0; W_ivdefs = 0; W_pred = ALL; W_nocse = 0; W_nua = 0; W_nld = 0; W_ivb = cast(i32, 0 - 1);
     W_h0 = cast(*d.IRInst, 0); W_t0 = cast(*d.IRInst, 0);
     W_h1 = cast(*d.IRInst, 0); W_t1 = cast(*d.IRInst, 0);
     W_h2 = cast(*d.IRInst, 0); W_t2 = cast(*d.IRInst, 0);
@@ -1501,9 +1529,12 @@ fn _room(func as *d.IRFunction, ip0 as *d.IRInst, lt as *d.IRInst, nn as i32, op
     ad.dest.op_type = cast(i8, d.OP_VREG); ad.dest.vreg = last;
     ad.src1.op_type = cast(i8, d.OP_VREG); ad.src1.vreg = ivn;
     ad.src2.op_type = cast(i8, d.OP_IMM); ad.src2.imm = cast(i64, W_vf - 1); ad.line = W_ln;
+    // counting down: `i - VF + 1 >= lo` (or `> lo`), the loop's own test
+    let is i32 as cop with mut = d.IR_LT;
+    if (W_desc == 1) { ad.src2.imm = cast(i64, 1 - W_vf); cop = lt.op; }
     ip = ex.emit(ip, ad);
     let is i32 as cond = ex.new_vreg(func);
-    let is *d.IRInst as c = d.new_inst(d.IR_LT);
+    let is *d.IRInst as c = d.new_inst(cop);
     c.dest.op_type = cast(i8, d.OP_VREG); c.dest.vreg = cond;
     c.src1.op_type = cast(i8, d.OP_VREG); c.src1.vreg = last;
     c.src2.op_type = cast(i8, d.OP_VREG); c.src2.vreg = nn;
@@ -1563,6 +1594,7 @@ fn _one_loop(func as *d.IRFunction, ip0 as *d.IRInst, hb as *cfg.BasicBlock, lb 
     ia.dest.op_type = cast(i8, d.OP_VREG); ia.dest.vreg = W_iv;
     ia.src1.op_type = cast(i8, d.OP_VREG); ia.src1.vreg = W_iv;
     ia.src2.op_type = cast(i8, d.OP_IMM); ia.src2.imm = cast(i64, W_vf); ia.line = W_ln;
+    if (W_desc == 1) { ia.src2.imm = cast(i64, 0 - W_vf); }
     ip = ex.emit(ip, ia);
     ip = _room(func, ip, lt, nn, d.IR_JNZ, top);
     ip = _link(ip, W_h2, W_t2);
@@ -1596,14 +1628,65 @@ fn _float_ext(hb as *cfg.BasicBlock, lb as *cfg.BasicBlock) as i32 {
     return n;
 }
 
+// The header's test of a loop counting down: JZ on `iv >= lo` or `iv > lo`,
+// lo a value the loop does not change; signed, or narrower than 64 bits (exact
+// in 64 signed bits), since the vector test runs VF - 1 below iv.
+fn _exit_test_down(blocks as *cfg.BasicBlock, L as *vl.VecLoop, iv as i32,
+                   def_inst as *i64, def_count as *i32, vc as i32, out_jz as *i64) as *d.IRInst {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *d.IRInst as p with mut = hb.first;
+    let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
+    while (cast(i64, p) != 0) {
+        if (p.is_dead == 0 && p.op == d.IR_JZ) { jz = p; }
+        if (cast(i64, p) == cast(i64, hb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+    }
+    if (cast(i64, jz) == 0 || jz.src1.op_type != d.OP_VREG || jz.dest.op_type != d.OP_LABEL) { return cast(*d.IRInst, 0); }
+    let is *d.IRInst as t = sc.scev_sdef(def_inst, def_count, vc, jz.src1.vreg);
+    if (cast(i64, t) == 0 || (t.op != d.IR_GE && t.op != d.IR_GT) || t.src1.op_type != d.OP_VREG) { return cast(*d.IRInst, 0); }
+    if (cast(i64, t.cast_to) != 0 && _tls(t.cast_to) == 8 && _tsgn(t.cast_to) == 0) { return cast(*d.IRInst, 0); }
+    if (cast(i64, t.cast_to) != 0 && _tflt(t.cast_to) == 1) { return cast(*d.IRInst, 0); }
+    if (ex._ax_test_src(&t.src1, iv, def_inst, def_count, vc) == 0) { return cast(*d.IRInst, 0); }
+    if (t.src2.op_type != d.OP_IMM && ex._ax_test_src(&t.src2, cast(i32, 0 - 1), def_inst, def_count, vc) == 0) { return cast(*d.IRInst, 0); }
+    *out_jz = cast(i64, jz);
+    return t;
+}
+
+// Counting down, the vector iteration runs VF scalar iterations in the
+// opposite order to the scalar loop. That order is invisible when no
+// iteration reads what another one writes: an array the loop writes is
+// touched at one offset only (other arrays are kept apart by the overlap
+// test), and no float reduction (folded in order) is carried.
+fn _down_ok() as i32 {
+    let is i32 as k with mut = 0;
+    while (k < W_nacc) {
+        if (W_acc_k[k] == AK_FADD || W_acc_k[k] == AK_FMUL) { _fail("float reduction counting down"); return 0; }
+        k = k + 1;
+    }
+    let is i32 as a with mut = 0;
+    while (a < W_nm) {
+        if (W_m_w[a] == 1) {
+            let is i32 as b with mut = 0;
+            while (b < W_nm) {
+                if (b != a && W_m_base[b] == W_m_base[a]) { _fail("array written at two offsets counting down"); return 0; }
+                b = b + 1;
+            }
+        }
+        a = a + 1;
+    }
+    return 1;
+}
+
 fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
                    iv as i32, iv_step as i64, maxvf as i64,
                    def_inst as *i64, def_count as *i32, vc as i32) as i32 {
-    if (iv_step != 1 || L.header_label < 0) { return 0; }
+    if ((iv_step != 1 && iv_step != 0 - 1) || L.header_label < 0) { return 0; }
     let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
     let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
     let is i64 as jzp with mut = 0;
-    let is *d.IRInst as lt = ex._exit_test(blocks, L, iv, def_inst, def_count, vc, &jzp);
+    let is *d.IRInst as lt with mut = cast(*d.IRInst, 0);
+    W_desc = 0;
+    if (iv_step == 1) { lt = ex._exit_test(blocks, L, iv, def_inst, def_count, vc, &jzp); }
+    else { W_desc = 1; lt = _exit_test_down(blocks, L, iv, def_inst, def_count, vc, &jzp); }
     if (cast(i64, lt) == 0) { return 0; }
     let is *d.IRInst as jz = cast(*d.IRInst, jzp);
     let is *d.IRInst as prev = ex._inst_before(func, hb.first);
@@ -1621,6 +1704,7 @@ fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Ve
         W_dry = 1; W_vex = 0; W_vf = 0;
         if (_walk(hb, lb, jz) == 1 && W_nstore + W_nacc > 0 && W_maxls > 0) { ok = 1; }
     }
+    if (ok == 1 && W_desc == 1 && _down_ok() == 0) { ok = 0; }
     let is i32 as do_avx with mut = 0;
     let is i32 as do_sse with mut = 0;
     if (ok == 1) {
@@ -1696,6 +1780,14 @@ fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Ve
                 jp = ex._ax_operand(func, jp, &lt.src2, def_inst, def_count, vc, W_ln, &n2);
                 let is i32 as i0 with mut = 0;
                 jp = ex._ax_operand(func, jp, &lt.src1, def_inst, def_count, vc, W_ln, &i0);
+                if (W_desc == 1) {
+                    // counting down from i to lo (or lo + 1): the indices [lo, i + 1)
+                    let is i32 as hi with mut = 0;
+                    jp = ex.emit_adj_base(func, jp, i0, 1, W_ln, &hi);
+                    let is i32 as lo with mut = n2;
+                    if (lt.op == d.IR_GT) { jp = ex.emit_adj_base(func, jp, n2, 1, W_ln, &lo); }
+                    i0 = lo; n2 = hi;
+                }
                 let is i32 as cnt with mut = 0;
                 jp = ex.emit_vv(func, jp, d.IR_SUB, n2, i0, W_ln, &cnt);
                 let is *i32 as st = cast(*i32, d.opt_alloc(cast(i64, W_nm + 1) * 4));

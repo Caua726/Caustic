@@ -331,3 +331,431 @@ fn pass_rotate(func as *d.IRFunction) as void {
     d.opt_free(cast(*u8, seen));
     d.opt_free(cast(*u8, lat));
 }
+
+// === The value a loop stores, carried to its next iteration ===
+//
+// -O2, after rotation. In a loop whose body is one block,
+//
+//     Lb:  ... x = load [p] ... store [p] = w ... jnz c, Lb
+//
+// with p not written in the body and that store the body's only write to
+// memory, every load of [p] above the store reads what the store of the
+// iteration before wrote (the accumulator of `s[k] = s[k] + a[i] * b[i]`).
+// The value then goes round in a register t instead: t is loaded once where
+// the guard falls into Lb, the loads become copies of t, and t takes w right
+// after the store. The store stays, because the other loads of the loop may
+// read the same memory through another pointer.
+//
+// A narrow integer comes back from memory truncated and extended, so t takes
+// it through the same cast; a float narrower than f64 is not carried at all.
+
+fn _fwd_pure(op as i32) as i32 {
+    if (op >= d.IR_IMM && op <= d.IR_GE) { return 1; }
+    if (op == d.IR_LOAD || op == d.IR_CAST || op == d.IR_ADDR || op == d.IR_ADDR_GLOBAL || op == d.IR_FN_ADDR) { return 1; }
+    if (op >= d.IR_SHL && op <= d.IR_NOT) { return 1; }
+    if (op >= d.IR_FADD && op <= d.IR_FNEG) { return 1; }
+    if (op == d.IR_FSQRT || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8 || op == d.IR_CMOV) { return 1; }
+    return 0;
+}
+
+// The type a carried value may have: 8 for a word (i64, u64, f64, a pointer),
+// the size of a narrower integer, 0 for anything else.
+fn _fwd_size(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    if (k >= 1 && k <= 8 && (sz == 1 || sz == 2 || sz == 4 || sz == 8)) { return sz; }
+    if ((k == 10 || k == 14) && sz == 8) { return 8; }
+    return 0;
+}
+
+fn _fwd_same_ty(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == cast(i64, b)) { return 1; }
+    if (cast(i64, a) == 0 || cast(i64, b) == 0) { return 0; }
+    if (*cast(*i32, a) != *cast(*i32, b)) { return 0; }
+    return cast(i32, *cast(*i32, cast(i64, a) + 28) == *cast(*i32, cast(i64, b) + 28));
+}
+
+// The object an address points into, as far as its definitions show: a
+// global (by name), the stack frame, or unknown. fo_obj[v]: 0 not yet seen,
+// FO_UNKNOWN, FO_STACK, or 1 + the index of a global in fo_names. An address
+// is its base plus an offset (ADD/SUB of anything to the base in src1, LEA of
+// an index to it, a copy), as the front-end builds every element and field
+// address; two different objects never overlap. With one store per address,
+// a body may then hold stores to other objects too (the globals and arrays
+// of a loop that reads, computes and writes several of them).
+let is i32 as FO_UNKNOWN with imut = 0 - 1;
+let is i32 as FO_STACK with imut = 0 - 2;
+let is *i32 as fo_obj with mut = cast(*i32, 0);
+let is *i64 as fo_one with mut = cast(*i64, 0);   // the one definition of a vreg, or 0
+let is i32 as fo_vc with mut = 0;
+let is [64]i64 as fo_nptr;
+let is [64]i32 as fo_nlen;
+let is i32 as fo_nn with mut = 0;
+
+fn _fo_name(p as *u8, n as i32) as i32 {
+    if (cast(i64, p) == 0 || n <= 0) { return FO_UNKNOWN; }
+    let is i32 as k with mut = 0;
+    while (k < fo_nn) {
+        if (fo_nlen[k] == n) {
+            let is *u8 as q = cast(*u8, fo_nptr[k]);
+            let is i32 as j with mut = 0;
+            while (j < n && q[j] == p[j]) { j = j + 1; }
+            if (j == n) { return k + 1; }
+        }
+        k = k + 1;
+    }
+    if (fo_nn >= 64) { return FO_UNKNOWN; }
+    fo_nptr[fo_nn] = cast(i64, p);
+    fo_nlen[fo_nn] = n;
+    fo_nn = fo_nn + 1;
+    return fo_nn;
+}
+
+fn _fo_get(v as i32) as i32 {
+    if (v < 0 || v >= fo_vc) { return FO_UNKNOWN; }
+    return fo_obj[v];
+}
+
+// The object a definition gives its dest.
+fn _fo_def(i as *d.IRInst) as i32 {
+    let is i32 as op = i.op;
+    if (op == d.IR_ADDR_GLOBAL) { return _fo_name(i.global_name_ptr, cast(i32, i.global_name_len)); }
+    if (op == d.IR_ADDR || op == d.IR_GET_ALLOC_ADDR) { return FO_STACK; }
+    if ((op == d.IR_ADD || op == d.IR_SUB || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8
+         || op == d.IR_MOV || op == d.IR_CAST) && i.src1.op_type == d.OP_VREG) {
+        if (op == d.IR_CAST && cast(i64, i.cast_to) != 0 && *cast(*i32, i.cast_to) >= 1 && *cast(*i32, i.cast_to) <= 8
+            && *cast(*i32, cast(i64, i.cast_to) + 28) < 8) { return FO_UNKNOWN; }
+        return _fo_get(i.src1.vreg);
+    }
+    return FO_UNKNOWN;
+}
+
+fn _fo_init(func as *d.IRFunction) as void {
+    if (cast(i64, fo_obj) != 0) { d.opt_free(cast(*u8, fo_obj)); d.opt_free(cast(*u8, fo_one)); }
+    fo_vc = func.vreg_count;
+    fo_nn = 0;
+    fo_obj = cast(*i32, d.opt_alloc(cast(i64, fo_vc) * 4 + 4));
+    fo_one = cast(*i64, d.opt_alloc(cast(i64, fo_vc) * 8 + 8));
+    let is i32 as i with mut = 0;
+    while (i < fo_vc) { fo_obj[i] = 0; fo_one[i] = 0; i = i + 1; }
+    let is *d.IRInst as w0 with mut = func.instructions;
+    while (cast(i64, w0) != 0) {
+        if (w0.is_dead == 0 && w0.dest.op_type == d.OP_VREG && w0.dest.vreg >= 0 && w0.dest.vreg < fo_vc
+            && w0.op != d.IR_STORE && w0.op != d.IR_COPY && w0.op != d.IR_ATOMIC_STORE
+            && w0.op != d.IR_VSTOREQ && w0.op != d.IR_VSTOREQ256 && w0.op != d.IR_CMOV) {
+            if (fo_one[w0.dest.vreg] == 0) { fo_one[w0.dest.vreg] = cast(i64, w0); } else { fo_one[w0.dest.vreg] = 0 - 1; }
+        }
+        w0 = w0.next;
+    }
+    // a vreg defined twice takes the object both agree on; ones never
+    // settled (a cycle of copies) end unknown
+    let is i32 as round with mut = 0;
+    let is i32 as chg with mut = 1;
+    while (chg == 1 && round < 6) {
+        chg = 0;
+        round = round + 1;
+        let is *d.IRInst as w with mut = func.instructions;
+        while (cast(i64, w) != 0) {
+            if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < fo_vc
+                && w.op != d.IR_STORE && w.op != d.IR_COPY && w.op != d.IR_ATOMIC_STORE
+                && w.op != d.IR_VSTOREQ && w.op != d.IR_VSTOREQ256) {
+                let is i32 as o = _fo_def(w);
+                let is i32 as cur = fo_obj[w.dest.vreg];
+                let is i32 as nw with mut = cur;
+                if (o == 0) { }
+                else if (cur == 0) { nw = o; }
+                else if (cur != o) { nw = FO_UNKNOWN; }
+                if (nw != cur) { fo_obj[w.dest.vreg] = nw; chg = 1; }
+            }
+            w = w.next;
+        }
+    }
+    i = 0;
+    while (i < fo_vc) { if (fo_obj[i] == 0) { fo_obj[i] = FO_UNKNOWN; } i = i + 1; }
+}
+
+// p and q are the same address: one vreg, or each the one definition of the
+// address of the same global.
+fn _fo_same_addr(p as i32, q as i32) as i32 {
+    if (p == q) { return 1; }
+    if (p < 0 || p >= fo_vc || q < 0 || q >= fo_vc) { return 0; }
+    if (fo_one[p] <= 0 || fo_one[q] <= 0) { return 0; }
+    let is *d.IRInst as a = cast(*d.IRInst, fo_one[p]);
+    let is *d.IRInst as b = cast(*d.IRInst, fo_one[q]);
+    if (a.op != d.IR_ADDR_GLOBAL || b.op != d.IR_ADDR_GLOBAL) { return 0; }
+    return cast(i32, fo_obj[p] > 0 && fo_obj[p] == fo_obj[q]);
+}
+
+// The object a store writes: by its address vreg, or a stack slot.
+fn _fo_store_obj(st as *d.IRInst) as i32 {
+    if (st.dest.op_type == d.OP_IMM) { return FO_STACK; }
+    if (st.dest.op_type == d.OP_VREG) { return _fo_get(st.dest.vreg); }
+    return FO_UNKNOWN;
+}
+
+// The loop entered at the label lbl (prev: the instruction before it).
+fn _fwd_one(func as *d.IRFunction, prev as *d.IRInst, lbl as *d.IRInst, njumps as i32, nr as *i32, lc as i32) as i32 {
+    if (njumps != 1) { return 0; }
+    // the body falls in from the guard
+    if (prev.op == d.IR_JMP || prev.op == d.IR_RET) { return 0; }
+    let is i32 as lb = lbl.dest.label;
+    let is [16]i64 as sts;
+    let is *d.IRInst as br with mut = cast(*d.IRInst, 0);
+    let is i32 as nst with mut = 0;
+    let is *d.IRInst as w with mut = lbl.next;
+    while (cast(i64, w) != 0 && cast(i64, br) == 0) {
+        if (w.is_dead == 0) {
+            let is i32 as op = w.op;
+            // a label nothing refers to (where an inlined body returned) is no join
+            if (op == d.IR_LABEL) {
+                if (w.dest.label < 0 || w.dest.label >= lc || nr[w.dest.label] != 0) { return 0; }
+            } else if (op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_JMP) {
+                if (op == d.IR_JMP || w.dest.op_type != d.OP_LABEL || w.dest.label != lb) { return 0; }
+                br = w;
+            } else if (op == d.IR_STORE) {
+                if (nst >= 16) { return 0; }
+                sts[nst] = cast(i64, w);
+                nst = nst + 1;
+            } else if (_fwd_pure(op) == 0) { return 0; }
+        }
+        if (cast(i64, br) == 0) { w = w.next; }
+    }
+    if (cast(i64, br) == 0) { return 0; }
+    _fwd_inv_loads(func, lbl, br, &sts[0], nst);
+    if (nst == 0) { return 0; }
+    if (nst == 1) {
+        let is *d.IRInst as pv1 with mut = func.instructions;
+        while (cast(i64, pv1) != 0 && cast(i64, pv1.next) != cast(i64, lbl)) { pv1 = pv1.next; }
+        return _fwd_st(func, pv1, lbl, br, cast(*d.IRInst, sts[0]));
+    }
+    // several stores: each one whose object no other store writes
+    let is i32 as done with mut = 0;
+    let is i32 as a with mut = 0;
+    while (a < nst) {
+        let is *d.IRInst as st = cast(*d.IRInst, sts[a]);
+        let is i32 as oa = _fo_store_obj(st);
+        let is i32 as ok with mut = cast(i32, oa != FO_UNKNOWN && oa != FO_STACK && st.dest.op_type == d.OP_VREG);
+        let is i32 as b with mut = 0;
+        while (b < nst && ok == 1) {
+            if (b != a) {
+                let is *d.IRInst as s2 = cast(*d.IRInst, sts[b]);
+                let is i32 as ob = _fo_store_obj(s2);
+                if (ob == FO_UNKNOWN || ob == oa) { ok = 0; }
+                if (s2.dest.op_type == d.OP_VREG && s2.dest.vreg == st.dest.vreg) { ok = 0; }
+            }
+            b = b + 1;
+        }
+        if (ok == 1) {
+            // the instruction now right before lbl (an earlier one may have put loads there)
+            let is *d.IRInst as pv with mut = func.instructions;
+            while (cast(i64, pv) != 0 && cast(i64, pv.next) != cast(i64, lbl)) { pv = pv.next; }
+            if (cast(i64, pv) != 0 && _fwd_st(func, pv, lbl, br, st) == 1) { done = 1; }
+        }
+        a = a + 1;
+    }
+    return done;
+}
+
+// A load in the single-block loop lbl..br from the address of a global that
+// none of the loop's stores writes (each of them writes another object) reads
+// the same value every time: it is loaded once on the way in, and the loads
+// become copies. A global's address cannot fault, and the way in runs only
+// when the body does. At most FWD_MAX_INV addresses per loop: each is a
+// register held across it.
+let is i32 as FWD_MAX_INV with imut = 4;
+
+fn _fwd_inv_loads(func as *d.IRFunction, lbl as *d.IRInst, br as *d.IRInst, sts as *i64, nst as i32) as void {
+    let is i32 as nh with mut = 0;
+    let is *d.IRInst as w with mut = lbl.next;
+    while (cast(i64, w) != cast(i64, br) && nh < FWD_MAX_INV) {
+        if (w.is_dead == 0 && w.op == d.IR_LOAD && w.src1.op_type == d.OP_VREG && w.dest.op_type == d.OP_VREG) {
+            let is i32 as q = w.src1.vreg;
+            let is i32 as oq = _fo_get(q);
+            let is i32 as ok with mut = 0;
+            if (oq > 0 && q < fo_vc && fo_one[q] > 0 && cast(*d.IRInst, fo_one[q]).op == d.IR_ADDR_GLOBAL) { ok = 1; }
+            // q's definition inside the body: the way in computes the address too
+            let is i32 as qin with mut = 0;
+            if (ok == 1) {
+                let is *d.IRInst as x with mut = lbl.next;
+                while (cast(i64, x) != cast(i64, br)) {
+                    if (x.is_dead == 0 && cast(i64, x) == fo_one[q]) { qin = 1; }
+                    x = x.next;
+                }
+            }
+            let is i32 as k with mut = 0;
+            while (k < nst && ok == 1) {
+                let is i32 as ob = _fo_store_obj(cast(*d.IRInst, sts[k]));
+                if (ob == FO_UNKNOWN || ob == oq) { ok = 0; }
+                k = k + 1;
+            }
+            if (ok == 1 && _fwd_size(w.cast_to) == 0 && (cast(i64, w.cast_to) == 0 || *cast(*i32, w.cast_to) != 9)) { ok = 0; }
+            if (ok == 1) {
+                let is i32 as t = func.vreg_count;
+                func.vreg_count = func.vreg_count + 1;
+                let is *d.IRInst as ld0 = _rot_clone(w);
+                ld0.dest = d.op_vreg(t);
+                let is *d.IRInst as pv with mut = func.instructions;
+                while (cast(i64, pv) != 0 && cast(i64, pv.next) != cast(i64, lbl)) { pv = pv.next; }
+                if (cast(i64, pv) == 0) { return; }
+                ld0.next = lbl;
+                pv.next = ld0;
+                if (qin == 1) {
+                    let is i32 as qa = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as ad = _rot_clone(cast(*d.IRInst, fo_one[q]));
+                    ad.dest = d.op_vreg(qa);
+                    ad.next = ld0;
+                    pv.next = ad;
+                    ld0.src1 = d.op_vreg(qa);
+                }
+                // every load of that address in the body, of that type, reads t
+                let is *d.IRInst as y with mut = w;
+                while (cast(i64, y) != cast(i64, br)) {
+                    if (y.is_dead == 0 && y.op == d.IR_LOAD && y.src1.op_type == d.OP_VREG
+                        && _fo_same_addr(y.src1.vreg, q) == 1 && _fwd_same_ty(y.cast_to, w.cast_to) == 1) {
+                        y.op = d.IR_MOV;
+                        y.src1 = d.op_vreg(t);
+                        y.src2 = d.op_none();
+                    }
+                    y = y.next;
+                }
+                nh = nh + 1;
+            }
+        }
+        w = w.next;
+    }
+}
+
+// Carry the value `st` stores round the single-block loop lbl..br.
+fn _fwd_st(func as *d.IRFunction, prev as *d.IRInst, lbl as *d.IRInst, br as *d.IRInst, st as *d.IRInst) as i32 {
+    let is *d.IRInst as w with mut = cast(*d.IRInst, 0);
+    if (st.dest.op_type != d.OP_VREG || st.src1.op_type != d.OP_VREG) { return 0; }
+    let is i32 as sz = _fwd_size(st.cast_to);
+    if (sz == 0) { return 0; }
+    let is i32 as p = st.dest.vreg;
+    // p keeps its value through the loop; the loads above the store agree on the type
+    let is i32 as nld with mut = 0;
+    let is i32 as above with mut = 1;
+    let is *d.IRInst as first with mut = cast(*d.IRInst, 0);
+    // p may also be q + k computed in the body ahead of the loads (the
+    // address of a field or of a constant index: LICM leaves those where they
+    // are), with q not written in the body; the way in computes it too.
+    let is *d.IRInst as pdef with mut = cast(*d.IRInst, 0);
+    w = lbl.next;
+    while (cast(i64, w) != cast(i64, br)) {
+        if (w.is_dead == 0) {
+            if (cast(i64, w) == cast(i64, st)) { above = 0; }
+            if (w.op != d.IR_STORE && w.dest.op_type == d.OP_VREG && w.dest.vreg == p) {
+                if (cast(i64, pdef) != 0 || cast(i64, first) != 0 || above == 0) { return 0; }
+                if (w.op != d.IR_ADD || w.src1.op_type != d.OP_VREG || w.src1.vreg == p
+                    || w.src2.op_type != d.OP_IMM) { return 0; }
+                pdef = w;
+            }
+            if (above == 1 && w.op == d.IR_LOAD && w.src1.op_type == d.OP_VREG && _fo_same_addr(w.src1.vreg, p) == 1) {
+                if (_fwd_same_ty(w.cast_to, st.cast_to) == 0) { return 0; }
+                if (cast(i64, first) == 0) { first = w; }
+                nld = nld + 1;
+            }
+        }
+        w = w.next;
+    }
+    if (nld == 0) { return 0; }
+    if (cast(i64, pdef) != 0) {
+        let is i32 as q = pdef.src1.vreg;
+        w = lbl.next;
+        while (cast(i64, w) != cast(i64, br)) {
+            if (w.is_dead == 0 && w.op != d.IR_STORE && w.op != d.IR_COPY
+                && w.dest.op_type == d.OP_VREG && w.dest.vreg == q) { return 0; }
+            w = w.next;
+        }
+    }
+
+    let is i32 as t = func.vreg_count;
+    func.vreg_count = func.vreg_count + 1;
+    // t's first value, on the way in
+    let is *d.IRInst as ld0 = _rot_clone(first);
+    ld0.dest = d.op_vreg(t);
+    ld0.next = lbl;
+    prev.next = ld0;
+    if (cast(i64, pdef) != 0) {
+        let is i32 as pa = func.vreg_count;
+        func.vreg_count = func.vreg_count + 1;
+        let is *d.IRInst as ad = _rot_clone(pdef);
+        ad.dest = d.op_vreg(pa);
+        ad.next = ld0;
+        prev.next = ad;
+        ld0.src1 = d.op_vreg(pa);
+    }
+    // the loads read t
+    w = lbl.next;
+    while (cast(i64, w) != cast(i64, st)) {
+        if (w.is_dead == 0 && w.op == d.IR_LOAD && w.src1.op_type == d.OP_VREG && _fo_same_addr(w.src1.vreg, p) == 1) {
+            w.op = d.IR_MOV;
+            w.src1 = d.op_vreg(t);
+            w.src2 = d.op_none();
+        }
+        w = w.next;
+    }
+    // t takes what the store wrote, as a load would read it back
+    let is *d.IRInst as mv with mut = cast(*d.IRInst, 0);
+    if (sz == 8) {
+        mv = d.new_inst(d.IR_MOV);
+    } else {
+        mv = d.new_inst(d.IR_CAST);
+        mv.cast_from = st.cast_to;
+    }
+    mv.dest = d.op_vreg(t);
+    mv.src1 = st.src1;
+    mv.src2 = d.op_none();
+    mv.cast_to = st.cast_to;
+    mv.line = st.line;
+    mv.next = st.next;
+    st.next = mv;
+    return 1;
+}
+
+fn _fwd_lref(o as *d.Operand, nr as *i32, lc as i32) as void {
+    if (o.op_type == d.OP_LABEL && o.label >= 0 && o.label < lc) { nr[o.label] = nr[o.label] + 1; }
+}
+
+fn pass_loop_fwd(func as *d.IRFunction) as void {
+    _fo_init(func);
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as nj = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < lc) { nj[i] = 0; i = i + 1; }
+    // every reference to a label, from any operand
+    let is *i32 as nr = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    i = 0;
+    while (i < lc) { nr[i] = 0; i = i + 1; }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && (w.op == d.IR_JMP || w.op == d.IR_JZ || w.op == d.IR_JNZ)
+            && w.dest.op_type == d.OP_LABEL && w.dest.label >= 0 && w.dest.label < lc) {
+            nj[w.dest.label] = nj[w.dest.label] + 1;
+        }
+        if (w.is_dead == 0 && w.op != d.IR_LABEL) {
+            _fwd_lref(&w.dest, nr, lc);
+            _fwd_lref(&w.src1, nr, lc);
+            _fwd_lref(&w.src2, nr, lc);
+        }
+        w = w.next;
+    }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (cast(i64, prev) != 0 && w.op == d.IR_LABEL && w.dest.label >= 0 && w.dest.label < lc) {
+            _fwd_one(func, prev, w, nj[w.dest.label], nr, lc);
+        }
+        prev = w;
+        w = w.next;
+    }
+    d.opt_free(cast(*u8, nj));
+    d.opt_free(cast(*u8, nr));
+    d.opt_free(cast(*u8, fo_obj));
+    d.opt_free(cast(*u8, fo_one));
+    fo_obj = cast(*i32, 0);
+    fo_one = cast(*i64, 0);
+    fo_vc = 0;
+}

@@ -17,6 +17,9 @@ use "opt_tre.cst" as tre;
 use "opt_bits.cst" as bits;
 use "opt_selfinline.cst" as si;
 use "opt_inline.cst" as inl;
+use "opt_unroll.cst" as unroll;
+use "opt_sroa.cst" as sroa;
+use "opt_sincos.cst" as sinc;
 use "../codegen/target.cst" as tgt;
 
 let is *u8 as opt_prog_ptr with mut;
@@ -108,6 +111,9 @@ fn opt_prof_print() as void {
     io.write_str(io.STDOUT, "ms\n");
 }
 
+// Set while optimize_func runs itself again (the unroll / SROA round).
+let is i32 as opt_nest with mut = 0;
+
 fn optimize_func(func as *d.IRFunction) as void {
     let is i32 as vc with mut = func.vreg_count;
     if (vc == 0) { return; }
@@ -190,6 +196,7 @@ fn optimize_func(func as *d.IRFunction) as void {
     if (opt_prof_on == 1) { opt_prof_times[6] = opt_prof_times[6] + opt_prof_time() - t0; }
 
     helpers.pass_lea_fusion(func, func.vreg_count);
+    if (d.ir_opt_level >= 2) { helpers.pass_lea_const(func); }
 
     // -O2: global value numbering (cross-block CSE). Gated >=2 so -O1/self-host
     // is byte-identical. DCE below cleans the now-dead redundant computations.
@@ -215,6 +222,9 @@ fn optimize_func(func as *d.IRFunction) as void {
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     phi.ssa_destroy(func);
     if (opt_prof_on == 1) { opt_prof_times[8] = opt_prof_times[8] + opt_prof_time() - t0; }
+    // -O2: a copy of a value defined once, read in another block, reads the
+    // value itself.
+    if (d.ir_opt_level >= 2) { prop.pass_single_copy_prop(func); helpers.pass_lea_const(func); }
 
     // Compact vregs into a dense range: kills the dead-vreg holes left by the
     // passes above so the O(n^2) register allocator isn't sized by a high-water
@@ -222,6 +232,19 @@ fn optimize_func(func as *d.IRFunction) as void {
     // final_resolve (so dead defs are flagged) and BEFORE the metadata cache
     // below stays vreg-independent anyway.
     helpers.pass_compact_vregs(func);
+
+    // -O2: small constant-trip loops unrolled, then local arrays and structs
+    // reached only at constant offsets split into scalar slots; each change
+    // gets one more round of the passes above (promotion to registers, the
+    // constants the copies leave behind).
+    if (d.ir_opt_level >= 2 && opt_nest == 0) {
+        opt_nest = 1;
+        if (unroll.pass_unroll_full(func) == 1) { optimize_func(func); }
+        // a split copy can free the object on its other side: one more round
+        let is i32 as srr with mut = 0;
+        while (srr < 3 && sroa.pass_sroa(func) == 1) { optimize_func(func); srr = srr + 1; }
+        opt_nest = 0;
+    }
 
     // Cache inline metadata
     func.has_stack_ops = loop.inline_has_stack_ops(func);
@@ -278,6 +301,8 @@ fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
 
     // Phase 3: re-optimize after inlining
     optimize_func(func);
+    // -O2: sin(v) and cos(v) of one value share one call (opt_sincos.cst)
+    if (d.ir_opt_level >= 2 && sinc.pass_sincos(func, prog) == 1) { optimize_func(func); }
 
     // -O2: a small recursive function expands one level into itself, off its
     // optimized body (tail recursion already a loop), and is optimized again.

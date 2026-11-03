@@ -1,0 +1,1209 @@
+use "defs.cst" as d;
+use "vec/vec_ops.cst" as vo;
+
+// === SLP: two f64 stores side by side become one 16-byte store ===
+//
+// -O2, in code generation (out of SSA, after the loop passes, before the
+// register classes are inferred). In one basic block, two stores of f64 to
+// [b + o] and [b + o + 8] whose values are computed the same way, lane by
+// lane, are computed once in an xmm register as a pair:
+//
+//     p.x = p.x + dt * v.x;            movupd  xmm2, [p]
+//     p.y = p.y + dt * v.y;      ->    movupd  xmm3, [v]     ; v.x, v.y
+//                                      movsd   xmm1, dt ; unpcklpd (both lanes)
+//                                      mulpd   xmm3, xmm1
+//                                      addpd   xmm2, xmm3
+//                                      movupd  [p], xmm2
+//
+// The tree under the two values pairs instructions of the same operation
+// (fadd fsub fmul fdiv) and loads from [c + k] and [c + k + 8]; one value read
+// by both lanes is broadcast; anything else is joined from its two scalars
+// (unpcklpd). Each lane computes what it computed: the same operations on the
+// same operands, so the results are the scalar ones bit for bit.
+//
+// Everything happens where the later store was. That moves loads down and
+// the earlier store down; the pair is made only when no store in between can
+// write what a moved load reads, the earlier store cannot write what a load
+// after it reads, and nothing in between reads what it writes. Two addresses
+// are apart when they are offsets of the same value, or of two different named
+// objects (globals, frame slots).
+
+let is i32 as SLP_MAXN with imut = 24;      // nodes in one tree
+let is i32 as SLP_MAXBLK with imut = 600;   // instructions in one block
+
+let is *i64 as sl_a with mut = cast(*i64, 0);   // live instructions in order
+let is *i32 as sl_blk with mut = cast(*i32, 0); // block start of each position
+let is i32 as sl_n with mut = 0;
+let is *d.IRFunction as sl_fn with mut = cast(*d.IRFunction, 0);
+// The frame slot each vreg's value is made from (sl_fsl: 0 none, the slot's
+// _named key, -1 several), the slots whose address leaves the function's
+// hands (stored, passed, returned...: sl_esc), and sl_fesc when that cannot
+// be told slot by slot.
+let is *i64 as sl_fsl with mut = cast(*i64, 0);
+let is [32]i64 as sl_esc;
+let is i32 as sl_nesc with mut = 0;
+let is i32 as sl_fesc with mut = 1;
+// the one position defining each vreg, -1 none, -2 several
+let is *i32 as sl_udef with mut = cast(*i32, 0);
+let is i32 as sl_nvu with mut = 0;     // vregs sl_udef covers
+// Every value a vreg takes is B + k*S + c for some integer k (S 0: exactly
+// B + c), B a vreg set once in the entry block (its number) or a frame slot's
+// or global's address (its _named key + 2^42): sf_b (-2 unknown yet, -1 no
+// such form), sf_s, sf_c. sf_x: an integer known to be a multiple of sf_x.
+let is *i64 as sf_b with mut = cast(*i64, 0);
+let is *i64 as sf_s with mut = cast(*i64, 0);
+let is *i64 as sf_c with mut = cast(*i64, 0);
+let is *i64 as sf_x with mut = cast(*i64, 0);
+let is i32 as sl_entry with mut = 0;   // position of the first label jumped to
+
+// pairs already computed as a vector in this function (earlier calls):
+// lane 0 and lane 1 instruction, the vector vreg
+let is [128]i64 as sv_i0;
+let is [128]i64 as sv_i1;
+let is [128]i32 as sv_v;
+let is i32 as sv_n with mut = 0;
+let is i32 as sl_P with mut = 0;      // where the tree being built goes
+let is i32 as sl_simple with mut = 0; // 1: same op in both lanes only, no swapped pairs
+let is *d.IRFunction as sv_fn with mut = cast(*d.IRFunction, 0);
+
+// tree nodes
+let is [24]i32 as nk;     // 1 load, 2 op, 3 splat, 4 pack, 5 a vector made before, 6 lanes swapped
+let is [24]i32 as nvo;    // an op node's vector op
+let is [24]i32 as np0;    // lane 0: position of its instruction (load / op), else the read position
+let is [24]i32 as np1;
+let is [24]i32 as nv0;    // the scalar vregs (splat / pack)
+let is [24]i32 as nv1;
+let is [24]i32 as nd0;    // reaching definitions of nv0 / nv1 (positions, -1 from outside)
+let is [24]i32 as nd1;
+let is [24]i32 as nc1;    // children (op)
+let is [24]i32 as nc2;
+let is [24]i32 as nroot;  // load: base vreg; its definition in nrd; offset in noff
+let is [24]i32 as nrd;
+let is [24]i64 as noff;
+let is [24]i64 as nidx;   // load: index part of the address (_ipack)
+let is [24]i32 as naddr;  // load: lane 0's address vreg, and its definition
+let is [24]i32 as naddrd;
+let is [24]i32 as nu0;    // what the vector code reads (after _keep)
+let is [24]i32 as nu1;
+let is [24]i32 as nua;
+let is [24]i32 as nout;   // vector vreg made for the node
+let is i32 as nn with mut = 0;
+
+fn _I(p as i32) as *d.IRInst { return cast(*d.IRInst, sl_a[p]); }
+
+fn _def(it as *d.IRInst) as i32 {
+    let is i32 as op = it.op;
+    if (op == d.IR_STORE || op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ
+        || op == d.IR_RET || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256 || op == d.IR_COPY
+        || op == d.IR_ATOMIC_STORE) { return 0 - 1; }
+    if (it.dest.op_type != d.OP_VREG) { return 0 - 1; }
+    return it.dest.vreg;
+}
+
+fn _is_f64(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    return cast(i32, *cast(*i32, t) == 10);
+}
+
+// The definition of v that reaches position p from inside p's block, or -1.
+fn _rdef(v as i32, p as i32) as i32 {
+    let is i32 as q with mut = p - 1;
+    let is i32 as b = sl_blk[p];
+    while (q >= b) {
+        if (_def(_I(q)) == v) { return q; }
+        q = q - 1;
+    }
+    return 0 - 1;
+}
+
+// An address v read at p as root + idx * sc + off: root and idx are vregs with
+// the definitions that reach there (idx -1 when there is none), through
+// copies, constant adds and base + index * 2/4/8.
+let is i32 as ad_root with mut = 0;
+let is i32 as ad_rd with mut = 0;
+let is i32 as ad_idx with mut = 0;
+let is i32 as ad_id with mut = 0;
+let is i32 as ad_sc with mut = 0;
+let is i64 as ad_off with mut = 0;
+
+// v read at p through copies and constant adds: ad_root / ad_rd / ad_off
+fn _chain(v as i32, p as i32) as void {
+    let is i32 as cv with mut = v;
+    let is i32 as cp with mut = p;
+    let is i64 as off with mut = 0;
+    let is i32 as hop with mut = 0;
+    while (hop < 8) {
+        let is i32 as q = _rdef(cv, cp);
+        if (q < 0) { hop = 8; }
+        else {
+            let is *d.IRInst as it = _I(q);
+            if (it.op == d.IR_ADD && it.src1.op_type == d.OP_VREG && it.src2.op_type == d.OP_IMM
+                && it.src2.imm > 0 - 1048576 && it.src2.imm < 1048576 && it.src1.vreg != cv) {
+                off = off + it.src2.imm; cv = it.src1.vreg; cp = q;
+            } else if (it.op == d.IR_SUB && it.src1.op_type == d.OP_VREG && it.src2.op_type == d.OP_IMM
+                && it.src2.imm > 0 - 1048576 && it.src2.imm < 1048576 && it.src1.vreg != cv) {
+                off = off - it.src2.imm; cv = it.src1.vreg; cp = q;
+            } else if (it.op == d.IR_MOV && it.src1.op_type == d.OP_VREG && it.src1.vreg != cv) {
+                cv = it.src1.vreg; cp = q;
+            } else { hop = 8; }
+        }
+        hop = hop + 1;
+    }
+    ad_root = cv; ad_rd = _rdef(cv, cp); ad_off = off;
+    // a conversion made twice from one value is one value: the earliest
+    if (ad_rd >= 0) {
+        let is *d.IRInst as ci = _I(ad_rd);
+        if (ci.op == d.IR_CAST && ci.src1.op_type == d.OP_VREG) {
+            let is i32 as sv = ci.src1.vreg;
+            let is i32 as sd = _rdef(sv, ad_rd);
+            let is i32 as e with mut = ad_rd - 1;
+            let is i32 as b = sl_blk[ad_rd];
+            while (e >= b) {
+                let is *d.IRInst as ce = _I(e);
+                if (ce.op == d.IR_CAST && ce.src1.op_type == d.OP_VREG && ce.src1.vreg == sv
+                    && ce.dest.op_type == d.OP_VREG && _tk(ce.cast_to) == _tk(ci.cast_to)
+                    && _tk(ce.cast_from) == _tk(ci.cast_from) && _rdef(sv, e) == sd) {
+                    ad_root = ce.dest.vreg; ad_rd = e;
+                }
+                e = e - 1;
+            }
+        }
+    }
+}
+
+fn _tk(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0 - 1; }
+    return *cast(*i32, t);
+}
+
+fn _addr(v as i32, p as i32) as void {
+    _chain(v, p);
+    ad_idx = 0 - 1; ad_id = 0 - 1; ad_sc = 0;
+    if (ad_rd < 0) { return; }
+    let is *d.IRInst as it = _I(ad_rd);
+    let is i32 as sc with mut = 0;
+    if (it.op == d.IR_LEA2) { sc = 2; } else if (it.op == d.IR_LEA4) { sc = 4; } else if (it.op == d.IR_LEA8) { sc = 8; }
+    if (sc == 0 || it.src1.op_type != d.OP_VREG || it.src2.op_type != d.OP_VREG) { return; }
+    let is i64 as o = ad_off;
+    let is i32 as q = ad_rd;
+    _chain(it.src2.vreg, q);
+    let is i32 as xi = ad_root;
+    let is i32 as xd = ad_rd;
+    let is i64 as xo = ad_off;
+    _chain(it.src1.vreg, q);
+    ad_idx = xi; ad_id = xd; ad_sc = sc;
+    ad_off = ad_off + o + xo * cast(i64, sc);
+}
+
+// A named object the value root (defined at rd) points into: >0, else 0.
+fn _named(root as i32, rd0 as i32) as i64 {
+    let is i32 as rd with mut = rd0;
+    // defined before the block: its only definition, wherever it is
+    if (rd < 0 && root >= 0 && root < sl_fn.vreg_count && cast(i64, sl_udef) != 0) { rd = sl_udef[root]; }
+    if (rd < 0) { return 0; }
+    return _ikey(_I(rd));
+}
+
+// the named object an address instruction makes: >0, else 0
+fn _ikey(it as *d.IRInst) as i64 {
+    if (it.op == d.IR_ADDR_GLOBAL) {
+        let is i64 as h with mut = 1469598103;
+        let is i32 as q with mut = 0;
+        while (q < it.global_name_len) {
+            h = ((h ^ cast(i64, it.global_name_ptr[q])) * 16777619) & 1099511627775;
+            q = q + 1;
+        }
+        return h * 2 + 2;
+    }
+    return _fkey(it);
+}
+
+// a frame slot's key (odd: variables and the call area apart), 0 otherwise
+fn _fkey(it as *d.IRInst) as i64 {
+    if (it.src1.op_type != d.OP_IMM) { return 0; }
+    if (it.op == d.IR_ADDR) { return (it.src1.imm + 4194304) * 4 + 1; }
+    if (it.op == d.IR_GET_ALLOC_ADDR) { return (it.src1.imm + 4194304) * 4 + 3; }
+    return 0;
+}
+
+fn _gcd(a0 as i64, b0 as i64) as i64 {
+    let is i64 as a with mut = a0;
+    let is i64 as b with mut = b0;
+    if (a < 0) { a = 0 - a; }
+    if (b < 0) { b = 0 - b; }
+    while (b != 0) { let is i64 as t = a % b; a = b; b = t; }
+    return a;
+}
+
+fn _md(c as i64, m as i64) as i64 {
+    if (m == 0) { return c; }
+    let is i64 as r = c % m;
+    if (r < 0) { return r + m; }
+    return r;
+}
+
+// a vreg that can be B: set once, in the entry block
+fn _sf_base(v as i32) as i32 {
+    if (v < 0 || v >= sl_fn.vreg_count) { return 0; }
+    let is i32 as u = sl_udef[v];
+    if (u < 0 || u >= sl_entry) { return 0; }
+    return 1;
+}
+
+let is i64 as fq_b with mut = 0;
+let is i64 as fq_s with mut = 0;
+let is i64 as fq_c with mut = 0;
+
+// the form of address r + idx + o (idx packed by _ipack) into fq_*, 0 when none
+fn _sf_of(r as i32, ix as i64, o as i64) as i32 {
+    if (cast(i64, sf_b) == 0 || r < 0 || r >= sl_fn.vreg_count) { return 0; }
+    if (sf_b[r] >= 0) { fq_b = sf_b[r]; fq_s = sf_s[r]; fq_c = sf_c[r]; }
+    else if (_sf_base(r) == 1) { fq_b = cast(i64, r); fq_s = 0; fq_c = 0; }
+    else { return 0; }
+    let is i64 as sc = ix & 15;
+    if (sc != 0) {
+        // the index's own form adds a multiple of its stride times sc
+        let is i64 as iv = ix / 68719476736 - 1;
+        let is i64 as m with mut = sc;
+        if (iv >= 0 && iv < cast(i64, sl_fn.vreg_count) && sf_x[cast(i32, iv)] > 0) { m = sc * sf_x[cast(i32, iv)]; }
+        fq_s = _gcd(fq_s, m);
+    }
+    fq_c = _md(fq_c + o, fq_s);
+    return 1;
+}
+
+fn _sf_apart(r1 as i32, i1 as i64, o1 as i64, s1 as i64, r2 as i32, i2 as i64, o2 as i64, s2 as i64) as i32 {
+    if (_sf_of(r1, i1, o1) == 0) { return 0; }
+    let is i64 as b1 = fq_b;
+    let is i64 as m1 = fq_s;
+    let is i64 as c1 = fq_c;
+    if (_sf_of(r2, i2, o2) == 0) { return 0; }
+    if (fq_b != b1) { return 0; }
+    let is i64 as m = _gcd(m1, fq_s);
+    let is i64 as a = _md(c1, m);
+    let is i64 as b = _md(fq_c, m);
+    if (m == 0) {
+        if (a + s1 <= b || b + s2 <= a) { return 1; }
+        return 0;
+    }
+    if (s1 + s2 > m) { return 0; }
+    // [a, a + s1) against [b + k*m, + s2) for the k that can reach it
+    let is i64 as k with mut = 0 - 1;
+    while (k <= 1) {
+        let is i64 as bb = b + k * m;
+        if (a < bb + s2 && bb < a + s1) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _sf_meet(v as i32, b as i64, sv as i64, c as i64) as i32 {
+    if (sf_b[v] == 0 - 1) { return 0; }
+    if (b < 0) { sf_b[v] = 0 - 1; return 1; }
+    if (sf_b[v] == 0 - 2) { sf_b[v] = b; sf_s[v] = sv; sf_c[v] = _md(c, sv); return 1; }
+    if (sf_b[v] != b) { sf_b[v] = 0 - 1; return 1; }
+    let is i64 as g = _gcd(_gcd(sf_s[v], sv), sf_c[v] - c);
+    let is i64 as nc = _md(sf_c[v], g);
+    if (g == sf_s[v] && nc == sf_c[v]) { return 0; }
+    sf_s[v] = g; sf_c[v] = nc;
+    return 1;
+}
+
+// the operand's form into fq_* (1), none (0), not known yet (2)
+fn _sf_opnd(o as *d.Operand) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= sl_fn.vreg_count) { return 0; }
+    let is i32 as v = o.vreg;
+    if (sf_b[v] >= 0) { fq_b = sf_b[v]; fq_s = sf_s[v]; fq_c = sf_c[v]; return 1; }
+    if (_sf_base(v) == 1) { fq_b = cast(i64, v); fq_s = 0; fq_c = 0; return 1; }
+    if (sf_b[v] == 0 - 2 && sl_udef[v] != 0 - 1) { return 2; }
+    return 0;
+}
+
+fn _sf_xof(o as *d.Operand) as i64 {
+    if (o.op_type == d.OP_IMM) { return o.imm; }
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= sl_fn.vreg_count) { return 0; }
+    return sf_x[o.vreg];
+}
+
+// one definition's contribution; final: an operand not known yet counts as none
+fn _sf_def(it as *d.IRInst, final as i32) as i32 {
+    let is i32 as v = _def(it);
+    if (v < 0 || v >= sl_fn.vreg_count) { return 0; }
+    let is i32 as op = it.op;
+    let is i32 as ch with mut = 0;
+    // multiples
+    let is i64 as x with mut = 0;
+    if (op == d.IR_MUL && it.src2.op_type == d.OP_IMM) { x = _gcd(it.src2.imm, 0); }
+    if (op == d.IR_MUL && it.src1.op_type == d.OP_IMM) { x = _gcd(it.src1.imm, 0); }
+    if (op == d.IR_MUL && it.src2.op_type == d.OP_VREG && it.src1.op_type == d.OP_VREG) {
+        let is i64 as xa = _sf_xof(&it.src1);
+        let is i64 as xb = _sf_xof(&it.src2);
+        if (xa > 0 && xb > 0) { x = xa * xb; } else if (xa > 0) { x = xa; } else if (xb > 0) { x = xb; }
+    }
+    if (op == d.IR_SHL && it.src2.op_type == d.OP_IMM && it.src2.imm >= 0 && it.src2.imm < 24) { x = cast(i64, 1) << it.src2.imm; }
+    if (op == d.IR_MOV || (op == d.IR_CAST && _size(it.cast_to) == 8)) { x = _sf_xof(&it.src1); }
+    if (op == d.IR_ADD || op == d.IR_SUB) {
+        let is i64 as xa = _sf_xof(&it.src1);
+        let is i64 as xb = _sf_xof(&it.src2);
+        if (xa != 0 && xb != 0) { x = _gcd(xa, xb); }
+    }
+    if (it.src1.op_type == d.OP_IMM && op == d.IR_IMM) { x = 0; }
+    if (op == d.IR_IMM && it.src1.op_type == d.OP_IMM && it.src1.imm != 0) { x = _gcd(it.src1.imm, 0); }
+    // a multiple only when every definition is: the smallest common one
+    if (x <= 0) { if (sf_x[v] != 0 - 1) { sf_x[v] = 0 - 1; ch = 1; } }
+    else if (sf_x[v] == 0) { sf_x[v] = x; ch = 1; }
+    else if (sf_x[v] > 0 && _gcd(sf_x[v], x) != sf_x[v]) { sf_x[v] = _gcd(sf_x[v], x); ch = 1; }
+    // pointer forms
+    let is i32 as k1 with mut = 0;
+    let is i64 as nb with mut = 0 - 1;
+    let is i64 as ns with mut = 0;
+    let is i64 as nc with mut = 0;
+    if (op == d.IR_ADDR || op == d.IR_GET_ALLOC_ADDR || op == d.IR_ADDR_GLOBAL) {
+        // a named object's address: the same value wherever it is made
+        let is i64 as key = _ikey(it);
+        if (key > 0) { nb = key + 4398046511104; ns = 0; nc = 0; }
+    } else if (op == d.IR_MOV || (op == d.IR_CAST && _size(it.cast_to) == 8)) {
+        k1 = _sf_opnd(&it.src1);
+        if (k1 == 1) { nb = fq_b; ns = fq_s; nc = fq_c; }
+    } else if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) {
+        k1 = _sf_opnd(&it.src1);
+        let is i32 as kb with mut = 0;
+        let is i64 as bb with mut = 0;
+        let is i64 as bs with mut = 0;
+        let is i64 as bc with mut = 0;
+        if (op == d.IR_ADD && k1 != 1) {
+            // the pointer may be the second operand
+            kb = _sf_opnd(&it.src2);
+            if (kb == 1) {
+                bb = fq_b; bs = fq_s; bc = fq_c;
+                let is i64 as xm = _sf_xof(&it.src1);
+                if (xm > 0) { nb = bb; ns = _gcd(bs, xm); nc = bc; k1 = 1; }
+                else if (k1 == 0) { k1 = 0; }
+            }
+        } else if (k1 == 1) {
+            bb = fq_b; bs = fq_s; bc = fq_c;
+            let is i64 as sc with mut = 1;
+            if (op == d.IR_LEA2) { sc = 2; } else if (op == d.IR_LEA4) { sc = 4; } else if (op == d.IR_LEA8) { sc = 8; }
+            if (it.src2.op_type == d.OP_IMM && op == d.IR_ADD) { nb = bb; ns = bs; nc = bc + it.src2.imm; }
+            else if (it.src2.op_type == d.OP_IMM && op == d.IR_SUB) { nb = bb; ns = bs; nc = bc - it.src2.imm; }
+            else if (op != d.IR_SUB) {
+                let is i64 as xm = _sf_xof(&it.src2);
+                if (xm > 0) { nb = bb; ns = _gcd(bs, xm * sc); nc = bc; }
+            }
+        }
+    }
+    if (k1 == 2 && final == 0) { return ch; }
+    if (_sf_meet(v, nb, ns, nc) == 1) { ch = 1; }
+    return ch;
+}
+
+fn _sf_build() as void {
+    let is i32 as nv = sl_fn.vreg_count;
+    sf_b = cast(*i64, d.opt_alloc(cast(i64, nv) * 8 + 8));
+    sf_s = cast(*i64, d.opt_alloc(cast(i64, nv) * 8 + 8));
+    sf_c = cast(*i64, d.opt_alloc(cast(i64, nv) * 8 + 8));
+    sf_x = cast(*i64, d.opt_alloc(cast(i64, nv) * 8 + 8));
+    let is i32 as v with mut = 0;
+    while (v < nv) { sf_b[v] = 0 - 2; sf_s[v] = 0; sf_c[v] = 0; sf_x[v] = 0; v = v + 1; }
+    let is i32 as fin with mut = 0;
+    while (fin < 2) {
+        let is i32 as ch with mut = 1;
+        let is i32 as rounds with mut = 0;
+        while (ch == 1) {
+            ch = 0;
+            rounds = rounds + 1;
+            if (rounds > 40) {
+                // no fixpoint in sight: no forms at all
+                v = 0;
+                while (v < nv) { sf_b[v] = 0 - 1; sf_x[v] = 0 - 1; v = v + 1; }
+                return;
+            }
+            let is i32 as q with mut = 0;
+            while (q < sl_n) {
+                if (_sf_def(_I(q), fin) == 1) { ch = 1; }
+                q = q + 1;
+            }
+        }
+        fin = fin + 1;
+    }
+}
+
+// Can r (any value) not point into the frame slot keyed k?
+fn _apart(k as i64, r as i32) as i32 {
+    if (sl_fesc != 0 || cast(i64, sl_fsl) == 0 || r < 0 || r >= sl_fn.vreg_count) { return 0; }
+    let is i32 as e with mut = 0;
+    while (e < sl_nesc) { if (sl_esc[e] == k) { return 0; } e = e + 1; }
+    let is i64 as f = sl_fsl[r];
+    if (f == k || f < 0) { return 0; }
+    return 1;
+}
+
+// The index part of the last _addr (vreg, definition, scale), packed.
+fn _ipack() as i64 { return (cast(i64, ad_idx) + 1) * 68719476736 + (cast(i64, ad_id) + 1) * 16 + cast(i64, ad_sc); }
+
+// May [r1 + i1 + o1, +s1) and [r2 + i2 + o2, +s2) overlap?
+fn _may(r1 as i32, d1 as i32, i1 as i64, o1 as i64, s1 as i64, r2 as i32, d2 as i32, i2 as i64, o2 as i64, s2 as i64) as i32 {
+    if (r1 == r2 && d1 == d2 && i1 == i2) {
+        if (o1 + s1 <= o2 || o2 + s2 <= o1) { return 0; }
+        return 1;
+    }
+    let is i64 as n1 = _named(r1, d1);
+    let is i64 as n2 = _named(r2, d2);
+    if (n1 > 0 && n2 > 0 && n1 != n2) { return 0; }
+    // a frame slot whose address never escapes, against a pointer not made from it
+    if ((n1 & 1) == 1 && n2 == 0 && _apart(n1, r2) == 1) { return 0; }
+    if ((n2 & 1) == 1 && n1 == 0 && _apart(n2, r1) == 1) { return 0; }
+    // B + k*S + c against B + k'*S + c': apart when the byte ranges are
+    // apart modulo S (fields of elements of one array of structs)
+    if (_sf_apart(r1, i1, o1, s1, r2, i2, o2, s2) == 1) { return 0; }
+    return 1;
+}
+
+// the memory an instruction at q touches as a scalar: 1 load, 2 store,
+// 0 none, 3 anything else (a call, asm, a copy, a vector op...)
+fn _memk(it as *d.IRInst) as i32 {
+    let is i32 as op = it.op;
+    if (op == d.IR_VOP) {
+        let is i32 as c = vo.vo_code(it.dest.label);
+        if (c == vo.VO_LOAD) {
+            if (it.src1.op_type != d.OP_VREG || it.src2.op_type != d.OP_IMM) { return 3; }
+            return 1;
+        }
+        if (c == vo.VO_FOLD) { return 0; }
+        return 0;
+    }
+    if (op == d.IR_VSTOREQ) {
+        if (it.src1.op_type != d.OP_VREG || it.dest.op_type != d.OP_IMM) { return 3; }
+        return 2;
+    }
+    if (op == d.IR_LOAD) {
+        if (it.src1.op_type != d.OP_VREG) { return 3; }
+        return 1;
+    }
+    if (op == d.IR_STORE) {
+        if (it.dest.op_type != d.OP_VREG) { return 3; }
+        return 2;
+    }
+    if (op == d.IR_IMM || op == d.IR_MOV || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
+        || op == d.IR_NEG || op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE
+        || op == d.IR_GT || op == d.IR_GE || op == d.IR_CAST || op == d.IR_SHL || op == d.IR_SHR
+        || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_NOT || op == d.IR_FADD
+        || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8 || op == d.IR_ADDR
+        || op == d.IR_ADDR_GLOBAL || op == d.IR_GET_ALLOC_ADDR || op == d.IR_CMOV) { return 0; }
+    // inside a block, a label is one nothing jumps to
+    if (op == d.IR_LABEL) { return 0; }
+    // the hidden context register for a call (r10): no memory
+    if (op == d.IR_SET_CTX) { return 0; }
+    return 3;
+}
+
+// a memory instruction's address vreg, displacement and size in bytes
+fn _maddr(it as *d.IRInst) as i32 {
+    if (it.op == d.IR_STORE) { return it.dest.vreg; }
+    return it.src1.vreg;
+}
+fn _mdisp(it as *d.IRInst) as i64 {
+    if (it.op == d.IR_VOP) { return it.src2.imm; }
+    if (it.op == d.IR_VSTOREQ) { return it.dest.imm; }
+    return 0;
+}
+fn _msize(it as *d.IRInst) as i64 {
+    if (it.op == d.IR_VOP) { return cast(i64, vo.vo_ls(it.dest.label) * vo.vo_lanes(it.dest.label)); }
+    if (it.op == d.IR_VSTOREQ) {
+        let is i64 as nb = cast(i64, it.dest.label & 255);
+        if (nb == 0) { return 16; }
+        return nb;
+    }
+    return _size(it.cast_to);
+}
+
+fn _size(t as *u8) as i64 {
+    if (cast(i64, t) == 0) { return 8; }
+    let is i32 as k = *cast(*i32, t);
+    if (k == 1 || k == 5 || k == 11 || k == 12) { return 1; }
+    if (k == 2 || k == 6) { return 2; }
+    if (k == 3 || k == 7 || k == 9) { return 4; }
+    return 8;
+}
+
+fn _newn(k as i32) as i32 {
+    if (nn >= SLP_MAXN) { return 0 - 1; }
+    let is i32 as i = nn;
+    nn = nn + 1;
+    nk[i] = k; np0[i] = 0 - 1; np1[i] = 0 - 1; nv0[i] = 0 - 1; nv1[i] = 0 - 1;
+    nd0[i] = 0 - 1; nd1[i] = 0 - 1; nc1[i] = 0 - 1; nc2[i] = 0 - 1;
+    nroot[i] = 0 - 1; nrd[i] = 0 - 1; noff[i] = 0; nout[i] = 0 - 1;
+    nidx[i] = 0; naddr[i] = 0 - 1; naddrd[i] = 0 - 1; nvo[i] = 0;
+    return i;
+}
+
+fn _leaf(v0 as i32, p0 as i32, v1 as i32, p1 as i32) as i32 {
+    let is i32 as r0 = _rdef(v0, p0);
+    let is i32 as r1 = _rdef(v1, p1);
+    let is i32 as k with mut = 4;
+    if (v0 == v1 && r0 == r1) { k = 3; }
+    let is i32 as i = _newn(k);
+    if (i < 0) { return i; }
+    nv0[i] = v0; nv1[i] = v1; nd0[i] = r0; nd1[i] = r1; np0[i] = p0; np1[i] = p1;
+    return i;
+}
+
+fn _vopcode(op as i32) as i32 {
+    if (op == d.IR_FADD) { return vo.VO_FADD; }
+    if (op == d.IR_FSUB) { return vo.VO_FSUB; }
+    if (op == d.IR_FMUL) { return vo.VO_FMUL; }
+    if (op == d.IR_FDIV) { return vo.VO_FDIV; }
+    return 0;
+}
+
+// No store between positions a and b (either order) may write [r + x + o, +8),
+// and nothing else in between touches memory.
+fn _clean(a as i32, b as i32, r as i32, rd as i32, x as i64, o as i64) as i32 {
+    let is i32 as lo with mut = a;
+    let is i32 as hi with mut = b;
+    if (b < a) { lo = b; hi = a; }
+    let is i32 as q with mut = lo + 1;
+    while (q < hi) {
+        let is *d.IRInst as it = _I(q);
+        let is i32 as mk = _memk(it);
+        if (mk == 3) { return 0; }
+        if (mk == 2) {
+            _addr(_maddr(it), q);
+            if (_may(r, rd, x, o, 8, ad_root, ad_rd, _ipack(), ad_off + _mdisp(it), _msize(it)) == 1) { return 0; }
+        }
+        q = q + 1;
+    }
+    return 1;
+}
+
+// The pair (v0 read at p0, v1 read at p1) as a node, -1 when the tree is full.
+fn _build(v0 as i32, p0 as i32, v1 as i32, p1 as i32, depth as i32) as i32 {
+    return _bld(v0, p0, v1, p1, depth, 0);
+}
+
+// The pair, or failing that the pair the other way round with its lanes
+// swapped back (norev 1: not that again).
+fn _bld(v0 as i32, p0 as i32, v1 as i32, p1 as i32, depth as i32, norev as i32) as i32 {
+    let is i32 as r0 = _rdef(v0, p0);
+    let is i32 as r1 = _rdef(v1, p1);
+    if ((v0 == v1 && r0 == r1) || r0 < 0 || r1 < 0 || r0 == r1 || depth > 6) { return _leaf(v0, p0, v1, p1); }
+    // the same pair already in this tree
+    let is i32 as mj with mut = 0;
+    while (mj < nn) {
+        if ((nk[mj] == 1 || nk[mj] == 2 || nk[mj] == 5) && np0[mj] == r0 && np1[mj] == r1) { return mj; }
+        mj = mj + 1;
+    }
+    let is i32 as n0 = _bnode(v0, p0, v1, p1, r0, r1, depth);
+    if (n0 != 0 - 2) { return n0; }
+    if (norev == 0 && sl_simple == 0) {
+        let is i32 as save = nn;
+        let is i32 as c = _bld(v1, p1, v0, p0, depth + 1, 1);
+        if (c == 0 - 1) { return c; }
+        if (nk[c] == 1 || nk[c] == 2 || nk[c] == 5) {
+            let is i32 as w = _newn(6);
+            if (w < 0) { return w; }
+            nc1[w] = c;
+            return w;
+        }
+        nn = save;
+    }
+    return _leaf(v0, p0, v1, p1);
+}
+
+// A vector load made earlier (sv_*) of [a + x + o, +16), before the tree's
+// place, with no write there between it and the scalar loads at r0, r1.
+fn _same_load(r0 as i32, r1 as i32, a as i32, ad as i32, x as i64, o as i64) as i32 {
+    let is i32 as sk with mut = 0;
+    while (sk < sv_n) {
+        let is i32 as vv = sv_v[sk];
+        if (vv >= 0 && vv < sl_nvu && sl_udef[vv] >= 0) {
+            let is i32 as u = sl_udef[vv];
+            let is *d.IRInst as it = _I(u);
+            if (it.op == d.IR_VOP && vo.vo_code(it.dest.label) == vo.VO_LOAD && it.src1.op_type == d.OP_VREG
+                && it.src2.op_type == d.OP_IMM && sl_blk[u] == sl_blk[r0] && u < sl_P) {
+                _addr(it.src1.vreg, u);
+                if (ad_root == a && ad_rd == ad && _ipack() == x && ad_off + it.src2.imm == o
+                    && _clean(r0, u, a, ad, x, o) == 1 && _clean(r1, u, a, ad, x, o + 8) == 1) { return vv; }
+            }
+        }
+        sk = sk + 1;
+    }
+    return 0 - 1;
+}
+
+// A load, op or earlier vector node for the pair, -2 when it is none of them,
+// -1 when the tree is full.
+fn _bnode(v0 as i32, p0 as i32, v1 as i32, p1 as i32, r0 as i32, r1 as i32, depth as i32) as i32 {
+    let is *d.IRInst as i0 = _I(r0);
+    let is *d.IRInst as i1 = _I(r1);
+    // the pair is a vector already, made before both reads
+    let is i32 as sk with mut = 0;
+    while (sk < sv_n) {
+        if (sv_i0[sk] == cast(i64, i0) && sv_i1[sk] == cast(i64, i1)) {
+            let is i32 as vv = sv_v[sk];
+            if (vv >= 0 && vv < sl_nvu) {
+                let is i32 as u = sl_udef[vv];
+                // made before the new tree's place, from the same values
+                // (the tree that made it checked its loads up to there)
+                if (u >= 0 && sl_blk[u] == sl_blk[p0] && u < sl_P) {
+                    let is i32 as i = _newn(5);
+                    if (i < 0) { return i; }
+                    np0[i] = r0; np1[i] = r1; nout[i] = vv;
+                    return i;
+                }
+            }
+        }
+        sk = sk + 1;
+    }
+    if (i0.op == d.IR_LOAD && i1.op == d.IR_LOAD && _is_f64(i0.cast_to) == 1 && _is_f64(i1.cast_to) == 1
+        && i0.src1.op_type == d.OP_VREG && i1.src1.op_type == d.OP_VREG) {
+        _addr(i0.src1.vreg, r0);
+        let is i32 as a0 = ad_root;
+        let is i32 as a0d = ad_rd;
+        let is i64 as x0 = _ipack();
+        let is i64 as o0 = ad_off;
+        _addr(i1.src1.vreg, r1);
+        if (ad_root == a0 && ad_rd == a0d && _ipack() == x0 && ad_off == o0 + 8) {
+            // the same 16 bytes loaded as a vector already, nothing written
+            // there in between: that vector
+            let is i32 as lv = _same_load(r0, r1, a0, a0d, x0, o0);
+            if (lv >= 0) {
+                let is i32 as i = _newn(5);
+                if (i < 0) { return i; }
+                np0[i] = r0; np1[i] = r1; nout[i] = lv;
+                return i;
+            }
+            let is i32 as i = _newn(1);
+            if (i < 0) { return i; }
+            np0[i] = r0; np1[i] = r1; nroot[i] = a0; nrd[i] = a0d; noff[i] = o0; nidx[i] = x0;
+            naddr[i] = i0.src1.vreg; naddrd[i] = _rdef(i0.src1.vreg, r0);
+            return i;
+        }
+        // one address read twice with nothing written between: one value
+        if (ad_root == a0 && ad_rd == a0d && _ipack() == x0 && ad_off == o0 && _clean(r0, r1, a0, a0d, x0, o0) == 1) {
+            let is i32 as e with mut = r0;
+            if (r1 < e) { e = r1; }
+            let is i32 as i = _newn(3);
+            if (i < 0) { return i; }
+            nv0[i] = _I(e).dest.vreg; nv1[i] = nv0[i]; nd0[i] = e; nd1[i] = e; np0[i] = p0; np1[i] = p1;
+            return i;
+        }
+        return 0 - 2;
+    }
+    let is i32 as vop with mut = 0;
+    if (i0.op == i1.op) { vop = _vopcode(i0.op); }
+    // lane 0 subtracts, lane 1 adds: addsubpd
+    if (i0.op == d.IR_FSUB && i1.op == d.IR_FADD && sl_simple == 0) { vop = vo.VO_FADDSUB; }
+    if (vop != 0 && _is_f64(i0.cast_to) == 1 && _is_f64(i1.cast_to) == 1
+        && i0.src1.op_type == d.OP_VREG && i1.src1.op_type == d.OP_VREG
+        && i0.src2.op_type == d.OP_VREG && i1.src2.op_type == d.OP_VREG) {
+        let is i32 as i = _newn(2);
+        if (i < 0) { return i; }
+        np0[i] = r0; np1[i] = r1; nvo[i] = vop;
+        let is i32 as c1 = _build(i0.src1.vreg, r0, i1.src1.vreg, r1, depth + 1);
+        if (c1 < 0) { return c1; }
+        let is i32 as c2 = _build(i0.src2.vreg, r0, i1.src2.vreg, r1, depth + 1);
+        if (c2 < 0) { return c2; }
+        nc1[i] = c1; nc2[i] = c2;
+        return i;
+    }
+    return 0 - 2;
+}
+
+// reads of v by live instructions of the function
+fn _reads(v as i32) as i32 {
+    let is i32 as c with mut = 0;
+    let is i32 as q with mut = 0;
+    while (q < sl_n) {
+        let is *d.IRInst as it = _I(q);
+        if (it.is_dead == 0) {
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg == v) { c = c + 1; }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg == v) { c = c + 1; }
+            if ((it.op == d.IR_STORE || it.op == d.IR_CMOV || it.op == d.IR_VSTOREQ || it.op == d.IR_VSTOREQ256)
+                && it.dest.op_type == d.OP_VREG && it.dest.vreg == v) { c = c + 1; }
+        }
+        q = q + 1;
+    }
+    return c;
+}
+
+// The tree computed at P, its scalars and memory unchanged since they were read.
+fn _legal(s0 as i32, s1 as i32, P as i32) as i32 {
+    let is i32 as lo with mut = s0;
+    if (s1 < lo) { lo = s1; }
+    let is i32 as i with mut = 0;
+    while (i < nn) {
+        if (nk[i] == 1) {
+            if (np0[i] < lo) { lo = np0[i]; }
+            if (np1[i] < lo) { lo = np1[i]; }
+        }
+        i = i + 1;
+    }
+    // the stores' own address
+    let is *d.IRInst as st0 = _I(s0);
+    _addr(st0.dest.vreg, s0);
+    let is i32 as sr = ad_root;
+    let is i32 as srd = ad_rd;
+    let is i64 as sx = _ipack();
+    let is i64 as so = ad_off;
+    let is i32 as q with mut = lo;
+    while (q < P) {
+        let is *d.IRInst as it = _I(q);
+        let is i32 as mk = _memk(it);
+        if (mk == 3) { return 0; }
+        if (mk == 1 || mk == 2) {
+            let is i32 as isseed = cast(i32, q == s0 || q == s1);
+            let is i32 as isload with mut = 0;
+            i = 0;
+            while (i < nn) { if (nk[i] == 1 && (np0[i] == q || np1[i] == q)) { isload = 1; } i = i + 1; }
+            _addr(_maddr(it), q);
+            let is i32 as qr = ad_root;
+            let is i32 as qd = ad_rd;
+            let is i64 as qx = _ipack();
+            let is i64 as qo = ad_off + _mdisp(it);
+            let is i64 as qs = _msize(it);
+            if (mk == 2 && isseed == 0) {
+                // a store that stays: no moved load before it reads there,
+                // and the seed stores before it do not write there
+                i = 0;
+                while (i < nn) {
+                    if (nk[i] == 1) {
+                        if (np0[i] < q && _may(nroot[i], nrd[i], nidx[i], noff[i], 8, qr, qd, qx, qo, qs) == 1) { return 0; }
+                        if (np1[i] < q && _may(nroot[i], nrd[i], nidx[i], noff[i] + 8, 8, qr, qd, qx, qo, qs) == 1) { return 0; }
+                    }
+                    i = i + 1;
+                }
+                if (s0 < q && _may(sr, srd, sx, so, 16, qr, qd, qx, qo, qs) == 1) { return 0; }
+                if (s1 < q && _may(sr, srd, sx, so, 16, qr, qd, qx, qo, qs) == 1) { return 0; }
+            }
+            if (mk == 2 && isseed == 1) {
+                // a seed store: no tree load after it reads there
+                i = 0;
+                while (i < nn) {
+                    if (nk[i] == 1) {
+                        if (np0[i] > q && _may(nroot[i], nrd[i], nidx[i], noff[i], 8, qr, qd, qx, qo, qs) == 1) { return 0; }
+                        if (np1[i] > q && _may(nroot[i], nrd[i], nidx[i], noff[i] + 8, 8, qr, qd, qx, qo, qs) == 1) { return 0; }
+                    }
+                    i = i + 1;
+                }
+            }
+            if (mk == 1 && isload == 0) {
+                // a load that stays: the seed stores before it do not write there
+                if ((s0 < q || s1 < q) && _may(sr, srd, sx, so, 16, qr, qd, qx, qo, qs) == 1) { return 0; }
+            }
+        }
+        q = q + 1;
+    }
+    return 1;
+}
+
+fn _ins_before(at as *d.IRInst, x as *d.IRInst) as void {
+    let is *d.IRInst as w with mut = sl_fn.instructions;
+    if (cast(i64, w) == cast(i64, at)) { x.next = at; sl_fn.instructions = x; return; }
+    while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, at)) { w = w.next; }
+    x.next = at;
+    w.next = x;
+}
+
+fn _nv() as i32 {
+    let is i32 as v = sl_fn.vreg_count;
+    sl_fn.vreg_count = sl_fn.vreg_count + 1;
+    return v;
+}
+
+// the node's vector, its instructions put before `at`
+fn _emit(i as i32, at as *d.IRInst, line as i32) as i32 {
+    if (nout[i] >= 0) { return nout[i]; }
+    let is i32 as k = nk[i];
+    let is *d.IRInst as x with mut = cast(*d.IRInst, 0);
+    if (k == 2) {
+        let is i32 as a = _emit(nc1[i], at, line);
+        let is i32 as b = _emit(nc2[i], at, line);
+        x = d.new_inst(d.IR_VOP);
+        x.dest = d.op_vreg(_nv());
+        x.dest.label = vo.vo_pack(nvo[i], 8, 0, 2, 0);
+        x.src1 = d.op_vreg(a); x.src2 = d.op_vreg(b);
+    } else if (k == 6) {
+        let is i32 as a = _emit(nc1[i], at, line);
+        x = d.new_inst(d.IR_VOP);
+        x.dest = d.op_vreg(_nv());
+        x.dest.label = vo.vo_pack(vo.VO_SWAP, 8, 0, 2, 0);
+        x.src1 = d.op_vreg(a);
+    } else if (k == 1) {
+        x = d.new_inst(d.IR_VOP);
+        x.dest = d.op_vreg(_nv());
+        x.dest.label = vo.vo_pack(vo.VO_LOAD, 8, 0, 2, 0);
+        x.src1 = d.op_vreg(nua[i]); x.src2 = d.op_imm(0);
+    } else if (k == 3) {
+        x = d.new_inst(d.IR_VOP);
+        x.dest = d.op_vreg(_nv());
+        x.dest.label = vo.vo_pack(vo.VO_SPLATF, 8, 0, 2, 0);
+        x.src1 = d.op_vreg(nu0[i]);
+    } else {
+        x = d.new_inst(d.IR_VOP);
+        x.dest = d.op_vreg(_nv());
+        x.dest.label = vo.vo_pack(vo.VO_PACK, 8, 0, 2, 0);
+        x.src1 = d.op_vreg(nu0[i]); x.src2 = d.op_vreg(nu1[i]);
+    }
+    x.line = line;
+    _ins_before(at, x);
+    nout[i] = x.dest.vreg;
+    return nout[i];
+}
+
+// what pairing saves: scalar instructions gone against vector ones made
+fn _gain(s0 as i32, s1 as i32) as i32 {
+    let is i32 as sc with mut = 2;
+    let is i32 as vc with mut = 1;
+    let is i32 as i with mut = 0;
+    while (i < nn) {
+        let is i32 as k = nk[i];
+        if (k == 1 || k == 2 || k == 5) {
+            if (k != 5) { vc = vc + 1; }
+            // a lane instruction read elsewhere stays
+            if (_reads(_I(np0[i]).dest.vreg) <= 1) { sc = sc + 1; }
+            if (_reads(_I(np1[i]).dest.vreg) <= 1) { sc = sc + 1; }
+        } else if (k == 6) { vc = vc + 1; }
+        else { vc = vc + 2; }
+        i = i + 1;
+    }
+    return sc - vc;
+}
+
+// v as it was read at position p, readable at P: v itself when nothing
+// redefines it in between, else a copy made just before p.
+fn _keep(v as i32, p as i32, P as i32) as i32 {
+    if (_rdef(v, P) == _rdef(v, p)) { return v; }
+    let is *d.IRInst as m = d.new_inst(d.IR_MOV);
+    let is i32 as t = _nv();
+    m.dest = d.op_vreg(t);
+    m.src1 = d.op_vreg(v);
+    m.line = _I(p).line;
+    _ins_before(_I(p), m);
+    return t;
+}
+
+// does the instruction read its dest operand (an address, a cmov's old value)?
+fn _rdest(it as *d.IRInst) as i32 {
+    if (it.dest.op_type != d.OP_VREG) { return 0; }
+    if (it.op == d.IR_CMOV || _def(it) < 0) { return 1; }
+    return 0;
+}
+
+// an instruction that only makes its value
+fn _removable(it as *d.IRInst) as i32 {
+    let is i32 as op = it.op;
+    if (op == d.IR_CMOV || op == d.IR_LABEL || op == d.IR_SET_CTX) { return 0; }
+    if (op == d.IR_LOAD || op == d.IR_VOP) { return 1; }
+    if (_memk(it) == 0) { return 1; }
+    return 0;
+}
+
+// What the pair left unread in the block starting at bs goes, and what only
+// that read, and so on.
+fn _sweep(bs as i32) as void {
+    let is i32 as nv = sl_fn.vreg_count;
+    let is *i32 as rc = cast(*i32, d.opt_alloc(cast(i64, nv) * 4 + 8));
+    let is i32 as v with mut = 0;
+    while (v < nv) { rc[v] = 0; v = v + 1; }
+    let is *d.IRInst as w with mut = sl_fn.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            if (w.src1.op_type == d.OP_VREG && w.src1.vreg >= 0 && w.src1.vreg < nv) { rc[w.src1.vreg] = rc[w.src1.vreg] + 1; }
+            if (w.src2.op_type == d.OP_VREG && w.src2.vreg >= 0 && w.src2.vreg < nv) { rc[w.src2.vreg] = rc[w.src2.vreg] + 1; }
+            if (_rdest(w) == 1 && w.dest.vreg >= 0 && w.dest.vreg < nv) { rc[w.dest.vreg] = rc[w.dest.vreg] + 1; }
+        }
+        w = w.next;
+    }
+    let is i32 as ch with mut = 1;
+    while (ch == 1) {
+        ch = 0;
+        let is i32 as q with mut = sl_n - 1;
+        while (q >= bs) {
+            if (sl_blk[q] == bs) {
+                let is *d.IRInst as it = _I(q);
+                let is i32 as dv = _def(it);
+                if (it.is_dead == 0 && dv >= 0 && dv < nv && rc[dv] == 0 && _removable(it) == 1) {
+                    it.is_dead = 1;
+                    ch = 1;
+                    if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < nv) { rc[it.src1.vreg] = rc[it.src1.vreg] - 1; }
+                    if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < nv) { rc[it.src2.vreg] = rc[it.src2.vreg] - 1; }
+                }
+            }
+            q = q - 1;
+        }
+    }
+    d.opt_free(cast(*u8, rc));
+}
+
+// 1 when the tree joins two scalars into a pair, else 0
+fn _packs() as i32 {
+    let is i32 as i with mut = 0;
+    while (i < nn) {
+        if (nk[i] == 4) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The tree for the pair, legal and worth it: the full one, else the one
+// pairing only equal ops. Worth it: an instruction saved, or two when two
+// scalars are joined into a pair (4): the pair then waits for the later of
+// the two, and the shuffle that joins them is more than its count.
+fn _tree(s0 as i32, s1 as i32) as i32 {
+    let is *d.IRInst as st0 = _I(s0);
+    let is *d.IRInst as st1 = _I(s1);
+    let is i32 as P with mut = s0;
+    if (s1 > P) { P = s1; }
+    sl_P = P;
+    sl_simple = 0;
+    while (sl_simple <= 1) {
+        nn = 0;
+        let is i32 as root = _build(st0.src1.vreg, s0, st1.src1.vreg, s1, 0);
+        if (root >= 0 && (nk[root] == 2 || nk[root] == 6) && _gain(s0, s1) > _packs() && _legal(s0, s1, P) == 1) {
+            sl_simple = 0;
+            return root;
+        }
+        sl_simple = sl_simple + 1;
+    }
+    sl_simple = 0;
+    return 0 - 1;
+}
+
+fn _try(s0 as i32, s1 as i32) as i32 {
+    let is *d.IRInst as st0 = _I(s0);
+    let is *d.IRInst as st1 = _I(s1);
+    let is i32 as root = _tree(s0, s1);
+    if (root < 0) { return 0; }
+    let is i32 as P with mut = s0;
+    if (s1 > P) { P = s1; }
+    let is *d.IRInst as at = _I(P);
+    // the scalars the vector code reads, as they were read
+    let is i32 as ki with mut = 0;
+    while (ki < nn) {
+        if (nk[ki] == 3 || nk[ki] == 4) {
+            nu0[ki] = _keep(nv0[ki], np0[ki], P);
+            if (nk[ki] == 3) { nu1[ki] = nu0[ki]; } else { nu1[ki] = _keep(nv1[ki], np1[ki], P); }
+        }
+        if (nk[ki] == 1) { nua[ki] = _keep(naddr[ki], np0[ki], P); }
+        ki = ki + 1;
+    }
+    let is i32 as sav = _keep(st0.dest.vreg, s0, P);
+    let is i32 as vv = _emit(root, at, at.line);
+    let is *d.IRInst as vs = d.new_inst(d.IR_VSTOREQ);
+    vs.dest.op_type = cast(i8, d.OP_IMM); vs.dest.imm = 0; vs.dest.label = 16;
+    vs.src1 = d.op_vreg(sav);
+    vs.src2 = d.op_vreg(vv);
+    vs.line = at.line;
+    _ins_before(at, vs);
+    st0.is_dead = 1;
+    st1.is_dead = 1;
+    // the pairs now vectors, for the trees after this one
+    let is i32 as ri with mut = 0;
+    while (ri < nn) {
+        if ((nk[ri] == 1 || nk[ri] == 2) && sv_n < 128) {
+            sv_i0[sv_n] = cast(i64, _I(np0[ri])); sv_i1[sv_n] = cast(i64, _I(np1[ri])); sv_v[sv_n] = nout[ri];
+            sv_n = sv_n + 1;
+        }
+        ri = ri + 1;
+    }
+    _sweep(sl_blk[P]);
+    return 1;
+}
+
+fn _fk(o as *d.Operand) as i64 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= sl_fn.vreg_count) { return 0; }
+    return sl_fsl[o.vreg];
+}
+
+// two slot keys as one: 0 none, k one slot, -1 several
+fn _fjoin(a as i64, b as i64) as i64 {
+    if (a == 0) { return b; }
+    if (b == 0 || a == b) { return a; }
+    return 0 - 1;
+}
+
+fn _escape(k as i64) as void {
+    if (k == 0) { return; }
+    if (k < 0 || sl_nesc >= 32) { sl_fesc = 1; return; }
+    let is i32 as e with mut = 0;
+    while (e < sl_nesc) { if (sl_esc[e] == k) { return; } e = e + 1; }
+    sl_esc[sl_nesc] = k;
+    sl_nesc = sl_nesc + 1;
+}
+
+// sl_udef, sl_fsl, sl_esc and sl_fesc for the function
+fn _frame_escape() as void {
+    let is i32 as nv = sl_fn.vreg_count;
+    sl_fsl = cast(*i64, d.opt_alloc(cast(i64, nv) * 8 + 8));
+    let is i32 as v with mut = 0;
+    while (v < nv) { sl_fsl[v] = 0; v = v + 1; }
+    sl_fesc = 0;
+    sl_nesc = 0;
+    sl_udef = cast(*i32, d.opt_alloc(cast(i64, nv) * 4 + 8));
+    sl_nvu = nv;
+    v = 0;
+    while (v < nv) { sl_udef[v] = 0 - 1; v = v + 1; }
+    let is i32 as u with mut = 0;
+    while (u < sl_n) {
+        let is i32 as dv = _def(_I(u));
+        if (dv >= 0 && dv < nv) {
+            if (sl_udef[dv] == 0 - 1) { sl_udef[dv] = u; } else { sl_udef[dv] = 0 - 2; }
+        }
+        u = u + 1;
+    }
+    // keys only grow: none -> one slot -> several
+    let is i32 as ch with mut = 1;
+    let is i32 as rounds with mut = 0;
+    while (ch == 1) {
+        ch = 0;
+        rounds = rounds + 1;
+        if (rounds > 64) { sl_fesc = 1; return; }
+        let is i32 as q with mut = 0;
+        while (q < sl_n) {
+            let is *d.IRInst as it = _I(q);
+            let is i32 as dv = _def(it);
+            if (dv >= 0 && dv < nv) {
+                let is i32 as op = it.op;
+                let is i64 as k with mut = 0;
+                if (op == d.IR_ADDR || op == d.IR_GET_ALLOC_ADDR) {
+                    k = _fkey(it);
+                    if (k == 0) { k = 0 - 1; }
+                }
+                if (op == d.IR_MOV || op == d.IR_CAST || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_LEA2
+                    || op == d.IR_LEA4 || op == d.IR_LEA8 || op == d.IR_CMOV) {
+                    k = _fjoin(_fk(&it.src1), _fk(&it.src2));
+                }
+                let is i64 as nk2 = _fjoin(sl_fsl[dv], k);
+                if (nk2 != sl_fsl[dv]) { sl_fsl[dv] = nk2; ch = 1; }
+            }
+            q = q + 1;
+        }
+    }
+    // where a frame address is read: as an address, or to make another one
+    let is i32 as q with mut = 0;
+    while (q < sl_n && sl_fesc == 0) {
+        let is *d.IRInst as it = _I(q);
+        let is i32 as op = it.op;
+        let is i64 as k1 = _fk(&it.src1);
+        let is i64 as k2 = _fk(&it.src2);
+        if (op == d.IR_LOAD || op == d.IR_VSTOREQ || (op == d.IR_VOP && vo.vo_code(it.dest.label) == vo.VO_LOAD)) {
+            _escape(k2);
+        } else if (op == d.IR_STORE) {
+            _escape(k1); _escape(k2);
+        } else if (op == d.IR_MOV || op == d.IR_CAST || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_LEA2
+            || op == d.IR_LEA4 || op == d.IR_LEA8 || op == d.IR_CMOV || op == d.IR_EQ || op == d.IR_NE
+            || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE || op == d.IR_COPY) {
+        } else {
+            _escape(k1); _escape(k2);
+            if (it.dest.op_type == d.OP_VREG && _def(it) < 0) { _escape(_fk(&it.dest)); }
+        }
+        q = q + 1;
+    }
+}
+
+fn _lref(o as *d.Operand, nr as *i32, lc as i32) as void {
+    if (o.op_type == d.OP_LABEL && o.label >= 0 && o.label < lc) { nr[o.label] = nr[o.label] + 1; }
+}
+
+// One pair per call; the caller repeats.
+fn pass_slp(func as *d.IRFunction) as i32 {
+    if (cast(i64, sv_fn) != cast(i64, func)) { sv_fn = func; sv_n = 0; }
+    if (func.vreg_count <= 0) { return 0; }
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    let is i32 as has with mut = 0;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            n = n + 1;
+            if (w.op == d.IR_STORE && _is_f64(w.cast_to) == 1) { has = has + 1; }
+            if (w.op == d.IR_ASM) { return 0; }
+        }
+        w = w.next;
+    }
+    if (has < 2 || n > 20000) { return 0; }
+    sl_fn = func;
+    sl_n = n;
+    sl_a = cast(*i64, d.opt_alloc(cast(i64, n) * 8 + 8));
+    sl_blk = cast(*i32, d.opt_alloc(cast(i64, n) * 4 + 4));
+    // a label nothing jumps to (left by inlining) does not start a block
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as nr = cast(*i32, d.opt_alloc(cast(i64, lc) * 4 + 4));
+    let is i32 as li with mut = 0;
+    while (li < lc) { nr[li] = 0; li = li + 1; }
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.op != d.IR_LABEL) {
+            _lref(&w.dest, nr, lc);
+            _lref(&w.src1, nr, lc);
+            _lref(&w.src2, nr, lc);
+        }
+        w = w.next;
+    }
+    n = 0;
+    sl_entry = 0 - 1;
+    let is i32 as bs with mut = 0;
+    let is i32 as brk with mut = 0;
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            let is i32 as entry with mut = 0;
+            if (w.op == d.IR_LABEL) {
+                entry = 1;
+                if (w.dest.op_type == d.OP_LABEL && w.dest.label >= 0 && w.dest.label < lc && nr[w.dest.label] == 0) { entry = 0; }
+            }
+            if ((entry == 1 || brk == 1) && sl_entry < 0) { sl_entry = n; }
+            if (entry == 1 || brk == 1 || n - bs >= SLP_MAXBLK) { bs = n; }
+            brk = 0;
+            if (w.op == d.IR_JMP || w.op == d.IR_JZ || w.op == d.IR_JNZ || w.op == d.IR_RET) { brk = 1; }
+            sl_a[n] = cast(i64, w);
+            sl_blk[n] = bs;
+            n = n + 1;
+        }
+        w = w.next;
+    }
+    d.opt_free(cast(*u8, nr));
+    if (sl_entry < 0) { sl_entry = n; }
+    _frame_escape();
+    _sf_build();
+    let is i32 as done with mut = 0;
+    let is i32 as p with mut = 0;
+    while (p < sl_n && done == 0) {
+        let is *d.IRInst as s0 = _I(p);
+        if (s0.op == d.IR_STORE && _is_f64(s0.cast_to) == 1 && s0.dest.op_type == d.OP_VREG
+            && s0.src1.op_type == d.OP_VREG) {
+            _addr(s0.dest.vreg, p);
+            let is i32 as r0 = ad_root;
+            let is i32 as rd0 = ad_rd;
+            let is i64 as x0 = _ipack();
+            let is i64 as o0 = ad_off;
+            let is i32 as q with mut = sl_blk[p];
+            while (q < sl_n && sl_blk[q] == sl_blk[p] && done == 0) {
+                let is *d.IRInst as s1 = _I(q);
+                if (q != p && s1.op == d.IR_STORE && _is_f64(s1.cast_to) == 1 && s1.dest.op_type == d.OP_VREG
+                    && s1.src1.op_type == d.OP_VREG) {
+                    _addr(s1.dest.vreg, q);
+                    if (ad_root == r0 && ad_rd == rd0 && _ipack() == x0 && ad_off == o0 + 8) {
+                        if (_try(p, q) == 1) { done = 1; }
+                    }
+                }
+                q = q + 1;
+            }
+        }
+        p = p + 1;
+    }
+    d.opt_free(cast(*u8, sl_a));
+    d.opt_free(cast(*u8, sl_blk));
+    d.opt_free(cast(*u8, sl_fsl));
+    sl_fsl = cast(*i64, 0);
+    d.opt_free(cast(*u8, sl_udef));
+    sl_udef = cast(*i32, 0);
+    d.opt_free(cast(*u8, sf_b));
+    d.opt_free(cast(*u8, sf_s));
+    d.opt_free(cast(*u8, sf_c));
+    d.opt_free(cast(*u8, sf_x));
+    sf_b = cast(*i64, 0);
+    sl_fesc = 1;
+    return done;
+}

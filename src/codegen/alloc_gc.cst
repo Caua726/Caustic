@@ -158,6 +158,66 @@ struct GCMove {
     status as i32;  // 0=active, 1=coalesced, 2=frozen, 3=constrained
 }
 
+fn gc2_dest_read(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+        || op == d.IR_CMOV || op == d.IR_COPY) { return 1; }
+    return 0;
+}
+
+fn gc2_reads(w as *d.IRInst, v as i32) as i32 {
+    if (w.src1.op_type == d.OP_VREG && w.src1.vreg == v) { return 1; }
+    if (w.src2.op_type == d.OP_VREG && w.src2.vreg == v) { return 1; }
+    if (w.dest.op_type == d.OP_VREG && w.dest.vreg == v && gc2_dest_read(w.op) == 1) { return 1; }
+    return 0;
+}
+
+// Is v dead at the clobber point p: does the straight line after p write v
+// before anything reads it? (A value whose interval spans a call only because
+// the other arm of a branch defines it after the call does not live across it.)
+fn gc2_dead_at(v as i32, p as i32, pinst as *i64, npos as i32) as i32 {
+    let is *d.IRInst as at = cast(*d.IRInst, pinst[p]);
+    if (at.is_dead == 0 && gc2_reads(at, v) == 1) { return 0; }
+    let is i32 as q with mut = p + 1;
+    while (q < npos && q < p + 32) {
+        let is *d.IRInst as w = cast(*d.IRInst, pinst[q]);
+        if (w.is_dead == 0) {
+            let is i32 as op = w.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET
+                || op == d.IR_ASM || op == d.IR_PHI) { return 0; }
+            if (gc2_reads(w, v) == 1) { return 0; }
+            if (w.dest.op_type == d.OP_VREG && w.dest.vreg == v) { return 1; }
+        }
+        q = q + 1;
+    }
+    return 0;
+}
+
+// Dead at every clobber point of [start, end_pos] (at most 16 of them).
+fn gc2_dead_at_all(ctx as *core.AllocCtx, v as i32, start as i32, end_pos as i32, pinst as *i64, npos as i32) as i32 {
+    // first clobber point > start
+    let is i32 as lo with mut = 0;
+    let is i32 as hi with mut = ctx.call_count - 1;
+    let is i32 as k with mut = ctx.call_count;
+    while (lo <= hi) {
+        let is i32 as mid = lo + (hi - lo) / 2;
+        if (*(cast(*i32, cast(i64, ctx.call_positions) + cast(i64, mid) * 4)) > start) { k = mid; hi = mid - 1; }
+        else { lo = mid + 1; }
+    }
+    let is i32 as seen with mut = 0;
+    while (k < ctx.call_count) {
+        let is i32 as p = *(cast(*i32, cast(i64, ctx.call_positions) + cast(i64, k) * 4));
+        if (p > start && p <= end_pos) {
+            if (p >= npos) { return 0; }
+            seen = seen + 1;
+            if (seen > 16) { return 0; }
+            if (gc2_dead_at(v, p, pinst, npos) == 0) { return 0; }
+        }
+        if (p > end_pos) { return 1; }
+        k = k + 1;
+    }
+    return 1;
+}
+
 fn gc2_get_iv(intervals as *core.LiveInterval, idx as i32) as *core.LiveInterval {
     return cast(*core.LiveInterval, cast(i64, intervals) + cast(i64, idx) * sizeof(core.LiveInterval));
 }
@@ -202,12 +262,19 @@ fn _lv_writes_dest(op as i32) as i32 {
 }
 
 // Emitters that load src1 into dest's register before anything else writes it
-// (gen_binop, the MUL and shift paths, DIV by a power of two): dest may share
-// src1's register. src2 is read after that load, so dest and src2 keep their edge.
+// (gen_binop, the MUL and shift paths, DIV by a power of two, the scalar float
+// ops): dest may share src1's register. src2 is read after that load, so dest
+// and src2 keep their edge.
 fn _lv_tie_src1(y as *d.IRInst) as i32 {
     let is i32 as op = y.op;
     if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_AND
         || op == d.IR_OR || op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR) { return 1; }
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV) { return 1; }
+    if (op == d.IR_ROL) { return 1; }
+    // a packed float op (vec_ops VO_FADD..VO_FDIV, VO_FADDSUB): emit_vec's
+    // bin() reads a first when d is a
+    if (op == d.IR_VOP && y.src1.op_type == d.OP_VREG && y.src2.op_type == d.OP_VREG
+        && (((y.dest.label & 255) >= 30 && (y.dest.label & 255) <= 33) || (y.dest.label & 255) == 36)) { return 1; }
     if (op == d.IR_DIV && y.src2.op_type == d.OP_IMM && y.src2.imm > 0
         && (y.src2.imm & (y.src2.imm - 1)) == 0) { return 1; }
     return 0;
@@ -237,8 +304,14 @@ fn _lv_opv(o as *d.Operand, n as i32) as i32 {
     return 0 - 1;
 }
 
+// The register class of each vreg while _lv_build runs (null: one class).
+let is *i32 as _lv_cls with mut = cast(*i32, 0);
+
 fn _lv_edge(matrix as *u8, n as i32, degree as *i32, a as i32, b as i32) as void {
     if (a == b || a < 0 || b < 0) { return; }
+    // a general register and an xmm never share a register: no edge, and no
+    // degree that would make either look harder to color than it is
+    if (cast(i64, _lv_cls) != 0 && _lv_cls[a] != _lv_cls[b]) { return; }
     if (bm_test(matrix, n, a, b) == 1) { return; }
     bm_set(matrix, n, a, b);
     degree[a] = degree[a] + 1;
@@ -280,6 +353,8 @@ fn _lv_edges_to_live(matrix as *u8, n as i32, degree as *i32, live as *i64, word
 fn _lv_build(func as *d.IRFunction, n as i32, matrix as *u8, degree as *i32) as void {
     let is i32 as words = (n + 63) / 64;
     _lv_ecnt = 0;
+    _lv_cls = cast(*i32, 0);
+    if (cast(i64, func.vreg_class) != 0 && n <= func.vreg_count) { _lv_cls = func.vreg_class; }
 
     // Instructions that reach the output (live ones, and every label), in order.
     let is i32 as m with mut = 0;
@@ -502,6 +577,13 @@ fn _gc_wake(x as i32, step as i32, wake as *i32) as void {
 fn _mv_open(st as i32) as i32 {
     if (st == 0 || st >= MV_WAIT) { return 1; }
     return 0;
+}
+
+// Colors a vreg can take: ten general registers, and at -O2, where the graph
+// has no edges between classes, fourteen xmms (xmm2..xmm15).
+fn _gc_k(func as *d.IRFunction, lv_mode as i32, v as i32) as i32 {
+    if (lv_mode == 1 && d.vreg_class_get(func, v) == d.VR_XMM) { return 14; }
+    return 10;
 }
 
 fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void {
@@ -769,6 +851,18 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
     pow10[0] = 1; pow10[1] = 100; pow10[2] = 10000; pow10[3] = 100000; pow10[4] = 100000;
 
     // crosses_call
+    // -O2: instructions by position, to see past a clobber point whether the
+    // value is still wanted there (gc2_dead_at)
+    let is i32 as npos with mut = 0;
+    let is *i64 as pinst with mut = cast(*i64, 0);
+    if (core.al_opt_level >= 2 && ctx.call_count > 0) {
+        let is *d.IRInst as pw with mut = func.instructions;
+        while (cast(i64, pw) != 0) { npos = npos + 1; pw = pw.next; }
+        pinst = cast(*i64, d.opt_alloc(cast(i64, npos) * 8 + 8));
+        npos = 0;
+        pw = func.instructions;
+        while (cast(i64, pw) != 0) { pinst[npos] = cast(i64, pw); npos = npos + 1; pw = pw.next; }
+    }
     i = 0;
     while (i < n) {
         let is *i32 as vi_p = cast(*i32, cast(i64, v2iv) + cast(i64, i) * 4);
@@ -777,12 +871,19 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             let is *core.LiveInterval as iv = gc2_get_iv(ctx.intervals, ii);
             if (iv.start != INT_MAX) {
                 let is *i32 as ccp = cast(*i32, cast(i64, crosses_call) + cast(i64, i) * 4);
-                if (core.al_opt_level >= 2) { *ccp = core.spans_call_strict(iv.start, iv.end_pos, ctx); }
+                if (core.al_opt_level >= 2) {
+                    *ccp = core.spans_call_strict(iv.start, iv.end_pos, ctx);
+                    // (floats only: a general register has callee-saved
+                    // registers to live in across the calls, an xmm has none)
+                    if (*ccp == 1 && npos > 0 && d.vreg_class_get(func, iv.vreg) == d.VR_XMM
+                        && gc2_dead_at_all(ctx, iv.vreg, iv.start, iv.end_pos, pinst, npos) == 1) { *ccp = 0; }
+                }
                 else { *ccp = core.spans_call(iv.start, iv.end_pos, ctx); }
             }
         }
         i = i + 1;
     }
+    if (cast(i64, pinst) != 0) { d.opt_free(cast(*u8, pinst)); }
 
     // Scan instructions for spill costs
     pos = 0;
@@ -869,7 +970,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
             let is *core.LiveInterval as iv = gc2_get_iv(ctx.intervals, ii);
             if (iv.start != INT_MAX) {
                 let is *i32 as ccp = cast(*i32, cast(i64, crosses_call) + cast(i64, i) * 4);
-                let is i32 as k_eff with mut = 10;
+                let is i32 as k_eff with mut = _gc_k(func, lv_mode, i);
                 if (*ccp == 1) { k_eff = 5; }
                 let is *i32 as dp = cast(*i32, cast(i64, degree) + cast(i64, i) * 4);
                 if (*dp >= k_eff) {
@@ -919,7 +1020,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         let is *i32 as dnb = cast(*i32, cast(i64, degree) + cast(i64, nb) * 4);
                         *dnb = *dnb - 1;
                         let is *i32 as cc_nb = cast(*i32, cast(i64, crosses_call) + cast(i64, nb) * 4);
-                        let is i32 as k_nb with mut = 10;
+                        let is i32 as k_nb with mut = _gc_k(func, lv_mode, nb);
                         if (*cc_nb == 1) { k_nb = 5; }
                         if (*dnb == k_nb - 1) {
                             _gc_wake(nb, gc_step, wake);
@@ -988,7 +1089,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                 let is *i32 as st_t = cast(*i32, cast(i64, status) + cast(i64, tt) * 4);
                                 if (*st_t == 0 && bm_test(matrix, n, tt, b) == 0) {
                                     let is *i32 as cc_t = cast(*i32, cast(i64, crosses_call) + cast(i64, tt) * 4);
-                                    let is i32 as k_t with mut = 10;
+                                    let is i32 as k_t with mut = _gc_k(func, lv_mode, tt);
                                     if (*cc_t == 1) { k_t = 5; }
                                     let is *i32 as dt = cast(*i32, cast(i64, degree) + cast(i64, tt) * 4);
                                     if (*dt >= k_t) { ok = 0; }
@@ -1002,7 +1103,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                     if (*st_t == 0) {
                                         if (bm_test(matrix, n, t, b) == 0) {
                                             let is *i32 as cc_t = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
-                                            let is i32 as k_t with mut = 10;
+                                            let is i32 as k_t with mut = _gc_k(func, lv_mode, t);
                                             if (*cc_t == 1) { k_t = 5; }
                                             let is *i32 as dt = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
                                             if (*dt >= k_t) { ok = 0; }
@@ -1072,7 +1173,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                             wl_remove(freeze_wl, &freeze_cnt, b);
                             wl_remove(spill_wl, &spill_cnt, b);
                             let is *i32 as db2 = cast(*i32, cast(i64, degree) + cast(i64, b) * 4);
-                            let is i32 as k_b with mut = 10;
+                            let is i32 as k_b with mut = _gc_k(func, lv_mode, b);
                             if (*cc_b == 1) { k_b = 5; }
                             if (*db2 >= k_b) {
                                 wl_add(spill_wl, &spill_cnt, b);
@@ -1091,7 +1192,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                     if (*st_t3 == 0) {
                                         let is *i32 as dt3 = cast(*i32, cast(i64, degree) + cast(i64, t) * 4);
                                         let is *i32 as cc_t3 = cast(*i32, cast(i64, crosses_call) + cast(i64, t) * 4);
-                                        let is i32 as k_t3 with mut = 10;
+                                        let is i32 as k_t3 with mut = _gc_k(func, lv_mode, t);
                                         if (*cc_t3 == 1) { k_t3 = 5; }
                                         if (*dt3 < k_t3 && wl_in(t, 3) == 1) {
                                             _gc_wake(t, gc_step, wake);
@@ -1217,7 +1318,7 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                                 let is *i32 as dsnb = cast(*i32, cast(i64, degree) + cast(i64, snb) * 4);
                                 *dsnb = *dsnb - 1;
                                 let is *i32 as cc_snb = cast(*i32, cast(i64, crosses_call) + cast(i64, snb) * 4);
-                                let is i32 as k_snb with mut = 10;
+                                let is i32 as k_snb with mut = _gc_k(func, lv_mode, snb);
                                 if (*cc_snb == 1) { k_snb = 5; }
                                 if (*dsnb == k_snb - 1) {
                                     _gc_wake(snb, gc_step, wake);
@@ -1368,6 +1469,24 @@ fn graph_coloring_alloc_v2(func as *d.IRFunction, ctx as *core.AllocCtx) as void
                         if (*cnb >= 16 && *cnb <= 31) { used_xmm[*cnb - 16] = 1; }
                     }
                     nb = nb + 1;
+                }
+            }
+            // A move partner's xmm, then (-O2) the one of the value it is
+            // tied to by a two-operand op, when free: the copy between the
+            // two disappears, as on the general-register side below.
+            let is i32 as xhk with mut = *(cast(*i32, cast(i64, mh_off) + cast(i64, v) * 4));
+            let is i32 as xhend = *(cast(*i32, cast(i64, mh_off) + cast(i64, v + 1) * 4));
+            while (xhk < xhend && chosen < 0) {
+                let is i32 as xpart = *(cast(*i32, cast(i64, mh_par) + cast(i64, xhk) * 4));
+                let is i32 as xc = *(cast(*i32, cast(i64, color) + cast(i64, xpart) * 4));
+                if (xc >= 16 && xc <= 31 && used_xmm[xc - 16] == 0) { chosen = xc; }
+                xhk = xhk + 1;
+            }
+            if (chosen < 0 && lv_mode == 1) {
+                let is i32 as xtp = *(cast(*i32, cast(i64, tie_par) + cast(i64, v) * 4));
+                if (xtp >= 0) {
+                    let is i32 as xc2 = *(cast(*i32, cast(i64, color) + cast(i64, gc2_resolve(alias, xtp)) * 4));
+                    if (xc2 >= 16 && xc2 <= 31 && used_xmm[xc2 - 16] == 0) { chosen = xc2; }
                 }
             }
             xi = 0;

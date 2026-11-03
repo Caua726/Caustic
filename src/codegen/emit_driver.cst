@@ -6,6 +6,8 @@ use "../ir/opt.cst" as opt;
 use "../ir/opt_ifconv.cst" as ifc;
 use "../ir/opt_unroll.cst" as unroll;
 use "../ir/opt_rotate.cst" as rot;
+use "../ir/opt_uj.cst" as uj;
+use "../ir/opt_slp.cst" as slp;
 use "../ir/opt_widen.cst" as widen;
 use "../ir/vec/vec_driver.cst" as vec2;
 use "../ir/gen_program.cst" as irp;
@@ -17,6 +19,7 @@ use "emit_inst.cst" as ei;
 use "target.cst" as tgt;
 use "dynsyms.cst" as dyns;
 use "shrinkwrap.cst" as sw;
+use "nowrap.cst" as nw;
 
 // Dynamic-stdlib mode (-lcaustic on an ELF/PE target): functions whose mangled
 // name starts with "_std_" are provided by libcaustic.so at runtime, so we
@@ -108,12 +111,341 @@ fn _frame_locals_used(func as *d.IRFunction) as i32 {
         if (inst.is_dead == 0) {
             let is i32 as op = inst.op;
             if (op == d.IR_ADDR || op == d.IR_ASM) { return 1; }
-            if (op == d.IR_LOAD && inst.src1.op_type != d.OP_VREG) { return 1; }
-            if (op == d.IR_STORE && inst.dest.op_type != d.OP_VREG) { return 1; }
+            if (op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) { return 1; }
+            if (op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) { return 1; }
         }
         inst = inst.next;
     }
     return 0;
+}
+
+// === Global addresses folded into the access (x86, -O1 and up) ===
+//
+//     ADDR_GLOBAL a = g ; LOAD t = [a]     → mov t, [rip+g]
+//     ADDR_GLOBAL a = g ; STORE [a] = v    → mov [rip+g], v
+//
+// The access names the global itself, so the address needs neither a lea nor a
+// register; the ADDR_GLOBAL stays only for readers that are not accesses (an
+// index added to it, a pointer passed on). Only a global this object defines:
+// a 64-bit `mov r64, [rip+g]` on an undefined g is the assembler's GOT load
+// of an `extern let`, and a string literal's ADDR_GLOBAL is what marks it used.
+fn _gsym_foldable(g as *d.IRInst) as i32 {
+    if (g.is_extern_global != 0) { return 0; }
+    let is i32 as n = cast(i32, g.global_name_len);
+    if (n <= 0 || n > e.GSYM_MAX) { return 0; }
+    let is *u8 as p = g.global_name_ptr;
+    if (n > 3 && p[0] == 46 && p[1] == 76 && p[2] == 67) { return 0; }   // .LC<sid>
+    if (tgt.module_only_get() == 1) {
+        let is *u8 as mp = tgt.module_prefix_ptr_get();
+        let is i32 as ml = tgt.module_prefix_len_get();
+        if (ml == 0 || n < ml + 1) { return 0; }
+        let is i32 as i with mut = 0;
+        while (i < ml) { if (p[i] != mp[i]) { return 0; } i = i + 1; }
+        if (p[ml] != 95) { return 0; }
+    }
+    return 1;
+}
+
+// === f64 constants as memory operands (x86, -O1 and up) ===
+//
+//     IMM c = bits ; FADD t = a, c    → addsd t, [rip+.LCFk]
+//
+// An f64 add, subtract, multiply or divide reads a constant operand from the
+// pool instead of from a register filled by movabs + movq. A constant first
+// operand of an add or multiply is swapped into the second place; of a
+// subtract or divide it is loaded straight into the accumulator. An f64
+// compare reads it the same way (ucomisd a, [rip+.LCFk]); a constant first
+// operand trades places with the other one and the compare turns around
+// (a < b is b > a, and both are false on a NaN). An IMM left with no reader
+// goes.
+fn _fc_is_cmp(op as i32) as i32 {
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { return 1; }
+    return 0;
+}
+
+// The compare that reads its operands the other way round.
+fn _fc_swap_cmp(op as i32) as i32 {
+    if (op == d.IR_LT) { return d.IR_GT; }
+    if (op == d.IR_GT) { return d.IR_LT; }
+    if (op == d.IR_LE) { return d.IR_GE; }
+    if (op == d.IR_GE) { return d.IR_LE; }
+    return op;
+}
+
+fn fconst_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i64 as idef = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { idef[i] = 0; i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+            && inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+            let is i32 as v = inst.dest.vreg;
+            if (inst.op == d.IR_IMM && idef[v] == 0) { idef[v] = cast(i64, inst); any = 1; }
+            else { idef[v] = 0 - 1; }
+        }
+        inst = inst.next;
+    }
+    if (any == 0) { d.opt_free(cast(*u8, idef)); return; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        let is i32 as op = inst.op;
+        if (inst.is_dead == 0 && (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV)
+            && e.get_type_size(inst.cast_to) == 8
+            && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG) {
+            let is i32 as c1 = inst.src1.vreg >= 0 && inst.src1.vreg < vc && idef[inst.src1.vreg] > 0;
+            let is i32 as c2 = inst.src2.vreg >= 0 && inst.src2.vreg < vc && idef[inst.src2.vreg] > 0;
+            if (c1 == 1 && c2 == 0 && (op == d.IR_FADD || op == d.IR_FMUL)) {
+                let is i32 as tv = inst.src1.vreg;
+                inst.src1.vreg = inst.src2.vreg;
+                inst.src2.vreg = tv;
+            }
+            if (inst.src2.vreg >= 0 && inst.src2.vreg < vc && idef[inst.src2.vreg] > 0) {
+                let is *d.IRInst as g2 = cast(*d.IRInst, idef[inst.src2.vreg]);
+                let is i32 as k2 = eo.fc_index(g2.src1.imm);
+                if (k2 >= 0) { inst.src2.op_type = cast(i8, d.OP_FCONST); inst.src2.imm = cast(i64, k2); }
+            }
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc && idef[inst.src1.vreg] > 0) {
+                let is *d.IRInst as g1 = cast(*d.IRInst, idef[inst.src1.vreg]);
+                let is i32 as k1 = eo.fc_index(g1.src1.imm);
+                if (k1 >= 0) { inst.src1.op_type = cast(i8, d.OP_FCONST); inst.src1.imm = cast(i64, k1); }
+            }
+        }
+        if (inst.is_dead == 0 && _fc_is_cmp(op) == 1 && e.is_float_type(inst.cast_to) == 1
+            && e.get_type_size(inst.cast_to) == 8
+            && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG
+            && inst.src1.vreg >= 0 && inst.src1.vreg < vc && inst.src2.vreg >= 0 && inst.src2.vreg < vc) {
+            if (idef[inst.src1.vreg] > 0 && idef[inst.src2.vreg] <= 0) {
+                let is i32 as tw = inst.src1.vreg;
+                inst.src1.vreg = inst.src2.vreg;
+                inst.src2.vreg = tw;
+                inst.op = cast(i8, _fc_swap_cmp(op));
+            }
+            if (idef[inst.src2.vreg] > 0 && idef[inst.src1.vreg] <= 0) {
+                let is *d.IRInst as gc = cast(*d.IRInst, idef[inst.src2.vreg]);
+                let is i32 as kc = eo.fc_index(gc.src1.imm);
+                if (kc >= 0) { inst.src2.op_type = cast(i8, d.OP_FCONST); inst.src2.imm = cast(i64, kc); }
+            }
+        }
+        inst = inst.next;
+    }
+    // An IMM nothing reads any more goes.
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc && idef[inst.src1.vreg] > 0) { idef[inst.src1.vreg] = 0 - 1; }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc && idef[inst.src2.vreg] > 0) { idef[inst.src2.vreg] = 0 - 1; }
+            if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc && idef[inst.dest.vreg] > 0
+                && cast(i64, inst) != idef[inst.dest.vreg]) { idef[inst.dest.vreg] = 0 - 1; }
+        }
+        inst = inst.next;
+    }
+    i = 0;
+    while (i < vc) {
+        if (idef[i] > 0) { let is *d.IRInst as g = cast(*d.IRInst, idef[i]); g.is_dead = 1; }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, idef));
+}
+
+// -O2: `(x << k) | (x >> (W - k))` on an unsigned W-bit value is one
+// `rol x, k`. A u32 shift works on the u32 value (the emitter extends an
+// operand left unextended), maybe through an explicit CAST to u32; the left
+// shift's upper bits are past the value anyway. The shifts and the cast go when the OR was their
+// only reader, and x must not be written between them and the OR.
+fn _uw(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    if (k == 7 && sz == 4) { return 32; }
+    if (k == 8 && sz == 8) { return 64; }
+    return 0;
+}
+
+fn _rol_def(def as *i64, vc as i32, v as i32) as *d.IRInst {
+    if (v < 0 || v >= vc || def[v] <= 0) { return cast(*d.IRInst, 0); }
+    return cast(*d.IRInst, def[v]);
+}
+
+fn rol_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i64 as def = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { def[i] = 0; uses[i] = 0; i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc) { uses[inst.src1.vreg] = uses[inst.src1.vreg] + 1; }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc) { uses[inst.src2.vreg] = uses[inst.src2.vreg] + 1; }
+            if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc) {
+                let is i32 as v = inst.dest.vreg;
+                if (inst.op == d.IR_STORE || inst.op == d.IR_COPY || inst.op == d.IR_CMOV) { uses[v] = uses[v] + 1; }
+                if (inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
+                    if (def[v] == 0) { def[v] = cast(i64, inst); } else { def[v] = 0 - 1; }
+                }
+            }
+            if (inst.op == d.IR_OR) { any = 1; }
+        }
+        inst = inst.next;
+    }
+    if (any == 1) {
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0 && inst.op == d.IR_OR && inst.dest.op_type == d.OP_VREG
+                && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG) {
+                _rol_one(inst, def, uses, vc);
+            }
+            inst = inst.next;
+        }
+    }
+    d.opt_free(cast(*u8, def));
+    d.opt_free(cast(*u8, uses));
+}
+
+fn _rol_one(o as *d.IRInst, def as *i64, uses as *i32, vc as i32) as void {
+    let is i32 as w = _uw(o.cast_to);
+    if (w == 0) { return; }
+    let is *d.IRInst as l with mut = _rol_def(def, vc, o.src1.vreg);
+    let is *d.IRInst as r with mut = _rol_def(def, vc, o.src2.vreg);
+    if (cast(i64, l) == 0 || cast(i64, r) == 0) { return; }
+    if (l.op == d.IR_SHR && r.op == d.IR_SHL) { let is *d.IRInst as t = l; l = r; r = t; }
+    if (l.op != d.IR_SHL || r.op != d.IR_SHR) { return; }
+    if (l.src1.op_type != d.OP_VREG || r.src1.op_type != d.OP_VREG) { return; }
+    if (l.src2.op_type != d.OP_IMM || r.src2.op_type != d.OP_IMM) { return; }
+    let is i64 as k = l.src2.imm;
+    if (k <= 0 || k >= cast(i64, w) || r.src2.imm != cast(i64, w) - k) { return; }
+    if (_uw(l.cast_to) != w || _uw(r.cast_to) != w) { return; }
+    if (uses[l.dest.vreg] != 1 || uses[r.dest.vreg] != 1) { return; }
+    let is i32 as x = l.src1.vreg;
+    let is *d.IRInst as zx with mut = cast(*d.IRInst, 0);
+    if (r.src1.vreg != x) {
+        // a u32 rotate: the two shifts may read x through casts that keep
+        // its low 32 bits (each its own cast of one value)
+        if (w != 32 || _low32_root(def, vc, x) != _low32_root(def, vc, r.src1.vreg)) { return; }
+        zx = _rol_def(def, vc, r.src1.vreg);
+        if (cast(i64, zx) != 0 && zx.op != d.IR_CAST) { zx = cast(*d.IRInst, 0); }
+    }
+    // l, r (and zx) above o in one straight run, x not written in between
+    let is i32 as seen with mut = 0;
+    let is i32 as need with mut = 2;
+    if (cast(i64, zx) != 0) { need = 3; }
+    let is *d.IRInst as w0 with mut = o;
+    // walk back: find the earliest of them by scanning from each candidate down to o
+    let is *d.IRInst as first with mut = l;
+    if (_before(r, first) == 1) { first = r; }
+    if (cast(i64, zx) != 0 && _before(zx, first) == 1) { first = zx; }
+    w0 = first;
+    while (cast(i64, w0) != cast(i64, o)) {
+        if (cast(i64, w0) == 0) { return; }
+        if (w0.op == d.IR_LABEL || w0.op == d.IR_JMP || w0.op == d.IR_JZ || w0.op == d.IR_JNZ) { return; }
+        if (w0.is_dead == 0 && cast(i64, w0) != cast(i64, first) && w0.dest.op_type == d.OP_VREG && w0.dest.vreg == x
+            && w0.op != d.IR_STORE && w0.op != d.IR_COPY) { return; }
+        if (cast(i64, w0) == cast(i64, l) || cast(i64, w0) == cast(i64, r) || cast(i64, w0) == cast(i64, zx)) { seen = seen + 1; }
+        w0 = w0.next;
+    }
+    if (seen != need) { return; }
+    o.op = d.IR_ROL;
+    o.src1 = d.op_vreg(x);
+    o.src2 = d.op_imm(k);
+    l.is_dead = 1;
+    r.is_dead = 1;
+    if (cast(i64, zx) != 0 && uses[zx.dest.vreg] == 1) { zx.is_dead = 1; }
+}
+
+// v through the integer casts between types of 4 bytes or more: they all
+// keep the low 32 bits.
+fn _low32_root(def as *i64, vc as i32, v0 as i32) as i32 {
+    let is i32 as v with mut = v0;
+    let is i32 as hops with mut = 0;
+    while (hops < 4) {
+        let is *d.IRInst as c = _rol_def(def, vc, v);
+        if (cast(i64, c) == 0 || c.op != d.IR_CAST || c.src1.op_type != d.OP_VREG) { return v; }
+        if (cast(i64, c.cast_to) == 0 || cast(i64, c.cast_from) == 0) { return v; }
+        let is i32 as kt = *cast(*i32, c.cast_to);
+        let is i32 as kf = *cast(*i32, c.cast_from);
+        if (kt < 1 || kt > 8 || kf < 1 || kf > 8) { return v; }
+        if (*cast(*i32, cast(i64, c.cast_to) + 28) < 4 || *cast(*i32, cast(i64, c.cast_from) + 28) < 4) { return v; }
+        v = c.src1.vreg;
+        hops = hops + 1;
+    }
+    return v;
+}
+
+// Does a come before b in the list (b reachable from a)?
+fn _before(a as *d.IRInst, b as *d.IRInst) as i32 {
+    let is *d.IRInst as w with mut = a.next;
+    let is i32 as n with mut = 0;
+    while (cast(i64, w) != 0 && n < 64) {
+        if (cast(i64, w) == cast(i64, b)) { return 1; }
+        w = w.next;
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn rip_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    // gdef[v]: the one ADDR_GLOBAL writing v, -1 once anything else writes it.
+    let is *i64 as gdef = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { gdef[i] = 0; i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+            && inst.op != d.IR_STORE) {
+            let is i32 as v = inst.dest.vreg;
+            if (inst.op == d.IR_ADDR_GLOBAL && gdef[v] == 0 && _gsym_foldable(inst) == 1) {
+                gdef[v] = cast(i64, inst);
+                any = 1;
+            } else {
+                gdef[v] = 0 - 1;
+            }
+        }
+        inst = inst.next;
+    }
+    if (any == 0) { d.opt_free(cast(*u8, gdef)); return; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc
+                && gdef[inst.src1.vreg] > 0) {
+                inst.src1.op_type = cast(i8, d.OP_GSYM);
+                inst.src1.imm = gdef[inst.src1.vreg];
+            }
+            if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc
+                && gdef[inst.dest.vreg] > 0
+                && (inst.src1.op_type != d.OP_VREG || inst.src1.vreg != inst.dest.vreg)) {
+                inst.dest.op_type = cast(i8, d.OP_GSYM);
+                inst.dest.imm = gdef[inst.dest.vreg];
+            }
+        }
+        inst = inst.next;
+    }
+    // An ADDR_GLOBAL nothing reads any more goes.
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0) {
+            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc && gdef[inst.src1.vreg] > 0) { gdef[inst.src1.vreg] = 0 - 1; }
+            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc && gdef[inst.src2.vreg] > 0) { gdef[inst.src2.vreg] = 0 - 1; }
+            if (inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc && gdef[inst.dest.vreg] > 0
+                && cast(i64, inst) != gdef[inst.dest.vreg]) { gdef[inst.dest.vreg] = 0 - 1; }
+        }
+        inst = inst.next;
+    }
+    i = 0;
+    while (i < vc) {
+        if (gdef[i] > 0) { let is *d.IRInst as g = cast(*d.IRInst, gdef[i]); g.is_dead = 1; }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, gdef));
 }
 
 // Does the function call out (and so need rsp 16-byte aligned at the call)?
@@ -308,6 +640,416 @@ fn _emit_prologue(func as *d.IRFunction, ctx as *al.AllocCtx, push_count as i32,
 
 }
 
+// -O2: an address `a = b + c` (c a vreg or a constant) read by a single load
+// or store further down its block moves to just before that access, where
+// try_addr_add folds it into the access's addressing ([b + c], [b + 16])
+// instead of computing it into a register of its own. It does not move past
+// a label, a branch, a call or argument set-up, a write of b or c, or more
+// than 32 instructions. A store of a constant keeps its IMM right before it.
+fn _as_barrier(op as i32) as i32 {
+    if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET
+        || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+        || op == d.IR_SET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_ASM || op == d.IR_VA_START
+        || op == d.IR_SET_CTX || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE
+        || op == d.IR_CMOV || op == d.IR_PHI) { return 1; }
+    return 0;
+}
+
+fn _as_reads_dest(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_CMOV || op == d.IR_ATOMIC_STORE
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) { return 1; }
+    return 0;
+}
+
+// The accesses addr_sink found for one address: each one, and the two
+// instructions the copy of the ADD goes between.
+let is [32]i64 as as_acc;
+let is [32]i64 as as_p;
+let is [32]i64 as as_q;
+
+// -O2: a cast of an integer to its own type (`CAST t = i (i32->i32)`, how a
+// narrow variable is read) is the value itself. When t is defined once and
+// read only further down its own block, before i is written again, its
+// readers read i: the allocator then never has a copy of i to coalesce (it
+// may not), and `t + 1` assigned back to i becomes one add.
+fn _idc_same(inst as *d.IRInst) as i32 {
+    if (inst.op != d.IR_CAST || inst.dest.op_type != d.OP_VREG || inst.src1.op_type != d.OP_VREG) { return 0; }
+    if (cast(i64, inst.cast_to) == 0 || cast(i64, inst.cast_from) == 0) { return 0; }
+    if (e.is_float_type(inst.cast_to) == 1 || e.is_float_type(inst.cast_from) == 1) { return 0; }
+    if (e.get_type_size(inst.cast_to) != e.get_type_size(inst.cast_from)) { return 0; }
+    if (e.is_signed_type(inst.cast_to) != e.is_signed_type(inst.cast_from)) { return 0; }
+    return 1;
+}
+
+// Does q read its operand `which` (1 src1, 2 src2) through the low 4 bytes
+// only? Such a reader leaves a narrow value free to stay unextended
+// (e.lz_init) whether it reads the cast or the variable; any other reader of
+// the cast is where the variable is extended once, which folding the cast
+// away would move to every write of the variable.
+fn _idc_low_reader(q as *d.IRInst, which as i32) as i32 {
+    let is i32 as op = q.op;
+    if (cast(i64, q.cast_to) == 0 || e.is_float_type(q.cast_to) == 1) { return 0; }
+    let is i32 as tsz = e.get_type_size(q.cast_to);
+    if (op == d.IR_CAST) {
+        if (which != 1 || cast(i64, q.cast_from) == 0 || e.is_float_type(q.cast_from) == 1) { return 0; }
+        let is i32 as fsz = e.get_type_size(q.cast_from);
+        return cast(i32, fsz >= 1 && fsz <= 4);
+    }
+    if (tsz < 1 || tsz > 4) { return 0; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { return 1; }
+    if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_NEG || op == d.IR_AND
+        || op == d.IR_OR || op == d.IR_XOR) { return 1; }
+    if (op == d.IR_SHL && which == 1) { return 1; }
+    if (op == d.IR_STORE && which == 1) { return 1; }
+    return 0;
+}
+
+fn id_cast_fold(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as defs = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    // full[v]: something reads v whole (not through its low 4 bytes, nor
+    // through a copy), so v is extended at its writes in any case.
+    let is *u8 as full = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as i with mut = 0;
+    while (i < vc) { uses[i] = 0; defs[i] = 0; full[i] = cast(u8, 0); i = i + 1; }
+    // Loop depth of each instruction, from the backward jumps (a loop is the
+    // stretch from a label to a jump back to it), and ddep[v] the deepest of
+    // v's writes: a variable written in a loop and read whole only after it
+    // is better left unextended there and extended once by the cast.
+    let is i32 as nl = func.label_count + 1;
+    let is *i32 as lpos = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    i = 0;
+    while (i < nl) { lpos[i] = 0 - 1; i = i + 1; }
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_LABEL && it.dest.label >= 0 && it.dest.label < nl) { lpos[it.dest.label] = n; }
+        n = n + 1;
+        it = it.next;
+    }
+    let is *i32 as dep = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    i = 0;
+    while (i <= n) { dep[i] = 0; i = i + 1; }
+    let is i32 as k with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_JMP || it.op == d.IR_JZ || it.op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+            && it.dest.label >= 0 && it.dest.label < nl && lpos[it.dest.label] >= 0 && lpos[it.dest.label] <= k) {
+            dep[lpos[it.dest.label]] = dep[lpos[it.dest.label]] + 1;
+            dep[k + 1] = dep[k + 1] - 1;
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    k = 1;
+    while (k <= n) { dep[k] = dep[k] + dep[k - 1]; k = k + 1; }
+    let is *i32 as ddep = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    i = 0;
+    while (i < vc) { ddep[i] = 0; i = i + 1; }
+    k = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.op == d.IR_ASM || it.op == d.IR_PHI) {
+                d.opt_free(cast(*u8, uses)); d.opt_free(cast(*u8, defs)); d.opt_free(full);
+                d.opt_free(cast(*u8, lpos)); d.opt_free(cast(*u8, dep)); d.opt_free(cast(*u8, ddep));
+                return;
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc && _as_reads_dest(it.op) == 0
+                && dep[k] > ddep[it.dest.vreg]) { ddep[it.dest.vreg] = dep[k]; }
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc) {
+                uses[it.src1.vreg] = uses[it.src1.vreg] + 1;
+                if (it.op != d.IR_MOV && _idc_low_reader(it, 1) == 0) { full[it.src1.vreg] = cast(u8, 1); }
+            }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) {
+                uses[it.src2.vreg] = uses[it.src2.vreg] + 1;
+                if (_idc_low_reader(it, 2) == 0) { full[it.src2.vreg] = cast(u8, 1); }
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc) {
+                if (_as_reads_dest(it.op) == 1) { uses[it.dest.vreg] = uses[it.dest.vreg] + 1; full[it.dest.vreg] = cast(u8, 1); }
+                if (it.op != d.IR_STORE && it.op != d.IR_COPY) { defs[it.dest.vreg] = defs[it.dest.vreg] + 1; }
+            }
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    // raw[v]: v may hold a value from outside -- a parameter, what a C
+    // function, a call through a pointer or an atomic returns -- whose upper
+    // half nobody extended (e.sx32_init). Only the cast extends it, so a
+    // compare, or a reader that reads it whole, must keep reading the cast.
+    let is *u8 as raw = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { raw[i] = cast(u8, 0); i = i + 1; }
+    let is i32 as rchg with mut = 1;
+    while (rchg == 1) {
+        rchg = 0;
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                && raw[it.dest.vreg] == cast(u8, 0)) {
+                let is i32 as op = it.op;
+                let is i32 as r with mut = 0;
+                if (op == d.IR_GET_ARG || op == d.IR_FFI_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_SYSCALL
+                    || (op == d.IR_CALL && it.is_extern_call != cast(i8, 0))
+                    || (op >= d.IR_ATOMIC_LOAD && op <= d.IR_ATOMIC_CAS && op != d.IR_ATOMIC_STORE)) { r = 1; }
+                if ((op == d.IR_MOV || op == d.IR_CMOV) && it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0
+                    && it.src1.vreg < vc && raw[it.src1.vreg] == cast(u8, 1)) { r = 1; }
+                if (r == 1) { raw[it.dest.vreg] = cast(u8, 1); rchg = 1; }
+            }
+            it = it.next;
+        }
+    }
+    // argx[v]: v is a parameter in a register read only through casts to
+    // i32, which e.sx32_init extends once on entry and its casts then copy;
+    // folding one of them would leave every other one a movsxd.
+    let is *u8 as argx = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { argx[i] = cast(u8, 0); i = i + 1; }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.op == d.IR_GET_ARG && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0
+            && it.dest.vreg < vc && e.arg_place(it, it.src1.imm) < 6) { argx[it.dest.vreg] = cast(u8, 1); }
+        it = it.next;
+    }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc && e._is_cast_to_i32s(it) == 0) {
+                argx[it.src1.vreg] = cast(u8, 0);
+            }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) { argx[it.src2.vreg] = cast(u8, 0); }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc && it.op != d.IR_GET_ARG) {
+                argx[it.dest.vreg] = cast(u8, 0);
+            }
+        }
+        it = it.next;
+    }
+    k = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && _idc_same(it) == 1) {
+            let is i32 as t = it.dest.vreg;
+            let is i32 as src = it.src1.vreg;
+            if (t >= 0 && t < vc && src >= 0 && src < vc && t != src && defs[t] == 1 && uses[t] > 0) {
+                // every read of t ahead in the block, with src unchanged
+                let is i32 as seen with mut = 0;
+                let is i32 as ok with mut = 1;
+                let is i32 as tfull with mut = 0;
+                let is i32 as tcmp with mut = 0;
+                let is *d.IRInst as q with mut = it.next;
+                while (cast(i64, q) != 0 && seen < uses[t] && ok == 1) {
+                    if (q.is_dead == 0) {
+                        if (q.op == d.IR_LABEL) { ok = 0; }
+                        else {
+                            if (q.op >= d.IR_EQ && q.op <= d.IR_GE && ((q.src1.op_type == d.OP_VREG && q.src1.vreg == t)
+                                || (q.src2.op_type == d.OP_VREG && q.src2.vreg == t))) { tcmp = 1; }
+                            if (q.src1.op_type == d.OP_VREG && q.src1.vreg == t) {
+                                seen = seen + 1;
+                                if (q.op == d.IR_MOV || _idc_low_reader(q, 1) == 0) { tfull = 1; }
+                            }
+                            if (q.src2.op_type == d.OP_VREG && q.src2.vreg == t) {
+                                seen = seen + 1;
+                                if (_idc_low_reader(q, 2) == 0) { tfull = 1; }
+                            }
+                            if (q.dest.op_type == d.OP_VREG && q.dest.vreg == t && _as_reads_dest(q.op) == 1) { seen = seen + 1; tfull = 1; }
+                            if (seen < uses[t]) {
+                                if (q.dest.op_type == d.OP_VREG && q.dest.vreg == src && q.op != d.IR_STORE && q.op != d.IR_COPY) { ok = 0; }
+                                if (q.op == d.IR_JMP || q.op == d.IR_JZ || q.op == d.IR_JNZ || q.op == d.IR_RET) { ok = 0; }
+                            }
+                        }
+                    }
+                    q = q.next;
+                }
+                if (tfull == 1 && full[src] == cast(u8, 0) && dep[k] < ddep[src]) { ok = 0; }
+                if (raw[src] == cast(u8, 1) && (tfull == 1 || tcmp == 1)) { ok = 0; }
+                if (argx[src] == cast(u8, 1)) { ok = 0; }
+                if (ok == 1 && seen == uses[t]) {
+                    if (tfull == 1) { full[src] = cast(u8, 1); }
+                    let is *d.IRInst as r with mut = it.next;
+                    let is i32 as done with mut = 0;
+                    while (cast(i64, r) != 0 && done < seen) {
+                        if (r.is_dead == 0) {
+                            if (r.src1.op_type == d.OP_VREG && r.src1.vreg == t) {
+                                r.src1.vreg = src; done = done + 1;
+                                // A copy keeps the cast's types: its dest still
+                                // reads as a value of the narrow type (e._lz_def_mask).
+                                if (r.op == d.IR_MOV && r.is_extern_call == cast(i8, 0) && r.dest.op_type == d.OP_VREG
+                                    && cast(i64, r.cast_to) == 0 && cast(i64, r.cast_from) == 0) {
+                                    r.cast_to = it.cast_to; r.cast_from = it.cast_from;
+                                }
+                            }
+                            if (r.src2.op_type == d.OP_VREG && r.src2.vreg == t) { r.src2.vreg = src; done = done + 1; }
+                            if (r.dest.op_type == d.OP_VREG && r.dest.vreg == t && _as_reads_dest(r.op) == 1) { r.dest.vreg = src; done = done + 1; }
+                        }
+                        r = r.next;
+                    }
+                    uses[src] = uses[src] + seen - 1;
+                    uses[t] = 0;
+                    defs[t] = 0;
+                    it.is_dead = 1;
+                }
+            }
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    d.opt_free(cast(*u8, uses));
+    d.opt_free(cast(*u8, defs));
+    d.opt_free(full);
+    d.opt_free(cast(*u8, lpos));
+    d.opt_free(cast(*u8, dep));
+    d.opt_free(cast(*u8, ddep));
+    d.opt_free(raw);
+    d.opt_free(argx);
+}
+
+// -O2: SET_CTX puts a call's context in r10 (0, or where a struct result
+// goes) for the callee to read on entry (std/string.cst getbeforevalue). In a
+// function left with no call and no inline asm, nothing reads it: the ones
+// before calls that were inlined are dropped, and with them the r10 clobber
+// the allocator keeps values away from.
+fn drop_set_ctx(func as *d.IRFunction) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    let is i32 as nctx with mut = 0;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL || op == d.IR_ASM) { return; }
+            if (op == d.IR_SET_CTX) { nctx = nctx + 1; }
+        }
+        it = it.next;
+    }
+    if (nctx == 0) { return; }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.op == d.IR_SET_CTX) { it.is_dead = 1; }
+        it = it.next;
+    }
+}
+
+fn addr_sink(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i32 as uses = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as defs = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { uses[i] = 0; defs[i] = 0; i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc) { uses[it.src1.vreg] = uses[it.src1.vreg] + 1; }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) { uses[it.src2.vreg] = uses[it.src2.vreg] + 1; }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc) {
+                if (_as_reads_dest(it.op) == 1) { uses[it.dest.vreg] = uses[it.dest.vreg] + 1; }
+                if (it.op != d.IR_STORE && it.op != d.IR_COPY) { defs[it.dest.vreg] = defs[it.dest.vreg] + 1; }
+            }
+            if (it.op == d.IR_PHI || it.op == d.IR_ASM) {
+                d.opt_free(cast(*u8, uses)); d.opt_free(cast(*u8, defs));
+                return;
+            }
+        }
+        it = it.next;
+    }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as moved with mut = 0;
+        let is i32 as cdisp = cast(i32, it.src2.op_type == d.OP_IMM);
+        if (it.is_dead == 0 && it.op == d.IR_ADD && it.dest.op_type == d.OP_VREG && it.src1.op_type == d.OP_VREG
+            && (it.src2.op_type == d.OP_VREG
+                || (cdisp == 1 && it.src2.imm <= 2147483647 && it.src2.imm >= 0 - 2147483647))
+            && it.dest.vreg >= 0 && it.dest.vreg < vc && defs[it.dest.vreg] == 1
+            && (uses[it.dest.vreg] == 1 || (cdisp == 1 && uses[it.dest.vreg] <= 32))) {
+            let is i32 as a = it.dest.vreg;
+            let is i32 as b = it.src1.vreg;
+            let is i32 as c with mut = 0 - 1;
+            if (it.src2.op_type == d.OP_VREG) { c = it.src2.vreg; }
+            let is i32 as want = uses[a];
+            // walk to the accesses; lp = the list predecessor of w, pl / ppl
+            // the last live instruction before w and its list predecessor
+            let is *d.IRInst as w with mut = it.next;
+            let is *d.IRInst as lp with mut = it;
+            let is *d.IRInst as pl with mut = it;
+            let is *d.IRInst as ppl with mut = prev;
+            let is i32 as nf with mut = 0;
+            let is i32 as steps with mut = 0;
+            let is i32 as stop with mut = 0;
+            let is i32 as lim with mut = 32;
+            if (want > 1) { lim = 256; }
+            while (stop == 0 && nf < want && cast(i64, w) != 0 && steps < lim) {
+                let is i32 as is_acc with mut = 0;
+                if (w.is_dead == 0) {
+                    if ((w.op == d.IR_LOAD && w.src1.op_type == d.OP_VREG && w.src1.vreg == a)
+                        || (w.op == d.IR_STORE && w.dest.op_type == d.OP_VREG && w.dest.vreg == a
+                            && (w.src1.op_type != d.OP_VREG || w.src1.vreg != a))) {
+                        is_acc = 1;
+                        let is *d.IRInst as qq with mut = w;
+                        let is *d.IRInst as pp with mut = lp;
+                        // a store of a constant keeps its IMM right before it
+                        if (w.op == d.IR_STORE && pl.op == d.IR_IMM && pl.dest.op_type == d.OP_VREG
+                            && w.src1.op_type == d.OP_VREG && w.src1.vreg == pl.dest.vreg
+                            && cast(i64, pl) != cast(i64, it)) {
+                            qq = pl; pp = ppl;
+                        }
+                        as_acc[nf] = cast(i64, w);
+                        as_p[nf] = cast(i64, pp);
+                        as_q[nf] = cast(i64, qq);
+                        nf = nf + 1;
+                    } else if (_as_barrier(w.op) == 1) {
+                        stop = 1;
+                    } else if ((w.src1.op_type == d.OP_VREG && w.src1.vreg == a)
+                               || (w.src2.op_type == d.OP_VREG && w.src2.vreg == a)
+                               || (w.dest.op_type == d.OP_VREG && w.dest.vreg == a)) {
+                        stop = 1;
+                    } else if (w.dest.op_type == d.OP_VREG && _as_reads_dest(w.op) == 0
+                               && (w.dest.vreg == b || w.dest.vreg == c)) {
+                        stop = 1;
+                    }
+                    if (stop == 0) { ppl = lp; pl = w; steps = steps + 1; }
+                }
+                if (stop == 0) { lp = w; w = w.next; }
+            }
+            if (nf == want && want == 1) {
+                let is *d.IRInst as ins_p = cast(*d.IRInst, as_p[0]);
+                let is *d.IRInst as ins_q = cast(*d.IRInst, as_q[0]);
+                if (cast(i64, ins_p) != cast(i64, it) && cast(i64, ins_q) != cast(i64, it)) {
+                    if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+                    ins_p.next = it;
+                    it.next = ins_q;
+                    moved = 1;
+                }
+            } else if (nf == want && want > 1) {
+                // one copy of the ADD in front of each access
+                let is i32 as k with mut = 0;
+                while (k < nf) {
+                    let is *d.IRInst as acc = cast(*d.IRInst, as_acc[k]);
+                    let is *d.IRInst as ins_p = cast(*d.IRInst, as_p[k]);
+                    let is *d.IRInst as ins_q = cast(*d.IRInst, as_q[k]);
+                    let is i32 as nv = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as cp = d.new_inst(d.IR_ADD);
+                    cp.dest = d.op_vreg(nv);
+                    cp.src1 = it.src1;
+                    cp.src2 = it.src2;
+                    cp.line = acc.line;
+                    cp.cast_to = it.cast_to; cp.cast_from = it.cast_from;
+                    if (acc.op == d.IR_LOAD) { acc.src1.vreg = nv; } else { acc.dest.vreg = nv; }
+                    ins_p.next = cp;
+                    cp.next = ins_q;
+                    k = k + 1;
+                }
+                it.is_dead = 1;
+            }
+        }
+        if (moved == 0) { prev = it; }
+        it = nx;
+    }
+    d.opt_free(cast(*u8, uses)); d.opt_free(cast(*u8, defs));
+}
+
 fn gen_func(func as *d.IRFunction) as void {
     // -O2 loop unrolling: runs HERE (post-optimize, pre-regalloc) — never inside
     // optimize_func — because it reuses vregs across unrolled copies, which would
@@ -317,10 +1059,17 @@ fn gen_func(func as *d.IRFunction) as void {
     if (al.al_opt_level >= 2) {
         // The LLVM-class vectorizer (Legal->Plan->Execute, src/ir/vec/): one transform
         // per call, re-invoked to a fixpoint. Runs before unroll claims counted loops.
+        // an outer loop whose inner loop sums floats: four of its iterations
+        // share one inner loop (opt_uj.cst)
+        let is i32 as jcount with mut = 0;
+        while (jcount < 4 && uj.pass_unroll_jam(func) == 1) { jcount = jcount + 1; }
         let is i32 as vcount with mut = 0;
         while (vcount < 16 && vec2.pass_vectorize2(func) == 1) { vcount = vcount + 1; }
         let is i32 as ucount with mut = 0;
         while (ucount < 16 && unroll.pass_unroll(func) == 1) { ucount = ucount + 1; }
+        // two f64 stores side by side computed as one pair (opt_slp.cst)
+        let is i32 as scount with mut = 0;
+        while (scount < 64 && slp.pass_slp(func) == 1) { scount = scount + 1; }
     }
     // -O2, on what the vectorizer left scalar: an i32 index that provably
     // never wraps addresses through a pointer that steps with it; a load of an
@@ -334,10 +1083,13 @@ fn gen_func(func as *d.IRFunction) as void {
     // If-conversion: rewrite tiny if/else value-selects into branchless cmov.
     // Runs here (post-optimize, pre-regalloc) so IR_CMOV is codegen-only and the
     // interval-overlap allocator handles its tied dest automatically.
+    if (al.al_opt_level >= 2) { drop_set_ctx(func); }
     if (al.al_opt_level >= 1) { ifc.pass_ifconv(func); }
     // -O2 loop rotation: the test moves to the bottom, one branch per iteration.
     // After the passes above, which match loops in their original shape.
-    if (al.al_opt_level >= 2) { rot.pass_rotate(func); }
+    if (al.al_opt_level >= 2) { rot.pass_rotate(func); rot.pass_loop_fwd(func); }
+    if (al.al_opt_level >= 1) { rip_fold(func); fconst_fold(func); }
+    if (al.al_opt_level >= 2) { rol_fold(func); addr_sink(func); id_cast_fold(func); }
     // -O2 shrink-wrapping: plan where the prologue goes (shrinkwrap.cst). The
     // split copies it inserts must exist before the use counts below.
     sw.sw_reset();
@@ -359,11 +1111,13 @@ fn gen_func(func as *d.IRFunction) as void {
     eo.peep_reset();
     ei.cmov_left = 0;
     if (al.al_opt_level >= 1) {
-        if (attempt == 1) { d.opt_free(cast(*u8, e.isel_uses)); d.opt_free(cast(*u8, e.isel_defs)); }
+        if (attempt == 1) { d.opt_free(cast(*u8, e.isel_uses)); d.opt_free(cast(*u8, e.isel_defs)); e.moves_to_casts(); }
         e.isel_init(func);
         e.isel_init_defs(func);
         e.sx32_init(func);
     }
+    nw.nw_reset();
+    if (al.al_opt_level >= 2) { nw.nw_init(func); }
 
     // Build intervals and allocate registers
     ctx = al.new_alloc_ctx();
@@ -520,6 +1274,12 @@ fn gen_func(func as *d.IRFunction) as void {
             let is i32 as inr = sw.sw_step(inst);
             ctx.sw_frameless = 1 - inr;
             if (cast(i64, inst) == cast(i64, sw.sw_p)) {
+                // a held-back load goes out before the frame changes
+                if (cast(i64, ei.il_pending) != 0) {
+                    let is *d.IRInst as swl = ei.il_pending;
+                    ei.il_pending = cast(*d.IRInst, 0);
+                    ei.il_off = 1; gen_inst(swl, ctx); ei.il_off = 0;
+                }
                 if (inst.op == d.IR_LABEL) { eo.out_str(".p2align 4,,10\n", 15); gen_inst(inst, ctx); }
                 if (cfa_framed == 1) { _cfa_frameless(); }
                 _emit_prologue(func, ctx, push_count, total, local_size, spill_size, alloc_size);
@@ -1102,6 +1862,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     ei.label_base = 0;
     ei.isa_cache_used = 0;
     ei.isa_label_n = 0;
+    eo.fc_reset();
     d.opt_bins_init();
     eo.out_init(fd);
     // Reset per-module string filtering (active only in module-only/batch mode).
@@ -1277,6 +2038,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
 
     // The vectorizer's AVX2 test caches its answer here (IR_HASAVX2).
     ei.emit_isa_cache();
+    eo.fc_emit_pool();
 
     // rodata (after codegen loop so regen'd strings are included)
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: rodata\n"); }
@@ -1736,6 +2498,21 @@ fn emit_cstsigs(prog as *d.IRProgram) as void {
 
 fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
+    // a load held back for this instruction (ei.il_try_defer): its memory
+    // operand, or emitted here, where it would have been
+    if (cast(i64, ei.il_pending) != 0) {
+        let is *d.IRInst as ild = ei.il_pending;
+        ei.il_pending = cast(*d.IRInst, 0);
+        if (al.al_opt_level >= 1 && inst.dest.op_type == d.OP_VREG) {
+            let is i32 as idl = al.get_loc(inst.dest.vreg, ctx);
+            if (idl >= 0) { eo.rc_invalidate_reg(idl); }
+            eo.rc_invalidate_vreg(inst.dest.vreg);
+        }
+        if (ei.il_fold(inst, ild, ctx, e.lz_lazy_inst(inst)) == 1) { return; }
+        ei.il_off = 1;
+        gen_inst(ild, ctx);
+        ei.il_off = 0;
+    }
 
     if (al.al_opt_level >= 1) {
         // Invalidate dest register — it will be overwritten by this instruction
@@ -1770,8 +2547,10 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV || op == d.IR_MOD || op == d.IR_NEG
         || op == d.IR_MULHI_U64) {
         if (e.lz_lazy_inst(inst) == 1) { e.lz_skip_narrow = 1; }
+        else if (nw.nw_has(inst) == 1) { e.nw_skip_narrow = 1; }
         ei.gen_inst_arith(inst, ctx);
         e.lz_skip_narrow = 0;
+        e.nw_skip_narrow = 0;
         return;
     }
     if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT) { ei.gen_inst_float(inst, ctx); return; }
@@ -1786,6 +2565,7 @@ fn gen_inst(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (op == d.IR_SET_ARG || op == d.IR_GET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_SYSCALL || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_VA_START || op == d.IR_FFI_CALL) { ei.gen_inst_calls(inst, ctx); return; }
     if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE) { ei.gen_inst_atomic(inst, ctx); return; }
     if (op == d.IR_CMOV) { ei.gen_inst_cmov(inst, ctx); return; }
+    if (op == d.IR_ROL) { ei.gen_inst_rol(inst, ctx); return; }
     if (op == d.IR_VZERO || op == d.IR_VLOADQ || op == d.IR_VADDQ || op == d.IR_VREDUCEQ
         || op == d.IR_VADDD || op == d.IR_VREDUCED || op == d.IR_VADDPD || op == d.IR_VREDUCEPD
         || op == d.IR_VSTOREQ || op == d.IR_VSUBQ || op == d.IR_VSUBD || op == d.IR_VSUBPD

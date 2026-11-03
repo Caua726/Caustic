@@ -19,6 +19,13 @@ use "defs.cst" as d;
 let is i32 as MAX_UNROLL with imut = 8;
 let is i32 as MAX_BODY with imut = 32;
 
+// The limits ur_try works to: the ones above for the pass in code generation;
+// pass_unroll_full (the IR optimizer) sets its own while it runs.
+let is i32 as ur_lim_trip with mut = 8;
+let is i32 as ur_lim_body with mut = 32;
+let is i32 as ur_lim_total with mut = 1000000;
+let is i32 as ur_drop_labels with mut = 0;
+
 // resolve v through single-def MOV-copy chains; stops at a multi-def vreg (so it
 // lands on the loop-carried induction var rather than over-resolving past it).
 fn ur_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
@@ -156,7 +163,7 @@ fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count a
     // skip the leading MOV/LT computation up to the JZ; bail on any barrier other than the JZ
     let is *d.IRInst as jz with mut = cast(*d.IRInst, 0);
     let is i32 as scan_guard with mut = 0;
-    while (cast(i64, c) != 0 && scan_guard < MAX_BODY) {
+    while (cast(i64, c) != 0 && scan_guard < ur_lim_body) {
         if (c.op == d.IR_JZ) { jz = c; c = cast(*d.IRInst, 0); }
         else if (ur_is_barrier(c.op) == 1) { return 0; }   // some other control before the test
         else { c = ur_next_live(c); scan_guard = scan_guard + 1; }
@@ -181,7 +188,7 @@ fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count a
     let is *d.IRInst as body_last with mut = cast(*d.IRInst, 0);
     let is *d.IRInst as b with mut = body_first;
     let is i32 as bsize with mut = 0;
-    while (cast(i64, b) != 0 && bsize <= MAX_BODY) {
+    while (cast(i64, b) != 0 && bsize <= ur_lim_body) {
         if (b.op == d.IR_JMP) {
             if (b.dest.op_type == d.OP_LABEL && b.dest.label == hlabel) { backedge = b; b = cast(*d.IRInst, 0); }
             else { return 0; }   // jump elsewhere → not a simple loop
@@ -193,7 +200,7 @@ fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count a
             b = ur_next_live(b);
         }
     }
-    if (cast(i64, backedge) == 0 || cast(i64, body_last) == 0 || bsize == 0 || bsize > MAX_BODY) { return 0; }
+    if (cast(i64, backedge) == 0 || cast(i64, body_last) == 0 || bsize == 0 || bsize > ur_lim_body) { return 0; }
     // The header must be entered only by falling into it: a jump to it from
     // elsewhere (the vectorizer resumes its scalar loop that way, with the
     // index past the start) would run the unrolled copies from another count.
@@ -248,7 +255,8 @@ fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count a
 
     // trip count = N - init, must be a small positive constant.
     let is i64 as kk = nbound - init;
-    if (kk < 1 || kk > cast(i64, MAX_UNROLL)) { return 0; }
+    if (kk < 1 || kk > cast(i64, ur_lim_trip)) { return 0; }
+    if (kk * cast(i64, bsize) > cast(i64, ur_lim_total)) { return 0; }
     let is i32 as k = cast(i32, kk);
 
     // --- transform: drop test + back-edge, clone body K-1 times after it ---
@@ -286,6 +294,114 @@ fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count a
         }
         copy = copy + 1;
     }
+    // In the IR optimizer each copy but the last defines fresh vregs: the
+    // copies' values are then single definitions the constant propagation and
+    // the address passes can read (an index of 0, 1, 2 instead of one vreg
+    // counting up). The last copy keeps the original names, so the values
+    // the code after the loop reads are where they were.
+    if (ur_drop_labels == 1) { ur_rename_copies(func, body_first, barr, nb, k); }
     d.opt_free(cast(*u8, barr));
+    // Nothing jumps to the header any more (checked above), nor, often, to the
+    // exit: without the labels the copies are straight-line code, and a loop
+    // around them can be unrolled in turn. The IR optimizer's CFG builders
+    // read a dead branch as the end of a block, so there the test, the back
+    // edge and the labels are unlinked rather than left dead.
+    if (ur_drop_labels == 1) {
+        let is i32 as xl = jz.dest.label;
+        let is i32 as xref with mut = 0;
+        let is *d.IRInst as xw with mut = func.instructions;
+        while (cast(i64, xw) != 0) {
+            if (xw.is_dead == 0 && (xw.op == d.IR_JMP || xw.op == d.IR_JZ || xw.op == d.IR_JNZ)
+                && xw.dest.op_type == d.OP_LABEL && xw.dest.label == xl) { xref = 1; }
+            xw = xw.next;
+        }
+        let is *d.IRInst as xprev with mut = cast(*d.IRInst, 0);
+        xw = func.instructions;
+        while (cast(i64, xw) != 0) {
+            let is *d.IRInst as xn = xw.next;
+            let is i32 as drop with mut = 0;
+            if (cast(i64, xw) == cast(i64, jz) || cast(i64, xw) == cast(i64, backedge)
+                || cast(i64, xw) == cast(i64, hdr)) { drop = 1; }
+            if (xref == 0 && xw.op == d.IR_LABEL && xw.dest.label == xl) { drop = 1; }
+            if (drop == 1) {
+                if (cast(i64, xprev) == 0) { func.instructions = xn; } else { xprev.next = xn; }
+            } else {
+                xprev = xw;
+            }
+            xw = xn;
+        }
+    }
     return 1;
+}
+
+// Does inst write its dest vreg? (STORE/COPY read dest as an address; a CMOV
+// or a vector store reads it too.)
+fn ur_dest_def(inst as *d.IRInst) as i32 {
+    if (inst.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = inst.op;
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) { return 0; }
+    return 1;
+}
+
+fn ur_map_use(o as *d.Operand, rmap as *i32, n as i32) as void {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= n) { return; }
+    if (rmap[o.vreg] >= 0) { o.vreg = rmap[o.vreg]; }
+}
+
+// Rename the defs of copies 0..k-2 of a fully unrolled body (nb live insts
+// per copy, copy 0 starting at body_first) to fresh vregs and point each use
+// at the latest def; the last copy writes the original vregs.
+fn ur_rename_copies(func as *d.IRFunction, body_first as *d.IRInst, barr as *i64, nb as i32, k as i32) as void {
+    if (k < 2) { return; }
+    let is i32 as j with mut = 0;
+    while (j < nb) {
+        let is *i64 as bp = cast(*i64, cast(i64, barr) + cast(i64, j) * 8);
+        let is *d.IRInst as bi = cast(*d.IRInst, *bp);
+        let is i32 as op = bi.op;
+        if (op == d.IR_CMOV || op == d.IR_ASM || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+            || op == d.IR_PHI) { return; }
+        j = j + 1;
+    }
+    let is i32 as n = func.vreg_count;
+    let is *i32 as rmap = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as v with mut = 0;
+    while (v < n) { rmap[v] = 0 - 1; v = v + 1; }
+    let is i32 as total = nb * k;
+    let is i32 as cnt with mut = 0;
+    let is *d.IRInst as it with mut = body_first;
+    while (cast(i64, it) != 0 && cnt < total) {
+        if (it.is_dead == 0) {
+            let is i32 as copy = cnt / nb;
+            ur_map_use(&it.src1, rmap, n);
+            ur_map_use(&it.src2, rmap, n);
+            if (it.op == d.IR_STORE || it.op == d.IR_COPY) { ur_map_use(&it.dest, rmap, n); }
+            if (ur_dest_def(it) == 1 && it.dest.vreg >= 0 && it.dest.vreg < n) {
+                if (copy < k - 1) {
+                    let is i32 as nv = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    rmap[it.dest.vreg] = nv;
+                    it.dest.vreg = nv;
+                } else {
+                    rmap[it.dest.vreg] = 0 - 1;
+                }
+            }
+            cnt = cnt + 1;
+        }
+        it = it.next;
+    }
+    d.opt_free(cast(*u8, rmap));
+}
+
+// -O2, in the IR optimizer: the same full unroll with room for more, so a
+// loop over a small local array leaves constant indices behind (pass_sroa can
+// then keep the elements in registers), and nests unroll from the inside out.
+// Returns 1 when it unrolled anything.
+fn pass_unroll_full(func as *d.IRFunction) as i32 {
+    ur_lim_trip = 16; ur_lim_body = 64; ur_lim_total = 256; ur_drop_labels = 1;
+    let is i32 as n with mut = 0;
+    while (n < 64 && pass_unroll(func) == 1) { n = n + 1; }
+    ur_lim_trip = MAX_UNROLL; ur_lim_body = MAX_BODY; ur_lim_total = 1000000; ur_drop_labels = 0;
+    if (n > 0) { return 1; }
+    return 0;
 }

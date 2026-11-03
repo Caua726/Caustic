@@ -136,6 +136,9 @@ let is i32 as IR_VPAND256      with imut = 102; // dest(YMM) = src1 & src2 (vpan
 // dest.label (see vec/vec_ops.cst). VOP defines an xmm-class vreg, VOPG a GPR.
 let is i32 as IR_VOP           with imut = 103;
 let is i32 as IR_VOPG          with imut = 104;
+// x86 codegen only (emit_driver.cst rol_fold): dest = src1 rotated left by
+// src2 (an immediate) within the width of cast_to (4 or 8 bytes).
+let is i32 as IR_ROL           with imut = 105;
 
 // === Vectorizer (LLVM-class, src/ir/vec/) debug flag ===
 // vec_debug: -debugvec — dumps loop discovery / SCEV / descriptors / legality from
@@ -148,6 +151,13 @@ let is i32 as OP_NONE  with imut = 0;
 let is i32 as OP_VREG  with imut = 1;
 let is i32 as OP_IMM   with imut = 2;
 let is i32 as OP_LABEL with imut = 3;
+// Codegen only (x86, after every IR pass): the address of a LOAD or STORE is
+// the global of the IR_ADDR_GLOBAL in imm, read as [rip+sym] by the access
+// itself (codegen/emit_driver.cst rip_fold).
+let is i32 as OP_GSYM  with imut = 4;
+// Codegen only (x86): an f64 constant read from the constant pool, imm = its
+// pool index (codegen/emit_driver.cst fconst_fold, emit_output.cst fc_*).
+let is i32 as OP_FCONST with imut = 5;
 
 // === Structs ===
 
@@ -555,6 +565,41 @@ fn ty_shr_is_arith(ty_ptr as *u8) as i32 {
     return 0;
 }
 
+// The float a call returns in xmm0 is read only before the next call, in its
+// own block: it then never has to live across a call and stays in an xmm.
+// (One that does is better in a callee-saved general register than in a
+// stack slot, so it keeps the default.)
+fn _call_float_local(c as *IRInst, v as i32) as i32 {
+    let is i32 as total with mut = 0;
+    let is *IRInst as w with mut = c.next;
+    // uses in the rest of the function
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            if (w.src1.op_type == OP_VREG && w.src1.vreg == v) { total = total + 1; }
+            if (w.src2.op_type == OP_VREG && w.src2.vreg == v) { total = total + 1; }
+            if (w.dest.op_type == OP_VREG && w.dest.vreg == v) {
+                if (w.op == IR_STORE || w.op == IR_SET_ARG) { total = total + 1; } else { return 0; }
+            }
+        }
+        w = w.next;
+    }
+    let is i32 as seen with mut = 0;
+    w = c.next;
+    while (cast(i64, w) != 0 && seen < total) {
+        if (w.is_dead == 0) {
+            let is i32 as op = w.op;
+            if (w.src1.op_type == OP_VREG && w.src1.vreg == v) { seen = seen + 1; }
+            if (w.src2.op_type == OP_VREG && w.src2.vreg == v) { seen = seen + 1; }
+            if (w.dest.op_type == OP_VREG && w.dest.vreg == v) { seen = seen + 1; }
+            if (seen < total && (op == IR_CALL || op == IR_CALL_INDIRECT || op == IR_FFI_CALL
+                || op == IR_LABEL || op == IR_JMP || op == IR_JZ || op == IR_JNZ || op == IR_RET
+                || op == IR_ASM || op == IR_SYSCALL)) { return 0; }
+        }
+        w = w.next;
+    }
+    return cast(i32, seen == total);
+}
+
 fn infer_vreg_classes(func as *IRFunction) as void {
     if (func.vreg_count == 0) { return; }
     func.vreg_class = cast(*i32, opt_alloc(cast(i64, func.vreg_count) * 4));
@@ -597,6 +642,11 @@ fn infer_vreg_classes(func as *IRFunction) as void {
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && inst.op == IR_LOAD && inst.dest.op_type == OP_VREG
             && cast(i64, inst.cast_to) != 0 && _ty_is_float(inst.cast_to) == 1) {
+            vreg_class_set(func, inst.dest.vreg, VR_XMM);
+        }
+        if (inst.is_dead == 0 && (inst.op == IR_CALL || inst.op == IR_CALL_INDIRECT) && inst.is_extern_call == 0
+            && inst.dest.op_type == OP_VREG && _ty_is_float(inst.cast_to) == 1
+            && _call_float_local(inst, inst.dest.vreg) == 1) {
             vreg_class_set(func, inst.dest.vreg, VR_XMM);
         }
         // A conversion to a float runs in an xmm (cvtsi2sd, cvtsd2ss, ...)

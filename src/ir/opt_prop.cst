@@ -132,6 +132,272 @@ fn pass_local_copy_prop(func as *d.IRFunction) as void {
     d.opt_free(cast(*u8, src_of));
 }
 
+// === Copies of a value defined once (-O2, after SSA destruction) ===
+//
+// `MOV v = u` with v and u each defined once: u's definition comes before
+// v's, which comes before every read of v, and u never changes, so every read
+// of v may read u. Block-local copy propagation stops at the first label; this
+// one reaches the reads in other blocks (an address copied before a loop and
+// read inside it). The copies are left dead.
+//
+// Except a copy that splits a value's life at a loop: the copy sits right
+// before a loop's head and is read only inside that loop, which makes no
+// call, and the value it copies lives across a call that more values live
+// across than there are callee-saved registers (5). Some of those go to the
+// stack; read whole, the value is one of the cheapest to put there, and every
+// read of it in the loop would load it back. The copy can take any register
+// the loop leaves free.
+let is i32 as SCP_SAVED with imut = 5;
+
+fn _scp_isp(a as *i32, i as i32) as *i32 { return cast(*i32, cast(i64, a) + cast(i64, i) * 4); }
+fn _scp_get(a as *i32, i as i32) as i32 { return *_scp_isp(a, i); }
+fn _scp_put(a as *i32, i as i32, v as i32) as void { *_scp_isp(a, i) = v; }
+
+fn _scp_is_call(op as i32) as i32 {
+    if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL) { return 1; }
+    return 0;
+}
+
+// A read of x at position k: x lives from its first definition (or the head
+// of the loop it is read in before that) to k, or to the end of the outermost
+// loop around k that it enters from outside.
+fn _scp_read(x as i32, k as i32, vc as i32, st as *i32, endp as *i32, minr as *i32, maxr as *i32,
+             inner as *i32, par as *i32, hend as *i32) as void {
+    if (x < 0 || x >= vc) { return; }
+    let is i32 as s with mut = _scp_get(st, x);
+    if (s < 0) { return; }
+    let is i32 as e with mut = k;
+    let is i32 as h with mut = _scp_get(inner, k);
+    if (k < s) {
+        if (h >= 0) { s = h; e = _scp_get(hend, h); }
+        else { s = k; }
+        _scp_put(st, x, s);
+    }
+    while (h >= 0 && h > s) {
+        if (_scp_get(hend, h) > e) { e = _scp_get(hend, h); }
+        h = _scp_get(par, h);
+    }
+    if (e > _scp_get(endp, x)) { _scp_put(endp, x, e); }
+    if (_scp_get(minr, x) < 0 || k < _scp_get(minr, x)) { _scp_put(minr, x, k); }
+    if (k > _scp_get(maxr, x)) { _scp_put(maxr, x, k); }
+}
+
+fn _scp_keep_splits(func as *d.IRFunction, vc as i32, src as *i32) as void {
+    let is i32 as nl with mut = func.label_count + 1;
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_LABEL && it.dest.label >= nl) { nl = it.dest.label + 1; }
+        n = n + 1;
+        it = it.next;
+    }
+    let is *i32 as lpos = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    // per position: calls before it, end of the loop headed there, innermost
+    // loop around it, the loop around that one, the loop entered from it
+    // through copies and labels only, values live across it, heavy calls
+    // before it
+    let is *i32 as ncall = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *i32 as hend = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *i32 as inner = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *i32 as par = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *i32 as nxl = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *i32 as live = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *i32 as heavy = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is *u8 as kind = d.opt_alloc(cast(i64, n) + 2);
+    let is *i32 as st = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as endp = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as minr = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as maxr = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as stk = cast(*i32, d.opt_alloc(cast(i64, n + 2) * 4));
+    let is i32 as i with mut = 0;
+    while (i < nl) { _scp_put(lpos, i, 0 - 1); i = i + 1; }
+    i = 0;
+    while (i <= n + 1) {
+        _scp_put(ncall, i, 0); _scp_put(hend, i, 0 - 1); _scp_put(inner, i, 0 - 1); _scp_put(par, i, 0 - 1);
+        _scp_put(nxl, i, 0 - 1); _scp_put(live, i, 0); _scp_put(heavy, i, 0); kind[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < vc) {
+        _scp_put(st, i, 0 - 1); _scp_put(endp, i, 0 - 1); _scp_put(minr, i, 0 - 1); _scp_put(maxr, i, 0 - 1);
+        i = i + 1;
+    }
+    // labels, calls, first definitions, loops (a label to its last jump back)
+    let is i32 as k with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is i32 as c with mut = 0;
+        if (it.is_dead == 1 || it.op == d.IR_MOV) { kind[k] = cast(u8, 2); }
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_LABEL && it.dest.label >= 0) { _scp_put(lpos, it.dest.label, k); kind[k] = cast(u8, 1); }
+            if (_scp_is_call(op) == 1) { c = 1; }
+            if ((op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+                && it.dest.label >= 0 && it.dest.label < nl) {
+                let is i32 as l = _scp_get(lpos, it.dest.label);
+                if (l >= 0 && l <= k && k > _scp_get(hend, l)) { _scp_put(hend, l, k); }
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                && op != d.IR_STORE && op != d.IR_COPY && op != d.IR_ATOMIC_STORE && op != d.IR_CMOV
+                && op != d.IR_VSTOREQ && op != d.IR_VSTOREQ256 && _scp_get(st, it.dest.vreg) < 0) {
+                _scp_put(st, it.dest.vreg, k); _scp_put(endp, it.dest.vreg, k);
+            }
+        }
+        _scp_put(ncall, k + 1, _scp_get(ncall, k) + c);
+        k = k + 1;
+        it = it.next;
+    }
+    // loop nesting
+    let is i32 as sp with mut = 0;
+    k = 0;
+    while (k < n) {
+        while (sp > 0 && _scp_get(hend, _scp_get(stk, sp - 1)) < k) { sp = sp - 1; }
+        if (_scp_get(hend, k) >= 0) {
+            if (sp > 0) { _scp_put(par, k, _scp_get(stk, sp - 1)); }
+            _scp_put(stk, sp, k); sp = sp + 1;
+        }
+        if (sp > 0) { _scp_put(inner, k, _scp_get(stk, sp - 1)); }
+        k = k + 1;
+    }
+    k = n - 1;
+    while (k >= 0) {
+        if (kind[k] == cast(u8, 1) && _scp_get(hend, k) >= 0) { _scp_put(nxl, k, k); }
+        else if (kind[k] != cast(u8, 0)) { _scp_put(nxl, k, _scp_get(nxl, k + 1)); }
+        k = k - 1;
+    }
+    // how far each value lives, and where each one is read
+    k = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.src1.op_type == d.OP_VREG) { _scp_read(it.src1.vreg, k, vc, st, endp, minr, maxr, inner, par, hend); }
+            if (it.src2.op_type == d.OP_VREG) { _scp_read(it.src2.vreg, k, vc, st, endp, minr, maxr, inner, par, hend); }
+            let is i32 as op = it.op;
+            if ((op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+                 || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) && it.dest.op_type == d.OP_VREG) {
+                _scp_read(it.dest.vreg, k, vc, st, endp, minr, maxr, inner, par, hend);
+            }
+        }
+        k = k + 1;
+        it = it.next;
+    }
+    // values live across each position (strictly inside their lives), and
+    // the calls more of them live across than there are saved registers
+    i = 0;
+    while (i < vc) {
+        let is i32 as s = _scp_get(st, i);
+        let is i32 as e = _scp_get(endp, i);
+        if (s >= 0 && e > s + 1) {
+            _scp_put(live, s + 1, _scp_get(live, s + 1) + 1);
+            _scp_put(live, e, _scp_get(live, e) - 1);
+        }
+        i = i + 1;
+    }
+    let is i32 as run with mut = 0;
+    k = 0;
+    while (k < n) {
+        run = run + _scp_get(live, k);
+        let is i32 as hv with mut = 0;
+        if (_scp_get(ncall, k + 1) > _scp_get(ncall, k) && run > SCP_SAVED) { hv = 1; }
+        _scp_put(heavy, k + 1, _scp_get(heavy, k) + hv);
+        k = k + 1;
+    }
+    i = 0;
+    while (i < vc) {
+        let is i32 as u = _scp_get(src, i);
+        let is i32 as cp = _scp_get(st, i);
+        if (u >= 0 && cp >= 0 && _scp_get(st, u) >= 0 && _scp_get(minr, i) >= 0) {
+            let is i32 as l = _scp_get(nxl, cp + 1);
+            if (l >= 0) {
+                let is i32 as j = _scp_get(hend, l);
+                let is i32 as hu = _scp_get(heavy, _scp_get(endp, u)) - _scp_get(heavy, _scp_get(st, u) + 1);
+                if (_scp_get(minr, i) >= l && _scp_get(maxr, i) <= j
+                    && _scp_get(ncall, j + 1) - _scp_get(ncall, l) == 0 && hu > 0) {
+                    _scp_put(src, i, 0 - 1);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, lpos)); d.opt_free(cast(*u8, ncall)); d.opt_free(cast(*u8, hend));
+    d.opt_free(cast(*u8, inner)); d.opt_free(cast(*u8, par)); d.opt_free(cast(*u8, nxl));
+    d.opt_free(cast(*u8, live)); d.opt_free(cast(*u8, heavy)); d.opt_free(kind);
+    d.opt_free(cast(*u8, st)); d.opt_free(cast(*u8, endp));
+    d.opt_free(cast(*u8, minr)); d.opt_free(cast(*u8, maxr)); d.opt_free(cast(*u8, stk));
+}
+
+fn pass_single_copy_prop(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc == 0) { return; }
+    let is *i32 as ndef = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i32 as src = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { ndef[i] = 0; src[i] = 0 - 1; i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_ASM || op == d.IR_PHI) {
+                d.opt_free(cast(*u8, ndef)); d.opt_free(cast(*u8, src));
+                return;
+            }
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                && op != d.IR_STORE && op != d.IR_COPY && op != d.IR_ATOMIC_STORE
+                && op != d.IR_VSTOREQ && op != d.IR_VSTOREQ256) {
+                // (a CMOV both reads and writes its dest: one more definition)
+                ndef[it.dest.vreg] = ndef[it.dest.vreg] + 1;
+                if (op == d.IR_MOV && it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc
+                    && it.src1.vreg != it.dest.vreg) {
+                    src[it.dest.vreg] = it.src1.vreg;
+                }
+            }
+        }
+        it = it.next;
+    }
+    // the end of each chain of such copies
+    let is i32 as any with mut = 0;
+    i = 0;
+    while (i < vc) {
+        if (ndef[i] != 1) { src[i] = 0 - 1; }
+        else if (src[i] >= 0 && ndef[src[i]] != 1) { src[i] = 0 - 1; }
+        if (src[i] >= 0) { any = 1; }
+        i = i + 1;
+    }
+    if (any == 1) { _scp_keep_splits(func, vc, src); }
+    if (any == 1) {
+        i = 0;
+        while (i < vc) {
+            if (src[i] >= 0) {
+                let is i32 as r with mut = src[i];
+                let is i32 as g with mut = 0;
+                while (src[r] >= 0 && g < 64) { r = src[r]; g = g + 1; }
+                src[i] = r;
+            }
+            i = i + 1;
+        }
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0) {
+                if (it.op == d.IR_MOV && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                    && src[it.dest.vreg] >= 0) {
+                    it.is_dead = 1;
+                } else {
+                    if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc && src[it.src1.vreg] >= 0) { it.src1.vreg = src[it.src1.vreg]; }
+                    if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc && src[it.src2.vreg] >= 0) { it.src2.vreg = src[it.src2.vreg]; }
+                    let is i32 as op = it.op;
+                    if ((op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+                         || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256)
+                        && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc && src[it.dest.vreg] >= 0) {
+                        it.dest.vreg = src[it.dest.vreg];
+                    }
+                }
+            }
+            it = it.next;
+        }
+    }
+    d.opt_free(cast(*u8, ndef)); d.opt_free(cast(*u8, src));
+}
+
 // === Pass 1: Constant Prop + Copy Prop (forward) ===
 
 // Type kind of an integer cast operand (ast.TY_I8..TY_U64 = 1..8), else 0.
@@ -524,6 +790,19 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
 
 // === Pass 1.1: Fuse ADDR+STORE/LOAD into direct stack ops ===
 
+// A pointer to an 8-byte scalar (i64, u64, f64 or a pointer): a load or store
+// through it covers the whole slot, whatever the slot was declared as.
+fn _word_ptr(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    if (*cast(*i32, t) != 14) { return 0; }
+    let is *u8 as b = *cast(**u8, cast(i64, t) + 4);
+    if (cast(i64, b) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, b);
+    if (k != 4 && k != 8 && k != 10 && k != 14) { return 0; }
+    if (*cast(*i32, cast(i64, b) + 28) != 8) { return 0; }
+    return 1;
+}
+
 fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     // Count uses of each vreg (as src1, src2, or dest-of-STORE/COPY)
     let is *i32 as use_count = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
@@ -572,6 +851,28 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
         }
         inst = inst.next;
     }
+    // The bit view of a word local, `*cast(*f64, &x)`: the address goes once
+    // through a CAST between two word pointer types. It fuses like a direct
+    // access; once the slot is promoted the value crosses as a MOV, which is
+    // a bit copy (movq between a general and an xmm register).
+    let is *i32 as via = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
+    i = 0;
+    while (i < vc_alloc) { via[i] = 0 - 1; i = i + 1; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_CAST && inst.dest.op_type == d.OP_VREG
+            && inst.src1.op_type == d.OP_VREG) {
+            let is i32 as cv = inst.src1.vreg;
+            let is i32 as cd = inst.dest.vreg;
+            if (cv >= 0 && cv < vc_alloc && cd >= 0 && cd < vc_alloc
+                && addr_offset[cv] >= 0 && use_count[cv] == 1
+                && _word_ptr(inst.cast_from) == 1 && _word_ptr(inst.cast_to) == 1) {
+                addr_offset[cd] = addr_offset[cv];
+                via[cd] = cv;
+            }
+        }
+        inst = inst.next;
+    }
     // Now scan: for each STORE/LOAD whose address vreg comes from ADDR(IMM) with use_count==1
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
@@ -588,13 +889,7 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
                         inst.dest.op_type = d.OP_IMM;
                         inst.dest.imm = off;
                         // Mark the ADDR instruction as dead (find it)
-                        let is *d.IRInst as scan with mut = func.instructions;
-                        while (cast(i64, scan) != 0) {
-                            if (scan.is_dead == 0 && scan.op == d.IR_ADDR && scan.dest.vreg == av) {
-                                scan.is_dead = 1;
-                            }
-                            scan = scan.next;
-                        }
+                        _kill_addr(func, av, via[av]);
                     }
                 }
             }
@@ -608,13 +903,7 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
                     if (*ucp == 1) {
                         inst.src1.op_type = d.OP_IMM;
                         inst.src1.imm = off;
-                        let is *d.IRInst as scan with mut = func.instructions;
-                        while (cast(i64, scan) != 0) {
-                            if (scan.is_dead == 0 && scan.op == d.IR_ADDR && scan.dest.vreg == av) {
-                                scan.is_dead = 1;
-                            }
-                            scan = scan.next;
-                        }
+                        _kill_addr(func, av, via[av]);
                     }
                 }
             }
@@ -623,6 +912,24 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
     }
     d.opt_free(cast(*u8, use_count));
     d.opt_free(cast(*u8, addr_offset));
+    d.opt_free(cast(*u8, via));
+}
+
+// The ADDR whose value av is, gone with the access it was fused into; with
+// the CAST it went through (av its result, src the ADDR's), both are.
+fn _kill_addr(func as *d.IRFunction, av as i32, src as i32) as void {
+    let is *d.IRInst as scan with mut = func.instructions;
+    while (cast(i64, scan) != 0) {
+        if (scan.is_dead == 0 && scan.dest.op_type == d.OP_VREG) {
+            if (src < 0) {
+                if (scan.op == d.IR_ADDR && scan.dest.vreg == av) { scan.is_dead = 1; }
+            } else {
+                if (scan.op == d.IR_CAST && scan.dest.vreg == av) { scan.is_dead = 1; }
+                if (scan.op == d.IR_ADDR && scan.dest.vreg == src) { scan.is_dead = 1; }
+            }
+        }
+        scan = scan.next;
+    }
 }
 
 // === Pass 1.2: Store-Load Forwarding ===

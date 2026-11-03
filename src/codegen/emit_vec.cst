@@ -29,13 +29,72 @@ fn _bb(x as i32) as void {
 }
 fn _be() as void { eo.out_char(10); }
 
+// Hardware number of the base register of enc's memory operand.
+let is i32 as _mbase with mut = 1;
+
+// Hardware number of the general register an allocator location names, -1
+// for none.
+fn _hw_gpr(loc as i32) as i32 {
+    if (loc == 3) { return 3; }
+    if (loc == 4) { return 6; }
+    if (loc == 5) { return 7; }
+    if (loc == 6) { return 8; }
+    if (loc == 7) { return 9; }
+    if (loc == 8) { return 10; }
+    if (loc == 10) { return 12; }
+    if (loc == 11) { return 13; }
+    if (loc == 12) { return 14; }
+    if (loc == 15) { return 15; }
+    return 0 - 1;
+}
+
+// The base register of a vector load or store: the one the address already
+// lives in (-O2), else rcx, loaded with it. A hardware number.
+fn vbase(vreg as i32, ctx as *al.AllocCtx) as i32 {
+    if (al.al_opt_level >= 2) {
+        let is i32 as hw = _hw_gpr(al.get_loc(vreg, ctx));
+        if (hw >= 0) { return hw; }
+    }
+    e.load_op(vreg, ctx, "rcx");
+    return 1;
+}
+
+// The same as a name, for the assembler's syntax.
+fn vbase_name(vreg as i32, ctx as *al.AllocCtx) as *u8 {
+    if (al.al_opt_level >= 2) {
+        let is i32 as loc = al.get_loc(vreg, ctx);
+        if (_hw_gpr(loc) >= 0) { return eo.reg64(loc); }
+    }
+    e.load_op(vreg, ctx, "rcx");
+    return "rcx";
+}
+
+// ModRM (+ SIB) and displacement of [base + disp], reg field reg.
+fn vmodrm(reg as i32, base as i32, disp as i64) as void {
+    let is i32 as b = base & 7;
+    let is i32 as r = (reg & 7) << 3;
+    if (disp == 0 && b != 5) {
+        _bb(r | b);
+        if (b == 4) { _bb(36); }
+    } else if (disp >= 0 - 128 && disp <= 127) {
+        _bb(64 | r | b);
+        if (b == 4) { _bb(36); }
+        _bb(cast(i32, disp & 255));
+    } else {
+        _bb(128 | r | b);
+        if (b == 4) { _bb(36); }
+        _bb(cast(i32, disp & 255)); _bb(cast(i32, (disp >> 8) & 255));
+        _bb(cast(i32, (disp >> 16) & 255)); _bb(cast(i32, (disp >> 24) & 255));
+    }
+}
+
 // pp: 0 none, 1 66, 2 F3, 3 F2. map: 1 0F, 2 0F38, 3 0F3A. rmk: 0 register
-// rm, 1 memory [rcx + disp]. imm < 0: none.
+// rm, 1 memory [_mbase + disp]. imm < 0: none.
 fn enc(vex as i32, pp as i32, map as i32, w as i32, l as i32, opc as i32,
        reg as i32, vvvv as i32, rmk as i32, rm as i32, disp as i64, imm as i32) as void {
     let is i32 as r3 = (reg >> 3) & 1;
     let is i32 as b3 with mut = 0;
-    if (rmk == 0) { b3 = (rm >> 3) & 1; }
+    if (rmk == 0) { b3 = (rm >> 3) & 1; } else { b3 = (_mbase >> 3) & 1; }
     _bo();
     if (vex == 1) {
         _bb(196);
@@ -50,15 +109,8 @@ fn enc(vex as i32, pp as i32, map as i32, w as i32, l as i32, opc as i32,
     _bb(opc);
     if (rmk == 0) {
         _bb(192 | ((reg & 7) << 3) | (rm & 7));
-    } else if (disp == 0) {
-        _bb(((reg & 7) << 3) | 1);
-    } else if (disp >= 0 - 128 && disp <= 127) {
-        _bb(64 | ((reg & 7) << 3) | 1);
-        _bb(cast(i32, disp & 255));
     } else {
-        _bb(128 | ((reg & 7) << 3) | 1);
-        _bb(cast(i32, disp & 255)); _bb(cast(i32, (disp >> 8) & 255));
-        _bb(cast(i32, (disp >> 16) & 255)); _bb(cast(i32, (disp >> 24) & 255));
+        vmodrm(reg, _mbase, disp);
     }
     if (imm >= 0) { _bb(imm); }
     _be();
@@ -292,7 +344,8 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as dn = vnum(inst.dest.vreg, ctx);
 
     if (code == vo.VO_LOAD) {
-        e.load_op(inst.src1.vreg, ctx, "rcx");
+        if (nbytes == 2) { e.load_op(inst.src1.vreg, ctx, "rcx"); }
+        else { _mbase = vbase(inst.src1.vreg, ctx); }
         let is i64 as disp with mut = 0;
         if (inst.src2.op_type == d.OP_IMM) { disp = inst.src2.imm; }
         if (nbytes == 2) {
@@ -304,12 +357,19 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         } else if (nbytes == 4) { enc(vex, 1, 1, 0, 0, 110, dn, 0, 1, 1, disp, 0 - 1); }     // movd
         else if (nbytes == 8) { enc(vex, 2, 1, 0, 0, 126, dn, 0, 1, 1, disp, 0 - 1); }       // movq
         else { enc(vex, 2, 1, 0, l, 111, dn, 0, 1, 1, disp, 0 - 1); }                        // movdqu
+        _mbase = 1;
         return;
     }
     if (code == vo.VO_ZERO) { enc(vex, 1, 1, 0, 0, 239, dn, dn, 0, dn, 0, 0 - 1); return; }       // pxor
     if (code == vo.VO_ONES) { enc(vex, 1, 1, 0, l, 118, dn, dn, 0, dn, 0, 0 - 1); return; }       // pcmpeqd
     if (code == vo.VO_SPLAT) {
-        e.load_op(inst.src1.vreg, ctx, "rax");
+        if (inst.src1.op_type == d.OP_IMM) {
+            // a constant: its low lane's bytes, straight into rax
+            let is i64 as kv with mut = inst.src1.imm;
+            if (ls == 1) { kv = kv & 255; } else if (ls == 2) { kv = kv & 65535; } else if (ls == 4) { kv = kv & 4294967295; }
+            if (ls < 8) { eo.out_str("  mov eax, ", 11); } else { eo.out_str("  mov rax, ", 11); }
+            eo.out_int(kv); eo.out_char(10);
+        } else { e.load_op(inst.src1.vreg, ctx, "rax"); }
         let is i32 as w with mut = 0; if (ls == 8) { w = 1; }
         _movd_to_x(vex, dn, w);
         _gpr_inval();
@@ -328,6 +388,12 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     if (code == vo.VO_SPLATF) {
         // the scalar into xmm1 in the lane's form, then into every lane
         let is i32 as isf32 with mut = 0; if (ls == 4) { isf32 = 1; }
+        // an f64 already in an xmm register: movddup straight from it
+        let is i32 as sloc = al.get_loc(inst.src1.vreg, ctx);
+        if (ls == 8 && l == 0 && sloc >= 16 && sloc <= 31 && e.f32s_is(inst.src1.vreg) == 0) {
+            enc(vex, 3, 1, 0, 0, 18, dn, 0, 0, sloc - 16, 0, 0 - 1);              // movddup
+            return;
+        }
         fs_load(inst.src1.vreg, ctx, 1, isf32, vex);
         if (vex == 1) {
             if (ls == 4) { enc(1, 1, 2, 0, l, 24, dn, 0, 0, 1, 0, 0 - 1); }      // vbroadcastss
@@ -338,6 +404,26 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         mov_v(0, 0, dn, 1);
         if (ls == 4) { enc(0, 0, 1, 0, 0, 198, dn, 0, 0, dn, 0, 0); }           // shufps 0
         else { enc(0, 1, 1, 0, 0, 20, dn, 0, 0, dn, 0, 0 - 1); }                // unpcklpd
+        return;
+    }
+    if (code == vo.VO_SWAP) {
+        enc(vex, 1, 1, 0, 0, 112, dn, 0, 0, vnum(inst.src1.vreg, ctx), 0, 78);               // pshufd d, a, 0x4E
+        return;
+    }
+    if (code == vo.VO_PACK) {
+        // two f64 scalars side by side: xmm0 = src1, xmm1 = src2, unpcklpd
+        let is i32 as pa = al.get_loc(inst.src1.vreg, ctx);
+        let is i32 as pb = al.get_loc(inst.src2.vreg, ctx);
+        if (vex == 0 && pa >= 16 && pa <= 31 && pb >= 16 && pb <= 31 && e.f32s_is(inst.src1.vreg) == 0
+            && e.f32s_is(inst.src2.vreg) == 0 && pb - 16 != dn) {
+            mov_v(0, 0, dn, pa - 16);
+            enc(0, 1, 1, 0, 0, 20, dn, 0, 0, pb - 16, 0, 0 - 1);                  // unpcklpd d, b
+            return;
+        }
+        fs_load(inst.src1.vreg, ctx, 0, 0, vex);
+        fs_load(inst.src2.vreg, ctx, 1, 0, vex);
+        enc(0, 1, 1, 0, 0, 20, 0, 0, 0, 1, 0, 0 - 1);                         // unpcklpd xmm0, xmm1
+        mov_v(0, 0, dn, 0);
         return;
     }
     if (code == vo.VO_IOTA) {
@@ -454,6 +540,7 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 
     let is i32 as bn = vnum(inst.src2.vreg, ctx);
 
+    if (code == vo.VO_FADDSUB) { bin(vex, l, 1, 1, 208, 0, dn, an, bn, 0 - 1); return; }   // addsubpd
     if (code == vo.VO_FADD || code == vo.VO_FSUB || code == vo.VO_FMUL || code == vo.VO_FDIV || code == vo.VO_FCMP) {
         let is i32 as pp with mut = 0; if (ls == 8) { pp = 1; }
         let is i32 as opc with mut = 88;
@@ -488,7 +575,8 @@ fn gen_vstore(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as nb with mut = inst.dest.label & 255;
     let is i32 as vex = (inst.dest.label >> 8) & 1;
     if (nb == 0) { nb = 16; }
-    e.load_op(inst.src1.vreg, ctx, "rcx");
+    if (nb == 2) { e.load_op(inst.src1.vreg, ctx, "rcx"); }
+    else { _mbase = vbase(inst.src1.vreg, ctx); }
     let is i64 as disp = inst.dest.imm;
     let is i32 as sn = vnum(inst.src2.vreg, ctx);
     if (nb == 2) {
@@ -500,4 +588,5 @@ fn gen_vstore(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     } else if (nb == 4) { enc(vex, 1, 1, 0, 0, 126, sn, 0, 1, 1, disp, 0 - 1); }      // movd
     else if (nb == 8) { enc(vex, 1, 1, 0, 0, 214, sn, 0, 1, 1, disp, 0 - 1); }        // movq
     else { enc(vex, 2, 1, 0, 0, 127, sn, 0, 1, 1, disp, 0 - 1); }                    // movdqu
+    _mbase = 1;
 }

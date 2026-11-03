@@ -181,6 +181,79 @@ fn gen_cmp(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i32 {
     return r;
 }
 
+// === x >= A && x <= B as one unsigned compare ===
+//
+// For an integer variable x of n bits and integer constants A <= B of its
+// type, x lies in [A, B] exactly when x - A, wrapped to n bits, is at most
+// B - A read as an unsigned n-bit number: below A the difference wraps to a
+// huge one. One subtraction and one compare in x's own width (so a widened
+// loop keeps its narrow lanes) instead of two compares and a branch. x > A
+// and x < B count as x >= A + 1 and x <= B - 1; the bounds come in either
+// order.
+
+// The bound a compare `x op N` puts on x: 1 lower (*v = the least x), 2 upper
+// (*v = the greatest), 0 none.
+fn _rf_bound(c as *ast.Node, v as *i64) as i32 {
+    let is i32 as k = c.kind;
+    if (k != ast.NK_GE && k != ast.NK_GT && k != ast.NK_LE && k != ast.NK_LT) { return 0; }
+    if (cast(i64, c.lhs) == 0 || cast(i64, c.rhs) == 0) { return 0; }
+    if (c.lhs.kind != ast.NK_IDENT || c.rhs.kind != ast.NK_NUM) { return 0; }
+    if (cast(i64, c.rhs.ty) == 0 || g.is_float_kind(c.rhs.ty.kind) == 1) { return 0; }
+    let is i64 as n = c.rhs.val;
+    if (n < 0 - 2147483647 || n > 2147483647) { return 0; }
+    if (k == ast.NK_GE) { *v = n; return 1; }
+    if (k == ast.NK_GT) { *v = n + 1; return 1; }
+    if (k == ast.NK_LE) { *v = n; return 2; }
+    *v = n - 1;
+    return 2;
+}
+
+fn _range_fold(node as *ast.Node, line as i32) as i32 {
+    let is *ast.Node as a = node.lhs;
+    let is *ast.Node as b = node.rhs;
+    if (cast(i64, a) == 0 || cast(i64, b) == 0) { return 0 - 1; }
+    let is i64 as va with mut = 0;
+    let is i64 as vb with mut = 0;
+    let is i32 as ka = _rf_bound(a, &va);
+    let is i32 as kb = _rf_bound(b, &vb);
+    if (ka == 0 || kb == 0 || ka == kb) { return 0 - 1; }
+    let is *ast.Node as x = a.lhs;
+    if (d.str_eq(x.name_ptr, x.name_len, b.lhs.name_ptr, b.lhs.name_len) == 0) { return 0 - 1; }
+    let is *ast.Type as t = x.ty;
+    if (cast(i64, t) == 0 || cast(i64, b.lhs.ty) != cast(i64, t)) { return 0 - 1; }
+    let is i32 as tk = t.kind;
+    // integers only (i8..i64, u8..u64, char)
+    if (!((tk >= 1 && tk <= 8) || tk == 12)) { return 0 - 1; }
+    let is i64 as lo with mut = va;
+    let is i64 as hi with mut = vb;
+    if (ka == 2) { lo = vb; hi = va; }
+    if (lo > hi) { return 0 - 1; }
+    // an unsigned x is never below 0
+    if ((tk >= 5 && tk <= 8) || tk == 12) { if (lo < 0) { return 0 - 1; } }
+    // the bounds must be values of x's type
+    let is i32 as sz = t.size;
+    let is *ast.Type as ut with mut = ast.type_u64;
+    if (sz == 1) { ut = ast.type_u8; } else if (sz == 2) { ut = ast.type_u16; } else if (sz == 4) { ut = ast.type_u32; }
+    else if (sz != 8) { return 0 - 1; }
+    if (sz < 8) {
+        let is i64 as bits = cast(i64, sz) * 8;
+        let is i64 as smin = 0 - (cast(i64, 1) << (bits - 1));
+        let is i64 as umax = (cast(i64, 1) << bits) - 1;
+        if (lo < smin || hi > umax) { return 0 - 1; }
+        if (tk >= 1 && tk <= 4 && hi >= (cast(i64, 1) << (bits - 1))) { return 0 - 1; }
+    }
+    let is i32 as xv = gen_expr(x);
+    let is i32 as xu with mut = xv;
+    if (cast(i64, ut) != cast(i64, t)) { xu = g.emit_cast_from(xv, cast(*u8, t), cast(*u8, ut), line); }
+    let is i32 as off = g.emit_imm(lo, line);
+    let is i32 as diff = g.emit_binary(d.IR_SUB, xu, off, line);
+    g.ctx_tail.cast_to = cast(*u8, ut);
+    let is i32 as span = g.emit_imm(hi - lo, line);
+    let is i32 as r = g.emit_binary(d.IR_LE, diff, span, line);
+    g.ctx_tail.cast_to = cast(*u8, ut);
+    return r;
+}
+
 fn gen_bitwise(node as *ast.Node, op as i32, line as i32, need_cast as i32) as i32 {
     let is i32 as lhs = gen_expr(node.lhs);
     let is i32 as rhs = gen_expr(node.rhs);
@@ -1021,6 +1094,8 @@ fn gen_expr(node as *ast.Node) as i32 {
 
     // Logical AND (multi-def dest — blocks const prop but is correct)
     if (k == ast.NK_LAND) {
+        let is i32 as rf = _range_fold(node, line);
+        if (rf >= 0) { return rf; }
         let is i32 as false_l = g.new_label();
         let is i32 as end_l = g.new_label();
         let is i32 as dest = g.new_vreg();

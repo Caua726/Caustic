@@ -47,6 +47,23 @@ fn ic_count_label_refs(func as *d.IRFunction, L as i32) as i32 {
     return cnt;
 }
 
+// The first live instruction from x on that is not a label nothing jumps to
+// (an inlined function's exit, say, left right after the else label).
+fn ic_skip_free_labels(func as *d.IRFunction, x as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as p with mut = x;
+    while (cast(i64, p) != 0 && p.op == d.IR_LABEL && ic_count_label_refs(func, p.dest.label) == 0) { p = ic_next_live(p); }
+    return p;
+}
+
+// Drop the labels nothing jumps to in [a, b).
+fn ic_kill_free_labels(func as *d.IRFunction, a as *d.IRInst, b as *d.IRInst) as void {
+    let is *d.IRInst as p with mut = a;
+    while (cast(i64, p) != 0 && cast(i64, p) != cast(i64, b)) {
+        if (p.is_dead == 0 && p.op == d.IR_LABEL && ic_count_label_refs(func, p.dest.label) == 0) { p.is_dead = 1; }
+        p = p.next;
+    }
+}
+
 // Try to match + convert a diamond starting at `jz`. Returns 1 if converted.
 fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     let is i32 as cond = jz.src1.vreg;
@@ -74,7 +91,7 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     if (cast(i64, lel) == 0 || lel.op != d.IR_LABEL || lel.dest.label != else_label) { return 0; }
 
     // --- else arm: pure MOV/IMM up to the join label ---
-    let is *d.IRInst as e with mut = ic_next_live(lel);
+    let is *d.IRInst as e with mut = ic_skip_free_labels(func, ic_next_live(lel));
     let is *d.IRInst as else_phi with mut = cast(*d.IRInst, 0);
     ok = 1;
     while (cast(i64, e) != 0 && e.op != d.IR_LABEL && ok == 1) {
@@ -103,7 +120,7 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
             && ic2_outside(func, w.dest.vreg, t0, jmp, 1) == 1) { return 0; }
         w = w.next;
     }
-    let is *d.IRInst as e0 = ic_next_live(lel);
+    let is *d.IRInst as e0 = ic_skip_free_labels(func, ic_next_live(lel));
     w = e0;
     while (cast(i64, w) != cast(i64, e)) {
         if (w.is_dead == 0 && cast(i64, w) != cast(i64, else_phi)
@@ -112,6 +129,7 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     }
 
     // --- transform ---
+    ic_kill_free_labels(func, lel.next, e0);
     jz.is_dead = 1;
     then_phi.is_dead = 1;       // then value St flows via the kept then-arm work
     jmp.is_dead = 1;
@@ -123,6 +141,8 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     cmov.line = else_phi.line;
     cmov.next = else_phi.next;
     else_phi.next = cmov;
+    // the join is straight-line code now
+    if (ic_count_label_refs(func, join_label) == 0) { e.is_dead = 1; }
     return 1;
 }
 
@@ -230,7 +250,7 @@ fn ic2_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     let is i32 as join_label = jmp.dest.label;
     let is *d.IRInst as lel = ic_next_live(jmp);
     if (cast(i64, lel) == 0 || lel.op != d.IR_LABEL || lel.dest.label != else_label) { return 0; }
-    let is *d.IRInst as e0 = ic_next_live(lel);
+    let is *d.IRInst as e0 = ic_skip_free_labels(func, ic_next_live(lel));
     let is *d.IRInst as e with mut = e0;
     while (cast(i64, e) != 0 && e.op != d.IR_LABEL) {
         if (ic2_pure(e) == 0) { return 0; }
@@ -369,6 +389,7 @@ fn ic2_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     }
 
     // --- transform ---
+    ic_kill_free_labels(func, lel.next, e0);
     jz.is_dead = 1;
     jmp.is_dead = 1;
     lel.is_dead = 1;
@@ -402,6 +423,8 @@ fn ic2_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
         tail = cm;
         k4 = k4 + 1;
     }
+    // the join is straight-line code now
+    if (ic_count_label_refs(func, join_label) == 0) { ljoin.is_dead = 1; }
     return 1;
 }
 

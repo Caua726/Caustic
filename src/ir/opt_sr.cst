@@ -20,7 +20,8 @@ use "phi.cst" as phi;
 // A chain is the address `base + X` (an ADD), base invariant in the loop, X
 // read only by that ADD:
 //   P3    X = iv << k
-//   FULL  X = (other + iv) << k, the sum maybe cast, other invariant
+//   FULL  X = (other + iv) << k, the sum maybe cast, other invariant; iv
+//         may also be iv * K, K a constant (a row index times its width)
 //   P4    X = iv * z, z an invariant register
 //   P5    X = (iv * K) << sh, K a constant, sh <= 3
 // where iv is q (the operand of the step), p, or a cast of either, through
@@ -100,6 +101,8 @@ struct SrL {
     ch_dead1 as [16]i64;
     ch_dead2 as [16]i64;
     ch_dead3 as [16]i64;
+    ch_mulk as [16]i64;  // FULL: the constant the induction variable is scaled by (1: none)
+    ch_accp as [16]i32;  // the phi the chain became
 }
 
 fn _bb(a as *SrA, b as i32) as *cfg.BasicBlock {
@@ -378,8 +381,19 @@ fn _strip(a as *SrA, w as i32) as i32 {
 
 // Which induction variable does w read? w is q exactly (P3: the shift that
 // the step reads too), or, through copies, q, p (allow_p) or a cast of
-// either (allow_cast). -1: none.
+// either (allow_cast); with either allowed, also one of those plus or minus a
+// constant (an index read as i + 1 moves with i: nx, the stepped value, is
+// one). -1: none.
 fn _iv_of(a as *SrA, l as *SrL, w0 as i32, allow_p as i32, allow_cast as i32) as i32 {
+    let is i32 as r = _iv_of1(a, l, w0, allow_p, allow_cast);
+    if (r >= 0 || (allow_p == 0 && allow_cast == 0) || w0 < 0) { return r; }
+    let is *d.IRInst as ad = _def(a, _strip(a, w0));
+    if (cast(i64, ad) == 0 || (ad.op != d.IR_ADD && ad.op != d.IR_SUB) || _step_of(ad) == 0) { return 0 - 1; }
+    if (_in_loop(a, ad.dest.vreg) == 0) { return 0 - 1; }
+    return _iv_of1(a, l, ad.src1.vreg, 1, 1);
+}
+
+fn _iv_of1(a as *SrA, l as *SrL, w0 as i32, allow_p as i32, allow_cast as i32) as i32 {
     if (w0 < 0) { return 0 - 1; }
     let is i32 as w with mut = w0;
     let is i32 as strip = cast(i32, allow_p == 1 || allow_cast == 1);
@@ -440,6 +454,7 @@ fn _add_chain(l as *SrL, iv as i32, kind as i32, e as *d.IRInst, base as i32, ot
     l.ch_dead1[c] = cast(i64, d1);
     l.ch_dead2[c] = cast(i64, d2);
     l.ch_dead3[c] = cast(i64, d3);
+    l.ch_mulk[c] = 1;
     l.nch = c + 1;
 }
 
@@ -478,11 +493,26 @@ fn _match_shl(a as *SrA, l as *SrL, s as *d.IRInst) as void {
     let is i32 as vb = ad.src2.vreg;
     let is i32 as other with mut = 0 - 1;
     let is i32 as w with mut = 0 - 1;
+    let is i64 as mk with mut = 1;
     iv = _iv_of(a, l, vb, 0, 1);
     if (iv >= 0) { other = va; w = vb; }
     else {
         iv = _iv_of(a, l, va, 0, 1);
         if (iv >= 0) { other = vb; w = va; }
+    }
+    // (other + iv * K) << k
+    if (iv < 0) {
+        let is *d.IRInst as mm with mut = _scaled_iv(a, l, vb);
+        if (cast(i64, mm) != 0) { other = va; }
+        else {
+            mm = _scaled_iv(a, l, va);
+            if (cast(i64, mm) != 0) { other = vb; }
+        }
+        if (cast(i64, mm) != 0) {
+            w = mm.src1.vreg;
+            iv = _iv_of(a, l, _mul_opnd(a, w), 1, 0);
+            mk = mm.src2.imm;
+        }
     }
     if (iv < 0 || _mat_ok(a, other, 0) == 0) { return; }
     let is *d.IRInst as e = _end_add(a, s.dest.vreg, &base);
@@ -490,7 +520,20 @@ fn _match_shl(a as *SrA, l as *SrL, s as *d.IRInst) as void {
     // the sum dies with the chain only when the chain is its one reader
     let is *d.IRInst as dsum with mut = ad;
     if (cast(i64, cst) != 0 && a.uc[sum] != 1) { dsum = cast(*d.IRInst, 0); }
-    _add_chain(l, iv, K_FULL, e, base, other, k, cast(i64, 1) << k, 0 - 1, w, dsum, s, cst);
+    if (mk != 1 && (k > 6 || _fits32(mk << k) == 0)) { return; }
+    _add_chain(l, iv, K_FULL, e, base, other, k, mk << k, 0 - 1, w, dsum, s, cst);
+    if (l.nch > 0 && l.ch_end[l.nch - 1] == cast(i64, e)) { l.ch_mulk[l.nch - 1] = mk; }
+}
+
+// x = iv * K, K a constant in [2, 2^31), read only by the sum: the MUL.
+fn _scaled_iv(a as *SrA, l as *SrL, x as i32) as *d.IRInst {
+    let is *d.IRInst as none = cast(*d.IRInst, 0);
+    if (x < 0 || x >= a.nv || a.uc[x] != 1 || _in_loop(a, x) == 0) { return none; }
+    let is *d.IRInst as m = _def(a, x);
+    if (cast(i64, m) == 0 || m.op != d.IR_MUL || m.src1.op_type != d.OP_VREG || m.src2.op_type != d.OP_IMM) { return none; }
+    if (m.src2.imm < 2 || m.src2.imm > 2147483647) { return none; }
+    if (_iv_of(a, l, _mul_opnd(a, m.src1.vreg), 1, 0) < 0) { return none; }
+    return m;
 }
 
 // The operand of a MUL, through one cast.
@@ -558,20 +601,22 @@ fn _const_of(a as *SrA, v0 as i32, out as *i64) as i32 {
 
 // w's value on the first iteration, in the preheader: a constant (returns 1,
 // *c) or a register (returns 0, *v). w reads the induction variable's root (p,
-// or the slot's load) through copies and casts: the casts are applied to the
-// first value of the root.
+// or the slot's load) through copies, casts and the step itself (nx): those
+// are applied to the first value of the root.
 fn _first(func as *d.IRFunction, a as *SrA, l as *SrL, iv as i32, w as i32, c as *i64, v as *i32) as i32 {
     let is i32 as root with mut = l.iv_p[iv];
     if (root < 0) { root = l.iv_q[iv]; }
     let is [16]i64 as path;
     let is i32 as np with mut = 0;
     let is i32 as ncast with mut = 0;
+    let is i64 as adj with mut = 0;
     let is i32 as cur with mut = w;
     while (cur != root && np < 16) {
         let is *d.IRInst as di = _def(a, cur);
         path[np] = cast(i64, di);
         np = np + 1;
         if (di.op == d.IR_CAST) { ncast = ncast + 1; }
+        if (di.op == d.IR_ADD || di.op == d.IR_SUB) { adj = adj + _step_of(di); }
         cur = di.src1.vreg;
     }
     let is i32 as x with mut = l.iv_x[iv];
@@ -590,15 +635,17 @@ fn _first(func as *d.IRFunction, a as *SrA, l as *SrL, iv as i32, w as i32, c as
         let is i64 as k with mut = 0;
         if (_const_of(a, x, &k) == 1) {
             // a constant in [0, 2^31) reads the same through any of the casts
-            if (k >= 0 && k <= 2147483647) { *c = k; return 1; }
-            if (ncast == 0 && k >= 0 - 2147483648 && k < 0) { *c = k; return 1; }
+            // (and stays one after the step, when w is nx)
+            let is i64 as k2 = k + adj;
+            if (k >= 0 && k <= 2147483647 && k2 >= 0 && k2 <= 2147483647) { *c = k2; return 1; }
+            if (ncast == 0 && k >= 0 - 2147483648 && k < 0 && k2 >= 0 - 2147483648 && k2 <= 2147483647) { *c = k2; return 1; }
         }
     }
     let is i32 as val with mut = x;
     let is i32 as j with mut = np - 1;
     while (j >= 0) {
         let is *d.IRInst as di = cast(*d.IRInst, path[j]);
-        if (di.op == d.IR_CAST) {
+        if (di.op == d.IR_CAST || di.op == d.IR_ADD || di.op == d.IR_SUB) {
             let is *d.IRInst as cc = d.clone_inst(di);
             let is i32 as nc = _newv(func);
             cc.dest = d.op_vreg(nc);
@@ -768,18 +815,161 @@ fn _is_callish(op as i32) as i32 {
     return 0;
 }
 
+// The copies the chains' addresses became (dest, src pairs): their readers
+// read the phi directly once all loops are done.
+let is *i32 as sr_cp with mut;
+let is i32 as sr_ncp with mut = 0;
+let is i32 as sr_cpcap with mut = 0;
+
+fn _note_copy(dv as i32, sv as i32) as void {
+    if (sr_ncp + 2 > sr_cpcap) {
+        let is i32 as nc with mut = sr_cpcap * 2;
+        if (nc < 64) { nc = 64; }
+        let is *i32 as nb = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is i32 as i with mut = 0;
+        while (i < sr_ncp) { nb[i] = sr_cp[i]; i = i + 1; }
+        if (sr_cpcap > 0) { d.opt_free(cast(*u8, sr_cp)); }
+        sr_cp = nb;
+        sr_cpcap = nc;
+    }
+    sr_cp[sr_ncp] = dv;
+    sr_cp[sr_ncp + 1] = sv;
+    sr_ncp = sr_ncp + 2;
+}
+
+fn _rd(o as *d.Operand, map as *i32, n as i32) as void {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= n) { return; }
+    let is i32 as hops with mut = 0;
+    while (hops < 16 && map[o.vreg] >= 0) { o.vreg = map[o.vreg]; hops = hops + 1; }
+}
+
+// Every reader of a chain's copy inside the loop reads the phi it is a copy
+// of: in the iteration that made the copy the phi has not moved yet. (After
+// the loop it has: a reader there keeps the copy.) The load and the store of
+// one array element then name the same register.
+fn _resolve_copies(func as *d.IRFunction, a as *SrA) as void {
+    if (sr_ncp == 0) { return; }
+    let is i32 as n = func.vreg_count;
+    let is *i32 as map = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as i with mut = 0;
+    while (i < n) { map[i] = 0 - 1; i = i + 1; }
+    i = 0;
+    while (i < sr_ncp) {
+        if (sr_cp[i] >= 0 && sr_cp[i] < n) { map[sr_cp[i]] = sr_cp[i + 1]; }
+        i = i + 2;
+    }
+    let is i32 as b with mut = 0;
+    while (b < a.nb) {
+        if (a.inl[b] == cast(u8, 1)) {
+        let is *cfg.BasicBlock as bb = _bb(a, b);
+        let is *d.IRInst as it with mut = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0) {
+        if (it.is_dead == 0) {
+            if (it.op == d.IR_PHI) {
+                let is i32 as k with mut = 0;
+                while (k < phi.phi_nargs(it)) {
+                    let is i32 as v with mut = phi.phi_val(it, k);
+                    let is i32 as hops with mut = 0;
+                    while (v >= 0 && v < n && hops < 16 && map[v] >= 0) { v = map[v]; hops = hops + 1; }
+                    phi.phi_set_val(it, k, v);
+                    k = k + 1;
+                }
+            } else {
+                _rd(&it.src1, map, n);
+                _rd(&it.src2, map, n);
+                if (dest_reads(it) == 1) { _rd(&it.dest, map, n); }
+            }
+        }
+        if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        }
+        b = b + 1;
+    }
+    d.opt_free(cast(*u8, map));
+    sr_ncp = 0;
+}
+
+// The instruction reads its dest operand (an address it writes through).
+fn dest_reads(it as *d.IRInst) as i32 {
+    let is i32 as op = it.op;
+    return cast(i32, op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256);
+}
+
 fn _kill(p as i64) as void {
     if (p == 0) { return; }
     let is *d.IRInst as it = cast(*d.IRInst, p);
     it.is_dead = 1;
 }
 
+// Two operands that are the same value: equal through copies, or the same
+// pure operation on operands that are (the form is SSA: one definition each).
+fn _eqv(a as *SrA, x0 as i32, y0 as i32, depth as i32) as i32 {
+    if (x0 < 0 || y0 < 0) { return cast(i32, x0 == y0); }
+    let is i32 as x = _strip(a, x0);
+    let is i32 as y = _strip(a, y0);
+    if (x == y) { return 1; }
+    if (depth > 4) { return 0; }
+    let is *d.IRInst as dx = _def(a, x);
+    let is *d.IRInst as dy = _def(a, y);
+    if (cast(i64, dx) == 0 || cast(i64, dy) == 0 || dx.op != dy.op) { return 0; }
+    let is i32 as op = dx.op;
+    if (op != d.IR_ADD && op != d.IR_SUB && op != d.IR_MUL && op != d.IR_SHL && op != d.IR_CAST
+        && op != d.IR_IMM && op != d.IR_AND && op != d.IR_OR && op != d.IR_XOR) { return 0; }
+    if (cast(i64, dx.cast_to) != cast(i64, dy.cast_to) || cast(i64, dx.cast_from) != cast(i64, dy.cast_from)) { return 0; }
+    if (_eqo(a, &dx.src1, &dy.src1, depth) == 0) { return 0; }
+    return _eqo(a, &dx.src2, &dy.src2, depth);
+}
+
+fn _eqo(a as *SrA, p as *d.Operand, q as *d.Operand, depth as i32) as i32 {
+    if (p.op_type != q.op_type) { return 0; }
+    if (p.op_type == d.OP_NONE) { return 1; }
+    if (p.op_type == d.OP_IMM) { return cast(i32, p.imm == q.imm); }
+    if (p.op_type == d.OP_VREG) { return _eqv(a, p.vreg, q.vreg, depth + 1); }
+    return 0;
+}
+
+fn _same_v(a as *SrA, x as i32, y as i32) as i32 { return _eqv(a, x, y, 0); }
+
+// An earlier chain of the loop that computes the same address (the same
+// array element written and read back): its phi, or -1.
+fn _twin(a as *SrA, l as *SrL, ci as i32) as i32 {
+    let is i32 as cj with mut = 0;
+    while (cj < ci) {
+        if (l.ch_iv[cj] == l.ch_iv[ci] && l.ch_kind[cj] == l.ch_kind[ci]
+            && l.ch_shift[cj] == l.ch_shift[ci] && l.ch_stride[cj] == l.ch_stride[ci]
+            && l.ch_mulk[cj] == l.ch_mulk[ci]
+            && _same_v(a, l.ch_base[cj], l.ch_base[ci]) == 1
+            && _same_v(a, l.ch_other[cj], l.ch_other[ci]) == 1
+            && _same_v(a, l.ch_z[cj], l.ch_z[ci]) == 1
+            && _same_v(a, l.ch_w[cj], l.ch_w[ci]) == 1) {
+            return l.ch_accp[cj];
+        }
+        cj = cj + 1;
+    }
+    return 0 - 1;
+}
+
 // Rewrite chain ci: its value on the first iteration in the preheader, a
-// header phi stepping it, the address a copy of the phi.
-fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.IRInst) as void {
+// header phi stepping it, the address a copy of the phi. Returns 1 when a phi
+// was put after phi_at, 0 when the chain reuses the phi of a twin.
+fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.IRInst) as i32 {
     let is i32 as iv = l.ch_iv[ci];
     let is i32 as kind = l.ch_kind[ci];
     let is *d.IRInst as e = cast(*d.IRInst, l.ch_end[ci]);
+    let is i32 as tw = _twin(a, l, ci);
+    if (tw >= 0) {
+        e.op = d.IR_MOV;
+        e.src1 = d.op_vreg(tw);
+        e.src2 = d.op_none();
+        if (e.dest.op_type == d.OP_VREG) { _note_copy(e.dest.vreg, tw); }
+        _kill(l.ch_dead1[ci]);
+        _kill(l.ch_dead2[ci]);
+        _kill(l.ch_dead3[ci]);
+        l.ch_accp[ci] = tw;
+        return 0;
+    }
     let is i64 as step = l.iv_step[iv];
     let is i32 as bm = _mat(func, a, l, l.ch_base[ci]);
     let is i64 as c0 with mut = 0;
@@ -805,9 +995,15 @@ fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.
         inc = step * stride;
     } else if (kind == K_FULL) {
         let is i32 as om = _mat(func, a, l, l.ch_other[ci]);
+        let is i64 as mk = l.ch_mulk[ci];
         let is i32 as t0 with mut = 0 - 1;
-        if (isc == 1) { t0 = _emit_add_imm(func, l, om, c0); }
-        else { t0 = _emit(func, l, d.IR_ADD, d.op_vreg(om), d.op_vreg(v0)); }
+        if (isc == 1 && (mk == 1 || _fits32(c0 * mk) == 1)) { t0 = _emit_add_imm(func, l, om, c0 * mk); }
+        else {
+            if (isc == 1) { v0 = _emit(func, l, d.IR_IMM, d.op_imm(c0), d.op_none()); }
+            let is i32 as xv with mut = v0;
+            if (mk != 1) { xv = _emit(func, l, d.IR_MUL, d.op_vreg(v0), d.op_imm(mk)); }
+            t0 = _emit(func, l, d.IR_ADD, d.op_vreg(om), d.op_vreg(xv));
+        }
         let is i32 as t1 = _emit(func, l, d.IR_SHL, d.op_vreg(t0), d.op_imm(l.ch_shift[ci]));
         acc0 = _emit(func, l, d.IR_ADD, d.op_vreg(bm), d.op_vreg(t1));
         inc = step * l.ch_stride[ci];
@@ -855,9 +1051,12 @@ fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.
     e.op = d.IR_MOV;
     e.src1 = d.op_vreg(accp);
     e.src2 = d.op_none();
+    if (e.dest.op_type == d.OP_VREG) { _note_copy(e.dest.vreg, accp); }
     _kill(l.ch_dead1[ci]);
     _kill(l.ch_dead2[ci]);
     _kill(l.ch_dead3[ci]);
+    l.ch_accp[ci] = accp;
+    return 1;
 }
 
 // Reduce the chains of the loop headed by the block labelled hl. Returns 1
@@ -987,11 +1186,11 @@ fn _do_loop(func as *d.IRFunction, a as *SrA, hl as i32) as i32 {
 
     let is i32 as ci with mut = 0;
     while (ci < l.nch) {
-        _reduce(func, a, l, ci, phi_at);
         // the next phi goes after the one just made
-        phi_at = phi_at.next;
+        if (_reduce(func, a, l, ci, phi_at) == 1) { phi_at = phi_at.next; }
         ci = ci + 1;
     }
+    _resolve_copies(func, a);
     d.opt_free(cast(*u8, l.latch_label));
     return 1;
 }

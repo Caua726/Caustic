@@ -1,0 +1,469 @@
+use "defs.cst" as d;
+use "../parser/ast.cst" as ast;
+
+// === Small local arrays and structs into scalar slots ===
+//
+// -O2, on the IR after the SSA form ends. A local whose address is taken
+// (IR_ADDR &[rbp-N]) is a frame object mem2reg leaves in memory. When every
+// use of that address is a load or a store at a constant offset from it,
+//
+//     ADDR a = &[rbp-N] ; ADD p = a, 12 ; LOAD x = [p]   ->   LOAD x = [rbp-(N-12)]
+//
+// each element is a slot of its own, read and written like a scalar local, and
+// the next round of the optimizer (ssa.build) promotes it to a register. That
+// is the state after a loop over the array was unrolled (opt_unroll), or a
+// function taking the array's address was inlined.
+//
+// The address may pass through copies, pointer casts, and additions of a
+// constant (ADD with an immediate or a vreg holding one; LEA2/4/8 with a
+// constant index), each a vreg defined once. Any other use of it (passed to a
+// call, stored, compared, returned, an index that is not constant) keeps the
+// object in memory. So do accesses that disagree: the same offset read with
+// two sizes or types, or two offsets whose bytes overlap. The rewritten slots
+// must not overlap a scalar slot the function already has, nor contain another
+// object's address.
+//
+// A block copy into or out of the object (a struct passed or returned by
+// value, or assigned whole) is split into one load and one store per field:
+// the fields are the object's own accesses, the bytes no access names go in
+// 8/4/2/1-byte pieces. The other side keeps its memory, read or written
+// through its address.
+
+let is i32 as SR_MAXACC with imut = 512;
+let is i32 as SR_MAXDER with imut = 1024;
+let is i32 as SR_MAXCP with imut = 16;      // block copies of one object
+let is i32 as SR_MAXCOPY with imut = 64;    // bytes in one of them
+let is i32 as SR_MAXPC with imut = 64;      // pieces they split into
+
+let is [16]i64 as sr_cp with mut;           // the copies
+let is [16]i64 as sr_cpo with mut;          // offset of the copied bytes in the object
+let is [16]i32 as sr_cps with mut;          // 1: the object is the destination
+let is [16]i64 as sr_tl with mut;           // the last instruction put in for it
+let is [64]i64 as sr_po with mut;           // pieces: offset in the object
+let is [64]i64 as sr_pt with mut;           // pieces: type
+let is [64]i32 as sr_pc with mut;           // pieces: which copy
+
+fn _sr_get(a as *i64, i as i32) as i64 { return *(cast(*i64, cast(i64, a) + cast(i64, i) * 8)); }
+fn _sr_put(a as *i64, i as i32, v as i64) as void { let is *i64 as p = cast(*i64, cast(i64, a) + cast(i64, i) * 8); *p = v; }
+fn _sr_geti(a as *i32, i as i32) as i32 { return *(cast(*i32, cast(i64, a) + cast(i64, i) * 4)); }
+fn _sr_puti(a as *i32, i as i32, v as i32) as void { let is *i32 as p = cast(*i32, cast(i64, a) + cast(i64, i) * 4); *p = v; }
+
+fn _sr_size(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    if (k == 1 || k == 5 || k == 11 || k == 12) { return 1; }
+    if (k == 2 || k == 6) { return 2; }
+    if (k == 3 || k == 7 || k == 9) { return 4; }
+    if (k == 4 || k == 8 || k == 10 || k == 14) { return 8; }
+    return 0;
+}
+
+fn _sr_kind(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    return *cast(*i32, t);
+}
+
+// Per function: definitions and their count, per vreg.
+let is *i64 as sr_def with mut = cast(*i64, 0);
+let is *i32 as sr_ndef with mut = cast(*i32, 0);
+let is i32 as sr_vc with mut = 0;
+
+// The constant a vreg holds (IMM, through copies), into *out.
+fn _sr_const(v as i32, out as *i64) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as guard with mut = 0;
+    while (guard < 16) {
+        if (cur < 0 || cur >= sr_vc || _sr_geti(sr_ndef, cur) != 1) { return 0; }
+        let is *d.IRInst as di = cast(*d.IRInst, _sr_get(sr_def, cur));
+        if (di.op == d.IR_IMM && di.src1.op_type == d.OP_IMM) { *out = di.src1.imm; return 1; }
+        if (di.op != d.IR_MOV || di.src1.op_type != d.OP_VREG) { return 0; }
+        cur = di.src1.vreg;
+        guard = guard + 1;
+    }
+    return 0;
+}
+
+fn _sr_opconst(o as *d.Operand, out as *i64) as i32 {
+    if (o.op_type == d.OP_IMM) { *out = o.imm; return 1; }
+    if (o.op_type == d.OP_VREG) { return _sr_const(o.vreg, out); }
+    return 0;
+}
+
+// Ops whose dest operand is read, not written.
+fn _sr_dest_read(op as i32) as i32 {
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
+        || op == d.IR_CMOV || op == d.IR_COPY) { return 1; }
+    return 0;
+}
+
+fn _sr_addr_op(kind as i32) as i32 {
+    if (kind == 1) { return d.IR_GET_ALLOC_ADDR; }
+    return d.IR_ADDR;
+}
+
+// Try one frame object, the one at frame offset `off` (kind 0), or the one of
+// the alloca area at `off` (kind 1: a call's result, a struct literal). Returns 1 when its
+// accesses were rewritten.
+fn _sr_object(func as *d.IRFunction, kind as i32, off as i64, der as *i32, dlt as *i64, acc as *i64, aoff as *i64) as i32 {
+    let is i32 as nder with mut = 0;
+    // the object's addresses: every live ADDR of it, delta 0
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.op == _sr_addr_op(kind) && w.src1.op_type == d.OP_IMM && w.src1.imm == off) {
+            if (w.dest.op_type != d.OP_VREG || w.dest.vreg < 0 || w.dest.vreg >= sr_vc) { return 0; }
+            if (_sr_geti(sr_ndef, w.dest.vreg) != 1) { return 0; }
+            if (nder >= SR_MAXDER) { return 0; }
+            _sr_puti(der, nder, w.dest.vreg); _sr_put(dlt, nder, 0);
+            nder = nder + 1;
+        }
+        w = w.next;
+    }
+    if (nder == 0) { return 0; }
+    // follow the addresses to their uses (a fixpoint over the list: a use may
+    // come before the definition it reads in list order, across a back edge)
+    let is i32 as nacc with mut = 0;
+    let is i32 as ncp with mut = 0;
+    let is i32 as chg with mut = 1;
+    let is i32 as rounds with mut = 0;
+    while (chg == 1 && rounds < 8) {
+        chg = 0; rounds = rounds + 1;
+        nacc = 0;
+        ncp = 0;
+        w = func.instructions;
+        while (cast(i64, w) != 0) {
+            if (w.is_dead == 0) {
+                let is i32 as k with mut = 0;
+                while (k < nder) {
+                    let is i32 as v = _sr_geti(der, k);
+                    let is i64 as dv = _sr_get(dlt, k);
+                    let is i32 as r1 = cast(i32, w.src1.op_type == d.OP_VREG && w.src1.vreg == v);
+                    let is i32 as r2 = cast(i32, w.src2.op_type == d.OP_VREG && w.src2.vreg == v);
+                    let is i32 as rd = cast(i32, w.dest.op_type == d.OP_VREG && w.dest.vreg == v && _sr_dest_read(w.op) == 1);
+                    if (r1 == 1 || r2 == 1 || rd == 1) {
+                        let is i32 as op = w.op;
+                        if (op == d.IR_LOAD && r1 == 1 && r2 == 0) {
+                            if (nacc >= SR_MAXACC) { return 0; }
+                            _sr_put(acc, nacc, cast(i64, w)); _sr_put(aoff, nacc, dv);
+                            nacc = nacc + 1;
+                        } else if (op == d.IR_STORE && rd == 1 && r1 == 0 && r2 == 0) {
+                            if (nacc >= SR_MAXACC) { return 0; }
+                            _sr_put(acc, nacc, cast(i64, w)); _sr_put(aoff, nacc, dv);
+                            nacc = nacc + 1;
+                        } else if ((op == d.IR_MOV || op == d.IR_CAST || op == d.IR_ADD || op == d.IR_LEA2
+                                    || op == d.IR_LEA4 || op == d.IR_LEA8) && rd == 0
+                                   && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < sr_vc) {
+                            if (_sr_geti(sr_ndef, w.dest.vreg) != 1) { return 0; }
+                            if (op == d.IR_CAST && (_sr_kind(w.cast_to) != 14 || _sr_kind(w.cast_from) != 14)) { return 0; }
+                            let is i64 as nd with mut = dv;
+                            if (op == d.IR_ADD) {
+                                let is i64 as c with mut = 0;
+                                if (r1 == 1 && r2 == 0 && _sr_opconst(&w.src2, &c) == 1) { nd = dv + c; }
+                                else if (r2 == 1 && r1 == 0 && _sr_opconst(&w.src1, &c) == 1) { nd = dv + c; }
+                                else { return 0; }
+                            } else if (op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) {
+                                let is i64 as c with mut = 0;
+                                if (r1 == 0 || r2 == 1) { return 0; }
+                                if (_sr_opconst(&w.src2, &c) == 0) { return 0; }
+                                let is i64 as sc with mut = 8;
+                                if (op == d.IR_LEA2) { sc = 2; } else if (op == d.IR_LEA4) { sc = 4; }
+                                nd = dv + c * sc;
+                            } else if (r1 == 0 || r2 == 1) { return 0; }
+                            // known already?
+                            let is i32 as j with mut = 0;
+                            let is i32 as seen with mut = 0;
+                            while (j < nder) {
+                                if (_sr_geti(der, j) == w.dest.vreg) {
+                                    seen = 1;
+                                    if (_sr_get(dlt, j) != nd) { return 0; }
+                                }
+                                j = j + 1;
+                            }
+                            if (seen == 0) {
+                                if (nder >= SR_MAXDER) { return 0; }
+                                _sr_puti(der, nder, w.dest.vreg); _sr_put(dlt, nder, nd);
+                                nder = nder + 1;
+                                chg = 1;
+                            }
+                        } else if (op == d.IR_COPY && r2 == 0 && r1 != rd && w.src2.op_type == d.OP_IMM
+                                   && w.src2.imm > 0 && w.src2.imm <= cast(i64, SR_MAXCOPY)
+                                   && w.src1.op_type == d.OP_VREG && w.dest.op_type == d.OP_VREG) {
+                            if (ncp >= SR_MAXCP) { return 0; }
+                            let is i32 as c with mut = 0;
+                            while (c < ncp) {
+                                // both sides in the object
+                                if (sr_cp[c] == cast(i64, w)) { return 0; }
+                                c = c + 1;
+                            }
+                            sr_cp[ncp] = cast(i64, w);
+                            sr_cpo[ncp] = dv;
+                            sr_cps[ncp] = rd;
+                            ncp = ncp + 1;
+                        } else {
+                            return 0;   // escapes
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+            w = w.next;
+        }
+    }
+    if (chg == 1 || (nacc == 0 && ncp == 0)) { return 0; }
+
+    let is i32 as nvia = nacc;   // the accesses through the address (to rewrite)
+    // the bytes they cover, from the object's address: [lo, hi)
+    let is i32 as a with mut = 0;
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = 0;
+    while (a < nacc) {
+        let is *d.IRInst as ia = cast(*d.IRInst, _sr_get(acc, a));
+        let is i64 as oa = _sr_get(aoff, a);
+        let is i32 as sa = _sr_size(ia.cast_to);
+        if (sa == 0 || oa < 0) { return 0; }
+        if (a == 0 || oa < lo) { lo = oa; }
+        if (a == 0 || oa + cast(i64, sa) > hi) { hi = oa + cast(i64, sa); }
+        a = a + 1;
+    }
+    a = 0;
+    while (a < ncp) {
+        let is i64 as oc = sr_cpo[a];
+        let is i64 as nc = cast(*d.IRInst, sr_cp[a]).src2.imm;
+        if (oc < 0) { return 0; }
+        if ((nacc == 0 && a == 0) || oc < lo) { lo = oc; }
+        if ((nacc == 0 && a == 0) || oc + nc > hi) { hi = oc + nc; }
+        a = a + 1;
+    }
+    if (kind == 0 && off - hi < 0) { return 0; }
+    // a slot read or written directly that lies in those bytes is one more
+    // access (an element named at a constant index); another object's address
+    // in them keeps the object in memory
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            let is i64 as so with mut = 0 - 1;
+            let is i32 as ss with mut = 1;
+            if (kind == 0) {
+                if (w.op == d.IR_LOAD && w.src1.op_type == d.OP_IMM) { so = w.src1.imm; ss = _sr_size(w.cast_to); }
+                if (w.op == d.IR_STORE && w.dest.op_type == d.OP_IMM) { so = w.dest.imm; ss = _sr_size(w.cast_to); }
+            }
+            if (w.op == _sr_addr_op(kind) && w.src1.op_type == d.OP_IMM && w.src1.imm != off) { so = w.src1.imm; ss = 1; }
+            if (w.op == d.IR_COPY || w.op == d.IR_ATOMIC_LOAD || w.op == d.IR_ATOMIC_STORE) {
+                if (w.src1.op_type == d.OP_IMM || w.dest.op_type == d.OP_IMM) { return 0; }
+            }
+            // slot so covers [-so, -so + ss) from rbp; the bytes [-off + lo, -off + hi)
+            let is i32 as sw with mut = ss;
+            if (sw <= 0) { sw = 8; }
+            if (so >= 0 && 0 - so < 0 - off + hi && 0 - off + lo < 0 - so + cast(i64, sw)) {
+                if (w.op == d.IR_ADDR || w.op == d.IR_GET_ALLOC_ADDR || ss <= 0) { return 0; }
+                if (nacc >= SR_MAXACC) { return 0; }
+                _sr_put(acc, nacc, cast(i64, w)); _sr_put(aoff, nacc, off - so);
+                nacc = nacc + 1;
+            }
+        }
+        w = w.next;
+    }
+    // the accesses agree: one size and type per offset, no partial overlap
+    a = 0;
+    while (a < nacc) {
+        let is *d.IRInst as ia = cast(*d.IRInst, _sr_get(acc, a));
+        let is i64 as oa = _sr_get(aoff, a);
+        let is i32 as sa = _sr_size(ia.cast_to);
+        if (sa == 0 || oa < 0) { return 0; }
+        let is i32 as b with mut = a + 1;
+        while (b < nacc) {
+            let is *d.IRInst as ib = cast(*d.IRInst, _sr_get(acc, b));
+            let is i64 as ob = _sr_get(aoff, b);
+            let is i32 as sb = _sr_size(ib.cast_to);
+            if (ob == oa) {
+                if (sb != sa || _sr_kind(ib.cast_to) != _sr_kind(ia.cast_to)) { return 0; }
+            } else if (ob < oa + cast(i64, sa) && oa < ob + cast(i64, sb)) { return 0; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    // the copies, split by those accesses
+    let is i32 as npc with mut = 0;
+    let is i32 as c with mut = 0;
+    while (c < ncp) {
+        let is i64 as pos with mut = sr_cpo[c];
+        let is i64 as end = pos + cast(*d.IRInst, sr_cp[c]).src2.imm;
+        while (pos < end) {
+            if (npc >= SR_MAXPC) { return 0; }
+            let is i64 as psz with mut = 0;
+            let is *u8 as pty with mut = cast(*u8, 0);
+            a = 0;
+            while (a < nacc) {
+                let is *d.IRInst as ia = cast(*d.IRInst, _sr_get(acc, a));
+                let is i64 as oa = _sr_get(aoff, a);
+                let is i64 as sa = cast(i64, _sr_size(ia.cast_to));
+                if (oa == pos) { psz = sa; pty = ia.cast_to; }
+                else if (oa < pos && pos < oa + sa) { return 0; }
+                a = a + 1;
+            }
+            if (psz == 0) {
+                // the widest piece no access overlaps
+                psz = 8;
+                while (psz > 1 && pos + psz > end) { psz = psz / 2; }
+                a = 0;
+                while (a < nacc) {
+                    let is i64 as oa = _sr_get(aoff, a);
+                    while (psz > 1 && oa > pos && oa < pos + psz) { psz = psz / 2; }
+                    a = a + 1;
+                }
+                pty = cast(*u8, ast.type_u8);
+                if (psz == 8) { pty = cast(*u8, ast.type_i64); }
+                else if (psz == 4) { pty = cast(*u8, ast.type_i32); }
+                else if (psz == 2) { pty = cast(*u8, ast.type_i16); }
+            }
+            if (pos + psz > end) { return 0; }
+            sr_po[npc] = pos; sr_pt[npc] = cast(i64, pty); sr_pc[npc] = c;
+            npc = npc + 1;
+            pos = pos + psz;
+        }
+        c = c + 1;
+    }
+    // pieces of two copies agree
+    a = 0;
+    while (a < npc) {
+        let is i64 as oa = sr_po[a];
+        let is i64 as sa = cast(i64, _sr_size(cast(*u8, sr_pt[a])));
+        let is i32 as b with mut = a + 1;
+        while (b < npc) {
+            let is i64 as ob = sr_po[b];
+            let is i64 as sb = cast(i64, _sr_size(cast(*u8, sr_pt[b])));
+            if (ob == oa) {
+                if (sb != sa || _sr_kind(cast(*u8, sr_pt[b])) != _sr_kind(cast(*u8, sr_pt[a]))) { return 0; }
+            } else if (ob < oa + sa && oa < ob + sb) { return 0; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    // rewrite: each access through the address reads or writes its slot, the
+    // addresses go. An object of the alloca area gets slots of its own past
+    // the frame's.
+    let is i64 as base with mut = off;
+    if (kind == 1) {
+        base = ((cast(i64, func.stack_size) + hi + 15) / 16) * 16;
+        func.stack_size = cast(i32, base);
+    }
+    a = 0;
+    while (a < nvia) {
+        let is *d.IRInst as ia = cast(*d.IRInst, _sr_get(acc, a));
+        let is i64 as slot = base - _sr_get(aoff, a);
+        if (ia.op == d.IR_LOAD) { ia.src1 = d.op_imm(slot); }
+        else { ia.dest = d.op_imm(slot); }
+        a = a + 1;
+    }
+    // each copy: a load and a store per piece, after it; the copy goes
+    c = 0;
+    while (c < ncp) { sr_tl[c] = sr_cp[c]; c = c + 1; }
+    a = 0;
+    while (a < npc) {
+        let is *d.IRInst as cp = cast(*d.IRInst, sr_cp[sr_pc[a]]);
+        let is i32 as into = sr_cps[sr_pc[a]];
+        let is i64 as rel = sr_po[a] - sr_cpo[sr_pc[a]];
+        let is *u8 as ty = cast(*u8, sr_pt[a]);
+        // the last instruction this copy has put in so far
+        let is *d.IRInst as tail = cast(*d.IRInst, sr_tl[sr_pc[a]]);
+        let is d.Operand as other with mut = cp.src1;
+        if (into == 0) { other = cp.dest; }
+        let is d.Operand as addr with mut = other;
+        let is *d.IRInst as ad with mut = cast(*d.IRInst, 0);
+        if (rel != 0) {
+            ad = d.new_inst(d.IR_ADD);
+            ad.dest = d.op_vreg(func.vreg_count);
+            func.vreg_count = func.vreg_count + 1;
+            ad.src1 = other;
+            ad.src2 = d.op_imm(rel);
+            ad.line = cp.line;
+            addr = ad.dest;
+        }
+        let is i32 as t = func.vreg_count;
+        func.vreg_count = func.vreg_count + 1;
+        let is *d.IRInst as ld = d.new_inst(d.IR_LOAD);
+        ld.dest = d.op_vreg(t);
+        ld.cast_to = ty;
+        ld.line = cp.line;
+        let is *d.IRInst as st = d.new_inst(d.IR_STORE);
+        st.src1 = d.op_vreg(t);
+        st.cast_to = ty;
+        st.line = cp.line;
+        if (into == 1) { ld.src1 = addr; st.dest = d.op_imm(base - sr_po[a]); }
+        else { ld.src1 = d.op_imm(base - sr_po[a]); st.dest = addr; }
+        let is *d.IRInst as first with mut = ld;
+        if (cast(i64, ad) != 0) { ad.next = ld; first = ad; }
+        ld.next = st;
+        st.next = tail.next;
+        tail.next = first;
+        sr_tl[sr_pc[a]] = cast(i64, st);
+        cp.is_dead = 1;
+        a = a + 1;
+    }
+    let is i32 as k with mut = 0;
+    while (k < nder) {
+        let is i32 as v = _sr_geti(der, k);
+        let is *d.IRInst as di = cast(*d.IRInst, _sr_get(sr_def, v));
+        di.is_dead = 1;
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn pass_sroa(func as *d.IRFunction) as i32 {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return 0; }
+    // any address of a frame object at all?
+    let is i32 as nobj with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && (w.op == d.IR_ADDR || w.op == d.IR_GET_ALLOC_ADDR) && w.src1.op_type == d.OP_IMM) { nobj = nobj + 1; }
+        // inline asm may name any slot
+        if (w.is_dead == 0 && w.op == d.IR_ASM) { return 0; }
+        w = w.next;
+    }
+    if (nobj == 0) { return 0; }
+    sr_vc = vc;
+    sr_def = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    sr_ndef = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { _sr_put(sr_def, i, 0); _sr_puti(sr_ndef, i, 0); i = i + 1; }
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc
+            && _sr_dest_read(w.op) == 0) {
+            _sr_puti(sr_ndef, w.dest.vreg, _sr_geti(sr_ndef, w.dest.vreg) + 1);
+            _sr_put(sr_def, w.dest.vreg, cast(i64, w));
+        }
+        w = w.next;
+    }
+    let is *i32 as der = cast(*i32, d.opt_alloc(cast(i64, SR_MAXDER) * 4));
+    let is *i64 as dlt = cast(*i64, d.opt_alloc(cast(i64, SR_MAXDER) * 8));
+    let is *i64 as acc = cast(*i64, d.opt_alloc(cast(i64, SR_MAXACC) * 8));
+    let is *i64 as aoff = cast(*i64, d.opt_alloc(cast(i64, SR_MAXACC) * 8));
+    // each object once, in order of its first address
+    let is *i64 as done = cast(*i64, d.opt_alloc(cast(i64, nobj) * 8));
+    let is i32 as nd with mut = 0;
+    let is i32 as any with mut = 0;
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && (w.op == d.IR_ADDR || w.op == d.IR_GET_ALLOC_ADDR) && w.src1.op_type == d.OP_IMM) {
+            let is i64 as off = w.src1.imm;
+            let is i32 as kind with mut = 0;
+            if (w.op == d.IR_GET_ALLOC_ADDR) { kind = 1; }
+            let is i64 as key = off * 2 + cast(i64, kind);
+            let is i32 as j with mut = 0;
+            let is i32 as seen with mut = 0;
+            while (j < nd) { if (_sr_get(done, j) == key) { seen = 1; } j = j + 1; }
+            if (seen == 0 && nd < nobj) {
+                _sr_put(done, nd, key); nd = nd + 1;
+                if (_sr_object(func, kind, off, der, dlt, acc, aoff) == 1) { any = 1; }
+            }
+        }
+        w = w.next;
+    }
+    d.opt_free(cast(*u8, done));
+    d.opt_free(cast(*u8, aoff)); d.opt_free(cast(*u8, acc));
+    d.opt_free(cast(*u8, dlt)); d.opt_free(cast(*u8, der));
+    d.opt_free(cast(*u8, sr_ndef)); d.opt_free(cast(*u8, sr_def));
+    return any;
+}

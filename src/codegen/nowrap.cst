@@ -1,0 +1,540 @@
+use "../ir/defs.cst" as d;
+use "emit.cst" as e;
+
+// === i32 additions that cannot wrap ===
+//
+// -O2 only. An i32 ADD or SUB is computed on the 64-bit registers and then
+// sign-extended from its low 32 bits (e.emit_narrow_truncate), so that a
+// result that wrapped reads as the i32 it is. In
+//
+//     while (i < n) { ... a[i + 1] ...; i = i + 1; }
+//
+// i < n <= INT_MAX holds at both additions, so i + 1 never leaves the i32
+// range: when i itself is sign-extended (e.sx32_is), the 64-bit sum already is
+// the sign-extended result and the `movsxd` after each one changes nothing.
+//
+// Which additions those are comes from an interval analysis over the live
+// instructions: for up to NW_SLOTS i32 values (the operands of the candidate
+// additions, the values they are computed from and what they are compared
+// with) a range [lo, hi] at the start of each block, met over the edges that
+// reach it. A definition sets the range of its dest (a constant, a copy, a
+// sum or difference, a cast from a narrower integer, an AND with a
+// non-negative mask; anything else gives the whole i32 range); a conditional
+// branch on a compare narrows both operands on each of its two edges. Ranges
+// that keep growing round a loop are widened to the i32 bounds after the
+// second change, to the next of the constants the function compares with
+// (and one either side of each), or to the i32 bounds, so that a loop whose
+// test caps its variable keeps that cap.
+// A candidate whose exact result range, from its operands' ranges where it
+// is, lies inside the i32 range in every reachable block is recorded; the
+// value it computes is then the exact sum.
+
+let is i64 as NW_MIN with imut = 0 - 2147483648;
+let is i64 as NW_MAX with imut = 2147483647;
+// an operand known to be no i32 (an i64 compared whole): far outside
+let is i64 as NW_BIG with imut = 1099511627776;
+let is i32 as NW_SLOTS with imut = 64;
+
+// the recorded instructions: an open-addressed set of pointers
+let is *i64 as nw_set with mut = cast(*i64, 0);
+let is i32 as nw_cap with mut = 0;
+
+fn _nw_hash(key as i64, mask as i32) as i32 {
+    let is i64 as h = (key >> 4) * 2654435761;
+    return cast(i32, h & cast(i64, mask));
+}
+
+fn nw_has(inst as *d.IRInst) as i32 {
+    if (nw_cap == 0) { return 0; }
+    let is i64 as key = cast(i64, inst);
+    let is i32 as h with mut = _nw_hash(key, nw_cap - 1);
+    while (nw_set[h] != 0) {
+        if (nw_set[h] == key) { return 1; }
+        h = (h + 1) & (nw_cap - 1);
+    }
+    return 0;
+}
+
+fn _nw_add(inst as *d.IRInst) as void {
+    let is i64 as key = cast(i64, inst);
+    let is i32 as h with mut = _nw_hash(key, nw_cap - 1);
+    while (nw_set[h] != 0) {
+        if (nw_set[h] == key) { return; }
+        h = (h + 1) & (nw_cap - 1);
+    }
+    nw_set[h] = key;
+}
+
+fn nw_reset() as void {
+    if (cast(i64, nw_set) != 0) { d.opt_free(cast(*u8, nw_set)); }
+    nw_set = cast(*i64, 0);
+    nw_cap = 0;
+}
+
+fn _nw_i32s(t as *u8) as i32 {
+    if (cast(i64, t) == 0 || e.is_float_type(t) == 1) { return 0; }
+    if (e.get_type_size(t) != 4 || e.is_signed_type(t) != 1) { return 0; }
+    return 1;
+}
+
+fn _nw_is_cmp(op as i32) as i32 {
+    if (op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE || op == d.IR_EQ || op == d.IR_NE) { return 1; }
+    return 0;
+}
+
+// A sign-extended i32 vreg operand, or a constant in the i32 range.
+fn _nw_opd_ok(o as *d.Operand) as i32 {
+    if (o.op_type == d.OP_IMM) { return cast(i32, o.imm >= NW_MIN && o.imm <= NW_MAX); }
+    if (o.op_type == d.OP_VREG) { return e.sx32_is(o.vreg); }
+    return 0;
+}
+
+// An i32 ADD or SUB that is extended after it.
+fn _nw_candidate(inst as *d.IRInst) as i32 {
+    if (inst.op != d.IR_ADD && inst.op != d.IR_SUB) { return 0; }
+    if (inst.dest.op_type != d.OP_VREG || inst.src1.op_type != d.OP_VREG) { return 0; }
+    if (_nw_i32s(inst.cast_to) == 0 || e.lz_lazy_inst(inst) == 1) { return 0; }
+    if (_nw_opd_ok(&inst.src1) == 0 || _nw_opd_ok(&inst.src2) == 0) { return 0; }
+    return 1;
+}
+
+// Does this instruction write its dest operand?
+fn _nw_writes(inst as *d.IRInst) as i32 {
+    if (inst.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = inst.op;
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256 || op == d.IR_COPY) { return 0; }
+    return 1;
+}
+
+// analysis state
+let is *i32 as nw_slot with mut = cast(*i32, 0);   // vreg -> slot, -1
+let is i32 as nw_vc with mut = 0;
+let is i32 as nw_nt with mut = 0;
+let is *i64 as nw_lo with mut = cast(*i64, 0);     // current state
+let is *i64 as nw_hi with mut = cast(*i64, 0);
+let is i32 as nw_mark with mut = 0;
+// widening thresholds, ascending
+let is [64]i64 as nw_thr;
+let is i32 as nw_nthr with mut = 0;
+
+fn _nw_thr_add(v as i64) as void {
+    if (v < NW_MIN || v > NW_MAX) { return; }
+    let is i32 as k with mut = 0;
+    while (k < nw_nthr) { if (nw_thr[k] == v) { return; } k = k + 1; }
+    if (nw_nthr >= 64) { return; }
+    // insert sorted
+    let is i32 as p with mut = nw_nthr;
+    while (p > 0 && nw_thr[p - 1] > v) { nw_thr[p] = nw_thr[p - 1]; p = p - 1; }
+    nw_thr[p] = v;
+    nw_nthr = nw_nthr + 1;
+}
+
+fn _nw_widen_hi(v as i64) as i64 {
+    let is i32 as k with mut = 0;
+    while (k < nw_nthr) { if (nw_thr[k] >= v) { return nw_thr[k]; } k = k + 1; }
+    return NW_MAX;
+}
+
+fn _nw_widen_lo(v as i64) as i64 {
+    let is i32 as k with mut = nw_nthr - 1;
+    while (k >= 0) { if (nw_thr[k] <= v) { return nw_thr[k]; } k = k - 1; }
+    return NW_MIN;
+}
+
+fn _nw_slot_of(v as i32) as i32 {
+    if (v < 0 || v >= nw_vc) { return 0 - 1; }
+    return nw_slot[v];
+}
+
+fn _nw_track(v as i32) as i32 {
+    if (v < 0 || v >= nw_vc || nw_slot[v] >= 0) { return 0; }
+    if (nw_nt >= NW_SLOTS || e.sx32_is(v) == 0) { return 0; }
+    nw_slot[v] = nw_nt;
+    nw_nt = nw_nt + 1;
+    return 1;
+}
+
+// The range of an operand where the current state holds; `wide` (an i64
+// compare) gives an untracked vreg that is no known i32 the far range.
+let is i64 as or_lo with mut = 0;
+let is i64 as or_hi with mut = 0;
+
+fn _nw_opd(o as *d.Operand, wide as i32) as void {
+    if (o.op_type == d.OP_IMM) { or_lo = o.imm; or_hi = o.imm; return; }
+    if (o.op_type == d.OP_VREG) {
+        let is i32 as s = _nw_slot_of(o.vreg);
+        if (s >= 0) { or_lo = nw_lo[s]; or_hi = nw_hi[s]; return; }
+        if (wide == 0 || e.sx32_is(o.vreg) == 1) { or_lo = NW_MIN; or_hi = NW_MAX; return; }
+    }
+    or_lo = 0 - NW_BIG; or_hi = NW_BIG;
+}
+
+fn _nw_int_range(t as *u8) as i32 {
+    // 1: or_lo/or_hi set to the values of narrow type t; 0: not narrow
+    if (cast(i64, t) == 0 || e.is_float_type(t) == 1) { return 0; }
+    let is i32 as sz = e.get_type_size(t);
+    let is i32 as sg = e.is_signed_type(t);
+    if (sz == 1 && sg == 1) { or_lo = 0 - 128; or_hi = 127; return 1; }
+    if (sz == 1) { or_lo = 0; or_hi = 255; return 1; }
+    if (sz == 2 && sg == 1) { or_lo = 0 - 32768; or_hi = 32767; return 1; }
+    if (sz == 2) { or_lo = 0; or_hi = 65535; return 1; }
+    return 0;
+}
+
+// Apply one instruction to the current state.
+fn _nw_step(inst as *d.IRInst) as void {
+    let is i32 as op = inst.op;
+    let is i32 as cand = cast(i32, nw_mark == 1 && _nw_candidate(inst) == 1);
+    if (_nw_writes(inst) == 0) { return; }
+    let is i32 as s = _nw_slot_of(inst.dest.vreg);
+    if (s < 0 && cand == 0) { return; }
+    let is i64 as lo with mut = NW_MIN;
+    let is i64 as hi with mut = NW_MAX;
+    if (op == d.IR_IMM && inst.src1.op_type == d.OP_IMM) {
+        lo = inst.src1.imm; hi = inst.src1.imm;
+    } else if (op == d.IR_MOV && (inst.src1.op_type == d.OP_VREG || inst.src1.op_type == d.OP_IMM)) {
+        _nw_opd(&inst.src1, 0);
+        lo = or_lo; hi = or_hi;
+    } else if (op == d.IR_CAST && inst.src1.op_type == d.OP_VREG && _nw_i32s(inst.cast_to) == 1) {
+        if (_nw_i32s(inst.cast_from) == 1) {
+            _nw_opd(&inst.src1, 0);
+            lo = or_lo; hi = or_hi;
+        } else if (_nw_int_range(inst.cast_from) == 1) {
+            lo = or_lo; hi = or_hi;
+        }
+    } else if ((op == d.IR_ADD || op == d.IR_SUB) && _nw_i32s(inst.cast_to) == 1
+               && _nw_opd_ok(&inst.src1) == 1 && _nw_opd_ok(&inst.src2) == 1) {
+        _nw_opd(&inst.src1, 0);
+        let is i64 as l1 = or_lo;
+        let is i64 as h1 = or_hi;
+        _nw_opd(&inst.src2, 0);
+        let is i64 as rl with mut = 0;
+        let is i64 as rh with mut = 0;
+        if (op == d.IR_ADD) { rl = l1 + or_lo; rh = h1 + or_hi; } else { rl = l1 - or_hi; rh = h1 - or_lo; }
+        if (rl >= NW_MIN && rh <= NW_MAX) {
+            lo = rl; hi = rh;
+            if (cand == 1) { _nw_add(inst); }
+        }
+    } else if (op == d.IR_AND && inst.src2.op_type == d.OP_IMM && inst.src2.imm >= 0 && inst.src2.imm <= NW_MAX) {
+        lo = 0; hi = inst.src2.imm;
+    }
+    if (s >= 0) {
+        if (lo < NW_MIN) { lo = NW_MIN; }
+        if (hi > NW_MAX) { hi = NW_MAX; }
+        nw_lo[s] = lo; nw_hi[s] = hi;
+    }
+}
+
+// Narrow the current state by `a rel b` (rel a compare op). Returns 0 when the
+// edge cannot be taken.
+fn _nw_refine(rel as i32, a as *d.Operand, b as *d.Operand, wide as i32) as i32 {
+    if (rel == d.IR_GT) { return _nw_refine(d.IR_LT, b, a, wide); }
+    if (rel == d.IR_GE) { return _nw_refine(d.IR_LE, b, a, wide); }
+    _nw_opd(a, wide);
+    let is i64 as al with mut = or_lo;
+    let is i64 as ah with mut = or_hi;
+    _nw_opd(b, wide);
+    let is i64 as bl with mut = or_lo;
+    let is i64 as bh with mut = or_hi;
+    if (rel == d.IR_LT) {
+        if (bh - 1 < ah) { ah = bh - 1; }
+        if (al + 1 > bl) { bl = al + 1; }
+    } else if (rel == d.IR_LE) {
+        if (bh < ah) { ah = bh; }
+        if (al > bl) { bl = al; }
+    } else if (rel == d.IR_EQ) {
+        if (bl > al) { al = bl; }
+        if (bh < ah) { ah = bh; }
+        bl = al; bh = ah;
+    } else if (rel == d.IR_NE) {
+        if (bl == bh) {
+            if (al == bl) { al = al + 1; }
+            if (ah == bl) { ah = ah - 1; }
+        }
+        if (al == ah) {
+            if (bl == al) { bl = bl + 1; }
+            if (bh == al) { bh = bh - 1; }
+        }
+    } else {
+        return 1;
+    }
+    if (al > ah || bl > bh) { return 0; }
+    if (a.op_type == d.OP_VREG) {
+        let is i32 as sa = _nw_slot_of(a.vreg);
+        if (sa >= 0) { nw_lo[sa] = al; nw_hi[sa] = ah; }
+    }
+    if (b.op_type == d.OP_VREG) {
+        let is i32 as sb = _nw_slot_of(b.vreg);
+        if (sb >= 0) { nw_lo[sb] = bl; nw_hi[sb] = bh; }
+    }
+    return 1;
+}
+
+fn _nw_negate(rel as i32) as i32 {
+    if (rel == d.IR_LT) { return d.IR_GE; }
+    if (rel == d.IR_LE) { return d.IR_GT; }
+    if (rel == d.IR_GT) { return d.IR_LE; }
+    if (rel == d.IR_GE) { return d.IR_LT; }
+    if (rel == d.IR_EQ) { return d.IR_NE; }
+    return d.IR_EQ;
+}
+
+fn _nw_is_jump(i as *d.IRInst) as i32 {
+    if (i.op == d.IR_JMP || i.op == d.IR_JZ || i.op == d.IR_JNZ) { return 1; }
+    return 0;
+}
+
+fn nw_init(func as *d.IRFunction) as void {
+    nw_reset();
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    // candidates, and the live instructions in order
+    let is i32 as m with mut = 0;
+    let is i32 as ncand with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            m = m + 1;
+            if (_nw_candidate(it) == 1) { ncand = ncand + 1; }
+            if (_nw_is_jump(it) == 1 && it.dest.op_type != d.OP_LABEL) { return; }
+            if (it.op == d.IR_PHI) { return; }
+        }
+        it = it.next;
+    }
+    if (ncand == 0) { return; }
+    let is *i64 as ins = cast(*i64, d.opt_alloc(cast(i64, m) * 8));
+    m = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) { ins[m] = cast(i64, it); m = m + 1; }
+        it = it.next;
+    }
+
+    // tracked values: the candidates' operands, then what they come from and
+    // what they are compared with
+    nw_vc = vc;
+    nw_nt = 0;
+    nw_slot = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is i32 as i with mut = 0;
+    while (i < vc) { nw_slot[i] = 0 - 1; i = i + 1; }
+    i = 0;
+    while (i < m) {
+        let is *d.IRInst as x = cast(*d.IRInst, ins[i]);
+        if (_nw_candidate(x) == 1) {
+            _nw_track(x.src1.vreg);
+            if (x.src2.op_type == d.OP_VREG) { _nw_track(x.src2.vreg); }
+        }
+        i = i + 1;
+    }
+    let is i32 as chg with mut = 1;
+    let is i32 as rounds with mut = 0;
+    while (chg == 1 && rounds < 8) {
+        chg = 0;
+        rounds = rounds + 1;
+        i = 0;
+        while (i < m) {
+            let is *d.IRInst as x = cast(*d.IRInst, ins[i]);
+            if (_nw_writes(x) == 1 && _nw_slot_of(x.dest.vreg) >= 0) {
+                if ((x.op == d.IR_MOV || x.op == d.IR_CAST || x.op == d.IR_ADD || x.op == d.IR_SUB)) {
+                    if (x.src1.op_type == d.OP_VREG && _nw_track(x.src1.vreg) == 1) { chg = 1; }
+                    if ((x.op == d.IR_ADD || x.op == d.IR_SUB) && x.src2.op_type == d.OP_VREG && _nw_track(x.src2.vreg) == 1) { chg = 1; }
+                }
+            }
+            if (_nw_is_cmp(x.op) == 1 && x.src1.op_type == d.OP_VREG && x.src2.op_type == d.OP_VREG) {
+                if (_nw_slot_of(x.src1.vreg) >= 0 && _nw_track(x.src2.vreg) == 1) { chg = 1; }
+                if (_nw_slot_of(x.src2.vreg) >= 0 && _nw_track(x.src1.vreg) == 1) { chg = 1; }
+            }
+            i = i + 1;
+        }
+    }
+    let is i32 as nt = nw_nt;
+    nw_nthr = 0;
+    _nw_thr_add(NW_MIN); _nw_thr_add(NW_MIN + 1); _nw_thr_add(NW_MAX - 1); _nw_thr_add(NW_MAX);
+    i = 0;
+    while (i < m) {
+        let is *d.IRInst as x = cast(*d.IRInst, ins[i]);
+        if (_nw_is_cmp(x.op) == 1) {
+            if (x.src2.op_type == d.OP_IMM) { _nw_thr_add(x.src2.imm - 1); _nw_thr_add(x.src2.imm); _nw_thr_add(x.src2.imm + 1); }
+            if (x.src1.op_type == d.OP_IMM) { _nw_thr_add(x.src1.imm - 1); _nw_thr_add(x.src1.imm); _nw_thr_add(x.src1.imm + 1); }
+        }
+        i = i + 1;
+    }
+
+    // blocks
+    let is *u8 as lead = d.opt_alloc(cast(i64, m) + 1);
+    i = 0;
+    while (i < m) { lead[i] = cast(u8, 0); i = i + 1; }
+    lead[0] = cast(u8, 1);
+    i = 0;
+    while (i < m) {
+        let is *d.IRInst as x = cast(*d.IRInst, ins[i]);
+        if (x.op == d.IR_LABEL) { lead[i] = cast(u8, 1); }
+        if ((_nw_is_jump(x) == 1 || x.op == d.IR_RET) && i + 1 < m) { lead[i + 1] = cast(u8, 1); }
+        i = i + 1;
+    }
+    let is i32 as nb with mut = 0;
+    i = 0;
+    while (i < m) { if (lead[i] == cast(u8, 1)) { nb = nb + 1; } i = i + 1; }
+    let is *i32 as bstart = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    nb = 0;
+    i = 0;
+    while (i < m) { if (lead[i] == cast(u8, 1)) { bstart[nb] = i; nb = nb + 1; } i = i + 1; }
+    bstart[nb] = m;
+    let is i32 as nl = func.label_count + 1;
+    let is *i32 as lblk = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    i = 0;
+    while (i < nl) { lblk[i] = 0 - 1; i = i + 1; }
+    let is i32 as b with mut = 0;
+    while (b < nb) {
+        let is *d.IRInst as f = cast(*d.IRInst, ins[bstart[b]]);
+        if (f.op == d.IR_LABEL && f.dest.label >= 0 && f.dest.label < nl) { lblk[f.dest.label] = b; }
+        b = b + 1;
+    }
+
+    // block entry states
+    let is i64 as sz = cast(i64, nb) * cast(i64, nt) * 8 + 8;
+    let is *i64 as in_lo = cast(*i64, d.opt_alloc(sz));
+    let is *i64 as in_hi = cast(*i64, d.opt_alloc(sz));
+    let is *u8 as reached = d.opt_alloc(cast(i64, nb) + 1);
+    let is *u8 as queued = d.opt_alloc(cast(i64, nb) + 1);
+    let is *i32 as nchg = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as work = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    nw_lo = cast(*i64, d.opt_alloc(cast(i64, nt) * 8 + 8));
+    nw_hi = cast(*i64, d.opt_alloc(cast(i64, nt) * 8 + 8));
+    let is *i64 as end_lo = cast(*i64, d.opt_alloc(cast(i64, nt) * 8 + 8));
+    let is *i64 as end_hi = cast(*i64, d.opt_alloc(cast(i64, nt) * 8 + 8));
+    b = 0;
+    while (b < nb) { reached[b] = cast(u8, 0); queued[b] = cast(u8, 0); nchg[b] = 0; b = b + 1; }
+    i = 0;
+    while (i < nt) { in_lo[i] = NW_MIN; in_hi[i] = NW_MAX; i = i + 1; }
+    reached[0] = cast(u8, 1);
+    queued[0] = cast(u8, 1);
+    work[0] = 0;
+    let is i32 as nwork with mut = 1;
+    nw_mark = 0;
+    while (nwork > 0) {
+        nwork = nwork - 1;
+        let is i32 as cb = work[nwork];
+        queued[cb] = cast(u8, 0);
+        let is i64 as base = cast(i64, cb) * cast(i64, nt);
+        i = 0;
+        while (i < nt) { nw_lo[i] = in_lo[base + cast(i64, i)]; nw_hi[i] = in_hi[base + cast(i64, i)]; i = i + 1; }
+        let is i32 as k with mut = bstart[cb];
+        while (k < bstart[cb + 1]) { _nw_step(cast(*d.IRInst, ins[k])); k = k + 1; }
+        i = 0;
+        while (i < nt) { end_lo[i] = nw_lo[i]; end_hi[i] = nw_hi[i]; i = i + 1; }
+        let is *d.IRInst as last = cast(*d.IRInst, ins[bstart[cb + 1] - 1]);
+        // the successors and the compare each edge proves
+        let is i32 as s1 with mut = 0 - 1;     // jump target
+        let is i32 as s2 with mut = 0 - 1;     // fall-through
+        if (last.op == d.IR_JMP) {
+            if (last.dest.label >= 0 && last.dest.label < nl) { s1 = lblk[last.dest.label]; }
+        } else if (last.op == d.IR_JZ || last.op == d.IR_JNZ) {
+            if (last.dest.label >= 0 && last.dest.label < nl) { s1 = lblk[last.dest.label]; }
+            if (cb + 1 < nb) { s2 = cb + 1; }
+        } else if (last.op != d.IR_RET) {
+            if (cb + 1 < nb) { s2 = cb + 1; }
+        }
+        // the compare the branch tests, its operands unchanged since
+        let is *d.IRInst as cmpi with mut = cast(*d.IRInst, 0);
+        if ((last.op == d.IR_JZ || last.op == d.IR_JNZ) && last.src1.op_type == d.OP_VREG) {
+            let is i32 as q with mut = bstart[cb + 1] - 2;
+            while (q >= bstart[cb] && cast(i64, cmpi) == 0) {
+                let is *d.IRInst as x = cast(*d.IRInst, ins[q]);
+                if (_nw_writes(x) == 1 && x.dest.vreg == last.src1.vreg) {
+                    if (_nw_is_cmp(x.op) == 1 && cast(i64, x.cast_to) != 0 && e.is_float_type(x.cast_to) == 0
+                        && e.is_signed_type(x.cast_to) == 1
+                        && (e.get_type_size(x.cast_to) == 4 || e.get_type_size(x.cast_to) == 8)) {
+                        cmpi = x;
+                        let is i32 as r with mut = q + 1;
+                        while (r < bstart[cb + 1] - 1) {
+                            let is *d.IRInst as y = cast(*d.IRInst, ins[r]);
+                            if (_nw_writes(y) == 1 && ((x.src1.op_type == d.OP_VREG && y.dest.vreg == x.src1.vreg)
+                                || (x.src2.op_type == d.OP_VREG && y.dest.vreg == x.src2.vreg))) { cmpi = cast(*d.IRInst, 0); }
+                            r = r + 1;
+                        }
+                    }
+                    q = 0 - 1;
+                }
+                q = q - 1;
+            }
+        }
+        let is i32 as e2 with mut = 0;
+        while (e2 < 2) {
+            let is i32 as sb with mut = s1;
+            if (e2 == 1) { sb = s2; }
+            if (sb >= 0) {
+                i = 0;
+                while (i < nt) { nw_lo[i] = end_lo[i]; nw_hi[i] = end_hi[i]; i = i + 1; }
+                let is i32 as feas with mut = 1;
+                if (cast(i64, cmpi) != 0) {
+                    // JNZ: the target is where the compare holds; JZ: the fall-through
+                    let is i32 as holds with mut = 0;
+                    if (last.op == d.IR_JNZ && e2 == 0) { holds = 1; }
+                    if (last.op == d.IR_JZ && e2 == 1) { holds = 1; }
+                    let is i32 as rel with mut = cast(i32, cmpi.op);
+                    if (holds == 0) { rel = _nw_negate(rel); }
+                    let is i32 as wide = cast(i32, e.get_type_size(cmpi.cast_to) == 8);
+                    feas = _nw_refine(rel, &cmpi.src1, &cmpi.src2, wide);
+                }
+                if (feas == 1) {
+                    let is i64 as sbase = cast(i64, sb) * cast(i64, nt);
+                    if (reached[sb] == cast(u8, 0)) {
+                        reached[sb] = cast(u8, 1);
+                        i = 0;
+                        while (i < nt) { in_lo[sbase + cast(i64, i)] = nw_lo[i]; in_hi[sbase + cast(i64, i)] = nw_hi[i]; i = i + 1; }
+                        if (queued[sb] == cast(u8, 0)) { queued[sb] = cast(u8, 1); work[nwork] = sb; nwork = nwork + 1; }
+                    } else {
+                        let is i32 as moved with mut = 0;
+                        i = 0;
+                        while (i < nt) {
+                            let is i64 as ol = in_lo[sbase + cast(i64, i)];
+                            let is i64 as oh = in_hi[sbase + cast(i64, i)];
+                            let is i64 as nlo with mut = ol;
+                            let is i64 as nhi with mut = oh;
+                            if (nw_lo[i] < nlo) { nlo = nw_lo[i]; if (nchg[sb] >= 2) { nlo = _nw_widen_lo(nlo); } }
+                            if (nw_hi[i] > nhi) { nhi = nw_hi[i]; if (nchg[sb] >= 2) { nhi = _nw_widen_hi(nhi); } }
+                            if (nlo != ol || nhi != oh) {
+                                in_lo[sbase + cast(i64, i)] = nlo; in_hi[sbase + cast(i64, i)] = nhi; moved = 1;
+                            }
+                            i = i + 1;
+                        }
+                        if (moved == 1) {
+                            nchg[sb] = nchg[sb] + 1;
+                            if (queued[sb] == cast(u8, 0)) { queued[sb] = cast(u8, 1); work[nwork] = sb; nwork = nwork + 1; }
+                        }
+                    }
+                }
+            }
+            e2 = e2 + 1;
+        }
+    }
+
+    // record the additions that stay in range
+    nw_cap = 64;
+    while (nw_cap < ncand * 2) { nw_cap = nw_cap * 2; }
+    nw_set = cast(*i64, d.opt_alloc(cast(i64, nw_cap) * 8));
+    i = 0;
+    while (i < nw_cap) { nw_set[i] = 0; i = i + 1; }
+    nw_mark = 1;
+    b = 0;
+    while (b < nb) {
+        if (reached[b] == cast(u8, 1)) {
+            let is i64 as base2 = cast(i64, b) * cast(i64, nt);
+            i = 0;
+            while (i < nt) { nw_lo[i] = in_lo[base2 + cast(i64, i)]; nw_hi[i] = in_hi[base2 + cast(i64, i)]; i = i + 1; }
+            let is i32 as k2 with mut = bstart[b];
+            while (k2 < bstart[b + 1]) { _nw_step(cast(*d.IRInst, ins[k2])); k2 = k2 + 1; }
+        }
+        b = b + 1;
+    }
+    nw_mark = 0;
+
+    d.opt_free(cast(*u8, ins)); d.opt_free(cast(*u8, nw_slot)); d.opt_free(lead);
+    d.opt_free(cast(*u8, bstart)); d.opt_free(cast(*u8, lblk));
+    d.opt_free(cast(*u8, in_lo)); d.opt_free(cast(*u8, in_hi)); d.opt_free(reached); d.opt_free(queued);
+    d.opt_free(cast(*u8, nchg)); d.opt_free(cast(*u8, work));
+    d.opt_free(cast(*u8, nw_lo)); d.opt_free(cast(*u8, nw_hi));
+    d.opt_free(cast(*u8, end_lo)); d.opt_free(cast(*u8, end_hi));
+    nw_slot = cast(*i32, 0); nw_lo = cast(*i64, 0); nw_hi = cast(*i64, 0);
+}

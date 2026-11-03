@@ -70,6 +70,41 @@ fn _sc_ops_read(o as *d.Operand, v as i32) as i32 {
     return 0;
 }
 
+fn _sc_inst_reads(r as *d.IRInst, v as i32) as i32 {
+    if (_sc_ops_read(&r.src1, v) == 1 || _sc_ops_read(&r.src2, v) == 1) { return 1; }
+    if ((r.op == d.IR_STORE || r.op == d.IR_COPY || r.op == d.IR_CMOV) && _sc_ops_read(&r.dest, v) == 1) { return 1; }
+    return 0;
+}
+
+// The copy `v = t` (mv) in the latch, where `t = v + C` is the one def of t in
+// the body, comes before the copy, and nothing else in the body reads t; and
+// nothing after the copy reads v. Leaving SSA writes a pointer induction this
+// way when the add cannot take v's register. Returns C, or 0.
+fn _sc_piv_copy(first as *d.IRInst, mv as *d.IRInst, last as *d.IRInst, v as i32, t as i32) as i64 {
+    let is i64 as c with mut = 0;
+    let is i32 as ndef with mut = 0;
+    let is i32 as bad with mut = 0;
+    let is i32 as after with mut = 0;
+    let is *d.IRInst as r with mut = first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, r) != 0) {
+        if (r.is_dead == 0 && cast(i64, r) != cast(i64, mv)) {
+            if (_sc_inst_reads(r, t) == 1) { bad = 1; }
+            if (after == 1 && _sc_inst_reads(r, v) == 1) { bad = 1; }
+            if (r.dest.op_type == d.OP_VREG && r.dest.vreg == t && r.op != d.IR_STORE && r.op != d.IR_COPY) {
+                ndef = ndef + 1;
+                if (after == 0 && r.op == d.IR_ADD && r.src1.op_type == d.OP_VREG && r.src1.vreg == v
+                    && r.src2.op_type == d.OP_IMM && r.src2.imm != 0) { c = r.src2.imm; }
+                else { bad = 1; }
+            }
+        }
+        if (cast(i64, r) == cast(i64, mv)) { after = 1; }
+        if (cast(i64, r) == cast(i64, last)) { stop = 1; } else { r = r.next; }
+    }
+    if (bad == 1 || ndef != 1) { return 0; }
+    return c;
+}
+
 // first..last: the loop body as a contiguous instruction range; lfirst: first
 // instruction of the latch block.
 fn loop_ctx_begin(first as *d.IRInst, lfirst as *d.IRInst, last as *d.IRInst, vc as i32, def_count as *i32) as void {
@@ -113,6 +148,10 @@ fn loop_ctx_begin(first as *d.IRInst, lfirst as *d.IRInst, last as *d.IRInst, vc
                 if (later == 0) {
                     let is *i64 as pp = cast(*i64, cast(i64, sc_piv) + cast(i64, v) * 8); *pp = w.src2.imm;
                 }
+            }
+            if (in_latch == 1 && *dcp > 1 && w.op == d.IR_MOV && w.src1.op_type == d.OP_VREG && w.src1.vreg != v) {
+                let is i64 as cc = _sc_piv_copy(first, w, last, v, w.src1.vreg);
+                if (cc != 0) { let is *i64 as pp = cast(*i64, cast(i64, sc_piv) + cast(i64, v) * 8); *pp = cc; }
             }
         }
         if (cast(i64, w) == cast(i64, last)) { stop = 1; } else { w = w.next; }

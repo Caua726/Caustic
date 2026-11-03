@@ -109,6 +109,35 @@ fn pass_gvn(func as *d.IRFunction) as void {
     i = 0;
     while (i < vc) { *(cast(*i32, cast(i64, same) + cast(i64, i) * 4)) = cast(i32, 0 - 1); i = i + 1; }
 
+    // aonly[v]: every read of v is the address of a load or a store. Such a
+    // value, a base plus a constant, is recomputed in another block rather
+    // than carried there: the access that reads it folds the sum into its
+    // address for free. (A scaled index is still shared: the forwarding of a
+    // stored element to the next iteration's load, opt_rotate.cst, keys on
+    // the one address.)
+    let is *u8 as aonly = d.opt_alloc(cast(i64, vc) + 1);
+    i = 0;
+    while (i < vc) { aonly[i] = cast(u8, 1); i = i + 1; }
+    ins = func.instructions;
+    while (cast(i64, ins) != 0) {
+        if (ins.is_dead == 0) {
+            if (ins.src1.op_type == d.OP_VREG && ins.op != d.IR_LOAD && ins.src1.vreg >= 0 && ins.src1.vreg < vc) { aonly[ins.src1.vreg] = cast(u8, 0); }
+            if (ins.src2.op_type == d.OP_VREG && ins.src2.vreg >= 0 && ins.src2.vreg < vc) { aonly[ins.src2.vreg] = cast(u8, 0); }
+            if (ins.dest.op_type == d.OP_VREG && (ins.op == d.IR_COPY || ins.op == d.IR_CMOV)
+                && ins.dest.vreg >= 0 && ins.dest.vreg < vc) { aonly[ins.dest.vreg] = cast(u8, 0); }
+            if (ins.op == d.IR_PHI) {
+                let is i32 as pn = phi.phi_nargs(ins);
+                let is i32 as pk2 with mut = 0;
+                while (pk2 < pn) {
+                    let is i32 as pv = phi.phi_val(ins, pk2);
+                    if (pv >= 0 && pv < vc) { aonly[pv] = cast(u8, 0); }
+                    pk2 = pk2 + 1;
+                }
+            }
+        }
+        ins = ins.next;
+    }
+
     // --- value table (open-addressed) ---
     let is i32 as cap with mut = 256;
     while (cap < nblocks * 8 + 64) { cap = cap + cap; }
@@ -188,7 +217,9 @@ fn pass_gvn(func as *d.IRFunction) as void {
                                 let is *i32 as sp = cast(*i32, cast(i64, same) + cast(i64, inst.dest.vreg) * 4);
                                 *sp = *dst_p;
                                 found = 1;
-                            } else if (dom_ok == 1 && (*blk_p == cur_blk || is_hdr[*blk_p] == cast(u8, 0))) {
+                            } else if (dom_ok == 1 && (*blk_p == cur_blk || is_hdr[*blk_p] == cast(u8, 0))
+                                       && (*blk_p == cur_blk || aonly[inst.dest.vreg] == cast(u8, 0)
+                                           || inst.op != d.IR_ADD || inst.src2.op_type != d.OP_IMM)) {
                                 // replace this computation with a copy of the dominating value
                                 inst.op = d.IR_MOV;
                                 inst.src1.op_type = d.OP_VREG; inst.src1.vreg = *dst_p;

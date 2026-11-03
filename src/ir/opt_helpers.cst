@@ -138,6 +138,17 @@ fn pass_fold_immediates(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                         inst.src2.op_type = d.OP_IMM;
                         inst.src2.imm = v2;
                     }
+                    // -O2: base + constant * scale is base plus an offset (a
+                    // fully unrolled loop leaves these), which the addressing
+                    // of the load or store that reads it takes for free.
+                    if (d.ir_opt_level >= 2 && (fop == d.IR_LEA2 || fop == d.IR_LEA4 || fop == d.IR_LEA8)
+                        && v2 >= (0 - 268435456) && v2 <= 268435456) {
+                        let is i64 as sc with mut = 8;
+                        if (fop == d.IR_LEA2) { sc = 2; } else if (fop == d.IR_LEA4) { sc = 4; }
+                        inst.op = cast(i8, d.IR_ADD);
+                        inst.src2.op_type = d.OP_IMM;
+                        inst.src2.imm = v2 * sc;
+                    }
                 }
             }
             } // end bounds check s2v < fold_vc
@@ -331,6 +342,53 @@ fn pass_lea_fusion(func as *d.IRFunction, vc as i32) as void {
     }
     d.opt_free(cast(*u8, uc));
     d.opt_free(cast(*u8, def_inst));
+}
+
+// -O2: `LEA base, k` with k a constant defined once is base + k * scale, an
+// ADD the addressing of the access that reads it takes for free. Runs after
+// the copies are resolved (pass_final_resolve), which is when a copy of the
+// constant becomes the constant itself; pass_fold_immediates catches the ones
+// visible earlier.
+fn pass_lea_const(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i32 as ndef = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
+    let is *i64 as cval = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is *u8 as isk = d.opt_alloc(cast(i64, vc));
+    let is i32 as i with mut = 0;
+    while (i < vc) { ndef[i] = 0; isk[i] = cast(u8, 0); i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+                && it.op != d.IR_STORE && it.op != d.IR_COPY) {
+                ndef[it.dest.vreg] = ndef[it.dest.vreg] + 1;
+                if (it.op == d.IR_IMM && it.src1.op_type == d.OP_IMM) { isk[it.dest.vreg] = cast(u8, 1); cval[it.dest.vreg] = it.src1.imm; }
+            }
+            if (it.op == d.IR_LEA2 || it.op == d.IR_LEA4 || it.op == d.IR_LEA8) { any = 1; }
+        }
+        it = it.next;
+    }
+    if (any == 1) {
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            let is i32 as op = it.op;
+            if (it.is_dead == 0 && (op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8)
+                && it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc) {
+                let is i32 as k = it.src2.vreg;
+                if (ndef[k] == 1 && isk[k] == cast(u8, 1) && cval[k] >= (0 - 268435456) && cval[k] <= 268435456) {
+                    let is i64 as sc with mut = 8;
+                    if (op == d.IR_LEA2) { sc = 2; } else if (op == d.IR_LEA4) { sc = 4; }
+                    it.op = cast(i8, d.IR_ADD);
+                    it.src2.op_type = d.OP_IMM;
+                    it.src2.imm = cval[k] * sc;
+                }
+            }
+            it = it.next;
+        }
+    }
+    d.opt_free(cast(*u8, ndef)); d.opt_free(cast(*u8, cval)); d.opt_free(isk);
 }
 
 // === Pass 2: DCE ===

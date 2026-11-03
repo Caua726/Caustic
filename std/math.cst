@@ -685,6 +685,15 @@ fn pow(x as f64, y as f64) as f64 {
     // x positive, normal and finite; |y| < 2^64
     if (ix >= 4503599627370496 && ix < 9218868437227405312 && ay < 4895412794951729152) {
         if (y == 2.0) { return x * x; }
+        // A result far below the subnormals or above the largest double is
+        // known before any log: the bits of x read as a fixed-point number,
+        // l = e + f, bound log2(x) = e + log2(1 + f) to [l, l + 0.0861].
+        let is f64 as l = cast(f64, ix - 4607182418800017408) * 2.220446049250313e-16;
+        let is f64 as za with mut = y * l;
+        let is f64 as zb with mut = y * (l + 0.0861);
+        if (y < 0.0) { let is f64 as zt = za; za = zb; zb = zt; }
+        if (zb < -1080.0) { return 0.0; }
+        if (za > 1030.0) { return inf(); }
         return _pow_core(ix, 0, y);
     }
     return _pow_special(x, y);
@@ -815,6 +824,8 @@ fn _pow_special(x as f64, y as f64) as f64 {
 //     carried out exactly; r is good to about 2^-98 absolute. That is not
 //     enough when r itself is tiny (45.553093477052 is within 2^-60.5 of
 //     29*pi/2), so below |r| = 2^-30 the large reduction is used instead.
+//   - |x| < 2^27: the same with pi/2 in three parts of 26 bits and the rest
+//     (_rem_pio2_mid), exact products for n < 2^27; r to about 2^-100.
 //   - otherwise: x's 53-bit mantissa times a 192-bit window of the bits of
 //     2/pi, in 32-bit integer limbs (Payne-Hanek). The bits that would only
 //     add multiples of 4 to x*2/pi are never fetched; what remains gives the
@@ -904,6 +915,33 @@ fn _rem_pio2_big(x as f64, out as *f64) as i64 {
     return q;
 }
 
+// Reduction of 1.6e6 <= |x| < 2^27 by pi/2: n = round(x * 2/pi) < 2^27, so
+// n times each 26-bit part of pi/2 is exact, and so is x - n*P1 (both are
+// multiples of 2^-32 and the difference is under 4). The next two
+// subtractions keep their rounding errors (two-sum) and n*P4 is under 2^-51,
+// so r = out[0] + out[1] is good to about 2^-100 absolute. Returns n mod 4,
+// or -1 when |r| < 2^-30, which needs the large reduction.
+fn _rem_pio2_mid(x as f64, out as *f64) as i64 {
+    let is f64 as kd = x * 0.6366197723675814 + 6755399441055744.0;
+    let is f64 as nf = kd - 6755399441055744.0;
+    let is f64 as a = x - nf * 1.5707963407039642;
+    let is f64 as w1 = nf * -1.3909067675399456e-08;
+    let is f64 as s1 = a - w1;
+    let is f64 as b1 = s1 - a;
+    let is f64 as e1 = (a - (s1 - b1)) - (w1 + b1);
+    let is f64 as w2 = nf * 6.123233932053594e-17;
+    let is f64 as s2 = s1 - w2;
+    let is f64 as b2 = s2 - s1;
+    let is f64 as e2 = (s1 - (s2 - b2)) - (w2 + b2);
+    let is f64 as v = nf * 6.36831716351095e-25;
+    let is f64 as hi = s2 - v;
+    let is f64 as lo = ((s2 - hi) - v) + (e1 + e2);
+    if (hi < 9.313225746154785e-10 && hi > -9.313225746154785e-10) { return 0 - 1; }
+    out[0] = hi;
+    out[1] = lo;
+    return cast(i64, nf) & 3;
+}
+
 // sin(hi + lo) for |hi| <= pi/4: hi + hi^3 * S(hi^2), S a degree-6 fit
 // (relative error 2^-63), plus lo * cos(hi) to first order.
 fn _sin_k(hi as f64, lo as f64) as f64 {
@@ -986,6 +1024,17 @@ fn sin(x as f64) as f64 {
             return 0.0 - rc;
         }
     }
+    if (ia >= 4699622759393656832 && ia < 4728779608739020800) {
+        let is [2]f64 as rm;
+        let is i64 as qm = _rem_pio2_mid(x, cast(*f64, &rm));
+        if (qm >= 0) {
+            let is i64 as qq = qm;
+            let is f64 as res with mut = 0.0;
+            if ((qq & 1) == 0) { res = _sin_k(rm[0], rm[1]); } else { res = _cos_k(rm[0], rm[1]); }
+            if ((qq & 2) != 0) { return 0.0 - res; }
+            return res;
+        }
+    }
     return _sincos_big(x, 0);
 }
 
@@ -1046,7 +1095,70 @@ fn cos(x as f64) as f64 {
             return 0.0 - rc;
         }
     }
+    if (ia >= 4699622759393656832 && ia < 4728779608739020800) {
+        let is [2]f64 as rm;
+        let is i64 as qm = _rem_pio2_mid(x, cast(*f64, &rm));
+        if (qm >= 0) {
+            let is i64 as qq = qm + 1;
+            let is f64 as res with mut = 0.0;
+            if ((qq & 1) == 0) { res = _sin_k(rm[0], rm[1]); } else { res = _cos_k(rm[0], rm[1]); }
+            if ((qq & 2) != 0) { return 0.0 - res; }
+            return res;
+        }
+    }
     return _sincos_big(x, 1);
+}
+
+// sin(x), with cos(x) written to *c: one argument reduction for both. The
+// results are those of sin and cos, bit for bit (the same reduction and the
+// same kernels). At -O2 the compiler turns a sin(v) and a cos(v) of one value
+// into this call.
+fn sincos(x as f64, c as *f64) as f64 {
+    let is i64 as ia = *cast(*i64, &x) & 9223372036854775807;
+    if (ia < 4605249457297304856) {
+        if (ia < 4485585228861014016) { *c = 1.0; return x; }
+        *c = cos(x);
+        return sin(x);
+    }
+    if (ia < 4699622759393656832) {
+        let is f64 as kd = x * 0.6366197723675814 + 6755399441055744.0;
+        let is f64 as nf = kd - 6755399441055744.0;
+        let is f64 as t1 = x - nf * 1.5707963267341256;
+        let is f64 as w = nf * 6.077100506303966e-11;
+        let is f64 as s = t1 - w;
+        let is f64 as bb = s - t1;
+        let is f64 as e = (t1 - (s - bb)) - (w + bb);
+        let is f64 as v = nf * 2.0222662487959506e-21;
+        let is f64 as hi = s - v;
+        let is f64 as lo = ((s - hi) - v) + e;
+        if (hi > 9.313225746154785e-10 || hi < -9.313225746154785e-10) {
+            let is i64 as q = cast(i64, nf);
+            let is f64 as ks = _sin_k(hi, lo);
+            let is f64 as kc = _cos_k(hi, lo);
+            *c = _sc_pick(ks, kc, q + 1);
+            return _sc_pick(ks, kc, q);
+        }
+    }
+    if (ia >= 4699622759393656832 && ia < 4728779608739020800) {
+        let is [2]f64 as rm;
+        let is i64 as qm = _rem_pio2_mid(x, cast(*f64, &rm));
+        if (qm >= 0) {
+            let is f64 as ks = _sin_k(rm[0], rm[1]);
+            let is f64 as kc = _cos_k(rm[0], rm[1]);
+            *c = _sc_pick(ks, kc, qm + 1);
+            return _sc_pick(ks, kc, qm);
+        }
+    }
+    *c = _sincos_big(x, 1);
+    return _sincos_big(x, 0);
+}
+
+// sin of the reduced argument (ks) or its cos (kc), signed, for quadrant q.
+fn _sc_pick(ks as f64, kc as f64, q as i64) as f64 {
+    let is f64 as r with mut = ks;
+    if ((q & 1) != 0) { r = kc; }
+    if ((q & 2) != 0) { return 0.0 - r; }
+    return r;
 }
 
 // sin (which = 0) or cos (which = 1) of x when the reduction above does not
@@ -1084,6 +1196,11 @@ fn tan(x as f64) as f64 {
         if (hi > 9.313225746154785e-10 || hi < -9.313225746154785e-10) {
             return _tan_k(hi, lo, cast(i64, nf) & 1);
         }
+    }
+    if (ia >= 4699622759393656832 && ia < 4728779608739020800) {
+        let is [2]f64 as rm;
+        let is i64 as qm = _rem_pio2_mid(x, cast(*f64, &rm));
+        if (qm >= 0) { return _tan_k(rm[0], rm[1], qm & 1); }
     }
     if (!(x - x == 0.0)) { return x - x; }
     let is [2]f64 as rr;

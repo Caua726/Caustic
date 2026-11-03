@@ -122,6 +122,10 @@ fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         e.store_op_xmm(inst.dest.vreg, ctx, nacc);
         return;
     }
+    // Two vregs the allocator gave the same spill slot: the value is already
+    // where the copy would put it.
+    let is i32 as same_slot = al.get_loc(inst.dest.vreg, ctx);
+    if (same_slot < 0 && al.get_loc(inst.src1.vreg, ctx) == same_slot) { return; }
     if (dest_cls == d.VR_XMM || src_cls == d.VR_XMM) {
         let is i32 as mdl = al.get_loc(inst.dest.vreg, ctx);
         let is i32 as msl = al.get_loc(inst.src1.vreg, ctx);
@@ -155,6 +159,8 @@ fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 // the codegen already treats as caller-saved scratch.
 
 fn gen_inst_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    // (an address the next access takes into its addressing)
+    if (e.try_addr_add(inst, ctx) == 1) { return; }
     let is i32 as scale_val with mut = 4;
     if (inst.op == d.IR_LEA2) { scale_val = 2; }
     else if (inst.op == d.IR_LEA8) { scale_val = 8; }
@@ -426,9 +432,10 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         e.emit_vreg_copy(inst.dest.vreg, inst.src1.vreg, ctx, inst.cast_to);
         return;
     }
+    // (an address the next access takes into its addressing: first)
+    if (op == d.IR_ADD && e.try_addr_add(inst, ctx) == 1) { return; }
     if ((op == d.IR_ADD || op == d.IR_SUB) && try_arg_lea(inst, ctx) == 1) { return; }
     if ((op == d.IR_ADD || op == d.IR_SUB) && try_copy_lea(inst, ctx) == 1) { return; }
-    if (op == d.IR_ADD && e.try_addr_add(inst, ctx) == 1) { return; }
     if (op == d.IR_ADD) { e.gen_binop(inst, ctx, "add"); return; }
     if (op == d.IR_SUB) { e.gen_binop(inst, ctx, "sub"); return; }
     if (op == d.IR_MUL && try_mul_lea(inst, ctx) == 1) { return; }
@@ -756,16 +763,14 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_VLOADQ256) {
-        e.load_op(inst.src1.vreg, ctx, "rcx");
-        if (inst.src2.op_type == d.OP_IMM && inst.src2.imm != 0) {
-            eo.out_str("  add rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
-        }
+        let is i32 as bs = ev.vbase(inst.src1.vreg, ctx);
+        let is i64 as disp with mut = 0;
+        if (inst.src2.op_type == d.OP_IMM) { disp = inst.src2.imm; }
         let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
         let is i32 as rbit with mut = 1; if (dn >= 8) { rbit = 0; }
-        let is i32 as b1 = rbit * 128 + 64 + 32 + 1;        // X=1,B=1(rcx),0F
-        let is i32 as modrm = (dn % 8) * 8 + 1;             // mod=00, rm=rcx
-        eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", 126, 111, ");   // F3,L=1; vmovdqu load
-        eo.out_int(cast(i64, modrm)); eo.out_char(10);
+        let is i32 as bbit with mut = 1; if (bs >= 8) { bbit = 0; }
+        ev._bo(); ev._bb(196); ev._bb(rbit * 128 + 64 + bbit * 32 + 1); ev._bb(126); ev._bb(111);   // F3,L=1; vmovdqu load
+        ev.vmodrm(dn, bs, disp); ev._be();
         return;
     }
     if (op == d.IR_VADDQ256 || op == d.IR_VADDD256 || op == d.IR_VADDPD256
@@ -905,16 +910,14 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_VSTOREQ256) {
-        e.load_op(inst.src1.vreg, ctx, "rcx");
-        if (inst.dest.op_type == d.OP_IMM && inst.dest.imm != 0) {
-            eo.out_str("  add rcx, ", 11); eo.out_int(inst.dest.imm); eo.out_char(10);
-        }
+        let is i32 as bs = ev.vbase(inst.src1.vreg, ctx);
+        let is i64 as disp with mut = 0;
+        if (inst.dest.op_type == d.OP_IMM) { disp = inst.dest.imm; }
         let is i32 as sn = _vec_num(inst.src2.vreg, ctx);
         let is i32 as rbit with mut = 1; if (sn >= 8) { rbit = 0; }   // R = reg field = source
-        let is i32 as b1 = rbit * 128 + 64 + 32 + 1;        // X=1, B=1(rcx), 0F
-        let is i32 as modrm = (sn % 8) * 8 + 1;             // mod=00, rm=rcx, reg=src
-        eo.out_cstr("  .byte 196, "); eo.out_int(cast(i64, b1)); eo.out_cstr(", 126, 127, ");   // F3,L=1; vmovdqu store (0x7F)
-        eo.out_int(cast(i64, modrm)); eo.out_char(10);
+        let is i32 as bbit with mut = 1; if (bs >= 8) { bbit = 0; }
+        ev._bo(); ev._bb(196); ev._bb(rbit * 128 + 64 + bbit * 32 + 1); ev._bb(126); ev._bb(127);   // F3,L=1; vmovdqu store
+        ev.vmodrm(sn, bs, disp); ev._be();
         return;
     }
     if (op == d.IR_VREDUCEQ256) {
@@ -973,21 +976,25 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_VLOADQ) {
-        e.load_op(inst.src1.vreg, ctx, "rcx");   // base -> rcx (base never modified)
-        if (inst.src2.op_type == d.OP_IMM && inst.src2.imm != 0) {
-            eo.out_str("  add rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
-        }
+        let is *u8 as bn = ev.vbase_name(inst.src1.vreg, ctx);
+        let is i64 as disp with mut = 0;
+        if (inst.src2.op_type == d.OP_IMM) { disp = inst.src2.imm; }
         let is *u8 as dr = _vec_xmm(inst.dest.vreg, ctx);
-        eo.out_str("  movdqu ", 9); eo.out_cstr(dr); eo.out_str(", [rcx]\n", 8);
+        eo.out_str("  movdqu ", 9); eo.out_cstr(dr); eo.out_str(", [", 3); eo.out_cstr(bn);
+        if (disp > 0) { eo.out_str(" + ", 3); eo.out_int(disp); }
+        if (disp < 0) { eo.out_str(" - ", 3); eo.out_int(0 - disp); }
+        eo.out_str("]\n", 2);
         return;
     }
     if (op == d.IR_VSTOREQ) {
-        e.load_op(inst.src1.vreg, ctx, "rcx");   // base -> rcx (base never modified)
-        if (inst.dest.op_type == d.OP_IMM && inst.dest.imm != 0) {
-            eo.out_str("  add rcx, ", 11); eo.out_int(inst.dest.imm); eo.out_char(10);
-        }
+        let is *u8 as bn = ev.vbase_name(inst.src1.vreg, ctx);
+        let is i64 as disp with mut = 0;
+        if (inst.dest.op_type == d.OP_IMM) { disp = inst.dest.imm; }
         let is *u8 as sv = _vec_xmm(inst.src2.vreg, ctx);
-        eo.out_str("  movdqu [rcx], ", 16); eo.out_cstr(sv); eo.out_char(10);
+        eo.out_str("  movdqu [", 10); eo.out_cstr(bn);
+        if (disp > 0) { eo.out_str(" + ", 3); eo.out_int(disp); }
+        if (disp < 0) { eo.out_str(" - ", 3); eo.out_int(0 - disp); }
+        eo.out_str("], ", 3); eo.out_cstr(sv); eo.out_char(10);
         return;
     }
     if (op == d.IR_VADDQ || op == d.IR_VADDD || op == d.IR_VADDPD
@@ -1142,6 +1149,176 @@ fn _gen_f32_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     e.store_op_xmm(inst.dest.vreg, ctx, acc);
 }
 
+// -O2: an f64 load read only by the scalar op right after it is not emitted;
+// the op takes the memory operand instead (`mulsd acc, [p]`). The load's
+// address is still in its register there: nothing runs in between, and the
+// op itself writes only xmm registers before it reads the operand.
+let is *d.IRInst as fl_pending with mut;
+
+fn _fl_next(inst as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as n with mut = inst.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1 && n.op != d.IR_LABEL) { n = n.next; }
+    return n;
+}
+
+fn fl_try_defer(inst as *d.IRInst) as i32 {
+    if (al.al_opt_level < 2 || inst.dest.op_type != d.OP_VREG) { return 0; }
+    if (inst.src1.op_type != d.OP_VREG && inst.src1.op_type != d.OP_IMM && inst.src1.op_type != d.OP_GSYM) { return 0; }
+    let is i32 as v = inst.dest.vreg;
+    if (e.isel_get_uses(v) != 1) { return 0; }
+    let is *d.IRInst as n = _fl_next(inst);
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as op = n.op;
+    if (op != d.IR_FADD && op != d.IR_FSUB && op != d.IR_FMUL && op != d.IR_FDIV) { return 0; }
+    if (e.get_type_size(n.cast_to) != 8) { return 0; }
+    let is i32 as in2 = cast(i32, n.src2.op_type == d.OP_VREG && n.src2.vreg == v);
+    let is i32 as in1 = cast(i32, n.src1.op_type == d.OP_VREG && n.src1.vreg == v);
+    if (in1 == 1 && in2 == 1) { return 0; }
+    if (in2 == 0) {
+        // the commutative ops take it on the left as well
+        if (in1 == 0 || (op != d.IR_FADD && op != d.IR_FMUL) || n.src2.op_type != d.OP_VREG) { return 0; }
+    }
+    fl_pending = inst;
+    return 1;
+}
+
+// `op acc, <the deferred load's memory operand>`. The address registers are
+// fetched (a spilled one reloaded into rax/rcx) before the line starts.
+fn _fl_op(op_name as *u8, acc as *u8, ld as *d.IRInst, ctx as *al.AllocCtx) as void {
+    if (ld.src1.op_type == d.OP_VREG) {
+        let is e.AddrMode as am with mut = e.try_match_addr(ld.src1.vreg, ctx);
+        if (am.matched == 1) {
+            let is *u8 as amb = e.op_reg(am.base_vreg, ctx, 0);
+            let is *u8 as ami = e.op_reg(am.index_vreg, ctx, 1);
+            eo.out_str("  ", 2); eo.out_cstr(op_name); eo.out_str(" ", 1); eo.out_cstr(acc); eo.out_str(", ", 2);
+            _am_open("QWORD PTR [", amb, ami);
+            eo.out_int(cast(i64, am.scale)); eo.out_str("]\n", 2);
+            return;
+        }
+        let is *u8 as ar = e.addr_reg(ld.src1.vreg, ctx, 0);
+        eo.out_str("  ", 2); eo.out_cstr(op_name); eo.out_str(" ", 1); eo.out_cstr(acc); eo.out_str(", ", 2);
+        eo.out_str("QWORD PTR [", 11); eo.out_cstr(ar); eo.out_str("]\n", 2);
+        return;
+    }
+    eo.out_str("  ", 2); eo.out_cstr(op_name); eo.out_str(" ", 1); eo.out_cstr(acc); eo.out_str(", ", 2);
+    if (ld.src1.op_type == d.OP_GSYM) {
+        eo.out_str("QWORD PTR [", 11); eo.out_cstr(e.gsym_str(&ld.src1)); eo.out_str("]\n", 2);
+    } else {
+        eo.out_str("QWORD PTR [", 11); eo.out_fp(ld.src1.imm); eo.out_str("]\n", 2);
+    }
+}
+
+// -O2: an integer load whose one reader is the next instruction, an add, sub,
+// imul, and, or or xor, goes out as that instruction's memory operand
+// (`imul r12d, DWORD PTR [rsi + r10 * 4]`). il_pending holds it until the
+// next instruction (emit_driver gen_inst), which takes it or emits it as it was.
+let is *d.IRInst as il_pending with mut;
+let is i32 as il_off with mut = 0;
+
+fn _il_opok(op as i32) as i32 {
+    return cast(i32, op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_AND
+        || op == d.IR_OR || op == d.IR_XOR);
+}
+
+fn il_try_defer(inst as *d.IRInst) as i32 {
+    if (al.al_opt_level < 2 || il_off == 1 || inst.dest.op_type != d.OP_VREG) { return 0; }
+    if (inst.src1.op_type != d.OP_VREG && inst.src1.op_type != d.OP_IMM && inst.src1.op_type != d.OP_GSYM) { return 0; }
+    if (cast(i64, inst.cast_to) == 0 || e.is_float_type(inst.cast_to) == 1) { return 0; }
+    let is i32 as sz = e.get_type_size(inst.cast_to);
+    if (sz != 8 && (sz != 4 || e.lz_lazy_inst(inst) == 0)) { return 0; }
+    let is i32 as v = inst.dest.vreg;
+    if (e.isel_get_uses(v) != 1) { return 0; }
+    let is *d.IRInst as n = _fl_next(inst);
+    if (cast(i64, n) == 0 || _il_opok(n.op) == 0 || n.dest.op_type != d.OP_VREG) { return 0; }
+    if (cast(i64, n.cast_to) == 0 || e.is_float_type(n.cast_to) == 1 || e.get_type_size(n.cast_to) != sz) { return 0; }
+    let is i32 as in2 = cast(i32, n.src2.op_type == d.OP_VREG && n.src2.vreg == v);
+    let is i32 as in1 = cast(i32, n.src1.op_type == d.OP_VREG && n.src1.vreg == v);
+    if (in1 == 1 && in2 == 1) { return 0; }
+    if (in2 == 1) { if (n.src1.op_type != d.OP_VREG) { return 0; } }
+    else {
+        if (in1 == 0 || n.op == d.IR_SUB || n.src2.op_type != d.OP_VREG) { return 0; }
+    }
+    // an add the next access takes into its addressing (e.try_addr_add) stays
+    if (n.op == d.IR_ADD) {
+        let is *d.IRInst as m = _fl_next(n);
+        if (cast(i64, m) != 0 && ((m.op == d.IR_LOAD && m.src1.op_type == d.OP_VREG && m.src1.vreg == n.dest.vreg)
+            || (m.op == d.IR_STORE && m.dest.op_type == d.OP_VREG && m.dest.vreg == n.dest.vreg))) { return 0; }
+    }
+    il_pending = inst;
+    return 1;
+}
+
+// A register an address reads, -1 when it is not in one of its own.
+fn _il_areg(v as i32, ctx as *al.AllocCtx) as i32 {
+    let is i32 as l = al.get_loc(v, ctx);
+    if (l < 0 || l >= 16 || al.is_mem(v, ctx) == 1) { return 0 - 1; }
+    return l;
+}
+
+// `inst` with the pending load as its memory operand; 0 (nothing written)
+// when the registers do not allow it.
+fn il_fold(inst as *d.IRInst, ld as *d.IRInst, ctx as *al.AllocCtx, skip_narrow as i32) as i32 {
+    let is i32 as v = ld.dest.vreg;
+    if (_il_opok(inst.op) == 0 || inst.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as in2 = cast(i32, inst.src2.op_type == d.OP_VREG && inst.src2.vreg == v);
+    let is i32 as in1 = cast(i32, inst.src1.op_type == d.OP_VREG && inst.src1.vreg == v);
+    if (in1 == in2) { return 0; }
+    let is d.Operand as other with mut = inst.src1;
+    if (in1 == 1) { other = inst.src2; }
+    if (other.op_type != d.OP_VREG) { return 0; }
+    let is i32 as dl = al.get_loc(inst.dest.vreg, ctx);
+    if (dl < 0 || dl >= 16) { return 0; }
+    let is i32 as sz = e.get_type_size(ld.cast_to);
+    // the address, in registers the copy into dl leaves alone
+    let is e.AddrMode as am with mut;
+    am.matched = 0;
+    let is i32 as rb with mut = 0 - 1;
+    let is i32 as ri with mut = 0 - 1;
+    let is i32 as viaa with mut = 0;
+    if (ld.src1.op_type == d.OP_VREG && e.aa_vreg >= 0 && e.aa_vreg == ld.src1.vreg) {
+        // [b + i * s] or [b + disp] from the add before the load (e.try_addr_add)
+        if (e.aa_b == dl || (e.aa_i >= 0 && e.aa_i == dl)) { return 0; }
+        viaa = 1;
+    } else if (ld.src1.op_type == d.OP_VREG) {
+        am = e.try_match_addr(ld.src1.vreg, ctx);
+        if (am.matched == 1) {
+            rb = _il_areg(am.base_vreg, ctx);
+            ri = _il_areg(am.index_vreg, ctx);
+            if (rb < 0 || ri < 0 || rb == dl || ri == dl) { return 0; }
+        } else {
+            rb = _il_areg(ld.src1.vreg, ctx);
+            if (rb < 0 || rb == dl) { return 0; }
+        }
+    }
+    let is *u8 as dr = eo.reg64(dl);
+    e.load_op(other.vreg, ctx, dr);
+    let is *u8 as nm with mut = "add";
+    if (inst.op == d.IR_SUB) { nm = "sub"; }
+    if (inst.op == d.IR_MUL) { nm = "imul"; }
+    if (inst.op == d.IR_AND) { nm = "and"; }
+    if (inst.op == d.IR_OR) { nm = "or"; }
+    if (inst.op == d.IR_XOR) { nm = "xor"; }
+    eo.out_str("  ", 2); eo.out_cstr(nm); eo.out_str(" ", 1);
+    if (sz == 4) { eo.out_cstr(eo.reg32(dl)); eo.out_str(", DWORD PTR [", 13); }
+    else { eo.out_cstr(dr); eo.out_str(", QWORD PTR [", 13); }
+    if (viaa == 1) { eo.out_cstr(e.addr_reg(ld.src1.vreg, ctx, 0)); }
+    else if (ld.src1.op_type == d.OP_VREG) {
+        if (am.matched == 1) {
+            eo.out_cstr(eo.reg64(rb)); eo.out_str(" + ", 3); eo.out_cstr(eo.reg64(ri)); eo.out_str(" * ", 3);
+            eo.out_int(cast(i64, am.scale));
+        } else { eo.out_cstr(eo.reg64(rb)); }
+    } else if (ld.src1.op_type == d.OP_GSYM) { eo.out_cstr(e.gsym_str(&ld.src1)); }
+    else { eo.out_fp(ld.src1.imm); }
+    eo.out_str("]\n", 2);
+    if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(dl); }
+    // a 32-bit op leaves the upper half zero: extended unless no reader looks
+    if (sz == 4 && skip_narrow == 1) { e.lz_skip_narrow = 1; }
+    e.emit_narrow_truncate(dl, inst.cast_to);
+    e.lz_skip_narrow = 0;
+    e.store_op(inst.dest.vreg, ctx, dr);
+    return 1;
+}
+
 fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
@@ -1186,12 +1363,40 @@ fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // When src2 is XMM-allocated or spilled, the op can take it as the rhs
     // directly — saves the redundant xmm1 stage.
     let is *u8 as acc = _xmm_acc_for(inst.dest.vreg, ctx);
-    e.load_op_xmm(inst.src1.vreg, ctx, acc);
     let is *u8 as op_name with mut = cast(*u8, 0);
     if (op == d.IR_FADD) { op_name = "addsd"; }
     if (op == d.IR_FSUB) { op_name = "subsd"; }
     if (op == d.IR_FMUL) { op_name = "mulsd"; }
     if (op == d.IR_FDIV) { op_name = "divsd"; }
+    let is *d.IRInst as fl = fl_pending;
+    fl_pending = cast(*d.IRInst, 0);
+    if (cast(i64, fl) != 0) {
+        // The other operand into acc, the load as the memory operand.
+        let is d.Operand as other with mut = inst.src1;
+        if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg == fl.dest.vreg) { other = inst.src2; }
+        if (other.op_type == d.OP_FCONST) {
+            eo.out_str("  movsd ", 8); eo.out_cstr(acc); eo.out_str(", ", 2);
+            eo.fc_out_ref(other.imm); eo.out_char(10);
+        } else {
+            e.load_op_xmm(other.vreg, ctx, acc);
+        }
+        _fl_op(op_name, acc, fl, ctx);
+        e.store_op_xmm(inst.dest.vreg, ctx, acc);
+        return;
+    }
+    if (inst.src1.op_type == d.OP_FCONST) {
+        eo.out_str("  movsd ", 8); eo.out_cstr(acc); eo.out_str(", ", 2);
+        eo.fc_out_ref(inst.src1.imm); eo.out_char(10);
+    } else {
+        e.load_op_xmm(inst.src1.vreg, ctx, acc);
+    }
+    if (inst.src2.op_type == d.OP_FCONST) {
+        eo.out_str("  ", 2); eo.out_cstr(op_name); eo.out_str(" ", 1);
+        eo.out_cstr(acc); eo.out_str(", ", 2);
+        eo.fc_out_ref(inst.src2.imm); eo.out_char(10);
+        e.store_op_xmm(inst.dest.vreg, ctx, acc);
+        return;
+    }
     let is i32 as s2loc = al.get_loc(inst.src2.vreg, ctx);
     if (s2loc < 0) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - s2loc) * 8;
@@ -1255,10 +1460,13 @@ fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as 
     let is *u8 as b with mut = "xmm1";
     let is i32 as spilled2 with mut = 0;
     let is i64 as off2 with mut = 0;
+    let is i32 as fconst2 = inst.src2.op_type == d.OP_FCONST;
     if (inst.src2.op_type == d.OP_IMM) {
         eo.out_str("  mov rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
         eo.out_line("movq xmm1, rcx");
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+    } else if (fconst2 == 1) {
+        // the pool constant is the memory operand (fconst_fold)
     } else if (sg2 == 1 && both == 0) {
         _widen_single(inst.src2.vreg, ctx, "xmm1");
     } else {
@@ -1273,7 +1481,8 @@ fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as 
     }
     if (both == 1) { eo.out_str("  ucomiss ", 10); } else { eo.out_str("  ucomisd ", 10); }
     eo.out_cstr(a); eo.out_str(", ", 2);
-    if (spilled2 == 1) {
+    if (fconst2 == 1) { eo.fc_out_ref(inst.src2.imm); }
+    else if (spilled2 == 1) {
         if (both == 1) { eo.out_str("DWORD PTR [", 11); } else { eo.out_str("QWORD PTR [", 11); }
         eo.out_fp(off2); eo.out_str("]", 1);
     }
@@ -1636,6 +1845,20 @@ fn gen_inst_shift_bitwise(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     e.store_op(inst.dest.vreg, ctx, scr);
 }
 
+// x = rol(src1, k) in the width of cast_to (emit_driver.cst rol_fold). A
+// 32-bit rotate leaves the upper half zero.
+fn gen_inst_rol(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as si = e.get_scratch_idx(inst.dest.vreg, ctx);
+    let is *u8 as scr = eo.reg64(si);
+    e.load_op(inst.src1.vreg, ctx, scr);
+    eo.out_str("  rol ", 6);
+    if (e.get_type_size(inst.cast_to) == 4) { eo.out_cstr(eo.reg32(si)); } else { eo.out_cstr(scr); }
+    eo.out_str(", ", 2);
+    eo.out_int(inst.src2.imm);
+    eo.out_char(10);
+    e.store_op(inst.dest.vreg, ctx, scr);
+}
+
 // === gen_inst: RET, LABEL, JMP, JZ, JNZ ===
 
 fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
@@ -1913,11 +2136,15 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     }
     if (op == d.IR_LOAD) {
         let is i32 as sz = e.get_type_size(inst.cast_to);
-        let is i32 as sgn = e.is_signed_type(inst.cast_to);
+        let is i32 as sgn with mut = e.is_signed_type(inst.cast_to);
+        // an i32 whose readers look at its low half only (e.lz_init): no movsxd
+        if (sz == 4 && sgn == 1 && e.lz_lazy_inst(inst) == 1) { sgn = 0; }
         // Fast path for float loads when the dest vreg lives in an xmm:
         // `movsd xmm_dest, [addr]` for f64, and for f32 the widening
         // `cvtss2sd xmm_dest, [addr]` (float vregs hold f64 values), instead
         // of going through a general register.
+        if (sz == 8 && e.is_float_type(inst.cast_to) == 1 && fl_try_defer(inst) == 1) { return; }
+        if (il_try_defer(inst) == 1) { return; }
         if ((sz == 8 || sz == 4) && e.is_float_type(inst.cast_to) == 1) {
             let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
             let is i32 as dest_is_xmm with mut = 0;
@@ -1938,7 +2165,10 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                     if (e.f32s_is(inst.dest.vreg) == 1) { fld = "  movss "; }
                     else { _xmm_break_dep(dst_xmm); fld = "  cvtss2sd "; }
                 }
-                if (inst.src1.op_type == d.OP_VREG) {
+                if (inst.src1.op_type == d.OP_GSYM) {
+                    eo.out_cstr(fld); eo.out_cstr(dst_xmm);
+                    eo.out_cstr(fptr); eo.out_cstr(e.gsym_str(&inst.src1)); eo.out_str("]\n", 2);
+                } else if (inst.src1.op_type == d.OP_VREG) {
                     let is e.AddrMode as am with mut;
                     am.matched = 0;
                     if (al.al_opt_level >= 1) { am = e.try_match_addr(inst.src1.vreg, ctx); }
@@ -1949,7 +2179,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                         _am_open(fptr, amb, ami);
                         eo.out_int(cast(i64, am.scale)); eo.out_str("]\n", 2);
                     } else {
-                        let is *u8 as ar = e.op_reg(inst.src1.vreg, ctx, 0);
+                        let is *u8 as ar = e.addr_reg(inst.src1.vreg, ctx, 0);
                         eo.out_cstr(fld); eo.out_cstr(dst_xmm);
                         eo.out_cstr(fptr); eo.out_cstr(ar); eo.out_str("]\n", 2);
                     }
@@ -1969,10 +2199,10 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is i32 as si = e.get_scratch_idx(inst.dest.vreg, ctx);
         let is *u8 as scr = eo.reg64(si);
         let is *u8 as scr32 = eo.reg32(si);
-        if (inst.src1.op_type == d.OP_VREG) {
+        if (inst.src1.op_type == d.OP_VREG || inst.src1.op_type == d.OP_GSYM) {
             let is e.AddrMode as am with mut;
             am.matched = 0;
-            if (al.al_opt_level >= 1) {
+            if (al.al_opt_level >= 1 && inst.src1.op_type == d.OP_VREG) {
                 am = e.try_match_addr(inst.src1.vreg, ctx);
             }
             if (am.matched == 1) {
@@ -1993,7 +2223,7 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                     eo.out_str("  mov ", 6); eo.out_cstr(scr); _am_open(", QWORD PTR [", amb, ami); eo.out_int(cast(i64, am.scale)); eo.out_str("]\n", 2);
                 }
             } else {
-            let is *u8 as ar = e.addr_reg(inst.src1.vreg, ctx, si);
+            let is *u8 as ar = e.addr_of(&inst.src1, ctx, si);
             if (sz == 8) {
                 eo.out_str("  mov ", 6); eo.out_cstr(scr); eo.out_str(", QWORD PTR [", 13); eo.out_cstr(ar); eo.out_str("]\n", 2);
             } else if (sz == 4) {
@@ -2058,8 +2288,8 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 let is *u8 as fsv with mut = "xmm0";
                 if (e.f32s_is(inst.src1.vreg) == 1 && fsl >= 16 && fsl <= 31) { fsv = eo.reg_xmm(fsl); }
                 else { _load_f32_xmm(inst.src1.vreg, ctx, "xmm0"); }
-                if (inst.dest.op_type == d.OP_VREG) {
-                    let is *u8 as far = e.addr_reg(inst.dest.vreg, ctx, 1);
+                if (inst.dest.op_type == d.OP_VREG || inst.dest.op_type == d.OP_GSYM) {
+                    let is *u8 as far = e.addr_of(&inst.dest, ctx, 1);
                     eo.out_str("  movss DWORD PTR [", 19); eo.out_cstr(far); eo.out_str("], ", 3);
                 } else {
                     eo.out_str("  movss DWORD PTR [", 19); eo.out_fp(inst.dest.imm); eo.out_str("], ", 3);
@@ -2080,9 +2310,9 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 let is *u8 as src_xmm with mut = "xmm0";
                 if (sloc >= 16 && sloc <= 31) { src_xmm = eo.reg_xmm(sloc); }
                 else { e.load_op_xmm(inst.src1.vreg, ctx, "xmm0"); }
-                if (inst.dest.op_type == d.OP_VREG) {
-                    e.load_op(inst.dest.vreg, ctx, "rcx");
-                    eo.out_str("  movsd QWORD PTR [rcx], ", 25);
+                if (inst.dest.op_type == d.OP_VREG || inst.dest.op_type == d.OP_GSYM) {
+                    let is *u8 as dar = e.addr_of(&inst.dest, ctx, 1);
+                    eo.out_str("  movsd QWORD PTR [", 19); eo.out_cstr(dar); eo.out_str("], ", 3);
                     eo.out_cstr(src_xmm); eo.out_char(10);
                 } else {
                     eo.out_str("  movsd QWORD PTR [", 19);
@@ -2093,11 +2323,13 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             }
         }
         // Integer store of 1/2/4/8 bytes through a register address: value and
-        // address are read where they live.
-        if (inst.dest.op_type == d.OP_VREG && e.is_float_type(inst.cast_to) == 0
+        // address are read where they live. An f64 held in a general register
+        // is its own eight bytes and goes the same way.
+        if ((inst.dest.op_type == d.OP_VREG || inst.dest.op_type == d.OP_GSYM)
+            && (e.is_float_type(inst.cast_to) == 0 || sz == 8)
             && (sz == 1 || sz == 2 || sz == 4 || sz == 8)) {
             let is i32 as vi = e.op_reg_idx(inst.src1.vreg, ctx, 0);
-            let is *u8 as ar = e.addr_reg(inst.dest.vreg, ctx, 1);
+            let is *u8 as ar = e.addr_of(&inst.dest, ctx, 1);
             if (sz == 8) { eo.out_str("  mov QWORD PTR [", 17); }
             else if (sz == 4) { eo.out_str("  mov DWORD PTR [", 17); }
             else if (sz == 2) { eo.out_str("  mov WORD PTR [", 16); }
@@ -2118,8 +2350,13 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             eo.out_line("cvtsd2ss xmm0, xmm0");
             eo.out_line("movd eax, xmm0");
         }
-        if (inst.dest.op_type == d.OP_VREG) {
-            e.load_op(inst.dest.vreg, ctx, "rcx");
+        if (inst.dest.op_type == d.OP_VREG || inst.dest.op_type == d.OP_GSYM) {
+            if (inst.dest.op_type == d.OP_GSYM) {
+                eo.out_str("  lea rcx, [", 12); eo.out_cstr(e.gsym_str(&inst.dest)); eo.out_str("]\n", 2);
+                if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+            } else {
+                e.load_op(inst.dest.vreg, ctx, "rcx");
+            }
             if (sz == 8) { eo.out_line("mov QWORD PTR [rcx], rax"); }
             else if (sz == 4) { eo.out_line("mov DWORD PTR [rcx], eax"); }
             else if (sz == 2) { eo.out_line("mov WORD PTR [rcx], ax"); }
@@ -2189,6 +2426,37 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         return;
     }
     if (op == d.IR_COPY) {
+        // A small copy of known size moves through rax and xmm0, read and
+        // written where the two addresses already live; only a larger one
+        // takes `rep movsb`, which needs rdi, rsi and rcx (see al.copy_is_rep).
+        if (al.copy_is_rep(inst) == 0) {
+            let is *u8 as dn = eo.reg64(e.op_reg_idx(inst.dest.vreg, ctx, 1));
+            let is *u8 as sn = eo.reg64(e.op_reg_idx(inst.src1.vreg, ctx, 2));
+            let is i64 as total = inst.src2.imm;
+            let is i64 as off with mut = 0;
+            while (off < total) {
+                let is i64 as left = total - off;
+                let is i64 as w with mut = 1;
+                if (left >= 16) { w = 16; } else if (left >= 8) { w = 8; } else if (left >= 4) { w = 4; } else if (left >= 2) { w = 2; }
+                if (w == 16) {
+                    eo.out_str("  movdqu xmm0, [", 16); eo.out_cstr(sn); eo.out_str(" + ", 3); eo.out_int(off); eo.out_str("]\n", 2);
+                    eo.out_str("  movdqu [", 10); eo.out_cstr(dn); eo.out_str(" + ", 3); eo.out_int(off); eo.out_str("], xmm0\n", 8);
+                } else {
+                    let is *u8 as pw with mut = "BYTE";
+                    let is *u8 as rr with mut = "al";
+                    if (w == 8) { pw = "QWORD"; rr = "rax"; }
+                    else if (w == 4) { pw = "DWORD"; rr = "eax"; }
+                    else if (w == 2) { pw = "WORD"; rr = "ax"; }
+                    eo.out_str("  mov ", 6); eo.out_cstr(rr); eo.out_str(", ", 2); eo.out_cstr(pw);
+                    eo.out_str(" PTR [", 6); eo.out_cstr(sn); eo.out_str(" + ", 3); eo.out_int(off); eo.out_str("]\n", 2);
+                    eo.out_str("  mov ", 6); eo.out_cstr(pw); eo.out_str(" PTR [", 6); eo.out_cstr(dn);
+                    eo.out_str(" + ", 3); eo.out_int(off); eo.out_str("], ", 3); eo.out_cstr(rr); eo.out_char(10);
+                }
+                off = off + w;
+            }
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
+            return;
+        }
         e.load_op(inst.dest.vreg, ctx, "rdi");
         e.load_op(inst.src1.vreg, ctx, "rsi");
         eo.out_str("  mov rcx, ", 11);
