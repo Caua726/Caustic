@@ -1,4 +1,6 @@
 use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "dom.cst" as dom;
 
 // === Loop rotation: the test moves to the bottom of the loop ===
 //
@@ -237,28 +239,86 @@ fn _rot_one(func as *d.IRFunction, latch as *d.IRInst, hdr_lbl as i32) as i32 {
     return 1;
 }
 
+// Does block a dominate block b? (idom chain walk; entry == block 0)
+fn _rot_dom(blocks as *cfg.BasicBlock, a as i32, b as i32) as i32 {
+    if (a < 0 || b < 0) { return 0; }
+    if (a == 0) { return 1; }
+    let is i32 as x with mut = b;
+    while (x > 0) {
+        if (x == a) { return 1; }
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, x) * sizeof(cfg.BasicBlock));
+        if (bb.idom < 0 || bb.idom == x) { return 0; }
+        x = bb.idom;
+    }
+    return 0;
+}
+
 fn pass_rotate(func as *d.IRFunction) as void {
-    // Latches: for each header label, the last live jmp back to it.
+    // Latches: for each header label, the last live jmp back to it from a
+    // block the header dominates — a back edge. A jmp to the header from
+    // outside the loop (the vectorizer's exit from its wide loop into the
+    // scalar one for the remainder, say) enters the loop; rotating that one
+    // instead would leave the loop's own back edge a jmp to the test. A label
+    // with no such jmp keeps the last one, as before.
     let is i32 as lc = func.label_count + 1;
     let is *i32 as seen = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
     let is i64 as lat_sz = cast(i64, lc) * 8;
     let is *i64 as lat = cast(*i64, d.opt_alloc(lat_sz));
+    let is *i64 as back = cast(*i64, d.opt_alloc(lat_sz));
     let is i32 as i with mut = 0;
     while (i < lc) {
         _rot_put(seen, i, 0);
         let is *i64 as lp = cast(*i64, cast(i64, lat) + cast(i64, i) * 8); *lp = 0;
+        let is *i64 as bp = cast(*i64, cast(i64, back) + cast(i64, i) * 8); *bp = 0;
         i = i + 1;
     }
+    let is i32 as cfg_cap = cfg.count_blocks(func) + 1;
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg_cap) * sizeof(cfg.BasicBlock)));
+    let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as nblocks with mut = 0;
+    cfg.build_cfg(func, blocks, cfg_cap, &nblocks, label_to_bb);
+    if (nblocks > 0) {
+        let is i32 as max_edges = nblocks * 2 + 4;
+        let is *i32 as preds_arr = cast(*i32, d.opt_alloc(cast(i64, max_edges) * 4));
+        let is *i32 as pred_starts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+        let is *i32 as pred_counts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+        cfg.build_preds(blocks, nblocks, preds_arr, pred_starts, pred_counts);
+        let is *i32 as rpo_order = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
+        let is i32 as rpo_count with mut = 0;
+        cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
+        dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds_arr, pred_starts, pred_counts);
+        d.opt_free(cast(*u8, rpo_order));
+        d.opt_free(cast(*u8, pred_counts)); d.opt_free(cast(*u8, pred_starts)); d.opt_free(cast(*u8, preds_arr));
+    }
+    let is i32 as cur_blk with mut = 0;
+    let is i32 as next_bi with mut = 1;
     let is *d.IRInst as w with mut = func.instructions;
     while (cast(i64, w) != 0) {
+        if (next_bi < nblocks) {
+            let is *cfg.BasicBlock as nb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, next_bi) * sizeof(cfg.BasicBlock));
+            if (cast(i64, nb.first) == cast(i64, w)) { cur_blk = next_bi; next_bi = next_bi + 1; }
+        }
         if (w.op == d.IR_LABEL && w.dest.label >= 0 && w.dest.label < lc) { _rot_put(seen, w.dest.label, 1); }
         if (w.is_dead == 0 && w.op == d.IR_JMP && w.dest.op_type == d.OP_LABEL
             && w.dest.label >= 0 && w.dest.label < lc && _rot_get(seen, w.dest.label) == 1) {
             let is *i64 as lp = cast(*i64, cast(i64, lat) + cast(i64, w.dest.label) * 8);
             *lp = cast(i64, w);
+            if (nblocks > 0 && _rot_dom(blocks, _rot_get(label_to_bb, w.dest.label), cur_blk) == 1) {
+                let is *i64 as bp = cast(*i64, cast(i64, back) + cast(i64, w.dest.label) * 8);
+                *bp = cast(i64, w);
+            }
         }
         w = w.next;
     }
+    i = 0;
+    while (i < lc) {
+        let is *i64 as lp = cast(*i64, cast(i64, lat) + cast(i64, i) * 8);
+        let is *i64 as bp = cast(*i64, cast(i64, back) + cast(i64, i) * 8);
+        if (*bp != 0) { *lp = *bp; }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, back));
+    d.opt_free(cast(*u8, label_to_bb)); d.opt_free(cast(*u8, blocks));
     let is i32 as done with mut = 0;
     i = 0;
     while (i < lc && done < ROT_MAX_LOOPS) {
