@@ -1,0 +1,647 @@
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "phi.cst" as phi;
+use "../parser/ast.cst" as ast;
+
+// === SCCP: sparse conditional constant propagation (Wegman-Zadeck) ===
+//
+// Runs on the SSA form, between construction and destruction. Every vreg sits
+// in a lattice: TOP (no value seen yet), CONST c, or BOTTOM (more than one
+// value, or one this pass does not compute). Two worklists drive it: a block
+// becomes executable when an edge into it does, and is then evaluated whole;
+// a vreg whose value drops sends its uses (in executable blocks) back to be
+// evaluated. A phi merges only the arguments that come over executable edges
+// (an undefined argument is ignored); a branch on a constant marks one edge.
+//
+// Then the results are written into the IR: a definition with a constant
+// value becomes `IMM dest = c` (a constant phi becomes one right after its
+// block's phis), a branch on a constant becomes a jump or disappears, and the
+// blocks never reached are unlinked — with the phi arguments that came from
+// them or over a folded edge.
+//
+// Values follow what the code generator computes: integer arithmetic in 64
+// bits, then truncated and extended to the width and signedness of cast_to;
+// a right shift is arithmetic for a signed type (or none), logical otherwise;
+// shift counts are taken mod 64; NOT is not re-extended; a compare is signed
+// for a signed type (or none), unsigned otherwise, and gives 0 or 1. Floats
+// are never computed.
+// A vreg with no definition, or more than one, is BOTTOM.
+
+let is i8 as L_TOP with imut = 0;
+let is i8 as L_CONST with imut = 1;
+let is i8 as L_BOT with imut = 2;
+
+struct Sccp {
+    func as *d.IRFunction;
+    nv as i32;
+    st as *i8;              // lattice state per vreg
+    val as *i64;            // constant per vreg
+    ninst as i32;
+    insts as *i64;          // instruction pointers, list order
+    iblk as *i32;           // block of each instruction
+    defi as *i32;           // defining instruction index per vreg (-1)
+    ustart as *i32;         // uses of vreg v: uidx[ustart[v] .. ustart[v+1])
+    uidx as *i32;
+    blocks as *cfg.BasicBlock;
+    nb as i32;
+    label_to_bb as *i32;
+    nlabels as i32;
+    exec_b as *u8;
+    exec_e as *u8;          // [2*b + k]: edge to succ0 (k=0) / succ1 (k=1) taken
+    bwl as *i32;            // block worklist
+    bwl_n as i32;
+    bwl_cap as i32;
+    vwl as *i32;            // vreg worklist
+    vwl_n as i32;
+    vwl_cap as i32;
+}
+
+fn _blk(s as *Sccp, b as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, s.blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+}
+
+fn _inst(s as *Sccp, i as i32) as *d.IRInst { return cast(*d.IRInst, s.insts[i]); }
+
+fn _push_b(s as *Sccp, b as i32) as void {
+    if (s.bwl_n >= s.bwl_cap) {
+        let is i32 as nc = s.bwl_cap * 2 + 16;
+        let is *i32 as np = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is i32 as k with mut = 0;
+        while (k < s.bwl_n) { np[k] = s.bwl[k]; k = k + 1; }
+        if (s.bwl_cap > 0) { d.opt_free(cast(*u8, s.bwl)); }
+        s.bwl = np; s.bwl_cap = nc;
+    }
+    s.bwl[s.bwl_n] = b;
+    s.bwl_n = s.bwl_n + 1;
+}
+
+fn _push_v(s as *Sccp, v as i32) as void {
+    if (s.vwl_n >= s.vwl_cap) {
+        let is i32 as nc = s.vwl_cap * 2 + 16;
+        let is *i32 as np = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is i32 as k with mut = 0;
+        while (k < s.vwl_n) { np[k] = s.vwl[k]; k = k + 1; }
+        if (s.vwl_cap > 0) { d.opt_free(cast(*u8, s.vwl)); }
+        s.vwl = np; s.vwl_cap = nc;
+    }
+    s.vwl[s.vwl_n] = v;
+    s.vwl_n = s.vwl_n + 1;
+}
+
+// Lower v to (state, value); a change sends v's uses back to the worklist.
+fn _set(s as *Sccp, v as i32, nst as i8, nval as i64) as void {
+    if (v < 0 || v >= s.nv) { return; }
+    let is i8 as cur = s.st[v];
+    if (cur == L_BOT) { return; }
+    let is i8 as ns with mut = nst;
+    if (cur == L_CONST) {
+        if (ns == L_TOP) { return; }
+        if (ns == L_CONST && nval == s.val[v]) { return; }
+        ns = L_BOT;
+    } else if (ns == L_TOP) {
+        return;
+    }
+    s.st[v] = ns;
+    s.val[v] = nval;
+    _push_v(s, v);
+}
+
+fn _mark_edge(s as *Sccp, b as i32, k as i32) as void {
+    let is i32 as e = 2 * b + k;
+    if (s.exec_e[e] == cast(u8, 1)) { return; }
+    s.exec_e[e] = cast(u8, 1);
+    let is *cfg.BasicBlock as bb = _blk(s, b);
+    let is i32 as t with mut = bb.succ0;
+    if (k == 1) { t = bb.succ1; }
+    if (t >= 0) { _push_b(s, t); }
+}
+
+// Is the edge from block p into block t executable?
+fn _edge_live(s as *Sccp, p as i32, t as i32) as i32 {
+    let is *cfg.BasicBlock as pb = _blk(s, p);
+    if (pb.succ0 == t && s.exec_e[2 * p] == cast(u8, 1)) { return 1; }
+    if (pb.succ1 == t && s.exec_e[2 * p + 1] == cast(u8, 1)) { return 1; }
+    return 0;
+}
+
+// --- value helpers ---
+
+fn _ty_kind(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0 - 1; }
+    return cast(*ast.Type, t).kind;
+}
+
+// Can a value of this type be computed here? (integers, bool, char, pointers)
+fn _ty_ok(t as *u8) as i32 {
+    let is i32 as k = _ty_kind(t);
+    if (k == 0 - 1) { return 1; }
+    if (k >= ast.TY_I8 && k <= ast.TY_U64) { return 1; }
+    if (k == ast.TY_BOOL || k == ast.TY_CHAR || k == ast.TY_PTR) { return 1; }
+    return 0;
+}
+
+fn _ty_signed(t as *u8) as i32 {
+    let is i32 as k = _ty_kind(t);
+    if (k == 0 - 1) { return 1; }
+    if (k >= ast.TY_I8 && k <= ast.TY_I64) { return 1; }
+    return 0;
+}
+
+// The canonical register form of v as a value of type t.
+fn _narrow(v as i64, t as *u8) as i64 {
+    if (cast(i64, t) == 0) { return v; }
+    let is i32 as sz = cast(*ast.Type, t).size;
+    if (sz >= 8 || sz <= 0) { return v; }
+    let is i32 as sg = _ty_signed(t);
+    if (sz == 4) {
+        if (sg == 1) { return ((v & 4294967295) ^ 2147483648) - 2147483648; }
+        return v & 4294967295;
+    }
+    if (sz == 2) {
+        if (sg == 1) { return ((v & 65535) ^ 32768) - 32768; }
+        return v & 65535;
+    }
+    if (sz == 1) {
+        if (sg == 1) { return ((v & 255) ^ 128) - 128; }
+        return v & 255;
+    }
+    return v;
+}
+
+// a < b as unsigned 64-bit numbers
+fn _ult(a as i64, b as i64) as i32 {
+    let is i64 as m = 0 - 9223372036854775807 - 1;
+    return cast(i32, (a ^ m) < (b ^ m));
+}
+
+fn _lshr(a as i64, n as i64) as i64 {
+    if (n == 0) { return a; }
+    return (a >> n) & ((cast(i64, 1) << (64 - n)) - 1);
+}
+
+// Operand -> (state, value)
+fn _opnd(s as *Sccp, o as *d.Operand, out as *i64) as i8 {
+    if (o.op_type == d.OP_IMM) { *out = o.imm; return L_CONST; }
+    if (o.op_type != d.OP_VREG) { return L_BOT; }
+    let is i32 as v = o.vreg;
+    if (v < 0 || v >= s.nv) { return L_BOT; }
+    *out = s.val[v];
+    return s.st[v];
+}
+
+fn _eval_phi(s as *Sccp, p as *d.IRInst, b as i32) as void {
+    let is i8 as rs with mut = L_TOP;
+    let is i64 as rv with mut = 0;
+    let is i32 as n = phi.phi_nargs(p);
+    let is i32 as k with mut = 0;
+    while (k < n && rs != L_BOT) {
+        let is i32 as l = phi.phi_label(p, k);
+        let is i32 as v = phi.phi_val(p, k);
+        if (l >= 0 && l < s.nlabels && v >= 0) {
+            let is i32 as pb = s.label_to_bb[l];
+            if (pb >= 0 && _edge_live(s, pb, b) == 1) {
+                let is i8 as as_ with mut = L_BOT;
+                let is i64 as av with mut = 0;
+                if (v < s.nv) { as_ = s.st[v]; av = s.val[v]; }
+                if (as_ == L_BOT) { rs = L_BOT; }
+                else if (as_ == L_CONST) {
+                    if (rs == L_TOP) { rs = L_CONST; rv = av; }
+                    else if (rv != av) { rs = L_BOT; }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    _set(s, p.dest.vreg, rs, rv);
+}
+
+fn _eval(s as *Sccp, it as *d.IRInst, b as i32) as void {
+    let is i32 as op = it.op;
+    if (op == d.IR_PHI) { _eval_phi(s, it, b); return; }
+    if (op == d.IR_JMP) { _mark_edge(s, b, 0); return; }
+    if (op == d.IR_JZ || op == d.IR_JNZ) {
+        let is i64 as c with mut = 0;
+        let is i8 as cs = _opnd(s, &it.src1, &c);
+        if (cs == L_BOT) { _mark_edge(s, b, 0); _mark_edge(s, b, 1); }
+        else if (cs == L_CONST) {
+            let is i32 as taken with mut = 0;
+            if (op == d.IR_JZ && c == 0) { taken = 1; }
+            if (op == d.IR_JNZ && c != 0) { taken = 1; }
+            if (taken == 1) { _mark_edge(s, b, 1); } else { _mark_edge(s, b, 0); }
+        }
+        return;
+    }
+    if (op == d.IR_RET) { return; }
+    if (phi_is_def(it) == 0) { return; }
+    let is i32 as dv = it.dest.vreg;
+    let is i64 as a with mut = 0;
+    let is i64 as bv with mut = 0;
+    if (op == d.IR_IMM) {
+        if (it.src1.op_type == d.OP_IMM) { _set(s, dv, L_CONST, it.src1.imm); } else { _set(s, dv, L_BOT, 0); }
+        return;
+    }
+    if (op == d.IR_MOV) {
+        let is i8 as as_ = _opnd(s, &it.src1, &a);
+        _set(s, dv, as_, a);
+        return;
+    }
+    if (op == d.IR_CAST) {
+        if (_ty_ok(it.cast_to) == 0 || _ty_ok(it.cast_from) == 0 || cast(i64, it.cast_to) == 0) { _set(s, dv, L_BOT, 0); return; }
+        let is i8 as as_ = _opnd(s, &it.src1, &a);
+        if (as_ == L_CONST) { _set(s, dv, L_CONST, _narrow(a, it.cast_to)); } else { _set(s, dv, as_, 0); }
+        return;
+    }
+    let is i32 as unary = cast(i32, op == d.IR_NEG || op == d.IR_NOT);
+    let is i32 as binary = cast(i32, op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_DIV
+        || op == d.IR_MOD || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR
+        || op == d.IR_SHL || op == d.IR_SHR);
+    let is i32 as cmp = cast(i32, op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE
+        || op == d.IR_GT || op == d.IR_GE);
+    if ((unary == 0 && binary == 0 && cmp == 0) || _ty_ok(it.cast_to) == 0) { _set(s, dv, L_BOT, 0); return; }
+    let is i8 as as_ = _opnd(s, &it.src1, &a);
+    let is i8 as bs with mut = L_CONST;
+    if (unary == 0) { bs = _opnd(s, &it.src2, &bv); }
+    // x * 0 and x & 0 are 0 whatever x is
+    if ((op == d.IR_MUL || op == d.IR_AND)
+        && ((as_ == L_CONST && a == 0) || (bs == L_CONST && bv == 0))) {
+        _set(s, dv, L_CONST, 0);
+        return;
+    }
+    if (as_ == L_BOT || bs == L_BOT) { _set(s, dv, L_BOT, 0); return; }
+    if (as_ == L_TOP || bs == L_TOP) { return; }
+    let is i64 as r with mut = 0;
+    if (cmp == 1) {
+        let is i32 as lt with mut = 0;
+        let is i32 as gt with mut = 0;
+        if (_ty_signed(it.cast_to) == 1) { lt = cast(i32, a < bv); gt = cast(i32, a > bv); }
+        else { lt = _ult(a, bv); gt = _ult(bv, a); }
+        let is i32 as res with mut = 0;
+        if (op == d.IR_EQ) { res = cast(i32, a == bv); }
+        if (op == d.IR_NE) { res = cast(i32, a != bv); }
+        if (op == d.IR_LT) { res = lt; }
+        if (op == d.IR_LE) { res = cast(i32, gt == 0); }
+        if (op == d.IR_GT) { res = gt; }
+        if (op == d.IR_GE) { res = cast(i32, lt == 0); }
+        _set(s, dv, L_CONST, cast(i64, res));
+        return;
+    }
+    if (op == d.IR_NEG) { r = 0 - a; }
+    // `not` is the one operation the code generator does not re-extend
+    if (op == d.IR_NOT) { _set(s, dv, L_CONST, a ^ (0 - 1)); return; }
+    if (op == d.IR_ADD) { r = a + bv; }
+    if (op == d.IR_SUB) { r = a - bv; }
+    if (op == d.IR_MUL) { r = a * bv; }
+    if (op == d.IR_AND) { r = a & bv; }
+    if (op == d.IR_OR) { r = a | bv; }
+    if (op == d.IR_XOR) { r = a ^ bv; }
+    if (op == d.IR_SHL) { r = a << (bv & 63); }
+    if (op == d.IR_SHR) {
+        if (_ty_signed(it.cast_to) == 1) { r = a >> (bv & 63); } else { r = _lshr(a, bv & 63); }
+    }
+    if (op == d.IR_DIV || op == d.IR_MOD) {
+        let is i64 as minv = 0 - 9223372036854775807 - 1;
+        if (bv == 0) { _set(s, dv, L_BOT, 0); return; }
+        if (_ty_signed(it.cast_to) == 1) {
+            if (a == minv && bv == 0 - 1) { _set(s, dv, L_BOT, 0); return; }
+        } else if (a < 0 || bv < 0) {
+            _set(s, dv, L_BOT, 0); return;
+        }
+        if (op == d.IR_DIV) { r = a / bv; } else { r = a % bv; }
+    }
+    _set(s, dv, L_CONST, _narrow(r, it.cast_to));
+}
+
+fn phi_is_def(it as *d.IRInst) as i32 {
+    if (it.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = it.op;
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) { return 0; }
+    return 1;
+}
+
+fn _visit_block(s as *Sccp, b as i32) as void {
+    let is *cfg.BasicBlock as bb = _blk(s, b);
+    let is *d.IRInst as it with mut = bb.first;
+    let is i32 as done with mut = 0;
+    while (done == 0) {
+        if (it.is_dead == 0) { _eval(s, it, b); }
+        if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+    }
+    // a block that does not end in a jump or return falls through
+    let is *d.IRInst as last = bb.last;
+    let is i32 as lop = last.op;
+    if ((lop != d.IR_JMP && lop != d.IR_JZ && lop != d.IR_JNZ && lop != d.IR_RET) || last.is_dead == 1) {
+        _mark_edge(s, b, 0);
+    }
+}
+
+fn _visit_phis(s as *Sccp, b as i32) as void {
+    let is *cfg.BasicBlock as bb = _blk(s, b);
+    let is *d.IRInst as it with mut = bb.first;
+    let is i32 as done with mut = 0;
+    if (it.op == d.IR_LABEL) {
+        if (cast(i64, it) == cast(i64, bb.last)) { return; }
+        it = it.next;
+    }
+    while (done == 0) {
+        if (it.op != d.IR_PHI) { return; }
+        if (it.is_dead == 0) { _eval_phi(s, it, b); }
+        if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+    }
+}
+
+fn _unlink_after(func as *d.IRFunction, prev as *d.IRInst, it as *d.IRInst) as void {
+    if (cast(i64, prev) == 0) { func.instructions = it.next; } else { prev.next = it.next; }
+}
+
+// Drop the arguments of block t's phis that come from block p (label pl).
+fn _drop_args(s as *Sccp, t as i32, pl as i32) as void {
+    let is *cfg.BasicBlock as tb = _blk(s, t);
+    let is *d.IRInst as it with mut = tb.first;
+    if (it.op == d.IR_LABEL) { it = it.next; }
+    while (cast(i64, it) != 0 && it.op == d.IR_PHI) {
+        let is i32 as k = phi.phi_find(it, pl);
+        if (k >= 0) { phi.phi_del(it, k); }
+        if (cast(i64, it) == cast(i64, tb.last)) { return; }
+        it = it.next;
+    }
+}
+
+fn _block_label(s as *Sccp, b as i32) as i32 {
+    let is *cfg.BasicBlock as bb = _blk(s, b);
+    if (bb.first.op == d.IR_LABEL) { return bb.first.dest.label; }
+    return 0 - 1;
+}
+
+fn pass_sccp(func as *d.IRFunction) as i32 {
+    let is i32 as nv = func.vreg_count;
+    if (nv == 0 || cast(i64, func.instructions) == 0) { return 0; }
+    let is Sccp as S;
+    let is *Sccp as s = &S;
+    s.func = func;
+    s.nv = nv;
+    s.bwl_n = 0; s.bwl_cap = 0; s.vwl_n = 0; s.vwl_cap = 0;
+
+    // CFG
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    s.blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    s.nlabels = func.label_count + 1;
+    s.label_to_bb = cast(*i32, d.opt_alloc(cast(i64, s.nlabels) * 4));
+    let is i32 as i with mut = 0;
+    while (i < s.nlabels) { s.label_to_bb[i] = 0 - 1; i = i + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, s.blocks, cap, &nb, s.label_to_bb);
+    s.nb = nb;
+
+    // instructions, their blocks, definitions
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) { n = n + 1; it = it.next; }
+    s.ninst = n;
+    s.insts = cast(*i64, d.opt_alloc(cast(i64, n + 1) * 8));
+    s.iblk = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as b with mut = 0;
+    i = 0;
+    while (b < nb) {
+        let is *cfg.BasicBlock as bb = _blk(s, b);
+        it = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0) {
+            s.insts[i] = cast(i64, it); s.iblk[i] = b; i = i + 1;
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        b = b + 1;
+    }
+    s.st = cast(*i8, d.opt_alloc(cast(i64, nv + 1)));
+    s.val = cast(*i64, d.opt_alloc(cast(i64, nv + 1) * 8));
+    s.defi = cast(*i32, d.opt_alloc(cast(i64, nv + 1) * 4));
+    let is *i32 as ndef = cast(*i32, d.opt_alloc(cast(i64, nv + 1) * 4));
+    let is *i32 as ucnt = cast(*i32, d.opt_alloc(cast(i64, nv + 1) * 4));
+    let is i32 as v with mut = 0;
+    while (v < nv) { ndef[v] = 0; ucnt[v] = 0; s.defi[v] = 0 - 1; s.val[v] = 0; v = v + 1; }
+    i = 0;
+    while (i < n) {
+        it = _inst(s, i);
+        if (it.is_dead == 0) {
+            if (phi_is_def(it) == 1 && it.dest.vreg >= 0 && it.dest.vreg < nv) {
+                ndef[it.dest.vreg] = ndef[it.dest.vreg] + 1;
+                s.defi[it.dest.vreg] = i;
+            }
+            _count_uses(it, ucnt, nv);
+        }
+        i = i + 1;
+    }
+    v = 0;
+    while (v < nv) {
+        if (ndef[v] == 1) { s.st[v] = L_TOP; } else { s.st[v] = L_BOT; }
+        v = v + 1;
+    }
+    s.ustart = cast(*i32, d.opt_alloc(cast(i64, nv + 2) * 4));
+    s.ustart[0] = 0;
+    v = 0;
+    while (v < nv) { s.ustart[v + 1] = s.ustart[v] + ucnt[v]; v = v + 1; }
+    v = 0;
+    while (v < nv) { ucnt[v] = 0; v = v + 1; }
+    s.uidx = cast(*i32, d.opt_alloc(cast(i64, s.ustart[nv] + 1) * 4));
+    i = 0;
+    while (i < n) {
+        it = _inst(s, i);
+        if (it.is_dead == 0) { _fill_uses(s, it, i, ucnt); }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, ndef));
+    d.opt_free(cast(*u8, ucnt));
+
+    s.exec_b = d.opt_alloc(cast(i64, nb + 1));
+    s.exec_e = d.opt_alloc(cast(i64, 2 * nb + 2));
+    b = 0;
+    while (b < nb) { s.exec_b[b] = cast(u8, 0); s.exec_e[2 * b] = cast(u8, 0); s.exec_e[2 * b + 1] = cast(u8, 0); b = b + 1; }
+
+    // solve
+    _push_b(s, 0);
+    while (s.bwl_n > 0 || s.vwl_n > 0) {
+        while (s.bwl_n > 0) {
+            s.bwl_n = s.bwl_n - 1;
+            let is i32 as t = s.bwl[s.bwl_n];
+            if (s.exec_b[t] == cast(u8, 0)) { s.exec_b[t] = cast(u8, 1); _visit_block(s, t); }
+            else { _visit_phis(s, t); }
+        }
+        if (s.vwl_n > 0) {
+            s.vwl_n = s.vwl_n - 1;
+            let is i32 as x = s.vwl[s.vwl_n];
+            let is i32 as k with mut = s.ustart[x];
+            while (k < s.ustart[x + 1]) {
+                let is i32 as ui = s.uidx[k];
+                let is i32 as ub = s.iblk[ui];
+                if (s.exec_b[ub] == cast(u8, 1)) { _eval(s, _inst(s, ui), ub); }
+                k = k + 1;
+            }
+        }
+    }
+
+    let is i32 as changed = _rewrite(s);
+
+    d.opt_free(cast(*u8, s.blocks)); d.opt_free(cast(*u8, s.label_to_bb));
+    d.opt_free(cast(*u8, s.insts)); d.opt_free(cast(*u8, s.iblk));
+    d.opt_free(cast(*u8, s.st)); d.opt_free(cast(*u8, s.val)); d.opt_free(cast(*u8, s.defi));
+    d.opt_free(cast(*u8, s.ustart)); d.opt_free(cast(*u8, s.uidx));
+    d.opt_free(s.exec_b); d.opt_free(s.exec_e);
+    if (s.bwl_cap > 0) { d.opt_free(cast(*u8, s.bwl)); }
+    if (s.vwl_cap > 0) { d.opt_free(cast(*u8, s.vwl)); }
+    return changed;
+}
+
+fn _count_one(o as *d.Operand, ucnt as *i32, nv as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < nv) { ucnt[o.vreg] = ucnt[o.vreg] + 1; }
+}
+
+fn _count_uses(it as *d.IRInst, ucnt as *i32, nv as i32) as void {
+    if (it.op == d.IR_PHI) {
+        let is i32 as k with mut = 0;
+        while (k < phi.phi_nargs(it)) {
+            let is i32 as v = phi.phi_val(it, k);
+            if (v >= 0 && v < nv) { ucnt[v] = ucnt[v] + 1; }
+            k = k + 1;
+        }
+        return;
+    }
+    _count_one(&it.src1, ucnt, nv);
+    _count_one(&it.src2, ucnt, nv);
+    if (it.dest.op_type == d.OP_VREG && phi_is_def(it) == 0) { _count_one(&it.dest, ucnt, nv); }
+}
+
+fn _fill_one(s as *Sccp, o as *d.Operand, i as i32, ucnt as *i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < s.nv) {
+        let is i32 as v = o.vreg;
+        s.uidx[s.ustart[v] + ucnt[v]] = i;
+        ucnt[v] = ucnt[v] + 1;
+    }
+}
+
+fn _fill_uses(s as *Sccp, it as *d.IRInst, i as i32, ucnt as *i32) as void {
+    if (it.op == d.IR_PHI) {
+        let is i32 as k with mut = 0;
+        while (k < phi.phi_nargs(it)) {
+            let is i32 as v = phi.phi_val(it, k);
+            if (v >= 0 && v < s.nv) { s.uidx[s.ustart[v] + ucnt[v]] = i; ucnt[v] = ucnt[v] + 1; }
+            k = k + 1;
+        }
+        return;
+    }
+    _fill_one(s, &it.src1, i, ucnt);
+    _fill_one(s, &it.src2, i, ucnt);
+    if (it.dest.op_type == d.OP_VREG && phi_is_def(it) == 0) { _fill_one(s, &it.dest, i, ucnt); }
+}
+
+// The definition keeps its types, as the constant folding after it does: an
+// IMM that came from `cast(u8, 0)` stays apart from a plain IMM 0 in local
+// CSE, so it stays next to the store that reads it (and fuses with it).
+fn _to_imm(it as *d.IRInst, c as i64) as void {
+    it.op = cast(i8, d.IR_IMM);
+    it.src1 = d.op_imm(c);
+    it.src2 = d.op_none();
+}
+
+// Write the solution into the IR. Returns 1 if anything changed.
+fn _rewrite(s as *Sccp) as i32 {
+    let is *d.IRFunction as func = s.func;
+    let is i32 as changed with mut = 0;
+    let is i32 as b with mut = 0;
+    while (b < s.nb) {
+        let is *cfg.BasicBlock as bb = _blk(s, b);
+        if (s.exec_b[b] == cast(u8, 1)) {
+            // constants; a constant phi becomes an IMM after the block's phis
+            let is *d.IRInst as phi_end with mut = bb.first;
+            let is *d.IRInst as it with mut = bb.first;
+            if (it.op == d.IR_LABEL && cast(i64, it) != cast(i64, bb.last)) {
+                let is *d.IRInst as q with mut = it.next;
+                let is i32 as qd with mut = 0;
+                while (qd == 0 && q.op == d.IR_PHI) {
+                    phi_end = q;
+                    if (cast(i64, q) == cast(i64, bb.last)) { qd = 1; } else { q = q.next; }
+                }
+            }
+            let is *d.IRInst as ins_at with mut = phi_end;
+            let is i32 as done with mut = 0;
+            while (done == 0) {
+                let is i32 as is_last = cast(i32, cast(i64, it) == cast(i64, bb.last));
+                let is *d.IRInst as nx = it.next;
+                if (it.op == d.IR_PHI) {
+                    let is i32 as pv = it.dest.vreg;
+                    if (it.is_dead == 0 && pv >= 0 && pv < s.nv && s.st[pv] == L_CONST) {
+                        it.is_dead = cast(i8, 1);
+                        let is *d.IRInst as im = d.new_inst(d.IR_IMM);
+                        im.dest = d.op_vreg(pv);
+                        im.src1 = d.op_imm(s.val[pv]);
+                        cfg.insert_after(ins_at, im);
+                        if (cast(i64, ins_at) == cast(i64, bb.last)) { bb.last = im; }
+                        ins_at = im;
+                        changed = 1;
+                    }
+                } else if (it.op != d.IR_LABEL && it.is_dead == 0 && phi_is_def(it) == 1 && it.op != d.IR_IMM) {
+                    let is i32 as dv = it.dest.vreg;
+                    if (dv >= 0 && dv < s.nv && s.st[dv] == L_CONST) { _to_imm(it, s.val[dv]); changed = 1; }
+                }
+                // (the IMMs written after the phis are past phi_end: skipped
+                // when the walk gets there, they are not PHI and already IMM)
+                if (is_last == 1) { done = 1; } else { it = nx; }
+            }
+            // a branch on a constant
+            let is *d.IRInst as last = bb.last;
+            if (last.is_dead == 0 && (last.op == d.IR_JZ || last.op == d.IR_JNZ) && bb.succ0 != bb.succ1) {
+                let is i32 as e0 = cast(i32, s.exec_e[2 * b] == cast(u8, 1));
+                let is i32 as e1 = cast(i32, s.exec_e[2 * b + 1] == cast(u8, 1));
+                let is i32 as bl = _block_label(s, b);
+                if (e1 == 1 && e0 == 0) {
+                    last.op = cast(i8, d.IR_JMP);
+                    last.src1 = d.op_none();
+                    if (bb.succ0 >= 0 && bl >= 0) { _drop_args(s, bb.succ0, bl); }
+                    changed = 1;
+                } else if (e0 == 1 && e1 == 0) {
+                    // falls through: the branch goes (unlinked, not left dead —
+                    // a dead branch still ends a block for the CFG builders)
+                    let is *d.IRInst as pv2 with mut = bb.first;
+                    while (cast(i64, pv2.next) != cast(i64, last)) { pv2 = pv2.next; }
+                    pv2.next = last.next;
+                    bb.last = pv2;
+                    if (bb.succ1 >= 0 && bl >= 0) { _drop_args(s, bb.succ1, bl); }
+                    changed = 1;
+                }
+            }
+        }
+        b = b + 1;
+    }
+    // unreachable blocks: their arguments in reachable phis, then the blocks
+    b = 0;
+    while (b < s.nb) {
+        if (s.exec_b[b] == cast(u8, 0)) {
+            let is *cfg.BasicBlock as bb = _blk(s, b);
+            let is i32 as bl = _block_label(s, b);
+            if (bl >= 0) {
+                if (bb.succ0 >= 0 && s.exec_b[bb.succ0] == cast(u8, 1)) { _drop_args(s, bb.succ0, bl); }
+                if (bb.succ1 >= 0 && s.exec_b[bb.succ1] == cast(u8, 1)) { _drop_args(s, bb.succ1, bl); }
+            }
+        }
+        b = b + 1;
+    }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    b = 0;
+    while (b < s.nb) {
+        let is *cfg.BasicBlock as bb = _blk(s, b);
+        let is *d.IRInst as stop = bb.last.next;
+        if (s.exec_b[b] == cast(u8, 0)) {
+            let is *d.IRInst as it with mut = bb.first;
+            while (cast(i64, it) != cast(i64, stop)) {
+                let is *d.IRInst as nx = it.next;
+                if (it.op == d.IR_PHI) { phi.phi_free(it); }
+                it = nx;
+            }
+            if (cast(i64, prev) == 0) { func.instructions = stop; } else { prev.next = stop; }
+            changed = 1;
+        } else {
+            prev = bb.last;
+        }
+        b = b + 1;
+    }
+    return changed;
+}

@@ -232,59 +232,82 @@ fn _ren(o as *d.Operand, uf as *i32, n as i32) as void {
     if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { o.vreg = _uf_find(uf, o.vreg); }
 }
 
-// Rename the versions back and drop the coalesced (non-slot) phis.
+// Rename the versions back. A version defined by an IMM keeps its own name:
+// the passes after destruction take an IMM for the only definition of its
+// vreg (local CSE and DCE both would break on `v = IMM` with v also defined
+// elsewhere), and constants are what SCCP writes. A phi that reads such a
+// version is left, renamed, for the copy pass to write `v = version` on that
+// edge; a phi left reading only its own web goes.
 fn ssa_coalesce(func as *d.IRFunction) as void {
     let is i32 as n = func.vreg_count;
+    if (ssa_orig_n == 0) { return; }
     let is *i32 as uf = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *u8 as excl = d.opt_alloc(cast(i64, n + 1));
     let is i32 as i with mut = 0;
-    while (i < n) { uf[i] = i; i = i + 1; }
-    let is i32 as any with mut = 0;
-    i = 0;
-    while (i < ssa_orig_n && i < n) {
-        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) { _uf_union(uf, i, ssa_orig[i]); any = 1; }
-        i = i + 1;
-    }
+    while (i < n) { uf[i] = i; excl[i] = cast(u8, 0); i = i + 1; }
     let is *d.IRInst as it with mut = func.instructions;
     while (cast(i64, it) != 0) {
-        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0) {
-            let is i32 as k with mut = 0;
-            while (k < phi_nargs(it)) {
-                let is i32 as v = phi_val(it, k);
-                if (v >= 0 && v < n) { _uf_union(uf, it.dest.vreg, v); }
-                k = k + 1;
-            }
-            any = 1;
+        if (it.is_dead == 0 && it.op == d.IR_IMM && it.dest.op_type == d.OP_VREG
+            && it.dest.vreg >= 0 && it.dest.vreg < n && it.dest.vreg < ssa_orig_n
+            && ssa_orig[it.dest.vreg] >= 0) {
+            excl[it.dest.vreg] = cast(u8, 1);
         }
         it = it.next;
     }
-    if (any == 1) {
-        let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
-        it = func.instructions;
-        while (cast(i64, it) != 0) {
-            let is *d.IRInst as nx = it.next;
-            if (it.op == d.IR_PHI && phi_is_slot(it) == 0) {
-                phi_free(it);
-                if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
-            } else {
-                _ren(&it.dest, uf, n);
-                _ren(&it.src1, uf, n);
-                _ren(&it.src2, uf, n);
-                if (it.op == d.IR_PHI) {
-                    let is i32 as k with mut = 0;
-                    while (k < phi_nargs(it)) {
-                        let is i32 as v = phi_val(it, k);
-                        if (v >= 0 && v < n) { phi_set_val(it, k, _uf_find(uf, v)); }
-                        k = k + 1;
-                    }
-                }
-                prev = it;
-            }
-            it = nx;
+    let is i32 as nexcl with mut = 0;
+    i = 0;
+    while (i < ssa_orig_n && i < n) {
+        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) {
+            if (excl[i] == cast(u8, 0)) { _uf_union(uf, i, ssa_orig[i]); } else { nexcl = nexcl + 1; }
         }
-        if (func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
+        i = i + 1;
     }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0 && excl[it.dest.vreg] == cast(u8, 0)) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n && excl[v] == cast(u8, 0)) { _uf_union(uf, it.dest.vreg, v); }
+                k = k + 1;
+            }
+        }
+        it = it.next;
+    }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as drop with mut = 0;
+        _ren(&it.dest, uf, n);
+        _ren(&it.src1, uf, n);
+        _ren(&it.src2, uf, n);
+        if (it.op == d.IR_PHI) {
+            let is i32 as need with mut = 0;
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n) {
+                    let is i32 as r = _uf_find(uf, v);
+                    phi_set_val(it, k, r);
+                    if (r != it.dest.vreg) { need = 1; }
+                }
+                k = k + 1;
+            }
+            if (phi_is_slot(it) == 0 && (need == 0 || it.is_dead == 1)) { drop = 1; }
+        }
+        if (drop == 1) {
+            phi_free(it);
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    if (nexcl == 0 && func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
     d.opt_free(cast(*u8, uf));
-    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
+    d.opt_free(excl);
+    d.opt_free(cast(*u8, ssa_orig));
     ssa_orig = cast(*i32, 0);
     ssa_orig_n = 0;
 }
@@ -613,9 +636,11 @@ fn ssa_destroy(func as *d.IRFunction) as void {
                                     let is i32 as k = phi_find(ph, pl);
                                     if (k >= 0) {
                                         let is i32 as v = phi_val(ph, k);
-                                        // a self-copy is written too: the passes after
-                                        // this one have always seen it
-                                        if (v >= 0) { pc_push(ph.dest.vreg, v, ph.cast_to, ph.cast_from); }
+                                        // a slot phi's self-copy is written too: the
+                                        // passes after this one have always seen it
+                                        if (v >= 0 && (phi_is_slot(ph) == 1 || v != ph.dest.vreg)) {
+                                            pc_push(ph.dest.vreg, v, ph.cast_to, ph.cast_from);
+                                        }
                                     }
                                 }
                             }
