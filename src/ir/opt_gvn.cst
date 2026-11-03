@@ -55,6 +55,27 @@ fn pass_gvn(func as *d.IRFunction) as void {
     cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
     dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds_arr, pred_starts, pred_counts);
 
+    // Loop headers: a block that dominates one of its predecessors. A value a
+    // header computes is never reused from another block: loop rotation
+    // (opt_rotate.cst, at codegen) copies the header's test to the bottom of
+    // the loop only when nothing else reads the header's values, and the
+    // header's work is the cheap test of the loop variable (anything
+    // invariant in it LICM has hoisted already).
+    let is *u8 as is_hdr = d.opt_alloc(cast(i64, nblocks) + 1);
+    let is i32 as hb with mut = 0;
+    while (hb < nblocks) {
+        is_hdr[hb] = cast(u8, 0);
+        let is i32 as pc = *(cast(*i32, cast(i64, pred_counts) + cast(i64, hb) * 4));
+        let is i32 as ps = *(cast(*i32, cast(i64, pred_starts) + cast(i64, hb) * 4));
+        let is i32 as pk with mut = 0;
+        while (pk < pc) {
+            let is i32 as p = *(cast(*i32, cast(i64, preds_arr) + cast(i64, ps + pk) * 4));
+            if (gvn_dominates(blocks, hb, p) == 1) { is_hdr[hb] = cast(u8, 1); }
+            pk = pk + 1;
+        }
+        hb = hb + 1;
+    }
+
     // --- per-vreg LIVE def counts + defining instruction (single-def filter,
     //     copy resolution). Dead defs (e.g. the IR's reused v0 = dead IMMs) are
     //     not counted, so an arg vreg copied into temps reads as single-def. ---
@@ -76,16 +97,17 @@ fn pass_gvn(func as *d.IRFunction) as void {
         ins = ins.next;
     }
     // On the SSA form a vreg that destruction gives several definitions (a
-    // version of a variable, a phi) is treated as one here already: such a
-    // value is a loop variable, and a copy of an earlier one in its place
-    // would turn the step an induction variable is recognized by into a MOV.
+    // version of a variable, a phi) is never replaced nor offered as a value:
+    // such a value is a loop variable, and a copy of an earlier one in its
+    // place would turn the step an induction variable is recognized by into a
+    // MOV. As an operand it is one value like any other (one definition, which
+    // dominates every use), so `CAST k` twice, or `j * M` twice, in a loop
+    // over k and j is computed once.
     let is *u8 as ml = phi.ssa_multi_like(func);
+    // same[v]: a CAST left in place whose value an earlier one computes.
+    let is *i32 as same = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
     i = 0;
-    while (i < vc) {
-        if (ml[i] == cast(u8, 1)) { let is *i32 as p = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4); *p = 2; }
-        i = i + 1;
-    }
-    d.opt_free(ml);
+    while (i < vc) { *(cast(*i32, cast(i64, same) + cast(i64, i) * 4)) = cast(i32, 0 - 1); i = i + 1; }
 
     // --- value table (open-addressed) ---
     let is i32 as cap with mut = 256;
@@ -121,21 +143,21 @@ fn pass_gvn(func as *d.IRFunction) as void {
             let is i32 as elig with mut = reach;
             if (inst.dest.op_type != d.OP_VREG) { elig = 0; }
             else if (gvn_defc(def_count, vc, inst.dest.vreg) != 1) { elig = 0; }
+            else if (ml[inst.dest.vreg] == cast(u8, 1)) { elig = 0; }
             if (elig == 1 && inst.src1.op_type == d.OP_VREG && gvn_defc(def_count, vc, inst.src1.vreg) != 1) { elig = 0; }
             if (elig == 1 && inst.src2.op_type == d.OP_VREG && gvn_defc(def_count, vc, inst.src2.vreg) != 1) { elig = 0; }
             if (elig == 1) {
                 let is i32 as s1t = cast(i32, inst.src1.op_type);
                 let is i64 as s1v with mut = 0;
-                if (s1t == d.OP_VREG) { s1v = cast(i64, gvn_resolve(def_inst, def_count, vc, inst.src1.vreg)); } else if (s1t == d.OP_IMM) { s1v = inst.src1.imm; }
+                if (s1t == d.OP_VREG) { s1v = cast(i64, gvn_resolve(def_inst, def_count, same, vc, inst.src1.vreg)); } else if (s1t == d.OP_IMM) { s1v = inst.src1.imm; }
                 let is i32 as s2t = cast(i32, inst.src2.op_type);
                 let is i64 as s2v with mut = 0;
-                if (s2t == d.OP_VREG) { s2v = cast(i64, gvn_resolve(def_inst, def_count, vc, inst.src2.vreg)); } else if (s2t == d.OP_IMM) { s2v = inst.src2.imm; }
-                // Reuse the operation key's low bit for precision: no extra
-                // table allocation, and f32/f64 are never interchangeable.
-                let is i32 as value_op with mut = inst.op * 2;
-                if (cast(i64, inst.cast_to) != 0 && cast(*ast.Type, inst.cast_to).kind == ast.TY_F32) {
-                    value_op = value_op + 1;
-                }
+                if (s2t == d.OP_VREG) { s2v = cast(i64, gvn_resolve(def_inst, def_count, same, vc, inst.src2.vreg)); } else if (s2t == d.OP_IMM) { s2v = inst.src2.imm; }
+                // The operation key carries the type: an i32 ADD and an i64
+                // ADD of the same operands are different values (the narrow
+                // one is extended from 32 bits), f32 and f64 are never
+                // interchangeable, and a CAST is its source and target types.
+                let is i32 as value_op = cast(i32, inst.op) * 4096 + gvn_type_key(inst);
                 let is i64 as hh with mut = cast(i64, value_op) * 1000003 + s1v * 131 + s2v * 17 + cast(i64, s1t) * 7 + cast(i64, s2t) * 3;
                 if (hh < 0) { hh = 0 - hh; }
                 let is i32 as slot with mut = cast(i32, hh & cast(i64, mask));
@@ -154,7 +176,19 @@ fn pass_gvn(func as *d.IRFunction) as void {
                             // key match — does its block dominate ours?
                             let is *i32 as blk_p = cast(*i32, cast(i64, h_blk) + cast(i64, slot) * 4);
                             let is *i32 as dst_p = cast(*i32, cast(i64, h_dst) + cast(i64, slot) * 4);
-                            if (gvn_dominates(blocks, *blk_p, cur_blk) == 1 && *dst_p != inst.dest.vreg) {
+                            let is i32 as dom_ok = cast(i32, gvn_dominates(blocks, *blk_p, cur_blk) == 1 && *dst_p != inst.dest.vreg);
+                            if (dom_ok == 1 && inst.op == d.IR_CAST) {
+                                // A CAST stays where it is: readers that are
+                                // not merged themselves (the step of an
+                                // induction variable, say) keep a conversion
+                                // the allocator folds into a register they
+                                // share. Its readers are keyed on the earlier
+                                // value, so whatever is computed from both is
+                                // merged, and a CAST left unread goes in DCE.
+                                let is *i32 as sp = cast(*i32, cast(i64, same) + cast(i64, inst.dest.vreg) * 4);
+                                *sp = *dst_p;
+                                found = 1;
+                            } else if (dom_ok == 1 && (*blk_p == cur_blk || is_hdr[*blk_p] == cast(u8, 0))) {
                                 // replace this computation with a copy of the dominating value
                                 inst.op = d.IR_MOV;
                                 inst.src1.op_type = d.OP_VREG; inst.src1.vreg = *dst_p;
@@ -205,6 +239,9 @@ fn pass_gvn(func as *d.IRFunction) as void {
     d.opt_free(cast(*u8, h_dst)); d.opt_free(cast(*u8, h_blk));
     d.opt_free(cast(*u8, def_inst));
     d.opt_free(cast(*u8, def_count));
+    d.opt_free(ml);
+    d.opt_free(cast(*u8, same));
+    d.opt_free(is_hdr);
     d.opt_free(cast(*u8, rpo_order));
     d.opt_free(cast(*u8, pred_counts)); d.opt_free(cast(*u8, pred_starts)); d.opt_free(cast(*u8, preds_arr));
     d.opt_free(cast(*u8, label_to_bb)); d.opt_free(cast(*u8, blocks));
@@ -215,23 +252,44 @@ fn pass_gvn(func as *d.IRFunction) as void {
 // (live), so the returned vreg holds a stable value identical to the input's —
 // making two operands that resolve to the same vreg provably equal. This is what
 // lets GVN see `v3=MOV(v0); v3+v4` and `v12=MOV(v0); v12+v13` as the same value.
-fn gvn_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
+fn gvn_resolve(def_inst as *i64, def_count as *i32, same as *i32, vc as i32, v as i32) as i32 {
     let is i32 as cur with mut = v;
     let is i32 as guard with mut = 0;
     while (guard < 64) {
         if (cur < 0 || cur >= vc) { return cur; }
-        let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
-        let is *d.IRInst as di = cast(*d.IRInst, *dip);
-        if (cast(i64, di) == 0) { return cur; }
-        if (di.op != d.IR_MOV || di.src1.op_type != d.OP_VREG) { return cur; }
-        let is i32 as src = di.src1.vreg;
-        if (src < 0 || src >= vc) { return cur; }
-        let is *i32 as scp = cast(*i32, cast(i64, def_count) + cast(i64, src) * 4);
-        if (*scp != 1) { return cur; }   // don't hop into a multi-def source
-        cur = src;
+        // a CAST kept in place reads as the earlier one with its value
+        let is i32 as sm = *(cast(*i32, cast(i64, same) + cast(i64, cur) * 4));
+        if (sm >= 0) {
+            cur = sm;
+        } else {
+            let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
+            let is *d.IRInst as di = cast(*d.IRInst, *dip);
+            if (cast(i64, di) == 0) { return cur; }
+            if (di.op != d.IR_MOV || di.src1.op_type != d.OP_VREG) { return cur; }
+            let is i32 as src = di.src1.vreg;
+            if (src < 0 || src >= vc) { return cur; }
+            let is *i32 as scp = cast(*i32, cast(i64, def_count) + cast(i64, src) * 4);
+            if (*scp != 1) { return cur; }   // don't hop into a multi-def source
+            cur = src;
+        }
         guard = guard + 1;
     }
     return cur;
+}
+
+// The type part of a value's key (below 4096). Integers of 64 bits, pointers
+// and untyped operations share 0, as do f64 and untyped float operations; f32
+// and each narrow integer type have their own. A CAST is keyed by both kinds.
+fn gvn_kind(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    return cast(*ast.Type, t).kind + 1;
+}
+
+fn gvn_type_key(inst as *d.IRInst) as i32 {
+    if (inst.op == d.IR_CAST) { return 1024 + gvn_kind(inst.cast_from) * 32 + gvn_kind(inst.cast_to); }
+    let is i32 as k = gvn_kind(inst.cast_to);
+    if (k == 0 || k == ast.TY_I64 + 1 || k == ast.TY_U64 + 1 || k == ast.TY_PTR + 1 || k == ast.TY_F64 + 1) { return 0; }
+    return k;
 }
 
 fn gvn_defc(def_count as *i32, vc as i32, v as i32) as i32 {
@@ -244,7 +302,9 @@ fn gvn_defc(def_count as *i32, vc as i32, v as i32) as i32 {
 // Excludes LOAD (aliasing), DIV/MOD (rdx clobber), ADDR_GLOBAL (name-keyed),
 // calls/atomics/control. Floats included: CSE of two IDENTICAL float ops is
 // value-preserving (same operands -> bit-identical result, NaN included); the
-// MOV that replaces the redundant op is register-class-aware (XMM).
+// MOV that replaces the redundant op is register-class-aware (XMM). A CAST is
+// a pure function of its operand and its two types (a conversion to integer
+// truncates and never traps), and its result is always materialized.
 //
 // Comparisons (EQ/NE/LT/LE/GT/GE) are DELIBERATELY excluded: instruction
 // selection fuses a compare that feeds a conditional branch straight into
@@ -261,7 +321,8 @@ fn gvn_is_pure(op as i32) as i32 {
         || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR
         || op == d.IR_SHL || op == d.IR_SHR || op == d.IR_NEG || op == d.IR_NOT
         || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8
-        || op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG) {
+        || op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG
+        || op == d.IR_CAST) {
         return 1;
     }
     return 0;
