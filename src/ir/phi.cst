@@ -189,129 +189,6 @@ fn ssa_end(func as *d.IRFunction) as void {
     ssa_active = 0;
 }
 
-// === Versions of multi-def vregs ===
-//
-// Construction gives each definition of a vreg defined more than once a fresh
-// vreg, and its phis fresh vregs too; ssa_orig[x] is the vreg version x came
-// from (-1 for anything else). Destruction renames every version back to its
-// vreg. That is sound while no pass has made two versions of one vreg live at
-// once — propagating constants and deleting code never do — and leaves the
-// IR as it came in when nothing changed. ssa_vc_built is the vreg count right
-// after construction and ssa_vc_restore the count before the first version:
-// when no vreg was made since, the versions' numbers are given back.
-let is *i32 as ssa_orig with mut = cast(*i32, 0);
-let is i32 as ssa_orig_n with mut = 0;
-let is i32 as ssa_vc_built with mut = 0;
-let is i32 as ssa_vc_restore with mut = 0;
-
-fn ssa_set_versions(orig as *i32, n as i32, vc_built as i32, vc_restore as i32) as void {
-    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
-    ssa_orig = orig;
-    ssa_orig_n = n;
-    ssa_vc_built = vc_built;
-    ssa_vc_restore = vc_restore;
-}
-
-fn _uf_find(uf as *i32, x as i32) as i32 {
-    let is i32 as r with mut = x;
-    while (uf[r] != r) { r = uf[r]; }
-    let is i32 as c with mut = x;
-    while (uf[c] != r) { let is i32 as nx = uf[c]; uf[c] = r; c = nx; }
-    return r;
-}
-
-// The smaller number becomes the representative: a version's vreg is always
-// smaller than the version.
-fn _uf_union(uf as *i32, a as i32, b as i32) as void {
-    let is i32 as ra = _uf_find(uf, a);
-    let is i32 as rb = _uf_find(uf, b);
-    if (ra < rb) { uf[rb] = ra; } else if (rb < ra) { uf[ra] = rb; }
-}
-
-fn _ren(o as *d.Operand, uf as *i32, n as i32) as void {
-    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { o.vreg = _uf_find(uf, o.vreg); }
-}
-
-// Rename the versions back. A version defined by an IMM keeps its own name:
-// the passes after destruction take an IMM for the only definition of its
-// vreg (local CSE and DCE both would break on `v = IMM` with v also defined
-// elsewhere), and constants are what SCCP writes. A phi that reads such a
-// version is left, renamed, for the copy pass to write `v = version` on that
-// edge; a phi left reading only its own web goes.
-fn ssa_coalesce(func as *d.IRFunction) as void {
-    let is i32 as n = func.vreg_count;
-    if (ssa_orig_n == 0) { return; }
-    let is *i32 as uf = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
-    let is *u8 as excl = d.opt_alloc(cast(i64, n + 1));
-    let is i32 as i with mut = 0;
-    while (i < n) { uf[i] = i; excl[i] = cast(u8, 0); i = i + 1; }
-    let is *d.IRInst as it with mut = func.instructions;
-    while (cast(i64, it) != 0) {
-        if (it.is_dead == 0 && it.op == d.IR_IMM && it.dest.op_type == d.OP_VREG
-            && it.dest.vreg >= 0 && it.dest.vreg < n && it.dest.vreg < ssa_orig_n
-            && ssa_orig[it.dest.vreg] >= 0) {
-            excl[it.dest.vreg] = cast(u8, 1);
-        }
-        it = it.next;
-    }
-    let is i32 as nexcl with mut = 0;
-    i = 0;
-    while (i < ssa_orig_n && i < n) {
-        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) {
-            if (excl[i] == cast(u8, 0)) { _uf_union(uf, i, ssa_orig[i]); } else { nexcl = nexcl + 1; }
-        }
-        i = i + 1;
-    }
-    it = func.instructions;
-    while (cast(i64, it) != 0) {
-        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0 && excl[it.dest.vreg] == cast(u8, 0)) {
-            let is i32 as k with mut = 0;
-            while (k < phi_nargs(it)) {
-                let is i32 as v = phi_val(it, k);
-                if (v >= 0 && v < n && excl[v] == cast(u8, 0)) { _uf_union(uf, it.dest.vreg, v); }
-                k = k + 1;
-            }
-        }
-        it = it.next;
-    }
-    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
-    it = func.instructions;
-    while (cast(i64, it) != 0) {
-        let is *d.IRInst as nx = it.next;
-        let is i32 as drop with mut = 0;
-        _ren(&it.dest, uf, n);
-        _ren(&it.src1, uf, n);
-        _ren(&it.src2, uf, n);
-        if (it.op == d.IR_PHI) {
-            let is i32 as need with mut = 0;
-            let is i32 as k with mut = 0;
-            while (k < phi_nargs(it)) {
-                let is i32 as v = phi_val(it, k);
-                if (v >= 0 && v < n) {
-                    let is i32 as r = _uf_find(uf, v);
-                    phi_set_val(it, k, r);
-                    if (r != it.dest.vreg) { need = 1; }
-                }
-                k = k + 1;
-            }
-            if (phi_is_slot(it) == 0 && (need == 0 || it.is_dead == 1)) { drop = 1; }
-        }
-        if (drop == 1) {
-            phi_free(it);
-            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
-        } else {
-            prev = it;
-        }
-        it = nx;
-    }
-    if (nexcl == 0 && func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
-    d.opt_free(cast(*u8, uf));
-    d.opt_free(excl);
-    d.opt_free(cast(*u8, ssa_orig));
-    ssa_orig = cast(*i32, 0);
-    ssa_orig_n = 0;
-}
-
 // === CFG view used by destruction ===
 
 struct DCfg {
@@ -378,6 +255,346 @@ fn first_phi(g as *DCfg, b as i32) as *d.IRInst {
         it = it.next;
     }
     return cast(*d.IRInst, 0);
+}
+
+// === Versions of multi-def vregs ===
+//
+// Construction gives each definition of a vreg defined more than once a fresh
+// vreg, and its phis fresh vregs too; ssa_orig[x] is the vreg version x came
+// from (-1 for anything else). Destruction renames every version back to its
+// vreg. That is sound while no pass has made two versions of one vreg live at
+// once — propagating constants and deleting code never do — and leaves the
+// IR as it came in when nothing changed. ssa_vc_built is the vreg count right
+// after construction and ssa_vc_restore the count before the first version:
+// when no vreg was made since, the versions' numbers are given back.
+let is *i32 as ssa_orig with mut = cast(*i32, 0);
+let is i32 as ssa_orig_n with mut = 0;
+let is i32 as ssa_vc_built with mut = 0;
+let is i32 as ssa_vc_restore with mut = 0;
+
+fn ssa_set_versions(orig as *i32, n as i32, vc_built as i32, vc_restore as i32) as void {
+    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
+    ssa_orig = orig;
+    ssa_orig_n = n;
+    ssa_vc_built = vc_built;
+    ssa_vc_restore = vc_restore;
+}
+
+fn _uf_find(uf as *i32, x as i32) as i32 {
+    let is i32 as r with mut = x;
+    while (uf[r] != r) { r = uf[r]; }
+    let is i32 as c with mut = x;
+    while (uf[c] != r) { let is i32 as nx = uf[c]; uf[c] = r; c = nx; }
+    return r;
+}
+
+// The smaller number becomes the representative: a version's vreg is always
+// smaller than the version.
+fn _uf_union(uf as *i32, a as i32, b as i32) as void {
+    let is i32 as ra = _uf_find(uf, a);
+    let is i32 as rb = _uf_find(uf, b);
+    if (ra < rb) { uf[rb] = ra; } else if (rb < ra) { uf[ra] = rb; }
+}
+
+fn _ren(o as *d.Operand, uf as *i32, n as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { o.vreg = _uf_find(uf, o.vreg); }
+}
+
+// === Interference of webs ===
+//
+// Two members of a web may share a vreg only if neither is live where the
+// other is defined. Liveness of the members (vregs with a definition in a web
+// of two or more) by the usual backward dataflow over the blocks: a phi
+// defines its dest at the top of its block and reads each argument at the end
+// of that argument's predecessor. Then each block is walked backward from its
+// live-out set, counting the live members of every web: a definition with
+// another member of its web live is an overlap (a copy `m = n` between two
+// members is not: both hold the same value). An overlapping web is split back
+// into its members: uf[x] = x for each, and the count of such webs returned.
+
+fn _bit(set as *i64, m as i32) as i32 { return cast(i32, (set[m >> 6] >> cast(i64, m & 63)) & 1); }
+fn _bset(set as *i64, m as i32) as void { set[m >> 6] = set[m >> 6] | (cast(i64, 1) << cast(i64, m & 63)); }
+fn _bclr(set as *i64, m as i32) as void { set[m >> 6] = set[m >> 6] & ((cast(i64, 1) << cast(i64, m & 63)) ^ (0 - 1)); }
+
+fn _midx(o as *d.Operand, midx as *i32, n as i32) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= n) { return 0 - 1; }
+    return midx[o.vreg];
+}
+
+fn _web_interference(func as *d.IRFunction, uf as *i32, n as i32) as i32 {
+    // members: vregs with a live definition, in a web of two or more
+    let is *i32 as wsize = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *u8 as hasdef = d.opt_alloc(cast(i64, n + 1));
+    let is i32 as i with mut = 0;
+    while (i < n) { wsize[i] = 0; hasdef[i] = cast(u8, 0); i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < n
+            && it.op != d.IR_STORE && it.op != d.IR_COPY) { hasdef[it.dest.vreg] = cast(u8, 1); }
+        it = it.next;
+    }
+    i = 0;
+    while (i < n) { if (hasdef[i] == cast(u8, 1)) { let is i32 as r = _uf_find(uf, i); wsize[r] = wsize[r] + 1; } i = i + 1; }
+    let is *i32 as midx = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *i32 as mweb = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as nm with mut = 0;
+    i = 0;
+    while (i < n) {
+        midx[i] = 0 - 1;
+        if (hasdef[i] == cast(u8, 1) && wsize[_uf_find(uf, i)] >= 2) { midx[i] = nm; mweb[nm] = _uf_find(uf, i); nm = nm + 1; }
+        i = i + 1;
+    }
+    let is i32 as nbad with mut = 0;
+    if (nm > 0) {
+        let is *DCfg as g = dcfg_build(func);
+        let is i32 as nb = g.nblocks;
+        let is i32 as w = (nm + 63) / 64;
+        let is *i64 as lout = cast(*i64, d.opt_alloc(cast(i64, nb * w + 1) * 8));
+        let is *i64 as lin = cast(*i64, d.opt_alloc(cast(i64, nb * w + 1) * 8));
+        let is *i64 as cur = cast(*i64, d.opt_alloc(cast(i64, w + 1) * 8));
+        i = 0;
+        while (i < nb * w) { lout[i] = 0; lin[i] = 0; i = i + 1; }
+        // instructions of each block, for the backward walks
+        let is i32 as ninst with mut = 0;
+        it = func.instructions;
+        while (cast(i64, it) != 0) { ninst = ninst + 1; it = it.next; }
+        let is *i64 as arr = cast(*i64, d.opt_alloc(cast(i64, ninst + 1) * 8));
+        let is *i32 as bstart = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+        let is i32 as k with mut = 0;
+        let is i32 as b with mut = 0;
+        while (b < nb) {
+            let is *cfg.BasicBlock as bb = bb_at(g, b);
+            bstart[b] = k;
+            it = bb.first;
+            let is i32 as done with mut = 0;
+            while (done == 0) {
+                arr[k] = cast(i64, it); k = k + 1;
+                if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+            }
+            b = b + 1;
+        }
+        bstart[nb] = k;
+        let is i32 as changed with mut = 1;
+        while (changed == 1) {
+            changed = 0;
+            b = nb - 1;
+            while (b >= 0) {
+                _live_out(g, b, w, lin, cur, midx, n);
+                let is i32 as j with mut = 0;
+                while (j < w) { lout[b * w + j] = cur[j]; j = j + 1; }
+                // transfer
+                let is i32 as q with mut = bstart[b + 1] - 1;
+                while (q >= bstart[b]) {
+                    let is *d.IRInst as x = cast(*d.IRInst, arr[q]);
+                    if (x.is_dead == 0) {
+                        let is i32 as dm with mut = 0 - 1;
+                        if (x.op != d.IR_STORE && x.op != d.IR_COPY) { dm = _midx(&x.dest, midx, n); }
+                        if (dm >= 0) { _bclr(cur, dm); }
+                        if (x.op != d.IR_PHI) {
+                            let is i32 as u1 = _midx(&x.src1, midx, n);
+                            let is i32 as u2 = _midx(&x.src2, midx, n);
+                            if (u1 >= 0) { _bset(cur, u1); }
+                            if (u2 >= 0) { _bset(cur, u2); }
+                            if (x.op == d.IR_STORE || x.op == d.IR_COPY) {
+                                let is i32 as u3 = _midx(&x.dest, midx, n);
+                                if (u3 >= 0) { _bset(cur, u3); }
+                            }
+                        }
+                    }
+                    q = q - 1;
+                }
+                j = 0;
+                while (j < w) {
+                    if (lin[b * w + j] != cur[j]) { lin[b * w + j] = cur[j]; changed = 1; }
+                    j = j + 1;
+                }
+                b = b - 1;
+            }
+        }
+        // the walk that counts live members per web
+        let is *i32 as cnt = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+        let is *u8 as bad = d.opt_alloc(cast(i64, n + 1));
+        i = 0;
+        while (i < n) { cnt[i] = 0; bad[i] = cast(u8, 0); i = i + 1; }
+        b = 0;
+        while (b < nb) {
+            let is i32 as j with mut = 0;
+            while (j < w) { cur[j] = lout[b * w + j]; j = j + 1; }
+            let is i32 as m with mut = 0;
+            while (m < nm) { if (_bit(cur, m) == 1) { cnt[mweb[m]] = cnt[mweb[m]] + 1; } m = m + 1; }
+            let is i32 as q with mut = bstart[b + 1] - 1;
+            while (q >= bstart[b]) {
+                let is *d.IRInst as x = cast(*d.IRInst, arr[q]);
+                if (x.is_dead == 0) {
+                    let is i32 as dm with mut = 0 - 1;
+                    if (x.op != d.IR_STORE && x.op != d.IR_COPY) { dm = _midx(&x.dest, midx, n); }
+                    if (dm >= 0) {
+                        let is i32 as wb = mweb[dm];
+                        let is i32 as others with mut = cnt[wb] - _bit(cur, dm);
+                        if (x.op == d.IR_MOV) {
+                            let is i32 as sm = _midx(&x.src1, midx, n);
+                            if (sm >= 0 && sm != dm && mweb[sm] == wb && _bit(cur, sm) == 1) { others = others - 1; }
+                        }
+                        if (others > 0) { bad[wb] = cast(u8, 1); }
+                        if (_bit(cur, dm) == 1) { _bclr(cur, dm); cnt[wb] = cnt[wb] - 1; }
+                    }
+                    if (x.op != d.IR_PHI) {
+                        let is i32 as u1 = _midx(&x.src1, midx, n);
+                        let is i32 as u2 = _midx(&x.src2, midx, n);
+                        let is i32 as u3 with mut = 0 - 1;
+                        if (x.op == d.IR_STORE || x.op == d.IR_COPY) { u3 = _midx(&x.dest, midx, n); }
+                        if (u1 >= 0 && _bit(cur, u1) == 0) { _bset(cur, u1); cnt[mweb[u1]] = cnt[mweb[u1]] + 1; }
+                        if (u2 >= 0 && _bit(cur, u2) == 0) { _bset(cur, u2); cnt[mweb[u2]] = cnt[mweb[u2]] + 1; }
+                        if (u3 >= 0 && _bit(cur, u3) == 0) { _bset(cur, u3); cnt[mweb[u3]] = cnt[mweb[u3]] + 1; }
+                    }
+                }
+                q = q - 1;
+            }
+            m = 0;
+            while (m < nm) { if (_bit(cur, m) == 1) { cnt[mweb[m]] = cnt[mweb[m]] - 1; } m = m + 1; }
+            b = b + 1;
+        }
+        // split the overlapping webs
+        i = 0;
+        while (i < n) {
+            let is i32 as r = _uf_find(uf, i);
+            if (bad[r] == cast(u8, 1)) { nbad = nbad + 1; }
+            i = i + 1;
+        }
+        if (nbad > 0) {
+            let is *i32 as root = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+            i = 0;
+            while (i < n) { root[i] = _uf_find(uf, i); i = i + 1; }
+            i = 0;
+            while (i < n) { if (bad[root[i]] == cast(u8, 1)) { uf[i] = i; } i = i + 1; }
+            d.opt_free(cast(*u8, root));
+        }
+        d.opt_free(cast(*u8, cnt)); d.opt_free(bad);
+        d.opt_free(cast(*u8, lout)); d.opt_free(cast(*u8, lin)); d.opt_free(cast(*u8, cur));
+        d.opt_free(cast(*u8, arr)); d.opt_free(cast(*u8, bstart));
+        dcfg_free(g);
+    }
+    d.opt_free(cast(*u8, wsize)); d.opt_free(hasdef);
+    d.opt_free(cast(*u8, midx)); d.opt_free(cast(*u8, mweb));
+    return nbad;
+}
+
+// cur = live-out of block b: the live-in of each successor, plus the
+// arguments its phis read on the edge from b.
+fn _live_out(g as *DCfg, b as i32, w as i32, lin as *i64, cur as *i64, midx as *i32, n as i32) as void {
+    let is i32 as j with mut = 0;
+    while (j < w) { cur[j] = 0; j = j + 1; }
+    let is *cfg.BasicBlock as bb = bb_at(g, b);
+    let is i32 as bl = block_label(g, b);
+    let is i32 as si with mut = 0;
+    while (si < 2) {
+        let is i32 as s with mut = bb.succ0;
+        if (si == 1) { s = bb.succ1; }
+        if (s >= 0) {
+            j = 0;
+            while (j < w) { cur[j] = cur[j] | lin[s * w + j]; j = j + 1; }
+            let is *d.IRInst as p with mut = first_phi(g, s);
+            let is *cfg.BasicBlock as sb = bb_at(g, s);
+            let is i32 as pd with mut = 0;
+            while (cast(i64, p) != 0 && pd == 0) {
+                if (p.op != d.IR_PHI) { pd = 1; }
+                else {
+                    if (p.is_dead == 0 && bl >= 0) {
+                        let is i32 as k = phi_find(p, bl);
+                        if (k >= 0) {
+                            let is i32 as v = phi_val(p, k);
+                            if (v >= 0 && v < n && midx[v] >= 0) { _bset(cur, midx[v]); }
+                        }
+                    }
+                    if (cast(i64, p) == cast(i64, sb.last)) { pd = 1; } else { p = p.next; }
+                }
+            }
+        }
+        si = si + 1;
+    }
+}
+
+// Rename the versions back. A version defined by an IMM keeps its own name:
+// the passes after destruction take an IMM for the only definition of its
+// vreg (local CSE and DCE both would break on `v = IMM` with v also defined
+// elsewhere), and constants are what SCCP writes. A phi that reads such a
+// version is left, renamed, for the copy pass to write `v = version` on that
+// edge; a phi left reading only its own web goes.
+fn ssa_coalesce(func as *d.IRFunction) as void {
+    let is i32 as n = func.vreg_count;
+    if (ssa_orig_n == 0) { return; }
+    let is *i32 as uf = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *u8 as excl = d.opt_alloc(cast(i64, n + 1));
+    let is i32 as i with mut = 0;
+    while (i < n) { uf[i] = i; excl[i] = cast(u8, 0); i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.op == d.IR_IMM && it.dest.op_type == d.OP_VREG
+            && it.dest.vreg >= 0 && it.dest.vreg < n && it.dest.vreg < ssa_orig_n
+            && ssa_orig[it.dest.vreg] >= 0) {
+            excl[it.dest.vreg] = cast(u8, 1);
+        }
+        it = it.next;
+    }
+    let is i32 as nexcl with mut = 0;
+    i = 0;
+    while (i < ssa_orig_n && i < n) {
+        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) {
+            if (excl[i] == cast(u8, 0)) { _uf_union(uf, i, ssa_orig[i]); } else { nexcl = nexcl + 1; }
+        }
+        i = i + 1;
+    }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0 && excl[it.dest.vreg] == cast(u8, 0)) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n && excl[v] == cast(u8, 0)) { _uf_union(uf, it.dest.vreg, v); }
+                k = k + 1;
+            }
+        }
+        it = it.next;
+    }
+    // a web whose members overlap is left as it is: its phis become copies
+    let is i32 as nbad = _web_interference(func, uf, n);
+    if (nbad > 0) { nexcl = nexcl + nbad; }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as drop with mut = 0;
+        _ren(&it.dest, uf, n);
+        _ren(&it.src1, uf, n);
+        _ren(&it.src2, uf, n);
+        if (it.op == d.IR_PHI) {
+            let is i32 as need with mut = 0;
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n) {
+                    let is i32 as r = _uf_find(uf, v);
+                    phi_set_val(it, k, r);
+                    if (r != it.dest.vreg) { need = 1; }
+                }
+                k = k + 1;
+            }
+            if (phi_is_slot(it) == 0 && (need == 0 || it.is_dead == 1)) { drop = 1; }
+        }
+        if (drop == 1) {
+            phi_free(it);
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    if (nexcl == 0 && func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
+    d.opt_free(cast(*u8, uf));
+    d.opt_free(excl);
+    d.opt_free(cast(*u8, ssa_orig));
+    ssa_orig = cast(*i32, 0);
+    ssa_orig_n = 0;
 }
 
 fn _uses_vreg(it as *d.IRInst, x as i32) as i32 {

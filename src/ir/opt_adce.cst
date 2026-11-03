@@ -1,0 +1,827 @@
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "dom.cst" as dom;
+use "phi.cst" as phi;
+
+// === ADCE: aggressive dead code elimination with control dependence ===
+//
+// Runs on the SSA form after SCCP. Everything starts dead; what has an effect
+// is live — stores, calls, returns, syscalls, inline asm, atomics, argument
+// set-up — and liveness flows back: the definitions a live instruction reads
+// (phi arguments included), the branches a live block is control dependent on
+// (its post-dominance frontier), and for a live phi the predecessors it
+// chooses between (their branches and their own control dependences). A dead
+// conditional branch becomes a jump to its block's immediate post-dominator:
+// nothing live sits on any path in between. The blocks left unreachable go,
+// with their arguments in the phis that remain; dead instructions are marked
+// dead.
+//
+// Caustic promises no forward progress: a loop that might not terminate must
+// keep running. So for every loop that is not provably finite, each branch in
+// it whose post-dominator lies outside the loop is live — the loop can never
+// be skipped or left early. Provably finite here means a counted loop: a
+// header phi stepped by 1 (or -1) once per iteration, tested every iteration
+// against a loop-invariant bound with < (or >), so it cannot wrap before the
+// test fails. A function with a block that cannot reach a return, or with an
+// irreducible cycle, keeps all its branches.
+
+struct Adce {
+    func as *d.IRFunction;
+    nv as i32;
+    blocks as *cfg.BasicBlock;
+    nb as i32;
+    label_to_bb as *i32;
+    nlabels as i32;
+    preds as *i32;
+    pred_start as *i32;
+    pred_count as *i32;
+    n as i32;
+    insts as *i64;
+    iblk as *i32;
+    term as *i32;        // index of each block's last instruction
+    dstart as *i32;      // definitions of v: didx[dstart[v] .. dstart[v+1])
+    didx as *i32;
+    live as *u8;
+    live_b as *u8;
+    wl as *i32;
+    wl_n as i32;
+    ipdom as *i32;       // -1: no path to a return; nb: the exit
+    cd_start as *i32;    // blocks whose branch b is control dependent on
+    cd as *i32;
+    reach as *u8;        // reachable from the entry
+}
+
+fn _blk(a as *Adce, b as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, a.blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+}
+
+fn _inst(a as *Adce, i as i32) as *d.IRInst { return cast(*d.IRInst, a.insts[i]); }
+
+fn _is_def(it as *d.IRInst) as i32 {
+    if (it.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = it.op;
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) { return 0; }
+    return 1;
+}
+
+// An instruction live for its own sake.
+fn _is_root(it as *d.IRInst) as i32 {
+    let is i32 as op = it.op;
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_CALL || op == d.IR_CALL_INDIRECT
+        || op == d.IR_FFI_CALL || op == d.IR_SYSCALL || op == d.IR_ASM || op == d.IR_RET
+        || op == d.IR_SET_ARG || op == d.IR_SET_SYS_ARG || op == d.IR_SET_CTX || op == d.IR_VA_START
+        || op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD
+        || op == d.IR_ATOMIC_XCHG || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS
+        || op == d.IR_FENCE) { return 1; }
+    return 0;
+}
+
+fn _mark(a as *Adce, i as i32) as void {
+    if (i < 0 || a.live[i] == cast(u8, 1)) { return; }
+    a.live[i] = cast(u8, 1);
+    a.wl[a.wl_n] = i;
+    a.wl_n = a.wl_n + 1;
+}
+
+fn _mark_vreg(a as *Adce, v as i32) as void {
+    if (v < 0 || v >= a.nv) { return; }
+    let is i32 as k with mut = a.dstart[v];
+    while (k < a.dstart[v + 1]) { _mark(a, a.didx[k]); k = k + 1; }
+}
+
+fn _mark_opnd(a as *Adce, o as *d.Operand) as void {
+    if (o.op_type == d.OP_VREG) { _mark_vreg(a, o.vreg); }
+}
+
+// Block b holds something live: the branches it depends on are live.
+fn _block_live(a as *Adce, b as i32) as void {
+    if (a.live_b[b] == cast(u8, 1)) { return; }
+    a.live_b[b] = cast(u8, 1);
+    let is i32 as k with mut = a.cd_start[b];
+    while (k < a.cd_start[b + 1]) { _mark_branch(a, a.cd[k]); k = k + 1; }
+}
+
+fn _mark_branch(a as *Adce, b as i32) as void {
+    let is i32 as t = a.term[b];
+    let is *d.IRInst as it = _inst(a, t);
+    if (it.op == d.IR_JZ || it.op == d.IR_JNZ) { _mark(a, t); }
+}
+
+fn _process(a as *Adce, i as i32) as void {
+    let is *d.IRInst as it = _inst(a, i);
+    let is i32 as b = a.iblk[i];
+    _block_live(a, b);
+    if (it.op == d.IR_PHI) {
+        let is i32 as k with mut = 0;
+        while (k < phi.phi_nargs(it)) {
+            _mark_vreg(a, phi.phi_val(it, k));
+            let is i32 as l = phi.phi_label(it, k);
+            if (l >= 0 && l < a.nlabels) {
+                let is i32 as q = a.label_to_bb[l];
+                if (q >= 0) { _block_live(a, q); _mark_branch(a, q); }
+            }
+            k = k + 1;
+        }
+        return;
+    }
+    _mark_opnd(a, &it.src1);
+    _mark_opnd(a, &it.src2);
+    if (_is_def(it) == 0) { _mark_opnd(a, &it.dest); }
+}
+
+// --- post-dominators: Cooper-Harvey-Kennedy on the reverse CFG, the exit
+// (node nb) joined from every block that returns ---
+
+fn _ends_ret(a as *Adce, b as i32) as i32 {
+    let is *d.IRInst as l = _inst(a, a.term[b]);
+    return cast(i32, l.op == d.IR_RET && l.is_dead == 0);
+}
+
+fn _pdom_intersect(ipd as *i32, ord as *i32, x0 as i32, y0 as i32) as i32 {
+    let is i32 as x with mut = x0;
+    let is i32 as y with mut = y0;
+    while (x != y) {
+        while (ord[x] > ord[y]) { x = ipd[x]; }
+        while (ord[y] > ord[x]) { y = ipd[y]; }
+    }
+    return x;
+}
+
+// Returns 1 if every reachable block reaches the exit.
+fn _postdom(a as *Adce) as i32 {
+    let is i32 as nb = a.nb;
+    let is i32 as nn = nb + 1;
+    // postorder of the reverse graph from the exit: its successors are the
+    // forward predecessors (and, for the exit, the returning blocks)
+    let is *i32 as ord = cast(*i32, d.opt_alloc(cast(i64, nn) * 4));     // reverse-postorder number
+    let is *i32 as rpo = cast(*i32, d.opt_alloc(cast(i64, nn) * 4));     // nodes by number
+    let is *i32 as stk = cast(*i32, d.opt_alloc(cast(i64, nn) * 4));
+    let is *i32 as sti = cast(*i32, d.opt_alloc(cast(i64, nn) * 4));
+    let is i32 as k with mut = 0;
+    while (k < nn) { ord[k] = 0 - 1; a.ipdom[k] = 0 - 1; k = k + 1; }
+    let is *u8 as seen = d.opt_alloc(cast(i64, nn));
+    k = 0;
+    while (k < nn) { seen[k] = cast(u8, 0); k = k + 1; }
+    let is i32 as cnt with mut = 0;
+    let is i32 as sp with mut = 1;
+    stk[0] = nb; sti[0] = 0; seen[nb] = cast(u8, 1);
+    while (sp > 0) {
+        let is i32 as v = stk[sp - 1];
+        let is i32 as j = sti[sp - 1];
+        let is i32 as nxt with mut = 0 - 1;
+        if (v == nb) {
+            // the j-th returning block
+            let is i32 as r with mut = 0;
+            let is i32 as found with mut = 0;
+            let is i32 as bb with mut = 0;
+            while (bb < nb && nxt < 0) {
+                if (a.reach[bb] == cast(u8, 1) && _ends_ret(a, bb) == 1) {
+                    if (found == j) { nxt = bb; }
+                    found = found + 1;
+                }
+                bb = bb + 1;
+            }
+            r = r;
+        } else if (j < a.pred_count[v]) {
+            nxt = a.preds[a.pred_start[v] + j];
+        }
+        if (nxt >= 0 || (v != nb && j < a.pred_count[v])) {
+            sti[sp - 1] = j + 1;
+            if (nxt >= 0 && seen[nxt] == cast(u8, 0) && a.reach[nxt] == cast(u8, 1)) {
+                seen[nxt] = cast(u8, 1);
+                stk[sp] = nxt; sti[sp] = 0; sp = sp + 1;
+            }
+        } else {
+            rpo[cnt] = v;
+            cnt = cnt + 1;
+            sp = sp - 1;
+        }
+    }
+    // cnt nodes in postorder: number them in reverse postorder
+    k = 0;
+    while (k < cnt) { ord[rpo[k]] = cnt - 1 - k; k = k + 1; }
+    let is *i32 as byord = cast(*i32, d.opt_alloc(cast(i64, cnt + 1) * 4));
+    k = 0;
+    while (k < cnt) { byord[ord[rpo[k]]] = rpo[k]; k = k + 1; }
+    a.ipdom[nb] = nb;
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        let is i32 as oi with mut = 1;
+        while (oi < cnt) {
+            let is i32 as v = byord[oi];
+            // reverse-graph predecessors: forward successors, and the exit
+            let is i32 as ni with mut = 0 - 1;
+            let is *cfg.BasicBlock as vb = _blk(a, v);
+            let is i32 as si with mut = 0;
+            while (si < 3) {
+                let is i32 as p with mut = 0 - 1;
+                if (si == 0) { p = vb.succ0; }
+                if (si == 1) { p = vb.succ1; }
+                if (si == 2 && _ends_ret(a, v) == 1) { p = nb; }
+                if (p >= 0 && a.ipdom[p] >= 0) {
+                    if (ni < 0) { ni = p; } else { ni = _pdom_intersect(a.ipdom, ord, ni, p); }
+                }
+                si = si + 1;
+            }
+            if (ni >= 0 && a.ipdom[v] != ni) { a.ipdom[v] = ni; changed = 1; }
+            oi = oi + 1;
+        }
+    }
+    let is i32 as all with mut = 1;
+    k = 0;
+    while (k < nb) {
+        if (a.reach[k] == cast(u8, 1) && seen[k] == cast(u8, 0)) { all = 0; }
+        k = k + 1;
+    }
+    d.opt_free(cast(*u8, ord)); d.opt_free(cast(*u8, rpo)); d.opt_free(cast(*u8, stk));
+    d.opt_free(cast(*u8, sti)); d.opt_free(seen); d.opt_free(cast(*u8, byord));
+    return all;
+}
+
+// Control dependence: b's branch decides whether block y runs when y lies on
+// the post-dominator path from a successor of b up to (not including) b's
+// immediate post-dominator. Lists cd[y] of such b, two passes (count, fill).
+fn _control_deps(a as *Adce) as void {
+    let is i32 as nb = a.nb;
+    let is *i32 as cnt = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as last = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    a.cd_start = cast(*i32, d.opt_alloc(cast(i64, nb + 2) * 4));
+    let is i32 as pass with mut = 0;
+    while (pass < 2) {
+        let is i32 as k with mut = 0;
+        while (k < nb) { last[k] = 0 - 1; k = k + 1; }
+        if (pass == 0) { k = 0; while (k < nb) { cnt[k] = 0; k = k + 1; } }
+        else {
+            a.cd_start[0] = 0;
+            k = 0;
+            while (k < nb) { a.cd_start[k + 1] = a.cd_start[k] + cnt[k]; k = k + 1; }
+            k = 0;
+            while (k < nb) { cnt[k] = 0; k = k + 1; }
+            a.cd = cast(*i32, d.opt_alloc(cast(i64, a.cd_start[nb] + 1) * 4));
+        }
+        let is i32 as b with mut = 0;
+        while (b < nb) {
+            let is *cfg.BasicBlock as bb = _blk(a, b);
+            if (a.reach[b] == cast(u8, 1) && bb.succ0 >= 0 && bb.succ1 >= 0 && bb.succ0 != bb.succ1) {
+                let is i32 as stop = a.ipdom[b];
+                let is i32 as si with mut = 0;
+                while (si < 2) {
+                    let is i32 as r with mut = bb.succ0;
+                    if (si == 1) { r = bb.succ1; }
+                    while (r >= 0 && r < nb && r != stop) {
+                        if (last[r] != b) {
+                            last[r] = b;
+                            if (pass == 1) { a.cd[a.cd_start[r] + cnt[r]] = b; }
+                            cnt[r] = cnt[r] + 1;
+                        }
+                        r = a.ipdom[r];
+                    }
+                    si = si + 1;
+                }
+            }
+            b = b + 1;
+        }
+        pass = pass + 1;
+    }
+    d.opt_free(cast(*u8, cnt));
+    d.opt_free(cast(*u8, last));
+}
+
+fn _dominates(a as *Adce, x as i32, y0 as i32) as i32 {
+    let is i32 as y with mut = y0;
+    while (y >= 0) {
+        if (y == x) { return 1; }
+        let is i32 as id = _blk(a, y).idom;
+        if (id == y) { return 0; }
+        y = id;
+    }
+    return 0;
+}
+
+// The instruction defining v (single definition), or null.
+fn _def_of(a as *Adce, v as i32) as *d.IRInst {
+    if (v < 0 || v >= a.nv) { return cast(*d.IRInst, 0); }
+    if (a.dstart[v + 1] - a.dstart[v] != 1) { return cast(*d.IRInst, 0); }
+    return _inst(a, a.didx[a.dstart[v]]);
+}
+
+fn _def_blk(a as *Adce, v as i32) as i32 {
+    if (v < 0 || v >= a.nv) { return 0 - 1; }
+    if (a.dstart[v + 1] - a.dstart[v] != 1) { return 0 - 1; }
+    return a.iblk[a.didx[a.dstart[v]]];
+}
+
+// v with copies and same-type integer casts looked through.
+fn _strip(a as *Adce, v0 as i32) as i32 {
+    let is i32 as v with mut = v0;
+    let is i32 as guard with mut = 0;
+    while (guard < 16) {
+        let is *d.IRInst as di = _def_of(a, v);
+        if (cast(i64, di) == 0 || di.src1.op_type != d.OP_VREG) { return v; }
+        if (di.op == d.IR_MOV) { v = di.src1.vreg; }
+        else if (di.op == d.IR_CAST && cast(i64, di.cast_to) != 0
+                 && cast(i64, di.cast_to) == cast(i64, di.cast_from)
+                 && *cast(*i32, di.cast_to) >= 1 && *cast(*i32, di.cast_to) <= 8) { v = di.src1.vreg; }
+        else { return v; }
+        guard = guard + 1;
+    }
+    return v;
+}
+
+// The constant value of operand o (an immediate or a vreg set by IMM).
+fn _const_of(a as *Adce, o as *d.Operand, out as *i64) as i32 {
+    if (o.op_type == d.OP_IMM) { *out = o.imm; return 1; }
+    if (o.op_type != d.OP_VREG) { return 0; }
+    let is *d.IRInst as di = _def_of(a, _strip(a, o.vreg));
+    if (cast(i64, di) == 0 || di.op != d.IR_IMM || di.src1.op_type != d.OP_IMM) { return 0; }
+    *out = di.src1.imm;
+    return 1;
+}
+
+// Loop-invariant operand: a constant, a value defined outside the loop, or
+// pure arithmetic on such values (a few levels deep).
+fn _invariant(a as *Adce, o as *d.Operand, inl as *u8) as i32 { return _inv(a, o, inl, 0); }
+
+fn _inv(a as *Adce, o as *d.Operand, inl as *u8, depth as i32) as i32 {
+    let is i64 as c with mut = 0;
+    if (_const_of(a, o, &c) == 1) { return 1; }
+    if (o.op_type != d.OP_VREG) { return 0; }
+    let is i32 as v = _strip(a, o.vreg);
+    let is i32 as db = _def_blk(a, v);
+    if (db < 0) { return 0; }
+    if (inl[db] == cast(u8, 0)) { return 1; }
+    if (depth >= 4) { return 0; }
+    let is *d.IRInst as di = _def_of(a, v);
+    let is i32 as op = di.op;
+    if (op != d.IR_ADD && op != d.IR_SUB && op != d.IR_MUL && op != d.IR_AND && op != d.IR_OR
+        && op != d.IR_XOR && op != d.IR_SHL && op != d.IR_SHR && op != d.IR_CAST && op != d.IR_NEG
+        && op != d.IR_NOT && op != d.IR_MOV) { return 0; }
+    if (di.src1.op_type != d.OP_NONE && _inv(a, &di.src1, inl, depth + 1) == 0) { return 0; }
+    if (di.src2.op_type != d.OP_NONE && _inv(a, &di.src2, inl, depth + 1) == 0) { return 0; }
+    return 1;
+}
+
+fn _type_size(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 8; }
+    let is i32 as k = *cast(*i32, t);
+    if (k < 1 || k > 8) { return 0 - 1; }
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    if (sz >= 8) { return 8; }
+    return sz;
+}
+
+fn _type_signed(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 1; }
+    let is i32 as k = *cast(*i32, t);
+    return cast(i32, k >= 1 && k <= 4);
+}
+
+// Is the loop headed by h, with body inl[] and latches lat[0..nl), counted?
+fn _loop_finite(a as *Adce, h as i32, inl as *u8, lat as *i32, nl as i32) as i32 {
+    let is *cfg.BasicBlock as hb = _blk(a, h);
+    let is i32 as hl = hb.first.dest.label;
+    // every exit branch: one that dominates each latch and tests an IV
+    let is i32 as b with mut = 0;
+    while (b < a.nb) {
+        if (inl[b] == cast(u8, 1)) {
+            let is *cfg.BasicBlock as bb = _blk(a, b);
+            let is *d.IRInst as br = _inst(a, a.term[b]);
+            let is i32 as dom_all with mut = 1;
+            let is i32 as li with mut = 0;
+            while (li < nl) { if (_dominates(a, b, lat[li]) == 0) { dom_all = 0; } li = li + 1; }
+            if (dom_all == 1 && (br.op == d.IR_JZ || br.op == d.IR_JNZ) && bb.succ0 >= 0 && bb.succ1 >= 0
+                && br.src1.op_type == d.OP_VREG
+                && cast(i32, inl[bb.succ0] == cast(u8, 1)) != cast(i32, inl[bb.succ1] == cast(u8, 1))) {
+                // stay_true: the loop goes on when the condition holds
+                let is i32 as fall_in = cast(i32, inl[bb.succ0] == cast(u8, 1));
+                let is i32 as stay_true with mut = 0;
+                if (br.op == d.IR_JZ) { stay_true = fall_in; } else { stay_true = 1 - fall_in; }
+                if (_counted_test(a, h, hl, inl, lat, nl, br.src1.vreg, stay_true) == 1) { return 1; }
+            }
+        }
+        b = b + 1;
+    }
+    return 0;
+}
+
+// The compare c decides whether the loop goes on (when c is true if
+// stay_true, else when it is false). Counted when it is `iv < bound` going up
+// by 1, or `iv > bound` going down by 1, at the IV's own width.
+fn _counted_test(a as *Adce, h as i32, hl as i32, inl as *u8, lat as *i32, nl as i32, c as i32, stay_true as i32) as i32 {
+    let is *d.IRInst as cmp = _def_of(a, _strip(a, c));
+    if (cast(i64, cmp) == 0) { return 0; }
+    let is i32 as op with mut = cmp.op;
+    if (op != d.IR_LT && op != d.IR_GT && op != d.IR_LE && op != d.IR_GE) { return 0; }
+    // the loop goes on while `x OP y`
+    if (stay_true == 0) {
+        if (op == d.IR_LT) { op = d.IR_GE; } else if (op == d.IR_GE) { op = d.IR_LT; }
+        else if (op == d.IR_GT) { op = d.IR_LE; } else { op = d.IR_GT; }
+    }
+    if (op == d.IR_LE || op == d.IR_GE) { return 0; }
+    if (cmp.src1.op_type != d.OP_VREG) { return 0; }
+    let is i32 as csz = _type_size(cmp.cast_to);
+    if (csz <= 0) { return 0; }
+    let is i32 as csg = _type_signed(cmp.cast_to);
+    // which side is the IV: up while iv < bound, down while iv > bound
+    let is i32 as k with mut = 0;
+    while (k < 2) {
+        let is *d.Operand as ivo with mut = &cmp.src1;
+        let is *d.Operand as bo with mut = &cmp.src2;
+        let is i32 as dir with mut = 1;
+        if (op == d.IR_GT) { dir = 0 - 1; }
+        if (k == 1) { ivo = &cmp.src2; bo = &cmp.src1; dir = 0 - dir; }
+        if (ivo.op_type == d.OP_VREG && _invariant(a, bo, inl) == 1
+            && _is_iv(a, h, hl, inl, lat, nl, _strip(a, ivo.vreg), dir, csz, csg) == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Is x the header phi of h, or the phi's next value, for a phi that steps by
+// dir each iteration at width sz / signedness sg?
+fn _is_iv(a as *Adce, h as i32, hl as i32, inl as *u8, lat as *i32, nl as i32, x as i32, dir as i32, sz as i32, sg as i32) as i32 {
+    // walk the header's phis
+    let is *cfg.BasicBlock as hb = _blk(a, h);
+    let is *d.IRInst as p with mut = hb.first.next;
+    while (cast(i64, p) != 0 && p.op == d.IR_PHI) {
+        if (p.is_dead == 0) {
+            // the value from every latch is the same `next`
+            let is i32 as nx with mut = 0 - 2;
+            let is i32 as ok with mut = 1;
+            let is i32 as kk with mut = 0;
+            while (kk < phi.phi_nargs(p)) {
+                let is i32 as l = phi.phi_label(p, kk);
+                let is i32 as q with mut = 0 - 1;
+                if (l >= 0 && l < a.nlabels) { q = a.label_to_bb[l]; }
+                if (q < 0) { ok = 0; }
+                else if (inl[q] == cast(u8, 1)) {
+                    let is i32 as v = phi.phi_val(p, kk);
+                    if (nx == 0 - 2) { nx = v; } else if (nx != v) { ok = 0; }
+                }
+                kk = kk + 1;
+            }
+            if (ok == 1 && nx >= 0) {
+                let is *d.IRInst as ad = _def_of(a, _strip(a, nx));
+                let is i32 as pv = p.dest.vreg;
+                if (cast(i64, ad) != 0 && (ad.op == d.IR_ADD || ad.op == d.IR_SUB)
+                    && ad.src1.op_type == d.OP_VREG && _strip(a, ad.src1.vreg) == pv
+                    && _type_size(ad.cast_to) == sz && _type_signed(ad.cast_to) == sg) {
+                    let is i64 as st with mut = 0;
+                    if (_const_of(a, &ad.src2, &st) == 1) {
+                        if (ad.op == d.IR_SUB) { st = 0 - st; }
+                        // the step runs every iteration
+                        let is i32 as ab = a.iblk[a.didx[a.dstart[_strip(a, nx)]]];
+                        let is i32 as every with mut = 1;
+                        let is i32 as li with mut = 0;
+                        while (li < nl) { if (_dominates(a, ab, lat[li]) == 0) { every = 0; } li = li + 1; }
+                        if (every == 1 && st == cast(i64, dir) && (x == pv || x == _strip(a, nx))) { return 1; }
+                    }
+                }
+            }
+        }
+        p = p.next;
+    }
+    return 0;
+}
+
+fn _drop_args(a as *Adce, t as i32, pl as i32) as void {
+    let is *cfg.BasicBlock as tb = _blk(a, t);
+    let is *d.IRInst as it with mut = tb.first.next;
+    while (cast(i64, it) != 0 && it.op == d.IR_PHI) {
+        let is i32 as k = phi.phi_find(it, pl);
+        if (k >= 0) { phi.phi_del(it, k); }
+        it = it.next;
+    }
+}
+
+fn pass_adce(func as *d.IRFunction) as i32 {
+    let is i32 as nv = func.vreg_count;
+    if (nv == 0 || cast(i64, func.instructions) == 0) { return 0; }
+    let is Adce as A;
+    let is *Adce as a = &A;
+    a.func = func;
+    a.nv = nv;
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    a.blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    a.nlabels = func.label_count + 1;
+    a.label_to_bb = cast(*i32, d.opt_alloc(cast(i64, a.nlabels) * 4));
+    let is i32 as i with mut = 0;
+    while (i < a.nlabels) { a.label_to_bb[i] = 0 - 1; i = i + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, a.blocks, cap, &nb, a.label_to_bb);
+    a.nb = nb;
+    // every block must start with a label (a phi names its predecessors so)
+    let is i32 as b with mut = 0;
+    while (b < nb) { if (_blk(a, b).first.op != d.IR_LABEL) { _free(a, 0); return 0; } b = b + 1; }
+    a.preds = cast(*i32, d.opt_alloc(cast(i64, nb * 2 + 4) * 4));
+    a.pred_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    a.pred_count = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    cfg.build_preds(a.blocks, nb, a.preds, a.pred_start, a.pred_count);
+    let is *i32 as rpo = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as rpo_n with mut = 0;
+    cfg.compute_rpo(a.blocks, nb, rpo, &rpo_n);
+    dom.compute_idom(a.blocks, nb, rpo, rpo_n, a.preds, a.pred_start, a.pred_count);
+    a.reach = d.opt_alloc(cast(i64, nb + 1));
+    b = 0;
+    while (b < nb) { a.reach[b] = cast(u8, 0); b = b + 1; }
+    i = 0;
+    while (i < rpo_n) { a.reach[rpo[i]] = cast(u8, 1); i = i + 1; }
+
+    // instructions
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) { n = n + 1; it = it.next; }
+    a.n = n;
+    a.insts = cast(*i64, d.opt_alloc(cast(i64, n + 1) * 8));
+    a.iblk = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    a.term = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    a.live = d.opt_alloc(cast(i64, n + 1));
+    a.wl = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    a.wl_n = 0;
+    i = 0;
+    b = 0;
+    while (b < nb) {
+        let is *cfg.BasicBlock as bb = _blk(a, b);
+        it = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0) {
+            a.insts[i] = cast(i64, it); a.iblk[i] = b; a.live[i] = cast(u8, 0);
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; a.term[b] = i; } else { it = it.next; }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    // definitions per vreg
+    a.dstart = cast(*i32, d.opt_alloc(cast(i64, nv + 2) * 4));
+    let is *i32 as dc = cast(*i32, d.opt_alloc(cast(i64, nv + 1) * 4));
+    let is i32 as v with mut = 0;
+    while (v < nv) { dc[v] = 0; v = v + 1; }
+    i = 0;
+    while (i < n) {
+        it = _inst(a, i);
+        if (it.is_dead == 0 && _is_def(it) == 1 && it.dest.vreg >= 0 && it.dest.vreg < nv) { dc[it.dest.vreg] = dc[it.dest.vreg] + 1; }
+        i = i + 1;
+    }
+    a.dstart[0] = 0;
+    v = 0;
+    while (v < nv) { a.dstart[v + 1] = a.dstart[v] + dc[v]; v = v + 1; }
+    v = 0;
+    while (v < nv) { dc[v] = 0; v = v + 1; }
+    a.didx = cast(*i32, d.opt_alloc(cast(i64, a.dstart[nv] + 1) * 4));
+    i = 0;
+    while (i < n) {
+        it = _inst(a, i);
+        if (it.is_dead == 0 && _is_def(it) == 1 && it.dest.vreg >= 0 && it.dest.vreg < nv) {
+            a.didx[a.dstart[it.dest.vreg] + dc[it.dest.vreg]] = i;
+            dc[it.dest.vreg] = dc[it.dest.vreg] + 1;
+        }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, dc));
+
+    // post-dominators and control dependence
+    a.ipdom = cast(*i32, d.opt_alloc(cast(i64, nb + 2) * 4));
+    let is i32 as all_exit = _postdom(a);
+    _control_deps(a);
+    a.live_b = d.opt_alloc(cast(i64, nb + 1));
+    b = 0;
+    while (b < nb) { a.live_b[b] = cast(u8, 0); b = b + 1; }
+
+    // Branches that must stay: everywhere when a block cannot reach a return
+    // or a cycle is irreducible; else those that could leave a loop that is
+    // not known to be finite.
+    let is i32 as keep_all with mut = 1 - all_exit;
+    b = 0;
+    while (b < nb && keep_all == 0) {
+        let is *cfg.BasicBlock as bb = _blk(a, b);
+        if (a.reach[b] == cast(u8, 1)) {
+            let is i32 as si with mut = 0;
+            while (si < 2) {
+                let is i32 as s with mut = bb.succ0;
+                if (si == 1) { s = bb.succ1; }
+                if (s >= 0 && _blk(a, s).rpo <= bb.rpo && _dominates(a, s, b) == 0) { keep_all = 1; }
+                si = si + 1;
+            }
+        }
+        b = b + 1;
+    }
+    if (keep_all == 1) {
+        b = 0;
+        while (b < nb) { if (a.reach[b] == cast(u8, 1)) { _mark_branch(a, b); } b = b + 1; }
+    } else {
+        _loop_roots(a);
+    }
+
+    // roots
+    i = 0;
+    while (i < n) {
+        it = _inst(a, i);
+        if (it.is_dead == 0 && a.reach[a.iblk[i]] == cast(u8, 1) && _is_root(it) == 1) { _mark(a, i); }
+        i = i + 1;
+    }
+    while (a.wl_n > 0) {
+        a.wl_n = a.wl_n - 1;
+        _process(a, a.wl[a.wl_n]);
+    }
+
+    let is i32 as changed = _rewrite(a);
+    d.opt_free(cast(*u8, rpo));
+    _free(a, 1);
+    return changed;
+}
+
+// For each loop not known to be finite: every branch in it whose immediate
+// post-dominator is outside it (or does not exist) is live.
+fn _loop_roots(a as *Adce) as void {
+    let is i32 as nb = a.nb;
+    let is *u8 as inl = d.opt_alloc(cast(i64, nb + 1));
+    let is *i32 as lat = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as stk = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as h with mut = 0;
+    while (h < nb) {
+        // latches of h: predecessors it dominates
+        let is i32 as nl with mut = 0;
+        let is i32 as pi with mut = 0;
+        if (a.reach[h] == cast(u8, 1)) {
+            while (pi < a.pred_count[h]) {
+                let is i32 as p = a.preds[a.pred_start[h] + pi];
+                if (a.reach[p] == cast(u8, 1) && _dominates(a, h, p) == 1) {
+                    let is i32 as dup with mut = 0;
+                    let is i32 as q with mut = 0;
+                    while (q < nl) { if (lat[q] == p) { dup = 1; } q = q + 1; }
+                    if (dup == 0) { lat[nl] = p; nl = nl + 1; }
+                }
+                pi = pi + 1;
+            }
+        }
+        if (nl > 0) {
+            let is i32 as k with mut = 0;
+            while (k < nb) { inl[k] = cast(u8, 0); k = k + 1; }
+            inl[h] = cast(u8, 1);
+            let is i32 as sp with mut = 0;
+            k = 0;
+            while (k < nl) { if (inl[lat[k]] == cast(u8, 0)) { inl[lat[k]] = cast(u8, 1); stk[sp] = lat[k]; sp = sp + 1; } k = k + 1; }
+            while (sp > 0) {
+                sp = sp - 1;
+                let is i32 as x = stk[sp];
+                let is i32 as j with mut = 0;
+                while (j < a.pred_count[x]) {
+                    let is i32 as p = a.preds[a.pred_start[x] + j];
+                    if (a.reach[p] == cast(u8, 1) && inl[p] == cast(u8, 0)) { inl[p] = cast(u8, 1); stk[sp] = p; sp = sp + 1; }
+                    j = j + 1;
+                }
+            }
+            if (_loop_finite(a, h, inl, lat, nl) == 0) {
+                let is i32 as bb with mut = 0;
+                while (bb < nb) {
+                    if (inl[bb] == cast(u8, 1)) {
+                        let is i32 as pd = a.ipdom[bb];
+                        if (pd < 0 || pd >= nb || inl[pd] == cast(u8, 0)) { _mark_branch(a, bb); }
+                    }
+                    bb = bb + 1;
+                }
+            }
+        }
+        h = h + 1;
+    }
+    d.opt_free(inl);
+    d.opt_free(cast(*u8, lat));
+    d.opt_free(cast(*u8, stk));
+}
+
+fn _block_label(a as *Adce, b as i32) as i32 {
+    let is *cfg.BasicBlock as bb = _blk(a, b);
+    return bb.first.dest.label;
+}
+
+fn _rewrite(a as *Adce) as i32 {
+    let is *d.IRFunction as func = a.func;
+    let is i32 as changed with mut = 0;
+    let is i32 as nb = a.nb;
+    // dead branches jump to their post-dominator
+    let is i32 as b with mut = 0;
+    while (b < nb) {
+        let is *cfg.BasicBlock as bb = _blk(a, b);
+        let is i32 as t = a.term[b];
+        let is *d.IRInst as br = _inst(a, t);
+        if (a.reach[b] == cast(u8, 1) && br.is_dead == 0 && (br.op == d.IR_JZ || br.op == d.IR_JNZ)
+            && a.live[t] == cast(u8, 0)) {
+            let is i32 as pd = a.ipdom[b];
+            if (pd >= 0 && pd < nb) {
+                let is i32 as bl = _block_label(a, b);
+                if (bb.succ0 >= 0) { _drop_args(a, bb.succ0, bl); }
+                if (bb.succ1 >= 0 && bb.succ1 != bb.succ0) { _drop_args(a, bb.succ1, bl); }
+                br.op = cast(i8, d.IR_JMP);
+                br.src1 = d.op_none();
+                br.dest = d.op_label(_block_label(a, pd));
+                // the new edge: pd's phis are all dead here, give them an
+                // undefined argument from b
+                let is *cfg.BasicBlock as pb = _blk(a, pd);
+                let is *d.IRInst as p with mut = pb.first.next;
+                while (cast(i64, p) != 0 && p.op == d.IR_PHI) {
+                    if (phi.phi_find(p, bl) < 0) { phi.phi_add(p, bl, 0 - 1); }
+                    p = p.next;
+                }
+                a.live[t] = cast(u8, 1);
+                changed = 1;
+            }
+        }
+        b = b + 1;
+    }
+    // dead instructions
+    let is i32 as i with mut = 0;
+    while (i < a.n) {
+        let is *d.IRInst as it = _inst(a, i);
+        let is i32 as op = it.op;
+        if (it.is_dead == 0 && a.live[i] == cast(u8, 0) && a.reach[a.iblk[i]] == cast(u8, 1)
+            && op != d.IR_LABEL && op != d.IR_JMP && op != d.IR_JZ && op != d.IR_JNZ && op != d.IR_RET) {
+            it.is_dead = cast(i8, 1);
+            changed = 1;
+        }
+        i = i + 1;
+    }
+    if (changed == 1) { _drop_unreachable(func); }
+    return changed;
+}
+
+// Unlink the blocks no longer reachable from the entry, and their arguments in
+// the phis of the blocks that stay.
+fn _drop_unreachable(func as *d.IRFunction) as void {
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    let is i32 as nl = func.label_count + 1;
+    let is *i32 as l2b = cast(*i32, d.opt_alloc(cast(i64, nl) * 4));
+    let is i32 as i with mut = 0;
+    while (i < nl) { l2b[i] = 0 - 1; i = i + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, blocks, cap, &nb, l2b);
+    let is *i32 as rpo = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as rn with mut = 0;
+    cfg.compute_rpo(blocks, nb, rpo, &rn);
+    if (rn < nb) {
+        let is *u8 as reach = d.opt_alloc(cast(i64, nb + 1));
+        let is i32 as b with mut = 0;
+        while (b < nb) { reach[b] = cast(u8, 0); b = b + 1; }
+        i = 0;
+        while (i < rn) { reach[rpo[i]] = cast(u8, 1); i = i + 1; }
+        b = 0;
+        while (b < nb) {
+            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+            if (reach[b] == cast(u8, 0) && bb.first.op == d.IR_LABEL) {
+                let is i32 as bl = bb.first.dest.label;
+                let is i32 as si with mut = 0;
+                while (si < 2) {
+                    let is i32 as s with mut = bb.succ0;
+                    if (si == 1) { s = bb.succ1; }
+                    if (s >= 0 && reach[s] == cast(u8, 1)) {
+                        let is *cfg.BasicBlock as sb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, s) * sizeof(cfg.BasicBlock));
+                        let is *d.IRInst as p with mut = sb.first.next;
+                        while (cast(i64, p) != 0 && p.op == d.IR_PHI) {
+                            let is i32 as k = phi.phi_find(p, bl);
+                            if (k >= 0) { phi.phi_del(p, k); }
+                            p = p.next;
+                        }
+                    }
+                    si = si + 1;
+                }
+            }
+            b = b + 1;
+        }
+        let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+        b = 0;
+        while (b < nb) {
+            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+            let is *d.IRInst as stop = bb.last.next;
+            if (reach[b] == cast(u8, 0)) {
+                let is *d.IRInst as it with mut = bb.first;
+                while (cast(i64, it) != cast(i64, stop)) {
+                    let is *d.IRInst as nx = it.next;
+                    if (it.op == d.IR_PHI) { phi.phi_free(it); }
+                    it = nx;
+                }
+                if (cast(i64, prev) == 0) { func.instructions = stop; } else { prev.next = stop; }
+            } else {
+                prev = bb.last;
+            }
+            b = b + 1;
+        }
+        d.opt_free(reach);
+    }
+    d.opt_free(cast(*u8, rpo));
+    d.opt_free(cast(*u8, blocks));
+    d.opt_free(cast(*u8, l2b));
+}
+
+fn _free(a as *Adce, full as i32) as void {
+    d.opt_free(cast(*u8, a.blocks));
+    d.opt_free(cast(*u8, a.label_to_bb));
+    if (full == 0) { return; }
+    d.opt_free(cast(*u8, a.preds)); d.opt_free(cast(*u8, a.pred_start)); d.opt_free(cast(*u8, a.pred_count));
+    d.opt_free(cast(*u8, a.insts)); d.opt_free(cast(*u8, a.iblk)); d.opt_free(cast(*u8, a.term));
+    d.opt_free(a.live); d.opt_free(cast(*u8, a.wl));
+    d.opt_free(cast(*u8, a.dstart)); d.opt_free(cast(*u8, a.didx));
+    d.opt_free(cast(*u8, a.ipdom)); d.opt_free(cast(*u8, a.cd_start)); d.opt_free(cast(*u8, a.cd));
+    d.opt_free(a.live_b); d.opt_free(a.reach);
+}
