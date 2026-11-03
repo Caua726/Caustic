@@ -183,11 +183,6 @@ fn fast_slot_index(m as *OffMap, off as i64) as i32 {
 // sorted by offset. Unlike the direct-mapped off_map this handles any offset
 // (including frames > OFF_MAP_MAX), so it matches the old exact `imm == offset`
 // comparison for every slot. Returns -1 if no promotable slot owns `off`.
-fn core_memzero_ssa(p as *u8, n as i64) as void {
-    let is i64 as i with mut = 0;
-    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
-}
-
 fn slot_bsearch(srt_off as *i64, srt_idx as *i32, np as i32, off as i64) as i32 {
     let is i32 as lo with mut = 0;
     let is i32 as hi with mut = np - 1;
@@ -200,549 +195,197 @@ fn slot_bsearch(srt_off as *i64, srt_idx as *i32, np as i32, off as i64) as i32 
     return cast(i32, 0 - 1);
 }
 
-// Push a block onto the phi worklist, doubling the buffer when it is full.
-// The list used to be a fixed [256]i32 with `wl_count < 256` guards at both
-// push sites, so every def block past the 256th was silently dropped: no phi
-// was inserted for it and the slot reads a value from the wrong path.
-fn wl_push(out_buf as **i32, out_cap as *i32, out_count as *i32, b as i32) as void {
-    if (*out_count >= *out_cap) {
-        let is i32 as nc = *out_cap * 2;
-        let is *i32 as nb = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
-        let is i32 as ci with mut = 0;
-        while (ci < *out_count) {
-            let is *i32 as dp = cast(*i32, cast(i64, nb) + cast(i64, ci) * 4);
-            let is *i32 as sp = cast(*i32, cast(i64, *out_buf) + cast(i64, ci) * 4);
-            *dp = *sp;
-            ci = ci + 1;
-        }
-        d.opt_free(cast(*u8, *out_buf));
-        *out_buf = nb;
-        *out_cap = nc;
-    }
-    let is *i32 as wp = cast(*i32, cast(i64, *out_buf) + cast(i64, *out_count) * 4);
-    *wp = b;
-    *out_count = *out_count + 1;
+// === SSA construction ===
+//
+// The variables put into SSA form are the promotable stack slots (what mem2reg
+// always did) and the vregs defined more than once — the copies an earlier
+// round's phis left, a value assigned on several paths. Phis go at the
+// iterated dominance frontier of each variable's definition blocks (Cytron et
+// al.), as IR_PHI instructions right after their block's label; the renaming
+// walk over the dominator tree then turns each load of a promoted slot into a
+// copy of the reaching value, drops the stores, gives every definition of a
+// multi-def vreg a fresh vreg and points each use at the reaching one. A slot
+// read before any store keeps its load; a vreg read where no definition
+// reaches keeps its name. Phi arguments start undefined (-1) and are filled in
+// from each predecessor as the walk leaves it.
+//
+// Variable ids: a promotable slot is its slot index (< nslots); multi-def vreg
+// number k is nslots + k.
+
+// Growable i32 vector.
+struct IVec {
+    p as *i32;
+    n as i32;
+    cap as i32;
 }
 
-// === Step 4: Insert phi nodes ===
-// Returns count of phis inserted. phi_block[i] = block of phi i, phi_slot[i] = slot index,
-// phi_vreg[i] = dest vreg of phi, phi_args[i * max_preds + j] = arg vreg from pred j
+fn iv_init(v as *IVec, cap as i32) as void {
+    let is i32 as c with mut = cap;
+    if (c < 8) { c = 8; }
+    v.p = cast(*i32, d.opt_alloc(cast(i64, c) * 4));
+    v.n = 0;
+    v.cap = c;
+}
 
-fn insert_phis(blocks as *cfg.BasicBlock, nblocks as i32,
-               slots as *SlotInfo, nslots as i32,
-               df_out as *i32, df_starts as *i32, df_counts as *i32,
-               func as *d.IRFunction,
-               phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
-               phi_args as *i32, max_preds as i32,
-               out_nphi as *i32) as void {
-    let is i32 as next_vreg with mut = func.vreg_count;
-    let is i32 as nphi with mut = 0;
-
-    // For each promotable slot, find def blocks and insert phis at DF
-    let is i32 as wl_cap with mut = 64;
-    let is *i32 as worklist = cast(*i32, d.opt_alloc(cast(i64, wl_cap) * 4));
-    let is i32 as hp_size = nblocks * nslots + 1;
-    let is *i32 as has_phi = cast(*i32, d.opt_alloc(cast(i64, hp_size) * 4));
-    let is i32 as hi with mut = 0;
-    while (hi < hp_size) {
-        let is *i32 as hpp = cast(*i32, cast(i64, has_phi) + cast(i64, hi) * 4);
-        *hpp = 0;
-        hi = hi + 1;
+fn iv_push(v as *IVec, x as i32) as void {
+    if (v.n >= v.cap) {
+        let is i32 as nc = v.cap * 2;
+        let is *i32 as np = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is i32 as k with mut = 0;
+        while (k < v.n) { np[k] = v.p[k]; k = k + 1; }
+        d.opt_free(cast(*u8, v.p));
+        v.p = np;
+        v.cap = nc;
     }
+    v.p[v.n] = x;
+    v.n = v.n + 1;
+}
 
-    // Invert the old O(nslots * ninsts) "for each slot, scan every block for a
-    // store" into ONE instruction walk. Build a sorted offset->slot map, then a
-    // block_def[bi*nslots+si] matrix marking which block stores which slot. The
-    // per-slot worklist below seeds from the matrix column (blocks ascending,
-    // same as before) — identical worklist order ⇒ identical phi vreg numbering.
-    let is *i64 as srt_off = cast(*i64, d.opt_alloc(cast(i64, nslots + 1) * 8));
-    let is *i32 as srt_idx = cast(*i32, d.opt_alloc(cast(i64, nslots + 1) * 4));
-    let is i32 as np with mut = 0;
-    let is i32 as psi with mut = 0;
-    while (psi < nslots) {
-        let is *SlotInfo as ps = cast(*SlotInfo, cast(i64, slots) + cast(i64, psi) * sizeof(SlotInfo));
-        if (ps.promotable == 1) {
-            // insertion sort by offset (np <= MAX_SLOTS = 256)
-            let is i32 as b with mut = np - 1;
-            while (b >= 0 && *(cast(*i64, cast(i64, srt_off) + cast(i64, b) * 8)) > ps.offset) {
-                let is *i64 as do2 = cast(*i64, cast(i64, srt_off) + cast(i64, b + 1) * 8);
-                let is *i64 as so2 = cast(*i64, cast(i64, srt_off) + cast(i64, b) * 8);
-                *do2 = *so2;
-                let is *i32 as di2 = cast(*i32, cast(i64, srt_idx) + cast(i64, b + 1) * 4);
-                let is *i32 as si2 = cast(*i32, cast(i64, srt_idx) + cast(i64, b) * 4);
-                *di2 = *si2;
-                b = b - 1;
-            }
-            let is *i64 as ko = cast(*i64, cast(i64, srt_off) + cast(i64, b + 1) * 8); *ko = ps.offset;
-            let is *i32 as ki = cast(*i32, cast(i64, srt_idx) + cast(i64, b + 1) * 4); *ki = psi;
-            np = np + 1;
+fn iv_free(v as *IVec) as void { d.opt_free(cast(*u8, v.p)); }
+
+fn _bb(blocks as *cfg.BasicBlock, b as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+}
+
+// start[k] = cnt[0] + ... + cnt[k-1] for k in 0..n, then cnt[] = 0. The sum
+// is carried through start[] itself: the -O2 vectorizer takes the usual
+// `start[k] = tot; tot = tot + cnt[k]` for a plain reduction and drops the
+// stores.
+fn prefix_sums(cnt as *i32, start as *i32, n as i32) as void {
+    start[0] = 0;
+    let is i32 as k with mut = 0;
+    while (k < n) { start[k + 1] = start[k] + cnt[k]; k = k + 1; }
+    k = 0;
+    while (k < n) { cnt[k] = 0; k = k + 1; }
+}
+
+// Dominance frontiers as lists df[df_start[b] .. df_start[b+1]), in the order
+// the frontier walk finds them: join blocks ascending, then predecessors in
+// order. A block joins a runner's frontier once (the last block added to it is
+// the only possible repeat, since one join block is handled at a time).
+fn build_df(blocks as *cfg.BasicBlock, nb as i32, preds as *i32, pred_start as *i32, pred_count as *i32,
+            df_start as *i32) as *i32 {
+    let is *i32 as last = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as cnt = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as pass with mut = 0;
+    let is *i32 as df with mut = cast(*i32, 0);
+    while (pass < 2) {
+        let is i32 as k with mut = 0;
+        while (k < nb) { last[k] = 0 - 1; if (pass == 0) { cnt[k] = 0; } k = k + 1; }
+        if (pass == 1) {
+            prefix_sums(cnt, df_start, nb);
+            df = cast(*i32, d.opt_alloc(cast(i64, df_start[nb] + 1) * 4));
         }
-        psi = psi + 1;
-    }
-    let is *u8 as block_def = cast(*u8, d.opt_alloc(cast(i64, nblocks) * cast(i64, nslots)));
-    core_memzero_ssa(block_def, cast(i64, nblocks) * cast(i64, nslots));
-    let is i32 as mbi with mut = 0;
-    while (mbi < nblocks) {
-        let is *cfg.BasicBlock as mbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, mbi) * sizeof(cfg.BasicBlock));
-        let is *d.IRInst as minst with mut = mbb.first;
-        let is i32 as mdone with mut = 0;
-        while (cast(i64, minst) != 0 && mdone == 0) {
-            if (minst.is_dead == 0 && minst.op == d.IR_STORE && minst.dest.op_type == d.OP_IMM) {
-                let is i32 as ms = slot_bsearch(srt_off, srt_idx, np, minst.dest.imm);
-                if (ms >= 0) {
-                    let is *u8 as bd = cast(*u8, cast(i64, block_def) + cast(i64, mbi) * cast(i64, nslots) + cast(i64, ms));
-                    *bd = cast(u8, 1);
-                }
-            }
-            if (cast(i64, minst) == cast(i64, mbb.last)) { mdone = 1; }
-            else { minst = minst.next; }
-        }
-        mbi = mbi + 1;
-    }
-
-    let is i32 as si with mut = 0;
-    while (si < nslots) {
-        let is *SlotInfo as s = cast(*SlotInfo, cast(i64, slots) + cast(i64, si) * sizeof(SlotInfo));
-        if (s.promotable == 1) {
-            // Collect def blocks from the matrix column (blocks ascending).
-            let is i32 as wl_count with mut = 0;
-            let is i32 as bi with mut = 0;
-            while (bi < nblocks) {
-                let is *u8 as bd = cast(*u8, cast(i64, block_def) + cast(i64, bi) * cast(i64, nslots) + cast(i64, si));
-                if (*bd == cast(u8, 1)) {
-                    wl_push(&worklist, &wl_cap, &wl_count, bi);
-                }
-                bi = bi + 1;
-            }
-
-            // Worklist: for each def block, insert phis at DF
-            let is i32 as wi with mut = 0;
-            while (wi < wl_count) {
-                let is i32 as def_b = worklist[wi];
-                let is *i32 as dsp = cast(*i32, cast(i64, df_starts) + cast(i64, def_b) * 4);
-                let is *i32 as dcp = cast(*i32, cast(i64, df_counts) + cast(i64, def_b) * 4);
-                let is i32 as di with mut = 0;
-                while (di < *dcp) {
-                    let is *i32 as dfp = cast(*i32, cast(i64, df_out) + cast(i64, *dsp + di) * 4);
-                    let is i32 as df_block = *dfp;
-                    let is i32 as hp_idx = df_block * nslots + si;
-                    let is *i32 as hp_ptr = cast(*i32, cast(i64, has_phi) + cast(i64, hp_idx) * 4);
-                    if (*hp_ptr == 0) {
-                        *hp_ptr = 1;
-                        // Insert phi
-                        let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, nphi) * 4);
-                        *pbp = df_block;
-                        let is *i32 as psp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, nphi) * 4);
-                        *psp2 = si;
-                        let is *i32 as pvp = cast(*i32, cast(i64, phi_vreg) + cast(i64, nphi) * 4);
-                        *pvp = next_vreg;
-                        next_vreg = next_vreg + 1;
-                        // Init phi args to -1
-                        let is i32 as ai with mut = 0;
-                        while (ai < max_preds) {
-                            let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, nphi * max_preds + ai) * 4);
-                            *pap = cast(i32, 0 - 1);
-                            ai = ai + 1;
+        let is i32 as bi with mut = 0;
+        while (bi < nb) {
+            if (pred_count[bi] >= 2) {
+                let is i32 as idom = _bb(blocks, bi).idom;
+                let is i32 as pi with mut = 0;
+                while (pi < pred_count[bi]) {
+                    let is i32 as runner with mut = preds[pred_start[bi] + pi];
+                    while (runner != idom && runner >= 0) {
+                        if (last[runner] != bi) {
+                            last[runner] = bi;
+                            if (pass == 1) { df[df_start[runner] + cnt[runner]] = bi; }
+                            cnt[runner] = cnt[runner] + 1;
                         }
-                        nphi = nphi + 1;
-                        // Add df_block to worklist if not already a def block
-                        wl_push(&worklist, &wl_cap, &wl_count, df_block);
+                        runner = _bb(blocks, runner).idom;
                     }
-                    di = di + 1;
+                    pi = pi + 1;
                 }
-                wi = wi + 1;
             }
+            bi = bi + 1;
         }
-        si = si + 1;
+        pass = pass + 1;
     }
-
-    func.vreg_count = next_vreg;
-    *out_nphi = nphi;
-    d.opt_free(cast(*u8, worklist));
-    d.opt_free(cast(*u8, has_phi));
-    d.opt_free(cast(*u8, srt_off));
-    d.opt_free(cast(*u8, srt_idx));
-    d.opt_free(cast(*u8, block_def));
+    d.opt_free(cast(*u8, last));
+    d.opt_free(cast(*u8, cnt));
+    return df;
 }
 
-// === Step 5: SSA Rename ===
-// DFS over dominator tree, maintaining a definition stack per slot
-
-fn ssa_rename(blocks as *cfg.BasicBlock, nblocks as i32,
-              slots as *SlotInfo, nslots as i32,
-              func as *d.IRFunction,
-              phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
-              phi_args as *i32, max_preds as i32, nphi as i32,
-              preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
-    // Build fast offset→slot map
-    let is *OffMap as off_map = build_off_map(slots, nslots);
-
-    // Build per-block phi index: phi_by_block_start[b], phi_by_block_count[b], phi_order[i]
-    let is *i32 as pb_count = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as pb_start = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as phi_order = cast(*i32, d.opt_alloc(cast(i64, nphi + 1) * 4));
-    let is i32 as pbi with mut = 0;
-    while (pbi < nblocks) {
-        let is *i32 as p = cast(*i32, cast(i64, pb_count) + cast(i64, pbi) * 4); *p = 0;
-        pbi = pbi + 1;
-    }
-    pbi = 0;
-    while (pbi < nphi) {
-        let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, pbi) * 4);
-        let is *i32 as pbc = cast(*i32, cast(i64, pb_count) + cast(i64, *pbp) * 4);
-        *pbc = *pbc + 1;
-        pbi = pbi + 1;
-    }
-    let is i32 as pb_total with mut = 0;
-    pbi = 0;
-    while (pbi < nblocks) {
-        let is *i32 as ps = cast(*i32, cast(i64, pb_start) + cast(i64, pbi) * 4); *ps = pb_total;
-        let is *i32 as pc = cast(*i32, cast(i64, pb_count) + cast(i64, pbi) * 4);
-        pb_total = pb_total + *pc;
-        *pc = 0;
-        pbi = pbi + 1;
-    }
-    pbi = 0;
-    while (pbi < nphi) {
-        let is *i32 as pbp = cast(*i32, cast(i64, phi_block) + cast(i64, pbi) * 4);
-        let is i32 as blk = *pbp;
-        let is *i32 as ps = cast(*i32, cast(i64, pb_start) + cast(i64, blk) * 4);
-        let is *i32 as pc = cast(*i32, cast(i64, pb_count) + cast(i64, blk) * 4);
-        let is *i32 as op = cast(*i32, cast(i64, phi_order) + cast(i64, *ps + *pc) * 4);
-        *op = pbi;
-        *pc = *pc + 1;
-        pbi = pbi + 1;
-    }
-
-    let is i32 as MAX_DEPTH = 512;
-    let is *i32 as def_stack = cast(*i32, d.opt_alloc(cast(i64, nslots * MAX_DEPTH) * 4));
-    let is *i32 as def_top = cast(*i32, d.opt_alloc(cast(i64, nslots) * 4));
-    let is i32 as si with mut = 0;
-    while (si < nslots) {
-        let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, si) * 4);
-        *tp = 0;
-        si = si + 1;
-    }
-
-    // Build dominator tree children list
-    let is *i32 as dom_child_start = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as dom_child_count = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as dom_children = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is i32 as bi with mut = 0;
-    while (bi < nblocks) {
-        let is *i32 as dcp = cast(*i32, cast(i64, dom_child_count) + cast(i64, bi) * 4);
-        *dcp = 0;
-        bi = bi + 1;
-    }
-    bi = 1; // skip entry
-    while (bi < nblocks) {
-        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
-        if (bb.idom >= 0) {
-            let is *i32 as dcp = cast(*i32, cast(i64, dom_child_count) + cast(i64, bb.idom) * 4);
-            *dcp = *dcp + 1;
-        }
-        bi = bi + 1;
-    }
-    let is i32 as total with mut = 0;
-    bi = 0;
-    while (bi < nblocks) {
-        let is *i32 as dsp = cast(*i32, cast(i64, dom_child_start) + cast(i64, bi) * 4);
-        *dsp = total;
-        let is *i32 as dcp = cast(*i32, cast(i64, dom_child_count) + cast(i64, bi) * 4);
-        total = total + *dcp;
-        *dcp = 0;
-        bi = bi + 1;
-    }
-    bi = 1;
-    while (bi < nblocks) {
-        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(cfg.BasicBlock));
-        if (bb.idom >= 0) {
-            let is i32 as par = bb.idom;
-            let is *i32 as dsp = cast(*i32, cast(i64, dom_child_start) + cast(i64, par) * 4);
-            let is *i32 as dcp = cast(*i32, cast(i64, dom_child_count) + cast(i64, par) * 4);
-            let is *i32 as cp = cast(*i32, cast(i64, dom_children) + cast(i64, *dsp + *dcp) * 4);
-            *cp = bi;
-            *dcp = *dcp + 1;
-        }
-        bi = bi + 1;
-    }
-
-    // Iterative DFS over dominator tree for renaming
-    let is *i32 as rn_stack = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as rn_child_idx = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as rn_save_tops = cast(*i32, d.opt_alloc(cast(i64, nblocks * nslots) * 4));
-    let is i32 as rn_sp with mut = 0;
-
-    // Push entry block
-    let is *i32 as rs0 = cast(*i32, cast(i64, rn_stack));
-    *rs0 = 0;
-    let is *i32 as rc0 = cast(*i32, cast(i64, rn_child_idx));
-    *rc0 = 0;
-    // Save stack tops
-    si = 0;
-    while (si < nslots) {
-        let is *i32 as sp2 = cast(*i32, cast(i64, rn_save_tops) + cast(i64, si) * 4);
-        let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, si) * 4);
-        *sp2 = *tp;
-        si = si + 1;
-    }
-    rn_sp = 1;
-
-    while (rn_sp > 0) {
-        let is i32 as cur_top = rn_sp - 1;
-        let is *i32 as rsp = cast(*i32, cast(i64, rn_stack) + cast(i64, cur_top) * 4);
-        let is i32 as b = *rsp;
-        let is *i32 as rcp = cast(*i32, cast(i64, rn_child_idx) + cast(i64, cur_top) * 4);
-
-        if (*rcp == 0) {
-            // First visit: process this block
-
-            // Process phis in this block via per-block index
-            let is *i32 as pbs = cast(*i32, cast(i64, pb_start) + cast(i64, b) * 4);
-            let is *i32 as pbc = cast(*i32, cast(i64, pb_count) + cast(i64, b) * 4);
-            let is i32 as phi_i with mut = 0;
-            while (phi_i < *pbc) {
-                let is *i32 as pop = cast(*i32, cast(i64, phi_order) + cast(i64, *pbs + phi_i) * 4);
-                let is i32 as pi = *pop;
-                let is *i32 as pslp = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                let is i32 as slot = *pslp;
-                let is *i32 as pvp = cast(*i32, cast(i64, phi_vreg) + cast(i64, pi) * 4);
-                let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
-                if (*tp < MAX_DEPTH) {
-                    let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp) * 4);
-                    *dsp2 = *pvp;
-                    *tp = *tp + 1;
-                }
-                phi_i = phi_i + 1;
-            }
-
-            // Process instructions in block
-            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
-            let is *d.IRInst as inst with mut = bb.first;
-            let is i32 as done with mut = 0;
-            while (done == 0) {
-                if (inst.is_dead == 0) {
-                    // Replace LOAD from promotable offset with MOV from current def
-                    if (inst.op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) {
-                        let is i32 as sidx = fast_slot_index(off_map, inst.src1.imm);
-                        if (sidx >= 0) {
-                            let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, sidx) * 4);
-                            if (*tp > 0) {
-                                let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, sidx * MAX_DEPTH + *tp - 1) * 4);
-                                let is i32 as cur_def = *dsp2;
-                                // Check if we need sign extension (type size < 8)
-                                let is i32 as need_cast with mut = 0;
-                                if (cast(i64, inst.cast_to) != 0) {
-                                    let is *i32 as szp = cast(*i32, cast(i64, inst.cast_to) + 28);
-                                    if (*szp < 8) { need_cast = 1; }
-                                }
-                                if (need_cast == 1) {
-                                    // Replace with CAST for sign extension
-                                    inst.op = d.IR_CAST;
-                                    inst.src1.op_type = d.OP_VREG;
-                                    inst.src1.vreg = cur_def;
-                                    // cast_to already set, set cast_from = cast_to (same type, triggers truncation+extension)
-                                    inst.cast_from = inst.cast_to;
-                                } else {
-                                    // Replace with MOV
-                                    inst.op = d.IR_MOV;
-                                    inst.src1.op_type = d.OP_VREG;
-                                    inst.src1.vreg = cur_def;
-                                }
-                            }
-                        }
-                    }
-                    // Replace STORE to promotable offset: mark dead, push value onto def stack
-                    if (inst.op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) {
-                        let is i32 as sidx = fast_slot_index(off_map, inst.dest.imm);
-                        if (sidx >= 0) {
-                            if (inst.src1.op_type == d.OP_VREG) {
-                                let is i32 as val_vreg = inst.src1.vreg;
-                                let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, sidx) * 4);
-                                if (*tp < MAX_DEPTH) {
-                                    let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, sidx * MAX_DEPTH + *tp) * 4);
-                                    *dsp2 = val_vreg;
-                                    *tp = *tp + 1;
-                                }
-                            }
-                            inst.is_dead = 1;
-                        }
-                    }
-                }
-                if (cast(i64, inst) == cast(i64, bb.last)) { done = 1; }
-                else { inst = inst.next; }
-            }
-
-            // Fill phi args in successors using per-block phi index
-            if (bb.succ0 >= 0) {
-                let is i32 as s = bb.succ0;
-                let is *i32 as psp3 = cast(*i32, cast(i64, pred_starts) + cast(i64, s) * 4);
-                let is *i32 as pcp3 = cast(*i32, cast(i64, pred_counts) + cast(i64, s) * 4);
-                let is i32 as pred_idx with mut = 0;
-                let is i32 as pii with mut = 0;
-                while (pii < *pcp3) {
-                    let is *i32 as pp2 = cast(*i32, cast(i64, preds) + cast(i64, *psp3 + pii) * 4);
-                    if (*pp2 == b) { pred_idx = pii; pii = *pcp3; }
-                    pii = pii + 1;
-                }
-                let is *i32 as spbs = cast(*i32, cast(i64, pb_start) + cast(i64, s) * 4);
-                let is *i32 as spbc = cast(*i32, cast(i64, pb_count) + cast(i64, s) * 4);
-                let is i32 as spi with mut = 0;
-                while (spi < *spbc) {
-                    let is *i32 as sop = cast(*i32, cast(i64, phi_order) + cast(i64, *spbs + spi) * 4);
-                    let is i32 as pi = *sop;
-                    let is *i32 as pslp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                    let is i32 as slot = *pslp2;
-                    let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
-                    if (*tp > 0) {
-                        let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp - 1) * 4);
-                        let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + pred_idx) * 4);
-                        *pap = *dsp2;
-                    }
-                    spi = spi + 1;
-                }
-            }
-            if (bb.succ1 >= 0) {
-                let is i32 as s = bb.succ1;
-                let is *i32 as psp3 = cast(*i32, cast(i64, pred_starts) + cast(i64, s) * 4);
-                let is *i32 as pcp3 = cast(*i32, cast(i64, pred_counts) + cast(i64, s) * 4);
-                let is i32 as pred_idx with mut = 0;
-                let is i32 as pii with mut = 0;
-                while (pii < *pcp3) {
-                    let is *i32 as pp2 = cast(*i32, cast(i64, preds) + cast(i64, *psp3 + pii) * 4);
-                    if (*pp2 == b) { pred_idx = pii; pii = *pcp3; }
-                    pii = pii + 1;
-                }
-                let is *i32 as spbs = cast(*i32, cast(i64, pb_start) + cast(i64, s) * 4);
-                let is *i32 as spbc = cast(*i32, cast(i64, pb_count) + cast(i64, s) * 4);
-                let is i32 as spi with mut = 0;
-                while (spi < *spbc) {
-                    let is *i32 as sop = cast(*i32, cast(i64, phi_order) + cast(i64, *spbs + spi) * 4);
-                    let is i32 as pi = *sop;
-                    let is *i32 as pslp2 = cast(*i32, cast(i64, phi_slot) + cast(i64, pi) * 4);
-                    let is i32 as slot = *pslp2;
-                    let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, slot) * 4);
-                    if (*tp > 0) {
-                        let is *i32 as dsp2 = cast(*i32, cast(i64, def_stack) + cast(i64, slot * MAX_DEPTH + *tp - 1) * 4);
-                        let is *i32 as pap = cast(*i32, cast(i64, phi_args) + cast(i64, pi * max_preds + pred_idx) * 4);
-                        *pap = *dsp2;
-                    }
-                    spi = spi + 1;
-                }
-            }
-        }
-
-        // Push next dominator tree child or pop
-        let is *i32 as dcsp = cast(*i32, cast(i64, dom_child_start) + cast(i64, b) * 4);
-        let is *i32 as dccp = cast(*i32, cast(i64, dom_child_count) + cast(i64, b) * 4);
-        if (*rcp < *dccp) {
-            let is *i32 as child_p = cast(*i32, cast(i64, dom_children) + cast(i64, *dcsp + *rcp) * 4);
-            let is i32 as child = *child_p;
-            *rcp = *rcp + 1;
-            // Save tops for child
-            let is *i32 as save_base = cast(*i32, cast(i64, rn_save_tops) + cast(i64, rn_sp * nslots) * 4);
-            si = 0;
-            while (si < nslots) {
-                let is *i32 as sv = cast(*i32, cast(i64, save_base) + cast(i64, si) * 4);
-                let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, si) * 4);
-                *sv = *tp;
-                si = si + 1;
-            }
-            // Push child
-            let is *i32 as nrs = cast(*i32, cast(i64, rn_stack) + cast(i64, rn_sp) * 4);
-            *nrs = child;
-            let is *i32 as nrc = cast(*i32, cast(i64, rn_child_idx) + cast(i64, rn_sp) * 4);
-            *nrc = 0;
-            rn_sp = rn_sp + 1;
-        } else {
-            // Pop: restore def stack tops
-            let is *i32 as save_base = cast(*i32, cast(i64, rn_save_tops) + cast(i64, cur_top * nslots) * 4);
-            si = 0;
-            while (si < nslots) {
-                let is *i32 as sv = cast(*i32, cast(i64, save_base) + cast(i64, si) * 4);
-                let is *i32 as tp = cast(*i32, cast(i64, def_top) + cast(i64, si) * 4);
-                *tp = *sv;
-                si = si + 1;
-            }
-            rn_sp = rn_sp - 1;
-        }
-    }
-
-    d.opt_free(cast(*u8, def_stack));
-    d.opt_free(cast(*u8, def_top));
-    d.opt_free(cast(*u8, dom_child_start));
-    d.opt_free(cast(*u8, dom_child_count));
-    d.opt_free(cast(*u8, dom_children));
-    d.opt_free(cast(*u8, rn_stack));
-    d.opt_free(cast(*u8, rn_child_idx));
-    d.opt_free(cast(*u8, rn_save_tops));
-    free_off_map(off_map);
-    d.opt_free(cast(*u8, pb_count));
-    d.opt_free(cast(*u8, pb_start));
-    d.opt_free(cast(*u8, phi_order));
+// Does `inst` write its dest vreg? (STORE/COPY read dest as an address.)
+fn dest_is_def(inst as *d.IRInst) as i32 {
+    if (inst.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = inst.op;
+    if (op == d.IR_STORE || op == d.IR_COPY || op == d.IR_ATOMIC_STORE || op == d.IR_CMOV
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256) { return 0; }
+    return 1;
 }
 
-// === Step 6: phi instructions ===
-// Every block gets a label (a phi names its predecessors by label); each phi
-// goes right after its block's label, in creation order, with one argument per
-// distinct predecessor. A narrow slot's phi carries the slot type, which the
-// copies made from it keep.
-
-fn place_phis(blocks as *cfg.BasicBlock, nblocks as i32,
-              func as *d.IRFunction,
-              phi_block as *i32, phi_slot as *i32, phi_vreg as *i32,
-              phi_args as *i32, max_preds as i32, nphi as i32,
-              preds as *i32, pred_starts as *i32, pred_counts as *i32,
-              slots as *SlotInfo) as void {
-    phi.ssa_begin(func);
-    phi.ssa_label_blocks(func, blocks, nblocks);
-    let is *i64 as tailp = cast(*i64, d.opt_alloc(cast(i64, nblocks) * 8));
-    let is i32 as b with mut = 0;
-    while (b < nblocks) {
-        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
-        tailp[b] = cast(i64, bb.first);
-        b = b + 1;
-    }
-    let is i32 as pi with mut = 0;
-    while (pi < nphi) {
-        let is i32 as pb = phi_block[pi];
-        let is i32 as ps = pred_starts[pb];
-        let is i32 as pc = pred_counts[pb];
-        let is *d.IRInst as p = phi.phi_new(phi_vreg[pi], pc);
-        let is *SlotInfo as slot = cast(*SlotInfo, cast(i64, slots) + cast(i64, phi_slot[pi]) * sizeof(SlotInfo));
-        if (cast(i64, slot.type_ptr) != 0) {
-            let is *i32 as szp = cast(*i32, cast(i64, slot.type_ptr) + 28);
-            if (*szp < 8) { p.cast_to = slot.type_ptr; p.cast_from = slot.type_ptr; }
-        }
-        let is i32 as ai with mut = 0;
-        while (ai < pc) {
-            let is i32 as pred = preds[ps + ai];
-            let is *cfg.BasicBlock as pbb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, pred) * sizeof(cfg.BasicBlock));
-            let is i32 as pl = pbb.first.dest.label;
-            if (phi.phi_find(p, pl) < 0) {
-                phi.phi_add(p, pl, phi_args[pi * max_preds + ai]);
+// The single-block form: no phis, the reaching store is the last one above.
+fn promote_one_block(func as *d.IRFunction, slots as *SlotInfo, nslots as i32) as void {
+    let is *OffMap as sb_off_map = build_off_map(slots, nslots);
+    let is i32 as oi with mut = 0;
+    let is *i32 as cur_def = cast(*i32, d.opt_alloc(cast(i64, nslots + 1) * 4));
+    while (oi < nslots) { cur_def[oi] = 0 - 1; oi = oi + 1; }
+    let is *d.IRInst as sb_inst with mut = func.instructions;
+    while (cast(i64, sb_inst) != 0) {
+        if (sb_inst.is_dead == 0) {
+            if (sb_inst.op == d.IR_LOAD && sb_inst.src1.op_type == d.OP_IMM) {
+                let is i32 as sb_sidx = fast_slot_index(sb_off_map, sb_inst.src1.imm);
+                if (sb_sidx >= 0 && cur_def[sb_sidx] >= 0) { load_to_copy(sb_inst, cur_def[sb_sidx]); }
             }
-            ai = ai + 1;
+            if (sb_inst.op == d.IR_STORE && sb_inst.dest.op_type == d.OP_IMM) {
+                let is i32 as sb_sidx = fast_slot_index(sb_off_map, sb_inst.dest.imm);
+                if (sb_sidx >= 0) {
+                    if (sb_inst.src1.op_type == d.OP_VREG) { cur_def[sb_sidx] = sb_inst.src1.vreg; }
+                    sb_inst.is_dead = 1;
+                }
+            }
         }
-        let is *d.IRInst as at = cast(*d.IRInst, tailp[pb]);
-        cfg.insert_after(at, p);
-        tailp[pb] = cast(i64, p);
-        pi = pi + 1;
+        sb_inst = sb_inst.next;
     }
-    d.opt_free(cast(*u8, tailp));
+    d.opt_free(cast(*u8, cur_def));
+    free_off_map(sb_off_map);
 }
 
-// === Main entry point ===
+// A load of a promoted slot becomes a copy of the value v that reaches it; a
+// narrow one re-truncates and extends it (CAST from the slot's own type).
+fn load_to_copy(inst as *d.IRInst, v as i32) as void {
+    let is i32 as need_cast with mut = 0;
+    if (cast(i64, inst.cast_to) != 0) {
+        let is *i32 as szp = cast(*i32, cast(i64, inst.cast_to) + 28);
+        if (*szp < 8) { need_cast = 1; }
+    }
+    if (need_cast == 1) {
+        inst.op = d.IR_CAST;
+        inst.cast_from = inst.cast_to;
+    } else {
+        inst.op = d.IR_MOV;
+    }
+    inst.src1.op_type = d.OP_VREG;
+    inst.src1.vreg = v;
+}
 
-fn mem2reg(func as *d.IRFunction) as void {
-    if (func.vreg_count == 0) { return; }
+// Undo log of the renaming walk: (variable, value it had before).
+let is IVec as un_var with mut;
+let is IVec as un_old with mut;
 
-    // Step 0: find promotable slots
+fn _def(cur as *i32, var as i32, v as i32) as void {
+    iv_push(&un_var, var);
+    iv_push(&un_old, cur[var]);
+    cur[var] = v;
+}
+
+fn _use(o as *d.Operand, var_of as *i32, vc0 as i32, cur as *i32) as void {
+    if (o.op_type != d.OP_VREG) { return; }
+    let is i32 as v = o.vreg;
+    if (v < 0 || v >= vc0) { return; }
+    let is i32 as x = var_of[v];
+    if (x < 0) { return; }
+    if (cur[x] >= 0) { o.vreg = cur[x]; }
+}
+
+// Build SSA form for func. promote: also promote stack slots (off under -g,
+// where locals must stay in their slots for the debug info).
+fn build(func as *d.IRFunction, promote as i32) as void {
+    let is i32 as vc0 = func.vreg_count;
+    if (vc0 == 0) { return; }
+
+    // Step 0: promotable slots
     let is *SlotInfo as slots = cast(*SlotInfo, d.opt_alloc(cast(i64, MAX_SLOTS) * sizeof(SlotInfo)));
     let is i32 as nslots with mut = 0;
-    find_promotable(func, slots, &nslots);
-
-    // Check if any slots are promotable
+    if (promote == 1) { find_promotable(func, slots, &nslots); }
     let is i32 as any_promo with mut = 0;
     let is i32 as si with mut = 0;
     while (si < nslots) {
@@ -750,143 +393,304 @@ fn mem2reg(func as *d.IRFunction) as void {
         if (s.promotable == 1) { any_promo = 1; }
         si = si + 1;
     }
-    if (any_promo == 0) { d.opt_free(cast(*u8, slots)); return; }
 
-    // Step 1: build CFG
+    // Step 1: vregs defined more than once
+    let is *i32 as var_of = cast(*i32, d.opt_alloc(cast(i64, vc0) * 4));
+    let is i32 as v with mut = 0;
+    while (v < vc0) { var_of[v] = 0; v = v + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && dest_is_def(it) == 1 && it.dest.vreg >= 0 && it.dest.vreg < vc0) {
+            var_of[it.dest.vreg] = var_of[it.dest.vreg] + 1;
+        }
+        it = it.next;
+    }
+    let is i32 as nmd with mut = 0;
+    let is i32 as md_defs with mut = 0;
+    v = 0;
+    while (v < vc0) {
+        if (var_of[v] >= 2) { md_defs = md_defs + var_of[v]; var_of[v] = nslots + nmd; nmd = nmd + 1; }
+        else { var_of[v] = 0 - 1; }
+        v = v + 1;
+    }
+    if (any_promo == 0 && nmd == 0) {
+        d.opt_free(cast(*u8, slots)); d.opt_free(cast(*u8, var_of));
+        return;
+    }
+
+    // Step 2: CFG
     let is i32 as cfg_cap = cfg.count_blocks(func) + 1;
     let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cfg_cap) * sizeof(cfg.BasicBlock)));
     let is i32 as lc = func.label_count + 1;
     let is *i32 as label_to_bb = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
     let is i32 as li with mut = 0;
-    while (li < lc) {
-        let is *i32 as p = cast(*i32, cast(i64, label_to_bb) + cast(i64, li) * 4);
-        *p = 0;
-        li = li + 1;
-    }
-    let is i32 as nblocks with mut = 0;
-    cfg.build_cfg(func, blocks, cfg_cap, &nblocks, label_to_bb);
-    if (nblocks <= 1) {
-        // Fast path: single basic block — no phis needed, simple linear forwarding
-        let is *OffMap as sb_off_map = build_off_map(slots, nslots);
-        let is i32 as oi with mut = 0;
-        // cur_def[slot] tracks current vreg holding the slot's value
-        let is *i32 as cur_def = cast(*i32, d.opt_alloc(cast(i64, nslots) * 4));
-        oi = 0;
-        while (oi < nslots) { let is *i32 as cd = cast(*i32, cast(i64, cur_def) + cast(i64, oi) * 4); *cd = cast(i32, 0 - 1); oi = oi + 1; }
-        let is *d.IRInst as sb_inst with mut = func.instructions;
-        while (cast(i64, sb_inst) != 0) {
-            if (sb_inst.is_dead == 0) {
-                if (sb_inst.op == d.IR_LOAD && sb_inst.src1.op_type == d.OP_IMM) {
-                    let is i32 as sb_sidx = fast_slot_index(sb_off_map, sb_inst.src1.imm);
-                    if (sb_sidx >= 0) {
-                        let is *i32 as cd = cast(*i32, cast(i64, cur_def) + cast(i64, sb_sidx) * 4);
-                        if (*cd >= 0) {
-                            let is i32 as need_cast with mut = 0;
-                            if (cast(i64, sb_inst.cast_to) != 0) {
-                                let is *i32 as szp = cast(*i32, cast(i64, sb_inst.cast_to) + 28);
-                                if (*szp < 8) { need_cast = 1; }
-                            }
-                            if (need_cast == 1) {
-                                sb_inst.op = d.IR_CAST;
-                                sb_inst.src1.op_type = d.OP_VREG;
-                                sb_inst.src1.vreg = *cd;
-                                sb_inst.cast_from = sb_inst.cast_to;
-                            } else {
-                                sb_inst.op = d.IR_MOV;
-                                sb_inst.src1.op_type = d.OP_VREG;
-                                sb_inst.src1.vreg = *cd;
-                            }
-                        }
-                    }
-                }
-                if (sb_inst.op == d.IR_STORE && sb_inst.dest.op_type == d.OP_IMM) {
-                    let is i32 as sb_sidx = fast_slot_index(sb_off_map, sb_inst.dest.imm);
-                    if (sb_sidx >= 0) {
-                        if (sb_inst.src1.op_type == d.OP_VREG) {
-                            let is *i32 as cd = cast(*i32, cast(i64, cur_def) + cast(i64, sb_sidx) * 4);
-                            *cd = sb_inst.src1.vreg;
-                        }
-                        sb_inst.is_dead = 1;
-                    }
-                }
-            }
-            sb_inst = sb_inst.next;
-        }
-        d.opt_free(cast(*u8, cur_def));
-        free_off_map(sb_off_map);
-        d.opt_free(cast(*u8, slots));
-        d.opt_free(cast(*u8, blocks));
-        d.opt_free(cast(*u8, label_to_bb));
+    while (li < lc) { label_to_bb[li] = 0; li = li + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, blocks, cfg_cap, &nb, label_to_bb);
+    if (nb <= 1) {
+        // One block: no phis; vregs stay as they are.
+        if (any_promo == 1) { promote_one_block(func, slots, nslots); }
+        d.opt_free(cast(*u8, slots)); d.opt_free(cast(*u8, var_of));
+        d.opt_free(cast(*u8, blocks)); d.opt_free(cast(*u8, label_to_bb));
         return;
     }
+    let is *i32 as preds = cast(*i32, d.opt_alloc(cast(i64, nb * 2 + 4) * 4));
+    let is *i32 as pred_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as pred_count = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    cfg.build_preds(blocks, nb, preds, pred_start, pred_count);
+    let is *i32 as rpo = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is i32 as rpo_n with mut = 0;
+    cfg.compute_rpo(blocks, nb, rpo, &rpo_n);
+    dom.compute_idom(blocks, nb, rpo, rpo_n, preds, pred_start, pred_count);
+    let is *i32 as df_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as df = build_df(blocks, nb, preds, pred_start, pred_count, df_start);
 
-    // Build predecessor lists
-    let is i32 as max_edges = nblocks * 2 + 4;
-    let is *i32 as preds_arr = cast(*i32, d.opt_alloc(cast(i64, max_edges) * 4));
-    let is *i32 as pred_starts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as pred_counts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    cfg.build_preds(blocks, nblocks, preds_arr, pred_starts, pred_counts);
+    // Every block gets a label: a phi names its predecessors by label.
+    phi.ssa_begin(func);
+    phi.ssa_label_blocks(func, blocks, nb);
 
-    // Step 2: compute RPO + dominance
-    let is *i32 as rpo_order = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is i32 as rpo_count with mut = 0;
-    cfg.compute_rpo(blocks, nblocks, rpo_order, &rpo_count);
-    dom.compute_idom(blocks, nblocks, rpo_order, rpo_count, preds_arr, pred_starts, pred_counts);
-
-    // Step 3: compute dominance frontiers
-    let is i32 as max_df with mut = nblocks * nblocks;
-    if (max_df > 65536) { max_df = 65536; }
-    let is *i32 as df_out = cast(*i32, d.opt_alloc(cast(i64, max_df) * 4));
-    let is *i32 as df_starts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    let is *i32 as df_counts = cast(*i32, d.opt_alloc(cast(i64, nblocks) * 4));
-    dom.compute_df(blocks, nblocks, preds_arr, pred_starts, pred_counts, df_out, df_starts, df_counts);
-
-    // Step 4: insert phis
-    let is i32 as max_preds with mut = 0;
-    let is i32 as bi with mut = 0;
-    while (bi < nblocks) {
-        let is *i32 as pcp = cast(*i32, cast(i64, pred_counts) + cast(i64, bi) * 4);
-        if (*pcp > max_preds) { max_preds = *pcp; }
-        bi = bi + 1;
+    // Step 3: definition blocks of each variable, ascending
+    let is i32 as nvars = nslots + nmd;
+    let is *OffMap as off_map = build_off_map(slots, nslots);
+    let is *i32 as dstamp = cast(*i32, d.opt_alloc(cast(i64, nvars + 1) * 4));
+    let is *i32 as dcnt = cast(*i32, d.opt_alloc(cast(i64, nvars + 1) * 4));
+    let is *i32 as dstart = cast(*i32, d.opt_alloc(cast(i64, nvars + 1) * 4));
+    let is *i32 as dblk with mut = cast(*i32, 0);
+    let is i32 as pass with mut = 0;
+    while (pass < 2) {
+        let is i32 as x with mut = 0;
+        while (x < nvars) { dstamp[x] = 0 - 1; if (pass == 0) { dcnt[x] = 0; } x = x + 1; }
+        if (pass == 1) {
+            prefix_sums(dcnt, dstart, nvars);
+            dblk = cast(*i32, d.opt_alloc(cast(i64, dstart[nvars] + 1) * 4));
+        }
+        let is i32 as b with mut = 0;
+        while (b < nb) {
+            let is *cfg.BasicBlock as bb = _bb(blocks, b);
+            let is *d.IRInst as ins with mut = bb.first;
+            let is i32 as done with mut = 0;
+            while (done == 0) {
+                if (ins.is_dead == 0) {
+                    let is i32 as var with mut = 0 - 1;
+                    if (ins.op == d.IR_STORE && ins.dest.op_type == d.OP_IMM) {
+                        var = fast_slot_index(off_map, ins.dest.imm);
+                    } else if (dest_is_def(ins) == 1 && ins.dest.vreg >= 0 && ins.dest.vreg < vc0) {
+                        var = var_of[ins.dest.vreg];
+                    }
+                    if (var >= 0 && dstamp[var] != b) {
+                        dstamp[var] = b;
+                        if (pass == 1) { dblk[dstart[var] + dcnt[var]] = b; }
+                        dcnt[var] = dcnt[var] + 1;
+                    }
+                }
+                if (cast(i64, ins) == cast(i64, bb.last)) { done = 1; } else { ins = ins.next; }
+            }
+            b = b + 1;
+        }
+        pass = pass + 1;
     }
-    if (max_preds < 2) { max_preds = 2; }
-    let is i32 as max_phis with mut = nslots * nblocks;
-    if (max_phis > 4096) { max_phis = 4096; }
-    let is *i32 as phi_block = cast(*i32, d.opt_alloc(cast(i64, max_phis) * 4));
-    let is *i32 as phi_slot = cast(*i32, d.opt_alloc(cast(i64, max_phis) * 4));
-    let is *i32 as phi_vreg = cast(*i32, d.opt_alloc(cast(i64, max_phis) * 4));
-    let is *i32 as phi_args = cast(*i32, d.opt_alloc(cast(i64, max_phis * max_preds) * 4));
-    let is i32 as nphi with mut = 0;
-    insert_phis(blocks, nblocks, slots, nslots, df_out, df_starts, df_counts,
-                func, phi_block, phi_slot, phi_vreg, phi_args, max_preds, &nphi);
 
-    // Step 5: SSA rename
-    ssa_rename(blocks, nblocks, slots, nslots, func,
-               phi_block, phi_slot, phi_vreg, phi_args, max_preds, nphi,
-               preds_arr, pred_starts, pred_counts);
+    // Step 4: phis at the iterated dominance frontiers
+    let is *i64 as ptail = cast(*i64, d.opt_alloc(cast(i64, nb) * 8));
+    let is *i32 as has_phi = cast(*i32, d.opt_alloc(cast(i64, nb) * 4));
+    let is i32 as b with mut = 0;
+    while (b < nb) { ptail[b] = cast(i64, _bb(blocks, b).first); has_phi[b] = 0 - 1; b = b + 1; }
+    let is IVec as wl;
+    iv_init(&wl, 64);
+    let is i32 as vc_slot_phis with mut = func.vreg_count;
+    let is i32 as x with mut = 0;
+    while (x < nvars) {
+        wl.n = 0;
+        let is i32 as k with mut = dstart[x];
+        while (k < dstart[x + 1]) { iv_push(&wl, dblk[k]); k = k + 1; }
+        let is i32 as wi with mut = 0;
+        while (wi < wl.n) {
+            let is i32 as db = wl.p[wi];
+            let is i32 as fi with mut = df_start[db];
+            while (fi < df_start[db + 1]) {
+                let is i32 as fb = df[fi];
+                if (has_phi[fb] != x) {
+                    has_phi[fb] = x;
+                    let is i32 as pv = func.vreg_count;
+                    func.vreg_count = func.vreg_count + 1;
+                    let is *d.IRInst as p = phi.phi_new(pv, pred_count[fb]);
+                    p.dest.imm = cast(i64, x);
+                    if (x < nslots) {
+                        let is *SlotInfo as slot = cast(*SlotInfo, cast(i64, slots) + cast(i64, x) * sizeof(SlotInfo));
+                        phi.phi_mark_slot(p);
+                        if (cast(i64, slot.type_ptr) != 0) {
+                            let is *i32 as szp = cast(*i32, cast(i64, slot.type_ptr) + 28);
+                            if (*szp < 8) { p.cast_to = slot.type_ptr; p.cast_from = slot.type_ptr; }
+                        }
+                    }
+                    let is i32 as pi with mut = 0;
+                    while (pi < pred_count[fb]) {
+                        let is *cfg.BasicBlock as pbb = _bb(blocks, preds[pred_start[fb] + pi]);
+                        let is i32 as pl = pbb.first.dest.label;
+                        if (phi.phi_find(p, pl) < 0) { phi.phi_add(p, pl, 0 - 1); }
+                        pi = pi + 1;
+                    }
+                    let is *cfg.BasicBlock as fbb = _bb(blocks, fb);
+                    let is *d.IRInst as at = cast(*d.IRInst, ptail[fb]);
+                    cfg.insert_after(at, p);
+                    if (cast(i64, at) == cast(i64, fbb.last)) { fbb.last = p; }
+                    ptail[fb] = cast(i64, p);
+                    iv_push(&wl, fb);
+                }
+                fi = fi + 1;
+            }
+            wi = wi + 1;
+        }
+        x = x + 1;
+        if (x == nslots) { vc_slot_phis = func.vreg_count; }
+    }
+    if (nslots == 0) { vc_slot_phis = vc0; }
+    iv_free(&wl);
 
-    // Step 6: the phis become IR_PHI instructions, then copies again
-    if (nphi > 0) {
-        place_phis(blocks, nblocks, func,
-                   phi_block, phi_slot, phi_vreg, phi_args, max_preds, nphi,
-                   preds_arr, pred_starts, pred_counts,
-                   slots);
-        phi.ssa_destroy(func);
+    // Step 5: rename, walking the dominator tree
+    let is i32 as orig_n = func.vreg_count + md_defs + 1;
+    let is *i32 as orig = cast(*i32, d.opt_alloc(cast(i64, orig_n) * 4));
+    let is i32 as oi with mut = 0;
+    while (oi < orig_n) { orig[oi] = 0 - 1; oi = oi + 1; }
+    // a multi-def vreg's phis are versions of it
+    let is *i32 as var_vreg = cast(*i32, d.opt_alloc(cast(i64, nmd + 1) * 4));
+    v = 0;
+    while (v < vc0) { if (var_of[v] >= 0) { var_vreg[var_of[v] - nslots] = v; } v = v + 1; }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && cast(i32, it.dest.imm) >= nslots) {
+            orig[it.dest.vreg] = var_vreg[cast(i32, it.dest.imm) - nslots];
+        }
+        it = it.next;
     }
 
-    // Cleanup
-    d.opt_free(cast(*u8, slots));
-    d.opt_free(cast(*u8, blocks));
-    d.opt_free(cast(*u8, label_to_bb));
-    d.opt_free(cast(*u8, preds_arr));
-    d.opt_free(cast(*u8, pred_starts));
-    d.opt_free(cast(*u8, pred_counts));
-    d.opt_free(cast(*u8, rpo_order));
-    d.opt_free(cast(*u8, df_out));
-    d.opt_free(cast(*u8, df_starts));
-    d.opt_free(cast(*u8, df_counts));
-    d.opt_free(cast(*u8, phi_block));
-    d.opt_free(cast(*u8, phi_slot));
-    d.opt_free(cast(*u8, phi_vreg));
-    d.opt_free(cast(*u8, phi_args));
+    // dominator tree children, ascending
+    let is *i32 as ch_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as ch_cnt = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as ch = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    b = 0;
+    while (b < nb) { ch_cnt[b] = 0; b = b + 1; }
+    b = 1;
+    while (b < nb) { let is i32 as id = _bb(blocks, b).idom; if (id >= 0) { ch_cnt[id] = ch_cnt[id] + 1; } b = b + 1; }
+    prefix_sums(ch_cnt, ch_start, nb);
+    b = 1;
+    while (b < nb) {
+        let is i32 as id = _bb(blocks, b).idom;
+        if (id >= 0) { ch[ch_start[id] + ch_cnt[id]] = b; ch_cnt[id] = ch_cnt[id] + 1; }
+        b = b + 1;
+    }
+
+    let is *i32 as cur = cast(*i32, d.opt_alloc(cast(i64, nvars + 1) * 4));
+    x = 0;
+    while (x < nvars) { cur[x] = 0 - 1; x = x + 1; }
+    iv_init(&un_var, 256);
+    iv_init(&un_old, 256);
+    let is *i32 as fr_b = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as fr_c = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as fr_u = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as sp with mut = 1;
+    fr_b[0] = 0; fr_c[0] = 0; fr_u[0] = 0;
+    while (sp > 0) {
+        let is i32 as top = sp - 1;
+        let is i32 as bk = fr_b[top];
+        let is *cfg.BasicBlock as bb = _bb(blocks, bk);
+        if (fr_c[top] == 0) {
+            fr_u[top] = un_var.n;
+            let is *d.IRInst as ins with mut = bb.first;
+            let is i32 as done with mut = 0;
+            while (done == 0) {
+                if (ins.is_dead == 0) {
+                    if (ins.op == d.IR_PHI) {
+                        _def(cur, cast(i32, ins.dest.imm), ins.dest.vreg);
+                    } else {
+                        _use(&ins.src1, var_of, vc0, cur);
+                        _use(&ins.src2, var_of, vc0, cur);
+                        if (ins.op == d.IR_STORE || ins.op == d.IR_COPY) { _use(&ins.dest, var_of, vc0, cur); }
+                        if (ins.op == d.IR_LOAD && ins.src1.op_type == d.OP_IMM) {
+                            let is i32 as sidx = fast_slot_index(off_map, ins.src1.imm);
+                            if (sidx >= 0 && cur[sidx] >= 0) { load_to_copy(ins, cur[sidx]); }
+                        } else if (ins.op == d.IR_STORE && ins.dest.op_type == d.OP_IMM) {
+                            let is i32 as sidx = fast_slot_index(off_map, ins.dest.imm);
+                            if (sidx >= 0) {
+                                if (ins.src1.op_type == d.OP_VREG) { _def(cur, sidx, ins.src1.vreg); }
+                                ins.is_dead = 1;
+                            }
+                        } else if (dest_is_def(ins) == 1 && ins.dest.vreg >= 0 && ins.dest.vreg < vc0
+                                   && var_of[ins.dest.vreg] >= 0) {
+                            let is i32 as nv = func.vreg_count;
+                            func.vreg_count = func.vreg_count + 1;
+                            orig[nv] = ins.dest.vreg;
+                            _def(cur, var_of[ins.dest.vreg], nv);
+                            ins.dest.vreg = nv;
+                        }
+                    }
+                }
+                if (cast(i64, ins) == cast(i64, bb.last)) { done = 1; } else { ins = ins.next; }
+            }
+            // arguments of the successors' phis on the edges from this block
+            let is i32 as bl = bb.first.dest.label;
+            let is i32 as sk with mut = 0;
+            while (sk < 2) {
+                let is i32 as su with mut = bb.succ0;
+                if (sk == 1) { su = bb.succ1; if (su == bb.succ0) { su = 0 - 1; } }
+                if (su >= 0) {
+                    let is *cfg.BasicBlock as sbb = _bb(blocks, su);
+                    let is *d.IRInst as p with mut = sbb.first.next;
+                    let is i32 as pdone with mut = 0;
+                    if (cast(i64, sbb.first) == cast(i64, sbb.last)) { pdone = 1; }
+                    while (pdone == 0) {
+                        if (p.op != d.IR_PHI) { pdone = 1; }
+                        else {
+                            let is i32 as ai = phi.phi_find(p, bl);
+                            if (ai >= 0) { phi.phi_set_val(p, ai, cur[cast(i32, p.dest.imm)]); }
+                            if (cast(i64, p) == cast(i64, sbb.last)) { pdone = 1; } else { p = p.next; }
+                        }
+                    }
+                }
+                sk = sk + 1;
+            }
+        }
+        if (fr_c[top] < ch_cnt[bk]) {
+            let is i32 as child = ch[ch_start[bk] + fr_c[top]];
+            fr_c[top] = fr_c[top] + 1;
+            fr_b[sp] = child; fr_c[sp] = 0; fr_u[sp] = un_var.n;
+            sp = sp + 1;
+        } else {
+            // leave the block: restore what it defined
+            while (un_var.n > fr_u[top]) {
+                un_var.n = un_var.n - 1;
+                un_old.n = un_old.n - 1;
+                cur[un_var.p[un_var.n]] = un_old.p[un_old.n];
+            }
+            sp = sp - 1;
+        }
+    }
+    // the variable ids parked in the phis' dest.imm are no longer needed
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI) { it.dest.imm = 0; }
+        it = it.next;
+    }
+    phi.ssa_set_versions(orig, orig_n, func.vreg_count, vc_slot_phis);
+
+    iv_free(&un_var); iv_free(&un_old);
+    d.opt_free(cast(*u8, fr_b)); d.opt_free(cast(*u8, fr_c)); d.opt_free(cast(*u8, fr_u));
+    d.opt_free(cast(*u8, cur));
+    d.opt_free(cast(*u8, ch_start)); d.opt_free(cast(*u8, ch_cnt)); d.opt_free(cast(*u8, ch));
+    d.opt_free(cast(*u8, var_vreg));
+    d.opt_free(cast(*u8, ptail)); d.opt_free(cast(*u8, has_phi));
+    d.opt_free(cast(*u8, dstamp)); d.opt_free(cast(*u8, dcnt)); d.opt_free(cast(*u8, dstart));
+    if (cast(i64, dblk) != 0) { d.opt_free(cast(*u8, dblk)); }
+    free_off_map(off_map);
+    d.opt_free(cast(*u8, df)); d.opt_free(cast(*u8, df_start));
+    d.opt_free(cast(*u8, rpo));
+    d.opt_free(cast(*u8, preds)); d.opt_free(cast(*u8, pred_start)); d.opt_free(cast(*u8, pred_count));
+    d.opt_free(cast(*u8, blocks)); d.opt_free(cast(*u8, label_to_bb));
+    d.opt_free(cast(*u8, slots)); d.opt_free(cast(*u8, var_of));
+}
+
+// mem2reg as the optimizer has always called it: SSA in, copies out.
+fn mem2reg(func as *d.IRFunction) as void {
+    build(func, 1);
+    phi.ssa_destroy(func);
 }

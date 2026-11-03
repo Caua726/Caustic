@@ -85,6 +85,12 @@ fn phi_free(p as *d.IRInst) as void {
     p.asm_str_len = 0;
 }
 
+// A phi of a promoted stack slot leaves copies at destruction (the shape the
+// passes after mem2reg have always seen); the phi of a vreg that had several
+// definitions is coalesced back into that vreg.
+fn phi_mark_slot(p as *d.IRInst) as void { p.is_extern_global = cast(i8, 1); }
+fn phi_is_slot(p as *d.IRInst) as i32 { return cast(i32, p.is_extern_global == cast(i8, 1)); }
+
 fn ssa_fail(msg as *u8, func as *d.IRFunction) as void {
     io.write_str(io.STDERR, "error: internal: SSA: ");
     io.write_str(io.STDERR, msg);
@@ -181,6 +187,106 @@ fn ssa_end(func as *d.IRFunction) as void {
     if (ssa_active == 0) { return; }
     ssa_drop_labels(func);
     ssa_active = 0;
+}
+
+// === Versions of multi-def vregs ===
+//
+// Construction gives each definition of a vreg defined more than once a fresh
+// vreg, and its phis fresh vregs too; ssa_orig[x] is the vreg version x came
+// from (-1 for anything else). Destruction renames every version back to its
+// vreg. That is sound while no pass has made two versions of one vreg live at
+// once — propagating constants and deleting code never do — and leaves the
+// IR as it came in when nothing changed. ssa_vc_built is the vreg count right
+// after construction and ssa_vc_restore the count before the first version:
+// when no vreg was made since, the versions' numbers are given back.
+let is *i32 as ssa_orig with mut = cast(*i32, 0);
+let is i32 as ssa_orig_n with mut = 0;
+let is i32 as ssa_vc_built with mut = 0;
+let is i32 as ssa_vc_restore with mut = 0;
+
+fn ssa_set_versions(orig as *i32, n as i32, vc_built as i32, vc_restore as i32) as void {
+    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
+    ssa_orig = orig;
+    ssa_orig_n = n;
+    ssa_vc_built = vc_built;
+    ssa_vc_restore = vc_restore;
+}
+
+fn _uf_find(uf as *i32, x as i32) as i32 {
+    let is i32 as r with mut = x;
+    while (uf[r] != r) { r = uf[r]; }
+    let is i32 as c with mut = x;
+    while (uf[c] != r) { let is i32 as nx = uf[c]; uf[c] = r; c = nx; }
+    return r;
+}
+
+// The smaller number becomes the representative: a version's vreg is always
+// smaller than the version.
+fn _uf_union(uf as *i32, a as i32, b as i32) as void {
+    let is i32 as ra = _uf_find(uf, a);
+    let is i32 as rb = _uf_find(uf, b);
+    if (ra < rb) { uf[rb] = ra; } else if (rb < ra) { uf[ra] = rb; }
+}
+
+fn _ren(o as *d.Operand, uf as *i32, n as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { o.vreg = _uf_find(uf, o.vreg); }
+}
+
+// Rename the versions back and drop the coalesced (non-slot) phis.
+fn ssa_coalesce(func as *d.IRFunction) as void {
+    let is i32 as n = func.vreg_count;
+    let is *i32 as uf = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as i with mut = 0;
+    while (i < n) { uf[i] = i; i = i + 1; }
+    let is i32 as any with mut = 0;
+    i = 0;
+    while (i < ssa_orig_n && i < n) {
+        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) { _uf_union(uf, i, ssa_orig[i]); any = 1; }
+        i = i + 1;
+    }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n) { _uf_union(uf, it.dest.vreg, v); }
+                k = k + 1;
+            }
+            any = 1;
+        }
+        it = it.next;
+    }
+    if (any == 1) {
+        let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            let is *d.IRInst as nx = it.next;
+            if (it.op == d.IR_PHI && phi_is_slot(it) == 0) {
+                phi_free(it);
+                if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+            } else {
+                _ren(&it.dest, uf, n);
+                _ren(&it.src1, uf, n);
+                _ren(&it.src2, uf, n);
+                if (it.op == d.IR_PHI) {
+                    let is i32 as k with mut = 0;
+                    while (k < phi_nargs(it)) {
+                        let is i32 as v = phi_val(it, k);
+                        if (v >= 0 && v < n) { phi_set_val(it, k, _uf_find(uf, v)); }
+                        k = k + 1;
+                    }
+                }
+                prev = it;
+            }
+            it = nx;
+        }
+        if (func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
+    }
+    d.opt_free(cast(*u8, uf));
+    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
+    ssa_orig = cast(*i32, 0);
+    ssa_orig_n = 0;
 }
 
 // === CFG view used by destruction ===
@@ -454,6 +560,7 @@ fn _list_tail(func as *d.IRFunction) as *d.IRInst {
 // holds the copies, between P and its fall-through successor, or reached by
 // P's branch.
 fn ssa_destroy(func as *d.IRFunction) as void {
+    ssa_coalesce(func);
     let is i32 as nphi with mut = 0;
     let is *d.IRInst as it with mut = func.instructions;
     while (cast(i64, it) != 0) {
