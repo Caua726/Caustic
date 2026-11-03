@@ -1,0 +1,121 @@
+// tests/vec_field_offset_test.cst
+//
+// At -O2 the vectorizer walks arrays through an affine address base + off +
+// i*elem. An array that is a struct field sits at a constant offset `off` from
+// the struct pointer, and the vector loop must add it: summing `r.vals[k]` once
+// read `[rbx + r9*8]` instead of `[rbx + 8 + r9*8]`. Sums and maps over field
+// arrays at nonzero offsets, of i64, i32 and f64 elements, every trip count
+// around the vector widths, plus a strided walk (`a[2*i]`) that is not a packed
+// load at all. The answers are checked against element-by-element references.
+//
+// Exit code 0 on success, else the number of the failing check.
+
+struct R64 { tag as i64; vals as [20]i64; }
+struct R32 { tag as i32; vals as [20]i32; }
+struct RF { a as i64; b as i64; vals as [20]f64; }
+struct M64 { tag as i64; outv as [20]i64; x as [20]i64; y as [20]i64; }
+struct M32 { tag as i32; outv as [20]i32; x as [20]i32; y as [20]i32; }
+struct MF { tag as i64; pad as i32; outv as [20]f64; x as [20]f64; }
+
+fn sum64(r as *R64, n as i64) as i64 {
+    let is i64 as s with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) { s = s + r.vals[k]; k = k + 1; }
+    return s;
+}
+
+fn sum32(r as *R32, n as i64) as i32 {
+    let is i32 as s with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) { s = s + r.vals[k]; k = k + 1; }
+    return s;
+}
+
+fn sumf(r as *RF, n as i64) as f64 {
+    let is f64 as s with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < n) { s = s + r.vals[k]; k = k + 1; }
+    return s;
+}
+
+fn map64(m as *M64, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { m.outv[k] = m.x[k] + m.y[k]; k = k + 1; }
+}
+
+fn map32(m as *M32, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { m.outv[k] = m.x[k] - m.y[k]; k = k + 1; }
+}
+
+fn mapf(m as *MF, n as i64, c as f64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { m.outv[k] = m.x[k] * c; k = k + 1; }
+}
+
+// i32 elements two apart: 8 bytes per iteration, but each load is 4 bytes.
+fn sum_stride2(a as *i32, n as i64) as i32 {
+    let is i32 as s with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) { s = s + a[k * 2]; k = k + 1; }
+    return s;
+}
+
+let is i64 as opaque with mut = 0;
+
+fn main() as i32 {
+    let is R64 as r64; let is R32 as r32; let is RF as rf;
+    let is M64 as m64; let is M32 as m32; let is MF as mf;
+    r64.tag = 99999; r32.tag = 77777; rf.a = 5; rf.b = 6;
+    m64.tag = 0 - 1; m32.tag = 0 - 1; mf.tag = 0 - 1; mf.pad = 3;
+    let is i64 as i with mut = 0;
+    while (i < 20) {
+        r64.vals[i] = (i + 1) * 1000003;
+        r32.vals[i] = cast(i32, (i + 1) * 7 - 50);
+        rf.vals[i] = cast(f64, i) * 0.5 + 0.25;
+        m64.x[i] = i * 3; m64.y[i] = 100 - i; m64.outv[i] = 0 - 7;
+        m32.x[i] = cast(i32, i * 5); m32.y[i] = cast(i32, 0 - i); m32.outv[i] = 0 - 7;
+        mf.x[i] = cast(f64, i) + 1.5; mf.outv[i] = 0.0 - 7.0;
+        i = i + 1;
+    }
+    let is [40]i32 as st;
+    i = 0;
+    while (i < 40) { st[i] = cast(i32, i * i - 3); i = i + 1; }
+
+    let is [9]i64 as ns;
+    ns[0] = 0; ns[1] = 1; ns[2] = 3; ns[3] = 4; ns[4] = 7; ns[5] = 8; ns[6] = 9; ns[7] = 17; ns[8] = 20;
+    let is i64 as t with mut = 0;
+    while (t < 9) {
+        let is i64 as n = ns[t] + opaque;
+        // references
+        let is i64 as e64 with mut = 0; let is i32 as e32 with mut = 0; let is f64 as ef with mut = 0.0;
+        let is i32 as es with mut = 0;
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            e64 = e64 + (j + 1) * 1000003;
+            e32 = e32 + cast(i32, (j + 1) * 7 - 50);
+            ef = ef + (cast(f64, j) * 0.5 + 0.25);
+            es = es + cast(i32, (2 * j) * (2 * j) - 3);
+            j = j + 1 + opaque;
+        }
+        if (sum64(&r64, n) != e64) { return cast(i32, 1 + t * 10); }
+        if (sum32(&r32, n) != e32) { return cast(i32, 2 + t * 10); }
+        if (sumf(&rf, n) != ef) { return cast(i32, 3 + t * 10); }
+        if (sum_stride2(cast(*i32, &st), n) != es) { return cast(i32, 4 + t * 10); }
+        map64(&m64, n); map32(&m32, n); mapf(&mf, n, 2.0);
+        j = 0;
+        while (j < 20) {
+            if (j < n) {
+                if (m64.outv[j] != j * 3 + 100 - j) { return cast(i32, 5 + t * 10); }
+                if (m32.outv[j] != cast(i32, j * 5 + j)) { return cast(i32, 6 + t * 10); }
+                if (mf.outv[j] != (cast(f64, j) + 1.5) * 2.0) { return cast(i32, 7 + t * 10); }
+            }
+            j = j + 1 + opaque;
+        }
+        // fields around the arrays are untouched
+        if (m64.tag != 0 - 1 || m32.tag != 0 - 1 || mf.tag != 0 - 1 || mf.pad != 3) { return cast(i32, 8 + t * 10); }
+        if (r64.tag != 99999 || r32.tag != 77777 || rf.a != 5 || rf.b != 6) { return cast(i32, 9 + t * 10); }
+        t = t + 1;
+    }
+    return 0;
+}

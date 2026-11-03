@@ -12,9 +12,10 @@
 // Runs at codegen time (gen_func), -O2 only, post mid-end, before pass_unroll.
 // Returns 1 if it transformed a loop (caller re-invokes to a fixpoint, <=16), else 0.
 //
-// Progress: M0/C1 scaffold (done). M0/C2 loop discovery (this commit) — builds the
-// CFG and discovers natural loops, dumping them under vec_debug; still returns 0
-// (no transform). The first IR-emitting commit is M3/C13.
+// Executors, tried in order on each innermost loop: sum reduction, map, byte
+// fill, byte count (vec_exec.cst), then the loop widener (vec_widen.cst: any
+// straight-line or if-converted body, integer reductions, conversions, float
+// folds kept in order), then multiply-add.
 
 use "../defs.cst" as d;
 use "../cfg.cst" as cfg;
@@ -24,6 +25,7 @@ use "vec_scev.cst" as sc;
 use "vec_recur.cst" as rc;
 use "vec_depend.cst" as dep;
 use "vec_exec.cst" as ex;
+use "vec_widen.cst" as wv;
 use "../debug.cst" as dbg;
 
 // inst is `x = ADD(p,q)` where one operand resolves to iv and the other is a
@@ -105,6 +107,22 @@ fn dump_scev(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
     }
 }
 
+// Dump the loop body's instructions, each with the type it carries (debug).
+fn dump_body(blocks as *cfg.BasicBlock, L as *vl.VecLoop) as void {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as n with mut = 0;
+    while (cast(i64, p) != 0 && n < 400) {
+        if (p.is_dead == 0) {
+            if (cast(i64, p.cast_to) != 0) { dbg.pr_str("      <"); dbg.pr_type_name(p.cast_to); dbg.pr_str(">"); }
+            dbg.print_inst(p, n);
+        }
+        if (cast(i64, p) == cast(i64, lb.last)) { p = cast(*d.IRInst, 0); } else { p = p.next; }
+        n = n + 1;
+    }
+}
+
 fn dump_loops(loops as *vl.VecLoop, nloops as i32) as void {
     dbg.pr_str("[vec] ");
     dbg.pr_int(cast(i64, nloops));
@@ -175,6 +193,7 @@ fn pass_vectorize2(func as *d.IRFunction) as i32 {
                     if (d.vec_debug == 1) {
                         dbg.pr_str("  loop hdr=L"); dbg.pr_int(cast(i64, L.header_label)); dbg.pr_str(":\n");
                         if (ivf == 1) { dump_scev(func, blocks, L, iv, step, def_inst, def_count, vc); }
+                        dump_body(blocks, L);
                         if (cvcode == dep.CV_OK) { dbg.pr_str("    VECTORIZABLE maxVF="); dbg.pr_int(maxvf); dbg.pr_str(" rt="); dbg.pr_int(cast(i64, rtchk)); dbg.pr_str("\n"); }
                         else {
                             dbg.pr_str("    MISSED: ");
@@ -219,6 +238,12 @@ fn pass_vectorize2(func as *d.IRFunction) as i32 {
                                 if (d.vec_debug == 1) { dbg.pr_str("    -> VECTORIZED (byte count)\n"); }
                                 transformed = 1;
                             }
+                        }
+                    }
+                    // anything else straight-line or if-converted: the loop widener
+                    if (transformed == 0 && ivf == 1 && cvcode == dep.CV_OK) {
+                        if (wv.vectorize_widen(func, blocks, L, iv, step, maxvf, def_inst, def_count, vc) == 1) {
+                            transformed = 1;
                         }
                     }
                     // multiply-add: legality again with the wider SCEV view

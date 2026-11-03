@@ -6,8 +6,22 @@ use "alloc_core.cst" as al;
 use "emit_output.cst" as eo;
 use "emit.cst" as e;
 use "target.cst" as tgt;
+use "emit_vec.cst" as ev;
 
 let is i32 as label_base with mut = 0;
+
+// IR_HASAVX2 asks cpuid once per program run: the answer is kept in a word of
+// this object's .data (0 unknown, 1 no AVX2, 2 AVX2), emitted at the end of
+// the module when some function used it.
+let is i32 as isa_cache_used with mut = 0;
+let is i32 as isa_label_n with mut = 0;
+
+fn emit_isa_cache() as void {
+    if (isa_cache_used == 0) { return; }
+    eo.out_str(".data\n", 6);
+    eo.out_str(".Lcst_isa:\n", 11);
+    eo.out_str("  .zero 8\n", 10);
+}
 
 // Granlund-Montgomery signed 64-bit magic for divide-by-constant.
 // Pre: d != 0, |d| != 1, |d| not a power of 2.
@@ -706,24 +720,34 @@ fn _sse_shift(ext as i32, xnum as i32, imm as i32) as void {
 }
 fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
+    // the loop widener's generic ops and sized stores (emit_vec.cst)
+    if (op == d.IR_VOP || op == d.IR_VOPG) { ev.gen_vop(inst, ctx); return; }
+    if (op == d.IR_VSTOREQ && inst.dest.label != 0) { ev.gen_vstore(inst, ctx); return; }
     // ---- AVX2 (256-bit) ----
     if (op == d.IR_HASAVX2) {
-        // result = (cpuid.7:0.ebx bit 5). Save/restore rax-rdx around cpuid via the
-        // stack; carry the result out through a stack temp so dest can be any GPR.
-        eo.out_line("sub rsp, 8");
+        // result = cpuid.7:0.ebx bit 5, cached: the first call runs cpuid (the
+        // four registers it writes saved around it) and stores 1 + bit.
+        isa_cache_used = 1;
+        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
+        let is i32 as ri with mut = 0;
+        if (dloc >= 0 && dloc < 16) { ri = dloc; }
+        let is *u8 as r32 = eo.reg32(ri);
+        let is *u8 as r64 = eo.reg64(ri);
+        let is i32 as lbl = isa_label_n;
+        isa_label_n = isa_label_n + 1;
+        eo.out_str("  mov ", 6); eo.out_cstr(r64); eo.out_str(", QWORD PTR [rip+.Lcst_isa]\n", 28);
+        eo.out_str("  test ", 7); eo.out_cstr(r64); eo.out_str(", ", 2); eo.out_cstr(r64); eo.out_char(10);
+        eo.out_str("  jnz .Lhv", 10); eo.out_int(cast(i64, lbl)); eo.out_char(10);
         eo.out_line("push rax"); eo.out_line("push rbx"); eo.out_line("push rcx"); eo.out_line("push rdx");
         eo.out_line("mov eax, 7"); eo.out_line("xor ecx, ecx"); eo.out_line(".byte 15, 162");   // cpuid
-        eo.out_line("shr ebx, 5"); eo.out_line("and ebx, 1"); eo.out_line("mov QWORD PTR [rsp+32], rbx");
+        eo.out_line("shr ebx, 5"); eo.out_line("and ebx, 1"); eo.out_line("add ebx, 1");
+        eo.out_line("lea rcx, [rip+.Lcst_isa]"); eo.out_line("mov QWORD PTR [rcx], rbx");
         eo.out_line("pop rdx"); eo.out_line("pop rcx"); eo.out_line("pop rbx"); eo.out_line("pop rax");
-        let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
-        if (dloc >= 0 && dloc < 16) {
-            eo.out_str("  mov ", 6); eo.out_cstr(eo.reg64(dloc)); eo.out_cstr(", QWORD PTR [rsp]"); eo.out_char(10);
-            eo.out_line("add rsp, 8");
-            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(dloc); }
-        } else {
-            eo.out_line("mov rax, QWORD PTR [rsp]"); eo.out_line("add rsp, 8");
-            e.store_op(inst.dest.vreg, ctx, "rax");
-        }
+        eo.out_str("  mov ", 6); eo.out_cstr(r64); eo.out_str(", QWORD PTR [rip+.Lcst_isa]\n", 28);
+        eo.out_str(".Lhv", 4); eo.out_int(cast(i64, lbl)); eo.out_str(":\n", 2);
+        eo.out_str("  sub ", 6); eo.out_cstr(r32); eo.out_str(", 1\n", 4);
+        if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(ri); }
+        if (dloc < 0 || dloc >= 16) { e.store_op(inst.dest.vreg, ctx, "rax"); }
         return;
     }
     if (op == d.IR_VZERO256) {
@@ -1506,6 +1530,9 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             let is *u8 as cr2 with mut = "rcx";
             if (c32 == 0) { cr2 = e.op_reg(inst.src1.vreg, ctx, 1); }
             eo.out_line("xor eax, eax");
+            // rax may have held a spilled operand the 32-bit compare below
+            // reloads through the register cache
+            if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
             if (c32 > 0) {
                 if (has_imm2 == 1) {
                     // cmp_try_inline_imm already took the constant; say it again.

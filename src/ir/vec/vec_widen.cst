@@ -1,0 +1,1748 @@
+// === vec2: the loop widener — any straight-line or if-converted loop body ===
+//
+// The other executors each match one loop shape. This one widens a loop body
+// instruction by instruction, VF iterations per vector iteration:
+//
+//   * loads and stores of unit-stride arrays (address base + off + i*elem),
+//     any element type, with a runtime overlap test between every array the
+//     loop writes and every other array it touches;
+//   * integer and float arithmetic, compares, shifts by a constant, and the
+//     conversions int -> float, f32 <-> f64 and integer widen / narrow, each
+//     value in lanes of its own type's size (VF follows the widest one, the
+//     narrower values fill part of a register);
+//   * the induction variable as a value (lane k holds i + k);
+//   * values the loop does not change, splatted once before the vector loop;
+//     an operation whose operands all are such values runs once, in scalar;
+//   * branches inside the body: every block gets a predicate, a truth table
+//     over the compare masks the branches test (at most 6), and a value
+//     assigned under a predicate is blended with the value it replaces —
+//     booleans stay truth tables, so `c = a && b` costs no blend at all;
+//   * reductions: a variable read before it is written in the iteration and
+//     combined only by one of + - ^ | & (integers, lane-wise, the lanes added
+//     up after the loop) or by one + or * per iteration (floats: the lanes are
+//     folded into the scalar IN ORDER every vector iteration, so the result is
+//     the sequential one bit for bit). A reduction may be conditional: under
+//     a predicate it adds the operation's identity instead.
+//
+// Values are tracked symbolically per scalar vreg while the body is walked in
+// order (WVal below) and materialized as vector registers only where an
+// instruction needs them. The walk runs three times: once without emitting
+// (legality, the widest lane, whether SSE2 can do every operation), then for
+// AVX2 (32-byte vectors) and SSE2 (16-byte). Layout:
+//
+//   prev:  overlap test -> scalar loop when arrays overlap, else jmp .Lvec
+//   H:     scalar loop (kept: the remainder, and the overlap fallback)
+//   .Lvec: if (!avx2) goto .Lsse ; AVX2 loop ; .Lsse: SSE2 loop ; goto H
+//
+// so on an AVX2 machine the SSE2 loop also takes one more group of VF/2
+// iterations before the scalar remainder.
+
+use "../defs.cst" as d;
+use "../cfg.cst" as cfg;
+use "../debug.cst" as dbg;
+use "vec_loops.cst" as vl;
+use "vec_scev.cst" as sc;
+use "vec_ops.cst" as vo;
+use "vec_exec.cst" as ex;
+
+let is i32 as WK_VEC   with imut = 1;
+let is i32 as WK_CONST with imut = 2;
+let is i32 as WK_INV   with imut = 3;
+let is i32 as WK_IV    with imut = 4;
+let is i32 as WK_MASK  with imut = 5;
+let is i32 as WK_BOOL  with imut = 6;
+let is i32 as WK_SEL   with imut = 7;
+let is i32 as WK_CARRY with imut = 8;
+
+// accumulator kinds
+let is i32 as AK_ADD  with imut = 1;
+let is i32 as AK_XOR  with imut = 2;
+let is i32 as AK_OR   with imut = 3;
+let is i32 as AK_AND  with imut = 4;
+let is i32 as AK_FADD with imut = 5;
+let is i32 as AK_FMUL with imut = 6;
+
+let is i64 as ALL with imut = 0 - 1;
+let is i32 as MAXATOM with imut = 6;
+let is i32 as MAXACC with imut = 8;
+let is i32 as MAXPOOL with imut = 4096;
+let is i32 as MAXCACHE with imut = 128;
+let is i32 as MAXMEM with imut = 32;
+
+struct WVal {
+    kind as i32;
+    v as i32;        // VEC/MASK: vector vreg; INV: scalar vreg; CARRY: accumulator index
+    ls as i32;       // VEC/MASK: lane bytes
+    flt as i32;      // VEC: float lanes
+    sgn as i32;      // VEC: signed lanes
+    neg as i32;      // MASK: the value is the complement of the mask
+    a as i32;        // SEL: value where tt holds; CARRY: contribution (-1: none); MASK: atom (-1: none)
+    b as i32;        // SEL: value elsewhere
+    imm as i64;      // CONST
+    tt as i64;       // BOOL, SEL
+}
+
+// ---- walk state ----
+let is *d.IRFunction as W_func with mut = cast(*d.IRFunction, 0);
+let is i32 as W_dry with mut = 0;
+let is i32 as W_vex with mut = 0;
+let is i32 as W_vf with mut = 0;
+let is i32 as W_ln with mut = 0;
+let is i32 as W_fail with mut = 0;
+let is *u8 as W_why with mut = cast(*u8, 0);
+let is i32 as W_sse_bad with mut = 0;
+let is i32 as W_maxls with mut = 0;
+let is i32 as W_iv with mut = 0;
+let is i32 as W_iv_dead with mut = 0;
+let is i32 as W_ivdefs with mut = 0;
+let is i32 as W_vc with mut = 0;
+let is i32 as W_fake with mut = 0;
+let is i32 as W_nocse with mut = 0;
+let is i32 as W_remat with mut = 0;      // constants splatted where used, not before the loop      // the next _vop makes a vreg of its own (carried later)
+let is i64 as W_pred with mut = 0;
+let is *i64 as W_def_inst with mut = cast(*i64, 0);
+let is *i32 as W_def_count with mut = cast(*i32, 0);
+
+let is *WVal as W_pool with mut = cast(*WVal, 0);
+let is i32 as W_np with mut = 0;
+let is *i32 as W_cur with mut = cast(*i32, 0);       // per vreg: pool index, -1 none
+let is *i64 as W_defd with mut = cast(*i64, 0);      // per vreg: predicate it was assigned under
+let is *u8 as W_need with mut = cast(*u8, 0);        // per vreg: its value is needed
+let is *u8 as W_live with mut = cast(*u8, 0);        // per vreg: read after the loop
+let is *i64 as W_edge with mut = cast(*i64, 0);      // per label: predicate of the edges into it
+let is *u8 as W_inb with mut = cast(*u8, 0);         // per label: defined in the body
+let is *u8 as W_seen with mut = cast(*u8, 0);        // per label: already passed
+let is i32 as W_nlab with mut = 0;
+
+let is *i32 as W_atom with mut = cast(*i32, 0);      // atom -> mask vreg
+let is *i32 as W_atom_ls with mut = cast(*i32, 0);
+let is i32 as W_natom with mut = 0;
+let is *i64 as W_mk_tt with mut = cast(*i64, 0);     // mask cache: truth table -> vreg
+let is *i32 as W_mk_v with mut = cast(*i32, 0);
+let is *i32 as W_mk_ls with mut = cast(*i32, 0);
+let is i32 as W_nmk with mut = 0;
+let is *i32 as W_sp_kind with mut = cast(*i32, 0);   // splat cache: (kind, key, ls, flt) -> vreg
+let is *i64 as W_sp_key with mut = cast(*i64, 0);
+let is *i32 as W_sp_ls with mut = cast(*i32, 0);
+let is *i32 as W_sp_v with mut = cast(*i32, 0);
+let is i32 as W_nsp with mut = 0;
+let is *i32 as W_ad_base with mut = cast(*i32, 0);   // address cache: (base, elem) -> vreg
+let is *i32 as W_ad_ls with mut = cast(*i32, 0);
+let is *i32 as W_ad_v with mut = cast(*i32, 0);
+let is i32 as W_nad with mut = 0;
+let is *i32 as W_inv_p with mut = cast(*i32, 0);     // per vreg: its INV pool entry (-1)
+let is *i32 as W_ua_base with mut = cast(*i32, 0);   // elements accessed on every path this iteration
+let is *i64 as W_ua_off with mut = cast(*i64, 0);
+let is *i32 as W_ua_ls with mut = cast(*i32, 0);
+let is i32 as W_nua with mut = 0;
+let is *i32 as W_ld_base with mut = cast(*i32, 0);   // loaded (or stored) vectors still valid
+let is *i64 as W_ld_off with mut = cast(*i64, 0);
+let is *i32 as W_ld_ls with mut = cast(*i32, 0);
+let is *i32 as W_ld_v with mut = cast(*i32, 0);
+let is i32 as W_nld with mut = 0;
+let is *i32 as W_viv with mut = cast(*i32, 0);       // vector IV per lane size (index ls)
+
+let is *i32 as W_acc_v with mut = cast(*i32, 0);     // accumulator -> scalar vreg
+let is *i32 as W_acc_k with mut = cast(*i32, 0);     // AK_*
+let is *i32 as W_acc_ls with mut = cast(*i32, 0);
+let is *i32 as W_acc_sgn with mut = cast(*i32, 0);
+let is *i64 as W_acc_ty with mut = cast(*i64, 0);    // the chain op's cast_to
+let is *i32 as W_acc_vv with mut = cast(*i32, 0);    // integer: the vector accumulator
+let is i32 as W_nacc with mut = 0;
+
+let is *i32 as W_m_base with mut = cast(*i32, 0);    // memory accesses (dry run): base, off, elem, write
+let is *i64 as W_m_off with mut = cast(*i64, 0);
+let is *i32 as W_m_ls with mut = cast(*i32, 0);
+let is *i32 as W_m_w with mut = cast(*i32, 0);
+let is i32 as W_nm with mut = 0;
+let is i32 as W_nstore with mut = 0;
+
+// emitted lists: 0 before the vector loop, 1 its body, 2 after it
+let is *d.IRInst as W_h0 with mut = cast(*d.IRInst, 0);
+let is *d.IRInst as W_t0 with mut = cast(*d.IRInst, 0);
+let is *d.IRInst as W_h1 with mut = cast(*d.IRInst, 0);
+let is *d.IRInst as W_t1 with mut = cast(*d.IRInst, 0);
+let is *d.IRInst as W_h2 with mut = cast(*d.IRInst, 0);
+let is *d.IRInst as W_t2 with mut = cast(*d.IRInst, 0);
+
+fn _fail(why as *u8) as void {
+    if (W_fail == 0) { W_why = why; }
+    W_fail = 1;
+}
+
+fn _P(i as i32) as *WVal { return cast(*WVal, cast(i64, W_pool) + cast(i64, i) * sizeof(WVal)); }
+
+fn _pv(kind as i32) as i32 {
+    if (W_np >= MAXPOOL) { _fail("too many values"); return 0; }
+    let is i32 as i = W_np;
+    W_np = W_np + 1;
+    let is *WVal as w = _P(i);
+    w.kind = kind; w.v = cast(i32, 0 - 1); w.ls = 0; w.flt = 0; w.sgn = 0; w.neg = 0;
+    w.a = cast(i32, 0 - 1); w.b = cast(i32, 0 - 1); w.imm = 0; w.tt = 0;
+    return i;
+}
+
+fn _pconst(imm as i64) as i32 { let is i32 as p = _pv(WK_CONST); _P(p).imm = imm; return p; }
+fn _pvec(v as i32, ls as i32, flt as i32, sgn as i32) as i32 {
+    let is i32 as p = _pv(WK_VEC);
+    let is *WVal as w = _P(p);
+    w.v = v; w.ls = ls; w.flt = flt; w.sgn = sgn;
+    return p;
+}
+fn _pbool(tt as i64) as i32 { let is i32 as p = _pv(WK_BOOL); _P(p).tt = tt; return p; }
+fn _pmask(v as i32, ls as i32, neg as i32) as i32 {
+    let is i32 as p = _pv(WK_MASK);
+    let is *WVal as w = _P(p);
+    w.v = v; w.ls = ls; w.neg = neg;
+    return p;
+}
+fn _pcarry(k as i32, c as i32) as i32 {
+    let is i32 as p = _pv(WK_CARRY);
+    let is *WVal as w = _P(p);
+    w.v = k; w.a = c;
+    return p;
+}
+
+// ---- types (ast Type: kind is the first field) ----
+fn _tkind(t as *u8) as i32 { if (cast(i64, t) == 0) { return 4; } return *cast(*i32, t); }
+fn _tls(t as *u8) as i32 { return cast(i32, sc.ty_size(t)); }
+fn _tflt(t as *u8) as i32 { let is i32 as k = _tkind(t); if (k == 9 || k == 10) { return 1; } return 0; }
+fn _tsgn(t as *u8) as i32 { let is i32 as k = _tkind(t); if (k >= 1 && k <= 4) { return 1; } return 0; }
+
+// ---- instruction creation ----
+fn _nv() as i32 {
+    if (W_dry == 1) { W_fake = W_fake + 1; return 1000000000 + W_fake; }
+    return ex.new_vreg(W_func);
+}
+
+fn _app(sel as i32, ni as *d.IRInst) as void {
+    ni.line = W_ln;
+    ni.next = cast(*d.IRInst, 0);
+    if (sel == 0) {
+        if (cast(i64, W_t0) == 0) { W_h0 = ni; } else { W_t0.next = ni; }
+        W_t0 = ni;
+    } else if (sel == 1) {
+        if (cast(i64, W_t1) == 0) { W_h1 = ni; } else { W_t1.next = ni; }
+        W_t1 = ni;
+    } else {
+        if (cast(i64, W_t2) == 0) { W_h2 = ni; } else { W_t2.next = ni; }
+        W_t2 = ni;
+    }
+}
+
+fn _sse2_ok(code as i32, ls as i32) as i32 {
+    if (code == vo.VO_CMPGT && ls == 8) { return 0; }
+    if (code == vo.VO_MUL && ls == 1) { return 0; }
+    if ((code == vo.VO_SHL || code == vo.VO_SHR) && ls == 1) { return 0; }
+    if (code == vo.VO_SAR && ls != 2 && ls != 4) { return 0; }
+    return 1;
+}
+
+// v written again after q in its list (a carried vector: not a fixed value)
+fn _redefined(q as *d.IRInst, v as i32) as i32 {
+    let is *d.IRInst as r with mut = q.next;
+    while (cast(i64, r) != 0) {
+        if (r.dest.op_type == d.OP_VREG && r.dest.vreg == v) { return 1; }
+        r = r.next;
+    }
+    return 0;
+}
+
+// dest = VOP code(s1, s2) with lanes of ls bytes, in list sel.
+fn _vop(sel as i32, code as i32, ls as i32, imm as i32, s1 as i32, s2 as i32) as i32 {
+    if (W_fail == 1) { return 0; }
+    if (_sse2_ok(code, ls) == 0) { W_sse_bad = 1; }
+    if (code == vo.VO_MUL && ls == 1) { _fail("multiply lane"); return 0; }
+    if ((code == vo.VO_SHL || code == vo.VO_SHR) && ls == 1) { _fail("byte shift"); return 0; }
+    if (code == vo.VO_SAR && ls != 2 && ls != 4) { _fail("arithmetic shift lane"); return 0; }
+    if (ls > W_maxls) { W_maxls = ls; }
+    // the same operation on the same values earlier in the list: reuse it
+    if (W_dry == 0 && code != vo.VO_LOAD && W_nocse == 0) {
+        let is i32 as want = vo.vo_pack(code, ls, W_vex, W_vf, imm);
+        let is *d.IRInst as q with mut = W_h1;
+        if (sel == 0) { q = W_h0; }
+        while (cast(i64, q) != 0) {
+            if (q.op == d.IR_VOP && q.dest.op_type == d.OP_VREG && q.dest.label == want
+                && ((s1 < 0 && q.src1.op_type == d.OP_NONE) || (s1 >= 0 && q.src1.op_type == d.OP_VREG && q.src1.vreg == s1))
+                && ((s2 < 0 && q.src2.op_type == d.OP_NONE) || (s2 >= 0 && q.src2.op_type == d.OP_VREG && q.src2.vreg == s2))
+                && _redefined(q, q.dest.vreg) == 0) { return q.dest.vreg; }
+            q = q.next;
+        }
+    }
+    let is i32 as dv = _nv();
+    if (W_dry == 0) {
+        let is *d.IRInst as ni = d.new_inst(d.IR_VOP);
+        ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = dv;
+        ni.dest.label = vo.vo_pack(code, ls, W_vex, W_vf, imm);
+        if (s1 >= 0) { ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = s1; }
+        if (s2 >= 0) { ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = s2; }
+        _app(sel, ni);
+    }
+    return dv;
+}
+
+// dest (an existing vreg) = VOP code(dest, s2): a value carried around the loop.
+fn _vop_into(sel as i32, code as i32, ls as i32, imm as i32, dv as i32, s1 as i32, s2 as i32) as void {
+    if (W_fail == 1 || W_dry == 1) { return; }
+    let is *d.IRInst as ni = d.new_inst(d.IR_VOP);
+    ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = dv;
+    ni.dest.label = vo.vo_pack(code, ls, W_vex, W_vf, imm);
+    ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = s1;
+    ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = s2;
+    _app(sel, ni);
+}
+
+// scalar dest = op(s1, s2 | imm); s2 < 0 with has_imm takes the immediate.
+fn _sop(sel as i32, op as i32, s1 as i32, s2 as i32, has_imm as i32, imm as i64, ty as *u8) as i32 {
+    let is i32 as dv = _nv();
+    if (W_dry == 0 && W_fail == 0) {
+        let is *d.IRInst as ni = d.new_inst(op);
+        ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = dv;
+        if (op == d.IR_IMM) { ni.src1.op_type = cast(i8, d.OP_IMM); ni.src1.imm = imm; }
+        else {
+            ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = s1;
+            if (has_imm == 1) { ni.src2.op_type = cast(i8, d.OP_IMM); ni.src2.imm = imm; }
+            else if (s2 >= 0) { ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = s2; }
+        }
+        ni.cast_to = ty;
+        _app(sel, ni);
+    }
+    return dv;
+}
+
+// ---- splats (hoisted before the loop, cached) ----
+fn _sp_find(kind as i32, key as i64, ls as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < W_nsp) {
+        if (W_sp_kind[i] == kind && W_sp_key[i] == key && W_sp_ls[i] == ls) { return W_sp_v[i]; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+fn _sp_put(kind as i32, key as i64, ls as i32, v as i32) as void {
+    if (W_nsp >= MAXCACHE) { return; }
+    W_sp_kind[W_nsp] = kind; W_sp_key[W_nsp] = key; W_sp_ls[W_nsp] = ls; W_sp_v[W_nsp] = v;
+    W_nsp = W_nsp + 1;
+}
+
+// kind 0: integer constant (low ls bytes), 1: f32/f64 constant given as f64 bits,
+// 2: integer invariant vreg, 3: float invariant vreg.
+fn _splat(kind as i32, key as i64, ls as i32) as i32 {
+    let is i32 as hit = _sp_find(kind, key, ls);
+    if (hit >= 0) { return hit; }
+    let is i32 as r with mut = 0;
+    let is i32 as sel with mut = 0;
+    if (W_remat == 1 && kind <= 1) { sel = 1; }
+    if (kind == 0 && key == 0) { r = _vop(sel, vo.VO_ZERO, ls, 0, cast(i32, 0 - 1), cast(i32, 0 - 1)); }
+    else if (kind == 0 && (key == 0 - 1 || (ls == 1 && (key & 255) == 255) || (ls == 2 && (key & 65535) == 65535)
+             || (ls == 4 && (key & 4294967295) == 4294967295))) {
+        r = _vop(sel, vo.VO_ONES, ls, 0, cast(i32, 0 - 1), cast(i32, 0 - 1));
+    } else if (kind == 0) {
+        let is i32 as t = _sop(sel, d.IR_IMM, cast(i32, 0 - 1), cast(i32, 0 - 1), 0, key, cast(*u8, 0));
+        r = _vop(sel, vo.VO_SPLAT, ls, 0, t, cast(i32, 0 - 1));
+    } else if (kind == 1) {
+        let is i32 as t = _sop(sel, d.IR_IMM, cast(i32, 0 - 1), cast(i32, 0 - 1), 0, key, cast(*u8, 0));
+        if (ls == 8) { r = _vop(sel, vo.VO_SPLAT, 8, 0, t, cast(i32, 0 - 1)); }
+        else { r = _vop(sel, vo.VO_SPLATF, 4, 0, t, cast(i32, 0 - 1)); }
+    } else if (kind == 2) {
+        r = _vop(0, vo.VO_SPLAT, ls, 0, cast(i32, key), cast(i32, 0 - 1));
+    } else {
+        r = _vop(0, vo.VO_SPLATF, ls, 0, cast(i32, key), cast(i32, 0 - 1));
+    }
+    _sp_put(kind, key, ls, r);
+    return r;
+}
+
+fn _zero(ls as i32) as i32 { return _splat(0, 0, ls); }
+fn _ones(ls as i32) as i32 { return _splat(0, 0 - 1, ls); }
+
+// The vector IV in lanes of ls bytes: lane k = i + k, advanced by VF at the
+// end of every vector iteration.
+fn _viv(ls as i32) as i32 {
+    if (W_viv[ls] >= 0) { return W_viv[ls]; }
+    let is i32 as s = _vop(0, vo.VO_SPLAT, ls, 0, W_iv, cast(i32, 0 - 1));
+    let is i32 as io = _vop(0, vo.VO_IOTA, ls, 0, cast(i32, 0 - 1), cast(i32, 0 - 1));
+    W_nocse = 1;
+    let is i32 as r = _vop(0, vo.VO_ADD, ls, 0, s, io);
+    W_nocse = 0;
+    W_viv[ls] = r;
+    return r;
+}
+
+// ---- truth tables over the atoms ----
+fn _atom_tt(k as i32) as i64 {
+    if (k == 0) { return 0 - 6148914691236517206; }   // 0xAAAAAAAAAAAAAAAA
+    if (k == 1) { return 0 - 3689348814741910324; }   // 0xCCCCCCCCCCCCCCCC
+    if (k == 2) { return 0 - 1085102592571150096; }   // 0xF0F0F0F0F0F0F0F0
+    if (k == 3) { return 0 - 71777214294589696; }     // 0xFF00FF00FF00FF00
+    if (k == 4) { return 0 - 281470681808896; }       // 0xFFFF0000FFFF0000
+    return 0 - 4294967296;                             // 0xFFFFFFFF00000000
+}
+
+fn _shl(x as i64, n as i64) as i64 { return x << n; }
+fn _shr(x as i64, n as i64) as i64 {
+    // logical: clear what the arithmetic shift drags in
+    let is i64 as r = x >> n;
+    let is i64 as m = ~(_shl(0 - 1, 64 - n));
+    return r & m;
+}
+
+fn _cof1(tt as i64, k as i32) as i64 {
+    let is i64 as w = _shl(1, cast(i64, k));
+    let is i64 as c = tt & _atom_tt(k);
+    return c | _shr(c, w);
+}
+fn _cof0(tt as i64, k as i32) as i64 {
+    let is i64 as w = _shl(1, cast(i64, k));
+    let is i64 as c = tt & ~_atom_tt(k);
+    return c | _shl(c, w);
+}
+
+fn _atomize(p as i32) as i64 {
+    let is *WVal as w = _P(p);
+    if (w.a < 0) {
+        if (W_natom >= MAXATOM) { _fail("too many conditions"); return 0; }
+        W_atom[W_natom] = w.v; W_atom_ls[W_natom] = w.ls;
+        w.a = W_natom;
+        W_natom = W_natom + 1;
+    }
+    let is i64 as t = _atom_tt(w.a);
+    if (w.neg == 1) { return ~t; }
+    return t;
+}
+
+// A mask vreg (lanes of ls bytes) for truth table tt, built from the atoms.
+fn _synth(tt as i64, ls as i32) as i32 {
+    if (W_fail == 1) { return 0; }
+    if (tt == ALL) { return _ones(ls); }
+    if (tt == 0) { return _zero(ls); }
+    let is i32 as i with mut = 0;
+    while (i < W_nmk) {
+        if (W_mk_tt[i] == tt && W_mk_ls[i] == ls) { return W_mk_v[i]; }
+        i = i + 1;
+    }
+    let is i32 as k with mut = 0;
+    while (k < W_natom && _cof1(tt, k) == _cof0(tt, k)) { k = k + 1; }
+    if (k >= W_natom) { _fail("truth table"); return 0; }
+    if (W_atom_ls[k] != ls) { _fail("mask lane size"); return 0; }
+    let is i32 as a = W_atom[k];
+    let is i64 as f1 = _cof1(tt, k);
+    let is i64 as f0 = _cof0(tt, k);
+    let is i32 as r with mut = 0;
+    if (f1 == ALL && f0 == 0) { r = a; }
+    else if (f1 == 0 && f0 == ALL) { r = _vop(1, vo.VO_ANDN, ls, 0, a, _ones(ls)); }
+    else if (f0 == 0) { r = _vop(1, vo.VO_AND, ls, 0, a, _synth(f1, ls)); }
+    else if (f1 == 0) { r = _vop(1, vo.VO_ANDN, ls, 0, a, _synth(f0, ls)); }
+    else if (f1 == ALL) { r = _vop(1, vo.VO_OR, ls, 0, a, _synth(f0, ls)); }
+    else if (f0 == ALL) { r = _vop(1, vo.VO_OR, ls, 0, _vop(1, vo.VO_ANDN, ls, 0, a, _ones(ls)), _synth(f1, ls)); }
+    else {
+        let is i32 as x1 = _vop(1, vo.VO_AND, ls, 0, a, _synth(f1, ls));
+        let is i32 as x0 = _vop(1, vo.VO_ANDN, ls, 0, a, _synth(f0, ls));
+        r = _vop(1, vo.VO_OR, ls, 0, x1, x0);
+    }
+    if (W_nmk < MAXCACHE) {
+        W_mk_tt[W_nmk] = tt; W_mk_ls[W_nmk] = ls; W_mk_v[W_nmk] = r;
+        W_nmk = W_nmk + 1;
+    }
+    return r;
+}
+
+fn _boolish(p as i32) as i32 {
+    let is *WVal as w = _P(p);
+    if (w.kind == WK_BOOL || w.kind == WK_MASK) { return 1; }
+    if (w.kind == WK_CONST && (w.imm == 0 || w.imm == 1)) { return 1; }
+    return 0;
+}
+
+fn _tt_of(p as i32) as i64 {
+    let is *WVal as w = _P(p);
+    if (w.kind == WK_BOOL) { return w.tt; }
+    if (w.kind == WK_CONST) { if (w.imm != 0) { return ALL; } return 0; }
+    if (w.kind == WK_MASK) { return _atomize(p); }
+    if (w.kind == WK_VEC && w.flt == 0) {
+        // a number as a condition: true where it is not 0
+        let is i32 as m = _vop(1, vo.VO_CMPEQ, w.ls, 0, w.v, _zero(w.ls));
+        return _atomize(_pmask(m, w.ls, 1));
+    }
+    _fail("not a condition");
+    return 0;
+}
+
+// ---- materialize a value as a vector of lanes of ls bytes ----
+fn _mat(p as i32, ls as i32, flt as i32) as i32 {
+    if (W_fail == 1) { return 0; }
+    let is *WVal as w = _P(p);
+    let is i32 as k = w.kind;
+    if (k == WK_VEC) {
+        if (w.ls != ls || w.flt != flt) { _fail("lane type mismatch"); return 0; }
+        return w.v;
+    }
+    if (k == WK_CONST) {
+        if (flt == 1) { return _splat(1, w.imm, ls); }
+        return _splat(0, w.imm, ls);
+    }
+    if (k == WK_INV) {
+        if (flt == 1) { return _splat(3, cast(i64, w.v), ls); }
+        return _splat(2, cast(i64, w.v), ls);
+    }
+    if (k == WK_IV) {
+        // lane j = i + j, truncated to w.ls bytes when a cast narrowed it
+        if (flt == 1) { _fail("float induction"); return 0; }
+        if (w.ls == 0 || ls <= w.ls) { return _viv(ls); }
+        return _resize(_viv(w.ls), w.ls, ls, w.sgn);
+    }
+    if (k == WK_MASK || k == WK_BOOL) {
+        if (flt == 1) { _fail("boolean as float"); return 0; }
+        // a boolean as a number: 0 or 1
+        if (k == WK_MASK && w.ls == ls) {
+            if (w.neg == 1) { return _vop(1, vo.VO_ADD, ls, 0, w.v, _splat(0, 1, ls)); }
+            return _vop(1, vo.VO_SUB, ls, 0, _zero(ls), w.v);
+        }
+        let is i32 as m = _synth(_tt_of(p), ls);
+        return _vop(1, vo.VO_SUB, ls, 0, _zero(ls), m);
+    }
+    if (k == WK_SEL) {
+        let is i32 as m = _synth(w.tt, ls);
+        let is i32 as pa = w.a;
+        let is i32 as pb = w.b;
+        let is *WVal as wa = _P(pa);
+        let is *WVal as wb = _P(pb);
+        if (wb.kind == WK_CONST && wb.imm == 0) { return _vop(1, vo.VO_AND, ls, 0, m, _mat(pa, ls, flt)); }
+        if (wa.kind == WK_CONST && wa.imm == 0) { return _vop(1, vo.VO_ANDN, ls, 0, m, _mat(pb, ls, flt)); }
+        let is i32 as x1 = _vop(1, vo.VO_AND, ls, 0, m, _mat(pa, ls, flt));
+        let is i32 as x0 = _vop(1, vo.VO_ANDN, ls, 0, m, _mat(pb, ls, flt));
+        return _vop(1, vo.VO_OR, ls, 0, x1, x0);
+    }
+    _fail("value not available");
+    return 0;
+}
+
+// ---- reading and writing scalar vregs ----
+fn _val_of(v as i32) as i32 {
+    if (W_fail == 1) { return 0; }
+    if (v == W_iv) {
+        if (W_iv_dead == 1) { _fail("induction read after its update"); return 0; }
+        let is i32 as p = _pv(WK_IV);
+        return p;
+    }
+    if (v < 0 || v >= W_vc) { _fail("vreg"); return 0; }
+    let is i32 as c = W_cur[v];
+    if (c >= 0) {
+        if ((W_pred & ~W_defd[v]) != 0) { _fail("value carried around the loop"); return 0; }
+        return c;
+    }
+    if (sc.ctx_inloop(v) == 0) {
+        if (W_inv_p[v] < 0) {
+            let is i32 as p = _pv(WK_INV);
+            _P(p).v = v;
+            W_inv_p[v] = p;
+        }
+        return W_inv_p[v];
+    }
+    // read before it is written in this iteration: an accumulator
+    if (W_defd[v] != 0) { _fail("value carried around the loop"); return 0; }
+    if (W_nacc >= MAXACC) { _fail("too many reductions"); return 0; }
+    let is i32 as k = W_nacc;
+    W_nacc = W_nacc + 1;
+    W_acc_v[k] = v; W_acc_k[k] = 0; W_acc_ls[k] = 0; W_acc_sgn[k] = 0; W_acc_ty[k] = 0; W_acc_vv[k] = cast(i32, 0 - 1);
+    let is i32 as p = _pcarry(k, cast(i32, 0 - 1));
+    W_cur[v] = p; W_defd[v] = ALL;
+    return p;
+}
+
+fn _opnd(o as *d.Operand) as i32 {
+    if (o.op_type == d.OP_IMM) { return _pconst(o.imm); }
+    if (o.op_type == d.OP_VREG) { return _val_of(o.vreg); }
+    _fail("operand");
+    return 0;
+}
+
+fn _ident(k as i32) as i32 {
+    let is i32 as ak = W_acc_k[k];
+    if (ak == AK_AND) { return _pconst(0 - 1); }
+    if (ak == AK_FADD) { return _pconst(0 - 9223372036854775807 - 1); }   // -0.0
+    if (ak == AK_FMUL) { return _pconst(4607182418800017408); }            // 1.0
+    if (ak == 0) { _fail("reduction kind"); }
+    return _pconst(0);
+}
+
+// a where W_pred / pr holds, b elsewhere
+fn _merge(pr as i64, a as i32, b as i32) as i32 {
+    if (W_fail == 1) { return 0; }
+    let is *WVal as wa = _P(a);
+    let is *WVal as wb = _P(b);
+    if (wa.kind == WK_CARRY || wb.kind == WK_CARRY) {
+        if (wa.kind != WK_CARRY || wb.kind != WK_CARRY || wa.v != wb.v) { _fail("reduction overwritten"); return 0; }
+        let is i32 as ca with mut = wa.a;
+        let is i32 as cb with mut = wb.a;
+        if (ca < 0 && cb < 0) { return a; }
+        if (ca < 0) { ca = _ident(wa.v); }
+        if (cb < 0) { cb = _ident(wa.v); }
+        return _pcarry(wa.v, _merge(pr, ca, cb));
+    }
+    if (_boolish(a) == 1 && _boolish(b) == 1) {
+        let is i64 as ta = _tt_of(a);
+        let is i64 as tb = _tt_of(b);
+        return _pbool((ta & pr) | (tb & ~pr));
+    }
+    let is i32 as p = _pv(WK_SEL);
+    let is *WVal as w = _P(p);
+    w.tt = pr; w.a = a; w.b = b;
+    return p;
+}
+
+fn _assign(v as i32, p as i32) as void {
+    if (W_fail == 1) { return; }
+    if (v < 0 || v >= W_vc) { _fail("vreg"); return; }
+    if (W_pred == ALL) { W_cur[v] = p; W_defd[v] = ALL; return; }
+    let is i32 as old = W_cur[v];
+    if (old < 0) { W_cur[v] = p; W_defd[v] = W_defd[v] | W_pred; return; }
+    W_cur[v] = _merge(W_pred, p, old);
+    W_defd[v] = W_defd[v] | W_pred;
+}
+
+// ---- reductions ----
+fn _acc_kind(k as i32, ak as i32, ls as i32, ty as *u8) as i32 {
+    if (W_acc_k[k] == 0) {
+        W_acc_k[k] = ak; W_acc_ls[k] = ls; W_acc_ty[k] = cast(i64, ty); W_acc_sgn[k] = _tsgn(ty);
+        return 1;
+    }
+    if (W_acc_k[k] != ak || W_acc_ls[k] != ls) { _fail("mixed reduction"); return 0; }
+    return 1;
+}
+
+// op(x, y) where one side is the accumulator's running value.
+fn _carry_op(inst as *d.IRInst, x as i32, y as i32) as i32 {
+    let is *WVal as wx = _P(x);
+    let is *WVal as wy = _P(y);
+    if (wx.kind == WK_CARRY && wy.kind == WK_CARRY) { _fail("reduction combined with itself"); return 0; }
+    let is i32 as c with mut = x;
+    let is i32 as z with mut = y;
+    if (wy.kind == WK_CARRY) { c = y; z = x; }
+    let is i32 as k = _P(c).v;
+    let is i32 as old = _P(c).a;
+    let is i32 as op = inst.op;
+    let is *u8 as ty = inst.cast_to;
+    let is i32 as ls = _tls(ty);
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL) {
+        if (_tflt(ty) == 0) { _fail("float type"); return 0; }
+        if (op == d.IR_FSUB && c != x) { _fail("reduction subtracted"); return 0; }
+        let is i32 as ak with mut = AK_FADD; if (op == d.IR_FMUL) { ak = AK_FMUL; }
+        if (_acc_kind(k, ak, ls, ty) == 0) { return 0; }
+        if (old >= 0) { _fail("two float steps in one iteration"); return 0; }
+        let is i32 as zv with mut = _mat(z, ls, 1);
+        if (op == d.IR_FSUB) {
+            let is i64 as sb with mut = 0 - 9223372036854775807 - 1;
+            if (ls == 4) { sb = 2147483648; }
+            zv = _vop(1, vo.VO_XOR, ls, 0, zv, _splat(0, sb, ls));
+        }
+        return _pcarry(k, _pvec(zv, ls, 1, 1));
+    }
+    if (_tflt(ty) == 1) { _fail("float type"); return 0; }
+    let is i32 as ak with mut = 0;
+    let is i32 as vc with mut = vo.VO_ADD;
+    if (op == d.IR_ADD) { ak = AK_ADD; }
+    else if (op == d.IR_SUB) { if (c != x) { _fail("reduction subtracted"); return 0; } ak = AK_ADD; vc = vo.VO_SUB; }
+    else if (op == d.IR_XOR) { ak = AK_XOR; vc = vo.VO_XOR; }
+    else if (op == d.IR_OR) { ak = AK_OR; vc = vo.VO_OR; }
+    else if (op == d.IR_AND) { ak = AK_AND; vc = vo.VO_AND; }
+    else { _fail("not a reduction op"); return 0; }
+    if (_acc_kind(k, ak, ls, ty) == 0) { return 0; }
+    let is i32 as zv = _mat(z, ls, 0);
+    let is i32 as nv with mut = zv;
+    if (old < 0) {
+        if (vc == vo.VO_SUB) { nv = _vop(1, vo.VO_SUB, ls, 0, _zero(ls), zv); }
+    } else {
+        nv = _vop(1, vc, ls, 0, _mat(old, ls, 0), zv);
+    }
+    return _pcarry(k, _pvec(nv, ls, 0, W_acc_sgn[k]));
+}
+
+// ---- uniform operations: run once, in scalar, before the vector loop ----
+fn _uniform(p as i32) as i32 {
+    let is i32 as k = _P(p).kind;
+    if (k == WK_CONST || k == WK_INV) { return 1; }
+    return 0;
+}
+
+fn _scalar_of(p as i32) as i32 {
+    let is *WVal as w = _P(p);
+    if (w.kind == WK_INV) { return w.v; }
+    return _sop(0, d.IR_IMM, cast(i32, 0 - 1), cast(i32, 0 - 1), 0, w.imm, cast(*u8, 0));
+}
+
+fn _clone_uniform(inst as *d.IRInst, x as i32, y as i32) as i32 {
+    let is i32 as dv = _nv();
+    if (W_dry == 0 && W_fail == 0) {
+        let is *d.IRInst as ni = d.new_inst(inst.op);
+        ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = dv;
+        ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = _scalar_of(x);
+        if (y >= 0) {
+            if (inst.src2.op_type == d.OP_IMM) { ni.src2 = inst.src2; }
+            else { ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = _scalar_of(y); }
+        }
+        ni.cast_to = inst.cast_to; ni.cast_from = inst.cast_from;
+        _app(0, ni);
+    }
+    let is i32 as p = _pv(WK_INV);
+    _P(p).v = dv;
+    return p;
+}
+
+// ---- integer widen / narrow of a vector, one halving or doubling at a time ----
+fn _resize(v as i32, from as i32, to as i32, sgn as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as s with mut = from;
+    while (s < to && W_fail == 0) {
+        if (sgn == 1) { cur = _vop(1, vo.VO_SEXT, s * 2, 0, cur, cast(i32, 0 - 1)); }
+        else { cur = _vop(1, vo.VO_ZEXT, s * 2, 0, cur, cast(i32, 0 - 1)); }
+        s = s * 2;
+    }
+    while (s > to && W_fail == 0) {
+        cur = _vop(1, vo.VO_TRUNC, s / 2, 0, cur, cast(i32, 0 - 1));
+        s = s / 2;
+    }
+    return cur;
+}
+
+// fold an integer constant into type t (truncate, then extend by t's sign)
+fn _const_to(imm as i64, t as *u8) as i64 {
+    let is i32 as ls = _tls(t);
+    if (ls >= 8) { return imm; }
+    let is i64 as bits = cast(i64, ls) * 8;
+    let is i64 as m = _shl(1, bits) - 1;
+    let is i64 as v = imm & m;
+    if (_tsgn(t) == 1 && (v & _shl(1, bits - 1)) != 0) { return v - _shl(1, bits); }
+    return v;
+}
+
+fn _do_cast(inst as *d.IRInst) as void {
+    let is *u8 as ft = inst.cast_from;
+    let is *u8 as tt = inst.cast_to;
+    let is i32 as x = _opnd(&inst.src1);
+    if (W_fail == 1) { return; }
+    let is *WVal as w = _P(x);
+    let is i32 as ff = _tflt(ft);
+    let is i32 as tf = _tflt(tt);
+    let is i32 as sf = _tls(ft);
+    let is i32 as st = _tls(tt);
+    if (sf == 0 || st == 0) { _fail("cast type"); return; }
+    if (w.kind == WK_CARRY) {
+        if (ff == tf && sf == st) { _assign(inst.dest.vreg, x); return; }
+        _fail("reduction converted"); return;
+    }
+    if (ff == 0 && tf == 0) {
+        if (w.kind == WK_CONST) { _assign(inst.dest.vreg, _pconst(_const_to(w.imm, tt))); return; }
+        if (w.kind == WK_INV) { _assign(inst.dest.vreg, _clone_uniform(inst, x, cast(i32, 0 - 1))); return; }
+        if (w.kind == WK_IV && w.ls == 0 && st >= sf) { _assign(inst.dest.vreg, x); return; }
+        if (w.kind == WK_IV && st < sf) {
+            // narrowing the index: still i + j, now in fewer bytes
+            let is i32 as p = _pv(WK_IV);
+            _P(p).ls = st; _P(p).sgn = _tsgn(tt);
+            if (w.ls != 0 && w.ls < st) { _P(p).ls = w.ls; _P(p).sgn = w.sgn; }
+            _assign(inst.dest.vreg, p);
+            return;
+        }
+        if ((w.kind == WK_MASK || w.kind == WK_BOOL) && st == sf) { _assign(inst.dest.vreg, x); return; }
+        if (w.kind == WK_SEL && st == sf) { _assign(inst.dest.vreg, x); return; }
+        if (w.kind == WK_VEC && st == sf) {
+            _assign(inst.dest.vreg, _pvec(w.v, w.ls, 0, _tsgn(tt)));
+            return;
+        }
+        let is i32 as v = _mat(x, sf, 0);
+        _assign(inst.dest.vreg, _pvec(_resize(v, sf, st, _tsgn(ft)), st, 0, _tsgn(tt)));
+        return;
+    }
+    if (_uniform(x) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, cast(i32, 0 - 1))); return; }
+    if (ff == 0 && tf == 1) {
+        // int -> float through i32 lanes: narrower ints widen exactly first;
+        // u32 and 64-bit ints have no packed conversion here.
+        if (sf > 4 || (sf == 4 && _tsgn(ft) == 0)) { _fail("int to float source"); return; }
+        let is i32 as v with mut = _mat(x, sf, 0);
+        if (sf < 4) { v = _resize(v, sf, 4, _tsgn(ft)); }
+        _assign(inst.dest.vreg, _pvec(_vop(1, vo.VO_I2F, st, 0, v, cast(i32, 0 - 1)), st, 1, 1));
+        return;
+    }
+    if (ff == 1 && tf == 1) {
+        if (sf == st) { _assign(inst.dest.vreg, x); return; }
+        let is i32 as v = _mat(x, sf, 1);
+        _assign(inst.dest.vreg, _pvec(_vop(1, vo.VO_F2F, st, 0, v, cast(i32, 0 - 1)), st, 1, 1));
+        return;
+    }
+    _fail("float to int");
+}
+
+fn _do_int(inst as *d.IRInst) as void {
+    let is i32 as op = inst.op;
+    let is *u8 as ty = inst.cast_to;
+    if (_tflt(ty) == 1) { _fail("float type on an integer op"); return; }
+    let is i32 as ls = _tls(ty);
+    let is i32 as sgn = _tsgn(ty);
+    if (ls == 0) { _fail("type"); return; }
+    if (op == d.IR_NEG || op == d.IR_NOT) {
+        let is i32 as x = _opnd(&inst.src1);
+        if (W_fail == 1) { return; }
+        if (_P(x).kind == WK_CARRY) { _fail("reduction negated"); return; }
+        if (_uniform(x) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, cast(i32, 0 - 1))); return; }
+        let is i32 as xv = _mat(x, ls, 0);
+        let is i32 as r with mut = 0;
+        if (op == d.IR_NEG) { r = _vop(1, vo.VO_SUB, ls, 0, _zero(ls), xv); }
+        else { r = _vop(1, vo.VO_XOR, ls, 0, xv, _ones(ls)); }
+        _assign(inst.dest.vreg, _pvec(r, ls, 0, sgn));
+        return;
+    }
+    let is i32 as x = _opnd(&inst.src1);
+    let is i32 as y = _opnd(&inst.src2);
+    if (W_fail == 1) { return; }
+    let is i32 as kx = _P(x).kind;
+    let is i32 as ky = _P(y).kind;
+    if (kx == WK_CARRY || ky == WK_CARRY) { _assign(inst.dest.vreg, _carry_op(inst, x, y)); return; }
+    if (_uniform(x) == 1 && _uniform(y) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, y)); return; }
+    // & | ^ of two booleans stay a boolean
+    if ((op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR) && (kx == WK_BOOL || kx == WK_MASK) && (ky == WK_BOOL || ky == WK_MASK)) {
+        let is i64 as ta = _tt_of(x);
+        let is i64 as tb = _tt_of(y);
+        if (op == d.IR_AND) { _assign(inst.dest.vreg, _pbool(ta & tb)); }
+        else if (op == d.IR_OR) { _assign(inst.dest.vreg, _pbool(ta | tb)); }
+        else { _assign(inst.dest.vreg, _pbool(ta ^ tb)); }
+        return;
+    }
+    if (op == d.IR_SHL || op == d.IR_SHR) {
+        if (ky != WK_CONST) { _fail("variable shift"); return; }
+        let is i64 as cnt with mut = _P(y).imm;
+        if (cnt < 0 || cnt > 63) { _fail("shift count"); return; }
+        if (cnt > cast(i64, ls * 8)) { cnt = cast(i64, ls * 8); }
+        let is i32 as code with mut = vo.VO_SHL;
+        if (op == d.IR_SHR) { if (sgn == 1) { code = vo.VO_SAR; if (cnt >= cast(i64, ls * 8)) { cnt = cast(i64, ls * 8 - 1); } } else { code = vo.VO_SHR; } }
+        let is i32 as r = _vop(1, code, ls, cast(i32, cnt), _mat(x, ls, 0), cast(i32, 0 - 1));
+        _assign(inst.dest.vreg, _pvec(r, ls, 0, sgn));
+        return;
+    }
+    let is i32 as code with mut = 0;
+    if (op == d.IR_ADD) { code = vo.VO_ADD; } else if (op == d.IR_SUB) { code = vo.VO_SUB; }
+    else if (op == d.IR_MUL) { code = vo.VO_MUL; } else if (op == d.IR_AND) { code = vo.VO_AND; }
+    else if (op == d.IR_OR) { code = vo.VO_OR; } else if (op == d.IR_XOR) { code = vo.VO_XOR; }
+    else { _fail("integer op"); return; }
+    let is i32 as r = _vop(1, code, ls, 0, _mat(x, ls, 0), _mat(y, ls, 0));
+    _assign(inst.dest.vreg, _pvec(r, ls, 0, sgn));
+}
+
+// base + idx * scale as 8-byte lanes, for an address used as a value
+fn _do_lea(inst as *d.IRInst) as void {
+    let is i32 as x = _opnd(&inst.src1);
+    let is i32 as y = _opnd(&inst.src2);
+    if (W_fail == 1) { return; }
+    if (_P(x).kind == WK_CARRY || _P(y).kind == WK_CARRY) { _fail("reduction in an address"); return; }
+    if (_uniform(x) == 1 && _uniform(y) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, y)); return; }
+    let is i32 as sh with mut = 3;
+    if (inst.op == d.IR_LEA2) { sh = 1; } else if (inst.op == d.IR_LEA4) { sh = 2; }
+    let is i32 as t = _vop(1, vo.VO_SHL, 8, sh, _mat(y, 8, 0), cast(i32, 0 - 1));
+    _assign(inst.dest.vreg, _pvec(_vop(1, vo.VO_ADD, 8, 0, _mat(x, 8, 0), t), 8, 0, 0));
+}
+
+fn _do_flt(inst as *d.IRInst) as void {
+    let is i32 as op = inst.op;
+    let is *u8 as ty = inst.cast_to;
+    if (_tflt(ty) == 0) { _fail("float op type"); return; }
+    let is i32 as ls = _tls(ty);
+    if (op == d.IR_FNEG || op == d.IR_FSQRT) {
+        let is i32 as x = _opnd(&inst.src1);
+        if (W_fail == 1) { return; }
+        if (_P(x).kind == WK_CARRY) { _fail("reduction negated"); return; }
+        if (_uniform(x) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, cast(i32, 0 - 1))); return; }
+        let is i32 as xv = _mat(x, ls, 1);
+        let is i32 as r with mut = 0;
+        if (op == d.IR_FSQRT) { r = _vop(1, vo.VO_FSQRT, ls, 0, xv, cast(i32, 0 - 1)); }
+        else {
+            let is i64 as sb with mut = 0 - 9223372036854775807 - 1;
+            if (ls == 4) { sb = 2147483648; }
+            r = _vop(1, vo.VO_XOR, ls, 0, xv, _splat(0, sb, ls));
+        }
+        _assign(inst.dest.vreg, _pvec(r, ls, 1, 1));
+        return;
+    }
+    let is i32 as x = _opnd(&inst.src1);
+    let is i32 as y = _opnd(&inst.src2);
+    if (W_fail == 1) { return; }
+    if (_P(x).kind == WK_CARRY || _P(y).kind == WK_CARRY) { _assign(inst.dest.vreg, _carry_op(inst, x, y)); return; }
+    if (_uniform(x) == 1 && _uniform(y) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, y)); return; }
+    let is i32 as code with mut = vo.VO_FADD;
+    if (op == d.IR_FSUB) { code = vo.VO_FSUB; } else if (op == d.IR_FMUL) { code = vo.VO_FMUL; }
+    else if (op == d.IR_FDIV) { code = vo.VO_FDIV; }
+    let is i32 as r = _vop(1, code, ls, 0, _mat(x, ls, 1), _mat(y, ls, 1));
+    _assign(inst.dest.vreg, _pvec(r, ls, 1, 1));
+}
+
+fn _do_cmp(inst as *d.IRInst) as void {
+    let is i32 as op = inst.op;
+    let is *u8 as ty = inst.cast_to;
+    let is i32 as ls = _tls(ty);
+    let is i32 as flt = _tflt(ty);
+    if (ls == 0) { _fail("compare type"); return; }
+    let is i32 as x = _opnd(&inst.src1);
+    let is i32 as y = _opnd(&inst.src2);
+    if (W_fail == 1) { return; }
+    if (_P(x).kind == WK_CARRY || _P(y).kind == WK_CARRY) { _fail("reduction compared"); return; }
+    if (_uniform(x) == 1 && _uniform(y) == 1) { _assign(inst.dest.vreg, _clone_uniform(inst, x, y)); return; }
+    if (flt == 1) {
+        // ordered < <= ==, unordered != (as the scalar compares answer for NaN)
+        let is i32 as a with mut = x;
+        let is i32 as b with mut = y;
+        let is i32 as pr with mut = 0;
+        if (op == d.IR_NE) { pr = 4; } else if (op == d.IR_LT) { pr = 1; } else if (op == d.IR_LE) { pr = 2; }
+        else if (op == d.IR_GT) { pr = 1; a = y; b = x; } else if (op == d.IR_GE) { pr = 2; a = y; b = x; }
+        let is i32 as m = _vop(1, vo.VO_FCMP, ls, pr, _mat(a, ls, 1), _mat(b, ls, 1));
+        _assign(inst.dest.vreg, _pmask(m, ls, 0));
+        return;
+    }
+    if (op == d.IR_EQ || op == d.IR_NE) {
+        let is i32 as m = _vop(1, vo.VO_CMPEQ, ls, 0, _mat(x, ls, 0), _mat(y, ls, 0));
+        let is i32 as ng with mut = 0; if (op == d.IR_NE) { ng = 1; }
+        _assign(inst.dest.vreg, _pmask(m, ls, ng));
+        return;
+    }
+    // signed a > b; unsigned through the sign bit flipped on both sides
+    let is i32 as a with mut = x;
+    let is i32 as b with mut = y;
+    let is i32 as ng with mut = 0;
+    if (op == d.IR_LT) { a = y; b = x; }
+    else if (op == d.IR_GE) { a = y; b = x; ng = 1; }
+    else if (op == d.IR_LE) { ng = 1; }
+    let is i32 as av with mut = 0;
+    let is i32 as bv with mut = 0;
+    if (_tsgn(ty) == 1) { av = _mat(a, ls, 0); bv = _mat(b, ls, 0); }
+    else {
+        let is i64 as sb = _shl(1, cast(i64, ls) * 8 - 1);
+        let is i32 as bias = _splat(0, sb, ls);
+        if (_P(a).kind == WK_CONST) { av = _splat(0, _P(a).imm ^ sb, ls); } else { av = _vop(1, vo.VO_XOR, ls, 0, _mat(a, ls, 0), bias); }
+        if (_P(b).kind == WK_CONST) { bv = _splat(0, _P(b).imm ^ sb, ls); } else { bv = _vop(1, vo.VO_XOR, ls, 0, _mat(b, ls, 0), bias); }
+    }
+    let is i32 as m = _vop(1, vo.VO_CMPGT, ls, 0, av, bv);
+    _assign(inst.dest.vreg, _pmask(m, ls, ng));
+}
+
+// ---- memory ----
+fn _addr(base as i32, ls as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < W_nad) {
+        if (W_ad_base[i] == base && W_ad_ls[i] == ls) { return W_ad_v[i]; }
+        i = i + 1;
+    }
+    let is i32 as r with mut = 0;
+    if (ls == 1) { r = _sop(1, d.IR_ADD, base, W_iv, 0, 0, cast(*u8, 0)); }
+    else {
+        let is i32 as lop with mut = d.IR_LEA8;
+        if (ls == 2) { lop = d.IR_LEA2; } else if (ls == 4) { lop = d.IR_LEA4; }
+        r = _sop(1, lop, base, W_iv, 0, 0, cast(*u8, 0));
+    }
+    if (W_nad < MAXCACHE) { W_ad_base[W_nad] = base; W_ad_ls[W_nad] = ls; W_ad_v[W_nad] = r; W_nad = W_nad + 1; }
+    return r;
+}
+
+fn _note_mem(base as i32, off as i64, ls as i32, wr as i32) as void {
+    if (W_dry == 0) { return; }
+    let is i32 as i with mut = 0;
+    while (i < W_nm) {
+        if (W_m_base[i] == base && W_m_off[i] == off && W_m_ls[i] == ls) {
+            if (wr == 1) { W_m_w[i] = 1; }
+            return;
+        }
+        i = i + 1;
+    }
+    if (W_nm >= MAXMEM) { _fail("too many arrays"); return; }
+    W_m_base[W_nm] = base; W_m_off[W_nm] = off; W_m_ls[W_nm] = ls; W_m_w[W_nm] = wr;
+    W_nm = W_nm + 1;
+}
+
+fn _ua_has(base as i32, off as i64, ls as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < W_nua) {
+        if (W_ua_base[i] == base && W_ua_off[i] == off && W_ua_ls[i] == ls) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn _ua_put(base as i32, off as i64, ls as i32) as void {
+    if (_ua_has(base, off, ls) == 1 || W_nua >= MAXCACHE) { return; }
+    W_ua_base[W_nua] = base; W_ua_off[W_nua] = off; W_ua_ls[W_nua] = ls;
+    W_nua = W_nua + 1;
+}
+fn _ld_find(base as i32, off as i64, ls as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < W_nld) {
+        if (W_ld_base[i] == base && W_ld_off[i] == off && W_ld_ls[i] == ls) { return W_ld_v[i]; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+fn _ld_put(base as i32, off as i64, ls as i32, v as i32) as void {
+    if (W_nld >= MAXCACHE) { return; }
+    W_ld_base[W_nld] = base; W_ld_off[W_nld] = off; W_ld_ls[W_nld] = ls; W_ld_v[W_nld] = v;
+    W_nld = W_nld + 1;
+}
+// a store to array `base` makes what was loaded from it stale (other arrays
+// do not overlap the ones written: the overlap test before the loop)
+fn _ld_kill(base as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < W_nld) {
+        if (W_ld_base[i] == base) {
+            W_nld = W_nld - 1;
+            W_ld_base[i] = W_ld_base[W_nld]; W_ld_off[i] = W_ld_off[W_nld];
+            W_ld_ls[i] = W_ld_ls[W_nld]; W_ld_v[i] = W_ld_v[W_nld];
+        } else { i = i + 1; }
+    }
+}
+
+// the array an address walks: base, offset, element = step; 0 when it is not one
+fn _array_of(addr as i32, ls as i32, out_base as *i32, out_off as *i64) as i32 {
+    let is sc.AffineExpr as ae;
+    sc.scev_of_vreg(W_def_inst, W_def_count, W_vc, W_iv, 1, addr, &ae, 0);
+    if (cast(i32, ae.kind) != sc.AE_AFFINE || ae.base < 0 || ae.step != cast(i64, ls)) { return 0; }
+    if (sc.ctx_inloop(ae.base) == 1) { return 0; }
+    *out_base = ae.base; *out_off = ae.base_imm;
+    return 1;
+}
+
+fn _do_load(inst as *d.IRInst) as void {
+    if (inst.src1.op_type != d.OP_VREG) { _fail("load address"); return; }
+    let is *u8 as ty = inst.cast_to;
+    let is i32 as ls = _tls(ty);
+    if (ls == 0) { _fail("load type"); return; }
+    let is i32 as base with mut = 0;
+    let is i64 as off with mut = 0;
+    if (_array_of(inst.src1.vreg, ls, &base, &off) == 0) { _fail("load not unit stride"); return; }
+    // under a condition only what every lane reads anyway: it cannot fault
+    if (W_pred != ALL && _ua_has(base, off, ls) == 0) { _fail("load under a condition"); return; }
+    let is i32 as hit = _ld_find(base, off, ls);
+    if (hit >= 0) { _assign(inst.dest.vreg, _pvec(hit, ls, _tflt(ty), _tsgn(ty))); return; }
+    if (W_pred == ALL) { _ua_put(base, off, ls); }
+    _note_mem(base, off, ls, 0);
+    let is i32 as av = _addr(base, ls);
+    if (ls > W_maxls) { W_maxls = ls; }
+    let is i32 as dv = _nv();
+    if (W_dry == 0 && W_fail == 0) {
+        let is *d.IRInst as ni = d.new_inst(d.IR_VOP);
+        ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = dv;
+        ni.dest.label = vo.vo_pack(vo.VO_LOAD, ls, W_vex, W_vf, 0);
+        ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = av;
+        ni.src2.op_type = cast(i8, d.OP_IMM); ni.src2.imm = off;
+        _app(1, ni);
+    }
+    _ld_put(base, off, ls, dv);
+    _assign(inst.dest.vreg, _pvec(dv, ls, _tflt(ty), _tsgn(ty)));
+}
+
+fn _do_store(inst as *d.IRInst) as void {
+    if (W_pred != ALL) { _fail("store under a condition"); return; }
+    if (inst.dest.op_type != d.OP_VREG) { _fail("store address"); return; }
+    let is *u8 as ty = inst.cast_to;
+    let is i32 as ls = _tls(ty);
+    let is i32 as flt = _tflt(ty);
+    if (ls == 0) { _fail("store type"); return; }
+    let is i32 as base with mut = 0;
+    let is i64 as off with mut = 0;
+    if (_array_of(inst.dest.vreg, ls, &base, &off) == 0) { _fail("store not unit stride"); return; }
+    let is i32 as x = _opnd(&inst.src1);
+    if (W_fail == 1) { return; }
+    let is *WVal as w = _P(x);
+    if (w.kind == WK_CARRY) { _fail("reduction stored"); return; }
+    let is i32 as vv with mut = 0;
+    if (w.kind == WK_VEC && flt == 0 && w.flt == 0 && w.ls > ls) { vv = _resize(w.v, w.ls, ls, 0); }
+    else { vv = _mat(x, ls, flt); }
+    _note_mem(base, off, ls, 1);
+    _ld_kill(base);
+    _ld_put(base, off, ls, vv);
+    _ua_put(base, off, ls);
+    W_nstore = W_nstore + 1;
+    let is i32 as av = _addr(base, ls);
+    if (ls > W_maxls) { W_maxls = ls; }
+    if (W_dry == 0 && W_fail == 0) {
+        let is i32 as nb = W_vf * ls;
+        let is *d.IRInst as ni with mut = cast(*d.IRInst, 0);
+        if (nb == 32) { ni = d.new_inst(d.IR_VSTOREQ256); }
+        else { ni = d.new_inst(d.IR_VSTOREQ); ni.dest.label = nb | (W_vex << 8); }
+        ni.dest.op_type = cast(i8, d.OP_IMM); ni.dest.imm = off;
+        ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = av;
+        ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = vv;
+        _app(1, ni);
+    }
+}
+
+fn _do_inst(inst as *d.IRInst) as void {
+    let is i32 as op = inst.op;
+    if (op == d.IR_STORE) { _do_store(inst); return; }
+    if (inst.dest.op_type != d.OP_VREG) { _fail("instruction"); return; }
+    let is i32 as dv = inst.dest.vreg;
+    if (dv == W_iv) {
+        if (W_pred != ALL) { _fail("conditional induction step"); return; }
+        W_ivdefs = W_ivdefs + 1;
+        W_iv_dead = 1;
+        return;
+    }
+    if (dv < 0 || dv >= W_vc || W_need[dv] == cast(u8, 0)) { return; }
+    if (op == d.IR_LOAD) { _do_load(inst); return; }
+    if (op == d.IR_IMM) { _assign(dv, _pconst(inst.src1.imm)); return; }
+    if (op == d.IR_MOV) { _assign(dv, _opnd(&inst.src1)); return; }
+    if (op == d.IR_CAST) { _do_cast(inst); return; }
+    if (op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { _do_lea(inst); return; }
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT) { _do_flt(inst); return; }
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE) { _do_cmp(inst); return; }
+    _do_int(inst);
+}
+
+fn _op_allowed(op as i32) as i32 {
+    if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ
+        || op == d.IR_IMM || op == d.IR_MOV || op == d.IR_CAST
+        || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR
+        || op == d.IR_SHL || op == d.IR_SHR || op == d.IR_NEG || op == d.IR_NOT
+        || op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE
+        || op == d.IR_LOAD || op == d.IR_STORE
+        || op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV || op == d.IR_FNEG || op == d.IR_FSQRT
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { return 1; }
+    return 0;
+}
+
+fn _reads(o as *d.Operand, v as i32) as i32 {
+    if (o.op_type == d.OP_VREG && o.vreg == v) { return 1; }
+    return 0;
+}
+
+fn _mark(o as *d.Operand) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= W_vc) { return 0; }
+    if (W_need[o.vreg] == cast(u8, 1)) { return 0; }
+    W_need[o.vreg] = cast(u8, 1);
+    return 1;
+}
+
+// The body: allowed ops only, every jump forward inside it, nothing jumps in
+// from outside, the induction variable not read after its update; which
+// values are read after the loop, and which values the vector code needs.
+fn _prescan(func as *d.IRFunction, hb as *cfg.BasicBlock, lb as *cfg.BasicBlock, jz as *d.IRInst) as i32 {
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    let is i32 as after_iv with mut = 0;
+    while (stop == 0 && cast(i64, p) != 0) {
+        if (p.is_dead == 0) {
+            if (_op_allowed(p.op) == 0) { _fail("operation"); return 0; }
+            if (p.op == d.IR_LABEL && p.dest.label >= 0 && p.dest.label < W_nlab) { W_inb[p.dest.label] = cast(u8, 1); }
+            if (after_iv == 1 && (_reads(&p.src1, W_iv) == 1 || _reads(&p.src2, W_iv) == 1
+                || (p.op == d.IR_STORE && _reads(&p.dest, W_iv) == 1))) { _fail("induction read after its update"); return 0; }
+            if (p.dest.op_type == d.OP_VREG && p.dest.vreg == W_iv && p.op != d.IR_STORE) { after_iv = 1; }
+        }
+        if (cast(i64, p) == cast(i64, lb.last)) { stop = 1; } else { p = p.next; }
+    }
+    if (lb.last.op != d.IR_JMP || lb.last.dest.op_type != d.OP_LABEL || hb.first.op != d.IR_LABEL
+        || lb.last.dest.label != hb.first.dest.label) { _fail("latch"); return 0; }
+    // branches: inside the body to body labels; from outside, none into it
+    let is i32 as inside with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (cast(i64, w) == cast(i64, hb.first)) { inside = 1; }
+        if (w.is_dead == 0 && (w.op == d.IR_JMP || w.op == d.IR_JZ || w.op == d.IR_JNZ) && w.dest.op_type == d.OP_LABEL) {
+            let is i32 as lab = w.dest.label;
+            let is i32 as lin with mut = 0;
+            if (lab >= 0 && lab < W_nlab && W_inb[lab] == cast(u8, 1)) { lin = 1; }
+            if (inside == 1 && lin == 0 && cast(i64, w) != cast(i64, jz)) { _fail("exit from the body"); return 0; }
+            if (inside == 0 && lin == 1 && lab != hb.first.dest.label) { _fail("jump into the body"); return 0; }
+        }
+        if (cast(i64, w) == cast(i64, lb.last)) { inside = 0; }
+        w = w.next;
+    }
+    // values read after the loop (copies followed through, as loop_values_private)
+    let is *u8 as u = cast(*u8, d.opt_alloc(cast(i64, W_vc + 1)));
+    let is i32 as i with mut = 0;
+    while (i < W_vc) { u[i] = cast(u8, 0); W_live[i] = cast(u8, 0); W_need[i] = cast(u8, 0); i = i + 1; }
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.op != d.IR_MOV) {
+            if (w.src1.op_type == d.OP_VREG && w.src1.vreg >= 0 && w.src1.vreg < W_vc) { u[w.src1.vreg] = cast(u8, 1); }
+            if (w.src2.op_type == d.OP_VREG && w.src2.vreg >= 0 && w.src2.vreg < W_vc) { u[w.src2.vreg] = cast(u8, 1); }
+            if ((w.op == d.IR_STORE || w.op == d.IR_COPY || w.op == d.IR_CMOV) && w.dest.op_type == d.OP_VREG
+                && w.dest.vreg >= 0 && w.dest.vreg < W_vc) { u[w.dest.vreg] = cast(u8, 1); }
+        }
+        w = w.next;
+    }
+    let is i32 as chg with mut = 1;
+    let is i32 as rounds with mut = 0;
+    while (chg == 1 && rounds < 64) {
+        chg = 0; rounds = rounds + 1;
+        w = func.instructions;
+        while (cast(i64, w) != 0) {
+            if (w.is_dead == 0 && w.op == d.IR_MOV && w.dest.op_type == d.OP_VREG && w.src1.op_type == d.OP_VREG
+                && w.dest.vreg >= 0 && w.dest.vreg < W_vc && w.src1.vreg >= 0 && w.src1.vreg < W_vc
+                && u[w.dest.vreg] == cast(u8, 1) && u[w.src1.vreg] == cast(u8, 0)) {
+                u[w.src1.vreg] = cast(u8, 1); chg = 1;
+            }
+            w = w.next;
+        }
+    }
+    inside = 0;
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (cast(i64, w) == cast(i64, hb.first)) { inside = 1; }
+        if (inside == 0 && w.is_dead == 0) {
+            let is i32 as rd with mut = 1;
+            if (w.op == d.IR_MOV && (w.dest.op_type != d.OP_VREG || w.dest.vreg < 0 || w.dest.vreg >= W_vc
+                || u[w.dest.vreg] == cast(u8, 0))) { rd = 0; }
+            if (rd == 1) {
+                if (w.src1.op_type == d.OP_VREG && w.src1.vreg >= 0 && w.src1.vreg < W_vc && sc.ctx_inloop(w.src1.vreg) == 1) { W_live[w.src1.vreg] = cast(u8, 1); }
+                if (w.src2.op_type == d.OP_VREG && w.src2.vreg >= 0 && w.src2.vreg < W_vc && sc.ctx_inloop(w.src2.vreg) == 1) { W_live[w.src2.vreg] = cast(u8, 1); }
+                if ((w.op == d.IR_STORE || w.op == d.IR_COPY || w.op == d.IR_CMOV) && w.dest.op_type == d.OP_VREG
+                    && w.dest.vreg >= 0 && w.dest.vreg < W_vc && sc.ctx_inloop(w.dest.vreg) == 1) { W_live[w.dest.vreg] = cast(u8, 1); }
+            }
+        }
+        if (cast(i64, w) == cast(i64, lb.last)) { inside = 0; }
+        w = w.next;
+    }
+    d.opt_free(u);
+    // needed: what stores, branches and the values read after the loop use
+    i = 0;
+    while (i < W_vc) { if (W_live[i] == cast(u8, 1) && i != W_iv) { W_need[i] = cast(u8, 1); } i = i + 1; }
+    chg = 1; rounds = 0;
+    while (chg == 1 && rounds < 1000) {
+        chg = 0; rounds = rounds + 1;
+        p = hb.first; stop = 0;
+        while (stop == 0 && cast(i64, p) != 0) {
+            if (p.is_dead == 0 && cast(i64, p) != cast(i64, jz)) {
+                if (p.op == d.IR_STORE) { if (_mark(&p.src1) == 1) { chg = 1; } }
+                else if (p.op == d.IR_JZ || p.op == d.IR_JNZ) { if (_mark(&p.src1) == 1) { chg = 1; } }
+                else if (p.dest.op_type == d.OP_VREG && p.dest.vreg >= 0 && p.dest.vreg < W_vc
+                         && p.dest.vreg != W_iv && W_need[p.dest.vreg] == cast(u8, 1) && p.op != d.IR_LOAD) {
+                    if (_mark(&p.src1) == 1) { chg = 1; }
+                    if (_mark(&p.src2) == 1) { chg = 1; }
+                }
+            }
+            if (cast(i64, p) == cast(i64, lb.last)) { stop = 1; } else { p = p.next; }
+        }
+    }
+    return 1;
+}
+
+// One walk over the body (dry or emitting). Returns 1 when it went through.
+fn _walk(hb as *cfg.BasicBlock, lb as *cfg.BasicBlock, jz as *d.IRInst) as i32 {
+    W_np = 0; W_natom = 0; W_nmk = 0; W_nsp = 0; W_nad = 0; W_nacc = 0; W_nstore = 0;
+    W_iv_dead = 0; W_ivdefs = 0; W_pred = ALL; W_nocse = 0; W_nua = 0; W_nld = 0;
+    W_h0 = cast(*d.IRInst, 0); W_t0 = cast(*d.IRInst, 0);
+    W_h1 = cast(*d.IRInst, 0); W_t1 = cast(*d.IRInst, 0);
+    W_h2 = cast(*d.IRInst, 0); W_t2 = cast(*d.IRInst, 0);
+    let is i32 as i with mut = 0;
+    while (i < W_vc) { W_cur[i] = cast(i32, 0 - 1); W_defd[i] = 0; W_inv_p[i] = cast(i32, 0 - 1); i = i + 1; }
+    i = 0;
+    while (i < W_nlab) { W_edge[i] = 0; W_seen[i] = cast(u8, 0); i = i + 1; }
+    i = 0;
+    while (i < 9) { W_viv[i] = cast(i32, 0 - 1); i = i + 1; }
+    // a jump back to the header from inside the body (continue) is backward
+    if (hb.first.dest.label >= 0 && hb.first.dest.label < W_nlab) { W_seen[hb.first.dest.label] = cast(u8, 1); }
+    let is *d.IRInst as p with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, p) != 0 && W_fail == 0) {
+        if (p.is_dead == 0 && cast(i64, p) != cast(i64, hb.first) && cast(i64, p) != cast(i64, jz)) {
+            let is i32 as op = p.op;
+            if (op == d.IR_LABEL) {
+                let is i32 as lab = p.dest.label;
+                if (lab >= 0 && lab < W_nlab) { W_pred = W_pred | W_edge[lab]; W_edge[lab] = 0; W_seen[lab] = cast(u8, 1); }
+            } else if (op == d.IR_JMP) {
+                if (cast(i64, p) != cast(i64, lb.last)) {
+                    let is i32 as lab = p.dest.label;
+                    if (lab < 0 || lab >= W_nlab || W_seen[lab] == cast(u8, 1)) { _fail("backward jump"); return 0; }
+                    W_edge[lab] = W_edge[lab] | W_pred;
+                    W_pred = 0;
+                }
+            } else if (op == d.IR_JZ || op == d.IR_JNZ) {
+                let is i32 as lab = p.dest.label;
+                if (lab < 0 || lab >= W_nlab || W_seen[lab] == cast(u8, 1)) { _fail("backward branch"); return 0; }
+                if (W_pred != 0) {
+                    let is i64 as t = _tt_of(_opnd(&p.src1));
+                    let is i64 as taken with mut = W_pred & t;
+                    let is i64 as fall with mut = W_pred & ~t;
+                    if (op == d.IR_JZ) { taken = W_pred & ~t; fall = W_pred & t; }
+                    W_edge[lab] = W_edge[lab] | taken;
+                    W_pred = fall;
+                }
+            } else if (W_pred != 0) {
+                _do_inst(p);
+            }
+        }
+        if (cast(i64, p) == cast(i64, lb.last)) { stop = 1; } else { p = p.next; }
+    }
+    if (W_fail == 1) { return 0; }
+    if (W_pred != ALL) { _fail("latch under a condition"); return 0; }
+    if (W_ivdefs != 1) { _fail("induction updates"); return 0; }
+    // values read after the loop: the induction variable and the reductions
+    i = 0;
+    while (i < W_vc) {
+        if (W_live[i] == cast(u8, 1) && i != W_iv) {
+            let is i32 as c = W_cur[i];
+            if (c < 0 || _P(c).kind != WK_CARRY || W_acc_v[_P(c).v] != i) { _fail("value read after the loop"); return 0; }
+        }
+        i = i + 1;
+    }
+    // finish the reductions: integers into their vector accumulator, floats
+    // folded into the scalar in order
+    let is i32 as k with mut = 0;
+    while (k < W_nacc && W_fail == 0) {
+        let is i32 as c = W_cur[W_acc_v[k]];
+        if (c < 0 || _P(c).kind != WK_CARRY || _P(c).v != k || W_defd[W_acc_v[k]] != ALL) { _fail("reduction overwritten"); return 0; }
+        let is i32 as contrib = _P(c).a;
+        if (contrib >= 0) {
+            let is i32 as ak = W_acc_k[k];
+            let is i32 as ls = W_acc_ls[k];
+            if (ak == AK_FADD || ak == AK_FMUL) {
+                let is i32 as cv = _mat(contrib, ls, 1);
+                if (W_dry == 0 && W_fail == 0) {
+                    let is *d.IRInst as ni = d.new_inst(d.IR_VOP);
+                    ni.dest.op_type = cast(i8, d.OP_VREG); ni.dest.vreg = W_acc_v[k];
+                    let is i32 as im with mut = 0; if (ak == AK_FMUL) { im = 1; }
+                    ni.dest.label = vo.vo_pack(vo.VO_FOLD, ls, W_vex, W_vf, im);
+                    ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = W_acc_v[k];
+                    ni.src2.op_type = cast(i8, d.OP_VREG); ni.src2.vreg = cv;
+                    _app(1, ni);
+                }
+            } else {
+                let is i32 as cv = _mat(contrib, ls, 0);
+                // the accumulator starts as the identity, in a vreg of its own
+                let is i32 as icode with mut = vo.VO_ZERO;
+                if (ak == AK_AND) { icode = vo.VO_ONES; }
+                W_nocse = 1;
+                let is i32 as vacc = _vop(0, icode, ls, 0, cast(i32, 0 - 1), cast(i32, 0 - 1));
+                W_nocse = 0;
+                W_acc_vv[k] = vacc;
+                let is i32 as code with mut = vo.VO_ADD;
+                if (ak == AK_XOR) { code = vo.VO_XOR; } else if (ak == AK_OR) { code = vo.VO_OR; } else if (ak == AK_AND) { code = vo.VO_AND; }
+                _vop_into(1, code, ls, 0, vacc, vacc, cv);
+                let is i32 as hk with mut = 0;
+                if (ak == AK_XOR) { hk = 1; } else if (ak == AK_OR) { hk = 2; } else if (ak == AK_AND) { hk = 3; }
+                if (W_acc_sgn[k] == 1) { hk = hk + 16; }
+                let is i32 as h = _nv();
+                if (W_dry == 0 && W_fail == 0) {
+                    let is *d.IRInst as hi = d.new_inst(d.IR_VOPG);
+                    hi.dest.op_type = cast(i8, d.OP_VREG); hi.dest.vreg = h;
+                    hi.dest.label = vo.vo_pack(vo.VO_HRED, ls, W_vex, W_vf, hk);
+                    hi.src1.op_type = cast(i8, d.OP_VREG); hi.src1.vreg = vacc;
+                    _app(2, hi);
+                    let is i32 as sop with mut = d.IR_ADD;
+                    if (ak == AK_XOR) { sop = d.IR_XOR; } else if (ak == AK_OR) { sop = d.IR_OR; } else if (ak == AK_AND) { sop = d.IR_AND; }
+                    let is *d.IRInst as fi = d.new_inst(sop);
+                    fi.dest.op_type = cast(i8, d.OP_VREG); fi.dest.vreg = W_acc_v[k];
+                    fi.src1.op_type = cast(i8, d.OP_VREG); fi.src1.vreg = W_acc_v[k];
+                    fi.src2.op_type = cast(i8, d.OP_VREG); fi.src2.vreg = h;
+                    fi.cast_to = cast(*u8, W_acc_ty[k]);
+                    _app(2, fi);
+                }
+            }
+        }
+        k = k + 1;
+    }
+    // advance the vector inductions
+    let is i32 as s with mut = 1;
+    while (s <= 8) {
+        if (W_viv[s] >= 0) { _vop_into(1, vo.VO_ADD, s, 0, W_viv[s], W_viv[s], _splat(0, cast(i64, W_vf), s)); }
+        s = s * 2;
+    }
+    if (W_fail == 1) { return 0; }
+    return 1;
+}
+
+// Vector registers live at once in the body (always-live ones counted once).
+fn _pressure() as i32 {
+    // vregs defined before the loop and read in it, plus the carried ones
+    let is i32 as n_inv with mut = 0;
+    let is *d.IRInst as a with mut = W_h0;
+    while (cast(i64, a) != 0) {
+        if (a.op == d.IR_VOP && a.dest.op_type == d.OP_VREG) {
+            let is i32 as used with mut = 0;
+            let is *d.IRInst as b with mut = W_h1;
+            while (cast(i64, b) != 0 && used == 0) {
+                if (_reads(&b.src1, a.dest.vreg) == 1 || _reads(&b.src2, a.dest.vreg) == 1) { used = 1; }
+                b = b.next;
+            }
+            n_inv = n_inv + used;
+        }
+        a = a.next;
+    }
+    // the body, backwards: live vectors defined in the body itself
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as x with mut = W_h1;
+    while (cast(i64, x) != 0) { n = n + 1; x = x.next; }
+    let is *i64 as arr = cast(*i64, d.opt_alloc(cast(i64, n + 1) * 8));
+    let is i32 as j with mut = 0;
+    x = W_h1;
+    while (cast(i64, x) != 0) { arr[j] = cast(i64, x); j = j + 1; x = x.next; }
+    let is *i32 as live = cast(*i32, d.opt_alloc(cast(i64, n * 2 + 2) * 4));
+    let is i32 as nl with mut = 0;
+    let is i32 as mx with mut = 0;
+    j = n - 1;
+    while (j >= 0) {
+        let is *d.IRInst as ins = cast(*d.IRInst, arr[j]);
+        // a def ends the live range (unless it reads itself: carried)
+        if (ins.op == d.IR_VOP && ins.dest.op_type == d.OP_VREG) {
+            let is i32 as q with mut = 0;
+            while (q < nl) {
+                if (live[q] == ins.dest.vreg) { live[q] = live[nl - 1]; nl = nl - 1; q = nl; }
+                q = q + 1;
+            }
+        }
+        let is i32 as opi with mut = 0;
+        while (opi < 2) {
+            let is *d.Operand as o with mut = &ins.src1;
+            if (opi == 1) { o = &ins.src2; }
+            if (o.op_type == d.OP_VREG) {
+                // only vectors made in the body
+                let is i32 as mine with mut = 0;
+                let is i32 as r with mut = 0;
+                while (r < n) {
+                    let is *d.IRInst as di = cast(*d.IRInst, arr[r]);
+                    if (di.op == d.IR_VOP && di.dest.op_type == d.OP_VREG && di.dest.vreg == o.vreg) { mine = 1; r = n; }
+                    r = r + 1;
+                }
+                if (mine == 1) {
+                    let is i32 as there with mut = 0;
+                    let is i32 as q with mut = 0;
+                    while (q < nl) { if (live[q] == o.vreg) { there = 1; } q = q + 1; }
+                    if (there == 0) { live[nl] = o.vreg; nl = nl + 1; }
+                }
+            }
+            opi = opi + 1;
+        }
+        if (nl > mx) { mx = nl; }
+        j = j - 1;
+    }
+    d.opt_free(cast(*u8, live)); d.opt_free(cast(*u8, arr));
+    return n_inv + mx + 1;
+}
+
+fn _alloc_state(vc as i32, nlab as i32) as void {
+    W_pool = cast(*WVal, d.opt_alloc(cast(i64, MAXPOOL) * sizeof(WVal)));
+    W_cur = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    W_defd = cast(*i64, d.opt_alloc(cast(i64, vc + 1) * 8));
+    W_need = d.opt_alloc(cast(i64, vc + 1));
+    W_live = d.opt_alloc(cast(i64, vc + 1));
+    W_inv_p = cast(*i32, d.opt_alloc(cast(i64, vc + 1) * 4));
+    W_edge = cast(*i64, d.opt_alloc(cast(i64, nlab + 1) * 8));
+    W_inb = d.opt_alloc(cast(i64, nlab + 1));
+    W_seen = d.opt_alloc(cast(i64, nlab + 1));
+    let is i32 as i with mut = 0;
+    while (i < nlab) { W_inb[i] = cast(u8, 0); i = i + 1; }
+    W_atom = cast(*i32, d.opt_alloc(cast(i64, MAXATOM) * 4));
+    W_atom_ls = cast(*i32, d.opt_alloc(cast(i64, MAXATOM) * 4));
+    W_mk_tt = cast(*i64, d.opt_alloc(cast(i64, MAXCACHE) * 8));
+    W_mk_v = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_mk_ls = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_sp_kind = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_sp_key = cast(*i64, d.opt_alloc(cast(i64, MAXCACHE) * 8));
+    W_sp_ls = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_sp_v = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ad_base = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ad_ls = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ad_v = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_viv = cast(*i32, d.opt_alloc(cast(i64, 9) * 4));
+    W_acc_v = cast(*i32, d.opt_alloc(cast(i64, MAXACC) * 4));
+    W_acc_k = cast(*i32, d.opt_alloc(cast(i64, MAXACC) * 4));
+    W_acc_ls = cast(*i32, d.opt_alloc(cast(i64, MAXACC) * 4));
+    W_acc_sgn = cast(*i32, d.opt_alloc(cast(i64, MAXACC) * 4));
+    W_acc_ty = cast(*i64, d.opt_alloc(cast(i64, MAXACC) * 8));
+    W_acc_vv = cast(*i32, d.opt_alloc(cast(i64, MAXACC) * 4));
+    W_m_base = cast(*i32, d.opt_alloc(cast(i64, MAXMEM) * 4));
+    W_m_off = cast(*i64, d.opt_alloc(cast(i64, MAXMEM) * 8));
+    W_m_ls = cast(*i32, d.opt_alloc(cast(i64, MAXMEM) * 4));
+    W_m_w = cast(*i32, d.opt_alloc(cast(i64, MAXMEM) * 4));
+    W_ua_base = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ua_off = cast(*i64, d.opt_alloc(cast(i64, MAXCACHE) * 8));
+    W_ua_ls = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ld_base = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ld_off = cast(*i64, d.opt_alloc(cast(i64, MAXCACHE) * 8));
+    W_ld_ls = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+    W_ld_v = cast(*i32, d.opt_alloc(cast(i64, MAXCACHE) * 4));
+}
+
+fn _free_state() as void {
+    d.opt_free(cast(*u8, W_pool)); d.opt_free(cast(*u8, W_cur)); d.opt_free(cast(*u8, W_defd));
+    d.opt_free(W_need); d.opt_free(W_live); d.opt_free(cast(*u8, W_inv_p));
+    d.opt_free(cast(*u8, W_edge)); d.opt_free(W_inb); d.opt_free(W_seen);
+    d.opt_free(cast(*u8, W_atom)); d.opt_free(cast(*u8, W_atom_ls));
+    d.opt_free(cast(*u8, W_mk_tt)); d.opt_free(cast(*u8, W_mk_v)); d.opt_free(cast(*u8, W_mk_ls));
+    d.opt_free(cast(*u8, W_sp_kind)); d.opt_free(cast(*u8, W_sp_key)); d.opt_free(cast(*u8, W_sp_ls)); d.opt_free(cast(*u8, W_sp_v));
+    d.opt_free(cast(*u8, W_ad_base)); d.opt_free(cast(*u8, W_ad_ls)); d.opt_free(cast(*u8, W_ad_v));
+    d.opt_free(cast(*u8, W_viv));
+    d.opt_free(cast(*u8, W_acc_v)); d.opt_free(cast(*u8, W_acc_k)); d.opt_free(cast(*u8, W_acc_ls));
+    d.opt_free(cast(*u8, W_acc_sgn)); d.opt_free(cast(*u8, W_acc_ty)); d.opt_free(cast(*u8, W_acc_vv));
+    d.opt_free(cast(*u8, W_m_base)); d.opt_free(cast(*u8, W_m_off)); d.opt_free(cast(*u8, W_m_ls)); d.opt_free(cast(*u8, W_m_w));
+    d.opt_free(cast(*u8, W_ua_base)); d.opt_free(cast(*u8, W_ua_off)); d.opt_free(cast(*u8, W_ua_ls));
+    d.opt_free(cast(*u8, W_ld_base)); d.opt_free(cast(*u8, W_ld_off)); d.opt_free(cast(*u8, W_ld_ls)); d.opt_free(cast(*u8, W_ld_v));
+}
+
+fn _link(ip as *d.IRInst, h as *d.IRInst, t as *d.IRInst) as *d.IRInst {
+    if (cast(i64, h) == 0) { return ip; }
+    t.next = ip.next;
+    ip.next = h;
+    return t;
+}
+
+fn _lbl(ip as *d.IRInst, lab as i32) as *d.IRInst {
+    let is *d.IRInst as ni = d.new_inst(d.IR_LABEL);
+    ni.dest.op_type = cast(i8, d.OP_LABEL); ni.dest.label = lab; ni.line = W_ln;
+    return ex.emit(ip, ni);
+}
+
+fn _jmp(ip as *d.IRInst, op as i32, cond as i32, lab as i32) as *d.IRInst {
+    let is *d.IRInst as ni = d.new_inst(op);
+    if (cond >= 0) { ni.src1.op_type = cast(i8, d.OP_VREG); ni.src1.vreg = cond; }
+    ni.dest.op_type = cast(i8, d.OP_LABEL); ni.dest.label = lab; ni.line = W_ln;
+    return ex.emit(ip, ni);
+}
+
+// branch op to lab on `i + VF - 1 < n`: room for VF more iterations
+fn _room(func as *d.IRFunction, ip0 as *d.IRInst, lt as *d.IRInst, nn as i32, op as i32, lab as i32) as *d.IRInst {
+    let is *d.IRInst as ip with mut = ip0;
+    let is i32 as ivn with mut = 0;
+    ip = ex._ax_operand(func, ip, &lt.src1, W_def_inst, W_def_count, W_vc, W_ln, &ivn);
+    let is i32 as last = ex.new_vreg(func);
+    let is *d.IRInst as ad = d.new_inst(d.IR_ADD);
+    ad.dest.op_type = cast(i8, d.OP_VREG); ad.dest.vreg = last;
+    ad.src1.op_type = cast(i8, d.OP_VREG); ad.src1.vreg = ivn;
+    ad.src2.op_type = cast(i8, d.OP_IMM); ad.src2.imm = cast(i64, W_vf - 1); ad.line = W_ln;
+    ip = ex.emit(ip, ad);
+    let is i32 as cond = ex.new_vreg(func);
+    let is *d.IRInst as c = d.new_inst(d.IR_LT);
+    c.dest.op_type = cast(i8, d.OP_VREG); c.dest.vreg = cond;
+    c.src1.op_type = cast(i8, d.OP_VREG); c.src1.vreg = last;
+    c.src2.op_type = cast(i8, d.OP_VREG); c.src2.vreg = nn;
+    // u64 bounds compare unsigned; anything narrower is exact in 64 signed bits
+    if (_tls(lt.cast_to) == 8 && _tsgn(lt.cast_to) == 0 && cast(i64, lt.cast_to) != 0) { c.cast_to = lt.cast_to; }
+    c.line = W_ln;
+    ip = ex.emit(ip, c);
+    return _jmp(ip, op, cond, lab);
+}
+
+// Emit one vector loop (W_vex, W_vf already set) after ip. 0: register budget.
+fn _one_loop(func as *d.IRFunction, ip0 as *d.IRInst, hb as *cfg.BasicBlock, lb as *cfg.BasicBlock,
+             jz as *d.IRInst, lt as *d.IRInst, nn as i32, ext as i32, out_ip as *i64) as i32 {
+    W_dry = 0;
+    W_remat = 0;
+    if (_walk(hb, lb, jz) == 0) { return 0; }
+    let is i32 as pr with mut = _pressure();
+    if (pr + ext > 13) {
+        // too many constants kept in registers: splat them where they are used
+        W_remat = 1;
+        if (_walk(hb, lb, jz) == 0) { return 0; }
+        pr = _pressure();
+    }
+    if (d.vec_debug == 1) { dbg.pr_str("    widen: vectors live "); dbg.pr_int(cast(i64, pr)); dbg.pr_str(" + float scalars "); dbg.pr_int(cast(i64, ext)); dbg.pr_str("\n"); }
+    if (pr + ext > 13) { _fail("register budget"); return 0; }
+    let is *d.IRInst as ip with mut = ip0;
+    // scalar work first, then the vectors: a legacy SSE scalar op after the
+    // first 256-bit op of the AVX2 path would pay the SSE/AVX transition
+    let is *d.IRInst as sh with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as stl with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as vh with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as vt with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as x with mut = W_h0;
+    while (cast(i64, x) != 0) {
+        let is *d.IRInst as nx = x.next;
+        x.next = cast(*d.IRInst, 0);
+        if (x.op != d.IR_VOP) {
+            if (cast(i64, stl) == 0) { sh = x; } else { stl.next = x; }
+            stl = x;
+        } else {
+            if (cast(i64, vt) == 0) { vh = x; } else { vt.next = x; }
+            vt = x;
+        }
+        x = nx;
+    }
+    // one test before (skipping the set-up too when there is no room for a
+    // vector step) and one at the bottom of the loop
+    let is i32 as top = ex.new_label(func);
+    let is i32 as skip = ex.new_label(func);
+    ip = _room(func, ip, lt, nn, d.IR_JZ, skip);
+    ip = _link(ip, sh, stl);
+    ip = _link(ip, vh, vt);
+    ip = _lbl(ip, top);
+    ip.is_extern_call = cast(i8, 1);       // not a loop to vectorize again
+    ip = _link(ip, W_h1, W_t1);
+    let is *d.IRInst as ia = d.new_inst(d.IR_ADD);
+    ia.dest.op_type = cast(i8, d.OP_VREG); ia.dest.vreg = W_iv;
+    ia.src1.op_type = cast(i8, d.OP_VREG); ia.src1.vreg = W_iv;
+    ia.src2.op_type = cast(i8, d.OP_IMM); ia.src2.imm = cast(i64, W_vf); ia.line = W_ln;
+    ip = ex.emit(ip, ia);
+    ip = _room(func, ip, lt, nn, d.IR_JNZ, top);
+    ip = _link(ip, W_h2, W_t2);
+    ip = _lbl(ip, skip);
+    *out_ip = cast(i64, ip);
+    return 1;
+}
+
+// Float scalars the vector loop keeps in xmm registers besides its vectors:
+// the float reductions and the float values from outside the loop it reads.
+fn _float_ext(hb as *cfg.BasicBlock, lb as *cfg.BasicBlock) as i32 {
+    let is i32 as n with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < W_nacc) { if (W_acc_k[k] == AK_FADD || W_acc_k[k] == AK_FMUL) { n = n + 1; } k = k + 1; }
+    let is i32 as i with mut = 0;
+    while (i < W_vc) {
+        let is i32 as p = W_inv_p[i];
+        if (p >= 0) {
+            // read as a float splat source or by a scalar float op in the loop
+            let is i32 as fl with mut = 0;
+            let is *d.IRInst as q with mut = hb.first;
+            let is i32 as stop with mut = 0;
+            while (stop == 0 && cast(i64, q) != 0) {
+                if (q.is_dead == 0 && _tflt(q.cast_to) == 1 && (_reads(&q.src1, i) == 1 || _reads(&q.src2, i) == 1)) { fl = 1; }
+                if (cast(i64, q) == cast(i64, lb.last)) { stop = 1; } else { q = q.next; }
+            }
+            n = n + fl;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
+                   iv as i32, iv_step as i64, maxvf as i64,
+                   def_inst as *i64, def_count as *i32, vc as i32) as i32 {
+    if (iv_step != 1 || L.header_label < 0) { return 0; }
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is i64 as jzp with mut = 0;
+    let is *d.IRInst as lt = ex._exit_test(blocks, L, iv, def_inst, def_count, vc, &jzp);
+    if (cast(i64, lt) == 0) { return 0; }
+    let is *d.IRInst as jz = cast(*d.IRInst, jzp);
+    let is *d.IRInst as prev = ex._inst_before(func, hb.first);
+    if (cast(i64, prev) == 0) { return 0; }
+
+    W_func = func; W_iv = iv; W_vc = vc; W_ln = hb.first.line;
+    W_def_inst = def_inst; W_def_count = def_count;
+    W_fail = 0; W_why = cast(*u8, 0); W_sse_bad = 0; W_maxls = 0; W_fake = 0; W_nm = 0;
+    W_nlab = func.label_count + 1;
+    _alloc_state(vc, W_nlab);
+
+    let is i32 as ok with mut = 0;
+    if (_prescan(func, hb, lb, jz) == 1) {
+        // dry run: legality, widest lane, SSE2 coverage, the arrays
+        W_dry = 1; W_vex = 0; W_vf = 0;
+        if (_walk(hb, lb, jz) == 1 && W_nstore + W_nacc > 0 && W_maxls > 0) { ok = 1; }
+    }
+    let is i32 as do_avx with mut = 0;
+    let is i32 as do_sse with mut = 0;
+    if (ok == 1) {
+        let is i64 as vfa = cast(i64, 32 / W_maxls);
+        let is i64 as vfs = cast(i64, 16 / W_maxls);
+        if (vfa <= maxvf) { do_avx = 1; }
+        if (vfs <= maxvf && W_sse_bad == 0 && vfs >= 2) { do_sse = 1; }
+        if (do_avx == 0 && do_sse == 0) { _fail("dependence distance"); ok = 0; }
+    }
+    // the arrays written against every other array: base + off + [i0, n) * elem
+    let is i32 as npair with mut = 0;
+    if (ok == 1) {
+        let is i32 as a with mut = 0;
+        while (a < W_nm) {
+            let is i32 as b with mut = 0;
+            while (b < W_nm) {
+                if (a != b && W_m_w[a] == 1 && W_m_base[a] != W_m_base[b] && (W_m_w[b] == 0 || a < b)) { npair = npair + 1; }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        if (npair > 8) { _fail("too many overlap tests"); ok = 0; }
+    }
+    let is i32 as ext with mut = 0;
+    if (ok == 1) { ext = _float_ext(hb, lb); }
+
+    if (ok == 1) {
+        let is i32 as exit_label = jz.dest.label;
+        let is i32 as hlabel = L.header_label;
+        // (2) the vector code, built detached and put after the scalar loop
+        //     only once every part of it went through
+        let is *d.IRInst as head = d.new_inst(d.IR_LABEL);
+        let is *d.IRInst as ip with mut = head;
+        ip = _jmp(ip, d.IR_JMP, cast(i32, 0 - 1), exit_label);
+        let is i32 as Lvec = ex.new_label(func);
+        ip = _lbl(ip, Lvec);
+        let is i32 as nn with mut = 0;
+        ip = ex._ax_operand(func, ip, &lt.src2, def_inst, def_count, vc, W_ln, &nn);
+        let is i32 as Lsse = ex.new_label(func);
+        if (do_avx == 1) {
+            let is i32 as flag = ex.new_vreg(func);
+            let is *d.IRInst as hav = d.new_inst(d.IR_HASAVX2);
+            hav.dest.op_type = cast(i8, d.OP_VREG); hav.dest.vreg = flag; hav.line = W_ln;
+            ip = ex.emit(ip, hav);
+            if (do_sse == 1) { ip = _jmp(ip, d.IR_JZ, flag, Lsse); } else { ip = _jmp(ip, d.IR_JZ, flag, hlabel); }
+            W_vex = 1; W_vf = 32 / W_maxls;
+            let is i64 as nip with mut = 0;
+            if (_one_loop(func, ip, hb, lb, jz, lt, nn, ext, &nip) == 1) {
+                ip = cast(*d.IRInst, nip);
+                let is *d.IRInst as vz = d.new_inst(d.IR_VOP);
+                vz.dest.label = vo.vo_pack(vo.VO_VZU, 8, 1, W_vf, 0); vz.line = W_ln;
+                ip = ex.emit(ip, vz);
+            }
+        }
+        if (do_sse == 1 && W_fail == 0) {
+            if (do_avx == 1) { ip = _lbl(ip, Lsse); }
+            W_vex = 0; W_vf = 16 / W_maxls;
+            let is i64 as nip with mut = 0;
+            if (_one_loop(func, ip, hb, lb, jz, lt, nn, ext, &nip) == 1) { ip = cast(*d.IRInst, nip); }
+        }
+        if (W_fail == 0) {
+            ip = _jmp(ip, d.IR_JMP, cast(i32, 0 - 1), hlabel);
+            ip.next = lb.last.next;
+            lb.last.next = head.next;
+            // (1) before the scalar loop: overlap test of each array written
+            //     against each other array, else straight to the vector code
+            let is *d.IRInst as h2 = d.new_inst(d.IR_LABEL);
+            let is *d.IRInst as jp with mut = h2;
+            if (npair == 0) {
+                jp = _jmp(jp, d.IR_JMP, cast(i32, 0 - 1), Lvec);
+            } else {
+                let is i32 as n2 with mut = 0;
+                jp = ex._ax_operand(func, jp, &lt.src2, def_inst, def_count, vc, W_ln, &n2);
+                let is i32 as i0 with mut = 0;
+                jp = ex._ax_operand(func, jp, &lt.src1, def_inst, def_count, vc, W_ln, &i0);
+                let is i32 as cnt with mut = 0;
+                jp = ex.emit_vv(func, jp, d.IR_SUB, n2, i0, W_ln, &cnt);
+                let is *i32 as st = cast(*i32, d.opt_alloc(cast(i64, W_nm + 1) * 4));
+                let is *i32 as en = cast(*i32, d.opt_alloc(cast(i64, W_nm + 1) * 4));
+                let is i32 as m with mut = 0;
+                while (m < W_nm) {
+                    let is i32 as lop with mut = d.IR_LEA8;
+                    if (W_m_ls[m] == 2) { lop = d.IR_LEA2; } else if (W_m_ls[m] == 4) { lop = d.IR_LEA4; }
+                    let is i32 as s0 with mut = 0;
+                    if (W_m_ls[m] == 1) { jp = ex.emit_vv(func, jp, d.IR_ADD, W_m_base[m], i0, W_ln, &s0); }
+                    else { jp = ex.emit_lea(func, jp, lop, W_m_base[m], i0, W_ln, &s0); }
+                    let is i32 as s1 with mut = 0;
+                    jp = ex.emit_adj_base(func, jp, s0, W_m_off[m], W_ln, &s1);
+                    let is i32 as e1 with mut = 0;
+                    if (W_m_ls[m] == 1) { jp = ex.emit_vv(func, jp, d.IR_ADD, s1, cnt, W_ln, &e1); }
+                    else { jp = ex.emit_lea(func, jp, lop, s1, cnt, W_ln, &e1); }
+                    st[m] = s1; en[m] = e1;
+                    m = m + 1;
+                }
+                let is i32 as any with mut = cast(i32, 0 - 1);
+                let is i32 as a with mut = 0;
+                while (a < W_nm) {
+                    let is i32 as b with mut = 0;
+                    while (b < W_nm) {
+                        if (a != b && W_m_w[a] == 1 && W_m_base[a] != W_m_base[b] && (W_m_w[b] == 0 || a < b)) {
+                            let is i32 as t1 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_LT, st[a], en[b], W_ln, &t1);
+                            let is i32 as t2 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_LT, st[b], en[a], W_ln, &t2);
+                            let is i32 as ov with mut = 0; jp = ex.emit_vv(func, jp, d.IR_AND, t1, t2, W_ln, &ov);
+                            if (any < 0) { any = ov; }
+                            else { let is i32 as o2 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_OR, any, ov, W_ln, &o2); any = o2; }
+                        }
+                        b = b + 1;
+                    }
+                    a = a + 1;
+                }
+                d.opt_free(cast(*u8, st)); d.opt_free(cast(*u8, en));
+                jp = _jmp(jp, d.IR_JZ, any, Lvec);
+            }
+            jp.next = prev.next;
+            prev.next = h2.next;
+        } else { ok = 0; }
+    }
+    if (d.vec_debug == 1) {
+        if (ok == 1) { dbg.pr_str("    -> VECTORIZED (widen) maxls="); dbg.pr_int(cast(i64, W_maxls)); dbg.pr_str("\n"); }
+        else if (cast(i64, W_why) != 0) { dbg.pr_str("    widen: "); dbg.pr_str(W_why); dbg.pr_str("\n"); }
+    }
+    _free_state();
+    if (ok == 1) { hb.first.is_extern_call = cast(i8, 1); }
+    return ok;
+}
