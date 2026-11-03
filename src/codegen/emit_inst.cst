@@ -100,6 +100,14 @@ fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is *d.IRFunction as func = cast(*d.IRFunction, ctx.func);
     let is i32 as dest_cls = d.vreg_class_get(func, inst.dest.vreg);
     let is i32 as src_cls = d.vreg_class_get(func, inst.src1.vreg);
+    if (e.f32s_is(inst.dest.vreg) == 1 && e.f32s_is(inst.src1.vreg) == 0) {
+        // An exact binary32 constant into a single-precision vreg (e.f32s).
+        let is *u8 as nacc = _xmm_acc_for(inst.dest.vreg, ctx);
+        e.load_op_xmm(inst.src1.vreg, ctx, nacc);
+        eo.out_str("  cvtsd2ss ", 11); eo.out_cstr(nacc); eo.out_str(", ", 2); eo.out_cstr(nacc); eo.out_char(10);
+        e.store_op_xmm(inst.dest.vreg, ctx, nacc);
+        return;
+    }
     if (dest_cls == d.VR_XMM || src_cls == d.VR_XMM) {
         let is i32 as mdl = al.get_loc(inst.dest.vreg, ctx);
         let is i32 as msl = al.get_loc(inst.src1.vreg, ctx);
@@ -1041,6 +1049,19 @@ fn _xmm_break_dep(x as *u8) as void {
 // XMM register or spill; a GPR bitpattern needs the existing movq bridge.
 fn _load_f32_xmm(vreg as i32, ctx as *al.AllocCtx, dst as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
+    // Already binary32 (e.f32s): a copy, or a 4-byte reload from its slot.
+    if (e.f32s_is(vreg) == 1 && loc < 0) {
+        let is i64 as soff = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+        eo.out_str("  movss ", 8); eo.out_cstr(dst);
+        eo.out_str(", DWORD PTR [", 13); eo.out_fp(soff); eo.out_str("]\n", 2);
+        return;
+    }
+    if (e.f32s_is(vreg) == 1 && loc >= 16 && loc <= 31) {
+        if (_same_name(eo.reg_xmm(loc), dst) == 0) {
+            eo.out_str("  movaps ", 9); eo.out_cstr(dst); eo.out_str(", ", 2); eo.out_cstr(eo.reg_xmm(loc)); eo.out_char(10);
+        }
+        return;
+    }
     if (loc < 0) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         _xmm_break_dep(dst);
@@ -1057,33 +1078,56 @@ fn _load_f32_xmm(vreg as i32, ctx as *al.AllocCtx, dst as *u8) as void {
     }
 }
 
+// f32 arithmetic: operands as binary32 in xmm (copied when they are already
+// single precision, narrowed otherwise), one scalar single op, and the result
+// widened only when the destination keeps f64 values (e.f32s).
+fn _gen_f32_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
+    let is i32 as op = inst.op;
+    let is *u8 as acc = _xmm_acc_for(inst.dest.vreg, ctx);
+    let is *u8 as single_op with mut = "sqrtss";
+    if (op == d.IR_FADD) { single_op = "addss"; }
+    else if (op == d.IR_FSUB) { single_op = "subss"; }
+    else if (op == d.IR_FMUL) { single_op = "mulss"; }
+    else if (op == d.IR_FDIV) { single_op = "divss"; }
+    let is *u8 as s2 with mut = "xmm1";
+    if (op != d.IR_FSQRT && op != d.IR_FNEG) {
+        let is i32 as l2 = al.get_loc(inst.src2.vreg, ctx);
+        if (e.f32s_is(inst.src2.vreg) == 1 && l2 >= 16 && l2 <= 31 && _same_name(eo.reg_xmm(l2), acc) == 0) {
+            s2 = eo.reg_xmm(l2);
+        } else {
+            _load_f32_xmm(inst.src2.vreg, ctx, "xmm1");
+        }
+    }
+    _load_f32_xmm(inst.src1.vreg, ctx, acc);
+    if (op == d.IR_FNEG) {
+        // Flip bit 31, the binary32 sign.
+        eo.out_line("mov rcx, 2147483648");
+        eo.out_line("movq xmm1, rcx");
+        eo.out_str("  pxor ", 7); eo.out_cstr(acc); eo.out_str(", xmm1\n", 7);
+        if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+    } else {
+        eo.out_str("  ", 2); eo.out_cstr(single_op); eo.out_char(32); eo.out_cstr(acc);
+        eo.out_str(", ", 2);
+        if (op == d.IR_FSQRT) { eo.out_cstr(acc); } else { eo.out_cstr(s2); }
+        eo.out_char(10);
+    }
+    if (e.f32s_is(inst.dest.vreg) == 0) {
+        eo.out_str("  cvtss2sd ", 11); eo.out_cstr(acc);
+        eo.out_str(", ", 2); eo.out_cstr(acc); eo.out_char(10);
+    }
+    e.store_op_xmm(inst.dest.vreg, ctx, acc);
+}
+
 fn gen_inst_float(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
 
+    if (e.get_type_size(inst.cast_to) == 4) { _gen_f32_arith(inst, ctx); return; }
     if (op == d.IR_FNEG) {
         let is *u8 as acc = _xmm_acc_for(inst.dest.vreg, ctx);
         e.load_op_xmm(inst.src1.vreg, ctx, acc);
         eo.out_line("mov rcx, 0x8000000000000000");
         eo.out_line("movq xmm1, rcx");
         eo.out_str("  xorpd ", 8); eo.out_cstr(acc); eo.out_str(", xmm1\n", 7);
-        e.store_op_xmm(inst.dest.vreg, ctx, acc);
-        return;
-    }
-    if (e.get_type_size(inst.cast_to) == 4) {
-        let is *u8 as acc = _xmm_acc_for(inst.dest.vreg, ctx);
-        let is *u8 as single_op with mut = "sqrtss";
-        if (op == d.IR_FADD) { single_op = "addss"; }
-        else if (op == d.IR_FSUB) { single_op = "subss"; }
-        else if (op == d.IR_FMUL) { single_op = "mulss"; }
-        else if (op == d.IR_FDIV) { single_op = "divss"; }
-        if (op != d.IR_FSQRT) { _load_f32_xmm(inst.src2.vreg, ctx, "xmm1"); }
-        _load_f32_xmm(inst.src1.vreg, ctx, acc);
-        eo.out_str("  ", 2); eo.out_cstr(single_op); eo.out_char(32); eo.out_cstr(acc);
-        eo.out_str(", ", 2);
-        if (op == d.IR_FSQRT) { eo.out_cstr(acc); } else { eo.out_cstr("xmm1"); }
-        eo.out_char(10);
-        eo.out_str("  cvtss2sd ", 11); eo.out_cstr(acc);
-        eo.out_str(", ", 2); eo.out_cstr(acc); eo.out_char(10);
         e.store_op_xmm(inst.dest.vreg, ctx, acc);
         return;
     }
@@ -1173,7 +1217,15 @@ fn _xmm_of(vreg as i32, ctx as *al.AllocCtx, scratch as *u8) as *u8 {
 // (tests/float_cmp_imm_test.cst). `zero_eax` emits `xor eax, eax` before the
 // compare, for the setcc form (xor would clobber the flags after it).
 fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as void {
-    let is *u8 as a = _xmm_of(inst.src1.vreg, ctx, "xmm0");
+    let is i32 as sg1 = e.f32s_is(inst.src1.vreg);
+    let is i32 as sg2 with mut = 0;
+    if (inst.src2.op_type == d.OP_VREG) { sg2 = e.f32s_is(inst.src2.vreg); }
+    // Both binary32 (e.f32s): ucomiss on them as they are. Otherwise a
+    // single-precision operand is widened (exactly) and the compare is ucomisd.
+    let is i32 as both = sg1 == 1 && sg2 == 1;
+    let is *u8 as a with mut = "xmm0";
+    if (sg1 == 1 && both == 0) { _widen_single(inst.src1.vreg, ctx, "xmm0"); }
+    else { a = _xmm_of(inst.src1.vreg, ctx, "xmm0"); }
     let is *u8 as b with mut = "xmm1";
     let is i32 as spilled2 with mut = 0;
     let is i64 as off2 with mut = 0;
@@ -1181,6 +1233,8 @@ fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as 
         eo.out_str("  mov rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
         eo.out_line("movq xmm1, rcx");
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
+    } else if (sg2 == 1 && both == 0) {
+        _widen_single(inst.src2.vreg, ctx, "xmm1");
     } else {
         let is i32 as l2 = al.get_loc(inst.src2.vreg, ctx);
         if (l2 >= 16 && l2 <= 31) { b = eo.reg_xmm(l2); }
@@ -1191,10 +1245,27 @@ fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as 
         eo.out_line("xor eax, eax");
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
     }
-    eo.out_str("  ucomisd ", 10); eo.out_cstr(a); eo.out_str(", ", 2);
-    if (spilled2 == 1) { eo.out_str("QWORD PTR [", 11); eo.out_fp(off2); eo.out_str("]", 1); }
+    if (both == 1) { eo.out_str("  ucomiss ", 10); } else { eo.out_str("  ucomisd ", 10); }
+    eo.out_cstr(a); eo.out_str(", ", 2);
+    if (spilled2 == 1) {
+        if (both == 1) { eo.out_str("DWORD PTR [", 11); } else { eo.out_str("QWORD PTR [", 11); }
+        eo.out_fp(off2); eo.out_str("]", 1);
+    }
     else { eo.out_cstr(b); }
     eo.out_char(10);
+}
+
+// A single-precision vreg (e.f32s) widened to an f64 value in xmm `dst`.
+fn _widen_single(vreg as i32, ctx as *al.AllocCtx, dst as *u8) as void {
+    let is i32 as loc = al.get_loc(vreg, ctx);
+    if (loc >= 16 && loc <= 31) {
+        if (_same_name(eo.reg_xmm(loc), dst) == 0) { _xmm_break_dep(dst); }
+        eo.out_str("  cvtss2sd ", 11); eo.out_cstr(dst); eo.out_str(", ", 2); eo.out_cstr(eo.reg_xmm(loc)); eo.out_char(10);
+        return;
+    }
+    let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
+    _xmm_break_dep(dst);
+    eo.out_str("  cvtss2sd ", 11); eo.out_cstr(dst); eo.out_str(", DWORD PTR [", 13); eo.out_fp(off); eo.out_str("]\n", 2);
 }
 
 // Function-local, deterministic labels for float parity/conversion branches.
@@ -1666,7 +1737,9 @@ fn _gen_float_cast(inst as *d.IRInst, ctx as *al.AllocCtx, from_flt as i32, to_f
         let is i32 as si = e.get_scratch_idx(inst.dest.vreg, ctx);
         let is *u8 as scr = eo.reg64(si);
         let is *u8 as sx = _xmm_of(inst.src1.vreg, ctx, "xmm0");
-        eo.out_str("  cvttsd2si ", 12); eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_cstr(sx); eo.out_char(10);
+        if (e.f32s_is(inst.src1.vreg) == 1) { eo.out_str("  cvttss2si ", 12); }
+        else { eo.out_str("  cvttsd2si ", 12); }
+        eo.out_cstr(scr); eo.out_str(", ", 2); eo.out_cstr(sx); eo.out_char(10);
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(si); }
         e.store_op(inst.dest.vreg, ctx, scr);
         return;
@@ -1702,16 +1775,23 @@ fn _gen_float_cast(inst as *d.IRInst, ctx as *al.AllocCtx, from_flt as i32, to_f
         _xmm_break_dep(acc);
         eo.out_str("  ", 2); eo.out_cstr(convert); eo.out_char(32); eo.out_cstr(acc); eo.out_str(", ", 2); eo.out_cstr(gs); eo.out_char(10);
         if (wide_unsigned == 1) { _float_label(inst.dest.vreg, "_converted"); eo.out_str(":\n", 2); }
-        if (single == 1) { eo.out_str("  cvtss2sd ", 11); eo.out_cstr(acc); eo.out_str(", ", 2); eo.out_cstr(acc); eo.out_char(10); }
+        if (single == 1 && e.f32s_is(inst.dest.vreg) == 0) { eo.out_str("  cvtss2sd ", 11); eo.out_cstr(acc); eo.out_str(", ", 2); eo.out_cstr(acc); eo.out_char(10); }
         e.store_op_xmm(inst.dest.vreg, ctx, acc);
         return;
     }
-    // Float to float. f64 -> f32 rounds to binary32 and keeps the result as
-    // an f64 value (cvtsd2ss + cvtss2sd); the store to an f32 slot narrows it
-    // exactly. f32 -> f64 and same-width casts are copies.
+    // Float to float. The value is in binary32 form when the source is a
+    // single-precision vreg (e.f32s), else an f64 value; the destination wants
+    // binary32 form when it is single precision, else an f64 value — and a
+    // cast to f32 rounds to binary32 in both cases.
+    let is i32 as s_single with mut = e.f32s_is(inst.src1.vreg);
+    let is i32 as d_single = e.f32s_is(inst.dest.vreg);
+    let is i32 as to_f32 = e.get_type_size(inst.cast_to) == 4;
     e.load_op_xmm(inst.src1.vreg, ctx, acc);
-    if (e.get_type_size(inst.cast_from) == 8 && e.get_type_size(inst.cast_to) == 4) {
+    if (s_single == 0 && (d_single == 1 || to_f32 == 1)) {
         eo.out_str("  cvtsd2ss ", 11); eo.out_cstr(acc); eo.out_str(", ", 2); eo.out_cstr(acc); eo.out_char(10);
+        s_single = 1;
+    }
+    if (s_single == 1 && d_single == 0) {
         eo.out_str("  cvtss2sd ", 11); eo.out_cstr(acc); eo.out_str(", ", 2); eo.out_cstr(acc); eo.out_char(10);
     }
     e.store_op_xmm(inst.dest.vreg, ctx, acc);
@@ -1809,7 +1889,13 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 if (dloc >= 16 && dloc <= 31) { dst_xmm = eo.reg_xmm(dloc); }
                 let is *u8 as fld with mut = "  movsd ";
                 let is *u8 as fptr with mut = ", QWORD PTR [";
-                if (sz == 4) { _xmm_break_dep(dst_xmm); fld = "  cvtss2sd "; fptr = ", DWORD PTR ["; }
+                if (sz == 4) {
+                    fptr = ", DWORD PTR [";
+                    // A single-precision dest takes the bits as they are; movss
+                    // from memory clears the rest of the register.
+                    if (e.f32s_is(inst.dest.vreg) == 1) { fld = "  movss "; }
+                    else { _xmm_break_dep(dst_xmm); fld = "  cvtss2sd "; }
+                }
                 if (inst.src1.op_type == d.OP_VREG) {
                     let is e.AddrMode as am with mut;
                     am.matched = 0;
@@ -1927,13 +2013,16 @@ fn gen_inst_memory(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 if (d.vreg_class_get(ffn, inst.src1.vreg) == d.VR_XMM) { f_xmm = 1; }
             }
             if (f_xmm == 1) {
-                _load_f32_xmm(inst.src1.vreg, ctx, "xmm0");
+                let is *u8 as fsv with mut = "xmm0";
+                if (e.f32s_is(inst.src1.vreg) == 1 && fsl >= 16 && fsl <= 31) { fsv = eo.reg_xmm(fsl); }
+                else { _load_f32_xmm(inst.src1.vreg, ctx, "xmm0"); }
                 if (inst.dest.op_type == d.OP_VREG) {
                     let is *u8 as far = e.addr_reg(inst.dest.vreg, ctx, 1);
-                    eo.out_str("  movss DWORD PTR [", 19); eo.out_cstr(far); eo.out_str("], xmm0\n", 8);
+                    eo.out_str("  movss DWORD PTR [", 19); eo.out_cstr(far); eo.out_str("], ", 3);
                 } else {
-                    eo.out_str("  movss DWORD PTR [", 19); eo.out_fp(inst.dest.imm); eo.out_str("], xmm0\n", 8);
+                    eo.out_str("  movss DWORD PTR [", 19); eo.out_fp(inst.dest.imm); eo.out_str("], ", 3);
                 }
+                eo.out_cstr(fsv); eo.out_char(10);
                 return;
             }
         }

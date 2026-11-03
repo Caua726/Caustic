@@ -934,6 +934,133 @@ fn sx32_is(v as i32) as i32 { return _sx32_get(v); }
 // gen_inst emits no conversion (to 8 bytes, or to i32 from a value already
 // sign-extended) is a plain copy; written as IR_MOV the allocator sees it as
 // one and can give both sides the same register.
+// === Single-precision vregs (-O1 and up) ===
+//
+// Float vregs hold f64 values: an f32 operation narrows its operands, works in
+// single precision and widens the result back. A vreg that only carries f32
+// values from one f32 operation to the next needs none of that. f32s[v] = 1
+// keeps v as a binary32 value in the low lane of its xmm (or spill slot).
+//
+// Every definition of v must make an f32 value: an f32 load, f32 arithmetic,
+// a cast to f32, or a copy of a vreg that is itself single precision or a
+// constant exactly representable in binary32 (the copy narrows it). Every
+// reader must know the representation: f32 arithmetic, an f32 store (as the
+// value), a cast from f32, a float compare, or a copy into a single-precision
+// vreg. Greatest fixpoint from the xmm-class vregs, so both ends of a copy
+// agree.
+let is *u8 as f32s with mut = cast(*u8, 0);
+let is i32 as f32s_vc with mut = 0;
+
+fn is_f32_type(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    if (is_float_type(t) == 0) { return 0; }
+    if (get_type_size(t) != 4) { return 0; }
+    return 1;
+}
+
+fn f32_arith(inst as *d.IRInst) as i32 {
+    let is i32 as op = inst.op;
+    if (op != d.IR_FADD && op != d.IR_FSUB && op != d.IR_FMUL && op != d.IR_FDIV
+        && op != d.IR_FSQRT && op != d.IR_FNEG) { return 0; }
+    return is_f32_type(inst.cast_to);
+}
+
+fn f32s_is(v as i32) as i32 {
+    if (cast(i64, f32s) == 0 || v < 0 || v >= f32s_vc) { return 0; }
+    return cast(i32, f32s[v]);
+}
+
+// f64 bits that go to binary32 and back unchanged: a zero, an infinity, or a
+// normal binary32 value (binary32 subnormals are left out).
+fn _f64_bits_exact_f32(b as i64) as i32 {
+    let is i64 as mag = b & 9223372036854775807;
+    if (mag == 0) { return 1; }
+    let is i64 as ex = mag >> 52;
+    let is i64 as mant = mag & 4503599627370495;
+    if (ex == 2047) { if (mant == 0) { return 1; } return 0; }
+    if (ex < 1023 - 126 || ex > 1023 + 127) { return 0; }
+    if ((mant & 536870911) != 0) { return 0; }
+    return 1;
+}
+
+fn _f32s_reader(inst as *d.IRInst, which as i32) as i32 {
+    let is i32 as op = inst.op;
+    if (f32_arith(inst) == 1) { return 1; }
+    if (op == d.IR_STORE && which == 1 && is_f32_type(inst.cast_to) == 1) { return 1; }
+    if (op == d.IR_CAST && which == 1 && is_f32_type(inst.cast_from) == 1) { return 1; }
+    if ((op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE)
+        && is_float_type(inst.cast_to) == 1) { return 1; }
+    if (op == d.IR_MOV && which == 1 && inst.dest.op_type == d.OP_VREG) { return f32s_is(inst.dest.vreg); }
+    return 0;
+}
+
+fn _f32s_clear_use(o as *d.Operand, inst as *d.IRInst, which as i32) as i32 {
+    if (o.op_type != d.OP_VREG || f32s_is(o.vreg) == 0) { return 0; }
+    if (which > 0 && _f32s_reader(inst, which) == 1) { return 0; }
+    f32s[o.vreg] = cast(u8, 0);
+    return 1;
+}
+
+fn f32s_init(func as *d.IRFunction) as void {
+    if (cast(i64, f32s) != 0) { d.opt_free(f32s); }
+    f32s = cast(*u8, 0);
+    f32s_vc = 0;
+    if (al.al_opt_level < 1 || cast(i64, func.vreg_class) == 0) { return; }
+    let is i32 as vc = func.vreg_count;
+    f32s_vc = vc;
+    f32s = d.opt_alloc(cast(i64, vc) + 1);
+    // kimm[v]: 0 no definition seen, 1 every definition is an IR_IMM exact in
+    // binary32, 2 anything else.
+    let is *u8 as kimm = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        f32s[i] = cast(u8, 0);
+        if (d.vreg_class_get(func, i) == d.VR_XMM) { f32s[i] = cast(u8, 1); }
+        kimm[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && _dest_is_read(inst.op) == 0
+            && inst.dest.vreg >= 0 && inst.dest.vreg < vc) {
+            let is i32 as dv = inst.dest.vreg;
+            if (inst.op == d.IR_IMM && _f64_bits_exact_f32(inst.src1.imm) == 1) {
+                if (kimm[dv] == cast(u8, 0)) { kimm[dv] = cast(u8, 1); }
+            } else {
+                kimm[dv] = cast(u8, 2);
+            }
+        }
+        inst = inst.next;
+    }
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == 0) {
+                let is i32 as op = inst.op;
+                if (inst.dest.op_type == d.OP_VREG && _dest_is_read(op) == 0 && f32s_is(inst.dest.vreg) == 1) {
+                    let is i32 as ok with mut = 0;
+                    if (op == d.IR_LOAD && is_f32_type(inst.cast_to) == 1) { ok = 1; }
+                    if (f32_arith(inst) == 1) { ok = 1; }
+                    if (op == d.IR_CAST && is_f32_type(inst.cast_to) == 1) { ok = 1; }
+                    if (op == d.IR_MOV && inst.src1.op_type == d.OP_VREG) {
+                        let is i32 as sv = inst.src1.vreg;
+                        if (f32s_is(sv) == 1) { ok = 1; }
+                        if (sv >= 0 && sv < vc && kimm[sv] == cast(u8, 1)) { ok = 1; }
+                    }
+                    if (ok == 0) { f32s[inst.dest.vreg] = cast(u8, 0); changed = 1; }
+                }
+                if (_f32s_clear_use(&inst.src1, inst, 1) == 1) { changed = 1; }
+                if (_f32s_clear_use(&inst.src2, inst, 2) == 1) { changed = 1; }
+                if (_dest_is_read(op) == 1 && _f32s_clear_use(&inst.dest, inst, 0) == 1) { changed = 1; }
+            }
+            inst = inst.next;
+        }
+    }
+    d.opt_free(kimm);
+}
+
 fn casts_to_moves(func as *d.IRFunction) as void {
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
