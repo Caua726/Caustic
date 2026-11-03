@@ -1,0 +1,1010 @@
+use "../../std/io.cst" as io;
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+
+// === Phi instructions and SSA destruction ===
+//
+// While the mid-end holds the IR in SSA form, a join is an IR_PHI instruction:
+// dest = the phi vreg, and one (predecessor label, incoming vreg) pair per
+// predecessor in a side array. The array lives behind asm_str_ptr:
+//   a[0]            capacity, in pairs
+//   a[1 + 2i]       label of the i-th predecessor block
+//   a[2 + 2i]       vreg flowing in from it (-1: undefined on that path)
+// and asm_str_len is the number of pairs. src1/src2 stay OP_NONE, so a pass
+// that does not know about phis sees a definition with no operands.
+// cast_to/cast_from carry the width annotation the copies made at
+// destruction keep (a narrow local's copies always carried its type).
+//
+// A predecessor is named by its label, so every block starts with one while
+// SSA is live: ssa_label_blocks gives a label to the blocks that have none
+// (the entry, a fall-through after a conditional branch). Those labels are
+// numbered from ssa_label_base up; ssa_destroy drops the ones no jump names.
+//
+// Phis sit right after their block's label, before any other instruction.
+
+fn phi_args(p as *d.IRInst) as *i32 { return cast(*i32, p.asm_str_ptr); }
+fn phi_nargs(p as *d.IRInst) as i32 { return p.asm_str_len; }
+fn phi_label(p as *d.IRInst, i as i32) as i32 { let is *i32 as a = phi_args(p); return a[1 + 2 * i]; }
+fn phi_val(p as *d.IRInst, i as i32) as i32 { let is *i32 as a = phi_args(p); return a[2 + 2 * i]; }
+fn phi_set_val(p as *d.IRInst, i as i32, v as i32) as void { let is *i32 as a = phi_args(p); a[2 + 2 * i] = v; }
+fn phi_set_label(p as *d.IRInst, i as i32, l as i32) as void { let is *i32 as a = phi_args(p); a[1 + 2 * i] = l; }
+
+fn phi_new(dest as i32, cap as i32) as *d.IRInst {
+    let is *d.IRInst as p = d.new_inst(d.IR_PHI);
+    p.dest = d.op_vreg(dest);
+    let is i32 as c with mut = cap;
+    if (c < 2) { c = 2; }
+    let is *i32 as a = cast(*i32, d.opt_alloc(cast(i64, 1 + 2 * c) * 4));
+    a[0] = c;
+    p.asm_str_ptr = cast(*u8, a);
+    p.asm_str_len = 0;
+    return p;
+}
+
+fn phi_add(p as *d.IRInst, label as i32, v as i32) as void {
+    let is *i32 as a with mut = phi_args(p);
+    let is i32 as n = p.asm_str_len;
+    if (n >= a[0]) {
+        let is i32 as nc = a[0] * 2;
+        let is *i32 as b = cast(*i32, d.opt_alloc(cast(i64, 1 + 2 * nc) * 4));
+        b[0] = nc;
+        let is i32 as k with mut = 0;
+        while (k < 2 * n) { b[1 + k] = a[1 + k]; k = k + 1; }
+        d.opt_free(cast(*u8, a));
+        p.asm_str_ptr = cast(*u8, b);
+        a = b;
+    }
+    a[1 + 2 * n] = label;
+    a[2 + 2 * n] = v;
+    p.asm_str_len = n + 1;
+}
+
+// Remove argument i, keeping the order of the others.
+fn phi_del(p as *d.IRInst, i as i32) as void {
+    let is *i32 as a = phi_args(p);
+    let is i32 as n = p.asm_str_len;
+    let is i32 as k with mut = i;
+    while (k + 1 < n) {
+        a[1 + 2 * k] = a[1 + 2 * (k + 1)];
+        a[2 + 2 * k] = a[2 + 2 * (k + 1)];
+        k = k + 1;
+    }
+    p.asm_str_len = n - 1;
+}
+
+fn phi_find(p as *d.IRInst, label as i32) as i32 {
+    let is i32 as n = p.asm_str_len;
+    let is i32 as i with mut = 0;
+    while (i < n) { if (phi_label(p, i) == label) { return i; } i = i + 1; }
+    return 0 - 1;
+}
+
+fn phi_free(p as *d.IRInst) as void {
+    if (cast(i64, p.asm_str_ptr) != 0) { d.opt_free(p.asm_str_ptr); }
+    p.asm_str_ptr = cast(*u8, 0);
+    p.asm_str_len = 0;
+}
+
+// A phi of a promoted stack slot leaves copies at destruction (the shape the
+// passes after mem2reg have always seen); the phi of a vreg that had several
+// definitions is coalesced back into that vreg.
+fn phi_mark_slot(p as *d.IRInst) as void { p.is_extern_global = cast(i8, 1); }
+fn phi_is_slot(p as *d.IRInst) as i32 { return cast(i32, p.is_extern_global == cast(i8, 1)); }
+
+// --- for the passes that run while phis are live ---
+
+// Add each phi argument to the use counts uc[0..vc).
+fn add_phi_uses(func as *d.IRFunction, uc as *i32, vc as i32) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < vc) { uc[v] = uc[v] + 1; }
+                k = k + 1;
+            }
+        }
+        it = it.next;
+    }
+}
+
+// Replace each phi argument v by map[v] (map[v] < 0 or == v: unchanged).
+fn remap_phi_args(func as *d.IRFunction, map as *i32, vc as i32) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < vc && map[v] >= 0) { phi_set_val(it, k, map[v]); }
+                k = k + 1;
+            }
+        }
+        it = it.next;
+    }
+}
+
+// Follow copy_of chains (copy_of[v] = the vreg v is a copy of, or -1).
+fn resolve_copy(copy_of as *i32, v as i32) as i32 {
+    let is i32 as cur with mut = v;
+    let is i32 as hops with mut = 0;
+    while (hops < 16 && copy_of[cur] >= 0) { cur = copy_of[cur]; hops = hops + 1; }
+    return cur;
+}
+
+// Point each phi argument at the end of its copy_of chain.
+fn resolve_phi_args(func as *d.IRFunction, copy_of as *i32, vc as i32) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < vc) { phi_set_val(it, k, resolve_copy(copy_of, v)); }
+                k = k + 1;
+            }
+        }
+        it = it.next;
+    }
+}
+
+fn ssa_fail(msg as *u8, func as *d.IRFunction) as void {
+    io.write_str(io.STDERR, "error: internal: SSA: ");
+    io.write_str(io.STDERR, msg);
+    io.write_str(io.STDERR, " in ");
+    io._write_fd(io.STDERR, func.asm_name_ptr, cast(i64, func.asm_name_len));
+    io.write_str(io.STDERR, "\n");
+    io.exit(1);
+}
+
+// === Block labels ===
+
+let is i32 as ssa_label_base with mut = 0;
+let is i32 as ssa_active with mut = 0;
+
+// Start an SSA region in func: labels made from here on are synthetic.
+fn ssa_begin(func as *d.IRFunction) as void {
+    if (ssa_active == 1) { return; }
+    ssa_active = 1;
+    ssa_label_base = func.label_count;
+}
+
+fn new_label(func as *d.IRFunction) as i32 {
+    let is i32 as l = func.label_count;
+    func.label_count = func.label_count + 1;
+    return l;
+}
+
+fn make_label(l as i32) as *d.IRInst {
+    let is *d.IRInst as li = d.new_inst(d.IR_LABEL);
+    li.dest = d.op_label(l);
+    return li;
+}
+
+// Give every block of the CFG `blocks` that starts without a label one.
+// Blocks are contiguous in list order, so the instruction before block b's
+// first is block b-1's last.
+fn ssa_label_blocks(func as *d.IRFunction, blocks as *cfg.BasicBlock, nblocks as i32) as void {
+    let is i32 as b with mut = 0;
+    while (b < nblocks) {
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+        if (bb.first.op != d.IR_LABEL) {
+            let is *d.IRInst as li = make_label(new_label(func));
+            li.next = bb.first;
+            if (b == 0) { func.instructions = li; }
+            else {
+                let is *cfg.BasicBlock as pb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b - 1) * sizeof(cfg.BasicBlock));
+                pb.last.next = li;
+            }
+            bb.first = li;
+        }
+        b = b + 1;
+    }
+}
+
+// Unlink the synthetic labels nothing jumps to and give back their numbers.
+fn ssa_drop_labels(func as *d.IRFunction) as void {
+    let is i32 as base = ssa_label_base;
+    let is i32 as lc = func.label_count;
+    if (lc <= base) { return; }
+    let is i32 as n = lc - base;
+    let is *u8 as refd = d.opt_alloc(cast(i64, n));
+    let is i32 as k with mut = 0;
+    while (k < n) { refd[k] = cast(u8, 0); k = k + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_JMP || it.op == d.IR_JZ || it.op == d.IR_JNZ)
+            && it.dest.label >= base && it.dest.label < lc) {
+            refd[it.dest.label - base] = cast(u8, 1);
+        }
+        it = it.next;
+    }
+    let is i32 as top with mut = base;
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as drop with mut = 0;
+        if (it.op == d.IR_LABEL && it.dest.label >= base && it.dest.label < lc) {
+            if (refd[it.dest.label - base] == cast(u8, 0)) { drop = 1; }
+            else if (it.dest.label + 1 > top) { top = it.dest.label + 1; }
+        }
+        if (drop == 1) {
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+            d.free_inst(it);
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    func.label_count = top;
+    d.opt_free(refd);
+}
+
+fn ssa_end(func as *d.IRFunction) as void {
+    if (ssa_active == 0) { return; }
+    ssa_drop_labels(func);
+    ssa_active = 0;
+}
+
+// === CFG view used by destruction ===
+
+struct DCfg {
+    blocks as *cfg.BasicBlock;
+    nblocks as i32;
+    label_to_bb as *i32;
+    nlabels as i32;
+    preds as *i32;
+    pred_start as *i32;
+    pred_count as *i32;
+}
+
+fn bb_at(g as *DCfg, b as i32) as *cfg.BasicBlock {
+    return cast(*cfg.BasicBlock, cast(i64, g.blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+}
+
+fn dcfg_build(func as *d.IRFunction) as *DCfg {
+    let is *DCfg as g = cast(*DCfg, d.opt_alloc(sizeof(DCfg)));
+    let is i32 as cap = cfg.count_blocks(func) + 1;
+    g.blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, cap) * sizeof(cfg.BasicBlock)));
+    g.nlabels = func.label_count + 1;
+    g.label_to_bb = cast(*i32, d.opt_alloc(cast(i64, g.nlabels) * 4));
+    let is i32 as i with mut = 0;
+    while (i < g.nlabels) { g.label_to_bb[i] = 0 - 1; i = i + 1; }
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, g.blocks, cap, &nb, g.label_to_bb);
+    g.nblocks = nb;
+    g.preds = cast(*i32, d.opt_alloc(cast(i64, nb * 2 + 4) * 4));
+    g.pred_start = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    g.pred_count = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    cfg.build_preds(g.blocks, nb, g.preds, g.pred_start, g.pred_count);
+    return g;
+}
+
+fn dcfg_free(g as *DCfg) as void {
+    d.opt_free(cast(*u8, g.blocks));
+    d.opt_free(cast(*u8, g.label_to_bb));
+    d.opt_free(cast(*u8, g.preds));
+    d.opt_free(cast(*u8, g.pred_start));
+    d.opt_free(cast(*u8, g.pred_count));
+    d.opt_free(cast(*u8, g));
+}
+
+fn block_label(g as *DCfg, b as i32) as i32 {
+    let is *cfg.BasicBlock as bb = bb_at(g, b);
+    if (bb.first.op == d.IR_LABEL) { return bb.first.dest.label; }
+    return 0 - 1;
+}
+
+// The first phi of block b, or null.
+fn first_phi(g as *DCfg, b as i32) as *d.IRInst {
+    let is *cfg.BasicBlock as bb = bb_at(g, b);
+    let is *d.IRInst as it with mut = bb.first;
+    if (it.op == d.IR_LABEL) {
+        if (cast(i64, it) == cast(i64, bb.last)) { return cast(*d.IRInst, 0); }
+        it = it.next;
+    }
+    while (1 == 1) {
+        if (it.is_dead == 0) {
+            if (it.op == d.IR_PHI) { return it; }
+            return cast(*d.IRInst, 0);
+        }
+        if (cast(i64, it) == cast(i64, bb.last)) { return cast(*d.IRInst, 0); }
+        it = it.next;
+    }
+    return cast(*d.IRInst, 0);
+}
+
+// === Versions of multi-def vregs ===
+//
+// Construction gives each definition of a vreg defined more than once a fresh
+// vreg, and its phis fresh vregs too; ssa_orig[x] is the vreg version x came
+// from (-1 for anything else). Destruction renames every version back to its
+// vreg. That is sound while no pass has made two versions of one vreg live at
+// once — propagating constants and deleting code never do — and leaves the
+// IR as it came in when nothing changed. ssa_vc_built is the vreg count right
+// after construction and ssa_vc_restore the count before the first version:
+// when no vreg was made since, the versions' numbers are given back.
+let is *i32 as ssa_orig with mut = cast(*i32, 0);
+let is i32 as ssa_orig_n with mut = 0;
+let is i32 as ssa_vc_built with mut = 0;
+let is i32 as ssa_vc_restore with mut = 0;
+
+// Is v a version of a vreg defined more than once (renamed back to it at
+// destruction)?
+fn is_version(v as i32) as i32 {
+    if (v < 0 || v >= ssa_orig_n || cast(i64, ssa_orig) == 0) { return 0; }
+    return cast(i32, ssa_orig[v] >= 0);
+}
+
+fn ssa_set_versions(orig as *i32, n as i32, vc_built as i32, vc_restore as i32) as void {
+    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
+    ssa_orig = orig;
+    ssa_orig_n = n;
+    ssa_vc_built = vc_built;
+    ssa_vc_restore = vc_restore;
+}
+
+fn _uf_find(uf as *i32, x as i32) as i32 {
+    let is i32 as r with mut = x;
+    while (uf[r] != r) { r = uf[r]; }
+    let is i32 as c with mut = x;
+    while (uf[c] != r) { let is i32 as nx = uf[c]; uf[c] = r; c = nx; }
+    return r;
+}
+
+// The smaller number becomes the representative: a version's vreg is always
+// smaller than the version.
+fn _uf_union(uf as *i32, a as i32, b as i32) as void {
+    let is i32 as ra = _uf_find(uf, a);
+    let is i32 as rb = _uf_find(uf, b);
+    if (ra < rb) { uf[rb] = ra; } else if (rb < ra) { uf[ra] = rb; }
+}
+
+fn _ren(o as *d.Operand, uf as *i32, n as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { o.vreg = _uf_find(uf, o.vreg); }
+}
+
+// === Interference of webs ===
+//
+// Two members of a web may share a vreg only if neither is live where the
+// other is defined. Liveness of the members (vregs with a definition in a web
+// of two or more) by the usual backward dataflow over the blocks: a phi
+// defines its dest at the top of its block and reads each argument at the end
+// of that argument's predecessor. Then each block is walked backward from its
+// live-out set, counting the live members of every web: a definition with
+// another member of its web live is an overlap (a copy `m = n` between two
+// members is not: both hold the same value). An overlapping web is split back
+// into its members: uf[x] = x for each, and the count of such webs returned.
+
+fn _bit(set as *i64, m as i32) as i32 { return cast(i32, (set[m >> 6] >> cast(i64, m & 63)) & 1); }
+fn _bset(set as *i64, m as i32) as void { set[m >> 6] = set[m >> 6] | (cast(i64, 1) << cast(i64, m & 63)); }
+fn _bclr(set as *i64, m as i32) as void { set[m >> 6] = set[m >> 6] & ((cast(i64, 1) << cast(i64, m & 63)) ^ (0 - 1)); }
+
+fn _midx(o as *d.Operand, midx as *i32, n as i32) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= n) { return 0 - 1; }
+    return midx[o.vreg];
+}
+
+fn _web_interference(func as *d.IRFunction, uf as *i32, n as i32) as i32 {
+    // members: vregs with a live definition, in a web of two or more
+    let is *i32 as wsize = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *u8 as hasdef = d.opt_alloc(cast(i64, n + 1));
+    let is i32 as i with mut = 0;
+    while (i < n) { wsize[i] = 0; hasdef[i] = cast(u8, 0); i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < n
+            && it.op != d.IR_STORE && it.op != d.IR_COPY) { hasdef[it.dest.vreg] = cast(u8, 1); }
+        it = it.next;
+    }
+    i = 0;
+    while (i < n) { if (hasdef[i] == cast(u8, 1)) { let is i32 as r = _uf_find(uf, i); wsize[r] = wsize[r] + 1; } i = i + 1; }
+    let is *i32 as midx = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *i32 as mweb = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as nm with mut = 0;
+    i = 0;
+    while (i < n) {
+        midx[i] = 0 - 1;
+        if (hasdef[i] == cast(u8, 1) && wsize[_uf_find(uf, i)] >= 2) { midx[i] = nm; mweb[nm] = _uf_find(uf, i); nm = nm + 1; }
+        i = i + 1;
+    }
+    let is i32 as nbad with mut = 0;
+    if (nm > 0) {
+        let is *DCfg as g = dcfg_build(func);
+        let is i32 as nb = g.nblocks;
+        let is i32 as w = (nm + 63) / 64;
+        let is *i64 as lout = cast(*i64, d.opt_alloc(cast(i64, nb * w + 1) * 8));
+        let is *i64 as lin = cast(*i64, d.opt_alloc(cast(i64, nb * w + 1) * 8));
+        let is *i64 as cur = cast(*i64, d.opt_alloc(cast(i64, w + 1) * 8));
+        i = 0;
+        while (i < nb * w) { lout[i] = 0; lin[i] = 0; i = i + 1; }
+        // instructions of each block, for the backward walks
+        let is i32 as ninst with mut = 0;
+        it = func.instructions;
+        while (cast(i64, it) != 0) { ninst = ninst + 1; it = it.next; }
+        let is *i64 as arr = cast(*i64, d.opt_alloc(cast(i64, ninst + 1) * 8));
+        let is *i32 as bstart = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+        let is i32 as k with mut = 0;
+        let is i32 as b with mut = 0;
+        while (b < nb) {
+            let is *cfg.BasicBlock as bb = bb_at(g, b);
+            bstart[b] = k;
+            it = bb.first;
+            let is i32 as done with mut = 0;
+            while (done == 0) {
+                arr[k] = cast(i64, it); k = k + 1;
+                if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+            }
+            b = b + 1;
+        }
+        bstart[nb] = k;
+        let is i32 as changed with mut = 1;
+        while (changed == 1) {
+            changed = 0;
+            b = nb - 1;
+            while (b >= 0) {
+                _live_out(g, b, w, lin, cur, midx, n);
+                let is i32 as j with mut = 0;
+                while (j < w) { lout[b * w + j] = cur[j]; j = j + 1; }
+                // transfer
+                let is i32 as q with mut = bstart[b + 1] - 1;
+                while (q >= bstart[b]) {
+                    let is *d.IRInst as x = cast(*d.IRInst, arr[q]);
+                    if (x.is_dead == 0) {
+                        let is i32 as dm with mut = 0 - 1;
+                        if (x.op != d.IR_STORE && x.op != d.IR_COPY) { dm = _midx(&x.dest, midx, n); }
+                        if (dm >= 0) { _bclr(cur, dm); }
+                        if (x.op != d.IR_PHI) {
+                            let is i32 as u1 = _midx(&x.src1, midx, n);
+                            let is i32 as u2 = _midx(&x.src2, midx, n);
+                            if (u1 >= 0) { _bset(cur, u1); }
+                            if (u2 >= 0) { _bset(cur, u2); }
+                            if (x.op == d.IR_STORE || x.op == d.IR_COPY) {
+                                let is i32 as u3 = _midx(&x.dest, midx, n);
+                                if (u3 >= 0) { _bset(cur, u3); }
+                            }
+                        }
+                    }
+                    q = q - 1;
+                }
+                j = 0;
+                while (j < w) {
+                    if (lin[b * w + j] != cur[j]) { lin[b * w + j] = cur[j]; changed = 1; }
+                    j = j + 1;
+                }
+                b = b - 1;
+            }
+        }
+        // the walk that counts live members per web
+        let is *i32 as cnt = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+        let is *u8 as bad = d.opt_alloc(cast(i64, n + 1));
+        i = 0;
+        while (i < n) { cnt[i] = 0; bad[i] = cast(u8, 0); i = i + 1; }
+        b = 0;
+        while (b < nb) {
+            let is i32 as j with mut = 0;
+            while (j < w) { cur[j] = lout[b * w + j]; j = j + 1; }
+            let is i32 as m with mut = 0;
+            while (m < nm) { if (_bit(cur, m) == 1) { cnt[mweb[m]] = cnt[mweb[m]] + 1; } m = m + 1; }
+            let is i32 as q with mut = bstart[b + 1] - 1;
+            while (q >= bstart[b]) {
+                let is *d.IRInst as x = cast(*d.IRInst, arr[q]);
+                if (x.is_dead == 0) {
+                    let is i32 as dm with mut = 0 - 1;
+                    if (x.op != d.IR_STORE && x.op != d.IR_COPY) { dm = _midx(&x.dest, midx, n); }
+                    if (dm >= 0) {
+                        let is i32 as wb = mweb[dm];
+                        let is i32 as others with mut = cnt[wb] - _bit(cur, dm);
+                        if (x.op == d.IR_MOV) {
+                            let is i32 as sm = _midx(&x.src1, midx, n);
+                            if (sm >= 0 && sm != dm && mweb[sm] == wb && _bit(cur, sm) == 1) { others = others - 1; }
+                        }
+                        if (others > 0) { bad[wb] = cast(u8, 1); }
+                        if (_bit(cur, dm) == 1) { _bclr(cur, dm); cnt[wb] = cnt[wb] - 1; }
+                    }
+                    if (x.op != d.IR_PHI) {
+                        let is i32 as u1 = _midx(&x.src1, midx, n);
+                        let is i32 as u2 = _midx(&x.src2, midx, n);
+                        let is i32 as u3 with mut = 0 - 1;
+                        if (x.op == d.IR_STORE || x.op == d.IR_COPY) { u3 = _midx(&x.dest, midx, n); }
+                        if (u1 >= 0 && _bit(cur, u1) == 0) { _bset(cur, u1); cnt[mweb[u1]] = cnt[mweb[u1]] + 1; }
+                        if (u2 >= 0 && _bit(cur, u2) == 0) { _bset(cur, u2); cnt[mweb[u2]] = cnt[mweb[u2]] + 1; }
+                        if (u3 >= 0 && _bit(cur, u3) == 0) { _bset(cur, u3); cnt[mweb[u3]] = cnt[mweb[u3]] + 1; }
+                    }
+                }
+                q = q - 1;
+            }
+            m = 0;
+            while (m < nm) { if (_bit(cur, m) == 1) { cnt[mweb[m]] = cnt[mweb[m]] - 1; } m = m + 1; }
+            b = b + 1;
+        }
+        // split the overlapping webs
+        i = 0;
+        while (i < n) {
+            let is i32 as r = _uf_find(uf, i);
+            if (bad[r] == cast(u8, 1)) { nbad = nbad + 1; }
+            i = i + 1;
+        }
+        if (nbad > 0) {
+            let is *i32 as root = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+            i = 0;
+            while (i < n) { root[i] = _uf_find(uf, i); i = i + 1; }
+            i = 0;
+            while (i < n) { if (bad[root[i]] == cast(u8, 1)) { uf[i] = i; } i = i + 1; }
+            d.opt_free(cast(*u8, root));
+        }
+        d.opt_free(cast(*u8, cnt)); d.opt_free(bad);
+        d.opt_free(cast(*u8, lout)); d.opt_free(cast(*u8, lin)); d.opt_free(cast(*u8, cur));
+        d.opt_free(cast(*u8, arr)); d.opt_free(cast(*u8, bstart));
+        dcfg_free(g);
+    }
+    d.opt_free(cast(*u8, wsize)); d.opt_free(hasdef);
+    d.opt_free(cast(*u8, midx)); d.opt_free(cast(*u8, mweb));
+    return nbad;
+}
+
+// cur = live-out of block b: the live-in of each successor, plus the
+// arguments its phis read on the edge from b.
+fn _live_out(g as *DCfg, b as i32, w as i32, lin as *i64, cur as *i64, midx as *i32, n as i32) as void {
+    let is i32 as j with mut = 0;
+    while (j < w) { cur[j] = 0; j = j + 1; }
+    let is *cfg.BasicBlock as bb = bb_at(g, b);
+    let is i32 as bl = block_label(g, b);
+    let is i32 as si with mut = 0;
+    while (si < 2) {
+        let is i32 as s with mut = bb.succ0;
+        if (si == 1) { s = bb.succ1; }
+        if (s >= 0) {
+            j = 0;
+            while (j < w) { cur[j] = cur[j] | lin[s * w + j]; j = j + 1; }
+            let is *d.IRInst as p with mut = first_phi(g, s);
+            let is *cfg.BasicBlock as sb = bb_at(g, s);
+            let is i32 as pd with mut = 0;
+            while (cast(i64, p) != 0 && pd == 0) {
+                if (p.op != d.IR_PHI) { pd = 1; }
+                else {
+                    if (p.is_dead == 0 && bl >= 0) {
+                        let is i32 as k = phi_find(p, bl);
+                        if (k >= 0) {
+                            let is i32 as v = phi_val(p, k);
+                            if (v >= 0 && v < n && midx[v] >= 0) { _bset(cur, midx[v]); }
+                        }
+                    }
+                    if (cast(i64, p) == cast(i64, sb.last)) { pd = 1; } else { p = p.next; }
+                }
+            }
+        }
+        si = si + 1;
+    }
+}
+
+// Rename the versions back; a phi left reading only its own web goes. A web
+// whose members overlap keeps them apart, and its phis are written as copies.
+fn ssa_coalesce(func as *d.IRFunction) as void {
+    let is i32 as n = func.vreg_count;
+    if (ssa_orig_n == 0) { return; }
+    let is *i32 as uf = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is i32 as i with mut = 0;
+    while (i < n) { uf[i] = i; i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    let is i32 as nsplit with mut = 0;
+    i = 0;
+    while (i < ssa_orig_n && i < n) {
+        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) {
+            _uf_union(uf, i, ssa_orig[i]);
+        }
+        i = i + 1;
+    }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0) {
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n) { _uf_union(uf, it.dest.vreg, v); }
+                k = k + 1;
+            }
+        }
+        it = it.next;
+    }
+    // a web whose members overlap is left as it is: its phis become copies
+    let is i32 as nbad = _web_interference(func, uf, n);
+    if (nbad > 0) { nsplit = nsplit + nbad; }
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        let is i32 as drop with mut = 0;
+        _ren(&it.dest, uf, n);
+        _ren(&it.src1, uf, n);
+        _ren(&it.src2, uf, n);
+        if (it.op == d.IR_PHI) {
+            let is i32 as need with mut = 0;
+            let is i32 as k with mut = 0;
+            while (k < phi_nargs(it)) {
+                let is i32 as v = phi_val(it, k);
+                if (v >= 0 && v < n) {
+                    let is i32 as r = _uf_find(uf, v);
+                    phi_set_val(it, k, r);
+                    if (r != it.dest.vreg) { need = 1; }
+                }
+                k = k + 1;
+            }
+            if (phi_is_slot(it) == 0 && (need == 0 || it.is_dead == 1)) { drop = 1; }
+        }
+        if (drop == 1) {
+            phi_free(it);
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+            d.free_inst(it);
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    if (nsplit == 0 && func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
+    d.opt_free(cast(*u8, uf));
+    d.opt_free(cast(*u8, ssa_orig));
+    ssa_orig = cast(*i32, 0);
+    ssa_orig_n = 0;
+}
+
+fn _uses_vreg(it as *d.IRInst, x as i32) as i32 {
+    if (it.src1.op_type == d.OP_VREG && it.src1.vreg == x) { return 1; }
+    if (it.src2.op_type == d.OP_VREG && it.src2.vreg == x) { return 1; }
+    if ((it.op == d.IR_STORE || it.op == d.IR_COPY) && it.dest.op_type == d.OP_VREG && it.dest.vreg == x) { return 1; }
+    return 0;
+}
+
+// Does some phi of block s read x on the edge from the block labelled pl?
+fn _edge_uses(g as *DCfg, s as i32, pl as i32, x as i32) as i32 {
+    let is *cfg.BasicBlock as sb = bb_at(g, s);
+    let is *d.IRInst as it with mut = first_phi(g, s);
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.op != d.IR_PHI) { return 0; }
+            let is i32 as k = phi_find(it, pl);
+            if (k >= 0 && phi_val(it, k) == x) { return 1; }
+        }
+        if (cast(i64, it) == cast(i64, sb.last)) { return 0; }
+        it = it.next;
+    }
+    return 0;
+}
+
+// Is x, defined by a phi of block s, live on entry to block t when control
+// comes from the block labelled pl? Forward search from t that never enters s
+// (x's definition): a use in a reached block, or a phi argument naming x on an
+// edge leaving one, keeps x live. The phis of t reading x on the edge from pl
+// count too — their copies run on that edge.
+fn _live_in(g as *DCfg, x as i32, t as i32, s as i32, pl as i32, mark as *u8, stack as *i32) as i32 {
+    if (_edge_uses(g, t, pl, x) == 1) { return 1; }
+    let is i32 as nb = g.nblocks;
+    let is i32 as i with mut = 0;
+    while (i < nb) { mark[i] = cast(u8, 0); i = i + 1; }
+    let is i32 as sp with mut = 0;
+    let is i32 as live with mut = 0;
+    stack[0] = t; sp = 1; mark[t] = cast(u8, 1);
+    while (sp > 0 && live == 0) {
+        sp = sp - 1;
+        let is i32 as b = stack[sp];
+        let is *cfg.BasicBlock as bb = bb_at(g, b);
+        let is *d.IRInst as it with mut = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0) {
+            if (it.is_dead == 0 && it.op != d.IR_PHI && _uses_vreg(it, x) == 1) { live = 1; }
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        let is i32 as bl = block_label(g, b);
+        let is i32 as si with mut = 0;
+        while (si < 2 && live == 0) {
+            let is i32 as su with mut = bb.succ0;
+            if (si == 1) { su = bb.succ1; }
+            if (su >= 0) {
+                if (bl >= 0 && _edge_uses(g, su, bl, x) == 1) { live = 1; }
+                if (su != s && mark[su] == cast(u8, 0)) {
+                    mark[su] = cast(u8, 1);
+                    stack[sp] = su; sp = sp + 1;
+                }
+            }
+            si = si + 1;
+        }
+    }
+    return live;
+}
+
+// === Parallel copies ===
+
+let is *i32 as pc_dst with mut = cast(*i32, 0);
+let is *i32 as pc_src with mut = cast(*i32, 0);
+let is *i64 as pc_ty with mut = cast(*i64, 0);
+let is *i64 as pc_tyf with mut = cast(*i64, 0);
+let is *u8 as pc_done with mut = cast(*u8, 0);
+let is i32 as pc_n with mut = 0;
+let is i32 as pc_cap with mut = 0;
+
+fn pc_reset() as void { pc_n = 0; }
+
+fn pc_push(dst as i32, src as i32, ty as *u8, tyf as *u8) as void {
+    if (pc_n >= pc_cap) {
+        let is i32 as nc with mut = pc_cap * 2;
+        if (nc < 16) { nc = 16; }
+        let is *i32 as nd = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is *i32 as ns = cast(*i32, d.opt_alloc(cast(i64, nc) * 4));
+        let is *i64 as nt = cast(*i64, d.opt_alloc(cast(i64, nc) * 8));
+        let is *i64 as nf = cast(*i64, d.opt_alloc(cast(i64, nc) * 8));
+        let is *u8 as nn = d.opt_alloc(cast(i64, nc));
+        let is i32 as k with mut = 0;
+        while (k < pc_n) { nd[k] = pc_dst[k]; ns[k] = pc_src[k]; nt[k] = pc_ty[k]; nf[k] = pc_tyf[k]; k = k + 1; }
+        if (pc_cap > 0) {
+            d.opt_free(cast(*u8, pc_dst)); d.opt_free(cast(*u8, pc_src));
+            d.opt_free(cast(*u8, pc_ty)); d.opt_free(cast(*u8, pc_tyf)); d.opt_free(pc_done);
+        }
+        pc_dst = nd; pc_src = ns; pc_ty = nt; pc_tyf = nf; pc_done = nn; pc_cap = nc;
+    }
+    pc_dst[pc_n] = dst; pc_src[pc_n] = src;
+    pc_ty[pc_n] = cast(i64, ty); pc_tyf[pc_n] = cast(i64, tyf);
+    pc_n = pc_n + 1;
+}
+
+fn pc_reverse() as void {
+    let is i32 as i with mut = 0;
+    let is i32 as j with mut = pc_n - 1;
+    while (i < j) {
+        let is i32 as t1 = pc_dst[i]; pc_dst[i] = pc_dst[j]; pc_dst[j] = t1;
+        let is i32 as t2 = pc_src[i]; pc_src[i] = pc_src[j]; pc_src[j] = t2;
+        let is i64 as t3 = pc_ty[i]; pc_ty[i] = pc_ty[j]; pc_ty[j] = t3;
+        let is i64 as t4 = pc_tyf[i]; pc_tyf[i] = pc_tyf[j]; pc_tyf[j] = t4;
+        i = i + 1; j = j - 1;
+    }
+}
+
+fn _mk_mov(dst as i32, src as i32, ty as i64, tyf as i64) as *d.IRInst {
+    let is *d.IRInst as m = d.new_inst(d.IR_MOV);
+    m.dest = d.op_vreg(dst);
+    m.src1 = d.op_vreg(src);
+    m.cast_to = cast(*u8, ty);
+    m.cast_from = cast(*u8, tyf);
+    return m;
+}
+
+// Emit the pending parallel copy as a sequence of MOVs placed after `at`
+// (or at the list head when at is null). Returns the last MOV written (or at).
+// A copy is written once its destination is no longer read by another pending
+// copy; a cycle is broken by saving one destination in a fresh vreg.
+fn pc_emit(func as *d.IRFunction, at as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as cur with mut = at;
+    let is i32 as k with mut = 0;
+    while (k < pc_n) { pc_done[k] = cast(u8, 0); k = k + 1; }
+    let is i32 as left with mut = 0;
+    k = 0;
+    while (k < pc_n) { if (pc_done[k] == cast(u8, 0)) { left = left + 1; } k = k + 1; }
+    while (left > 0) {
+        let is i32 as progress with mut = 0;
+        let is i32 as i with mut = 0;
+        while (i < pc_n) {
+            if (pc_done[i] == cast(u8, 0)) {
+                let is i32 as blocked with mut = 0;
+                let is i32 as j with mut = 0;
+                while (j < pc_n && blocked == 0) {
+                    if (j != i && pc_done[j] == cast(u8, 0) && pc_src[j] == pc_dst[i]) { blocked = 1; }
+                    j = j + 1;
+                }
+                if (blocked == 0) {
+                    let is *d.IRInst as m = _mk_mov(pc_dst[i], pc_src[i], pc_ty[i], pc_tyf[i]);
+                    if (cast(i64, cur) == 0) { m.next = func.instructions; func.instructions = m; }
+                    else { cfg.insert_after(cur, m); }
+                    cur = m;
+                    pc_done[i] = cast(u8, 1);
+                    left = left - 1;
+                    progress = 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (progress == 0) {
+            // Only cycles remain: save the first pending destination.
+            let is i32 as c with mut = 0;
+            while (pc_done[c] != cast(u8, 0)) { c = c + 1; }
+            let is i32 as t = func.vreg_count;
+            func.vreg_count = func.vreg_count + 1;
+            let is *d.IRInst as m = _mk_mov(t, pc_dst[c], pc_ty[c], pc_tyf[c]);
+            if (cast(i64, cur) == 0) { m.next = func.instructions; func.instructions = m; }
+            else { cfg.insert_after(cur, m); }
+            cur = m;
+            let is i32 as j with mut = 0;
+            while (j < pc_n) {
+                if (pc_done[j] == cast(u8, 0) && pc_src[j] == pc_dst[c]) { pc_src[j] = t; }
+                j = j + 1;
+            }
+        }
+    }
+    return cur;
+}
+
+// The instruction right before `target` in block bb (target != bb.first).
+fn _prev_in(bb as *cfg.BasicBlock, target as *d.IRInst) as *d.IRInst {
+    let is *d.IRInst as p with mut = bb.first;
+    while (cast(i64, p.next) != cast(i64, target)) { p = p.next; }
+    return p;
+}
+
+fn _is_branch(it as *d.IRInst) as i32 {
+    return cast(i32, it.op == d.IR_JZ || it.op == d.IR_JNZ);
+}
+
+// The instruction a new block can follow without breaking a fall-through:
+// the last instruction of the function.
+fn _list_tail(func as *d.IRFunction) as *d.IRInst {
+    let is *d.IRInst as t with mut = func.instructions;
+    while (cast(i64, t.next) != 0) { t = t.next; }
+    return t;
+}
+
+// === SSA destruction ===
+//
+// Each phi becomes copies on its incoming edges: the copies of one edge form
+// a parallel copy, sequentialized by pc_emit. They go at the end of the
+// predecessor P (before its jump) when that is the only place they can run
+// on that edge alone — P has one successor — or when running them on P's
+// other edge too changes nothing: no destination is read by P's branch or
+// live into the other successor. Otherwise the edge is split: a new block
+// holds the copies, between P and its fall-through successor, or reached by
+// P's branch.
+fn ssa_destroy(func as *d.IRFunction) as void {
+    ssa_coalesce(func);
+    let is i32 as nphi with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0) { nphi = nphi + 1; }
+        it = it.next;
+    }
+    if (nphi > 0) {
+        let is *DCfg as g = dcfg_build(func);
+        let is i32 as nb = g.nblocks;
+        let is *u8 as mark = d.opt_alloc(cast(i64, nb + 1));
+        let is *i32 as stack = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+        let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
+        // ft_free[b]: no instruction falls into b, so a split block may sit
+        // right before it and fall in itself (one per block).
+        let is *u8 as ft_free = d.opt_alloc(cast(i64, nb + 1));
+        let is i32 as fb with mut = 0;
+        while (fb < nb) {
+            ft_free[fb] = cast(u8, 0);
+            if (fb > 0) {
+                let is *cfg.BasicBlock as pbb0 = bb_at(g, fb - 1);
+                let is *d.IRInst as pll = pbb0.last;
+                if (pll.op == d.IR_JMP || pll.op == d.IR_RET) { ft_free[fb] = cast(u8, 1); }
+            }
+            fb = fb + 1;
+        }
+        let is i32 as s with mut = 0;
+        while (s < nb) {
+            let is *d.IRInst as phi0 = first_phi(g, s);
+            if (cast(i64, phi0) != 0) {
+                let is i32 as ps = g.pred_start[s];
+                let is i32 as pn = g.pred_count[s];
+                let is i32 as pi with mut = 0;
+                while (pi < pn) {
+                    let is i32 as p = g.preds[ps + pi];
+                    // each predecessor once (both edges of a branch may come here)
+                    let is i32 as dup with mut = 0;
+                    let is i32 as q with mut = 0;
+                    while (q < pi) { if (g.preds[ps + q] == p) { dup = 1; } q = q + 1; }
+                    if (dup == 0) {
+                        let is i32 as pl = block_label(g, p);
+                        if (pl < 0) { ssa_fail("a predecessor of a phi block has no label", func); }
+                        pc_reset();
+                        let is *cfg.BasicBlock as sb = bb_at(g, s);
+                        let is *d.IRInst as ph with mut = phi0;
+                        let is i32 as pdone with mut = 0;
+                        while (pdone == 0) {
+                            if (ph.is_dead == 0) {
+                                if (ph.op != d.IR_PHI) { pdone = 1; }
+                                else {
+                                    let is i32 as k = phi_find(ph, pl);
+                                    if (k >= 0) {
+                                        let is i32 as v = phi_val(ph, k);
+                                        // a slot phi's self-copy is written too: the
+                                        // passes after this one have always seen it
+                                        if (v >= 0 && (phi_is_slot(ph) == 1 || v != ph.dest.vreg)) {
+                                            pc_push(ph.dest.vreg, v, ph.cast_to, ph.cast_from);
+                                        }
+                                    }
+                                }
+                            }
+                            if (pdone == 0) {
+                                if (cast(i64, ph) == cast(i64, sb.last)) { pdone = 1; } else { ph = ph.next; }
+                            }
+                        }
+                        if (pc_n > 0) {
+                            let is *cfg.BasicBlock as pb = bb_at(g, p);
+                            let is *d.IRInst as term = pb.last;
+                            let is i32 as two with mut = 0;
+                            if (_is_branch(term) == 1 && pb.succ0 >= 0 && pb.succ1 >= 0 && pb.succ0 != pb.succ1) { two = 1; }
+                            let is i32 as split with mut = 0;
+                            if (two == 1) {
+                                let is i32 as other with mut = pb.succ0;
+                                if (other == s) { other = pb.succ1; }
+                                let is i32 as c with mut = 0;
+                                while (c < pc_n && split == 0) {
+                                    let is i32 as x = pc_dst[c];
+                                    if (term.src1.op_type == d.OP_VREG && term.src1.vreg == x) { split = 1; }
+                                    else if (_live_in(g, x, other, s, pl, mark, stack) == 1) { split = 1; }
+                                    c = c + 1;
+                                }
+                            }
+                            if (split == 0) {
+                                if (term.op == d.IR_JMP || _is_branch(term) == 1) {
+                                    pc_emit(func, _prev_in(pb, term));
+                                } else {
+                                    // after a fall-through block's last instruction the
+                                    // copies come in reverse order, as mem2reg always
+                                    // wrote them (the late passes match on that shape)
+                                    pc_reverse();
+                                    pc_emit(func, term);
+                                }
+                            } else {
+                                // Split the edge p -> s.
+                                let is i32 as le = new_label(func);
+                                let is *d.IRInst as lbl = make_label(le);
+                                let is i32 as sl = block_label(g, s);
+                                if (pb.succ0 == s) {
+                                    // fall-through edge: the new block goes between p and s
+                                    cfg.insert_after(term, lbl);
+                                    pc_emit(func, lbl);
+                                } else {
+                                    // branch edge: p's branch goes to the new block, which
+                                    // falls into s when nothing else does, else jumps to it
+                                    if (sl < 0) { ssa_fail("a phi block has no label", func); }
+                                    term.dest.label = le;
+                                    let is *d.IRInst as before_s with mut = cast(*d.IRInst, 0);
+                                    if (s > 0 && ft_free[s] == cast(u8, 1)) {
+                                        let is *cfg.BasicBlock as prevb = bb_at(g, s - 1);
+                                        before_s = prevb.last;
+                                    }
+                                    if (cast(i64, before_s) != 0) {
+                                        // nothing falls into s: the new block goes right before it
+                                        ft_free[s] = cast(u8, 0);
+                                        cfg.insert_after(before_s, lbl);
+                                        pc_emit(func, lbl);
+                                    } else {
+                                        if (cast(i64, tail) == 0) { tail = _list_tail(func); }
+                                        cfg.insert_after(tail, lbl);
+                                        let is *d.IRInst as last_mov = pc_emit(func, lbl);
+                                        let is *d.IRInst as j = d.new_inst(d.IR_JMP);
+                                        j.dest = d.op_label(sl);
+                                        cfg.insert_after(last_mov, j);
+                                        tail = j;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    pi = pi + 1;
+                }
+            }
+            s = s + 1;
+        }
+        d.opt_free(mark);
+        d.opt_free(cast(*u8, stack));
+        d.opt_free(ft_free);
+        dcfg_free(g);
+    }
+    // Unlink every phi (dead ones included) and free its arguments.
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        let is *d.IRInst as nx = it.next;
+        if (it.op == d.IR_PHI) {
+            phi_free(it);
+            if (cast(i64, prev) == 0) { func.instructions = nx; } else { prev.next = nx; }
+            d.free_inst(it);
+        } else {
+            prev = it;
+        }
+        it = nx;
+    }
+    ssa_end(func);
+}

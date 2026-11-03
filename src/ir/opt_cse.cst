@@ -1,4 +1,5 @@
 use "defs.cst" as d;
+use "phi.cst" as phi;
 
 // === Local CSE / GVN within a basic block ===
 // Hashes pure arithmetic/address expressions and replaces redundant copies
@@ -133,6 +134,20 @@ fn pass_cse_local(func as *d.IRFunction) as void {
         i = i + 1;
     }
 
+    // Definitions per vreg: only a value defined once can stand for another
+    // (a later definition would change what its readers see), and the
+    // definition of a vreg defined more than once (a function too small for
+    // SSA keeps those) empties the table, as its old value may be a key.
+    let is *i32 as ndef = cast(*i32, d.opt_alloc(cast(i64, func.vreg_count) * 4));
+    i = 0;
+    while (i < func.vreg_count) { ndef[i] = 0; i = i + 1; }
+    let is *d.IRInst as dc with mut = func.instructions;
+    while (cast(i64, dc) != 0) {
+        if (dc.is_dead == 0 && dc.dest.op_type == d.OP_VREG && dc.op != d.IR_STORE && dc.op != d.IR_COPY
+            && dc.dest.vreg >= 0 && dc.dest.vreg < func.vreg_count) { ndef[dc.dest.vreg] = ndef[dc.dest.vreg] + 1; }
+        dc = dc.next;
+    }
+
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 1) { inst = inst.next; }
@@ -157,7 +172,10 @@ fn pass_cse_local(func as *d.IRFunction) as void {
                 inst.dest.vreg = *rp;
             }
 
-            if (op_ends_block(inst.op) == 1) { cse_reset(); }
+            let is i32 as multi with mut = 0;
+            if (inst.dest.op_type == d.OP_VREG && inst.op != d.IR_STORE && inst.op != d.IR_COPY
+                && inst.dest.vreg >= 0 && inst.dest.vreg < func.vreg_count && ndef[inst.dest.vreg] > 1) { multi = 1; }
+            if (op_ends_block(inst.op) == 1 || multi == 1) { cse_reset(); }
             else if (is_pure_op(inst.op) == 1 && inst.dest.op_type == d.OP_VREG) {
                 // Pack (op, src1, src2) and look up.
                 let is i32 as s1t = inst.src1.op_type;
@@ -181,5 +199,20 @@ fn pass_cse_local(func as *d.IRFunction) as void {
         }
     }
 
+    // Uses the walk passed before their remap was known (phi arguments on a
+    // back edge, a use laid out above its definition) are rewritten now.
+    let is i32 as rvc = func.vreg_count;
+    let is *d.IRInst as fin with mut = func.instructions;
+    while (cast(i64, fin) != 0) {
+        if (fin.is_dead == 0) {
+            if (fin.src1.op_type == d.OP_VREG && fin.src1.vreg >= 0 && fin.src1.vreg < rvc) { fin.src1.vreg = remap[fin.src1.vreg]; }
+            if (fin.src2.op_type == d.OP_VREG && fin.src2.vreg >= 0 && fin.src2.vreg < rvc) { fin.src2.vreg = remap[fin.src2.vreg]; }
+            if ((fin.op == d.IR_STORE || fin.op == d.IR_COPY) && fin.dest.op_type == d.OP_VREG
+                && fin.dest.vreg >= 0 && fin.dest.vreg < rvc) { fin.dest.vreg = remap[fin.dest.vreg]; }
+        }
+        fin = fin.next;
+    }
+    phi.remap_phi_args(func, remap, rvc);
     d.opt_free(cast(*u8, remap));
+    d.opt_free(cast(*u8, ndef));
 }
