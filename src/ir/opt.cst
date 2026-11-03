@@ -54,7 +54,7 @@ fn opt_prof_print() as void {
     names[5] = cast(i64, "licm");
     names[6] = cast(i64, "strength_red");
     names[7] = cast(i64, "dce");
-    names[8] = cast(i64, "final_resolve");
+    names[8] = cast(i64, "ssa_destroy");
     names[9] = cast(i64, "inline");
 
     i = 0;
@@ -176,38 +176,20 @@ fn optimize_func(func as *d.IRFunction) as void {
     licm.pass_licm_ssa(func);
     if (opt_prof_on == 1) { opt_prof_times[5] = opt_prof_times[5] + opt_prof_time() - t0; }
 
-    // End of the SSA form. Strength reduction finds its induction variables
-    // as vregs with several definitions and matches the copies a header phi
-    // becomes at the latch; LEA fusion, local copy propagation, GVN, DCE,
-    // exact division and TRE come after it and are written for that form
-    // too. Destruction renames vregs, so every use goes through copy_of first
-    // and copy_of starts over.
+    // Every use reads the end of its copy chain; the passes below take
+    // operands as they find them.
     helpers.pass_final_resolve(func, copy_of);
     phi.resolve_phi_args(func, copy_of, vc_alloc);
-    i = 0;
-    while (i < vc_alloc) { copy_of[i] = 0 - 1; i = i + 1; }
-    phi.ssa_destroy(func);
-    if (func.vreg_count + 16 > vc_alloc) {
-        // destruction may add vregs (a copy cycle broken through a temporary)
-        let is i32 as nva = func.vreg_count + 512;
-        let is *i32 as nco = cast(*i32, d.opt_alloc(cast(i64, nva) * 4));
-        let is i32 as ci with mut = 0;
-        while (ci < nva) { if (ci < vc_alloc) { nco[ci] = copy_of[ci]; } else { nco[ci] = 0 - 1; } ci = ci + 1; }
-        d.opt_free(cast(*u8, copy_of));
-        copy_of = nco;
-        vc_alloc = nva;
-    }
+    d.opt_free(cast(*u8, is_const));
+    d.opt_free(cast(*u8, imm_val));
+    d.opt_free(cast(*u8, copy_of));
 
+    // Induction variables are the header phis.
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     sr.pass_strength_reduction(func);
     if (opt_prof_on == 1) { opt_prof_times[6] = opt_prof_times[6] + opt_prof_time() - t0; }
 
-    // SR may create new vregs — update vc_alloc for DCE bounds checks
-    if (func.vreg_count + 16 > vc_alloc) {
-        vc_alloc = func.vreg_count + 16;
-    }
-
-    helpers.pass_lea_fusion(func, vc_alloc);
+    helpers.pass_lea_fusion(func, func.vreg_count);
 
     // -O2: global value numbering (cross-block CSE). Gated >=2 so -O1/self-host
     // is byte-identical. DCE below cleans the now-dead redundant computations.
@@ -215,22 +197,21 @@ fn optimize_func(func as *d.IRFunction) as void {
     if (d.ir_opt_level >= 2) { gvn.pass_gvn(func); }
 
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
-    helpers.pass_dce(func, vc_alloc, copy_of);
+    helpers.pass_dce(func);
     if (opt_prof_on == 1) { opt_prof_times[7] = opt_prof_times[7] + opt_prof_time() - t0; }
-
-    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
-    helpers.pass_final_resolve(func, copy_of);
-    if (opt_prof_on == 1) { opt_prof_times[8] = opt_prof_times[8] + opt_prof_time() - t0; }
-
-    d.opt_free(cast(*u8, is_const));
-    d.opt_free(cast(*u8, imm_val));
-    d.opt_free(cast(*u8, copy_of));
 
     // -O2: a division by 2^k whose low bits are known zero becomes a shift.
     if (d.ir_opt_level >= 2) { bits.pass_exact_div(func); }
 
-    // -O2: a self call in tail position becomes a jump back to the top.
+    // -O2: a self call in tail position becomes a jump back to a loop head
+    // whose phis are the parameters.
     if (d.ir_opt_level >= 2) { tre.pass_tre(func); }
+
+    // End of the SSA form: nothing after this point (the inliner's metadata
+    // below, self-inlining, the IR cache, code generation) reads a phi.
+    if (opt_prof_on == 1) { t0 = opt_prof_time(); }
+    phi.ssa_destroy(func);
+    if (opt_prof_on == 1) { opt_prof_times[8] = opt_prof_times[8] + opt_prof_time() - t0; }
 
     // Compact vregs into a dense range: kills the dead-vreg holes left by the
     // passes above so the O(n^2) register allocator isn't sized by a high-water

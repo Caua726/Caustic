@@ -1,4 +1,6 @@
 use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "phi.cst" as phi;
 
 // === Tail recursion becomes a loop ===
 //
@@ -14,18 +16,19 @@ use "defs.cst" as d;
 // Integer addition wraps, so (acc + x) + v equals acc + (x + v) for every input,
 // which is what makes the second shape exact. Only ADD is accumulated.
 //
-//     entry: GET_ARG v0..vk
-//            MOV n0 = v0 .. MOV nk = vk ; IMM acc = 0
-//     H:     body, where every use of vi reads ni
-//     tail:  SET_ARG i = ai   ->  MOV ti = ai      (same place, same value)
+//     entry: GET_ARG v0..vk ; IMM a0 = 0
+//     H:     ni = phi(entry: vi, tail: ai) ; acc = phi(entry: a0, tail: a2)
+//            body, where every use of vi reads ni
+//     tail:  SET_ARG i = ai   ->  (gone: ai flows into ni's phi)
 //            CALL f           ->  (gone)
-//                                 [ADD a2 = acc, x ; MOV acc = a2]
-//                                 MOV ni = ti
+//                                 [ADD a2 = acc, x]
 //            RET              ->  JMP H
 //
-// The arguments are captured where the SET_ARGs stood, so an argument that
-// reads a parameter sees the old value even when another one is reassigned
-// first.
+// On the SSA form the arguments are values, read together on the edge into
+// H, so an argument that reads a parameter sees the old value even when
+// another parameter takes a new one. Destruction writes each parameter's phi
+// as a copy on each edge (none for an argument that is the parameter itself)
+// and joins the accumulator with its sums.
 //
 // Left alone: a function whose return type IR generation did not record
 // (IRFunction.ret_kind), one whose frame holds anything (a stack slot read or
@@ -182,6 +185,43 @@ fn _tre_args(func as *d.IRFunction, ci as *d.IRInst, sa as *i64, n as i32) as i3
     return 1;
 }
 
+// The label of the block each instruction is in: the last label above it.
+fn _tre_block_label(func as *d.IRFunction, at as *d.IRInst) as i32 {
+    let is i32 as lab with mut = 0 - 1;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0 && cast(i64, it) != cast(i64, at)) {
+        if (it.op == d.IR_LABEL) { lab = it.dest.label; }
+        it = it.next;
+    }
+    return lab;
+}
+
+fn _tre_rename_phi(p as *d.IRInst, from as *i32, to as *i32, n as i32) as void {
+    let is i32 as k with mut = 0;
+    while (k < phi.phi_nargs(p)) {
+        let is i32 as v = phi.phi_val(p, k);
+        let is i32 as i with mut = 0;
+        while (i < n) {
+            if (v == _tre_get(from, i)) { phi.phi_set_val(p, k, _tre_get(to, i)); i = n; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// An operand as a vreg: itself, or a new IMM put after prev.
+fn _tre_as_vreg(func as *d.IRFunction, o as d.Operand, prev as *d.IRInst, line as i32) as i32 {
+    if (o.op_type == d.OP_VREG) { return o.vreg; }
+    let is i32 as t = func.vreg_count;
+    func.vreg_count = func.vreg_count + 1;
+    let is *d.IRInst as z = d.new_inst(d.IR_IMM);
+    z.dest = d.op_vreg(t);
+    z.src1 = o;
+    z.line = line;
+    cfg.insert_after(prev, z);
+    return t;
+}
+
 fn pass_tre(func as *d.IRFunction) as i32 {
     if (func.is_naked != 0 || func.is_variadic != 0) { return 0; }
     let is i32 as na = func.num_args;
@@ -193,8 +233,8 @@ fn pass_tre(func as *d.IRFunction) as i32 {
     let is i32 as is_void with mut = 0;
     if (func.ret_kind == 1) { is_void = 1; }
 
-    // Shape of the function: no frame contents, parameters at the top and
-    // never written again, at least one self call.
+    // Shape of the function: no frame contents, parameters at the top (after
+    // the entry block's label) and never written again, at least one self call.
     let is [6]i32 as pv;
     let is i32 as npv with mut = 0;
     let is i32 as nself with mut = 0;
@@ -208,7 +248,7 @@ fn pass_tre(func as *d.IRFunction) as i32 {
         if (inst.is_dead == cast(i8, 0)) {
             let is i32 as op = inst.op;
             if (op == d.IR_ASM || op == d.IR_VA_START || op == d.IR_SET_CTX || op == d.IR_GET_ALLOC_ADDR
-                || op == d.IR_COPY || op == d.IR_PHI) { d.opt_free(cast(*u8, uses)); return 0; }
+                || op == d.IR_COPY) { d.opt_free(cast(*u8, uses)); return 0; }
             if (op == d.IR_ADDR) { d.opt_free(cast(*u8, uses)); return 0; }
             if (op == d.IR_STORE && inst.dest.op_type == d.OP_IMM) { d.opt_free(cast(*u8, uses)); return 0; }
             if (op == d.IR_LOAD && inst.src1.op_type == d.OP_IMM) { d.opt_free(cast(*u8, uses)); return 0; }
@@ -217,6 +257,8 @@ fn pass_tre(func as *d.IRFunction) as i32 {
                 pv[npv] = inst.dest.vreg;
                 npv = npv + 1;
                 last_arg = inst;
+            } else if (op == d.IR_LABEL && cast(i64, inst) == cast(i64, func.instructions)) {
+                // the entry block's label
             } else {
                 top = 0;
                 if (inst.dest.op_type == d.OP_VREG) {
@@ -228,8 +270,17 @@ fn pass_tre(func as *d.IRFunction) as i32 {
                 }
             }
             if (_tre_self(func, inst) == 1) { nself = nself + 1; }
-            _tre_uses(uses, &inst.src1, vc);
-            _tre_uses(uses, &inst.src2, vc);
+            if (op == d.IR_PHI) {
+                let is i32 as pk with mut = 0;
+                while (pk < phi.phi_nargs(inst)) {
+                    let is i32 as av = phi.phi_val(inst, pk);
+                    if (av >= 0 && av < vc) { _tre_put(uses, av, _tre_get(uses, av) + 1); }
+                    pk = pk + 1;
+                }
+            } else {
+                _tre_uses(uses, &inst.src1, vc);
+                _tre_uses(uses, &inst.src2, vc);
+            }
             if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256
                 || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_LABEL || op == d.IR_SET_ARG) {
                 _tre_uses(uses, &inst.dest, vc);
@@ -239,7 +290,20 @@ fn pass_tre(func as *d.IRFunction) as i32 {
     }
     if (nself == 0 || npv != na) { d.opt_free(cast(*u8, uses)); return 0; }
 
+    // The head goes right after the parameters, in the entry block: not when
+    // that block is a loop's (entered again from below).
+    if (func.instructions.op == d.IR_LABEL) {
+        let is i32 as el = func.instructions.dest.label;
+        inst = func.instructions;
+        while (cast(i64, inst) != 0) {
+            if (inst.is_dead == cast(i8, 0) && (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ)
+                && inst.dest.label == el) { d.opt_free(cast(*u8, uses)); return 0; }
+            inst = inst.next;
+        }
+    }
+
     // Find the tail sites.
+    let is [6]i64 as sa0;
     let is i32 as nsite with mut = 0;
     let is i32 as has_acc with mut = 0;
     inst = func.instructions;
@@ -247,7 +311,7 @@ fn pass_tre(func as *d.IRFunction) as i32 {
         if (inst.is_dead == cast(i8, 0) && _tre_self(func, inst) == 1) {
             let is i64 as addp with mut = 0;
             let is i32 as k = _tre_site(func, inst, is_void, uses, vc, &addp);
-            if (k != 0) {
+            if (k != 0 && _tre_args(func, inst, cast(*i64, &sa0), na) == 1) {
                 nsite = nsite + 1;
                 if (k == 2) { has_acc = 1; }
             }
@@ -256,58 +320,80 @@ fn pass_tre(func as *d.IRFunction) as i32 {
     }
     if (nsite == 0) { d.opt_free(cast(*u8, uses)); return 0; }
 
-    // Entry: copies of the parameters, the accumulator, the loop head.
-    let is [6]i32 as nv;
+    // The loop head is a block of its own, right after the parameters; the
+    // parameters and the accumulator are its phis, copied on each edge into
+    // it when the SSA form ends (as the entry and every tail site always set
+    // them).
+    phi.ssa_ensure_labels(func);
+    let is *d.IRInst as entry = func.instructions;
+    let is i32 as elab = entry.dest.label;
     let is i32 as line0 with mut = 0;
     if (cast(i64, last_arg) != 0) { line0 = last_arg.line; }
-    let is *d.IRInst as tailp with mut = last_arg;
-    let is *d.IRInst as after with mut = func.instructions;
-    if (cast(i64, last_arg) != 0) { after = last_arg.next; }
-    let is *d.IRInst as chain_h with mut = cast(*d.IRInst, 0);
-    let is *d.IRInst as chain_t with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as tailp with mut = entry;
+    if (cast(i64, last_arg) != 0) { tailp = last_arg; }
+    let is *d.IRInst as zero_at with mut = tailp;
+    let is i32 as acc0 with mut = 0 - 1;
+    if (has_acc == 1) {
+        acc0 = func.vreg_count;
+        func.vreg_count = func.vreg_count + 1;
+        let is *d.IRInst as z = d.new_inst(d.IR_IMM);
+        z.dest = d.op_vreg(acc0);
+        z.src1 = d.op_imm(0);
+        z.line = line0;
+        cfg.insert_after(tailp, z);
+        zero_at = z;
+    }
+    let is i32 as head = phi.new_label(func);
+    let is *d.IRInst as hl = phi.make_label(head);
+    cfg.insert_after(zero_at, hl);
+    // What came after the parameters now leaves from the head's block.
+    inst = hl.next;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_PHI) {
+            let is i32 as ai = phi.phi_find(inst, elab);
+            if (ai >= 0) { phi.phi_set_label(inst, ai, head); }
+        }
+        inst = inst.next;
+    }
+    let is [6]i32 as nv;
+    i = 0;
+    while (i < na) { nv[i] = func.vreg_count; func.vreg_count = func.vreg_count + 1; i = i + 1; }
+    // Every use of a parameter past the head reads its phi.
+    inst = hl.next;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_PHI) { _tre_rename_phi(inst, cast(*i32, &pv), cast(*i32, &nv), na); }
+        else {
+            _tre_rename(&inst.dest, cast(*i32, &pv), cast(*i32, &nv), na);
+            _tre_rename(&inst.src1, cast(*i32, &pv), cast(*i32, &nv), na);
+            _tre_rename(&inst.src2, cast(*i32, &pv), cast(*i32, &nv), na);
+        }
+        inst = inst.next;
+    }
+    let is [6]i64 as hp;
+    let is *d.IRInst as phi_at with mut = hl;
     i = 0;
     while (i < na) {
-        nv[i] = func.vreg_count;
-        func.vreg_count = func.vreg_count + 1;
-        let is *d.IRInst as m = _tre_mov(nv[i], d.op_vreg(pv[i]), line0);
-        if (cast(i64, chain_h) == 0) { chain_h = m; } else { chain_t.next = m; }
-        chain_t = m;
+        let is *d.IRInst as p = phi.phi_new(nv[i], nsite + 1);
+        phi.phi_mark_copies(p);
+        phi.phi_add(p, elab, pv[i]);
+        cfg.insert_after(phi_at, p);
+        phi_at = p;
+        hp[i] = cast(i64, p);
         i = i + 1;
     }
     let is i32 as acc with mut = 0 - 1;
+    let is *d.IRInst as acc_phi with mut = cast(*d.IRInst, 0);
     let is *d.IRInst as acc_tpl with mut = cast(*d.IRInst, 0);
     if (has_acc == 1) {
         acc = func.vreg_count;
         func.vreg_count = func.vreg_count + 1;
-        let is *d.IRInst as z = d.new_inst(d.IR_IMM);
-        z.dest = d.op_vreg(acc);
-        z.src1 = d.op_imm(0);
-        z.line = line0;
-        if (cast(i64, chain_h) == 0) { chain_h = z; } else { chain_t.next = z; }
-        chain_t = z;
-    }
-    let is i32 as head = func.label_count;
-    func.label_count = func.label_count + 1;
-    let is *d.IRInst as hl = d.new_inst(d.IR_LABEL);
-    hl.dest = d.op_label(head);
-    if (cast(i64, chain_h) == 0) { chain_h = hl; } else { chain_t.next = hl; }
-    chain_t = hl;
-    chain_t.next = after;
-    if (cast(i64, tailp) == 0) { func.instructions = chain_h; } else { tailp.next = chain_h; }
-
-    // Every use of a parameter past the head reads its copy.
-    let is i32 as pv_n = na;
-    inst = hl.next;
-    while (cast(i64, inst) != 0) {
-        _tre_rename(&inst.dest, cast(*i32, &pv), cast(*i32, &nv), pv_n);
-        _tre_rename(&inst.src1, cast(*i32, &pv), cast(*i32, &nv), pv_n);
-        _tre_rename(&inst.src2, cast(*i32, &pv), cast(*i32, &nv), pv_n);
-        inst = inst.next;
+        acc_phi = phi.phi_new(acc, nsite + 1);
+        phi.phi_add(acc_phi, elab, acc0);
+        cfg.insert_after(phi_at, acc_phi);
     }
 
-    // Rewrite the tail sites.
+    // Rewrite the tail sites: their arguments flow into the head's phis.
     let is [6]i64 as sa;
-    let is [6]i32 as tv;
     inst = hl.next;
     while (cast(i64, inst) != 0) {
         let is *d.IRInst as nxt with mut = inst.next;
@@ -316,38 +402,21 @@ fn pass_tre(func as *d.IRFunction) as i32 {
             let is i32 as k = _tre_site(func, inst, is_void, uses, vc, &addp);
             if (k != 0 && _tre_args(func, inst, cast(*i64, &sa), na) == 1) {
                 let is i32 as line = inst.line;
-                // An argument that is the parameter itself needs nothing
-                // (tv = -2). One that reads no parameter is copied in at the
-                // jump (tv = -1). One that reads another parameter is captured
-                // where its SET_ARG stood (SET_ARG i = ai -> MOV ti = ai), as
-                // that parameter may be written first.
+                let is i32 as slab = _tre_block_label(func, inst);
+                let is *d.IRInst as ret with mut = _tre_next(inst);
+                let is *d.IRInst as cur with mut = inst;
+                inst.is_dead = cast(i8, 1);
+                // the arguments, as vregs, where the call was
                 i = 0;
                 while (i < na) {
                     let is *d.IRInst as s = cast(*d.IRInst, sa[i]);
-                    let is i32 as reads_n with mut = 0;
-                    if (s.src1.op_type == d.OP_VREG) {
-                        let is i32 as q with mut = 0;
-                        while (q < na) { if (s.src1.vreg == nv[q]) { reads_n = 1; } q = q + 1; }
-                    }
-                    if (s.src1.op_type == d.OP_VREG && s.src1.vreg == nv[i]) {
-                        tv[i] = 0 - 2;
-                        s.is_dead = cast(i8, 1);
-                    } else if (reads_n == 0) {
-                        tv[i] = 0 - 1;
-                        s.is_dead = cast(i8, 1);
-                    } else {
-                        tv[i] = func.vreg_count;
-                        func.vreg_count = func.vreg_count + 1;
-                        s.op = cast(i8, d.IR_MOV);
-                        s.dest = d.op_vreg(tv[i]);
-                        s.cast_to = cast(*u8, 0);
-                    }
+                    s.is_dead = cast(i8, 1);
+                    let is i32 as av = _tre_as_vreg(func, s.src1, cur, line);
+                    if (s.src1.op_type != d.OP_VREG) { cur = cur.next; }
+                    let is *d.IRInst as hpi = cast(*d.IRInst, hp[i]);
+                    phi.phi_add(hpi, slab, av);
                     i = i + 1;
                 }
-                inst.is_dead = cast(i8, 1);
-                let is *d.IRInst as ch with mut = cast(*d.IRInst, 0);
-                let is *d.IRInst as ct with mut = cast(*d.IRInst, 0);
-                let is *d.IRInst as ret with mut = _tre_next(inst);
                 if (k == 2) {
                     let is *d.IRInst as add = cast(*d.IRInst, addp);
                     let is d.Operand as x with mut = add.src1;
@@ -361,41 +430,26 @@ fn pass_tre(func as *d.IRFunction) as i32 {
                     na2.cast_to = add.cast_to;
                     na2.cast_from = add.cast_from;
                     na2.line = add.line;
-                    ch = na2;
-                    ct = na2;
-                    let is *d.IRInst as ma = _tre_mov(acc, d.op_vreg(a2), add.line);
-                    ct.next = ma;
-                    ct = ma;
                     if (cast(i64, acc_tpl) == 0) { acc_tpl = add; }
                     add.is_dead = cast(i8, 1);
                     ret = _tre_next(add);
+                    // right before the return, where the sum was
+                    let is *d.IRInst as bp with mut = add;
+                    while (cast(i64, bp.next) != cast(i64, ret)) { bp = bp.next; }
+                    cfg.insert_after(bp, na2);
+                    phi.phi_add(acc_phi, slab, a2);
                 } else if (ret.op == d.IR_IMM) {
                     ret.is_dead = cast(i8, 1);
                     ret = _tre_next(ret);
                 }
-                i = 0;
-                while (i < na) {
-                    if (tv[i] != 0 - 2) {
-                        let is *d.IRInst as s = cast(*d.IRInst, sa[i]);
-                        let is d.Operand as src with mut = s.src1;
-                        if (tv[i] >= 0) { src = d.op_vreg(tv[i]); }
-                        let is *d.IRInst as m = _tre_mov(nv[i], src, line);
-                        if (cast(i64, ch) == 0) { ch = m; } else { ct.next = m; }
-                        ct = m;
-                    }
-                    i = i + 1;
-                }
-                // RET -> JMP head; the new code goes right before it.
+                // RET -> JMP head
                 let is *d.IRInst as j = d.new_inst(d.IR_JMP);
                 j.dest = d.op_label(head);
                 j.line = ret.line;
-                if (cast(i64, ch) == 0) { ch = j; } else { ct.next = j; }
-                ct = j;
                 ret.is_dead = cast(i8, 1);
-                let is *d.IRInst as before with mut = inst;
-                while (cast(i64, before.next) != cast(i64, ret)) { before = before.next; }
-                ct.next = ret;
-                before.next = ch;
+                let is *d.IRInst as bj with mut = func.instructions;
+                while (cast(i64, bj.next) != cast(i64, ret)) { bj = bj.next; }
+                cfg.insert_after(bj, j);
                 nxt = ret.next;
             }
         }
@@ -409,25 +463,19 @@ fn pass_tre(func as *d.IRFunction) as i32 {
             if (inst.is_dead == cast(i8, 0) && inst.op == d.IR_RET && inst.src1.op_type != d.OP_NONE) {
                 let is i32 as t = func.vreg_count;
                 func.vreg_count = func.vreg_count + 1;
-                let is *d.IRInst as ad = d.new_inst(d.IR_ADD);
-                ad.dest = d.op_vreg(t);
-                ad.src1 = d.op_vreg(acc);
-                ad.src2 = inst.src1;
-                ad.cast_to = acc_tpl.cast_to;
-                ad.cast_from = acc_tpl.cast_from;
-                ad.line = inst.line;
                 // Turn this RET into the ADD and put a fresh RET after it.
                 let is *d.IRInst as r = d.new_inst(d.IR_RET);
                 r.src1 = d.op_vreg(t);
                 r.line = inst.line;
                 r.cast_to = inst.cast_to;
                 r.next = inst.next;
+                let is d.Operand as v = inst.src1;
                 inst.op = cast(i8, d.IR_ADD);
-                inst.dest = ad.dest;
-                inst.src1 = ad.src1;
-                inst.src2 = ad.src2;
-                inst.cast_to = ad.cast_to;
-                inst.cast_from = ad.cast_from;
+                inst.dest = d.op_vreg(t);
+                inst.src1 = d.op_vreg(acc);
+                inst.src2 = v;
+                inst.cast_to = acc_tpl.cast_to;
+                inst.cast_from = acc_tpl.cast_from;
                 inst.next = r;
                 inst = r;
             }

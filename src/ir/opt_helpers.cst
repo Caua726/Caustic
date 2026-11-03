@@ -1,4 +1,5 @@
 use "defs.cst" as d;
+use "phi.cst" as phi;
 
 // === Helpers ===
 
@@ -247,6 +248,8 @@ fn pass_lea_fusion(func as *d.IRFunction, vc as i32) as void {
         }
         cinst = cinst.next;
     }
+    // a phi reads its arguments too
+    phi.add_phi_uses(func, uc, vc);
 
     // Build def_inst[] for O(1) lookup of each vreg's defining instruction.
     let is *i64 as def_inst = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
@@ -330,109 +333,109 @@ fn pass_lea_fusion(func as *d.IRFunction, vc as i32) as void {
     d.opt_free(cast(*u8, def_inst));
 }
 
-// === Pass 2: DCE (backward scan) ===
+// === Pass 2: DCE ===
+//
+// A definition without side effects whose value nothing live reads is dead,
+// and so, in turn, is whatever only it read: use counts over the live
+// instructions (a phi reads its arguments), and a worklist of the definitions
+// whose count reaches zero. A vreg defined more than once (the IR of a
+// function SSA construction left alone) goes when none of its definitions is
+// read, all of them at once.
 
-fn pass_dce(func as *d.IRFunction, vc_alloc as i32, copy_of as *i32) as void {
-    // Count instructions
-    let is i32 as inst_count with mut = 0;
+fn _dce_dec(o as *d.Operand, uc as *i32, n as i32, dhead as *i32, dnext as *i32, arr as *i64, wl as *i32, wn as *i32) as void {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= n) { return; }
+    _dce_drop(o.vreg, uc, dhead, dnext, arr, wl, wn);
+}
+
+fn _dce_drop(v as i32, uc as *i32, dhead as *i32, dnext as *i32, arr as *i64, wl as *i32, wn as *i32) as void {
+    uc[v] = uc[v] - 1;
+    if (uc[v] != 0) { return; }
+    let is i32 as j with mut = dhead[v];
+    while (j >= 0) {
+        let is *d.IRInst as di = cast(*d.IRInst, arr[j]);
+        if (di.is_dead == 0 && has_side_effects(di.op) == 0) { wl[*wn] = j; *wn = *wn + 1; }
+        j = dnext[j];
+    }
+}
+
+fn _dce_use(o as *d.Operand, uc as *i32, n as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { uc[o.vreg] = uc[o.vreg] + 1; }
+}
+
+fn pass_dce(func as *d.IRFunction) as void {
+    let is i32 as ni with mut = 0;
     let is *d.IRInst as inst with mut = func.instructions;
-    while (cast(i64, inst) != 0) {
-        inst_count = inst_count + 1;
-        inst = inst.next;
-    }
-
-    if (inst_count == 0) {
-        return;
-    }
-
-    // Build array of instruction pointers (forward scan)
-    let is *i64 as inst_arr = cast(*i64, d.opt_alloc(cast(i64, inst_count) * 8));
-    let is i32 as idx with mut = 0;
-    inst = func.instructions;
-    while (cast(i64, inst) != 0) {
-        let is *i64 as ap = cast(*i64, cast(i64, inst_arr) + cast(i64, idx) * 8);
-        *ap = cast(i64, inst);
-        idx = idx + 1;
-        inst = inst.next;
-    }
-
-    // Allocate used[] array (vc_alloc to cover SSA vregs)
-    let is *i32 as used = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
+    while (cast(i64, inst) != 0) { ni = ni + 1; inst = inst.next; }
+    if (ni == 0) { return; }
+    let is i32 as n = func.vreg_count;
+    let is *i64 as arr = cast(*i64, d.opt_alloc(cast(i64, ni) * 8));
+    let is *i32 as dnext = cast(*i32, d.opt_alloc(cast(i64, ni) * 4));
+    let is *i32 as wl = cast(*i32, d.opt_alloc(cast(i64, ni + 1) * 4));
+    let is *i32 as uc = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    let is *i32 as dhead = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
     let is i32 as i with mut = 0;
-    while (i < vc_alloc) {
-        let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, i) * 4);
-        *up = 0;
-        i = i + 1;
-    }
-
-    // Count defs per vreg — multi-def vregs (phi copies) must not be DCE'd
-    let is *i32 as def_count = cast(*i32, d.opt_alloc(cast(i64, vc_alloc) * 4));
+    while (i < n) { uc[i] = 0; dhead[i] = 0 - 1; i = i + 1; }
     i = 0;
-    while (i < vc_alloc) {
-        let is *i32 as dp = cast(*i32, cast(i64, def_count) + cast(i64, i) * 4);
-        *dp = 0;
-        i = i + 1;
-    }
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
-        if (inst.is_dead == 0 && inst.dest.op_type == d.OP_VREG && inst.op != d.IR_STORE && inst.op != d.IR_COPY) {
-            let is i32 as dv = inst.dest.vreg;
-            if (dv >= 0 && dv < vc_alloc) {
-                let is *i32 as dp = cast(*i32, cast(i64, def_count) + cast(i64, dv) * 4);
-                *dp = *dp + 1;
+        arr[i] = cast(i64, inst);
+        dnext[i] = 0 - 1;
+        if (inst.is_dead == 0) {
+            let is i32 as op = inst.op;
+            if (op == d.IR_PHI) {
+                let is i32 as k with mut = 0;
+                while (k < phi.phi_nargs(inst)) {
+                    let is i32 as pv = phi.phi_val(inst, k);
+                    if (pv >= 0 && pv < n) { uc[pv] = uc[pv] + 1; }
+                    k = k + 1;
+                }
+            } else {
+                _dce_use(&inst.src1, uc, n);
+                _dce_use(&inst.src2, uc, n);
+                if (op == d.IR_STORE || op == d.IR_COPY) { _dce_use(&inst.dest, uc, n); }
+            }
+            if (inst.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY
+                && inst.dest.vreg >= 0 && inst.dest.vreg < n) {
+                dnext[i] = dhead[inst.dest.vreg];
+                dhead[inst.dest.vreg] = i;
             }
         }
+        i = i + 1;
         inst = inst.next;
     }
-
-    // Backward scan
-    idx = inst_count - 1;
-    while (idx >= 0) {
-        let is *i64 as ap = cast(*i64, cast(i64, inst_arr) + cast(i64, idx) * 8);
-        inst = cast(*d.IRInst, *ap);
-
-        if (inst.is_dead == 0) {
-            // Mark operand vregs as used
-            if (inst.src1.op_type == d.OP_VREG && inst.src1.vreg >= 0 && inst.src1.vreg < vc_alloc) {
-                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.src1.vreg) * 4);
-                *up = 1;
-            }
-            if (inst.src2.op_type == d.OP_VREG && inst.src2.vreg >= 0 && inst.src2.vreg < vc_alloc) {
-                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.src2.vreg) * 4);
-                *up = 1;
-            }
-            // For STORE/COPY, dest vreg is also a use (address), not a def
-            if ((inst.op == d.IR_STORE || inst.op == d.IR_COPY) && inst.dest.op_type == d.OP_VREG && inst.dest.vreg >= 0 && inst.dest.vreg < vc_alloc) {
-                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, inst.dest.vreg) * 4);
-                *up = 1;
-            }
-
-            // Check if dest vreg is unused (and no side effects)
-            // DCE: mark dead if dest vreg has zero uses
-            if (inst.dest.op_type == d.OP_VREG && has_side_effects(inst.op) == 0 && inst.dest.vreg >= 0 && inst.dest.vreg < vc_alloc) {
-                let is i32 as dv = inst.dest.vreg;
-                let is *i32 as up = cast(*i32, cast(i64, used) + cast(i64, dv) * 4);
-                if (*up == 0) {
-                    let is i32 as dce_safe with mut = 1;
-                    if (dv >= 0 && dv < vc_alloc) {
-                        let is *i32 as dp = cast(*i32, cast(i64, def_count) + cast(i64, dv) * 4);
-                        // Multi-def: not safe to delete, an IMM included — this
-                        // scan runs in list order, and a definition at the bottom
-                        // of a loop may be read at its top.
-                        if (*dp > 1) { dce_safe = 0; }
-                    }
-                    if (dce_safe == 1) {
-                        inst.is_dead = 1;
-                    }
+    let is i32 as wn with mut = 0;
+    i = 0;
+    while (i < ni) {
+        let is *d.IRInst as x = cast(*d.IRInst, arr[i]);
+        if (x.is_dead == 0 && x.dest.op_type == d.OP_VREG && x.op != d.IR_STORE && x.op != d.IR_COPY
+            && has_side_effects(x.op) == 0 && x.dest.vreg >= 0 && x.dest.vreg < n && uc[x.dest.vreg] == 0) {
+            wl[wn] = i; wn = wn + 1;
+        }
+        i = i + 1;
+    }
+    while (wn > 0) {
+        wn = wn - 1;
+        let is *d.IRInst as x = cast(*d.IRInst, arr[wl[wn]]);
+        if (x.is_dead == 0) {
+            x.is_dead = 1;
+            if (x.op == d.IR_PHI) {
+                let is i32 as k with mut = 0;
+                while (k < phi.phi_nargs(x)) {
+                    let is i32 as pv = phi.phi_val(x, k);
+                    if (pv >= 0 && pv < n) { _dce_drop(pv, uc, dhead, dnext, arr, wl, &wn); }
+                    k = k + 1;
                 }
+            } else {
+                _dce_dec(&x.src1, uc, n, dhead, dnext, arr, wl, &wn);
+                _dce_dec(&x.src2, uc, n, dhead, dnext, arr, wl, &wn);
             }
         }
-        idx = idx - 1;
     }
-
-    d.opt_free(cast(*u8, inst_arr));
-    d.opt_free(cast(*u8, used));
-    d.opt_free(cast(*u8, def_count));
+    d.opt_free(cast(*u8, arr));
+    d.opt_free(cast(*u8, dnext));
+    d.opt_free(cast(*u8, wl));
+    d.opt_free(cast(*u8, uc));
+    d.opt_free(cast(*u8, dhead));
 }
 
 // === Vreg compaction ===

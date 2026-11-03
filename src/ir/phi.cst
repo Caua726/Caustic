@@ -89,7 +89,10 @@ fn phi_free(p as *d.IRInst) as void {
 // passes after mem2reg have always seen); the phi of a vreg that had several
 // definitions is coalesced back into that vreg.
 fn phi_mark_slot(p as *d.IRInst) as void { p.is_extern_global = cast(i8, 1); }
-fn phi_is_slot(p as *d.IRInst) as i32 { return cast(i32, p.is_extern_global == cast(i8, 1)); }
+fn phi_is_slot(p as *d.IRInst) as i32 { return cast(i32, p.is_extern_global != cast(i8, 0)); }
+// Copies too, but none from the phi's own dest (a loop head TRE makes: an
+// argument that is the parameter itself needs nothing).
+fn phi_mark_copies(p as *d.IRInst) as void { p.is_extern_global = cast(i8, 2); }
 
 // --- for the passes that run while phis are live ---
 
@@ -246,6 +249,16 @@ fn ssa_end(func as *d.IRFunction) as void {
     if (ssa_active == 0) { return; }
     ssa_drop_labels(func);
     ssa_active = 0;
+}
+
+// A pass that adds phis to a function construction left alone (one block, or
+// nothing to rename) labels its blocks first.
+fn ssa_ensure_labels(func as *d.IRFunction) as void {
+    if (ssa_active == 1) { return; }
+    let is *DCfg as g = dcfg_build(func);
+    ssa_begin(func);
+    ssa_label_blocks(func, g.blocks, g.nblocks);
+    dcfg_free(g);
 }
 
 // === CFG view used by destruction ===
@@ -580,26 +593,25 @@ fn _live_out(g as *DCfg, b as i32, w as i32, lin as *i64, cur as *i64, midx as *
     }
 }
 
-// Rename the versions back; a phi left reading only its own web goes. A web
-// whose members overlap keeps them apart, and its phis are written as copies.
-fn ssa_coalesce(func as *d.IRFunction) as void {
+// The webs of the SSA form: each version joined with its vreg, each phi
+// that is not a slot's with its arguments. uf[v] is v's representative (the
+// smallest member), for v < func.vreg_count, already resolved.
+fn ssa_web_uf(func as *d.IRFunction) as *i32 {
     let is i32 as n = func.vreg_count;
-    if (ssa_orig_n == 0) { return; }
     let is *i32 as uf = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
     let is i32 as i with mut = 0;
     while (i < n) { uf[i] = i; i = i + 1; }
-    let is *d.IRInst as it with mut = func.instructions;
-    let is i32 as nsplit with mut = 0;
-    i = 0;
-    while (i < ssa_orig_n && i < n) {
-        if (ssa_orig[i] >= 0 && ssa_orig[i] < n) {
-            _uf_union(uf, i, ssa_orig[i]);
+    if (cast(i64, ssa_orig) != 0) {
+        i = 0;
+        while (i < ssa_orig_n && i < n) {
+            if (ssa_orig[i] >= 0 && ssa_orig[i] < n) { _uf_union(uf, i, ssa_orig[i]); }
+            i = i + 1;
         }
-        i = i + 1;
     }
-    it = func.instructions;
+    let is *d.IRInst as it with mut = func.instructions;
     while (cast(i64, it) != 0) {
-        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0) {
+        if (it.op == d.IR_PHI && it.is_dead == 0 && phi_is_slot(it) == 0
+            && it.dest.vreg >= 0 && it.dest.vreg < n) {
             let is i32 as k with mut = 0;
             while (k < phi_nargs(it)) {
                 let is i32 as v = phi_val(it, k);
@@ -609,6 +621,67 @@ fn ssa_coalesce(func as *d.IRFunction) as void {
         }
         it = it.next;
     }
+    i = 0;
+    while (i < n) { uf[i] = _uf_find(uf, i); i = i + 1; }
+    return uf;
+}
+
+// The vregs that destruction leaves with more than one definition, as the
+// passes written before the SSA form saw them: a member of a web with two or
+// more definitions other than its phis, and a slot phi's dest (a copy on each
+// incoming edge). Those passes keep treating them as variables. One byte per
+// vreg below func.vreg_count; the caller frees it.
+fn ssa_multi_like(func as *d.IRFunction) as *u8 {
+    let is i32 as n = func.vreg_count;
+    let is *u8 as ml = d.opt_alloc(cast(i64, n + 1));
+    let is i32 as i with mut = 0;
+    while (i < n) { ml[i] = cast(u8, 0); i = i + 1; }
+    if (ssa_active == 0 && cast(i64, ssa_orig) == 0) { return ml; }
+    let is *i32 as uf = ssa_web_uf(func);
+    let is *i32 as cnt = cast(*i32, d.opt_alloc(cast(i64, n + 1) * 4));
+    i = 0;
+    while (i < n) { cnt[i] = 0; i = i + 1; }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < n
+            && it.op != d.IR_STORE && it.op != d.IR_COPY) {
+            if (it.op == d.IR_PHI) {
+                if (phi_is_slot(it) == 1) { ml[it.dest.vreg] = cast(u8, 1); }
+            } else {
+                let is i32 as r = _uf_find(uf, it.dest.vreg);
+                cnt[r] = cnt[r] + 1;
+            }
+        }
+        it = it.next;
+    }
+    i = 0;
+    while (i < n) {
+        if (cnt[_uf_find(uf, i)] >= 2) { ml[i] = cast(u8, 1); }
+        i = i + 1;
+    }
+    d.opt_free(cast(*u8, cnt));
+    d.opt_free(cast(*u8, uf));
+    return ml;
+}
+
+// Rename the versions back; a phi left reading only its own web goes. A web
+// whose members overlap keeps them apart, and its phis are written as copies.
+// Phis a later pass made (with or without versions from construction) are
+// joined with their arguments the same way.
+fn ssa_coalesce(func as *d.IRFunction) as void {
+    let is i32 as n = func.vreg_count;
+    let is i32 as versions = cast(i32, ssa_orig_n > 0 && cast(i64, ssa_orig) != 0);
+    let is *d.IRInst as it with mut = func.instructions;
+    if (versions == 0) {
+        let is i32 as any with mut = 0;
+        while (cast(i64, it) != 0 && any == 0) {
+            if (it.op == d.IR_PHI && phi_is_slot(it) == 0) { any = 1; }
+            it = it.next;
+        }
+        if (any == 0) { return; }
+    }
+    let is *i32 as uf = ssa_web_uf(func);
+    let is i32 as nsplit with mut = 0;
     // a web whose members overlap is left as it is: its phis become copies
     let is i32 as nbad = _web_interference(func, uf, n);
     if (nbad > 0) { nsplit = nsplit + nbad; }
@@ -643,9 +716,9 @@ fn ssa_coalesce(func as *d.IRFunction) as void {
         }
         it = nx;
     }
-    if (nsplit == 0 && func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
+    if (versions == 1 && nsplit == 0 && func.vreg_count == ssa_vc_built) { func.vreg_count = ssa_vc_restore; }
     d.opt_free(cast(*u8, uf));
-    d.opt_free(cast(*u8, ssa_orig));
+    if (cast(i64, ssa_orig) != 0) { d.opt_free(cast(*u8, ssa_orig)); }
     ssa_orig = cast(*i32, 0);
     ssa_orig_n = 0;
 }
@@ -906,9 +979,9 @@ fn ssa_destroy(func as *d.IRFunction) as void {
                                     let is i32 as k = phi_find(ph, pl);
                                     if (k >= 0) {
                                         let is i32 as v = phi_val(ph, k);
-                                        // a slot phi's self-copy is written too: the
-                                        // passes after this one have always seen it
-                                        if (v >= 0 && (phi_is_slot(ph) == 1 || v != ph.dest.vreg)) {
+                                        // a slot phi's self-copy is written too, as it
+                                        // always was (not a TRE head's)
+                                        if (v >= 0 && (ph.is_extern_global == cast(i8, 1) || v != ph.dest.vreg)) {
                                             pc_push(ph.dest.vreg, v, ph.cast_to, ph.cast_from);
                                         }
                                     }
@@ -941,8 +1014,9 @@ fn ssa_destroy(func as *d.IRFunction) as void {
                                 } else {
                                     // after a fall-through block's last instruction the
                                     // copies come in reverse order, as mem2reg always
-                                    // wrote them (the late passes match on that shape)
-                                    pc_reverse();
+                                    // wrote them; a TRE loop head's in order, as TRE
+                                    // always wrote its parameter copies
+                                    if (phi0.is_extern_global != cast(i8, 2)) { pc_reverse(); }
                                     pc_emit(func, term);
                                 }
                             } else {
