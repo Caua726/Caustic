@@ -128,7 +128,47 @@ The pass builds a reverse instruction array and scans backward, counting uses of
 
 ### 9. Inlining
 
-Runs as a separate phase after all per-function optimizations, so `inline_has_stack_ops()` accurately reflects the post-mem2reg state of each callee.
+Runs as a separate phase after all per-function optimizations. `-O1` and `-O2`
+use different inliners.
+
+#### -O2: cost model (`src/ir/opt_inline.cst`)
+
+Every call site gets a threshold, in estimated instructions of the callee once
+optimized: a base, plus a bonus when the call sits in a loop (more in a nested
+loop), when it is the only reference to the callee in the program, and per
+constant argument. A callee no bigger than the call itself (arguments + call +
+result) always goes in. Each caller has a growth budget proportional to its own
+size, and hard caps on virtual registers and on the stack bytes the copies add.
+Sites are taken in priority order: free ones, then sites in loops, then the
+smallest callees. Calls inside a copied body are considered again, up to three
+levels, drawing on what the site that brought them in had left of its
+threshold, and never re-entering a function already on that chain.
+
+Callees may keep a frame. The copy's locals (frame offsets `[48, ext]`) move
+past the caller's, and its alloca area (`IR_GET_ALLOC_ADDR`) past the caller's,
+each by a multiple of 16; the frame grows to cover them. Arrays, address-taken
+locals, struct locals, struct parameters and struct results all work this way.
+After the caller is optimized, regions nothing references any more are
+squeezed out of the frame. More than six arguments work too: the stack
+pushes, the `sub rsp, 8` padding and the `add rsp, N` after the call go away
+with the call.
+
+Whole-program builds visit callees before callers, so a copy already has its
+own calls inlined. The parallel build keeps every body unoptimized until its
+function is emitted; there, callees are judged by an estimate of the raw body
+and copied from an optimized copy made once per process.
+
+Never inlined: inline asm (other than the stack adjustments of a >6-argument
+call), `naked`, variadic and directly recursive functions, functions from a
+dynamically linked runtime, and functions outside the module being compiled
+in module-only builds. With `-g`, callees that keep a frame stay out of line.
+
+#### -O1: fixed limits (`src/ir/opt_loop.cst`, `pass_inline`)
+
+`inline_has_stack_ops()` reflects the post-mem2reg state of each callee. In
+the parallel build (the default for `-o`) the callee's metadata describes its
+unoptimized body, where every parameter is stored to a frame slot, so there
+only callees without parameters or locals pass the stack-operation test.
 
 **Eligibility criteria:**
 - Callee has <= 60 live instructions

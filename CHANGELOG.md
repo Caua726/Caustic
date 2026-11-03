@@ -58,6 +58,22 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   happens only when the generated code is what is being read. The guest
   self-host round (`userspace/tests/bootstrap.cst` in causticos) checks both
   halves on CausticOS itself.
+- **-O2 inlines by cost, including callees that keep a frame.** The inliner
+  had fixed limits (60 instructions, 6 arguments, 4 copies per caller, 512
+  virtual registers, no frame) and, in the parallel build every `-o` goes
+  through, judged callees by their unoptimized body, where each parameter sits
+  in a frame slot — so a function with a parameter was never inlined there.
+  `-O2` now has its own pass (`src/ir/opt_inline.cst`): a threshold per call
+  site in estimated instructions after optimization, raised for calls in loops,
+  for a callee's only call site and per constant argument; a growth budget per
+  caller; copies get their own region of the caller's frame (arrays,
+  address-taken locals, struct locals, parameters and results), squeezed out
+  again when the caller no longer references it; calls with more than six
+  arguments; nested inlining through the copied bodies; callees before callers
+  in whole-program builds. `-O1` is unchanged. Against the previous `-O2`:
+  nbody_energy 2.6x, scheduler 1.4x, object_alloc 1.3x, lens_ray_trace 1.25x,
+  json_parse, storage_tree and collision about 1.2x; the self-host build takes
+  9% longer (wall) and the compiler's code grows 19%.
 
 ### Fixed
 - **`add QWORD PTR [rbp-8], 1` no longer reaches the assembler.** The
