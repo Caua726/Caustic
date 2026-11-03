@@ -1,0 +1,352 @@
+// tests/loop_store_next_test.cst
+//
+// Loops whose load reads what the store of the iteration before wrote, which
+// -O2 carries in a register, and indices a constant apart (x + j - 1, x + j,
+// x + j + 1), which strength reduction walks with one pointer. Each loop is
+// checked against the same computation written so neither applies: the value
+// read back through a call, or the indices computed by a call. Also the loops
+// next to those shapes that must keep reading memory: another distance, a
+// step that skips the element, another pointer to the same array, another
+// width, and a loop that never runs on a null pointer.
+//
+// Exit code 0 on success, else the number of the failing check.
+
+let is i32 as SZ with imut = 40;
+let is i32 as W with imut = 9;
+
+type RdF = fn(*f64, i64) as f64;
+
+fn at(i as i32, j as i32, w as i32) as i64 { return cast(i64, i) * cast(i64, w) + cast(i64, j); }
+fn rd_f64(p as *f64, i as i64) as f64 { return p[i]; }
+fn rd_i64(p as *i64, i as i64) as i64 { return p[i]; }
+
+fn fill_f64(a as *f64, n as i32, s as f64) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) { a[i] = s + cast(f64, i) * 0.375 + cast(f64, (i * 7) % 5); i = i + 1; }
+}
+
+fn fill_i64(a as *i64, n as i32, s as i64) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) { a[i] = s + cast(i64, i) * 1000003; i = i + 1; }
+}
+
+fn same_f64(a as *f64, b as *f64, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn same_i64(a as *i64, b as *i64, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+// a[i] = a[i - 1] + b[i]
+fn prefix_f64(a as *f64, b as *f64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) { a[i] = a[i - 1] + b[i]; i = i + 1; }
+}
+
+fn prefix_i64(a as *i64, b as *i64, n as i64) as void {
+    let is i64 as i with mut = 1;
+    while (i < n) { a[i] = a[i - 1] + b[i]; i = i + 1; }
+}
+
+fn prefix_f64_ref(f as RdF, a as *f64, b as *f64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) {
+        let is f64 as v = call(f, a, cast(i64, i) - 1);
+        a[i] = v + b[i];
+        i = i + 1;
+    }
+}
+
+fn prefix_i64_ref(f as *u8, a as *i64, b as *i64, n as i64) as void {
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        let is i64 as v = call(f, a, i - 1);
+        a[i] = v + b[i];
+        i = i + 1;
+    }
+}
+
+// through a pointer that steps
+fn walk_i64(a as *i64, n as i64) as void {
+    let is i64 as p with mut = cast(i64, a);
+    let is i64 as k with mut = 1;
+    while (k < n) {
+        *cast(*i64, p + 8) = *cast(*i64, p) * 3 + k;
+        p = p + 8;
+        k = k + 1;
+    }
+}
+
+fn walk_i64_ref(f as *u8, a as *i64, n as i64) as void {
+    let is i64 as k with mut = 1;
+    while (k < n) {
+        let is i64 as v = call(f, a, k - 1);
+        a[k] = v * 3 + k;
+        k = k + 1;
+    }
+}
+
+// counting down: a[i] = a[i + 1] + b[i]
+fn down_f64(a as *f64, b as *f64, n as i32) as void {
+    let is i32 as i with mut = n - 2;
+    while (i >= 0) { a[i] = a[i + 1] * 0.5 + b[i]; i = i - 1; }
+}
+
+fn down_f64_ref(f as RdF, a as *f64, b as *f64, n as i32) as void {
+    let is i32 as i with mut = n - 2;
+    while (i >= 0) {
+        let is f64 as v = call(f, a, cast(i64, i) + 1);
+        a[i] = v * 0.5 + b[i];
+        i = i - 1;
+    }
+}
+
+// the stored value comes back truncated and extended
+fn narrow_u8(a as *u8, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) { a[i] = cast(u8, cast(i32, a[i - 1]) + 201); i = i + 1; }
+}
+
+fn narrow_i8(a as *i8, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) { a[i] = cast(i8, cast(i32, a[i - 1]) + 101); i = i + 1; }
+}
+
+fn narrow_i32(a as *i32, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) { a[i] = cast(i32, cast(i64, a[i - 1]) * 3 + 2000000011); i = i + 1; }
+}
+
+fn narrow_f32(a as *f32, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i < n) { a[i] = a[i - 1] * 1.5 + 0.1; i = i + 1; }
+}
+
+// Not the element the last iteration stored: two back, a step that skips it,
+// and a read of the element itself after the store.
+fn dist2(a as *i64, n as i64) as void {
+    let is i64 as i with mut = 2;
+    while (i < n) { a[i] = a[i - 2] + 1; i = i + 1; }
+}
+
+fn skip2(a as *i64, n as i64) as void {
+    let is i64 as i with mut = 1;
+    while (i < n) { a[i] = a[i - 1] + 1; i = i + 2; }
+}
+
+fn step2(a as *i64, n as i64) as void {
+    let is i64 as i with mut = 2;
+    while (i < n) { a[i] = a[i - 2] + 5; i = i + 2; }
+}
+
+fn reread(a as *i64, n as i64) as i64 {
+    let is i64 as s with mut = 0;
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        a[i] = a[i - 1] + 2;
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+// the same array through a second pointer
+fn two_ptrs(d as *i64, r as *i64, n as i64) as void {
+    let is i64 as i with mut = 1;
+    while (i < n) { d[i] = r[i - 1] + 1; i = i + 1; }
+}
+
+// a narrower read of the word stored
+fn low_half(a as *i64, n as i64) as void {
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        let is *i32 as q = cast(*i32, cast(i64, a) + (i - 1) * 8);
+        a[i] = cast(i64, *q) + 4294967297;
+        i = i + 1;
+    }
+}
+
+// In place, nine points. Indices x + j - 1, x + j, x + j + 1 of three rows.
+fn stencil(a as *f64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i <= n - 2) {
+        let is i32 as j with mut = 1;
+        while (j <= n - 2) {
+            a[i * n + j] = (a[(i - 1) * n + j - 1] + a[(i - 1) * n + j] + a[(i - 1) * n + j + 1]
+                            + a[i * n + j - 1] + a[i * n + j] + a[i * n + j + 1]
+                            + a[(i + 1) * n + j - 1] + a[(i + 1) * n + j] + a[(i + 1) * n + j + 1]) / 9.0;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn stencil_ref(f as *u8, a as *f64, n as i32) as void {
+    let is i32 as i with mut = 1;
+    while (i <= n - 2) {
+        let is i32 as j with mut = 1;
+        while (j <= n - 2) {
+            let is i64 as p00 = call(f, i - 1, j - 1, n);
+            let is i64 as p01 = call(f, i - 1, j, n);
+            let is i64 as p02 = call(f, i - 1, j + 1, n);
+            let is i64 as p10 = call(f, i, j - 1, n);
+            let is i64 as p11 = call(f, i, j, n);
+            let is i64 as p12 = call(f, i, j + 1, n);
+            let is i64 as p20 = call(f, i + 1, j - 1, n);
+            let is i64 as p21 = call(f, i + 1, j, n);
+            let is i64 as p22 = call(f, i + 1, j + 1, n);
+            a[p11] = (a[p00] + a[p01] + a[p02] + a[p10] + a[p11] + a[p12] + a[p20] + a[p21] + a[p22]) / 9.0;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Neighbours two apart and the sum also read for itself, integer elements.
+fn wide_nb(a as *i64, x as i32, n as i32) as i64 {
+    let is i64 as t with mut = 0;
+    let is i32 as j with mut = 2;
+    while (j < n) {
+        let is i32 as s = x + j;
+        t = t + cast(i64, s);
+        a[s] = a[s - 2] + a[s + 2] + a[s];
+        j = j + 1;
+    }
+    return t;
+}
+
+fn wide_nb_ref(f as *u8, a as *i64, x as i32, n as i32) as i64 {
+    let is i64 as t with mut = 0;
+    let is i32 as j with mut = 2;
+    while (j < n) {
+        t = t + cast(i64, x + j);
+        let is i64 as p0 = call(f, 0, x + j - 2, 0);
+        let is i64 as p1 = call(f, 0, x + j, 0);
+        let is i64 as p2 = call(f, 0, x + j + 2, 0);
+        a[p1] = a[p0] + a[p2] + a[p1];
+        j = j + 1;
+    }
+    return t;
+}
+
+fn main() as i32 {
+    let is *u8 as fat = fn_ptr(at);
+    let is RdF as ff = fn_ptr(rd_f64);
+    let is *u8 as fi = fn_ptr(rd_i64);
+    let is [40]f64 as a;
+    let is [40]f64 as c;
+    let is [40]f64 as b;
+    let is [40]i64 as p;
+    let is [40]i64 as q;
+    let is [40]i64 as r;
+
+    fill_f64(a, SZ, 1.5); fill_f64(c, SZ, 1.5); fill_f64(b, SZ, 0.25);
+    prefix_f64(a, b, SZ); prefix_f64_ref(ff, c, b, SZ);
+    if (same_f64(a, c, SZ) == 0) { return 1; }
+
+    fill_i64(p, SZ, 3); fill_i64(q, SZ, 3); fill_i64(r, SZ, 11);
+    prefix_i64(p, r, 40); prefix_i64_ref(fi, q, r, 40);
+    if (same_i64(p, q, SZ) == 0) { return 2; }
+
+    fill_i64(p, SZ, 3); fill_i64(q, SZ, 3);
+    walk_i64(p, 40); walk_i64_ref(fi, q, 40);
+    if (same_i64(p, q, SZ) == 0) { return 3; }
+
+    fill_f64(a, SZ, 2.5); fill_f64(c, SZ, 2.5);
+    down_f64(a, b, SZ); down_f64_ref(ff, c, b, SZ);
+    if (same_f64(a, c, SZ) == 0) { return 4; }
+
+    // 200, then +201 mod 256
+    let is [12]u8 as u;
+    u[0] = cast(u8, 200);
+    narrow_u8(u, 8);
+    if (u[1] != cast(u8, 145) || u[2] != cast(u8, 90) || u[7] != cast(u8, 71)) { return 5; }
+
+    // 100, then +101 as a signed byte
+    let is [12]i8 as sb;
+    sb[0] = cast(i8, 100);
+    narrow_i8(sb, 8);
+    if (cast(i32, sb[1]) != 0 - 55 || cast(i32, sb[2]) != 46 || cast(i32, sb[3]) != 0 - 109) { return 6; }
+
+    // the value read back is the low 32 bits of x * 3 + 2000000011, sign-extended
+    let is [5]i32 as si;
+    si[0] = 7;
+    narrow_i32(si, 5);
+    let is i64 as w with mut = 7;
+    let is i32 as k with mut = 1;
+    while (k < 5) {
+        w = w * 3 + 2000000011;
+        w = cast(i64, cast(i32, w));
+        if (cast(i64, si[k]) != w) { return 7; }
+        k = k + 1;
+    }
+
+    let is [6]f32 as sf;
+    sf[0] = 1.0;
+    narrow_f32(sf, 6);
+    let is f32 as v32 with mut = 1.0;
+    k = 1;
+    while (k < 6) {
+        v32 = v32 * 1.5 + 0.1;
+        if (sf[k] != v32) { return 8; }
+        k = k + 1;
+    }
+
+    fill_i64(p, SZ, 1);
+    dist2(p, 40);
+    if (p[2] != 2 || p[3] != 1000005 || p[38] != 20 || p[39] != 1000023) { return 9; }
+
+    fill_i64(p, SZ, 1);
+    skip2(p, 7);
+    if (p[1] != 2 || p[2] != 2000007 || p[3] != 2000008 || p[5] != 4000014) { return 10; }
+
+    fill_i64(p, SZ, 1);
+    step2(p, 9);
+    if (p[2] != 6 || p[4] != 11 || p[6] != 16 || p[8] != 21 || p[3] != 3000010) { return 11; }
+
+    fill_i64(p, SZ, 0);
+    if (reread(p, 5) != 2 + 4 + 6 + 8) { return 12; }
+
+    // one array, two names, and two arrays
+    fill_i64(p, SZ, 0);
+    two_ptrs(p, p, 6);
+    if (p[5] != 5) { return 13; }
+    fill_i64(p, SZ, 0); fill_i64(q, SZ, 100);
+    two_ptrs(p, q, 6);
+    if (p[1] != 101 || p[5] != 4000113) { return 14; }
+
+    fill_i64(p, SZ, 0);
+    p[0] = 4294967296 * 5 + 9;
+    low_half(p, 4);
+    if (p[1] != 4294967296 + 10 || p[2] != 4294967296 + 11 || p[3] != 4294967296 + 12) { return 15; }
+
+    // a loop that does not run reads nothing
+    prefix_f64(cast(*f64, 0), cast(*f64, 0), 1);
+    prefix_i64(cast(*i64, 0), cast(*i64, 0), 0);
+    walk_i64(cast(*i64, 0), 1);
+    down_f64(cast(*f64, 0), cast(*f64, 0), 1);
+
+    let is [81]f64 as s1;
+    let is [81]f64 as s2;
+    fill_f64(s1, W * W, 0.5); fill_f64(s2, W * W, 0.5);
+    stencil(s1, W); stencil_ref(fat, s2, W);
+    if (same_f64(s1, s2, W * W) == 0) { return 16; }
+    stencil(s1, W); stencil_ref(fat, s2, W);
+    if (same_f64(s1, s2, W * W) == 0) { return 17; }
+
+    // a row of two (no inner iterations)
+    stencil(s1, 2);
+    if (same_f64(s1, s2, W * W) == 0) { return 18; }
+
+    fill_i64(p, SZ, 5); fill_i64(q, SZ, 5);
+    let is i64 as t1 = wide_nb(p, 3, 30);
+    let is i64 as t2 = wide_nb_ref(fat, q, 3, 30);
+    if (t1 != t2) { return 19; }
+    if (same_i64(p, q, SZ) == 0) { return 20; }
+    return 0;
+}

@@ -103,6 +103,8 @@ struct SrL {
     ch_dead3 as [16]i64;
     ch_mulk as [16]i64;  // FULL: the constant the induction variable is scaled by (1: none)
     ch_accp as [16]i32;  // the phi the chain became
+    ch_add as [16]i64;   // FULL: a constant added to the sum before the shift
+    ch_phic as [16]i64;  // the ch_add the phi in ch_accp stands for
 }
 
 fn _bb(a as *SrA, b as i32) as *cfg.BasicBlock {
@@ -455,6 +457,8 @@ fn _add_chain(l as *SrL, iv as i32, kind as i32, e as *d.IRInst, base as i32, ot
     l.ch_dead2[c] = cast(i64, d2);
     l.ch_dead3[c] = cast(i64, d3);
     l.ch_mulk[c] = 1;
+    l.ch_add[c] = 0;
+    l.ch_phic[c] = 0;
     l.nch = c + 1;
 }
 
@@ -476,8 +480,12 @@ fn _match_shl(a as *SrA, l as *SrL, s as *d.IRInst) as void {
         }
         return;
     }
-    // FULL: (other + iv) << k, the sum maybe cast
-    if (_in_loop(a, src) == 0 || a.uc[src] != 1) { return; }
+    // FULL: (other + iv) << k, the sum maybe cast. At -O2 the sum may be read
+    // by others as well and reached through copies (a local index read several
+    // times); what stays unread then goes in DCE.
+    if (_in_loop(a, src) == 0) { return; }
+    let is i32 as shared with mut = cast(i32, a.uc[src] != 1);
+    if (shared == 1 && d.ir_opt_level < 2) { return; }
     let is i32 as sum with mut = src;
     let is *d.IRInst as cst with mut = cast(*d.IRInst, 0);
     let is *d.IRInst as sd = _def(a, src);
@@ -486,7 +494,31 @@ fn _match_shl(a as *SrA, l as *SrL, s as *d.IRInst) as void {
         cst = sd;
         sum = sd.src1.vreg;
     }
-    let is *d.IRInst as ad = _def(a, sum);
+    let is i32 as top = sum;
+    if (d.ir_opt_level >= 2) { sum = _strip(a, sum); }
+    if (sum != top) { shared = 1; }
+    let is *d.IRInst as ad with mut = _def(a, sum);
+    // -O2: (other + iv) + C, C a constant, the sum maybe cast: the index of a
+    // neighbour (j - 1, j + 1 next to j). Its chain is the sum's, displaced by
+    // C << k, and shares a phi with the other chains of that sum (_twin).
+    let is i64 as addc with mut = 0;
+    let is *d.IRInst as dout with mut = cast(*d.IRInst, 0);
+    if (d.ir_opt_level >= 2 && cast(i64, ad) != 0 && (ad.op == d.IR_ADD || ad.op == d.IR_SUB)
+        && _step_of(ad) != 0 && _in_loop(a, sum) == 1) {
+        let is i32 as inner with mut = _strip(a, ad.src1.vreg);
+        let is *d.IRInst as ai with mut = _def(a, inner);
+        if (_cast_ok(ai) == 1) {
+            inner = _strip(a, ai.src1.vreg);
+            ai = _def(a, inner);
+        }
+        if (cast(i64, ai) != 0 && ai.op == d.IR_ADD && ai.src1.op_type == d.OP_VREG
+            && ai.src2.op_type == d.OP_VREG) {
+            addc = _step_of(ad);
+            dout = ad;
+            sum = inner;
+            ad = ai;
+        }
+    }
     if (cast(i64, ad) == 0 || ad.op != d.IR_ADD || ad.src1.op_type != d.OP_VREG || ad.src2.op_type != d.OP_VREG) { return; }
     if (_in_loop(a, sum) == 0) { return; }
     let is i32 as va = ad.src1.vreg;
@@ -518,11 +550,19 @@ fn _match_shl(a as *SrA, l as *SrL, s as *d.IRInst) as void {
     let is *d.IRInst as e = _end_add(a, s.dest.vreg, &base);
     if (cast(i64, e) == 0) { return; }
     // the sum dies with the chain only when the chain is its one reader
+    // (with a constant added, the sum itself may have other readers: DCE
+    // drops it when it has none)
     let is *d.IRInst as dsum with mut = ad;
-    if (cast(i64, cst) != 0 && a.uc[sum] != 1) { dsum = cast(*d.IRInst, 0); }
+    if (cast(i64, dout) != 0) { dsum = dout; }
+    if (cast(i64, cst) != 0 && a.uc[top] != 1) { dsum = cast(*d.IRInst, 0); }
+    if (shared == 1) { dsum = cast(*d.IRInst, 0); cst = cast(*d.IRInst, 0); }
     if (mk != 1 && (k > 6 || _fits32(mk << k) == 0)) { return; }
+    if (cast(i64, dout) != 0 && (k > 6 || _fits32(addc << k) == 0)) { return; }
     _add_chain(l, iv, K_FULL, e, base, other, k, mk << k, 0 - 1, w, dsum, s, cst);
-    if (l.nch > 0 && l.ch_end[l.nch - 1] == cast(i64, e)) { l.ch_mulk[l.nch - 1] = mk; }
+    if (l.nch > 0 && l.ch_end[l.nch - 1] == cast(i64, e)) {
+        l.ch_mulk[l.nch - 1] = mk;
+        l.ch_add[l.nch - 1] = addc;
+    }
 }
 
 // x = iv * K, K a constant in [2, 2^31), read only by the sum: the MUL.
@@ -933,18 +973,20 @@ fn _eqo(a as *SrA, p as *d.Operand, q as *d.Operand, depth as i32) as i32 {
 fn _same_v(a as *SrA, x as i32, y as i32) as i32 { return _eqv(a, x, y, 0); }
 
 // An earlier chain of the loop that computes the same address (the same
-// array element written and read back): its phi, or -1.
+// array element written and read back), or one a constant away (a[x + j - 1]
+// next to a[x + j]): its index, or -1.
 fn _twin(a as *SrA, l as *SrL, ci as i32) as i32 {
     let is i32 as cj with mut = 0;
     while (cj < ci) {
         if (l.ch_iv[cj] == l.ch_iv[ci] && l.ch_kind[cj] == l.ch_kind[ci]
+            && _fits32((l.ch_add[ci] - l.ch_phic[cj]) << l.ch_shift[ci]) == 1
             && l.ch_shift[cj] == l.ch_shift[ci] && l.ch_stride[cj] == l.ch_stride[ci]
             && l.ch_mulk[cj] == l.ch_mulk[ci]
             && _same_v(a, l.ch_base[cj], l.ch_base[ci]) == 1
             && _same_v(a, l.ch_other[cj], l.ch_other[ci]) == 1
             && _same_v(a, l.ch_z[cj], l.ch_z[ci]) == 1
             && _same_v(a, l.ch_w[cj], l.ch_w[ci]) == 1) {
-            return l.ch_accp[cj];
+            return cj;
         }
         cj = cj + 1;
     }
@@ -958,16 +1000,25 @@ fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.
     let is i32 as iv = l.ch_iv[ci];
     let is i32 as kind = l.ch_kind[ci];
     let is *d.IRInst as e = cast(*d.IRInst, l.ch_end[ci]);
-    let is i32 as tw = _twin(a, l, ci);
-    if (tw >= 0) {
-        e.op = d.IR_MOV;
-        e.src1 = d.op_vreg(tw);
-        e.src2 = d.op_none();
-        if (e.dest.op_type == d.OP_VREG) { _note_copy(e.dest.vreg, tw); }
+    let is i32 as tj = _twin(a, l, ci);
+    if (tj >= 0) {
+        let is i32 as tw = l.ch_accp[tj];
+        let is i64 as dc = (l.ch_add[ci] - l.ch_phic[tj]) << l.ch_shift[ci];
+        if (dc == 0) {
+            e.op = d.IR_MOV;
+            e.src1 = d.op_vreg(tw);
+            e.src2 = d.op_none();
+            if (e.dest.op_type == d.OP_VREG) { _note_copy(e.dest.vreg, tw); }
+        } else {
+            e.op = d.IR_ADD;
+            e.src1 = d.op_vreg(tw);
+            e.src2 = d.op_imm(dc);
+        }
         _kill(l.ch_dead1[ci]);
         _kill(l.ch_dead2[ci]);
         _kill(l.ch_dead3[ci]);
         l.ch_accp[ci] = tw;
+        l.ch_phic[ci] = l.ch_phic[tj];
         return 0;
     }
     let is i64 as step = l.iv_step[iv];
@@ -997,12 +1048,13 @@ fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.
         let is i32 as om = _mat(func, a, l, l.ch_other[ci]);
         let is i64 as mk = l.ch_mulk[ci];
         let is i32 as t0 with mut = 0 - 1;
-        if (isc == 1 && (mk == 1 || _fits32(c0 * mk) == 1)) { t0 = _emit_add_imm(func, l, om, c0 * mk); }
+        if (isc == 1 && (mk == 1 || _fits32(c0 * mk) == 1)) { t0 = _emit_add_imm(func, l, om, c0 * mk + l.ch_add[ci]); }
         else {
             if (isc == 1) { v0 = _emit(func, l, d.IR_IMM, d.op_imm(c0), d.op_none()); }
             let is i32 as xv with mut = v0;
             if (mk != 1) { xv = _emit(func, l, d.IR_MUL, d.op_vreg(v0), d.op_imm(mk)); }
             t0 = _emit(func, l, d.IR_ADD, d.op_vreg(om), d.op_vreg(xv));
+            if (l.ch_add[ci] != 0) { t0 = _emit_add_imm(func, l, t0, l.ch_add[ci]); }
         }
         let is i32 as t1 = _emit(func, l, d.IR_SHL, d.op_vreg(t0), d.op_imm(l.ch_shift[ci]));
         acc0 = _emit(func, l, d.IR_ADD, d.op_vreg(bm), d.op_vreg(t1));
@@ -1056,6 +1108,7 @@ fn _reduce(func as *d.IRFunction, a as *SrA, l as *SrL, ci as i32, phi_at as *d.
     _kill(l.ch_dead2[ci]);
     _kill(l.ch_dead3[ci]);
     l.ch_accp[ci] = accp;
+    l.ch_phic[ci] = l.ch_add[ci];
     return 1;
 }
 

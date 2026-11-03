@@ -527,7 +527,8 @@ fn _fwd_one(func as *d.IRFunction, prev as *d.IRInst, lbl as *d.IRInst, njumps a
     if (nst == 1) {
         let is *d.IRInst as pv1 with mut = func.instructions;
         while (cast(i64, pv1) != 0 && cast(i64, pv1.next) != cast(i64, lbl)) { pv1 = pv1.next; }
-        return _fwd_st(func, pv1, lbl, br, cast(*d.IRInst, sts[0]));
+        if (_fwd_st(func, pv1, lbl, br, cast(*d.IRInst, sts[0])) == 1) { return 1; }
+        return _fwd_next(func, pv1, lbl, br, cast(*d.IRInst, sts[0]));
     }
     // several stores: each one whose object no other store writes
     let is i32 as done with mut = 0;
@@ -715,11 +716,186 @@ fn _fwd_st(func as *d.IRFunction, prev as *d.IRInst, lbl as *d.IRInst, br as *d.
     return 1;
 }
 
+// === The value stored one iteration back ===
+//
+// The same loops, when the store's address moves: it writes [P + o2], a load
+// above it reads [P + o1], and between the store and the next iteration's
+// load P steps by s with o1 + s == o2 (`a[i] = a[i - 1] + b[i]`, a stencil
+// updated in place). The load then reads what the store of the iteration
+// before wrote, the loop's only write, and the value goes round in a register
+// t as above: t is loaded where the guard falls into Lb, the loads become
+// copies of t, and t takes the stored value right after the store. Each
+// address is followed as the value of a vreg at the start of the iteration
+// plus a constant, through copies, casts between words and additions or
+// subtractions of a constant made in the body (fn_st: 0 the vreg still holds
+// its value from the start of the iteration, 1 it holds fn_b + fn_o, 2
+// anything else).
+
+// Set when one such loop was rewritten: its loads' addresses may be unread now.
+let is i32 as fwd_next_hit with mut = 0;
+let is *u8 as fn_st with mut = cast(*u8, 0);
+let is *i32 as fn_b with mut = cast(*i32, 0);
+let is *i64 as fn_o with mut = cast(*i64, 0);
+
+// An integer or a pointer of eight bytes: a cast between two of them copies.
+fn _fn_word(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    return cast(i32, ((k >= 1 && k <= 8) || k == 14) && sz == 8);
+}
+
+// 1 with v's value now as *b + *o, 0 when it is none of those.
+fn _fn_val(v as i32, b as *i32, o as *i64) as i32 {
+    if (fn_st[v] == cast(u8, 0)) { *b = v; *o = 0; return 1; }
+    if (fn_st[v] == cast(u8, 1)) { *b = fn_b[v]; *o = fn_o[v]; return 1; }
+    return 0;
+}
+
+fn _fwd_next(func as *d.IRFunction, prev as *d.IRInst, lbl as *d.IRInst, br as *d.IRInst, stn as *d.IRInst) as i32 {
+    if (stn.dest.op_type != d.OP_VREG || stn.src1.op_type != d.OP_VREG) { return 0; }
+    let is i32 as sz = _fwd_size(stn.cast_to);
+    if (sz == 0) { return 0; }
+    let is i32 as vc = func.vreg_count;
+    fn_st = d.opt_alloc(cast(i64, vc) + 1);
+    fn_b = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
+    fn_o = cast(*i64, d.opt_alloc(cast(i64, vc) * 8 + 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { fn_st[i] = cast(u8, 0); i = i + 1; }
+    // the loads above the store, by the address they read
+    let is [16]i64 as lds;
+    let is [16]i32 as ldb;
+    let is [16]i64 as ldo;
+    let is i32 as nl with mut = 0;
+    let is i32 as above with mut = 1;
+    let is i32 as sb with mut = 0 - 1;
+    let is i64 as so with mut = 0;
+    let is i32 as ok with mut = 1;
+    let is i32 as b with mut = 0;
+    let is i64 as o with mut = 0;
+    let is *d.IRInst as w with mut = lbl.next;
+    while (cast(i64, w) != cast(i64, br) && ok == 1) {
+        if (w.is_dead == 0) {
+            if (cast(i64, w) == cast(i64, stn)) {
+                above = 0;
+                if (stn.dest.vreg < vc && _fn_val(stn.dest.vreg, &b, &o) == 1) { sb = b; so = o; }
+                else { ok = 0; }
+            } else if (above == 1 && w.op == d.IR_LOAD && w.src1.op_type == d.OP_VREG && w.src1.vreg < vc
+                       && _fwd_same_ty(w.cast_to, stn.cast_to) == 1 && nl < 16
+                       && _fn_val(w.src1.vreg, &b, &o) == 1) {
+                lds[nl] = cast(i64, w);
+                ldb[nl] = b;
+                ldo[nl] = o;
+                nl = nl + 1;
+            }
+            if (w.op != d.IR_STORE && w.dest.op_type == d.OP_VREG) {
+                let is i32 as v = w.dest.vreg;
+                if (v < 0 || v >= vc) { ok = 0; }
+                else {
+                    let is i32 as known with mut = 0;
+                    if ((w.op == d.IR_ADD || w.op == d.IR_SUB) && w.src1.op_type == d.OP_VREG
+                        && w.src2.op_type == d.OP_IMM && w.src1.vreg < vc
+                        && _fn_val(w.src1.vreg, &b, &o) == 1) {
+                        if (w.op == d.IR_ADD) { o = o + w.src2.imm; } else { o = o - w.src2.imm; }
+                        known = 1;
+                    } else if (w.op == d.IR_MOV && w.src1.op_type == d.OP_VREG && w.src1.vreg < vc
+                               && _fn_val(w.src1.vreg, &b, &o) == 1) {
+                        known = 1;
+                    } else if (w.op == d.IR_CAST && w.src1.op_type == d.OP_VREG && w.src1.vreg < vc
+                               && _fn_word(w.cast_to) == 1 && _fn_word(w.cast_from) == 1
+                               && _fn_val(w.src1.vreg, &b, &o) == 1) {
+                        known = 1;
+                    }
+                    if (known == 1) { fn_st[v] = cast(u8, 1); fn_b[v] = b; fn_o[v] = o; }
+                    else { fn_st[v] = cast(u8, 2); }
+                }
+            }
+        }
+        w = w.next;
+    }
+    // the loads that read, in the next iteration, what the store wrote; all
+    // from the address of the first (on the first iteration they must read
+    // the same memory as the load on the way in)
+    let is *d.IRInst as first with mut = cast(*d.IRInst, 0);
+    let is i32 as fb with mut = 0 - 1;
+    let is i64 as fo with mut = 0;
+    let is u8 as hit with mut = cast(u8, 0);
+    let is [16]u8 as take;
+    i = 0;
+    while (i < nl) {
+        take[i] = cast(u8, 0);
+        if (ok == 1 && sb >= 0 && _fn_val(ldb[i], &b, &o) == 1 && b == sb && o + ldo[i] == so
+            && (cast(i64, first) == 0 || (ldb[i] == fb && ldo[i] == fo))) {
+            if (cast(i64, first) == 0) { first = cast(*d.IRInst, lds[i]); fb = ldb[i]; fo = ldo[i]; }
+            take[i] = cast(u8, 1);
+            hit = cast(u8, 1);
+        }
+        i = i + 1;
+    }
+    d.opt_free(fn_st);
+    d.opt_free(cast(*u8, fn_b));
+    d.opt_free(cast(*u8, fn_o));
+    fn_st = cast(*u8, 0);
+    fn_b = cast(*i32, 0);
+    fn_o = cast(*i64, 0);
+    if (hit == cast(u8, 0) || fo < 0 - 2147483648 || fo > 2147483647) { return 0; }
+
+    let is i32 as t = func.vreg_count;
+    func.vreg_count = func.vreg_count + 1;
+    // t's first value, on the way in: the load the first iteration makes
+    let is *d.IRInst as ld0 = _rot_clone(first);
+    ld0.dest = d.op_vreg(t);
+    ld0.src1 = d.op_vreg(fb);
+    ld0.next = lbl;
+    prev.next = ld0;
+    if (fo != 0) {
+        let is i32 as pa = func.vreg_count;
+        func.vreg_count = func.vreg_count + 1;
+        let is *d.IRInst as ad = d.new_inst(d.IR_ADD);
+        ad.dest = d.op_vreg(pa);
+        ad.src1 = d.op_vreg(fb);
+        ad.src2 = d.op_imm(fo);
+        ad.line = first.line;
+        ad.next = ld0;
+        prev.next = ad;
+        ld0.src1 = d.op_vreg(pa);
+    }
+    // the loads read t
+    i = 0;
+    while (i < nl) {
+        if (take[i] == cast(u8, 1)) {
+            let is *d.IRInst as ld = cast(*d.IRInst, lds[i]);
+            ld.op = d.IR_MOV;
+            ld.src1 = d.op_vreg(t);
+            ld.src2 = d.op_none();
+        }
+        i = i + 1;
+    }
+    // t takes what the store wrote, as a load would read it back
+    let is *d.IRInst as mv with mut = cast(*d.IRInst, 0);
+    if (sz == 8) {
+        mv = d.new_inst(d.IR_MOV);
+    } else {
+        mv = d.new_inst(d.IR_CAST);
+        mv.cast_from = stn.cast_to;
+    }
+    mv.dest = d.op_vreg(t);
+    mv.src1 = stn.src1;
+    mv.src2 = d.op_none();
+    mv.cast_to = stn.cast_to;
+    mv.line = stn.line;
+    mv.next = stn.next;
+    stn.next = mv;
+    fwd_next_hit = 1;
+    return 1;
+}
+
 fn _fwd_lref(o as *d.Operand, nr as *i32, lc as i32) as void {
     if (o.op_type == d.OP_LABEL && o.label >= 0 && o.label < lc) { nr[o.label] = nr[o.label] + 1; }
 }
 
 fn pass_loop_fwd(func as *d.IRFunction) as void {
+    fwd_next_hit = 0;
     _fo_init(func);
     let is i32 as lc = func.label_count + 1;
     let is *i32 as nj = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));

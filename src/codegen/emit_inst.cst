@@ -84,9 +84,65 @@ fn _is_magic_const(imm as i64) as i32 {
     return 1;
 }
 
+// -O2: a division in this function has nothing to save in rdx. No vreg is ever
+// allocated to it; what can live there is an argument already set for a call
+// to come, a parameter not read yet, or what inline asm left, and the scan
+// looks for those.
+let is i32 as rdx_free with mut = 0;
+
+// 1 for `sub rsp, N` or `add rsp, N` alone: what a call with stack arguments
+// emits as an IR_ASM of its own.
+fn _asm_is_rsp_adjust(it as *d.IRInst) as i32 {
+    let is *u8 as p = it.asm_str_ptr;
+    let is i32 as n = cast(i32, it.asm_str_len);
+    if (cast(i64, p) == 0 || n < 10) { return 0; }
+    let is i32 as sub = cast(i32, p[0] == cast(u8, 115) && p[1] == cast(u8, 117) && p[2] == cast(u8, 98));
+    let is i32 as add = cast(i32, p[0] == cast(u8, 97) && p[1] == cast(u8, 100) && p[2] == cast(u8, 100));
+    if (sub == 0 && add == 0) { return 0; }
+    if (p[3] != cast(u8, 32) || p[4] != cast(u8, 114) || p[5] != cast(u8, 115) || p[6] != cast(u8, 112)
+        || p[7] != cast(u8, 44) || p[8] != cast(u8, 32)) { return 0; }
+    let is i32 as k with mut = 9;
+    while (k < n) {
+        if (p[k] < cast(u8, 48) || p[k] > cast(u8, 57)) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn rdx_free_scan(func as *d.IRFunction) as void {
+    rdx_free = 0;
+    let is i32 as seen_div with mut = 0;
+    let is i32 as pending with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_ASM && _asm_is_rsp_adjust(it) == 0) { return; }
+            if (op == d.IR_DIV || op == d.IR_MOD || op == d.IR_MULHI_U64) {
+                if (pending == 1) { return; }
+                seen_div = 1;
+            }
+            if (op == d.IR_GET_ARG && seen_div == 1) { return; }
+            if (op == d.IR_SET_ARG || op == d.IR_SET_SYS_ARG) { pending = 1; }
+            if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL) { pending = 0; }
+        }
+        it = it.next;
+    }
+    rdx_free = 1;
+}
+
+fn _rdx_save() as void {
+    if (rdx_free == 1) { eo.rc_invalidate_reg(2); return; }
+    eo.out_line("push rdx");
+}
+
+fn _rdx_restore() as void {
+    if (rdx_free == 0) { eo.out_line("pop rdx"); }
+}
+
 // Emit the magic-multiply sequence for signed div-by-constant.
 // Pre-conditions: dividend has been loaded into rax. rdx will be clobbered
-// (caller must push/pop it). Leaves the quotient in rdx and the saved
+// (the caller saves it: _rdx_save). Leaves the quotient in rdx and the saved
 // dividend in rcx so callers computing mod can reuse them.
 fn _emit_magic_div_s64(d_imm as i64) as void {
     let is i64 as M with mut = 0;
@@ -517,10 +573,10 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 eo.rc_invalidate_reg(2);
             }
             e.load_op(inst.src1.vreg, ctx, "rax");
-            eo.out_line("push rdx");
+            _rdx_save();
             _emit_magic_div_s64(inst.src2.imm);
             eo.out_line("mov rax, rdx");
-            eo.out_line("pop rdx");
+            _rdx_restore();
             e.emit_narrow_truncate(0, inst.cast_to);
             e.store_op(inst.dest.vreg, ctx, "rax");
             return;
@@ -532,7 +588,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         } else {
             e.load_op(inst.src2.vreg, ctx, "rcx");
         }
-        eo.out_line("push rdx");
+        _rdx_save();
         if (e.is_signed_type(inst.cast_to) == 1) {
             eo.out_line("cqo");
             eo.out_line("idiv rcx");
@@ -540,7 +596,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             eo.out_line("xor rdx, rdx");
             eo.out_line("div rcx");
         }
-        eo.out_line("pop rdx");
+        _rdx_restore();
         e.emit_narrow_truncate(0, inst.cast_to);
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
@@ -550,9 +606,8 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         // instruction that produces them: it multiplies rax by its operand and
         // leaves the 128-bit result in rdx:rax, high half in rdx.
         //
-        // rdx is saved and restored the same way IR_DIV does it — the register
-        // allocator may have something live there, and `mul` clobbers it
-        // unconditionally.
+        // rdx is saved and restored the same way IR_DIV does it: `mul` clobbers
+        // it unconditionally.
         if (al.al_opt_level >= 1) {
             eo.rc_invalidate_reg(1);
             eo.rc_invalidate_reg(2);
@@ -563,10 +618,10 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         } else {
             e.load_op(inst.src2.vreg, ctx, "rcx");
         }
-        eo.out_line("push rdx");
+        _rdx_save();
         eo.out_line("mul rcx");
         eo.out_line("mov rax, rdx");
-        eo.out_line("pop rdx");
+        _rdx_restore();
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
     }
@@ -603,12 +658,12 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
                 eo.rc_invalidate_reg(2);
             }
             e.load_op(inst.src1.vreg, ctx, "rax");
-            eo.out_line("push rdx");
+            _rdx_save();
             _emit_magic_div_s64(inst.src2.imm);
             eo.out_str("  imul rdx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
             eo.out_line("sub rcx, rdx");
             eo.out_line("mov rax, rcx");
-            eo.out_line("pop rdx");
+            _rdx_restore();
             e.emit_narrow_truncate(0, inst.cast_to);
             e.store_op(inst.dest.vreg, ctx, "rax");
             return;
@@ -620,7 +675,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         } else {
             e.load_op(inst.src2.vreg, ctx, "rcx");
         }
-        eo.out_line("push rdx");
+        _rdx_save();
         if (e.is_signed_type(inst.cast_to) == 1) {
             eo.out_line("cqo");
             eo.out_line("idiv rcx");
@@ -629,7 +684,7 @@ fn gen_inst_arith(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             eo.out_line("div rcx");
         }
         eo.out_line("mov rax, rdx");
-        eo.out_line("pop rdx");
+        _rdx_restore();
         e.emit_narrow_truncate(0, inst.cast_to);
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
