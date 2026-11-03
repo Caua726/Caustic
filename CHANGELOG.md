@@ -60,6 +60,10 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   halves on CausticOS itself.
 
 ### Fixed
+- **`add QWORD PTR [rbp-8], 1` no longer reaches the assembler.** The
+  load-add-store fusion for a counter kept in memory emitted the word, dword
+  and qword forms, which caustic-as does not encode, and the build failed. It
+  now fuses only the byte form.
 - **A function declared twice in one module is an error at its line.** Only
   a repeated global was caught; a second function by the same name reached
   the assembler as a label defined twice, with no file or line, and a second
