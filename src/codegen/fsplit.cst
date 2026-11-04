@@ -1,0 +1,326 @@
+// -O2: a float that lives across a call gets a stack slot for its whole life,
+// since every xmm is caller-saved. In a loop that makes no call this costs a
+// load per read and, for a value the loop writes, a store forwarded to the next
+// iteration's load. Inside such a loop the value gets a vreg of its own: copied
+// there before the loop and, if the loop writes it, back after it.
+//
+// The loop has to be entered by falling into it, so the copy runs exactly once
+// on the way in. A value the loop writes also needs the only way out to be
+// falling off the last jump back: there is then one place for the copy back,
+// and a jump around the whole loop finds the value where it was.
+
+use "../ir/defs.cst" as d;
+
+fn _gi(a as *i32, i as i32) as i32 { return *(cast(*i32, cast(i64, a) + cast(i64, i) * 4)); }
+fn _pi(a as *i32, i as i32, v as i32) as void { *(cast(*i32, cast(i64, a) + cast(i64, i) * 4)) = v; }
+fn _ia(n as i32, v as i32) as *i32 {
+    let is *i32 as a = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    let is i32 as i with mut = 0;
+    while (i < n) { _pi(a, i, v); i = i + 1; }
+    return a;
+}
+
+fn _is_jump(op as i32) as i32 {
+    if (op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) { return 1; }
+    return 0;
+}
+
+fn _is_call(op as i32) as i32 {
+    if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL
+        || op == d.IR_SYSCALL || op == d.IR_ASM) { return 1; }
+    return 0;
+}
+
+// Does this instruction write the vreg in its dest (and not read through it)?
+fn _writes_dest(i as *d.IRInst) as i32 {
+    if (i.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as op = i.op;
+    if (op == d.IR_STORE || op == d.IR_ATOMIC_STORE || op == d.IR_VSTOREQ
+        || op == d.IR_VSTOREQ256 || op == d.IR_COPY) { return 0; }
+    return 1;
+}
+
+// A definition that leaves one scalar in the vreg: the copy moves it whole.
+// Vector operations share the xmm class and are wider than an IR_MOV.
+fn _scalar_def(op as i32) as i32 {
+    if (op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV
+        || op == d.IR_FNEG || op == d.IR_FSQRT || op == d.IR_LOAD || op == d.IR_BITS
+        || op == d.IR_CAST || op == d.IR_IMM || op == d.IR_MOV || op == d.IR_GET_ARG
+        || op == d.IR_CALL || op == d.IR_CALL_INDIRECT) { return 1; }
+    return 0;
+}
+
+// The vregs of the function that are scalar floats: 1 in the result.
+fn _scalars(func as *d.IRFunction, vc as i32) as *i32 {
+    let is *i32 as ok = _ia(vc, 0);
+    let is i32 as v with mut = 0;
+    while (v < vc) {
+        if (d.vreg_class_get(func, v) == d.VR_XMM) { _pi(ok, v, 1); }
+        v = v + 1;
+    }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && _writes_dest(it) == 1 && _scalar_def(it.op) == 0) { _pi(ok, it.dest.vreg, 0); }
+        it = it.next;
+    }
+    let is i32 as changed with mut = 1;
+    while (changed == 1) {
+        changed = 0;
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0 && it.op == d.IR_MOV && it.dest.op_type == d.OP_VREG && it.src1.op_type == d.OP_VREG
+                && d.vreg_class_get(func, it.src1.vreg) == d.VR_XMM
+                && _gi(ok, it.src1.vreg) == 0 && _gi(ok, it.dest.vreg) == 1) {
+                _pi(ok, it.dest.vreg, 0);
+                changed = 1;
+            }
+            it = it.next;
+        }
+    }
+    return ok;
+}
+
+fn _ren(o as *d.Operand, vc as i32, stamp as *i32, map as *i32, st as i32) as void {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= vc) { return; }
+    if (_gi(stamp, o.vreg) == st) { o.vreg = _gi(map, o.vreg); }
+}
+
+// One read or write of v at position k: v lives from its first sight to k, or
+// to the end of the outermost loop around k that it comes into from outside.
+fn _reach(v as i32, k as i32, first as *i32, last as *i32, inner as *i32, par as *i32, hend as *i32) as void {
+    let is i32 as s = _gi(first, v);
+    let is i32 as e with mut = k;
+    let is i32 as h with mut = _gi(inner, k);
+    while (h >= 0 && h > s) {
+        if (_gi(hend, h) > e) { e = _gi(hend, h); }
+        h = _gi(par, h);
+    }
+    if (e > _gi(last, v)) { _pi(last, v, e); }
+}
+
+fn _sight(o as *d.Operand, k as i32, vc as i32, first as *i32) as void {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= vc) { return; }
+    if (_gi(first, o.vreg) < 0 || k < _gi(first, o.vreg)) { _pi(first, o.vreg, k); }
+}
+
+fn _cand(o as *d.Operand, vc as i32, ok as *i32, seen as *i32, st as i32, cand as *i32, nc as i32) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= vc) { return nc; }
+    if (_gi(ok, o.vreg) == 0 || _gi(seen, o.vreg) == st) { return nc; }
+    _pi(seen, o.vreg, st);
+    _pi(cand, nc, o.vreg);
+    return nc + 1;
+}
+
+fn _new_copy(to as i32, from as i32, line as i32) as *d.IRInst {
+    let is *d.IRInst as mv = d.new_inst(d.IR_MOV);
+    mv.dest = d.op_vreg(to);
+    mv.src1 = d.op_vreg(from);
+    mv.line = line;
+    // never merged with the value it copies (alloc_gc.cst)
+    mv.is_extern_call = cast(i8, 3);
+    return mv;
+}
+
+fn fs_split(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc == 0) { return; }
+    let is i32 as n with mut = 0;
+    let is i32 as nl with mut = func.label_count + 1;
+    let is i32 as calls with mut = 0;
+    let is i32 as nj with mut = 0;
+    let is i32 as fp with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.op == d.IR_LABEL && it.dest.label >= nl) { nl = it.dest.label + 1; }
+        if (it.is_dead == 0) {
+            if (_is_call(it.op) == 1) { calls = calls + 1; }
+            if (_is_jump(it.op) == 1) { nj = nj + 1; }
+            if (it.op == d.IR_FADD || it.op == d.IR_FSUB || it.op == d.IR_FMUL || it.op == d.IR_FDIV) { fp = 1; }
+        }
+        n = n + 1;
+        it = it.next;
+    }
+    if (calls == 0 || fp == 0 || nj == 0) { return; }
+
+    let is *i32 as old_class = func.vreg_class;
+    d.infer_vreg_classes(func);
+    let is *i32 as ok = _scalars(func, vc);
+    let is *i64 as ip = cast(*i64, d.opt_alloc(cast(i64, n + 1) * 8));
+    let is *i32 as lpos = _ia(nl, 0 - 1);
+    let is *i32 as ncall = _ia(n + 2, 0);
+    let is *i32 as hend = _ia(n + 2, 0 - 1);
+    let is *i32 as inner = _ia(n + 2, 0 - 1);
+    let is *i32 as par = _ia(n + 2, 0 - 1);
+    let is *i32 as jpos = _ia(nj + 1, 0);
+    let is *i32 as first = _ia(vc, 0 - 1);
+    let is *i32 as fdef = _ia(vc, 0 - 1);
+    let is *i32 as last = _ia(vc, 0 - 1);
+    let is *i32 as wr = _ia(vc, 0 - 1);
+    let is *i32 as seen = _ia(vc, 0 - 1);
+    let is *i32 as stamp = _ia(vc, 0 - 1);
+    let is *i32 as map = _ia(vc, 0);
+    let is *i32 as cand = _ia(vc + 1, 0);
+    let is *i32 as stk = _ia(n + 2, 0);
+
+    // positions, labels, calls, the jumps, first sights, loops
+    let is i32 as k with mut = 0;
+    nj = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        *(cast(*i64, cast(i64, ip) + cast(i64, k) * 8)) = cast(i64, it);
+        let is i32 as c with mut = 0;
+        if (it.is_dead == 0) {
+            if (it.op == d.IR_LABEL && it.dest.label >= 0) { _pi(lpos, it.dest.label, k); }
+            if (_is_call(it.op) == 1) { c = 1; }
+            if (_is_jump(it.op) == 1) {
+                _pi(jpos, nj, k);
+                nj = nj + 1;
+                if (it.dest.op_type == d.OP_LABEL && it.dest.label >= 0 && it.dest.label < nl) {
+                    let is i32 as l = _gi(lpos, it.dest.label);
+                    if (l >= 0 && l <= k && k > _gi(hend, l)) { _pi(hend, l, k); }
+                }
+            }
+            _sight(&it.dest, k, vc, first);
+            _sight(&it.src1, k, vc, first);
+            _sight(&it.src2, k, vc, first);
+            if (_writes_dest(it) == 1 && it.dest.vreg >= 0 && it.dest.vreg < vc && _gi(fdef, it.dest.vreg) < 0) {
+                _pi(fdef, it.dest.vreg, k);
+            }
+        }
+        _pi(ncall, k + 1, _gi(ncall, k) + c);
+        k = k + 1;
+        it = it.next;
+    }
+    // loop nesting
+    let is i32 as sp with mut = 0;
+    k = 0;
+    while (k < n) {
+        while (sp > 0 && _gi(hend, _gi(stk, sp - 1)) < k) { sp = sp - 1; }
+        if (_gi(hend, k) >= 0) {
+            if (sp > 0) { _pi(par, k, _gi(stk, sp - 1)); }
+            _pi(stk, sp, k);
+            sp = sp + 1;
+        }
+        if (sp > 0) { _pi(inner, k, _gi(stk, sp - 1)); }
+        k = k + 1;
+    }
+    // how far each value lives
+    k = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc && _gi(ok, it.dest.vreg) == 1) {
+                _reach(it.dest.vreg, k, first, last, inner, par, hend);
+            }
+            if (it.src1.op_type == d.OP_VREG && it.src1.vreg >= 0 && it.src1.vreg < vc && _gi(ok, it.src1.vreg) == 1) {
+                _reach(it.src1.vreg, k, first, last, inner, par, hend);
+            }
+            if (it.src2.op_type == d.OP_VREG && it.src2.vreg >= 0 && it.src2.vreg < vc && _gi(ok, it.src2.vreg) == 1) {
+                _reach(it.src2.vreg, k, first, last, inner, par, hend);
+            }
+        }
+        k = k + 1;
+        it = it.next;
+    }
+
+    // Each loop with no call, outermost first; a value left in an outer loop
+    // can still be split at an inner one.
+    let is i32 as lh with mut = 1;
+    while (lh < n) {
+        let is i32 as le = _gi(hend, lh);
+        if (le >= 0 && _gi(ncall, le + 1) == _gi(ncall, lh)) {
+            let is i32 as st = lh;
+            let is i32 as nc with mut = 0;
+            let is i32 as i with mut = lh;
+            while (i <= le) {
+                let is *d.IRInst as x = cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, i) * 8)));
+                if (x.is_dead == 0) {
+                    nc = _cand(&x.dest, vc, ok, seen, st, cand, nc);
+                    nc = _cand(&x.src1, vc, ok, seen, st, cand, nc);
+                    nc = _cand(&x.src2, vc, ok, seen, st, cand, nc);
+                    if (_writes_dest(x) == 1 && x.dest.vreg >= 0 && x.dest.vreg < vc) { _pi(wr, x.dest.vreg, st); }
+                }
+                i = i + 1;
+            }
+            if (nc > 0) {
+                // falls in: nothing jumps into the loop, the code before it reaches it
+                let is i32 as enter with mut = 1;
+                let is i32 as simple with mut = 1;
+                let is i32 as j with mut = 0;
+                while (j < nj) {
+                    let is i32 as jk = _gi(jpos, j);
+                    let is *d.IRInst as ji = cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, jk) * 8)));
+                    let is i32 as tgt with mut = 0 - 1;
+                    if (ji.dest.op_type == d.OP_LABEL && ji.dest.label >= 0 && ji.dest.label < nl) { tgt = _gi(lpos, ji.dest.label); }
+                    let is i32 as inside = cast(i32, jk >= lh && jk <= le);
+                    if (tgt < 0) {
+                        if (inside == 1) { simple = 0; }
+                    } else {
+                        let is i32 as into = cast(i32, tgt >= lh && tgt <= le);
+                        if (inside == 0 && into == 1) { enter = 0; }
+                        if (inside == 1 && into == 0) { simple = 0; }
+                    }
+                    j = j + 1;
+                }
+                i = lh - 1;
+                while (i >= 0 && cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, i) * 8))).is_dead == 1) { i = i - 1; }
+                if (i < 0) { enter = 0; }
+                else {
+                    let is i32 as bop = cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, i) * 8))).op;
+                    if (bop == d.IR_JMP || bop == d.IR_RET) { enter = 0; }
+                }
+                let is *d.IRInst as bottom = cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, le) * 8)));
+                if (bottom.op == d.IR_JMP) { simple = 0; }
+                if (enter == 1) {
+                    let is *d.IRInst as before = cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, lh - 1) * 8)));
+                    let is i32 as made with mut = 0;
+                    let is i32 as q with mut = 0;
+                    while (q < nc) {
+                        let is i32 as v = _gi(cand, q);
+                        let is i32 as writes = cast(i32, _gi(wr, v) == st);
+                        if (_gi(fdef, v) >= 0 && _gi(fdef, v) < lh && (writes == 0 || simple == 1)
+                            && _gi(last, v) >= 0 && _gi(first, v) < lh
+                            && _gi(ncall, _gi(last, v)) > _gi(ncall, _gi(first, v) + 1)) {
+                            let is i32 as nv = func.vreg_count;
+                            func.vreg_count = func.vreg_count + 1;
+                            _pi(stamp, v, st);
+                            _pi(map, v, nv);
+                            made = 1;
+                            let is *d.IRInst as inc = _new_copy(nv, v, bottom.line);
+                            inc.next = before.next;
+                            before.next = inc;
+                            if (writes == 1) {
+                                let is *d.IRInst as outc = _new_copy(v, nv, bottom.line);
+                                outc.next = bottom.next;
+                                bottom.next = outc;
+                            }
+                        }
+                        q = q + 1;
+                    }
+                    if (made == 1) {
+                        i = lh;
+                        while (i <= le) {
+                            let is *d.IRInst as x = cast(*d.IRInst, *(cast(*i64, cast(i64, ip) + cast(i64, i) * 8)));
+                            if (x.is_dead == 0) {
+                                _ren(&x.dest, vc, stamp, map, st);
+                                _ren(&x.src1, vc, stamp, map, st);
+                                _ren(&x.src2, vc, stamp, map, st);
+                            }
+                            i = i + 1;
+                        }
+                    }
+                }
+            }
+        }
+        lh = lh + 1;
+    }
+
+    d.opt_free(cast(*u8, func.vreg_class));
+    func.vreg_class = old_class;
+    d.opt_free(cast(*u8, ok)); d.opt_free(cast(*u8, ip)); d.opt_free(cast(*u8, lpos));
+    d.opt_free(cast(*u8, ncall)); d.opt_free(cast(*u8, hend)); d.opt_free(cast(*u8, inner));
+    d.opt_free(cast(*u8, par)); d.opt_free(cast(*u8, jpos)); d.opt_free(cast(*u8, first));
+    d.opt_free(cast(*u8, fdef)); d.opt_free(cast(*u8, last)); d.opt_free(cast(*u8, wr));
+    d.opt_free(cast(*u8, seen)); d.opt_free(cast(*u8, stamp)); d.opt_free(cast(*u8, map));
+    d.opt_free(cast(*u8, cand)); d.opt_free(cast(*u8, stk));
+}
