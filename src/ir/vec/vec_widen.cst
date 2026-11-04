@@ -86,6 +86,7 @@ struct WVal {
 let is *d.IRFunction as W_func with mut = cast(*d.IRFunction, 0);
 let is i32 as W_dry with mut = 0;
 let is i32 as W_vex with mut = 0;
+let is i32 as W_room_done with mut = 0;   // the way into the next _one_loop already tested for room
 let is i32 as W_vf with mut = 0;
 let is i32 as W_ln with mut = 0;
 let is i32 as W_fail with mut = 0;
@@ -1519,6 +1520,39 @@ fn _jmp(ip as *d.IRInst, op as i32, cond as i32, lab as i32) as *d.IRInst {
     return ex.emit(ip, ni);
 }
 
+// 1 when the loop's counter (read by the test lt) was just set to 0 in the
+// straight code ending at `last`, right before the loop: `v = 0`, or a copy of
+// a vreg holding 0 there.
+fn _starts_at_zero(func as *d.IRFunction, last as *d.IRInst, lt as *d.IRInst) as i32 {
+    if (lt.src1.op_type != d.OP_VREG || lt.src1.vreg != W_iv) { return 0; }
+    let is [6]i32 as z;
+    let is i32 as nz with mut = 0;
+    let is *d.IRInst as x with mut = func.instructions;
+    while (cast(i64, x) != 0) {
+        if (x.op == d.IR_LABEL) { nz = 0; }
+        else if (x.is_dead == 0 && x.dest.op_type == d.OP_VREG) {
+            let is i32 as zero with mut = 0;
+            if (x.op == d.IR_IMM && x.src1.imm == 0) { zero = 1; }
+            let is i32 as k with mut = 0;
+            let is i32 as out with mut = 0;
+            while (k < nz) {
+                if (x.op == d.IR_MOV && x.src1.op_type == d.OP_VREG && x.src1.vreg == z[k]) { zero = 1; }
+                if (z[k] != x.dest.vreg) { z[out] = z[k]; out = out + 1; }
+                k = k + 1;
+            }
+            nz = out;
+            if (zero == 1 && nz < 6) { z[nz] = x.dest.vreg; nz = nz + 1; }
+        }
+        if (cast(i64, x) == cast(i64, last)) {
+            let is i32 as j with mut = 0;
+            while (j < nz) { if (z[j] == W_iv) { return 1; } j = j + 1; }
+            return 0;
+        }
+        x = x.next;
+    }
+    return 0;
+}
+
 // branch op to lab on `i + VF - 1 < n`: room for VF more iterations
 fn _room(func as *d.IRFunction, ip0 as *d.IRInst, lt as *d.IRInst, nn as i32, op as i32, lab as i32) as *d.IRInst {
     let is *d.IRInst as ip with mut = ip0;
@@ -1548,6 +1582,8 @@ fn _room(func as *d.IRFunction, ip0 as *d.IRInst, lt as *d.IRInst, nn as i32, op
 // Emit one vector loop (W_vex, W_vf already set) after ip. 0: register budget.
 fn _one_loop(func as *d.IRFunction, ip0 as *d.IRInst, hb as *cfg.BasicBlock, lb as *cfg.BasicBlock,
              jz as *d.IRInst, lt as *d.IRInst, nn as i32, ext as i32, out_ip as *i64) as i32 {
+    let is i32 as room_done = W_room_done;
+    W_room_done = 0;
     W_dry = 0;
     W_remat = 0;
     if (_walk(hb, lb, jz) == 0) { return 0; }
@@ -1584,7 +1620,7 @@ fn _one_loop(func as *d.IRFunction, ip0 as *d.IRInst, hb as *cfg.BasicBlock, lb 
     // vector step) and one at the bottom of the loop
     let is i32 as top = ex.new_label(func);
     let is i32 as skip = ex.new_label(func);
-    ip = _room(func, ip, lt, nn, d.IR_JZ, skip);
+    if (room_done == 0) { ip = _room(func, ip, lt, nn, d.IR_JZ, skip); }
     ip = _link(ip, sh, stl);
     ip = _link(ip, vh, vt);
     ip = _lbl(ip, top);
@@ -1598,6 +1634,13 @@ fn _one_loop(func as *d.IRFunction, ip0 as *d.IRInst, hb as *cfg.BasicBlock, lb 
     ip = ex.emit(ip, ia);
     ip = _room(func, ip, lt, nn, d.IR_JNZ, top);
     ip = _link(ip, W_h2, W_t2);
+    // the upper halves are dirty only if the loop ran: a call too short for it
+    // skips this along with the rest
+    if (W_vex == 1) {
+        let is *d.IRInst as vz = d.new_inst(d.IR_VOP);
+        vz.dest.label = vo.vo_pack(vo.VO_VZU, 8, 1, W_vf, 0); vz.line = W_ln;
+        ip = ex.emit(ip, vz);
+    }
     ip = _lbl(ip, skip);
     *out_ip = cast(i64, ip);
     return 1;
@@ -1744,25 +1787,28 @@ fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Ve
         let is i32 as nn with mut = 0;
         ip = ex._ax_operand(func, ip, &lt.src2, def_inst, def_count, vc, W_ln, &nn);
         let is i32 as Lsse = ex.new_label(func);
+        // the room for the wider vectors first: a call too short for them does
+        // not read the CPU flag
         if (do_avx == 1) {
+            W_vex = 1; W_vf = 32 / W_maxls;
+            let is i32 as no_avx with mut = hlabel;
+            if (do_sse == 1) { no_avx = Lsse; }
+            ip = _room(func, ip, lt, nn, d.IR_JZ, no_avx);
             let is i32 as flag = ex.new_vreg(func);
             let is *d.IRInst as hav = d.new_inst(d.IR_HASAVX2);
             hav.dest.op_type = cast(i8, d.OP_VREG); hav.dest.vreg = flag; hav.line = W_ln;
             ip = ex.emit(ip, hav);
-            if (do_sse == 1) { ip = _jmp(ip, d.IR_JZ, flag, Lsse); } else { ip = _jmp(ip, d.IR_JZ, flag, hlabel); }
-            W_vex = 1; W_vf = 32 / W_maxls;
+            ip = _jmp(ip, d.IR_JZ, flag, no_avx);
             let is i64 as nip with mut = 0;
-            if (_one_loop(func, ip, hb, lb, jz, lt, nn, ext, &nip) == 1) {
-                ip = cast(*d.IRInst, nip);
-                let is *d.IRInst as vz = d.new_inst(d.IR_VOP);
-                vz.dest.label = vo.vo_pack(vo.VO_VZU, 8, 1, W_vf, 0); vz.line = W_ln;
-                ip = ex.emit(ip, vz);
-            }
+            W_room_done = 1;
+            if (_one_loop(func, ip, hb, lb, jz, lt, nn, ext, &nip) == 1) { ip = cast(*d.IRInst, nip); }
         }
         if (do_sse == 1 && W_fail == 0) {
             if (do_avx == 1) { ip = _lbl(ip, Lsse); }
             W_vex = 0; W_vf = 16 / W_maxls;
             let is i64 as nip with mut = 0;
+            // alone it has the room test in front of the overlap tests
+            if (do_avx == 0 && npair > 0) { W_room_done = 1; }
             if (_one_loop(func, ip, hb, lb, jz, lt, nn, ext, &nip) == 1) { ip = cast(*d.IRInst, nip); }
         }
         if (W_fail == 0) {
@@ -1778,8 +1824,15 @@ fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Ve
             } else {
                 let is i32 as n2 with mut = 0;
                 jp = ex._ax_operand(func, jp, &lt.src2, def_inst, def_count, vc, W_ln, &n2);
+                // a loop too short for the narrowest vector skips the tests too
+                W_vf = 16 / W_maxls;
+                if (do_sse == 0) { W_vf = 32 / W_maxls; }
+                jp = _room(func, jp, lt, n2, d.IR_JZ, hlabel);
+                // starting from 0 the ranges are just base + off and n * elem
+                let is i32 as from0 with mut = 0;
+                if (W_desc == 0) { from0 = _starts_at_zero(func, prev, lt); }
                 let is i32 as i0 with mut = 0;
-                jp = ex._ax_operand(func, jp, &lt.src1, def_inst, def_count, vc, W_ln, &i0);
+                if (from0 == 0) { jp = ex._ax_operand(func, jp, &lt.src1, def_inst, def_count, vc, W_ln, &i0); }
                 if (W_desc == 1) {
                     // counting down from i to lo (or lo + 1): the indices [lo, i + 1)
                     let is i32 as hi with mut = 0;
@@ -1788,16 +1841,17 @@ fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Ve
                     if (lt.op == d.IR_GT) { jp = ex.emit_adj_base(func, jp, n2, 1, W_ln, &lo); }
                     i0 = lo; n2 = hi;
                 }
-                let is i32 as cnt with mut = 0;
-                jp = ex.emit_vv(func, jp, d.IR_SUB, n2, i0, W_ln, &cnt);
+                let is i32 as cnt with mut = n2;
+                if (from0 == 0) { jp = ex.emit_vv(func, jp, d.IR_SUB, n2, i0, W_ln, &cnt); }
                 let is *i32 as st = cast(*i32, d.opt_alloc(cast(i64, W_nm + 1) * 4));
                 let is *i32 as en = cast(*i32, d.opt_alloc(cast(i64, W_nm + 1) * 4));
                 let is i32 as m with mut = 0;
                 while (m < W_nm) {
                     let is i32 as lop with mut = d.IR_LEA8;
                     if (W_m_ls[m] == 2) { lop = d.IR_LEA2; } else if (W_m_ls[m] == 4) { lop = d.IR_LEA4; }
-                    let is i32 as s0 with mut = 0;
-                    if (W_m_ls[m] == 1) { jp = ex.emit_vv(func, jp, d.IR_ADD, W_m_base[m], i0, W_ln, &s0); }
+                    let is i32 as s0 with mut = W_m_base[m];
+                    if (from0 == 1) { }
+                    else if (W_m_ls[m] == 1) { jp = ex.emit_vv(func, jp, d.IR_ADD, W_m_base[m], i0, W_ln, &s0); }
                     else { jp = ex.emit_lea(func, jp, lop, W_m_base[m], i0, W_ln, &s0); }
                     let is i32 as s1 with mut = 0;
                     jp = ex.emit_adj_base(func, jp, s0, W_m_off[m], W_ln, &s1);
@@ -1807,24 +1861,35 @@ fn vectorize_widen(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.Ve
                     st[m] = s1; en[m] = e1;
                     m = m + 1;
                 }
-                let is i32 as any with mut = cast(i32, 0 - 1);
+                // Each pair overlaps when st[a] < en[b] and st[b] < en[a]: two
+                // compares and branches, the first of which usually decides.
+                let is i32 as Lsc = ex.new_label(func);
+                let is i32 as pi with mut = 0;
                 let is i32 as a with mut = 0;
                 while (a < W_nm) {
                     let is i32 as b with mut = 0;
                     while (b < W_nm) {
                         if (a != b && W_m_w[a] == 1 && W_m_base[a] != W_m_base[b] && (W_m_w[b] == 0 || a < b)) {
+                            pi = pi + 1;
                             let is i32 as t1 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_LT, st[a], en[b], W_ln, &t1);
-                            let is i32 as t2 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_LT, st[b], en[a], W_ln, &t2);
-                            let is i32 as ov with mut = 0; jp = ex.emit_vv(func, jp, d.IR_AND, t1, t2, W_ln, &ov);
-                            if (any < 0) { any = ov; }
-                            else { let is i32 as o2 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_OR, any, ov, W_ln, &o2); any = o2; }
+                            if (pi == npair) {
+                                jp = _jmp(jp, d.IR_JZ, t1, Lvec);
+                                let is i32 as t2 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_LT, st[b], en[a], W_ln, &t2);
+                                jp = _jmp(jp, d.IR_JZ, t2, Lvec);
+                            } else {
+                                let is i32 as Lnx = ex.new_label(func);
+                                jp = _jmp(jp, d.IR_JZ, t1, Lnx);
+                                let is i32 as t2 with mut = 0; jp = ex.emit_vv(func, jp, d.IR_LT, st[b], en[a], W_ln, &t2);
+                                jp = _jmp(jp, d.IR_JNZ, t2, Lsc);
+                                jp = _lbl(jp, Lnx);
+                            }
                         }
                         b = b + 1;
                     }
                     a = a + 1;
                 }
                 d.opt_free(cast(*u8, st)); d.opt_free(cast(*u8, en));
-                jp = _jmp(jp, d.IR_JZ, any, Lvec);
+                jp = _lbl(jp, Lsc);
             }
             jp.next = prev.next;
             prev.next = h2.next;

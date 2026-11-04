@@ -544,6 +544,47 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
                 }
             }
 
+            // the bits of a constant are the constant: an IR_IMM holds bits
+            if (op == d.IR_BITS && inst.src1.op_type == d.OP_VREG
+                && *cast(*i32, cast(i64, is_const) + cast(i64, inst.src1.vreg) * 4) == 1) {
+                let is i64 as bv = *cast(*i64, cast(i64, imm_val) + cast(i64, inst.src1.vreg) * 8);
+                inst.op = d.IR_IMM;
+                inst.src1 = d.op_imm(bv);
+                *cast(*i32, cast(i64, is_const) + cast(i64, inst.dest.vreg) * 4) = 1;
+                *cast(*i64, cast(i64, imm_val) + cast(i64, inst.dest.vreg) * 8) = bv;
+            }
+
+            // f64 arithmetic on constants: the same IEEE operation the program
+            // would run. A NaN stays at run time, its bits are the machine's.
+            if ((op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV)
+                && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG
+                && d.ty_is_f64(inst.cast_to) == 1) {
+                let is i32 as fa = inst.src1.vreg;
+                let is i32 as fb = inst.src2.vreg;
+                if (*cast(*i32, cast(i64, is_const) + cast(i64, fa) * 4) == 1
+                    && *cast(*i32, cast(i64, is_const) + cast(i64, fb) * 4) == 1) {
+                    let is i64 as ba with mut = *cast(*i64, cast(i64, imm_val) + cast(i64, fa) * 8);
+                    let is i64 as bb with mut = *cast(*i64, cast(i64, imm_val) + cast(i64, fb) * 8);
+                    let is f64 as x = *cast(*f64, &ba);
+                    let is f64 as y = *cast(*f64, &bb);
+                    let is f64 as fr with mut = 0.0;
+                    if (op == d.IR_FADD) { fr = x + y; }
+                    if (op == d.IR_FSUB) { fr = x - y; }
+                    if (op == d.IR_FMUL) { fr = x * y; }
+                    if (op == d.IR_FDIV) { fr = x / y; }
+                    if (fr == fr) {
+                        let is i64 as frb = *cast(*i64, &fr);
+                        inst.op = d.IR_IMM;
+                        inst.src1.op_type = d.OP_IMM;
+                        inst.src1.imm = frb;
+                        inst.src2.op_type = d.OP_NONE;
+                        let is i32 as fdv = inst.dest.vreg;
+                        *cast(*i32, cast(i64, is_const) + cast(i64, fdv) * 4) = 1;
+                        *cast(*i64, cast(i64, imm_val) + cast(i64, fdv) * 8) = frb;
+                    }
+                }
+            }
+
             // Identity elimination and constant folding for binary ops
             if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL ||
                 op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR ||
@@ -792,6 +833,13 @@ fn pass_const_copy_prop(func as *d.IRFunction, is_const as *i32, imm_val as *i64
 
 // A pointer to an 8-byte scalar (i64, u64, f64 or a pointer): a load or store
 // through it covers the whole slot, whatever the slot was declared as.
+// (An f64 read as an integer, or the other way round, is the program asking for
+// the bits: that stays a load, a copy between the register classes would not be.)
+fn _word_is_f64(t as *u8) as i32 {
+    let is *u8 as b = *cast(**u8, cast(i64, t) + 4);
+    return cast(i32, *cast(*i32, b) == 10);
+}
+
 fn _word_ptr(t as *u8) as i32 {
     if (cast(i64, t) == 0) { return 0; }
     if (*cast(*i32, t) != 14) { return 0; }
@@ -866,7 +914,8 @@ fn pass_addr_fusion(func as *d.IRFunction, vc_alloc as i32) as void {
             let is i32 as cd = inst.dest.vreg;
             if (cv >= 0 && cv < vc_alloc && cd >= 0 && cd < vc_alloc
                 && addr_offset[cv] >= 0 && use_count[cv] == 1
-                && _word_ptr(inst.cast_from) == 1 && _word_ptr(inst.cast_to) == 1) {
+                && _word_ptr(inst.cast_from) == 1 && _word_ptr(inst.cast_to) == 1
+                && _word_is_f64(inst.cast_from) == _word_is_f64(inst.cast_to)) {
                 addr_offset[cd] = addr_offset[cv];
                 via[cd] = cv;
             }
@@ -1042,3 +1091,63 @@ fn pass_store_load_fwd(func as *d.IRFunction) as void {
     }
 }
 
+// === Additions of constants, one after the other ===
+//
+// -O2, on the SSA form: x2 = x1 + c2 with x1 = x0 + c1 is x2 = x0 + (c1 + c2),
+// of the same width (a narrow sum wraps the same either way). What is left of
+// x1 goes in DCE, and an address that was two steps from its base is one, a
+// displacement for the access that reads it. Unrolling a loop leaves these:
+// the pointer that stepped through it, one step per copy.
+fn _ac_size(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 8; }
+    return *cast(*i32, cast(i64, t) + 28);
+}
+
+fn pass_add_chain(func as *d.IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    if (vc <= 0) { return; }
+    let is *i64 as def = cast(*i64, d.opt_alloc(cast(i64, vc) * 8));
+    let is *u8 as many = d.opt_alloc(cast(i64, vc) + 1);
+    let is i32 as i with mut = 0;
+    while (i < vc) {
+        *cast(*i64, cast(i64, def) + cast(i64, i) * 8) = 0;
+        many[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < vc
+            && it.op != d.IR_STORE && it.op != d.IR_COPY && it.op != d.IR_VSTOREQ && it.op != d.IR_VSTOREQ256) {
+            let is *i64 as q = cast(*i64, cast(i64, def) + cast(i64, it.dest.vreg) * 8);
+            if (*q != 0) { many[it.dest.vreg] = cast(u8, 1); }
+            *q = cast(i64, it);
+        }
+        it = it.next;
+    }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_ADD || it.op == d.IR_SUB)
+            && it.src1.op_type == d.OP_VREG && it.src2.op_type == d.OP_IMM
+            && it.src1.vreg >= 0 && it.src1.vreg < vc && many[it.src1.vreg] == cast(u8, 0)) {
+            let is *d.IRInst as a = cast(*d.IRInst, *cast(*i64, cast(i64, def) + cast(i64, it.src1.vreg) * 8));
+            if (cast(i64, a) != 0 && a.is_dead == 0 && (a.op == d.IR_ADD || a.op == d.IR_SUB)
+                && a.src1.op_type == d.OP_VREG && a.src2.op_type == d.OP_IMM
+                && a.src1.vreg >= 0 && a.src1.vreg < vc && many[a.src1.vreg] == cast(u8, 0)
+                && a.src1.vreg != it.dest.vreg && _ac_size(a.cast_to) == _ac_size(it.cast_to)) {
+                let is i64 as c1 with mut = a.src2.imm;
+                let is i64 as c2 with mut = it.src2.imm;
+                if (a.op == d.IR_SUB) { c1 = 0 - c1; }
+                if (it.op == d.IR_SUB) { c2 = 0 - c2; }
+                let is i64 as c = c1 + c2;
+                if (c >= 0 - 2147483647 && c <= 2147483647) {
+                    it.op = cast(i8, d.IR_ADD);
+                    it.src1 = d.op_vreg(a.src1.vreg);
+                    it.src2 = d.op_imm(c);
+                }
+            }
+        }
+        it = it.next;
+    }
+    d.opt_free(cast(*u8, def));
+    d.opt_free(many);
+}

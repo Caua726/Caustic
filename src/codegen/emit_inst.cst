@@ -163,6 +163,24 @@ fn _emit_magic_div_s64(d_imm as i64) as void {
 fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     if (op == d.IR_IMM) {
+        let is i32 as il = al.get_loc(inst.dest.vreg, ctx);
+        if (il >= 16 && il <= 31) {
+            // a float constant (d._classify_float_imms)
+            let is *u8 as xr = eo.reg_xmm(il);
+            if (inst.src1.imm == 0) {
+                eo.out_str("  pxor ", 7); eo.out_cstr(xr); eo.out_str(", ", 2); eo.out_cstr(xr); eo.out_char(10);
+                return;
+            }
+            let is i32 as pk = eo.fc_index(inst.src1.imm);
+            if (pk >= 0) {
+                eo.out_str("  movsd ", 8); eo.out_cstr(xr); eo.out_str(", ", 2);
+                eo.fc_out_ref(cast(i64, pk)); eo.out_char(10);
+                return;
+            }
+            eo.out_str("  mov rax, ", 11); eo.out_int(inst.src1.imm); eo.out_char(10);
+            e.store_op(inst.dest.vreg, ctx, "rax");
+            return;
+        }
         e.emit_mov_imm(inst.dest.vreg, ctx, inst.src1.imm);
         return;
     }
@@ -217,6 +235,7 @@ fn gen_inst_imm_mov(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
 fn gen_inst_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     // (an address the next access takes into its addressing)
     if (e.try_addr_add(inst, ctx) == 1) { return; }
+    if (ev.try_vec_lea(inst, ctx) == 1) { return; }
     let is i32 as scale_val with mut = 4;
     if (inst.op == d.IR_LEA2) { scale_val = 2; }
     else if (inst.op == d.IR_LEA8) { scale_val = 8; }
@@ -237,6 +256,9 @@ fn gen_inst_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     eo.out_cstr(ir);
     eo.out_str(" * ", 3);
     eo.out_int(cast(i64, scale_val));
+    // (the constant of the index, lea_disp_fold)
+    if (al.al_opt_level >= 2 && inst.src2.imm > 0) { eo.out_str(" + ", 3); eo.out_int(inst.src2.imm); }
+    else if (al.al_opt_level >= 2 && inst.src2.imm < 0) { eo.out_str(" - ", 3); eo.out_int(0 - inst.src2.imm); }
     eo.out_str("]\n", 2);
     if (al.al_opt_level >= 1) {
         eo.rc_invalidate_reg(eo.reg_name_to_idx(dr));
@@ -285,6 +307,9 @@ fn cmov_users(c as *d.IRInst) as i32 {
         if (w.op == d.IR_CMOV && w.src1.op_type == d.OP_VREG && w.src1.vreg == v && w.dest.vreg != v) {
             n = n + 1; w = _next_live(w);
         } else if (w.op == d.IR_MOV && w.src1.op_type == d.OP_VREG && w.dest.op_type == d.OP_VREG && w.dest.vreg != v) {
+            w = _next_live(w);
+        } else if (w.op == d.IR_IMM && w.dest.op_type == d.OP_VREG && w.dest.vreg != v) {
+            // (the value a CMOV takes: a mov of a constant leaves the flags alone)
             w = _next_live(w);
         } else { go = 0; }
     }
@@ -416,24 +441,40 @@ fn try_arg_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
 }
 
 // -O2: `y = x +/- k` with x and y in different registers is one
-// `lea y, [x +/- k]` instead of `mov y, x` then `add`/`sub`. No IR reads the
-// flags an ADD/SUB leaves (compares set their own).
+// `lea y, [x +/- k]` instead of `mov y, x` then `add`/`sub`, and so is
+// `y = a + b`. No IR reads the flags an ADD/SUB leaves (compares set their own).
+// A narrow result is truncated just as gen_binop does.
 fn try_copy_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     if (al.al_opt_level < 2) { return 0; }
-    if (inst.src2.op_type != d.OP_IMM || inst.src1.op_type != d.OP_VREG || inst.dest.op_type != d.OP_VREG) { return 0; }
-    if (inst.src2.imm > 2147483647 || inst.src2.imm < 0 - 2147483647) { return 0; }
-    if (_wide64(inst.cast_to) == 0) { return 0; }
+    if (inst.src1.op_type != d.OP_VREG || inst.dest.op_type != d.OP_VREG) { return 0; }
     let is i32 as sl = al.get_loc(inst.src1.vreg, ctx);
     let is i32 as dl = al.get_loc(inst.dest.vreg, ctx);
     if (sl < 0 || sl >= 16 || dl < 0 || dl >= 16 || sl == dl) { return 0; }
-    let is i64 as k with mut = inst.src2.imm;
-    if (inst.op == d.IR_SUB) { k = 0 - k; }
-    eo.out_str("  lea ", 6); eo.out_cstr(eo.reg64(dl)); eo.out_str(", [", 3);
-    eo.out_cstr(eo.reg64(sl));
-    if (k >= 0) { eo.out_str(" + ", 3); eo.out_int(k); }
-    else { eo.out_str(" - ", 3); eo.out_int(0 - k); }
-    eo.out_str("]\n", 2);
-    e.store_op(inst.dest.vreg, ctx, eo.reg64(dl));
+    if (inst.src2.op_type == d.OP_VREG) {
+        // `y = a + b`, y neither of them: the same one lea
+        if (inst.op != d.IR_ADD) { return 0; }
+        let is i32 as bl = al.get_loc(inst.src2.vreg, ctx);
+        if (bl < 0 || bl >= 16 || bl == dl) { return 0; }
+        eo.out_str("  lea ", 6); eo.out_cstr(eo.reg64(dl)); eo.out_str(", [", 3);
+        eo.out_cstr(eo.reg64(sl)); eo.out_str(" + ", 3); eo.out_cstr(eo.reg64(bl));
+        eo.out_str("]\n", 2);
+    } else {
+        if (inst.src2.op_type != d.OP_IMM) { return 0; }
+        if (inst.src2.imm > 2147483647 || inst.src2.imm < 0 - 2147483647) { return 0; }
+        let is i64 as k with mut = inst.src2.imm;
+        if (inst.op == d.IR_SUB) { k = 0 - k; }
+        eo.out_str("  lea ", 6); eo.out_cstr(eo.reg64(dl)); eo.out_str(", [", 3);
+        eo.out_cstr(eo.reg64(sl));
+        if (k >= 0) { eo.out_str(" + ", 3); eo.out_int(k); }
+        else { eo.out_str(" - ", 3); eo.out_int(0 - k); }
+        eo.out_str("]\n", 2);
+    }
+    if (_wide64(inst.cast_to) == 1) {
+        e.store_op(inst.dest.vreg, ctx, eo.reg64(dl));
+    } else {
+        eo.rc_invalidate_reg(dl);
+        e.emit_narrow_truncate(dl, inst.cast_to);
+    }
     return 1;
 }
 
@@ -822,10 +863,7 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is i64 as disp with mut = 0;
         if (inst.src2.op_type == d.OP_IMM) { disp = inst.src2.imm; }
         let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
-        let is i32 as rbit with mut = 1; if (dn >= 8) { rbit = 0; }
-        let is i32 as bbit with mut = 1; if (bs >= 8) { bbit = 0; }
-        ev._bo(); ev._bb(196); ev._bb(rbit * 128 + 64 + bbit * 32 + 1); ev._bb(126); ev._bb(111);   // F3,L=1; vmovdqu load
-        ev.vmodrm(dn, bs, disp); ev._be();
+        ev.enc_ymm_mem(111, dn, bs, disp);
         return;
     }
     if (op == d.IR_VADDQ256 || op == d.IR_VADDD256 || op == d.IR_VADDPD256
@@ -969,10 +1007,7 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is i64 as disp with mut = 0;
         if (inst.dest.op_type == d.OP_IMM) { disp = inst.dest.imm; }
         let is i32 as sn = _vec_num(inst.src2.vreg, ctx);
-        let is i32 as rbit with mut = 1; if (sn >= 8) { rbit = 0; }   // R = reg field = source
-        let is i32 as bbit with mut = 1; if (bs >= 8) { bbit = 0; }
-        ev._bo(); ev._bb(196); ev._bb(rbit * 128 + 64 + bbit * 32 + 1); ev._bb(126); ev._bb(127);   // F3,L=1; vmovdqu store
-        ev.vmodrm(sn, bs, disp); ev._be();
+        ev.enc_ymm_mem(127, sn, bs, disp);
         return;
     }
     if (op == d.IR_VREDUCEQ256) {
@@ -1502,6 +1537,8 @@ fn _xmm_of(vreg as i32, ctx as *al.AllocCtx, scratch as *u8) as *u8 {
 // stale: the immediate is the raw IEEE bits and must be used as such
 // (tests/float_cmp_imm_test.cst). `zero_eax` emits `xor eax, eax` before the
 // compare, for the setcc form (xor would clobber the flags after it).
+let is i32 as fcf_rev with mut = 0;   // the constant src2 on the left: `c > a` for `a < c`
+
 fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as void {
     let is i32 as sg1 = e.f32s_is(inst.src1.vreg);
     let is i32 as sg2 with mut = 0;
@@ -1516,7 +1553,9 @@ fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as 
     let is i32 as spilled2 with mut = 0;
     let is i64 as off2 with mut = 0;
     let is i32 as fconst2 = inst.src2.op_type == d.OP_FCONST;
-    if (inst.src2.op_type == d.OP_IMM) {
+    if (inst.src2.op_type == d.OP_IMM && inst.src2.imm == 0 && al.al_opt_level >= 2) {
+        eo.out_line("pxor xmm1, xmm1");
+    } else if (inst.src2.op_type == d.OP_IMM) {
         eo.out_str("  mov rcx, ", 11); eo.out_int(inst.src2.imm); eo.out_char(10);
         eo.out_line("movq xmm1, rcx");
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(1); }
@@ -1533,6 +1572,14 @@ fn _float_cmp_flags(inst as *d.IRInst, ctx as *al.AllocCtx, zero_eax as i32) as 
     if (zero_eax == 1) {
         eo.out_line("xor eax, eax");
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
+    }
+    if (fcf_rev == 1) {
+        fcf_rev = 0;
+        if (fconst2 == 1) {
+            eo.out_str("  movsd xmm1, ", 14); eo.fc_out_ref(inst.src2.imm); eo.out_char(10);
+        }
+        eo.out_str("  ucomisd xmm1, ", 16); eo.out_cstr(a); eo.out_char(10);
+        return;
     }
     if (both == 1) { eo.out_str("  ucomiss ", 10); } else { eo.out_str("  ucomisd ", 10); }
     eo.out_cstr(a); eo.out_str(", ", 2);
@@ -1676,8 +1723,25 @@ fn _cmp32_flags(inst as *d.IRInst, ctx as *al.AllocCtx, s1 as i32, w as i32) as 
 }
 
 fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
-    let is i32 as op = inst.op;
     let is i32 as is_flt = e.is_float_type(inst.cast_to);
+    // a < b is b > a, and "above" is false on unordered by itself: the form
+    // that needs no parity check.
+    if (al.al_opt_level >= 2 && is_flt == 1 && (inst.op == d.IR_LT || inst.op == d.IR_LE)
+        && inst.src1.op_type == d.OP_VREG && inst.src2.op_type == d.OP_VREG) {
+        let is i32 as sw = inst.src1.vreg;
+        inst.src1.vreg = inst.src2.vreg;
+        inst.src2.vreg = sw;
+        if (inst.op == d.IR_LT) { inst.op = d.IR_GT; } else { inst.op = d.IR_GE; }
+    }
+    let is i32 as op with mut = inst.op;
+    // The same with a constant: it goes in xmm1, on the left.
+    fcf_rev = 0;
+    if (al.al_opt_level >= 2 && is_flt == 1 && (op == d.IR_LT || op == d.IR_LE)
+        && inst.src1.op_type == d.OP_VREG && (inst.src2.op_type == d.OP_FCONST || inst.src2.op_type == d.OP_IMM)
+        && e.f32s_is(inst.src1.vreg) == 0) {
+        fcf_rev = 1;
+        if (op == d.IR_LT) { op = d.IR_GT; } else { op = d.IR_GE; }
+    }
     let is i32 as fused with mut = 0;
     let is *d.IRInst as nx = inst.next;
     let is i32 as and_t = test_and_vreg;
@@ -1780,6 +1844,16 @@ fn gen_inst_compare(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             cmov_cond = inst.dest.vreg;
             cmov_left = nc;
             cmov_cc = _cc_of(op, e.is_signed_type(inst.cast_to));
+            fused = 1;
+        }
+    }
+    if (fused == 0 && is_flt == 1 && ld_t < 0 && (op == d.IR_GT || op == d.IR_GE)) {
+        let is i32 as nf = cmov_users(inst);
+        if (nf > 0) {
+            _float_cmp_flags(inst, ctx, 0);
+            cmov_cond = inst.dest.vreg;
+            cmov_left = nf;
+            cmov_cc = _cc_of(op, 0);
             fused = 1;
         }
     }
@@ -1956,6 +2030,17 @@ fn gen_inst_control(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         eo.out_int(cast(i64, inst.dest.label + label_base));
         eo.out_char(10);
         return;
+    }
+    if (al.al_opt_level >= 2 && (op == d.IR_JZ || op == d.IR_JNZ)) {
+        let is i32 as jl = al.get_loc(inst.src1.vreg, ctx);
+        if (jl >= 0 && jl < 16) {
+            let is *u8 as jr = eo.reg64(jl);
+            eo.out_str("  test ", 7); eo.out_cstr(jr); eo.out_str(", ", 2); eo.out_cstr(jr); eo.out_char(10);
+            if (op == d.IR_JZ) { eo.out_str("  jz .L", 7); } else { eo.out_str("  jnz .L", 8); }
+            eo.out_int(cast(i64, inst.dest.label + label_base));
+            eo.out_char(10);
+            return;
+        }
     }
     if (op == d.IR_JZ) {
         e.load_op(inst.src1.vreg, ctx, "rax");
@@ -2746,6 +2831,8 @@ fn gen_inst_calls(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             return;
         }
         if (inst.is_extern_call == 0 && try_call_add(inst, ctx) == 1) { return; }
+        // a result nobody reads stays where it is
+        if (al.al_opt_level >= 2 && inst.dest.op_type == d.OP_VREG && e.isel_get_uses(inst.dest.vreg) == 0) { return; }
         e.store_op(inst.dest.vreg, ctx, "rax");
         return;
     }

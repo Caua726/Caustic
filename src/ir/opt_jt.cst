@@ -1,0 +1,364 @@
+// Jump threading (-O2, on the IR after the SSA form).
+//
+// A jump whose path fixes the value the block it lands on tests goes straight
+// to where that test leads. The usual case is a function returning constants,
+// inlined and tested by its caller:
+//
+//     v = -1; jmp L        ...        L: t = v < 0; jz t, X; ...
+//
+// Only tests are skipped: constants, copies and casts of constants, comparisons
+// of them. A value they define that is read elsewhere too is set to its constant
+// in front of the jump (the read may well be on a path this jump no longer
+// takes). A label that a later jump targets (a loop header) is where the walk
+// stops, so a loop keeps its one entry. The caller optimizes the function again:
+// the blocks and copies this leaves without a reader go away there.
+
+use "defs.cst" as d;
+use "opt_sccp.cst" as sccp;
+
+let is i32 as JT_ENV with imut = 24;
+let is i32 as JT_SKIP with imut = 12;
+let is i32 as JT_STEPS with imut = 32;
+
+struct Env {
+    n as i32;
+    v as [24]i32;
+    c as [24]i64;
+}
+
+struct Skipped {
+    n as i32;
+    full as i32;                // something was skipped that the list cannot hold
+    v as [12]i32;
+    reads as [12]i32;
+    mat as [12]u8;              // can be set to its constant in front of the jump
+}
+
+struct Tables {
+    uses as *i32;
+    known as *u8;               // vreg with one definition, an IR_IMM
+    value as *i64;
+    lab as *i64;                // label -> its IR_LABEL
+    back as *u8;                // label targeted from further down
+    cap as i32;
+    vregs as i32;
+}
+
+fn _env_kill(e as *Env, v as i32) as void {
+    let is i32 as k with mut = 0;
+    while (k < e.n) {
+        if (e.v[k] == v) {
+            e.n = e.n - 1;
+            e.v[k] = e.v[e.n];
+            e.c[k] = e.c[e.n];
+            return;
+        }
+        k = k + 1;
+    }
+}
+
+fn _env_set(e as *Env, v as i32, c as i64) as void {
+    _env_kill(e, v);
+    if (e.n < JT_ENV) {
+        e.v[e.n] = v;
+        e.c[e.n] = c;
+        e.n = e.n + 1;
+    }
+}
+
+fn _value(o as *d.Operand, e as *Env, t as *Tables, out as *i64) as i32 {
+    if (o.op_type == d.OP_IMM) { *out = o.imm; return 1; }
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= t.vregs) { return 0; }
+    let is i32 as k with mut = 0;
+    while (k < e.n) {
+        if (e.v[k] == o.vreg) { *out = e.c[k]; return 1; }
+        k = k + 1;
+    }
+    if (t.known[o.vreg] == cast(u8, 1)) { *out = t.value[o.vreg]; return 1; }
+    return 0;
+}
+
+fn _sk_def(s as *Skipped, v as i32, it as *d.IRInst) as void {
+    let is i32 as k with mut = 0;
+    while (k < s.n) {
+        if (s.v[k] == v) { return; }
+        k = k + 1;
+    }
+    if (s.n >= JT_SKIP) { s.full = 1; return; }
+    s.v[s.n] = v;
+    s.reads[s.n] = 0;
+    s.mat[s.n] = cast(u8, 0);
+    if (it.op != d.IR_MOV) { s.mat[s.n] = cast(u8, 1); }
+    s.n = s.n + 1;
+}
+
+fn _sk_read(s as *Skipped, o as *d.Operand) as void {
+    if (o.op_type != d.OP_VREG) { return; }
+    let is i32 as k with mut = 0;
+    while (k < s.n) {
+        if (s.v[k] == o.vreg) { s.reads[k] = s.reads[k] + 1; return; }
+        k = k + 1;
+    }
+}
+
+// Everything the skipped code defined and something past it reads can be set in
+// front of the jump, from the constants of this path.
+fn _sk_closed(s as *Skipped, e as *Env, t as *Tables) as i32 {
+    if (s.full != 0) { return 0; }
+    let is i32 as k with mut = 0;
+    while (k < s.n) {
+        if (t.uses[s.v[k]] != s.reads[k]) {
+            if (s.mat[k] == cast(u8, 0)) { return 0; }
+            let is i32 as q with mut = 0;
+            let is i32 as seen with mut = 0;
+            while (q < e.n) { if (e.v[q] == s.v[k]) { seen = 1; } q = q + 1; }
+            if (seen == 0) { return 0; }
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _sk_copy(a as *Skipped, b as *Skipped) as void {
+    a.n = b.n;
+    a.full = b.full;
+    let is i32 as k with mut = 0;
+    while (k < b.n) { a.v[k] = b.v[k]; a.reads[k] = b.reads[k]; a.mat[k] = b.mat[k]; k = k + 1; }
+}
+
+fn _is_cmp(op as i32) as i32 {
+    return cast(i32, op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE
+                     || op == d.IR_GT || op == d.IR_GE);
+}
+
+fn _compare(op as i32, a as i64, b as i64, ty as *u8) as i64 {
+    let is i32 as lt with mut = 0;
+    let is i32 as gt with mut = 0;
+    if (sccp._ty_signed(ty) == 1) { lt = cast(i32, a < b); gt = cast(i32, a > b); }
+    else { lt = sccp._ult(a, b); gt = sccp._ult(b, a); }
+    if (op == d.IR_EQ) { return cast(i64, a == b); }
+    if (op == d.IR_NE) { return cast(i64, a != b); }
+    if (op == d.IR_LT) { return cast(i64, lt); }
+    if (op == d.IR_LE) { return cast(i64, gt == 0); }
+    if (op == d.IR_GT) { return cast(i64, gt); }
+    return cast(i64, lt == 0);
+}
+
+fn _lab_at(t as *Tables, l as i32) as *d.IRInst {
+    if (l < 0 || l >= t.cap) { return cast(*d.IRInst, 0); }
+    return cast(*d.IRInst, t.lab[l]);
+}
+
+// Follow j from its target with the constants of its path. 1 if it moved.
+fn _thread(func as *d.IRFunction, prev as *d.IRInst, j as *d.IRInst, path as *Env, t as *Tables) as i32 {
+    let is Env as e;
+    mem_copy_env(&e, path);
+    let is Skipped as s;
+    s.n = 0;
+    s.full = 0;
+    let is Env as be;
+    be.n = 0;
+    let is Skipped as bs;
+    bs.n = 0;
+    bs.full = 0;
+    let is i32 as to_label with mut = 0 - 1;
+    let is *d.IRInst as to_after with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as cur with mut = _lab_at(t, j.dest.label);
+    let is i32 as steps with mut = 0;
+    let is i32 as go with mut = 1;
+    while (go == 1 && steps < JT_STEPS && cast(i64, cur) != 0) {
+        steps = steps + 1;
+        let is *d.IRInst as nx with mut = cur.next;
+        if (cur.is_dead == 0) {
+            let is i32 as op = cur.op;
+            let is i64 as a with mut = 0;
+            let is i64 as b with mut = 0;
+            if (op == d.IR_LABEL) {
+                if (cur.dest.label >= 0 && cur.dest.label < t.cap && t.back[cur.dest.label] == cast(u8, 1)) { go = 0; }
+            } else if (op == d.IR_IMM && cur.dest.op_type == d.OP_VREG && cur.src1.op_type == d.OP_IMM
+                       && sccp._ty_ok(cur.cast_to) == 1) {
+                _sk_def(&s, cur.dest.vreg, cur);
+                _env_set(&e, cur.dest.vreg, cur.src1.imm);
+            } else if (op == d.IR_MOV && cur.dest.op_type == d.OP_VREG && _value(&cur.src1, &e, t, &a) == 1) {
+                _sk_read(&s, &cur.src1);
+                _sk_def(&s, cur.dest.vreg, cur);
+                _env_set(&e, cur.dest.vreg, a);
+            } else if (op == d.IR_CAST && cur.dest.op_type == d.OP_VREG && sccp._ty_ok(cur.cast_to) == 1
+                       && sccp._ty_ok(cur.cast_from) == 1 && cast(i64, cur.cast_to) != 0
+                       && _value(&cur.src1, &e, t, &a) == 1) {
+                _sk_read(&s, &cur.src1);
+                _sk_def(&s, cur.dest.vreg, cur);
+                _env_set(&e, cur.dest.vreg, sccp._narrow(a, cur.cast_to));
+            } else if (_is_cmp(op) == 1 && cur.dest.op_type == d.OP_VREG && sccp._ty_ok(cur.cast_to) == 1
+                       && _value(&cur.src1, &e, t, &a) == 1 && _value(&cur.src2, &e, t, &b) == 1) {
+                _sk_read(&s, &cur.src1);
+                _sk_read(&s, &cur.src2);
+                _sk_def(&s, cur.dest.vreg, cur);
+                _env_set(&e, cur.dest.vreg, _compare(op, a, b, cur.cast_to));
+            } else if (op == d.IR_JMP) {
+                if (_sk_closed(&s, &e, t) == 1) {
+                    to_label = cur.dest.label; to_after = cast(*d.IRInst, 0);
+                    mem_copy_env(&be, &e); _sk_copy(&bs, &s);
+                }
+                nx = _lab_at(t, cur.dest.label);
+            } else if ((op == d.IR_JZ || op == d.IR_JNZ) && _value(&cur.src1, &e, t, &a) == 1) {
+                _sk_read(&s, &cur.src1);
+                let is i32 as taken = cast(i32, (op == d.IR_JZ) == (a == 0));
+                if (_sk_closed(&s, &e, t) == 1) {
+                    if (taken == 1) { to_label = cur.dest.label; to_after = cast(*d.IRInst, 0); }
+                    else { to_after = cur; to_label = 0 - 1; }
+                    mem_copy_env(&be, &e); _sk_copy(&bs, &s);
+                }
+                if (taken == 1) { nx = _lab_at(t, cur.dest.label); }
+            } else {
+                go = 0;
+            }
+        }
+        cur = nx;
+    }
+    if (cast(i64, to_after) != 0) {
+        // Past a test that does not jump: the next instruction, under a label.
+        let is *d.IRInst as nx with mut = to_after.next;
+        while (cast(i64, nx) != 0 && nx.is_dead != 0) { nx = nx.next; }
+        if (cast(i64, nx) != 0 && nx.op == d.IR_LABEL) {
+            to_label = nx.dest.label;
+        } else {
+            let is i32 as lb = func.label_count;
+            if (lb >= t.cap) { return 0; }
+            func.label_count = lb + 1;
+            let is *d.IRInst as li = d.new_inst(d.IR_LABEL);
+            li.dest = d.op_label(lb);
+            li.next = to_after.next;
+            to_after.next = li;
+            t.lab[lb] = cast(i64, li);
+            t.back[lb] = cast(u8, 0);
+            to_label = lb;
+        }
+    }
+    if (to_label < 0) { return 0; }
+    j.dest.label = to_label;
+    // what the skipped code would have defined for a reader past it
+    let is *d.IRInst as at with mut = prev;
+    let is i32 as k with mut = 0;
+    while (k < bs.n) {
+        if (t.uses[bs.v[k]] != bs.reads[k]) {
+            let is i32 as q with mut = 0;
+            while (q < be.n) {
+                if (be.v[q] == bs.v[k]) {
+                    let is *d.IRInst as im = d.new_inst(d.IR_IMM);
+                    im.dest = d.op_vreg(bs.v[k]);
+                    im.src1 = d.op_imm(be.c[q]);
+                    im.line = j.line;
+                    im.next = j;
+                    at.next = im;
+                    at = im;
+                    q = be.n;
+                }
+                q = q + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn mem_copy_env(a as *Env, b as *Env) as void {
+    a.n = b.n;
+    let is i32 as k with mut = 0;
+    while (k < b.n) { a.v[k] = b.v[k]; a.c[k] = b.c[k]; k = k + 1; }
+}
+
+fn _count_read(o as *d.Operand, uses as *i32, n as i32) as void {
+    if (o.op_type == d.OP_VREG && o.vreg >= 0 && o.vreg < n) { uses[o.vreg] = uses[o.vreg] + 1; }
+}
+
+fn pass_jump_thread(func as *d.IRFunction) as i32 {
+    let is i32 as n = func.vreg_count;
+    let is i32 as jumps with mut = 0;
+    let is *d.IRInst as i with mut = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            if (i.op == d.IR_PHI) { return 0; }
+            if (i.op == d.IR_JMP) { jumps = jumps + 1; }
+        }
+        i = i.next;
+    }
+    if (jumps == 0 || n == 0) { return 0; }
+    let is Tables as t;
+    t.vregs = n;
+    t.cap = func.label_count + jumps + 2;
+    t.uses = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    t.known = d.opt_alloc(cast(i64, n));
+    t.value = cast(*i64, d.opt_alloc(cast(i64, n) * 8));
+    t.lab = cast(*i64, d.opt_alloc(cast(i64, t.cap) * 8));
+    t.back = d.opt_alloc(cast(i64, t.cap));
+    let is *i32 as defs = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    let is i32 as k with mut = 0;
+    while (k < n) { t.uses[k] = 0; t.known[k] = cast(u8, 0); t.value[k] = 0; defs[k] = 0; k = k + 1; }
+    k = 0;
+    while (k < t.cap) { t.lab[k] = 0; t.back[k] = cast(u8, 0); k = k + 1; }
+
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL) {
+                if (i.dest.label >= 0 && i.dest.label < t.cap) { t.lab[i.dest.label] = cast(i64, i); }
+            } else if (op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) {
+                if (i.dest.label >= 0 && i.dest.label < t.cap && t.lab[i.dest.label] != 0) { t.back[i.dest.label] = cast(u8, 1); }
+            }
+            _count_read(&i.src1, t.uses, n);
+            _count_read(&i.src2, t.uses, n);
+            if (i.dest.op_type == d.OP_VREG && i.dest.vreg >= 0 && i.dest.vreg < n) {
+                if (op == d.IR_IMM || op == d.IR_MOV || _is_cmp(op) == 1) {
+                    defs[i.dest.vreg] = defs[i.dest.vreg] + 1;
+                    if (op == d.IR_IMM && i.src1.op_type == d.OP_IMM) {
+                        t.known[i.dest.vreg] = cast(u8, 1);
+                        t.value[i.dest.vreg] = i.src1.imm;
+                    }
+                } else {
+                    // whatever else it is, its dest counts as a read and a definition
+                    defs[i.dest.vreg] = defs[i.dest.vreg] + 2;
+                    t.uses[i.dest.vreg] = t.uses[i.dest.vreg] + 1;
+                }
+            }
+        }
+        i = i.next;
+    }
+    k = 0;
+    while (k < n) {
+        if (defs[k] != 1) { t.known[k] = cast(u8, 0); }
+        k = k + 1;
+    }
+
+    let is i32 as changed with mut = 0;
+    let is Env as e;
+    e.n = 0;
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            let is i64 as a with mut = 0;
+            if (op == d.IR_LABEL) { e.n = 0; }
+            else if (op == d.IR_JMP) {
+                if (e.n > 0 && cast(i64, prev) != 0 && _thread(func, prev, i, &e, &t) == 1) { changed = 1; }
+                e.n = 0;
+            }
+            else if (i.dest.op_type == d.OP_VREG) {
+                if (op == d.IR_IMM && i.src1.op_type == d.OP_IMM) { _env_set(&e, i.dest.vreg, i.src1.imm); }
+                else if (op == d.IR_MOV && _value(&i.src1, &e, &t, &a) == 1) { _env_set(&e, i.dest.vreg, a); }
+                else { _env_kill(&e, i.dest.vreg); }
+            }
+        }
+        prev = i;
+        i = i.next;
+    }
+    d.opt_free(cast(*u8, defs));
+    d.opt_free(t.back);
+    d.opt_free(cast(*u8, t.lab));
+    d.opt_free(cast(*u8, t.value));
+    d.opt_free(t.known);
+    d.opt_free(cast(*u8, t.uses));
+    return changed;
+}

@@ -81,10 +81,13 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     if (cast(i64, t) == 0 || t.op != d.IR_JMP) { return 0; }
     let is *d.IRInst as jmp = t;
     let is i32 as join_label = jmp.dest.label;
-    if (cast(i64, then_phi) == 0 || then_phi.op != d.IR_MOV
-        || then_phi.src1.op_type != d.OP_VREG || then_phi.dest.op_type != d.OP_VREG) { return 0; }
-    let is i32 as destT = then_phi.dest.vreg;
-    let is i32 as srcT = then_phi.src1.vreg;
+    // -O2: an arm with nothing in it: the value is what the dest holds already.
+    let is i32 as empty = cast(i32, cast(i64, then_phi) == 0 && d.ir_opt_level >= 2);
+    if (empty == 0 && (cast(i64, then_phi) == 0 || then_phi.op != d.IR_MOV
+        || then_phi.src1.op_type != d.OP_VREG || then_phi.dest.op_type != d.OP_VREG)) { return 0; }
+    let is i32 as destT with mut = 0 - 1;
+    let is i32 as srcT with mut = 0 - 1;
+    if (empty == 0) { destT = then_phi.dest.vreg; srcT = then_phi.src1.vreg; }
 
     // --- else label must match the JZ target ---
     let is *d.IRInst as lel = ic_next_live(jmp);
@@ -105,10 +108,15 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     let is i32 as destE = else_phi.dest.vreg;
 
     // --- guards ---
-    if (destE != destT) { return 0; }
+    if (empty == 0 && destE != destT) { return 0; }
     if (srcT == destE) { return 0; }   // cmov dest,dest could never select St
-    if (ic_count_label_refs(func, else_label) != 1) { return 0; }
-    if (ic_count_label_refs(func, join_label) != 1) { return 0; }
+    if (cond == destE) { return 0; }
+    // -O2: other jumps may reach the else arm (the first test of an &&), when it
+    // is one copy: this path gets a copy of it. They may reach the join too.
+    let is i32 as refs_else = ic_count_label_refs(func, else_label);
+    if (refs_else != 1 && (d.ir_opt_level < 2 || cast(i64, ic_next_live(else_phi)) != cast(i64, e)
+        || cast(i64, ic_skip_free_labels(func, ic_next_live(lel))) != cast(i64, else_phi))) { return 0; }
+    if (ic_count_label_refs(func, join_label) != 1 && d.ir_opt_level < 2) { return 0; }
     // Both arms run unconditionally afterwards, the then arm first: every value
     // either arm writes besides its phi move must be the arm's own — written
     // and read nowhere else — or running the other arm too would overwrite a
@@ -129,10 +137,52 @@ fn ic_try(func as *d.IRFunction, jz as *d.IRInst) as i32 {
     }
 
     // --- transform ---
+    if (refs_else != 1 || empty == 1) {
+        // The true value, a copy of the dest when the arm was empty.
+        let is *d.IRInst as hd with mut = cast(*d.IRInst, 0);
+        let is *d.IRInst as tl with mut = cast(*d.IRInst, 0);
+        if (empty == 1) {
+            srcT = func.vreg_count;
+            func.vreg_count = func.vreg_count + 1;
+            let is *d.IRInst as kp = d.new_inst(d.IR_MOV);
+            kp.dest = d.op_vreg(srcT);
+            kp.src1 = d.op_vreg(destE);
+            kp.line = jz.line;
+            hd = kp;
+            tl = kp;
+        }
+        let is *d.IRInst as fv = d.new_inst(d.IR_MOV);
+        fv.dest = else_phi.dest; fv.src1 = else_phi.src1; fv.cast_to = else_phi.cast_to; fv.line = else_phi.line;
+        if (cast(i64, tl) != 0) { tl.next = fv; } else { hd = fv; }
+        let is *d.IRInst as sel = d.new_inst(d.IR_CMOV);
+        sel.dest.op_type = d.OP_VREG; sel.dest.vreg = destE;
+        sel.src1.op_type = d.OP_VREG; sel.src1.vreg = cond;
+        sel.src2.op_type = d.OP_VREG; sel.src2.vreg = srcT;
+        sel.line = else_phi.line;
+        fv.next = sel;
+        // in place of the jz's branch, right before the jmp that stays
+        let is *d.IRInst as pj with mut = jz;
+        while (cast(i64, pj.next) != cast(i64, jmp)) { pj = pj.next; }
+        sel.next = jmp;
+        pj.next = hd;
+        jz.is_dead = 1;
+        if (empty == 0) { then_phi.is_dead = 1; }
+        // the else arm stays for whoever else jumps there; alone, the jmp and it
+        // can go
+        if (ic_count_label_refs(func, else_label) == 0) {
+            jmp.is_dead = 1;
+            lel.is_dead = 1;
+            else_phi.is_dead = 1;
+            if (ic_count_label_refs(func, join_label) == 0) { e.is_dead = 1; }
+        }
+        return 1;
+    }
     ic_kill_free_labels(func, lel.next, e0);
     jz.is_dead = 1;
     then_phi.is_dead = 1;       // then value St flows via the kept then-arm work
     jmp.is_dead = 1;
+    // nothing jumps to the else label now: one straight run, compare to select
+    if (ic_count_label_refs(func, else_label) == 0) { lel.is_dead = 1; }
     // else_phi (MOV destE = Sf) survives as the false-value preload into destE.
     let is *d.IRInst as cmov = d.new_inst(d.IR_CMOV);
     cmov.dest.op_type = d.OP_VREG; cmov.dest.vreg = destE;
@@ -154,6 +204,128 @@ fn pass_ifconv(func as *d.IRFunction) as void {
             if (ic_try(func, inst) == 0 && d.ir_opt_level >= 2) { ic2_try(func, inst); }
         }
         inst = inst.next;
+    }
+    if (d.ir_opt_level >= 2) { ic_bool_select(func); }
+}
+
+// A branch over a run that ends in a call that never returns (a RET marked by
+// opt_inline's pass_noreturn_cut): the run moves to the end of the function
+// and the hot path falls through.
+fn pass_cold_sink(func as *d.IRFunction) as void {
+    let is *d.IRInst as tail with mut = func.instructions;
+    if (cast(i64, tail) == 0) { return; }
+    let is *d.IRInst as last_live with mut = cast(*d.IRInst, 0);
+    while (cast(i64, tail.next) != 0) {
+        if (tail.is_dead == 0) { last_live = tail; }
+        tail = tail.next;
+    }
+    if (tail.is_dead == 0) { last_live = tail; }
+    if (cast(i64, last_live) == 0 || (last_live.op != d.IR_RET && last_live.op != d.IR_JMP)) { return; }
+    let is *d.IRInst as end = tail;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != cast(i64, end)) {
+        if (w.is_dead == 0 && (w.op == d.IR_JZ || w.op == d.IR_JNZ) && w.dest.op_type == d.OP_LABEL) {
+            let is *d.IRInst as x with mut = ic_next_live(w);
+            let is i32 as ok with mut = 1;
+            while (ok == 1 && cast(i64, x) != 0 && x.op != d.IR_RET) {
+                if (x.op == d.IR_LABEL || x.op == d.IR_JMP || x.op == d.IR_JZ || x.op == d.IR_JNZ) { ok = 0; }
+                else { x = ic_next_live(x); }
+            }
+            if (ok == 1 && cast(i64, x) != 0 && x.is_extern_call == 1) {
+                let is *d.IRInst as a with mut = ic_next_live(x);
+                let is i32 as hit with mut = 0;
+                while (hit == 0 && cast(i64, a) != 0 && a.op == d.IR_LABEL) {
+                    if (a.dest.label == w.dest.label) { hit = 1; } else { a = ic_next_live(a); }
+                }
+                if (hit == 1) {
+                    let is i32 as lc = func.label_count;
+                    func.label_count = lc + 1;
+                    let is *d.IRInst as first = w.next;
+                    w.next = x.next;
+                    if (w.op == d.IR_JZ) { w.op = d.IR_JNZ; } else { w.op = d.IR_JZ; }
+                    w.dest.label = lc;
+                    let is *d.IRInst as lab = d.new_inst(d.IR_LABEL);
+                    lab.dest.op_type = d.OP_LABEL;
+                    lab.dest.label = lc;
+                    lab.line = x.line;
+                    tail.next = lab;
+                    lab.next = first;
+                    x.next = cast(*d.IRInst, 0);
+                    tail = x;
+                }
+            }
+        }
+        w = w.next;
+    }
+}
+
+// `c ? 1 : 0` of a compare is the compare's own 0 or 1.
+let is i32 as ic_bool_hit with mut = 0;
+
+fn _ib_last_def(ring as *i64, n as i32, v as i32) as i32 {
+    let is i32 as k with mut = n - 1;
+    while (k >= 0) {
+        let is *d.IRInst as r = cast(*d.IRInst, ring[k]);
+        if (r.dest.op_type == d.OP_VREG && r.dest.vreg == v) { return k; }
+        k = k - 1;
+    }
+    return 0 - 1;
+}
+
+// The constant v holds at the end of the ring: an IMM, or a copy of one.
+fn _ib_imm_of(ring as *i64, n as i32, v as i32, out as *i64) as i32 {
+    let is i32 as k = _ib_last_def(ring, n, v);
+    if (k < 0) { return 0; }
+    let is *d.IRInst as de = cast(*d.IRInst, ring[k]);
+    if (de.op == d.IR_IMM && de.src1.op_type == d.OP_IMM) { *out = de.src1.imm; return 1; }
+    if (de.op == d.IR_MOV && de.src1.op_type == d.OP_VREG) {
+        let is i32 as k2 = _ib_last_def(ring, k, de.src1.vreg);
+        if (k2 < 0) { return 0; }
+        let is *d.IRInst as d2 = cast(*d.IRInst, ring[k2]);
+        if (d2.op == d.IR_IMM && d2.src1.op_type == d.OP_IMM) { *out = d2.src1.imm; return 1; }
+    }
+    return 0;
+}
+
+fn ic_bool_select(func as *d.IRFunction) as void {
+    ic_bool_hit = 0;
+    let is [8]i64 as ring;
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            let is i32 as op = w.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) {
+                n = 0;
+            } else {
+                if (op == d.IR_CMOV && n >= 1 && w.src1.op_type == d.OP_VREG && w.src2.op_type == d.OP_VREG) {
+                    let is i32 as cdk = _ib_last_def(&ring[0], n, w.src1.vreg);
+                    let is *d.IRInst as pre = cast(*d.IRInst, ring[n - 1]);
+                    let is i64 as tv with mut = 0;
+                    let is i64 as fv with mut = 0;
+                    if (cdk >= 0 && cdk < n - 1 && ic2_is_cmp(cast(*d.IRInst, ring[cdk]).op) == 1
+                        && pre.dest.op_type == d.OP_VREG && pre.dest.vreg == w.dest.vreg
+                        && (pre.op == d.IR_IMM || pre.op == d.IR_MOV)
+                        && _ib_imm_of(&ring[0], n, w.src2.vreg, &tv) == 1 && tv == 1
+                        && _ib_imm_of(&ring[0], n, w.dest.vreg, &fv) == 1 && fv == 0) {
+                        // the preload goes, and the select reads the compare
+                        pre.is_dead = 1;
+                        w.op = d.IR_MOV;
+                        w.cast_to = pre.cast_to;
+                        w.src2.op_type = d.OP_NONE;
+                        ic_bool_hit = 1;
+                    }
+                }
+                if (n == 8) {
+                    let is i32 as k with mut = 1;
+                    while (k < 8) { ring[k - 1] = ring[k]; k = k + 1; }
+                    n = 7;
+                }
+                ring[n] = cast(i64, w);
+                n = n + 1;
+            }
+        }
+        w = w.next;
     }
 }
 

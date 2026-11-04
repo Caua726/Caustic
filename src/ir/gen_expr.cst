@@ -573,6 +573,83 @@ fn gen_syscall(node as *ast.Node, line as i32) as i32 {
     return dest;
 }
 
+// Branch on a condition without materializing && and || as a 0 or 1 first:
+// jump to `fl` when it is false, and fall through when it is true.
+fn gen_cond_false(node as *ast.Node, fl as i32, line as i32) as void {
+    if (node.kind == ast.NK_LAND) {
+        let is i32 as rf = _range_fold(node, line);
+        if (rf >= 0) { _branch(d.IR_JZ, rf, fl, line); return; }
+        gen_cond_false(node.lhs, fl, line);
+        gen_cond_false(node.rhs, fl, line);
+        return;
+    }
+    if (node.kind == ast.NK_LOR) {
+        let is i32 as tl = g.new_label();
+        gen_cond_true(node.lhs, tl, line);
+        gen_cond_false(node.rhs, fl, line);
+        _branch_label(tl);
+        return;
+    }
+    _branch(d.IR_JZ, gen_expr(node), fl, line);
+}
+
+// The same, jumping to `tl` when it is true.
+fn gen_cond_true(node as *ast.Node, tl as i32, line as i32) as void {
+    if (node.kind == ast.NK_LOR) {
+        gen_cond_true(node.lhs, tl, line);
+        gen_cond_true(node.rhs, tl, line);
+        return;
+    }
+    if (node.kind == ast.NK_LAND) {
+        let is i32 as rf = _range_fold(node, line);
+        if (rf >= 0) { _branch(d.IR_JNZ, rf, tl, line); return; }
+        let is i32 as fl = g.new_label();
+        gen_cond_false(node.lhs, fl, line);
+        gen_cond_true(node.rhs, tl, line);
+        _branch_label(fl);
+        return;
+    }
+    _branch(d.IR_JNZ, gen_expr(node), tl, line);
+}
+
+// `*cast(*i64, &x)` of a local f64, or `*cast(*f64, &n)` of a local i64: the
+// program asks for the bits. The value needs no address and no trip to memory.
+fn _bits_of_local(node as *ast.Node, ty as *ast.Type, line as i32) as i32 {
+    if (d.ir_opt_level < 2 || g.xmm_args_abi() == 0) { return 0 - 1; }
+    let is *ast.Node as c = node.expr;
+    if (c.kind != ast.NK_CAST || c.expr.kind != ast.NK_ADDR) { return 0 - 1; }
+    let is *ast.Node as x = c.expr.expr;
+    if (x.kind != ast.NK_IDENT || x.is_global != 0 || cast(i64, x.ty) == 0) { return 0 - 1; }
+    let is i32 as tk = ty.kind;
+    let is i32 as xk = x.ty.kind;
+    let is i32 as t_int = cast(i32, tk == ast.TY_I64 || tk == ast.TY_U64);
+    let is i32 as x_int = cast(i32, xk == ast.TY_I64 || xk == ast.TY_U64);
+    let is i32 as fits = cast(i32, (tk == ast.TY_F64 && x_int == 1) || (t_int == 1 && xk == ast.TY_F64));
+    if (fits == 0) { return 0 - 1; }
+    let is i32 as v = gen_expr(x);
+    let is i32 as dest = g.new_vreg();
+    let is *d.IRInst as b = d.new_inst(d.IR_BITS);
+    b.dest = d.op_vreg(dest);
+    b.src1 = d.op_vreg(v);
+    b.cast_from = cast(*u8, x.ty);
+    b.cast_to = cast(*u8, ty);
+    b.line = line;
+    g.emit(b);
+    return dest;
+}
+
+fn _branch(op as i32, v as i32, lab as i32, line as i32) as void {
+    let is *d.IRInst as j = d.new_inst(op);
+    j.src1 = d.op_vreg(v); j.dest = d.op_label(lab); j.line = line;
+    g.emit(j);
+}
+
+fn _branch_label(lab as i32) as void {
+    let is *d.IRInst as l = d.new_inst(d.IR_LABEL);
+    l.dest = d.op_label(lab);
+    g.emit(l);
+}
+
 // Atomic builtins (seq_cst). cast_to carries the pointee type so codegen picks
 // 32 vs 64-bit. LOAD/ADD/XCHG/CAS return the OLD value in a fresh vreg;
 // STORE/FENCE return 0 (void — never consumed, guaranteed by semantic).
@@ -710,6 +787,8 @@ fn gen_expr(node as *ast.Node) as i32 {
 
     // NK_DEREF
     if (k == ast.NK_DEREF) {
+        let is i32 as bits = _bits_of_local(node, ty, line);
+        if (bits >= 0) { return bits; }
         let is i32 as addr = gen_expr(node.expr);
         return emit_load_from_addr(addr, cast(*u8, ty), line);
     }
@@ -846,6 +925,11 @@ fn gen_expr(node as *ast.Node) as i32 {
         // folded to a literal in semantic, emit the literal directly. Skips
         // the IR_ADDR_GLOBAL + IR_LOAD pair so dead-branch elim and other
         // literal-driven folds upstream can see the actual constant value.
+        if (node.is_global == 1 && node.is_string_const == ast.IDENT_FLOAT_CONST) {
+            let is i32 as fc = g.emit_imm(node.val, line);
+            g.ctx_tail.cast_to = cast(*u8, ty);
+            return fc;
+        }
         if (node.is_global == 1) {
             let is *sd.Variable as cv = sc.lookup_var(node.name_ptr, node.name_len);
             if (cast(i64, cv) != 0 && cv.has_folded_init == 1) {
@@ -1099,12 +1183,8 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is i32 as false_l = g.new_label();
         let is i32 as end_l = g.new_label();
         let is i32 as dest = g.new_vreg();
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is *d.IRInst as jz1 = d.new_inst(d.IR_JZ);
-        jz1.src1 = d.op_vreg(lhs); jz1.dest = d.op_label(false_l); jz1.line = line; g.emit(jz1);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is *d.IRInst as jz2 = d.new_inst(d.IR_JZ);
-        jz2.src1 = d.op_vreg(rhs); jz2.dest = d.op_label(false_l); jz2.line = line; g.emit(jz2);
+        gen_cond_false(node.lhs, false_l, line);
+        gen_cond_false(node.rhs, false_l, line);
         let is *d.IRInst as mt = d.new_inst(d.IR_IMM);
         mt.dest = d.op_vreg(dest); mt.src1 = d.op_imm(1); g.emit(mt);
         let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);
@@ -1123,12 +1203,8 @@ fn gen_expr(node as *ast.Node) as i32 {
         let is i32 as true_l = g.new_label();
         let is i32 as end_l = g.new_label();
         let is i32 as dest = g.new_vreg();
-        let is i32 as lhs = gen_expr(node.lhs);
-        let is *d.IRInst as jnz1 = d.new_inst(d.IR_JNZ);
-        jnz1.src1 = d.op_vreg(lhs); jnz1.dest = d.op_label(true_l); jnz1.line = line; g.emit(jnz1);
-        let is i32 as rhs = gen_expr(node.rhs);
-        let is *d.IRInst as jnz2 = d.new_inst(d.IR_JNZ);
-        jnz2.src1 = d.op_vreg(rhs); jnz2.dest = d.op_label(true_l); jnz2.line = line; g.emit(jnz2);
+        gen_cond_true(node.lhs, true_l, line);
+        gen_cond_true(node.rhs, true_l, line);
         let is *d.IRInst as mf = d.new_inst(d.IR_IMM);
         mf.dest = d.op_vreg(dest); mf.src1 = d.op_imm(0); g.emit(mf);
         let is *d.IRInst as jmp = d.new_inst(d.IR_JMP);

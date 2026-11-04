@@ -139,6 +139,10 @@ let is i32 as IR_VOPG          with imut = 104;
 // x86 codegen only (emit_driver.cst rol_fold): dest = src1 rotated left by
 // src2 (an immediate) within the width of cast_to (4 or 8 bytes).
 let is i32 as IR_ROL           with imut = 105;
+// -O2 on x86: dest = the 64 bits of src1, read as the other register class: an
+// f64 as an integer or an integer as an f64 (`*cast(*i64, &x)`, gen_expr.cst).
+// Not a copy: the passes that look through MOV must not read through this.
+let is i32 as IR_BITS          with imut = 106;
 
 // === Vectorizer (LLVM-class, src/ir/vec/) debug flag ===
 // vec_debug: -debugvec — dumps loop discovery / SCEV / descriptors / legality from
@@ -200,6 +204,7 @@ struct IRInst {
 }
 
 struct IRFunction {
+    addr_taken as i32;        // set by emit_driver.cst codegen (d.params_canonical)
     name_ptr as *u8;
     name_len as i32;
     asm_name_ptr as *u8;
@@ -295,6 +300,17 @@ struct IRProgram {
 
 // === Config ===
 let is i32 as ir_opt_level with mut = 0;
+
+// -O2, one file built into a static x86_64 ELF: nothing but this program's own
+// direct calls reaches a function whose address is never taken (main.cst says
+// when that is so; emit_driver.cst codegen looks for what would break it: a C
+// function that could call back, inline asm that calls). Such a function's narrow
+// integer parameter arrives in its canonical 64-bit form, as every other value
+// does, and needs no extending. params_canonical holds for the function being
+// generated; a call through an untyped pointer can pass anything.
+let is i32 as params_canon_ok with mut = 0;
+let is i32 as params_canon_prog with mut = 0;
+let is i32 as params_canonical with mut = 0;
 
 // Cross-module inline restriction. In --module-objects/--module-only mode this
 // is set to the target module's mangled prefix so pass_inline only inlines
@@ -540,11 +556,11 @@ fn vreg_class_set(func as *IRFunction, vreg as i32, cls as i32) as void {
 //   - Result of IR_LOAD/STORE with cast_to=f32/f64 is XMM.
 //   - Result of IR_CAST to float is XMM; to int is GPR (handled implicitly).
 //   - Result of IR_MOV/COPY inherits its source's class.
-//   - Result of IR_GET_ARG: GPR by default (caller passes f64 args via xmm
-//     registers per SysV ABI, but the get-arg emitter unpacks into the gpr
-//     so the f64 value still lives in a GPR vreg unless propagated later).
-//     We promote to XMM in a fix-up pass when the vreg's only uses are
-//     XMM-class consumers.
+//   - Result of IR_GET_ARG: a float parameter stays in an xmm when nothing
+//     can clobber it there: a function that makes no call, or a parameter read
+//     only before the first one. One that lives across calls is better in a
+//     callee-saved general register than in a stack slot, so it keeps the
+//     default, like a float a call returned (_call_float_local).
 // Default class is GPR. Iterates until fixed point so MOV chains propagate.
 // True if the type pointer (an *ast.Type) is f32/f64. Reads the kind
 // field at offset 0 directly to avoid importing the parser into defs.
@@ -558,6 +574,12 @@ fn _ty_is_float(ty_ptr as *u8) as i32 {
 
 // A right shift of this type is arithmetic: a signed integer type (or none
 // given). Kinds are ast.TY_I8..TY_I64 = 1..4, read at offset 0 as above.
+fn ty_is_f64(ty_ptr as *u8) as i32 {
+    if (cast(i64, ty_ptr) == 0) { return 0; }
+    if (*cast(*i32, ty_ptr) == 10) { return 1; }
+    return 0;
+}
+
 fn ty_shr_is_arith(ty_ptr as *u8) as i32 {
     if (cast(i64, ty_ptr) == 0) { return 1; }
     let is *i32 as kp = cast(*i32, cast(i64, ty_ptr));
@@ -600,6 +622,49 @@ fn _call_float_local(c as *IRInst, v as i32) as i32 {
     return cast(i32, seen == total);
 }
 
+// -O2: a constant read only as a float (a returned 1.0, a phi's incoming value,
+// a float argument) is loaded from the pool into an xmm: not through a general
+// register. Called once the classes above have settled.
+fn _classify_float_imms(func as *IRFunction) as void {
+    let is i32 as vc = func.vreg_count;
+    // 0 nothing yet; 1 one IMM def; 2 not one; +4 read as a float
+    let is *u8 as st = opt_alloc(cast(i64, vc) + 8);
+    let is i32 as i with mut = 0;
+    while (i < vc) { st[i] = cast(u8, 0); i = i + 1; }
+    let is *IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && w.dest.op_type == OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
+            let is i32 as v = w.dest.vreg;
+            if (w.op == IR_STORE || w.op == IR_COPY || w.op == IR_CMOV || w.op == IR_VSTOREQ || w.op == IR_VSTOREQ256) { st[v] = cast(u8, 2); }
+            else if (w.op == IR_IMM && st[v] == cast(u8, 0)) { st[v] = cast(u8, 1); }
+            else { st[v] = cast(u8, 2); }
+        }
+        w = w.next;
+    }
+    w = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0) {
+            if (w.src2.op_type == OP_VREG && w.src2.vreg >= 0 && w.src2.vreg < vc) { st[w.src2.vreg] = cast(u8, 2); }
+            if (w.src1.op_type == OP_VREG && w.src1.vreg >= 0 && w.src1.vreg < vc) {
+                let is i32 as v = w.src1.vreg;
+                let is i32 as fl with mut = 0;
+                if (w.op == IR_RET && _ty_is_float(w.cast_to) == 1) { fl = 1; }
+                if (w.op == IR_MOV && w.dest.op_type == OP_VREG && vreg_class_get(func, w.dest.vreg) == VR_XMM) { fl = 1; }
+                if (w.op == IR_SET_ARG && w.src2.op_type == OP_IMM && w.src2.imm >= 100) { fl = 1; }
+                if (fl == 1) { st[v] = cast(u8, cast(i32, st[v]) | 4); }
+                else { st[v] = cast(u8, 2); }
+            }
+        }
+        w = w.next;
+    }
+    i = 0;
+    while (i < vc) {
+        if (st[i] == cast(u8, 5)) { vreg_class_set(func, i, VR_XMM); }
+        i = i + 1;
+    }
+    opt_free(st);
+}
+
 fn infer_vreg_classes(func as *IRFunction) as void {
     if (func.vreg_count == 0) { return; }
     func.vreg_class = cast(*i32, opt_alloc(cast(i64, func.vreg_count) * 4));
@@ -610,10 +675,22 @@ fn infer_vreg_classes(func as *IRFunction) as void {
         i = i + 1;
     }
     // Initial seeding: dest of every float op is XMM.
+    let is i32 as makes_call with mut = 0;
     let is *IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && (inst.op == IR_CALL || inst.op == IR_CALL_INDIRECT || inst.op == IR_FFI_CALL
+            || inst.op == IR_SYSCALL || inst.op == IR_ASM)) { makes_call = 1; }
+        inst = inst.next;
+    }
+    inst = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && inst.dest.op_type == OP_VREG) {
             let is i32 as op = inst.op;
+            // (at -O2: the other levels keep the simplest form)
+            if (op == IR_GET_ARG && ir_opt_level >= 2 && inst.src2.op_type == OP_IMM && inst.src2.imm >= 100
+                && (makes_call == 0 || _call_float_local(inst, inst.dest.vreg) == 1)) {
+                vreg_class_set(func, inst.dest.vreg, VR_XMM);
+            }
             if (op == IR_FADD || op == IR_FSUB || op == IR_FMUL || op == IR_FDIV
                 || op == IR_FNEG || op == IR_FSQRT
                 || op == IR_VZERO || op == IR_VLOADQ || op == IR_VADDQ || op == IR_VADDD
@@ -640,7 +717,7 @@ fn infer_vreg_classes(func as *IRFunction) as void {
     // propagation below carries it through `mj = mov(load)` chains.
     inst = func.instructions;
     while (cast(i64, inst) != 0) {
-        if (inst.is_dead == 0 && inst.op == IR_LOAD && inst.dest.op_type == OP_VREG
+        if (inst.is_dead == 0 && (inst.op == IR_LOAD || inst.op == IR_BITS) && inst.dest.op_type == OP_VREG
             && cast(i64, inst.cast_to) != 0 && _ty_is_float(inst.cast_to) == 1) {
             vreg_class_set(func, inst.dest.vreg, VR_XMM);
         }
@@ -678,4 +755,5 @@ fn infer_vreg_classes(func as *IRFunction) as void {
             inst = inst.next;
         }
     }
+    if (ir_opt_level >= 2) { _classify_float_imms(func); }
 }

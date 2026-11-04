@@ -1,0 +1,102 @@
+// tests/string_lit_test.cst
+//
+// strcpy of a literal becomes a copy of a known size and strlen of one a number
+// at -O2, and strcmp reads words after aligning one side. Lengths around the
+// widths the copy uses, escapes (the text as written is not the bytes), the
+// value strcpy returns, copies into the middle of a buffer, and strcmp at every
+// alignment, across the end of a page, at every position of the first
+// difference, and with bytes above 127.
+//
+// Exit code 0 on success, else the number of the failing check.
+use "../std/string.cst" as string;
+use "../std/os/linux.cst" as linux;
+
+fn same(a as *u8, b as *u8, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn copy_at(buf as *u8, off as i64, lit as *u8) as *u8 {
+    return string.strcpy(buf + off, lit);
+}
+
+fn main() as i32 {
+    let is [200]u8 as bufa;
+    let is *u8 as buf = cast(*u8, &bufa);
+    let is i64 as i with mut = 0;
+    while (i < 200) { buf[i] = cast(u8, 170); i = i + 1; }
+
+    // Lengths 0, 1, 7, 8, 15, 16, 31, 63 and 64: the byte after stays.
+    if (cast(i64, copy_at(buf, 0, "")) != cast(i64, buf) || buf[0] != 0 || buf[1] != cast(u8, 170)) { return 1; }
+    copy_at(buf, 10, "a");
+    if (buf[10] != 97 || buf[11] != 0 || buf[12] != cast(u8, 170)) { return 2; }
+    copy_at(buf, 20, "1234567");
+    if (same(buf + 20, "1234567", 8) == 0 || buf[28] != cast(u8, 170)) { return 3; }
+    copy_at(buf, 30, "12345678");
+    if (same(buf + 30, "12345678", 9) == 0 || buf[39] != cast(u8, 170)) { return 4; }
+    copy_at(buf, 40, "123456789012345");
+    if (same(buf + 40, "123456789012345", 16) == 0 || buf[56] != cast(u8, 170)) { return 5; }
+    copy_at(buf, 60, "1234567890123456");
+    if (same(buf + 60, "1234567890123456", 17) == 0 || buf[77] != cast(u8, 170)) { return 6; }
+    copy_at(buf, 80, "1234567890123456789012345678901");
+    if (same(buf + 80, "1234567890123456789012345678901", 32) == 0 || buf[112] != cast(u8, 170)) { return 7; }
+    copy_at(buf, 120, "123456789012345678901234567890123456789012345678901234567890123");
+    if (same(buf + 120, "123456789012345678901234567890123456789012345678901234567890123", 64) == 0
+        || buf[184] != cast(u8, 170)) { return 8; }
+
+    // Escapes: three bytes, not four.
+    copy_at(buf, 0, "a\nb");
+    if (buf[1] != 10 || buf[2] != 98 || buf[3] != 0) { return 9; }
+    if (string.strlen("a\nb") != 3 || string.strlen("") != 0 || string.strlen("hello") != 5) { return 10; }
+    // A literal longer than any copy.
+    let is [300]u8 as longa;
+    let is *u8 as long = cast(*u8, &longa);
+    string.strcpy(long, "1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890");
+    if (string.strlen(long) != 100 || long[99] != 48) { return 11; }
+
+    // strcmp: order, equal, prefix, bytes as unsigned.
+    if (string.strcmp("abc", "abc") != 0 || string.strcmp("", "") != 0) { return 12; }
+    if (string.strcmp("abc", "abd") >= 0 || string.strcmp("abd", "abc") <= 0) { return 13; }
+    if (string.strcmp("abc", "abcd") >= 0 || string.strcmp("abcd", "abc") <= 0) { return 14; }
+    if (string.strcmp("\xff", "a") <= 0) { return 15; }
+
+    // Every alignment of both sides, every position of the difference.
+    let is [80]u8 as xa;
+    let is [80]u8 as ya;
+    let is *u8 as x = cast(*u8, &xa);
+    let is *u8 as y = cast(*u8, &ya);
+    let is i64 as ax with mut = 0;
+    while (ax < 9) {
+        let is i64 as ay with mut = 0;
+        while (ay < 9) {
+            let is i64 as len with mut = 0;
+            while (len < 40) {
+                let is i64 as k with mut = 0;
+                while (k < len) { x[ax + k] = cast(u8, 65 + k % 26); y[ay + k] = cast(u8, 65 + k % 26); k = k + 1; }
+                x[ax + len] = 0; y[ay + len] = 0;
+                if (string.strcmp(x + ax, y + ay) != 0) { return 16; }
+                if (len > 0) {
+                    y[ay + len - 1] = cast(u8, 200);
+                    if (string.strcmp(x + ax, y + ay) >= 0) { return 17; }
+                    if (string.strcmp(y + ay, x + ax) <= 0) { return 18; }
+                }
+                len = len + 1;
+            }
+            ay = ay + 1;
+        }
+        ax = ax + 1;
+    }
+
+    // Ending right at the end of a mapped page, with nothing readable after it.
+    let is *u8 as m = cast(*u8, linux.mmap(cast(*u8, 0), 8192, 3, 34, 0 - 1, 0));
+    linux.munmap(m + 4096, 4096);
+    let is *u8 as tail = m + 4096 - 5;
+    tail[0] = 104; tail[1] = 101; tail[2] = 108; tail[3] = 108; tail[4] = 0;
+    if (string.strcmp(tail, "hell") != 0 || string.strcmp("hell", tail) != 0) { return 19; }
+    if (string.strcmp(tail, "help") >= 0 || string.strcmp("hello", tail) <= 0) { return 20; }
+    return 0;
+}

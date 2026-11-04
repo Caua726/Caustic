@@ -1,0 +1,128 @@
+// tests/heap_elide_test.cst
+//
+// An object from bins_alloc that is only written through and freed is removed
+// at -O2. These are the shapes that must keep working either way: objects read
+// back, whose pointer is stored, returned, passed to a function or compared,
+// freed on one path only, and the ones that do go, with the allocator working
+// afterwards.
+//
+// Exit code 0 on success, else the number of the failing check.
+use "../std/mem.cst" as mem;
+
+struct Node {
+    v as i64;
+    w as i32;
+    next as *Node;
+}
+
+let is mem.bins.Bins as heap with mut;
+let is *Node as kept with mut;
+let is i64 as seen with mut = 0;
+
+fn make(v as i64) as *Node {
+    let is *Node as n = cast(*Node, mem.bins.bins_alloc(&heap, sizeof(Node)));
+    n.v = v;
+    n.w = 1;
+    n.next = cast(*Node, 0);
+    return n;
+}
+
+// Goes away: written and freed.
+fn only_written(k as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < k) {
+        let is *Node as n = make(cast(i64, i));
+        mem.bins.bins_free(&heap, cast(*u8, n));
+        i = i + 1;
+    }
+}
+
+// Read back.
+fn read_back(v as i64) as i64 {
+    let is *Node as n = make(v);
+    let is i64 as r = n.v + cast(i64, n.w);
+    mem.bins.bins_free(&heap, cast(*u8, n));
+    return r;
+}
+
+// The pointer goes into another object.
+fn linked(v as i64) as i64 {
+    let is *Node as a = make(v);
+    let is *Node as b = make(v + 1);
+    a.next = b;
+    let is i64 as r = a.next.v;
+    mem.bins.bins_free(&heap, cast(*u8, b));
+    mem.bins.bins_free(&heap, cast(*u8, a));
+    return r;
+}
+
+// The pointer goes into a global.
+fn stored(v as i64) as void {
+    kept = make(v);
+}
+
+// The pointer is returned.
+fn returned(v as i64) as *Node {
+    let is *Node as n = make(v);
+    n.w = 2;
+    return n;
+}
+
+fn look(n as *Node) as void { seen = seen + n.v; }
+
+// The pointer is passed to a function that reads through it.
+fn passed(v as i64) as void {
+    let is *Node as n = make(v);
+    look(n);
+    mem.bins.bins_free(&heap, cast(*u8, n));
+}
+
+// The pointer's value is looked at.
+fn compared(v as i64) as i32 {
+    let is *Node as n = make(v);
+    let is i32 as r with mut = 0;
+    if (cast(i64, n) != 0) { r = 1; }
+    mem.bins.bins_free(&heap, cast(*u8, n));
+    return r;
+}
+
+// Freed on one path only: a leak on the other is still nobody's to see.
+fn one_path(v as i64) as void {
+    let is *Node as n = make(v);
+    if (v > 3) { mem.bins.bins_free(&heap, cast(*u8, n)); }
+}
+
+// A pointer into the middle of the object, written through.
+fn inner(v as i32) as void {
+    let is *Node as n = make(cast(i64, v));
+    let is *i32 as q = &n.w;
+    q[0] = v;
+    mem.bins.bins_free(&heap, cast(*u8, n));
+}
+
+fn main() as i32 {
+    heap = mem.bins.bins_new(65536);
+    only_written(1000);
+    if (read_back(41) != 42) { return 1; }
+    if (linked(7) != 8) { return 2; }
+    stored(5);
+    if (kept.v != 5 || kept.w != 1) { return 3; }
+    let is *Node as r = returned(6);
+    if (r.v != 6 || r.w != 2) { return 4; }
+    passed(10);
+    passed(20);
+    if (seen != 30) { return 5; }
+    if (compared(1) != 1) { return 6; }
+    one_path(1);
+    one_path(5);
+    inner(3);
+    // The allocator still hands out distinct objects that hold what was written.
+    let is *Node as a = make(100);
+    let is *Node as b = make(200);
+    if (cast(i64, a) == cast(i64, b) || a.v != 100 || b.v != 200) { return 7; }
+    mem.bins.bins_free(&heap, cast(*u8, a));
+    mem.bins.bins_free(&heap, cast(*u8, b));
+    mem.bins.bins_free(&heap, cast(*u8, r));
+    mem.bins.bins_free(&heap, cast(*u8, kept));
+    return 0;
+}

@@ -1,4 +1,5 @@
 use "defs.cst" as d;
+use "opt_rotate.cst" as rot;
 
 // === i32 loop indices become 64-bit pointers that step ===
 //
@@ -592,7 +593,10 @@ fn pass_widen(func as *d.IRFunction) as void {
 // -O2. In one straight line (no label in between; a branch's fallthrough
 // continues it), `t2 = LOAD [a]` after `t1 = LOAD [a]` of the same type, with
 // nothing that writes memory in between (store, call, asm, atomic, copy) and
-// neither a nor t1 written again, becomes `t2 = MOV t1`.
+// neither a nor t1 written again, becomes `t2 = MOV t1`. A store counts as a
+// load of what it wrote; a narrow integer is read back through its own cast,
+// which redoes the extension the load did, and an f32 (rounded by the store)
+// is left to memory.
 fn _lc_clobbers(op as i32) as i32 {
     if (op == d.IR_STORE || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256 || op == d.IR_COPY
         || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
@@ -603,27 +607,150 @@ fn _lc_clobbers(op as i32) as i32 {
     return 0;
 }
 
+// 0: not forwarded; 1: a whole value, as it is; 2: narrow, through a cast
+fn _lc_fwd_kind(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    if (k == 10 || k == 14) { return 1; }
+    if (k >= 1 && k <= 8) { if (sz == 8) { return 1; } return 2; }
+    return 0;
+}
+
+// Addresses as base + constant, in the current straight line: a store to one
+// field leaves what is known about the others.
+let is [24]i32 as pa_v with mut;
+let is [24]i32 as pa_root with mut;
+let is [24]i64 as pa_off with mut;
+let is i32 as pa_n with mut = 0;
+
+fn _pa_find(v as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < pa_n) { if (pa_v[k] == v) { return k; } k = k + 1; }
+    return 0 - 1;
+}
+
+fn _pa_root(v as i32) as i32 {
+    let is i32 as k = _pa_find(v);
+    if (k >= 0) { return pa_root[k]; }
+    return v;
+}
+
+fn _pa_off(v as i32) as i64 {
+    let is i32 as k = _pa_find(v);
+    if (k >= 0) { return pa_off[k]; }
+    return 0;
+}
+
+fn _pa_kill(w as i32) as void {
+    let is i32 as k with mut = 0;
+    let is i32 as o with mut = 0;
+    while (k < pa_n) {
+        if (pa_v[k] != w && pa_root[k] != w) {
+            pa_v[o] = pa_v[k]; pa_root[o] = pa_root[k]; pa_off[o] = pa_off[k];
+            o = o + 1;
+        }
+        k = k + 1;
+    }
+    pa_n = o;
+}
+
+// What it writes, read before: `d = s +/- k` and `d = s`, 64 bits wide.
+fn _pa_note(it as *d.IRInst) as void {
+    if (it.dest.op_type != d.OP_VREG) { return; }
+    let is i32 as w = it.dest.vreg;
+    let is i32 as ok with mut = 0;
+    let is i64 as dk with mut = 0;
+    if ((it.op == d.IR_MOV || it.op == d.IR_ADD || it.op == d.IR_SUB) && it.src1.op_type == d.OP_VREG && it.src1.vreg != w
+        && (cast(i64, it.cast_to) == 0 || *cast(*i32, cast(i64, it.cast_to) + 28) == 8)) {
+        if (it.op == d.IR_MOV) { ok = 1; }
+        else if ((it.op == d.IR_ADD || it.op == d.IR_SUB) && it.src2.op_type == d.OP_IMM
+                 && it.src2.imm > 0 - 1073741824 && it.src2.imm < 1073741824) {
+            ok = 1;
+            dk = it.src2.imm;
+            if (it.op == d.IR_SUB) { dk = 0 - dk; }
+        }
+    }
+    let is i32 as root with mut = 0;
+    let is i64 as off with mut = 0;
+    if (ok == 1) { root = _pa_root(it.src1.vreg); off = _pa_off(it.src1.vreg) + dk; }
+    _pa_kill(w);
+    if (ok == 1 && root != w && pa_n < 24) {
+        pa_v[pa_n] = w; pa_root[pa_n] = root; pa_off[pa_n] = off;
+        pa_n = pa_n + 1;
+    }
+}
+
+fn _pa_size(t as i64) as i64 {
+    if (t == 0) { return 0; }
+    return cast(i64, *cast(*i32, t + 28));
+}
+
+// 1 when the two accesses share a base and their bytes do not meet.
+fn _pa_apart(a as i32, ta as i64, b as i32, tb as i64) as i32 {
+    let is i64 as sa = _pa_size(ta);
+    let is i64 as sb = _pa_size(tb);
+    if (sa <= 0 || sb <= 0 || _pa_root(a) != _pa_root(b)) { return 0; }
+    let is i64 as oa = _pa_off(a);
+    let is i64 as ob = _pa_off(b);
+    return cast(i32, oa + sa <= ob || ob + sb <= oa);
+}
+
+// 1 when the two name the same bytes.
+fn _pa_same(a as i32, b as i32) as i32 {
+    if (a == b) { return 1; }
+    return cast(i32, _pa_root(a) == _pa_root(b) && _pa_off(a) == _pa_off(b));
+}
+
 fn pass_load_cse(func as *d.IRFunction) as void {
+    pa_n = 0;
     let is [8]i32 as la;      // address vreg
     let is [8]i32 as lv;      // loaded value vreg
     let is [8]i64 as lt;      // type
     let is i32 as n with mut = 0;
+    rot.fo_begin(func);
     let is *d.IRInst as it with mut = func.instructions;
     while (cast(i64, it) != 0) {
         if (it.is_dead == 0) {
-            if (_lc_clobbers(it.op) == 1) { n = 0; }
+            if (it.op == d.IR_STORE || it.op == d.IR_VSTOREQ || it.op == d.IR_VSTOREQ256) {
+                // a store leaves what was loaded from another object
+                let is i32 as so = rot.fo_of_store(it);
+                let is i32 as k3 with mut = 0;
+                let is i32 as o3 with mut = 0;
+                while (k3 < n) {
+                    if (rot.fo_distinct(so, rot.fo_of_vreg(la[k3])) == 1
+                        || (it.op == d.IR_STORE && it.dest.op_type == d.OP_VREG
+                            && _pa_apart(it.dest.vreg, cast(i64, it.cast_to), la[k3], lt[k3]) == 1)) {
+                        la[o3] = la[k3]; lv[o3] = lv[k3]; lt[o3] = lt[k3];
+                        o3 = o3 + 1;
+                    }
+                    k3 = k3 + 1;
+                }
+                n = o3;
+                if (it.op == d.IR_STORE && it.dest.op_type == d.OP_VREG && it.src1.op_type == d.OP_VREG
+                    && it.src1.vreg != it.dest.vreg && n < 8 && _lc_fwd_kind(it.cast_to) != 0) {
+                    la[n] = it.dest.vreg; lv[n] = it.src1.vreg; lt[n] = cast(i64, it.cast_to);
+                    n = n + 1;
+                }
+            } else if (_lc_clobbers(it.op) == 1) {
+                n = 0;
+                if (it.op == d.IR_LABEL) { pa_n = 0; }
+                else { _pa_note(it); }
+            }
             else {
                 let is i32 as hit with mut = 0 - 1;
                 if (it.op == d.IR_LOAD && it.src1.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
                     && it.dest.vreg != it.src1.vreg) {
                     let is i32 as k with mut = 0;
                     while (k < n) {
-                        if (la[k] == it.src1.vreg && lt[k] == cast(i64, it.cast_to)) { hit = k; }
+                        if ((_pa_same(la[k], it.src1.vreg) == 1 || rot.fo_same_global(la[k], it.src1.vreg) == 1)
+                            && lt[k] == cast(i64, it.cast_to)) { hit = k; }
                         k = k + 1;
                     }
                 }
                 let is i32 as hv with mut = 0 - 1;
                 if (hit >= 0) { hv = lv[hit]; }
+                _pa_note(it);
                 // a write of any vreg drops the entries that name it
                 if (it.dest.op_type == d.OP_VREG) {
                     let is i32 as w = it.dest.vreg;
@@ -636,12 +763,62 @@ fn pass_load_cse(func as *d.IRFunction) as void {
                     n = o;
                 }
                 if (hv >= 0) {
-                    it.op = cast(i8, d.IR_MOV);
+                    if (_lc_fwd_kind(it.cast_to) == 2) {
+                        it.op = cast(i8, d.IR_CAST);
+                        it.cast_from = it.cast_to;
+                    } else {
+                        it.op = cast(i8, d.IR_MOV);
+                    }
                     it.src1 = d.op_vreg(hv);
                 } else if (it.op == d.IR_LOAD && it.src1.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
                     && it.dest.vreg != it.src1.vreg && n < 8) {
                     la[n] = it.src1.vreg; lv[n] = it.dest.vreg; lt[n] = cast(i64, it.cast_to);
                     n = n + 1;
+                }
+            }
+        }
+        it = it.next;
+    }
+    rot.fo_end();
+}
+
+// === An index or offset known to be 0, in the code the passes above wrote ===
+//
+// -O2. The loop guards they emit name the induction variable, which right there
+// often still holds its first value: in one straight line, ADD, SUB and scaled
+// LEA of a value last set by IMM 0 are copies of their base.
+fn pass_add_zero(func as *d.IRFunction) as void {
+    let is [8]i32 as z;
+    let is i32 as n with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_LABEL) { n = 0; }
+            else {
+                let is i32 as is_lea = cast(i32, op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8);
+                if ((op == d.IR_ADD || op == d.IR_SUB || is_lea == 1) && it.src1.op_type == d.OP_VREG
+                    && it.src2.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
+                    && (is_lea == 1 || cast(i64, it.cast_to) == 0 || *cast(*i32, cast(i64, it.cast_to) + 28) == 8)) {
+                    let is i32 as k with mut = 0;
+                    let is i32 as zero with mut = 0;
+                    while (k < n) { if (z[k] == it.src2.vreg) { zero = 1; } k = k + 1; }
+                    if (zero == 1) {
+                        it.op = cast(i8, d.IR_MOV);
+                        it.src2.op_type = cast(i8, d.OP_NONE);
+                    }
+                }
+                if (it.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY
+                    && op != d.IR_VSTOREQ && op != d.IR_VSTOREQ256) {
+                    let is i32 as w = it.dest.vreg;
+                    let is i32 as k2 with mut = 0;
+                    let is i32 as o with mut = 0;
+                    while (k2 < n) {
+                        if (z[k2] != w) { z[o] = z[k2]; o = o + 1; }
+                        k2 = k2 + 1;
+                    }
+                    n = o;
+                    if (op == d.IR_IMM && it.src1.imm == 0 && n < 8) { z[n] = w; n = n + 1; }
                 }
             }
         }

@@ -878,6 +878,12 @@ fn _lz_init(func as *d.IRFunction, vc as i32) as void {
     }
 }
 
+// A GET_ARG of a parameter known to arrive canonical (d.params_canonical).
+fn param_canon(inst as *d.IRInst) as i32 {
+    if (d.params_canonical == 0 || inst.op != d.IR_GET_ARG || cast(i64, inst.cast_to) == 0) { return 0; }
+    return 1;
+}
+
 // Does this definition leave its dest sign-extended as an i32?
 fn _sx32_def_ok(inst as *d.IRInst) as i32 {
     let is i32 as op = inst.op;
@@ -894,7 +900,10 @@ fn _sx32_def_ok(inst as *d.IRInst) as i32 {
         if (inst.src1.op_type == d.OP_IMM && inst.src1.imm >= 0 - 2147483648 && inst.src1.imm <= 2147483647) { return 1; }
         return 0;
     }
-    if (op == d.IR_GET_ARG) { return cast(i32, argx32[inst.dest.vreg]); }
+    if (op == d.IR_GET_ARG) {
+        if (param_canon(inst) == 1 && _is_i32s(inst.cast_to) == 1) { return 1; }
+        return cast(i32, argx32[inst.dest.vreg]);
+    }
     // A Caustic function returns an i32 sign-extended (its RET reads the value
     // whole), which a cast of the result to i64 already counts on.
     if (op == d.IR_CALL && inst.is_extern_call == cast(i8, 0) && _is_i32s(inst.cast_to) == 1) { return 1; }
@@ -946,7 +955,7 @@ fn sx32_init(func as *d.IRFunction) as void {
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         if (inst.is_dead == 0 && inst.op == d.IR_GET_ARG && inst.dest.op_type == d.OP_VREG
-            && arg_place(inst, inst.src1.imm) < 6 && inst.dest.vreg < vc) {
+            && arg_place(inst, inst.src1.imm) < 6 && inst.dest.vreg < vc && param_canon(inst) == 0) {
             argx32[inst.dest.vreg] = cast(u8, 1);
         }
         // A shrink-wrap split copy (shrinkwrap.cst) passes the parameter on:
@@ -1108,6 +1117,8 @@ fn _f32s_reader(inst as *d.IRInst, which as i32) as i32 {
     if ((op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE)
         && is_float_type(inst.cast_to) == 1) { return 1; }
     if (op == d.IR_MOV && which == 1 && inst.dest.op_type == d.OP_VREG) { return f32s_is(inst.dest.vreg); }
+    // a broadcast into f32 lanes (vec_ops VO_SPLATF, ls 4)
+    if (op == d.IR_VOP && which == 1 && (inst.dest.label & 255) == 3 && ((inst.dest.label >> 8) & 15) == 4) { return 1; }
     return 0;
 }
 
@@ -1321,7 +1332,7 @@ let is i32 as aa_b with mut = 0;
 let is i32 as aa_i with mut = 0;
 let is i64 as aa_disp with mut = 0;
 let is i32 as aa_scale with mut = 1;
-let is [32]u8 as aa_buf;
+let is [48]u8 as aa_buf;
 
 fn _aa_reg(v as i32, ctx as *al.AllocCtx) as i32 {
     let is i32 as loc = al.get_loc(v, ctx);
@@ -1399,6 +1410,7 @@ fn try_addr_add(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
     aa_disp = 0;
     aa_scale = sc;
     if (cdisp == 1) { aa_disp = inst.src2.imm * cast(i64, sc); }
+    else if (sc > 1) { aa_disp = inst.src2.imm; }
     return 1;
 }
 
@@ -1434,6 +1446,17 @@ fn addr_reg(v as i32, ctx as *al.AllocCtx, scratch as i32) as *u8 {
             // " * s"
             out[k] = cast(u8, 32); out[k + 1] = cast(u8, 42); out[k + 2] = cast(u8, 32);
             out[k + 3] = cast(u8, 48 + aa_scale); k = k + 4;
+        }
+        if (aa_disp != 0) {
+            // " + d" / " - d": the constant of the index (lea_disp_fold)
+            let is i64 as dv with mut = aa_disp;
+            out[k] = cast(u8, 32); out[k + 1] = cast(u8, 43); out[k + 2] = cast(u8, 32);
+            if (dv < 0) { out[k + 1] = cast(u8, 45); dv = 0 - dv; }
+            k = k + 3;
+            let is [24]u8 as dg;
+            let is i32 as nd with mut = 0;
+            while (dv > 0) { dg[nd] = cast(u8, 48 + cast(i32, dv % 10)); nd = nd + 1; dv = dv / 10; }
+            while (nd > 0) { nd = nd - 1; out[k] = dg[nd]; k = k + 1; }
         }
         out[k] = cast(u8, 0);
         return out;

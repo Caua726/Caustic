@@ -38,6 +38,13 @@ fn ur_resolve(def_inst as *i64, def_count as *i32, vc as i32, v as i32) as i32 {
         let is *i64 as dip = cast(*i64, cast(i64, def_inst) + cast(i64, cur) * 8);
         let is *d.IRInst as di = cast(*d.IRInst, *dip);
         if (cast(i64, di) == 0) { return cur; }
+        // (in the IR optimizer, also a cast to the type it already has: how an
+        // i32 variable is read)
+        if (ur_drop_labels == 1 && di.op == d.IR_CAST && di.src1.op_type == d.OP_VREG && _cf_same_cast(di) == 1) {
+            cur = di.src1.vreg;
+            guard = guard + 1;
+            continue;
+        }
         if (di.op != d.IR_MOV || di.src1.op_type != d.OP_VREG) { return cur; }
         cur = di.src1.vreg;
         guard = guard + 1;
@@ -155,6 +162,201 @@ fn ur_next_live(inst as *d.IRInst) as *d.IRInst {
 }
 
 // Try to unroll the loop whose header LABEL is `hdr`. Returns 1 on success.
+// === A loop that only adds constants: its sum at once ===
+//
+// IR optimizer only. A constant-trip loop whose body is copies and additions
+// of constants, with nothing read from it after the loop but the variables that
+// went up by a constant each iteration, leaves each of those at its first value
+// plus trips * step. An i32 sum wraps as it would have: the addition is typed
+// and only the low bits of the constant matter. The body becomes those
+// additions; a loop around it is then straight-line code that can go the same
+// way (six nested counting loops become one addition).
+
+// An instruction that reads its dest operand (an address it writes through).
+fn _fwd_reads_dest(op as i32) as i32 {
+    return cast(i32, op == d.IR_STORE || op == d.IR_COPY || op == d.IR_CMOV || op == d.IR_ATOMIC_STORE
+        || op == d.IR_VSTOREQ || op == d.IR_VSTOREQ256);
+}
+
+fn _cf_put(st as *u8, b as *i32, o as *i64, v as i32, state as i32, bv as i32, ov as i64) as void {
+    st[v] = cast(u8, state);
+    *cast(*i32, cast(i64, b) + cast(i64, v) * 4) = bv;
+    *cast(*i64, cast(i64, o) + cast(i64, v) * 8) = ov;
+}
+
+// v's value now: state 0 what it held at the start of the iteration, 1 b + o,
+// 2 the constant o, 3 anything else.
+fn _cf_get(st as *u8, b as *i32, o as *i64, v as i32, bv as *i32, ov as *i64) as i32 {
+    let is i32 as s = cast(i32, st[v]);
+    if (s == 0) { *bv = v; *ov = 0; return 1; }
+    *bv = *cast(*i32, cast(i64, b) + cast(i64, v) * 4);
+    *ov = *cast(*i64, cast(i64, o) + cast(i64, v) * 8);
+    return s;
+}
+
+fn _cf_word(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    let is i32 as sz = *cast(*i32, cast(i64, t) + 28);
+    return cast(i32, ((k >= 1 && k <= 8) || k == 14) && sz == 8);
+}
+
+// A cast that leaves the value as it was: between two words, or to the type
+// it already has.
+fn _cf_same_cast(i as *d.IRInst) as i32 {
+    if (_cf_word(i.cast_to) == 1 && _cf_word(i.cast_from) == 1) { return 1; }
+    if (cast(i64, i.cast_to) == 0 || cast(i64, i.cast_from) == 0) { return 0; }
+    if (*cast(*i32, i.cast_to) != *cast(*i32, i.cast_from)) { return 0; }
+    return cast(i32, *cast(*i32, cast(i64, i.cast_to) + 28) == *cast(*i32, cast(i64, i.cast_from) + 28));
+}
+
+fn _cf_reads(o as *d.Operand, st as *u8, vc as i32) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= vc) { return 0; }
+    return cast(i32, st[o.vreg] != cast(u8, 0));
+}
+
+// The body as those additions; 0 (nothing changed) when it is anything else.
+fn ur_closed(func as *d.IRFunction, hdr as *d.IRInst, backedge as *d.IRInst, body_last as *d.IRInst, jz as *d.IRInst,
+             def_inst as *i64, def_count as *i32, vc as i32, trips as i64) as i32 {
+    let is *u8 as st = d.opt_alloc(cast(i64, vc) + 1);
+    let is *i32 as bs = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
+    let is *i64 as os = cast(*i64, d.opt_alloc(cast(i64, vc) * 8 + 8));
+    let is *i64 as lastadd = cast(*i64, d.opt_alloc(cast(i64, vc) * 8 + 8));
+    let is i32 as i with mut = 0;
+    while (i < vc) { st[i] = cast(u8, 0); *cast(*i64, cast(i64, lastadd) + cast(i64, i) * 8) = 0; i = i + 1; }
+    let is i32 as ok with mut = 1;
+    let is i32 as seen_jz with mut = 0;
+    let is i32 as bv with mut = 0;
+    let is i64 as ov with mut = 0;
+    let is *d.IRInst as w with mut = hdr.next;
+    while (cast(i64, w) != cast(i64, backedge) && ok == 1) {
+        if (w.is_dead == 0 && cast(i64, w) != cast(i64, jz)) {
+            let is i32 as op = w.op;
+            let is i32 as v = w.dest.vreg;
+            if (w.dest.op_type != d.OP_VREG || v < 0 || v >= vc) { ok = 0; }
+            else if (op == d.IR_IMM && w.src1.op_type == d.OP_IMM) {
+                _cf_put(st, bs, os, v, 2, 0, w.src1.imm);
+            } else if ((op == d.IR_ADD || op == d.IR_SUB) && w.src1.op_type == d.OP_VREG && w.src1.vreg < vc) {
+                let is i64 as c with mut = 0;
+                if (ur_val_const(def_inst, def_count, vc, cast(i32, w.src2.op_type), w.src2.vreg, w.src2.imm, &c) == 0) { ok = 0; }
+                else {
+                    let is i32 as s = _cf_get(st, bs, os, w.src1.vreg, &bv, &ov);
+                    if (op == d.IR_SUB) { c = 0 - c; }
+                    if (s == 3) { _cf_put(st, bs, os, v, 3, 0, 0); }
+                    else if (s == 2) { _cf_put(st, bs, os, v, 2, 0, ov + c); }
+                    else {
+                        _cf_put(st, bs, os, v, 1, bv, ov + c);
+                        *cast(*i64, cast(i64, lastadd) + cast(i64, bv) * 8) = cast(i64, w);
+                    }
+                }
+            } else if ((op == d.IR_MOV || (op == d.IR_CAST && _cf_same_cast(w) == 1))
+                       && w.src1.op_type == d.OP_VREG && w.src1.vreg < vc) {
+                let is i32 as s = _cf_get(st, bs, os, w.src1.vreg, &bv, &ov);
+                if (s == 3) { _cf_put(st, bs, os, v, 3, 0, 0); }
+                else if (s == 2) { _cf_put(st, bs, os, v, 2, 0, ov); }
+                else { _cf_put(st, bs, os, v, 1, bv, ov); }
+            } else if (op >= d.IR_EQ && op <= d.IR_GE) {
+                _cf_put(st, bs, os, v, 3, 0, 0);
+            } else { ok = 0; }
+        }
+        if (cast(i64, w) == cast(i64, jz)) { seen_jz = 1; }
+        w = w.next;
+    }
+    if (seen_jz == 0) { ok = 0; }
+    // read after the loop: only what went up by a constant, or a constant
+    if (ok == 1) {
+        let is i32 as inloop with mut = 0;
+        w = func.instructions;
+        while (cast(i64, w) != 0 && ok == 1) {
+            if (cast(i64, w) == cast(i64, hdr)) { inloop = 1; }
+            if (inloop == 0 && w.is_dead == 0) {
+                let is i32 as q with mut = 0 - 1;
+                if (_cf_reads(&w.src1, st, vc) == 1) { q = w.src1.vreg; }
+                if (_cf_reads(&w.src2, st, vc) == 1) {
+                    let is i32 as q2 = w.src2.vreg;
+                    if (q >= 0) {
+                        let is i32 as sq = _cf_get(st, bs, os, q, &bv, &ov);
+                        if (sq == 3 || (sq == 1 && bv != q)) { ok = 0; }
+                    }
+                    q = q2;
+                }
+                if (w.dest.op_type == d.OP_VREG && _fwd_reads_dest(w.op) == 1 && _cf_reads(&w.dest, st, vc) == 1) {
+                    if (q >= 0) {
+                        let is i32 as sq = _cf_get(st, bs, os, q, &bv, &ov);
+                        if (sq == 3 || (sq == 1 && bv != q)) { ok = 0; }
+                    }
+                    q = w.dest.vreg;
+                }
+                if (q >= 0) {
+                    let is i32 as sq = _cf_get(st, bs, os, q, &bv, &ov);
+                    if (sq == 3 || (sq == 1 && bv != q)) { ok = 0; }
+                }
+            }
+            if (cast(i64, w) == cast(i64, backedge)) { inloop = 0; }
+            w = w.next;
+        }
+    }
+    // the constants fit the additions
+    i = 0;
+    while (i < vc && ok == 1) {
+        if (st[i] == cast(u8, 1)) {
+            let is i32 as sq = _cf_get(st, bs, os, i, &bv, &ov);
+            if (sq == 1 && bv == i && ov != 0) {
+                let is *d.IRInst as a = cast(*d.IRInst, *cast(*i64, cast(i64, lastadd) + cast(i64, i) * 8));
+                if (cast(i64, a) == 0) { ok = 0; }
+                else {
+                    let is i64 as t with mut = ov * trips;
+                    let is i32 as sz with mut = 8;
+                    if (cast(i64, a.cast_to) != 0) { sz = *cast(*i32, cast(i64, a.cast_to) + 28); }
+                    if (sz <= 4) { t = cast(i64, cast(i32, t)); }
+                    if (t < 0 - 2147483648 || t > 2147483647) { ok = 0; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (ok == 0) {
+        d.opt_free(st); d.opt_free(cast(*u8, bs)); d.opt_free(cast(*u8, os)); d.opt_free(cast(*u8, lastadd));
+        return 0;
+    }
+    // the body goes; the sums, and the constants read after the loop, take its place
+    w = jz.next;
+    while (cast(i64, w) != cast(i64, backedge)) { w.is_dead = 1; w = w.next; }
+    let is *d.IRInst as at with mut = body_last;
+    i = 0;
+    while (i < vc) {
+        let is i32 as sq with mut = 0;
+        if (st[i] != cast(u8, 0)) { sq = _cf_get(st, bs, os, i, &bv, &ov); }
+        let is *d.IRInst as ni with mut = cast(*d.IRInst, 0);
+        if (sq == 1 && bv == i && ov != 0) {
+            let is *d.IRInst as a = cast(*d.IRInst, *cast(*i64, cast(i64, lastadd) + cast(i64, i) * 8));
+            let is i64 as t with mut = ov * trips;
+            let is i32 as sz with mut = 8;
+            if (cast(i64, a.cast_to) != 0) { sz = *cast(*i32, cast(i64, a.cast_to) + 28); }
+            if (sz <= 4) { t = cast(i64, cast(i32, t)); }
+            ni = ur_clone_inst(a);
+            ni.op = d.IR_ADD;
+            ni.dest = d.op_vreg(i);
+            ni.src1 = d.op_vreg(i);
+            ni.src2 = d.op_imm(t);
+        } else if (sq == 2) {
+            ni = d.new_inst(d.IR_IMM);
+            ni.dest = d.op_vreg(i);
+            ni.src1 = d.op_imm(ov);
+            ni.line = hdr.line;
+        }
+        if (cast(i64, ni) != 0) {
+            ni.is_dead = 0;
+            ni.next = at.next;
+            at.next = ni;
+            at = ni;
+        }
+        i = i + 1;
+    }
+    d.opt_free(st); d.opt_free(cast(*u8, bs)); d.opt_free(cast(*u8, os)); d.opt_free(cast(*u8, lastadd));
+    return 1;
+}
+
 fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count as *i32, vc as i32) as i32 {
     let is i32 as hlabel = hdr.dest.label;
 
@@ -255,9 +457,18 @@ fn ur_try(func as *d.IRFunction, hdr as *d.IRInst, def_inst as *i64, def_count a
 
     // trip count = N - init, must be a small positive constant.
     let is i64 as kk = nbound - init;
-    if (kk < 1 || kk > cast(i64, ur_lim_trip)) { return 0; }
-    if (kk * cast(i64, bsize) > cast(i64, ur_lim_total)) { return 0; }
-    let is i32 as k = cast(i32, kk);
+    if (kk < 1) { return 0; }
+    // (the sum at once beats the copies, and has no limit on the trips)
+    let is i32 as closed with mut = 0;
+    if (ur_drop_labels == 1 && d.ir_opt_level >= 2) {
+        closed = ur_closed(func, hdr, backedge, body_last, jz, def_inst, def_count, vc, kk);
+    }
+    if (closed == 0) {
+        if (kk > cast(i64, ur_lim_trip)) { return 0; }
+        if (kk * cast(i64, bsize) > cast(i64, ur_lim_total)) { return 0; }
+    }
+    let is i32 as k with mut = 1;
+    if (closed == 0) { k = cast(i32, kk); }
 
     // --- transform: drop test + back-edge, clone body K-1 times after it ---
     // Snapshot the live body insts into an array FIRST. Cloning by walking the

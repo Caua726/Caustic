@@ -53,15 +53,15 @@ use "../../std/mem/core.cst" as core;
 // references any more — most of them, once their scalars live in registers.
 
 let is i32 as INL_BASE with imut = 15;
-let is i32 as INL_LOOP_BONUS with imut = 45;
-let is i32 as INL_LOOP2_BONUS with imut = 30;
+let is i32 as INL_LOOP_BONUS with imut = 60;
+let is i32 as INL_LOOP2_BONUS with imut = 60;
 let is i32 as INL_SINGLE_BONUS with imut = 100;
 let is i32 as INL_DOUBLE_BONUS with imut = 30;
 let is i32 as INL_CONST_BONUS with imut = 8;
 // A callee that makes no call and is at most this much bigger than the call
 // (an expression in a function: a rotate, a min) goes in for free as well:
 // the call, the argument moves and the frame cost about as much.
-let is i32 as INL_LEAF_FREE with imut = 4;
+let is i32 as INL_LEAF_FREE with imut = 10;
 let is i32 as INL_MAX_DEPTH with imut = 3;
 // Growth budget of one caller: MIN + PCT% of its own estimate, at most MAX.
 // The budget, more than the thresholds, sets what inlining costs in compile
@@ -179,6 +179,7 @@ let is PMap as _est with mut;                       // *IRFunction -> estimate +
 let is PMap as _stk with mut;                       // *IRFunction -> sticky frame bytes + 1
 let is PMap as _est_raw with mut;                   // *IRFunction -> estimate of the raw body + 1
 let is PMap as _shadow with mut;                    // *IRFunction -> its optimized copy
+let is PMap as _nr_memo with mut;                   // *IRFunction -> 1 returns, 2 does not (_noreturn)
 
 // The parallel path keeps every body as the frontend produced it (unoptimized,
 // so the per-module objects do not depend on emission order). There a callee
@@ -240,6 +241,7 @@ fn _ensure_tables(prog as *u8) as void {
     _pm_clear(&_stk);
     _pm_clear(&_est_raw);
     _pm_clear(&_shadow);
+    _pm_clear(&_nr_memo);
     f = p.functions;
     while (cast(i64, f) != 0) {
         if (f.is_reachable == 1 && cast(i64, f.call_targets) != 0) {
@@ -254,6 +256,9 @@ fn _ensure_tables(prog as *u8) as void {
         }
         f = f.next;
     }
+    // Read off the bodies as they are now, before any copy changes one.
+    f = p.functions;
+    while (cast(i64, f) != 0) { _noreturn(f); f = f.next; }
 }
 
 // === Callee size estimate ===
@@ -383,6 +388,125 @@ fn _ms_split(o as *d.Operand, ak as *i32, vc as i32, bad as *i32) as i32 {
     return 1;
 }
 
+// === Calls that never return ===
+//
+// A function whose first straight run of code ends the process, or calls one
+// that does: `fail("...")`, a usage message. The path to such a call runs at
+// most once, so it costs an inlined copy nothing (the size estimate leaves it
+// out, and it does not make its function a caller), it is not itself worth
+// copying, and no value is live past it (pass_noreturn_cut).
+
+fn _name_ends(f as *d.IRFunction, s as *u8, n as i32) as i32 {
+    if (f.asm_name_len < n) { return 0; }
+    let is *u8 as t = cast(*u8, cast(i64, f.asm_name_ptr) + cast(i64, f.asm_name_len - n));
+    let is i32 as k with mut = 0;
+    while (k < n) {
+        if (t[k] != s[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _noreturn(f as *d.IRFunction) as i32 {
+    if (cast(i64, f) == 0 || cast(i64, f.instructions) == 0 || f.is_naked != 0) { return 0; }
+    let is i64 as m = _pm_get(&_nr_memo, cast(i64, f));
+    if (m != 0) { return cast(i32, m - 1); }
+    _pm_put(&_nr_memo, cast(i64, f), 1);            // a cycle proves nothing
+    let is i32 as r with mut = 0;
+    // std/os/linux.cst's exit wrappers: their one syscall does not come back
+    if (_name_ends(f, "_std_os_linux_cst_exit", 22) == 1 || _name_ends(f, "_std_os_linux_cst_exit_thread", 29) == 1) { r = 1; }
+    let is *d.IRInst as i with mut = f.instructions;
+    let is i32 as go with mut = 1;
+    while (r == 0 && go == 1 && cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { go = 0; }
+            else if (_noreturn_call(i) == 1) { r = 1; }
+        }
+        i = i.next;
+    }
+    _pm_put(&_nr_memo, cast(i64, f), cast(i64, r) + 1);
+    return r;
+}
+
+// Calls opt_libcall.cst reads for what they mean: they stay calls until every
+// function has had its first round, and only then go in (late_inline_func).
+let is i32 as _late_round with mut = 0;
+
+fn set_late_round(v as i32) as void { _late_round = v; }
+
+fn _is_late(f as *d.IRFunction) as i32 {
+    if (_name_ends(f, "_std_mem_bins_cst_bins_alloc", 28) == 1 || _name_ends(f, "_std_mem_bins_cst_bins_free", 27) == 1
+        || _name_ends(f, "_std_string_cst_strcpy", 22) == 1 || _name_ends(f, "_std_string_cst_strlen", 22) == 1) { return 1; }
+    return 0;
+}
+
+// Does the function still call one of them?
+fn has_late_call(func as *d.IRFunction) as i32 {
+    let is *d.IRInst as i with mut = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0 && i.op == d.IR_CALL && i.is_extern_call == 0) {
+            let is *d.IRFunction as g = _lookup(i.call_name_ptr, i.call_name_len);
+            if (cast(i64, g) != 0 && _is_late(g) == 1) { return 1; }
+        }
+        i = i.next;
+    }
+    return 0;
+}
+
+fn _noreturn_call(i as *d.IRInst) as i32 {
+    if (i.op != d.IR_CALL || i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
+    return _noreturn(_lookup(i.call_name_ptr, i.call_name_len));
+}
+
+// A function that goes straight to formatting output: its time is the variadic
+// call's. Taking it in saves next to nothing, and the registers it holds across
+// that call land on the caller's hot path when it reports an error.
+fn _reports(f as *d.IRFunction) as i32 {
+    if (cast(i64, f) == 0) { return 0; }
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_LABEL || op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { return 0; }
+            if (op == d.IR_CALL && i.is_variadic_call != 0) { return 1; }
+        }
+        i = i.next;
+    }
+    return 0;
+}
+
+// A call of one, on a path that goes on: that path is the cold one.
+fn _report_call(i as *d.IRInst) as i32 {
+    if (i.op != d.IR_CALL || i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
+    return _reports(_lookup(i.call_name_ptr, i.call_name_len));
+}
+
+// Nothing runs after a call that never returns: a RET right after it, marked
+// (is_extern_call = 1) for ic.pass_cold_sink, ends the block and takes with it
+// the code up to the next label. What was live only past the call no longer
+// keeps a callee-saved register or a slot across it.
+fn pass_noreturn_cut(func as *d.IRFunction) as void {
+    if (func.is_naked != 0) { return; }
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0) {
+        if (w.is_dead == 0 && _noreturn_call(w) == 1) {
+            let is *d.IRInst as r = d.new_inst(d.IR_RET);
+            r.line = w.line;
+            r.is_extern_call = cast(i8, 1);
+            r.next = w.next;
+            w.next = r;
+            let is *d.IRInst as x with mut = r.next;
+            while (cast(i64, x) != 0 && (x.is_dead == 1 || x.op != d.IR_LABEL)) {
+                x.is_dead = 1;
+                x = x.next;
+            }
+            w = r;
+        }
+        w = w.next;
+    }
+}
+
 fn _measure(f as *d.IRFunction, out_sticky as *i32) as i32 {
     *out_sticky = 0;
     let is i32 as vc = f.vreg_count;
@@ -418,14 +542,19 @@ fn _measure(f as *d.IRFunction, out_sticky as *i32) as i32 {
     }
     let is i32 as n with mut = 0;
     let is i32 as unreachable with mut = 0;
+    let is i32 as run_start with mut = 0;
     i = f.instructions;
     while (cast(i64, i) != 0) {
         if (i.is_dead == 0) {
             let is i32 as op = i.op;
-            if (op == d.IR_LABEL) { unreachable = 0; }
+            if (op == d.IR_LABEL) { unreachable = 0; run_start = n; }
             else if (unreachable == 1) { }
             else if (op == d.IR_RET) { unreachable = 1; }
             else if (op == d.IR_JMP) { unreachable = 1; n = n + 1; }
+            else if (op == d.IR_JZ || op == d.IR_JNZ) { n = n + 1; run_start = n; }
+            // a path that ends in a call that never returns: cold, it costs nothing
+            else if (_noreturn_call(i) == 1) { n = run_start; unreachable = 1; }
+            else if (_report_call(i) == 1) { n = run_start; }
             else if (op == d.IR_GET_ARG || op == d.IR_MOV || op == d.IR_IMM || op == d.IR_SET_CTX) { }
             else if (op == d.IR_LOAD && i.src1.op_type == d.OP_IMM && _addr_taken(offs, k, i.src1.imm) == 0) { }
             else if (op == d.IR_STORE && i.dest.op_type == d.OP_IMM && _addr_taken(offs, k, i.dest.imm) == 0) { }
@@ -454,7 +583,7 @@ fn _makes_call(f as *d.IRFunction) as i32 {
     let is *d.IRInst as i with mut = f.instructions;
     while (cast(i64, i) != 0) {
         if (i.is_dead == 0 && (i.op == d.IR_CALL || i.op == d.IR_CALL_INDIRECT || i.op == d.IR_FFI_CALL
-                               || i.op == d.IR_SYSCALL)) { return 1; }
+                               || i.op == d.IR_SYSCALL) && _noreturn_call(i) == 0 && _report_call(i) == 0) { return 1; }
         i = i.next;
     }
     return 0;
@@ -469,7 +598,7 @@ fn _is_leaf(f as *d.IRFunction) as i32 {
     while (cast(i64, i) != 0) {
         if (i.is_dead == 0) {
             if (i.op == d.IR_CALL_INDIRECT || i.op == d.IR_FFI_CALL || i.op == d.IR_SYSCALL) { return 0; }
-            if (i.op == d.IR_CALL) {
+            if (i.op == d.IR_CALL && _noreturn_call(i) == 0 && _report_call(i) == 0) {
                 if (i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
                 let is *d.IRFunction as g = _lookup(i.call_name_ptr, i.call_name_len);
                 if (cast(i64, g) == 0 || cast(i64, g) == cast(i64, f) || cast(i64, g.instructions) == 0) { return 0; }
@@ -655,6 +784,9 @@ fn _callee_ok(f as *d.IRFunction, caller as *d.IRFunction) as i32 {
     if (f.is_variadic != 0 || f.is_naked != 0 || f.is_recursive != 0) { return 0; }
     if (f.live_inst_count <= 0 || f.live_inst_count > INL_RAW_CAP) { return 0; }
     if (d.inline_callee_ok(f) == 0) { return 0; }
+    if (_noreturn(f) == 1) { return 0; }
+    if (_late_round == 0 && _is_late(f) == 1) { return 0; }
+    if (_reports(f) == 1) { return 0; }
     return 1;
 }
 
@@ -722,7 +854,8 @@ fn _collect(func as *d.IRFunction, round as i64, out_size as *i64) as i64 {
                 if (_chain_depth(ch) == round && i.is_variadic_call == 0 && i.is_extern_call == 0
                     && i.dest.op_type == d.OP_VREG) {
                     let is *d.IRFunction as callee = _lookup(i.call_name_ptr, i.call_name_len);
-                    if (_callee_ok(callee, func) == 1 && _chain_has(ch, callee) == 0) {
+                    if (_callee_ok(callee, func) == 1 && _chain_has(ch, callee) == 0
+                        && (_late_round == 0 || round > 0 || _is_late(callee) == 1)) {
                         let is i64 as nconst with mut = 0;
                         let is *d.IRInst as a with mut = run;
                         while (cast(i64, a) != 0 && cast(i64, a) != cast(i64, i)) {
@@ -733,9 +866,12 @@ fn _collect(func as *d.IRFunction, round as i64, out_size as *i64) as i64 {
                             }
                             a = a.next;
                         }
+                        // a recursive function's body runs as often as a loop's
+                        let is i64 as hot with mut = depth_now;
+                        if (func.is_recursive != 0) { hot = hot + 1; }
                         let is i64 as thr with mut = cast(i64, INL_BASE);
-                        if (depth_now >= 1) { thr = thr + cast(i64, INL_LOOP_BONUS); }
-                        if (depth_now >= 2) { thr = thr + cast(i64, INL_LOOP2_BONUS); }
+                        if (hot >= 1) { thr = thr + cast(i64, INL_LOOP_BONUS); }
+                        if (hot >= 2) { thr = thr + cast(i64, INL_LOOP2_BONUS); }
                         let is i64 as nrefs = _pm_get(&_refs, cast(i64, callee));
                         if (nrefs == 1) { thr = thr + cast(i64, INL_SINGLE_BONUS); }
                         if (nrefs == 2) { thr = thr + cast(i64, INL_DOUBLE_BONUS); }
@@ -765,9 +901,9 @@ fn _collect(func as *d.IRFunction, round as i64, out_size as *i64) as i64 {
                             s.pos = pos;
                             s.thr = thr;
                             s.inloop = 0;
-                            if (depth_now >= 1) { s.inloop = 1; }
+                            if (hot >= 1) { s.inloop = 1; }
                             if (s.est <= s.cost || (s.est <= s.cost + cast(i64, INL_LEAF_FREE) && _makes_call(callee) == 0)) { s.prio = 0; }
-                            else if (depth_now >= 1) { s.prio = 1; }
+                            else if (hot >= 1) { s.prio = 1; }
                             else { s.prio = 2; }
                             let is i64 as grow with mut = s.est - s.cost;
                             if (grow < 0) { grow = 0; }

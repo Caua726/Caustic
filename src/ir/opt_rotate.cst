@@ -27,8 +27,8 @@ use "dom.cst" as dom;
 //
 // H is copied only when it is short (ROT_MAX_HDR instructions) and made of the
 // plain operations below. A value H computes for its own test gets a fresh vreg
-// in the copy; a header whose values are read elsewhere in the function is left
-// alone, so no vreg gains a second definition.
+// in the copy; a value read elsewhere too (the copy of the counter the body steps)
+// keeps its vreg, set again at the bottom as it was at the top.
 //
 // Runs at codegen (emit_driver.cst), after the vectorizer, unroll and
 // if-conversion, which all match the loop in its original shape.
@@ -39,7 +39,7 @@ let is i32 as ROT_MAX_LOOPS with imut = 256;
 fn _rot_hdr_op(op as i32) as i32 {
     if (op == d.IR_IMM || op == d.IR_MOV || op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL
         || op == d.IR_AND || op == d.IR_OR || op == d.IR_XOR || op == d.IR_SHL || op == d.IR_SHR
-        || op == d.IR_NEG || op == d.IR_NOT || op == d.IR_CAST || op == d.IR_LOAD
+        || op == d.IR_NEG || op == d.IR_NOT || op == d.IR_CAST || op == d.IR_LOAD || op == d.IR_BITS
         || op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE
         || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { return 1; }
     return 0;
@@ -151,26 +151,12 @@ fn _rot_one(func as *d.IRFunction, latch as *d.IRInst, hdr_lbl as i32) as i32 {
         _rot_uncount(&w.dest, cnt, vc); _rot_uncount(&w.src1, cnt, vc); _rot_uncount(&w.src2, cnt, vc);
         if (cast(i64, w) == cast(i64, g)) { stop = 1; } else { w = w.next; }
     }
-    let is i32 as ok with mut = 1;
-    w = lh.next;
-    stop = 0;
-    while (stop == 0) {
-        if (cast(i64, w) != cast(i64, g) && w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
-            if (_rot_get(cnt, w.dest.vreg) != 0) { ok = 0; }
-        }
-        if (cast(i64, w) == cast(i64, g)) { stop = 1; } else { w = w.next; }
-    }
-    if (ok == 0) {
-        d.opt_free(cast(*u8, cnt)); d.opt_free(cast(*u8, map)); d.opt_free(cast(*u8, immd));
-        return 0;
-    }
-
     // Fresh vregs for the copy.
     w = lh.next;
     stop = 0;
     while (stop == 0) {
         if (cast(i64, w) != cast(i64, g) && w.is_dead == 0 && w.dest.op_type == d.OP_VREG && w.dest.vreg >= 0 && w.dest.vreg < vc) {
-            if (_rot_get(map, w.dest.vreg) < 0) {
+            if (_rot_get(map, w.dest.vreg) < 0 && _rot_get(cnt, w.dest.vreg) == 0) {
                 _rot_put(map, w.dest.vreg, func.vreg_count);
                 func.vreg_count = func.vreg_count + 1;
             }
@@ -492,6 +478,36 @@ fn _fo_store_obj(st as *d.IRInst) as i32 {
     if (st.dest.op_type == d.OP_IMM) { return FO_STACK; }
     if (st.dest.op_type == d.OP_VREG) { return _fo_get(st.dest.vreg); }
     return FO_UNKNOWN;
+}
+
+// The object analysis for another pass: fo_begin, then fo_of_addr / fo_of_store,
+// then fo_end. fo_distinct: two addresses known to point into different objects.
+fn fo_same_global(p as i32, q as i32) as i32 {
+    if (p < 0 || q < 0 || p >= fo_vc || q >= fo_vc || fo_one[p] <= 0 || fo_one[q] <= 0) { return 0; }
+    let is *d.IRInst as a = cast(*d.IRInst, fo_one[p]);
+    let is *d.IRInst as b = cast(*d.IRInst, fo_one[q]);
+    if (a.op != d.IR_ADDR_GLOBAL || b.op != d.IR_ADDR_GLOBAL) { return 0; }
+    return d.str_eq(a.global_name_ptr, cast(i32, a.global_name_len), b.global_name_ptr, cast(i32, b.global_name_len));
+}
+
+fn fo_begin(func as *d.IRFunction) as void { _fo_init(func); }
+fn fo_end() as void {
+    d.opt_free(cast(*u8, fo_obj));
+    d.opt_free(cast(*u8, fo_one));
+    fo_obj = cast(*i32, 0);
+    fo_one = cast(*i64, 0);
+    fo_vc = 0;
+}
+fn fo_of_vreg(v as i32) as i32 { return _fo_get(v); }
+fn fo_of_store(st as *d.IRInst) as i32 {
+    if (st.op != d.IR_STORE) {
+        if (st.src1.op_type == d.OP_VREG) { return _fo_get(st.src1.vreg); }
+        return FO_UNKNOWN;
+    }
+    return _fo_store_obj(st);
+}
+fn fo_distinct(x as i32, y as i32) as i32 {
+    return cast(i32, x != FO_UNKNOWN && y != FO_UNKNOWN && x != y);
 }
 
 // The loop entered at the label lbl (prev: the instruction before it).

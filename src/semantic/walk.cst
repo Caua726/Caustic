@@ -398,6 +398,37 @@ fn try_fold_const(n as *ast.Node, out as *i64, depth as i32) as i32 {
     return 0;
 }
 
+// The value of a float constant expression the compiler can compute: literals,
+// `with imut` globals holding one, and arithmetic on them (IEEE double, what the
+// program's own f64 arithmetic does).
+fn float_const_of(n as *ast.Node, out as *f64, depth as i32) as i32 {
+    if (depth > 32 || cast(i64, n) == 0 || cast(i64, n.ty) == 0 || n.ty.kind != ast.TY_F64) { return 0; }
+    let is i32 as k = n.kind;
+    if (k == ast.NK_NUM) { *out = n.fval; return 1; }
+    if (k == ast.NK_IDENT && n.is_string_const == ast.IDENT_FLOAT_CONST) { *out = ast.i64_to_f64(n.val); return 1; }
+    if (k == ast.NK_NEG) {
+        let is f64 as v with mut = 0.0;
+        if (float_const_of(n.expr, &v, depth + 1) == 0) { return 0; }
+        if (v == 0.0) { return 0; }
+        *out = 0.0 - v;
+        return 1;
+    }
+    if (k == ast.NK_ADD || k == ast.NK_SUB || k == ast.NK_MUL || k == ast.NK_DIV) {
+        let is f64 as l with mut = 0.0;
+        let is f64 as r with mut = 0.0;
+        if (float_const_of(n.lhs, &l, depth + 1) == 0 || float_const_of(n.rhs, &r, depth + 1) == 0) { return 0; }
+        let is f64 as v with mut = 0.0;
+        if (k == ast.NK_ADD) { v = l + r; }
+        if (k == ast.NK_SUB) { v = l - r; }
+        if (k == ast.NK_MUL) { v = l * r; }
+        if (k == ast.NK_DIV) { v = l / r; }
+        if (v != v) { return 0; }
+        *out = v;
+        return 1;
+    }
+    return 0;
+}
+
 fn walk_let(node as *ast.Node) as void {
     node.ty = wt.resolve_type_ptr(cast(*u8, node.ty));
     if (node.ty.kind == ast.TY_VOID) {
@@ -429,9 +460,16 @@ fn walk_let(node as *ast.Node) as void {
     // can substitute literal at every use site.
     if (var.is_global == 1 && node.flags == ast.VF_IMUT && cast(i64, node.init_expr) != 0) {
         let is i64 as fv with mut = 0;
+        let is f64 as flit with mut = 0.0;
         if (try_fold_const(node.init_expr, &fv, 0) == 1) {
             var.has_folded_init = 1;
             var.folded_init_val = fv;
+        } else if (node.ty.kind == ast.TY_F32 && node.init_expr.kind == ast.NK_NUM) {
+            var.has_folded_init = 2;
+            var.folded_init_val = ast.f64_to_i64(ast.round_f32(node.init_expr.fval));
+        } else if (float_const_of(node.init_expr, &flit, 0) == 1) {
+            var.has_folded_init = 2;
+            var.folded_init_val = ast.f64_to_i64(flit);
         }
     }
     if (var.asm_name_len > 0) {
@@ -623,6 +661,10 @@ fn walk(node as *ast.Node) as void {
         // both sides as literals).
         if (var.has_folded_init == 1) {
             node.kind = ast.NK_NUM;
+            node.val = var.folded_init_val;
+        }
+        if (var.has_folded_init == 2) {
+            node.is_string_const = ast.IDENT_FLOAT_CONST;
             node.val = var.folded_init_val;
         }
         return;
@@ -1413,6 +1455,10 @@ fn walk_member(node as *ast.Node) as void {
                 node.var_offset = mv.offset;
                 node.is_global = mv.is_global;
                 node.is_string_const = mv.is_string_const;
+                if (mv.has_folded_init == 2) {
+                    node.is_string_const = ast.IDENT_FLOAT_CONST;
+                    node.val = mv.folded_init_val;
+                }
                 return;
             }
             mv = mv.next;

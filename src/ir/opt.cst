@@ -10,6 +10,8 @@ use "opt_helpers.cst" as helpers;
 use "opt_prop.cst" as prop;
 use "opt_loop.cst" as loop;
 use "opt_sr.cst" as sr;
+use "opt_libcall.cst" as lib;
+use "opt_jt.cst" as jt;
 use "opt_cse.cst" as cse;
 use "opt_reassoc.cst" as reassoc;
 use "opt_gvn.cst" as gvn;
@@ -119,6 +121,7 @@ fn optimize_func(func as *d.IRFunction) as void {
     if (vc == 0) { return; }
     let is i32 as vc_alloc with mut = vc + 512;
 
+    if (d.ir_opt_level >= 2) { helpers.pass_dead_ctx(func); helpers.pass_void_ret(func); }
     let is i64 as t0 with mut = 0;
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     prop.pass_addr_fusion(func, vc_alloc);
@@ -190,6 +193,8 @@ fn optimize_func(func as *d.IRFunction) as void {
     d.opt_free(cast(*u8, imm_val));
     d.opt_free(cast(*u8, copy_of));
 
+    if (d.ir_opt_level >= 2) { prop.pass_add_chain(func); }
+
     // Induction variables are the header phis.
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     sr.pass_strength_reduction(func);
@@ -243,6 +248,7 @@ fn optimize_func(func as *d.IRFunction) as void {
         // a split copy can free the object on its other side: one more round
         let is i32 as srr with mut = 0;
         while (srr < 3 && sroa.pass_sroa(func) == 1) { optimize_func(func); srr = srr + 1; }
+        if (jt.pass_jump_thread(func) == 1) { optimize_func(func); }
         opt_nest = 0;
     }
 
@@ -295,12 +301,17 @@ fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
     if (opt_prof_on == 1) { ti = opt_prof_time(); }
     // -O2 decides by cost and copies callees that keep a frame (opt_inline.cst);
     // -O1, the fast tier, keeps the fixed limits of opt_loop.cst.
-    if (d.ir_opt_level >= 2) { inl.pass_inline_o2(func, prog); }
+    if (d.ir_opt_level >= 2) { inl.pass_inline_o2(func, prog); inl.pass_noreturn_cut(func); }
     else { loop.pass_inline(func, prog); }
     if (opt_prof_on == 1) { opt_prof_times[9] = opt_prof_times[9] + opt_prof_time() - ti; }
 
     // Phase 3: re-optimize after inlining
     optimize_func(func);
+    // -O2: calls of std's allocator and string functions, read for what they mean
+    if (d.ir_opt_level >= 2) {
+        let is *d.IRProgram as lp = cast(*d.IRProgram, prog);
+        if (lib.pass_lib_calls(func, lp.strings) == 1) { optimize_func(func); }
+    }
     // -O2: sin(v) and cos(v) of one value share one call (opt_sincos.cst)
     if (d.ir_opt_level >= 2 && sinc.pass_sincos(func, prog) == 1) { optimize_func(func); }
 
@@ -319,6 +330,19 @@ fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
         // Whatever was measured of this body as a callee no longer holds.
         inl.forget(func);
     }
+}
+
+// -O2, after every function's optimize_inline_func: the calls opt_inline kept
+// out for opt_libcall go in where they are still calls.
+fn late_inline_func(func as *d.IRFunction, prog as *u8) as void {
+    if (d.ir_opt_level < 2 || inl.has_late_call(func) == 0) { return; }
+    inl.set_late_round(1);
+    inl.pass_inline_o2(func, prog);
+    inl.pass_noreturn_cut(func);
+    inl.set_late_round(0);
+    optimize_func(func);
+    inl.compact_frame(func);
+    inl.forget(func);
 }
 
 // Bodies stay unoptimized until their function is emitted (parallel path):

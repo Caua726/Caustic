@@ -31,6 +31,12 @@ fn _be() as void { eo.out_char(10); }
 
 // Hardware number of the base register of enc's memory operand.
 let is i32 as _mbase with mut = 1;
+// [_mbase + _mindex * _mscale + disp + _mdisp] when _mindex >= 0: an address
+// the access took from the LEA before it (try_vec_lea). The next memory
+// operand uses them up.
+let is i32 as _mindex with mut = 0 - 1;
+let is i32 as _mscale with mut = 1;
+let is i64 as _mdisp with mut = 0;
 
 // Hardware number of the general register an allocator location names, -1
 // for none.
@@ -51,11 +57,59 @@ fn _hw_gpr(loc as i32) as i32 {
 // The base register of a vector load or store: the one the address already
 // lives in (-O2), else rcx, loaded with it. A hardware number.
 fn vbase(vreg as i32, ctx as *al.AllocCtx) as i32 {
+    if (vreg == vf_vreg) {
+        vf_vreg = 0 - 1;
+        _mindex = vf_index; _mscale = vf_scale; _mdisp = vf_disp;
+        return vf_base;
+    }
     if (al.al_opt_level >= 2) {
         let is i32 as hw = _hw_gpr(al.get_loc(vreg, ctx));
         if (hw >= 0) { return hw; }
     }
     e.load_op(vreg, ctx, "rcx");
+    return 1;
+}
+
+// -O2: `a = LEA b, i` read only by the whole-register vector load or store right
+// after it: the access takes [b + i * scale] itself, and no LEA is written. b and
+// i are still in their registers there, with nothing between the two.
+let is i32 as vf_vreg with mut = 0 - 1;
+let is i32 as vf_base with mut = 0;
+let is i32 as vf_index with mut = 0;
+let is i32 as vf_scale with mut = 1;
+let is i64 as vf_disp with mut = 0;
+
+fn try_vec_lea(inst as *d.IRInst, ctx as *al.AllocCtx) as i32 {
+    vf_vreg = 0 - 1;
+    if (al.al_opt_level < 2) { return 0; }
+    if (inst.src1.op_type != d.OP_VREG || inst.src2.op_type != d.OP_VREG || inst.dest.op_type != d.OP_VREG) { return 0; }
+    let is i32 as a = inst.dest.vreg;
+    if (e.isel_get_uses(a) != 1) { return 0; }
+    let is *d.IRInst as n with mut = inst.next;
+    while (cast(i64, n) != 0 && n.is_dead == 1) { n = n.next; }
+    if (cast(i64, n) == 0 || n.src1.op_type != d.OP_VREG || n.src1.vreg != a) { return 0; }
+    let is i32 as ok with mut = 0;
+    if (n.op == d.IR_VLOADQ256 || n.op == d.IR_VSTOREQ256) { ok = 1; }
+    if (n.op == d.IR_VSTOREQ && ((n.dest.label & 255) == 0 || (n.dest.label & 255) == 16)) { ok = 1; }
+    if (n.op == d.IR_VOP && vo.vo_code(n.dest.label) == vo.VO_LOAD
+        && vo.vo_lanes(n.dest.label) * vo.vo_ls(n.dest.label) >= 16) { ok = 1; }
+    if (ok == 0) { return 0; }
+    let is i32 as ix = _hw_gpr(al.get_loc(inst.src2.vreg, ctx));
+    if (ix < 0) { return 0; }
+    let is i32 as bs with mut = _hw_gpr(al.get_loc(inst.src1.vreg, ctx));
+    if (bs < 0) {
+        // a spilled base: into rax, which the vector access leaves alone
+        if (al.get_loc(inst.src1.vreg, ctx) >= 16) { return 0; }
+        e.load_op(inst.src1.vreg, ctx, "rax");
+        _gpr_inval();
+        bs = 0;
+    }
+    vf_base = bs;
+    vf_index = ix;
+    vf_scale = 4;
+    if (inst.op == d.IR_LEA2) { vf_scale = 2; } else if (inst.op == d.IR_LEA8) { vf_scale = 8; }
+    vf_disp = inst.src2.imm;
+    vf_vreg = a;
     return 1;
 }
 
@@ -70,9 +124,27 @@ fn vbase_name(vreg as i32, ctx as *al.AllocCtx) as *u8 {
 }
 
 // ModRM (+ SIB) and displacement of [base + disp], reg field reg.
-fn vmodrm(reg as i32, base as i32, disp as i64) as void {
+fn vmodrm(reg as i32, base as i32, disp0 as i64) as void {
     let is i32 as b = base & 7;
     let is i32 as r = (reg & 7) << 3;
+    let is i64 as disp = disp0 + _mdisp;
+    _mdisp = 0;
+    if (_mindex >= 0) {
+        let is i32 as ss with mut = 0;
+        if (_mscale == 2) { ss = 1; } else if (_mscale == 4) { ss = 2; } else if (_mscale == 8) { ss = 3; }
+        let is i32 as sib = (ss << 6) | ((_mindex & 7) << 3) | b;
+        _mindex = 0 - 1;
+        if (disp == 0 && b != 5) {
+            _bb(r | 4); _bb(sib);
+        } else if (disp >= 0 - 128 && disp <= 127) {
+            _bb(64 | r | 4); _bb(sib); _bb(cast(i32, disp & 255));
+        } else {
+            _bb(128 | r | 4); _bb(sib);
+            _bb(cast(i32, disp & 255)); _bb(cast(i32, (disp >> 8) & 255));
+            _bb(cast(i32, (disp >> 16) & 255)); _bb(cast(i32, (disp >> 24) & 255));
+        }
+        return;
+    }
     if (disp == 0 && b != 5) {
         _bb(r | b);
         if (b == 4) { _bb(36); }
@@ -95,14 +167,16 @@ fn enc(vex as i32, pp as i32, map as i32, w as i32, l as i32, opc as i32,
     let is i32 as r3 = (reg >> 3) & 1;
     let is i32 as b3 with mut = 0;
     if (rmk == 0) { b3 = (rm >> 3) & 1; } else { b3 = (_mbase >> 3) & 1; }
+    let is i32 as x3 with mut = 0;
+    if (rmk != 0 && _mindex >= 0) { x3 = (_mindex >> 3) & 1; }
     _bo();
     if (vex == 1) {
         _bb(196);
-        _bb(((1 - r3) << 7) | 64 | ((1 - b3) << 5) | map);
+        _bb(((1 - r3) << 7) | ((1 - x3) << 6) | ((1 - b3) << 5) | map);
         _bb((w << 7) | ((15 - (vvvv & 15)) << 3) | (l << 2) | pp);
     } else {
         if (pp == 1) { _bb(102); } else if (pp == 2) { _bb(243); } else if (pp == 3) { _bb(242); }
-        if (w == 1 || r3 == 1 || b3 == 1) { _bb(64 | (w << 3) | (r3 << 2) | b3); }
+        if (w == 1 || r3 == 1 || b3 == 1 || x3 == 1) { _bb(64 | (w << 3) | (r3 << 2) | (x3 << 1) | b3); }
         _bb(15);
         if (map == 2) { _bb(56); } else if (map == 3) { _bb(58); }
     }
@@ -114,6 +188,34 @@ fn enc(vex as i32, pp as i32, map as i32, w as i32, l as i32, opc as i32,
     }
     if (imm >= 0) { _bb(imm); }
     _be();
+}
+
+// An instruction whose memory operand is pool constant k (.LCFk), read through
+// [rip+disp32]. No immediate follows the displacement.
+fn enc_pool(vex as i32, pp as i32, map as i32, w as i32, l as i32, opc as i32, reg as i32, k as i32) as void {
+    let is i32 as r3 = (reg >> 3) & 1;
+    _bo();
+    if (vex == 1) {
+        _bb(196);
+        _bb(((1 - r3) << 7) | 96 | map);
+        _bb((w << 7) | 120 | (l << 2) | pp);
+    } else {
+        if (pp == 1) { _bb(102); } else if (pp == 2) { _bb(243); } else if (pp == 3) { _bb(242); }
+        if (r3 == 1) { _bb(68); }
+        _bb(15);
+        if (map == 2) { _bb(56); } else if (map == 3) { _bb(58); }
+    }
+    _bb(opc);
+    _bb(((reg & 7) << 3) | 5);
+    _be();
+    eo.out_str("  .ripdisp .LCF", 15); eo.out_int(cast(i64, k)); eo.out_char(10);
+}
+
+// vmovdqu of a ymm register, opc 111 load or 127 store, at [bs + ...].
+fn enc_ymm_mem(opc as i32, reg as i32, bs as i32, disp as i64) as void {
+    _mbase = bs;
+    enc(1, 2, 1, 0, 1, opc, reg, 0, 1, 1, disp, 0 - 1);
+    _mbase = 1;
 }
 
 // Register number (0..15) of a vector vreg; a spilled vector stops the compile.
@@ -367,6 +469,20 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             // a constant: its low lane's bytes, straight into rax
             let is i64 as kv with mut = inst.src1.imm;
             if (ls == 1) { kv = kv & 255; } else if (ls == 2) { kv = kv & 65535; } else if (ls == 4) { kv = kv & 4294967295; }
+            // -O2: the eight bytes of two lanes' worth from the pool, one instruction
+            if (al.al_opt_level >= 2) {
+                let is i64 as rep with mut = kv;
+                if (ls == 1) { rep = kv * 72340172838076673; }
+                else if (ls == 2) { rep = kv * 281479271743489; }
+                else if (ls == 4) { rep = kv | (kv << 32); }
+                if (rep == 0) { enc(vex, 1, 1, 0, 0, 239, dn, dn, 0, dn, 0, 0 - 1); return; }   // pxor
+                let is i32 as pk = eo.fc_index(rep);
+                if (pk >= 0) {
+                    if (vex == 1) { enc_pool(1, 1, 2, 0, l, 89, dn, pk); }                     // vpbroadcastq
+                    else { enc_pool(0, 3, 1, 0, 0, 18, dn, pk); }                              // movddup
+                    return;
+                }
+            }
             if (ls < 8) { eo.out_str("  mov eax, ", 11); } else { eo.out_str("  mov rax, ", 11); }
             eo.out_int(kv); eo.out_char(10);
         } else { e.load_op(inst.src1.vreg, ctx, "rax"); }
@@ -392,6 +508,11 @@ fn gen_vop(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         let is i32 as sloc = al.get_loc(inst.src1.vreg, ctx);
         if (ls == 8 && l == 0 && sloc >= 16 && sloc <= 31 && e.f32s_is(inst.src1.vreg) == 0) {
             enc(vex, 3, 1, 0, 0, 18, dn, 0, 0, sloc - 16, 0, 0 - 1);              // movddup
+            return;
+        }
+        if (ls == 4 && l == 0 && vex == 0 && sloc >= 16 && sloc <= 31 && e.f32s_is(inst.src1.vreg) == 1) {
+            mov_v(0, 0, dn, sloc - 16);
+            enc(0, 0, 1, 0, 0, 198, dn, 0, 0, dn, 0, 0);                          // shufps 0
             return;
         }
         fs_load(inst.src1.vreg, ctx, 1, isf32, vex);

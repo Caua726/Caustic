@@ -1,5 +1,6 @@
 use "defs.cst" as d;
 use "../parser/ast.cst" as ast;
+use "vec/vec_ops.cst" as vo;
 
 // === Unroll and jam: U iterations of an outer loop share one inner loop ===
 //
@@ -28,6 +29,10 @@ use "../parser/ast.cst" as ast;
 //   L_je:  post, post+1, ... ; j = j + Uc ... ; goto L_j
 //   L_orig: the loop as it was, for the iterations left over.
 //
+// When the columns the copies read and write sit side by side in memory, the U
+// chains are one or two vectors (see _v_plan below): the outer loop vectorized
+// around its inner reduction, each lane still adding in its own order.
+//
 // What makes the order change safe: the variables the loop carries from one
 // iteration to the next are all stepped by constants (j, a pointer that walks
 // with it); nothing computed in an iteration is read after the loop; the
@@ -54,6 +59,18 @@ let is *i64 as uj_cdef with mut = cast(*i64, 0);  // the carried variable's def 
 let is *u8 as uj_dep with mut = cast(*u8, 0);     // depends on j
 let is *u8 as uj_need with mut = cast(*u8, 0);    // per position in the loop
 let is *i32 as uj_map with mut = cast(*i32, 0);   // vreg * U + k -> its copy
+// the vector form: uj_vk 1 float value in vectors, 2 integer depending on j;
+// uj_root the value a copy shares its vectors with; uj_vv the root's first
+// vector; uj_der the integer's change per j (uj_dk: known)
+let is *u8 as uj_vk with mut = cast(*u8, 0);
+let is *i32 as uj_root with mut = cast(*i32, 0);
+let is *i32 as uj_vv with mut = cast(*i32, 0);
+let is *i64 as uj_der with mut = cast(*i64, 0);
+let is *u8 as uj_dk with mut = cast(*u8, 0);
+let is i32 as uj_ls with mut = 0;
+let is i32 as uj_lanes with mut = 0;
+let is i32 as uj_nvec with mut = 0;
+let is i32 as uj_narrow with mut = 0;
 // labels from uj_lbase up are this pass's own: a loop it built is not jammed again
 let is *d.IRFunction as uj_fn with mut = cast(*d.IRFunction, 0);
 let is i32 as uj_lbase with mut = 0;
@@ -221,6 +238,603 @@ fn _i64t(t as *u8) as i32 {
     if (cast(i64, t) == 0) { return 0; }
     let is i32 as kd = *cast(*i32, t);
     return cast(i32, kd >= 1 && kd <= 4);
+}
+
+// the last of the U iterations still runs: j + (U-1)c, in 64 bits
+fn _emit_guard(func as *d.IRFunction, jv as i32, cmp as *d.IRInst, lh as i32, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is *d.IRInst as x with mut = cast(*d.IRInst, 0);
+    let is i32 as jw with mut = jv;
+    if (_tsz(cmp.cast_to) != 8) {
+        jw = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+        x = d.new_inst(d.IR_CAST);
+        x.dest = d.op_vreg(jw); x.src1 = d.op_vreg(jv);
+        x.cast_from = cmp.cast_to; x.cast_to = cast(*u8, ast.type_i64);
+        _link(head, tail, x);
+    }
+    let is i32 as jt = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+    x = d.new_inst(d.IR_ADD);
+    x.dest = d.op_vreg(jt); x.src1 = d.op_vreg(jw); x.src2 = d.op_imm(uj_step[jv] * cast(i64, UJ_U - 1));
+    x.cast_to = cast(*u8, ast.type_i64);
+    _link(head, tail, x);
+    let is d.Operand as bnd with mut = cmp.src2;
+    if (cmp.src2.op_type == d.OP_VREG && _tsz(cmp.cast_to) != 8) {
+        let is i32 as bw = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+        x = d.new_inst(d.IR_CAST);
+        x.dest = d.op_vreg(bw); x.src1 = cmp.src2;
+        x.cast_from = cmp.cast_to; x.cast_to = cast(*u8, ast.type_i64);
+        _link(head, tail, x);
+        bnd = d.op_vreg(bw);
+    }
+    let is i32 as jc = func.vreg_count; func.vreg_count = func.vreg_count + 1;
+    x = d.new_inst(cmp.op);
+    x.dest = d.op_vreg(jc); x.src1 = d.op_vreg(jt); x.src2 = bnd;
+    x.cast_to = cast(*u8, ast.type_i64);
+    x.line = cmp.line;
+    _link(head, tail, x);
+    x = d.new_inst(d.IR_JZ);
+    x.src1 = d.op_vreg(jc); x.dest = d.op_label(lh);
+    _link(head, tail, x);
+}
+
+// === The outer loop as vectors ===
+//
+// Each float value of the copies is one lane: f32 runs U = 4 lanes in one xmm,
+// f64 two pairs. It takes: the float work that depends on j is f32 (or f64)
+// arithmetic, loads and one store, and its addresses move by exactly one element
+// per j, so that lane k's address is the k-th element after lane 0's. A float the
+// iterations share is broadcast. Each lane computes what its copy computed, in
+// the same order: the results are the scalar ones bit for bit, and the load and
+// the store touch the elements the copies touched.
+//
+// Address arithmetic narrower than 64 bits could wrap inside the four columns:
+// then the last column's address is computed too and compared at run time, and
+// those columns go to the scalar loop if it is not where it should be.
+
+fn _is_elem(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    if (uj_ls == 4) { return cast(i32, k == 9); }
+    return cast(i32, k == 10);
+}
+
+fn _is_int_ty(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    let is i32 as k = *cast(*i32, t);
+    return cast(i32, (k >= 1 && k <= 8) || k == 14);
+}
+
+fn _is_farith(op as i32) as i32 {
+    return cast(i32, op == d.IR_FADD || op == d.IR_FSUB || op == d.IR_FMUL || op == d.IR_FDIV);
+}
+
+fn _is_lea(op as i32) as i32 {
+    return cast(i32, op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8);
+}
+
+fn _find(v as i32) as i32 {
+    let is i32 as r with mut = v;
+    while (uj_root[r] != r) { r = uj_root[r]; }
+    return r;
+}
+
+// dest = src with nothing to compute: a float copy
+fn _is_falias(it as *d.IRInst) as i32 {
+    if (it.src1.op_type != d.OP_VREG || it.dest.op_type != d.OP_VREG) { return 0; }
+    if (uj_vk[it.dest.vreg] != cast(u8, 1) || uj_vk[it.src1.vreg] != cast(u8, 1)) { return 0; }
+    return cast(i32, it.op == d.IR_MOV || it.op == d.IR_CAST);
+}
+
+fn _const_of(o as *d.Operand, out as *i64) as i32 {
+    if (o.op_type == d.OP_IMM) { *out = o.imm; return 1; }
+    if (o.op_type != d.OP_VREG) { return 0; }
+    let is *d.IRInst as t = _only_def(o.vreg);
+    if (cast(i64, t) != 0 && t.op == d.IR_IMM && t.src1.op_type == d.OP_IMM) { *out = t.src1.imm; return 1; }
+    return 0;
+}
+
+// the change per j of an operand: 0 when it is not known yet
+fn _der_of(o as *d.Operand, out as *i64) as i32 {
+    if (o.op_type == d.OP_IMM) { *out = 0; return 1; }
+    if (o.op_type != d.OP_VREG) { return 0; }
+    if (o.vreg >= uj_nv || uj_dep[o.vreg] == cast(u8, 0)) { *out = 0; return 1; }
+    if (uj_dk[o.vreg] == cast(u8, 1)) { *out = uj_der[o.vreg]; return 1; }
+    return 0;
+}
+
+// the integers: what each one changes by per j; 0 when something cannot be told
+fn _v_derivs(h as i32, b as i32) as i32 {
+    let is i32 as round with mut = 0;
+    let is i32 as ch with mut = 1;
+    while (ch == 1 && round < 8) {
+        ch = 0;
+        round = round + 1;
+        let is i32 as p with mut = h + 1;
+        while (p < b) {
+            let is *d.IRInst as it = _I(p);
+            let is i32 as dv = _def(it);
+            if (uj_need[p - h] == cast(u8, 1) && dv >= 0 && uj_vk[dv] == cast(u8, 2) && uj_isc[dv] == cast(u8, 0)) {
+                let is i32 as op = it.op;
+                let is i64 as a with mut = 0;
+                let is i64 as bb with mut = 0;
+                let is i64 as c with mut = 0;
+                let is i32 as has with mut = 0;
+                let is i64 as r with mut = 0;
+                if (op == d.IR_ADD && _rd(&it.src1, dv) == 1 && it.src2.op_type == d.OP_IMM) { }  // steps with i: j does not enter
+                else if (op == d.IR_MOV || op == d.IR_CAST) { if (_der_of(&it.src1, &a) == 1) { r = a; has = 1; } }
+                else if (op == d.IR_ADD || op == d.IR_SUB) {
+                    if (_der_of(&it.src1, &a) == 1 && _der_of(&it.src2, &bb) == 1) {
+                        r = a + bb;
+                        if (op == d.IR_SUB) { r = a - bb; }
+                        has = 1;
+                    }
+                }
+                else if (op == d.IR_MUL) {
+                    if (_const_of(&it.src2, &c) == 1) { if (_der_of(&it.src1, &a) == 1) { r = a * c; has = 1; } }
+                    else if (_const_of(&it.src1, &c) == 1) { if (_der_of(&it.src2, &a) == 1) { r = a * c; has = 1; } }
+                    else { return 0; }
+                }
+                else if (op == d.IR_SHL) {
+                    if (it.src2.op_type != d.OP_IMM || it.src2.imm < 0 || it.src2.imm > 16) { return 0; }
+                    if (_der_of(&it.src1, &a) == 1) { r = a << it.src2.imm; has = 1; }
+                }
+                else if (_is_lea(op) == 1) {
+                    let is i64 as sc with mut = 2;
+                    if (op == d.IR_LEA4) { sc = 4; }
+                    if (op == d.IR_LEA8) { sc = 8; }
+                    if (_der_of(&it.src1, &a) == 1 && _der_of(&it.src2, &bb) == 1) { r = a + bb * sc; has = 1; }
+                }
+                else { return 0; }
+                if (has == 1) {
+                    if (uj_dk[dv] == cast(u8, 0)) { uj_dk[dv] = 1; uj_der[dv] = r; ch = 1; }
+                    else if (uj_der[dv] != r) { return 0; }
+                }
+            }
+            p = p + 1;
+        }
+    }
+    return 1;
+}
+
+fn _v_plan(func as *d.IRFunction, h as i32, ih as i32, iz as i32, ib as i32, ie as i32, b as i32) as i32 {
+    // the element type
+    uj_ls = 0;
+    let is i32 as p with mut = iz + 1;
+    while (p < ib) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1) && (it.op == d.IR_FADD || it.op == d.IR_FSUB) && uj_dep[it.dest.vreg] == cast(u8, 1)) {
+            let is i32 as k with mut = 0;
+            if (cast(i64, it.cast_to) != 0) { k = *cast(*i32, it.cast_to); }
+            let is i32 as ls with mut = 0;
+            if (k == 9) { ls = 4; }
+            if (k == 10) { ls = 8; }
+            if (ls == 0 || (uj_ls != 0 && uj_ls != ls)) { return 0; }
+            uj_ls = ls;
+        }
+        p = p + 1;
+    }
+    if (uj_ls == 0) { return 0; }
+    uj_lanes = 16 / uj_ls;
+    uj_nvec = UJ_U / uj_lanes;
+    let is i32 as v with mut = 0;
+    while (v < uj_nv) {
+        uj_vk[v] = 0;
+        if (uj_isc[v] == cast(u8, 1)) { uj_vk[v] = 2; }
+        uj_root[v] = v;
+        uj_vv[v] = 0 - 1;
+        uj_dk[v] = 0;
+        uj_der[v] = 0;
+        if (uj_isc[v] == cast(u8, 1)) { uj_dk[v] = 1; uj_der[v] = uj_step[v]; }
+        v = v + 1;
+    }
+    // what each value that depends on j is
+    uj_narrow = 0;
+    let is i32 as ch with mut = 1;
+    let is i32 as round with mut = 0;
+    while (ch == 1 && round < 8) {
+        ch = 0;
+        round = round + 1;
+        p = h + 1;
+        while (p < b) {
+            let is *d.IRInst as it = _I(p);
+            let is i32 as dv = _def(it);
+            if (uj_need[p - h] == cast(u8, 1) && dv >= 0 && uj_dep[dv] == cast(u8, 1) && uj_isc[dv] == cast(u8, 0)) {
+                let is i32 as op = it.op;
+                let is i32 as k with mut = 0;
+                if (_is_farith(op) == 1 || op == d.IR_LOAD) {
+                    if (_is_elem(it.cast_to) == 0) { return 0; }
+                    k = 1;
+                } else if (op == d.IR_CAST) {
+                    if (_is_elem(it.cast_to) == 1 && _is_elem(it.cast_from) == 1) { k = 1; }
+                    else if (_is_int_ty(it.cast_to) == 1 && _is_int_ty(it.cast_from) == 1) {
+                        k = 2;
+                        if (_tsz(it.cast_to) < _tsz(it.cast_from)) { uj_narrow = 1; }
+                    }
+                    else { return 0; }
+                } else if (op == d.IR_MOV) {
+                    if (it.src1.op_type == d.OP_VREG && uj_dep[it.src1.vreg] == cast(u8, 1)) { k = cast(i32, uj_vk[it.src1.vreg]); }
+                } else if (op == d.IR_ADD || op == d.IR_SUB || op == d.IR_MUL || op == d.IR_SHL || _is_lea(op) == 1) {
+                    k = 2;
+                    let is i32 as sz = _tsz(it.cast_to);
+                    if (_is_lea(op) == 0 && sz != 0 && sz < 8) { uj_narrow = 1; }
+                } else if (op != d.IR_IMM) {
+                    return 0;
+                }
+                if (k != 0) {
+                    if (uj_vk[dv] == cast(u8, 0)) { uj_vk[dv] = cast(u8, k); ch = 1; }
+                    else if (cast(i32, uj_vk[dv]) != k) { return 0; }
+                }
+            }
+            p = p + 1;
+        }
+    }
+    // every use fits, one store, and what the float copies share
+    let is i32 as stores with mut = 0;
+    let is i32 as splats with mut = 0;
+    p = h + 1;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1) && p != ih && p != ie && it.op != d.IR_LABEL && p != iz) {
+            let is i32 as op = it.op;
+            let is i32 as dv = _def(it);
+            let is i32 as depd with mut = 0;
+            if (dv >= 0 && uj_dep[dv] == cast(u8, 1)) { depd = 1; }
+            if (op == d.IR_STORE) {
+                stores = stores + 1;
+                if (stores > 1 || it.src1.op_type != d.OP_VREG || it.dest.op_type != d.OP_VREG) { return 0; }
+                if (uj_vk[it.src1.vreg] != cast(u8, 1) || uj_vk[it.dest.vreg] != cast(u8, 2)) { return 0; }
+                if (_is_elem(it.cast_to) == 0) { return 0; }
+            } else if (depd == 1) {
+                let is i32 as kd = cast(i32, uj_vk[dv]);
+                if (kd == 0) { return 0; }
+                if (kd == 1) {
+                    if (op == d.IR_LOAD) {
+                        if (it.src1.op_type != d.OP_VREG || uj_vk[it.src1.vreg] != cast(u8, 2)) { return 0; }
+                    } else if (_is_farith(op) == 1) {
+                        if (it.src1.op_type != d.OP_VREG || it.src2.op_type != d.OP_VREG) { return 0; }
+                        if (uj_vk[it.src1.vreg] == cast(u8, 2) || uj_vk[it.src2.vreg] == cast(u8, 2)) { return 0; }
+                        if (uj_dep[it.src1.vreg] == cast(u8, 0)) { splats = splats + 1; }
+                        if (uj_dep[it.src2.vreg] == cast(u8, 0)) { splats = splats + 1; }
+                    } else if (_is_falias(it) == 1) {
+                        let is i32 as ra = _find(it.src1.vreg);
+                        let is i32 as rb = _find(dv);
+                        if (ra != rb) { uj_root[rb] = ra; }
+                    } else if (op == d.IR_MOV) {
+                        // a shared float where it starts: not after the inner loop's head
+                        if (p >= ih || it.src1.op_type != d.OP_VREG || uj_dep[it.src1.vreg] == cast(u8, 1)) { return 0; }
+                    } else if (op == d.IR_IMM) {
+                        if (p >= ih || it.src1.op_type != d.OP_IMM || it.src1.imm != 0) { return 0; }
+                    } else { return 0; }
+                } else {
+                    if (it.src1.op_type == d.OP_VREG && uj_vk[it.src1.vreg] == cast(u8, 1)) { return 0; }
+                    if (it.src2.op_type == d.OP_VREG && uj_vk[it.src2.vreg] == cast(u8, 1)) { return 0; }
+                }
+            }
+        }
+        p = p + 1;
+    }
+    if (stores != 1) { return 0; }
+    // past the inner loop, integers and shared values move in front of it: they
+    // must not read anything the inner loop changes
+    p = ie + 1;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1) && it.op != d.IR_LABEL) {
+            let is i32 as dv = _def(it);
+            let is i32 as fl with mut = 0;
+            if (dv >= 0 && uj_vk[dv] == cast(u8, 1)) { fl = 1; }
+            if (it.op == d.IR_STORE) { fl = 1; }
+            if (fl == 0) {
+                let is i32 as q with mut = ih + 1;
+                while (q < ie) {
+                    let is i32 as qd = _def(_I(q));
+                    if (qd >= 0 && (_rd(&it.src1, qd) == 1 || _rd(&it.src2, qd) == 1)) { return 0; }
+                    q = q + 1;
+                }
+            }
+        }
+        p = p + 1;
+    }
+    // a float the inner loop carries: it reads the old value only up to the
+    // operation that makes the new one, and nothing but the copy back reads that
+    v = 0;
+    let is i32 as nclass with mut = 0;
+    while (v < uj_nv) {
+        if (uj_vk[v] == cast(u8, 1) && _find(v) == v) {
+            nclass = nclass + 1;
+            let is i32 as wp with mut = 0 - 1;
+            let is i32 as members with mut = 0;
+            p = h + 1;
+            while (p < b) {
+                let is *d.IRInst as it = _I(p);
+                let is i32 as dv = _def(it);
+                if (uj_need[p - h] == cast(u8, 1) && dv >= 0 && uj_vk[dv] == cast(u8, 1) && _find(dv) == v) {
+                    members = members + 1;
+                    if (_is_falias(it) == 0 && it.op != d.IR_IMM && it.op != d.IR_MOV) {
+                        if (wp >= 0) { return 0; }
+                        wp = p;
+                    }
+                }
+                p = p + 1;
+            }
+            if (wp > iz && wp < ib && members > 1) {
+                let is i32 as carried with mut = 0;
+                let is i32 as back with mut = 0;
+                p = iz + 1;
+                while (p < ib) {
+                    let is *d.IRInst as it = _I(p);
+                    if (uj_need[p - h] == cast(u8, 1)) {
+                        let is i32 as rf with mut = 0;
+                        if (it.src1.op_type == d.OP_VREG && uj_vk[it.src1.vreg] == cast(u8, 1) && _find(it.src1.vreg) == v) { rf = 1; }
+                        if (it.src2.op_type == d.OP_VREG && uj_vk[it.src2.vreg] == cast(u8, 1) && _find(it.src2.vreg) == v) { rf = 1; }
+                        if (rf == 1) {
+                            if (p <= wp) { carried = 1; }
+                            else if (it.op == d.IR_MOV && back == 0 && _rd(&it.src1, _I(wp).dest.vreg) == 1) { back = 1; }
+                            else { back = 2; }
+                        }
+                    }
+                    p = p + 1;
+                }
+                if (carried == 1 && back != 1) { return 0; }
+            }
+        }
+        v = v + 1;
+    }
+    if (nclass == 0 || nclass * uj_nvec + splats > 10) { return 0; }
+    if (_v_derivs(h, b) == 0) { return 0; }
+    // addresses one element apart per j; with a check, known in front of the loop
+    p = h + 1;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1)) {
+            let is i32 as av with mut = 0 - 1;
+            if (it.op == d.IR_LOAD && uj_vk[it.dest.vreg] == cast(u8, 1)) { av = it.src1.vreg; }
+            if (it.op == d.IR_STORE) { av = it.dest.vreg; }
+            if (av >= 0) {
+                if (uj_dk[av] == cast(u8, 0) || uj_der[av] != cast(i64, uj_ls)) { return 0; }
+                if (uj_narrow == 1) {
+                    let is i32 as q with mut = ih + 1;
+                    while (q < ie) {
+                        let is *d.IRInst as qi = _I(q);
+                        if (_def(qi) == av && (qi.op != d.IR_ADD || _rd(&qi.src1, av) == 0 || qi.src2.op_type != d.OP_IMM)) { return 0; }
+                        q = q + 1;
+                    }
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return 1;
+}
+
+fn _vec_of(v as i32, func as *d.IRFunction) as i32 {
+    let is i32 as r = _find(v);
+    if (uj_vv[r] < 0) {
+        uj_vv[r] = func.vreg_count;
+        func.vreg_count = func.vreg_count + uj_nvec;
+    }
+    return uj_vv[r];
+}
+
+fn _vop3(code as i32, dv as i32, s1 as i32, s2 as i32, line as i32, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is *d.IRInst as x = d.new_inst(d.IR_VOP);
+    x.dest = d.op_vreg(dv);
+    x.dest.label = vo.vo_pack(code, uj_ls, 0, uj_lanes, 0);
+    if (s1 >= 0) { x.src1 = d.op_vreg(s1); }
+    if (s2 >= 0) { x.src2 = d.op_vreg(s2); }
+    x.line = line;
+    _link(head, tail, x);
+}
+
+// A float operand of a vector operation: its vector, or the shared scalar in all lanes.
+fn _v_operand(o as *d.Operand, m as i32, line as i32, func as *d.IRFunction, head as **d.IRInst, tail as **d.IRInst) as i32 {
+    if (uj_vk[o.vreg] == cast(u8, 1)) { return _vec_of(o.vreg, func) + m; }
+    let is i32 as t = func.vreg_count;
+    func.vreg_count = t + 1;
+    _vop3(vo.VO_SPLATF, t, o.vreg, 0 - 1, line, head, tail);
+    return t;
+}
+
+// The vector form of one float instruction of the loop.
+fn _v_float(it as *d.IRInst, func as *d.IRFunction, head as **d.IRInst, tail as **d.IRInst) as void {
+    if (_is_falias(it) == 1) { return; }
+    let is i32 as op = it.op;
+    let is i32 as dvec = _vec_of(it.dest.vreg, func);
+    let is i32 as sa with mut = 0;
+    let is i32 as sb with mut = 0;
+    let is i32 as m with mut = 0;
+    while (m < uj_nvec) {
+        if (op == d.IR_IMM) {
+            _vop3(vo.VO_ZERO, dvec + m, 0 - 1, 0 - 1, it.line, head, tail);
+        } else if (op == d.IR_MOV) {
+            let is i64 as c with mut = 1;
+            if (_const_of(&it.src1, &c) == 1 && c == 0) { _vop3(vo.VO_ZERO, dvec + m, 0 - 1, 0 - 1, it.line, head, tail); }
+            else { _vop3(vo.VO_SPLATF, dvec + m, it.src1.vreg, 0 - 1, it.line, head, tail); }
+        } else if (op == d.IR_LOAD) {
+            let is *d.IRInst as x = d.new_inst(d.IR_VOP);
+            x.dest = d.op_vreg(dvec + m);
+            x.dest.label = vo.vo_pack(vo.VO_LOAD, uj_ls, 0, uj_lanes, 0);
+            x.src1 = d.op_vreg(it.src1.vreg);
+            x.src2 = d.op_imm(cast(i64, m) * 16);
+            x.line = it.line;
+            _link(head, tail, x);
+        } else {
+            let is i32 as code with mut = vo.VO_FADD;
+            if (op == d.IR_FSUB) { code = vo.VO_FSUB; }
+            if (op == d.IR_FMUL) { code = vo.VO_FMUL; }
+            if (op == d.IR_FDIV) { code = vo.VO_FDIV; }
+            if (m == 0 || uj_vk[it.src1.vreg] == cast(u8, 1)) { sa = _v_operand(&it.src1, m, it.line, func, head, tail); }
+            if (m == 0 || uj_vk[it.src2.vreg] == cast(u8, 1)) { sb = _v_operand(&it.src2, m, it.line, func, head, tail); }
+            _vop3(code, dvec + m, sa, sb, it.line, head, tail);
+        }
+        m = m + 1;
+    }
+}
+
+// positions [a, b) of the loop: floats as vectors, everything else once, and
+// when the addresses are checked the integers depending on j for the last column too
+fn _v_range(a as i32, b as i32, h as i32, last as i32, func as *d.IRFunction, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is i32 as p with mut = a;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1) && it.op != d.IR_LABEL && it.op != d.IR_STORE) {
+            let is i32 as dv = _def(it);
+            if (dv >= 0 && uj_vk[dv] == cast(u8, 1)) { _v_float(it, func, head, tail); }
+            else {
+                _emit_copy(it, 0, head, tail);
+                if (last == 1 && dv >= 0 && uj_vk[dv] == cast(u8, 2)) { _emit_copy(it, UJ_U - 1, head, tail); }
+            }
+        }
+        p = p + 1;
+    }
+}
+
+// the integers and shared values past the inner loop, in front of it
+fn _v_moved(a as i32, b as i32, h as i32, last as i32, func as *d.IRFunction, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is i32 as p with mut = a;
+    while (p < b) {
+        let is *d.IRInst as it = _I(p);
+        if (uj_need[p - h] == cast(u8, 1) && it.op != d.IR_LABEL && it.op != d.IR_STORE) {
+            let is i32 as dv = _def(it);
+            if (dv < 0 || uj_vk[dv] != cast(u8, 1)) {
+                _emit_copy(it, 0, head, tail);
+                if (last == 1 && dv >= 0 && uj_vk[dv] == cast(u8, 2)) { _emit_copy(it, UJ_U - 1, head, tail); }
+            }
+        }
+        p = p + 1;
+    }
+}
+
+// The run-time check of one address: the last column's is U-1 elements on.
+fn _v_check(av as i32, lh as i32, func as *d.IRFunction, head as **d.IRInst, tail as **d.IRInst) as void {
+    let is i32 as t = func.vreg_count;
+    let is i32 as c = t + 1;
+    func.vreg_count = t + 2;
+    let is *d.IRInst as x = d.new_inst(d.IR_SUB);
+    x.dest = d.op_vreg(t);
+    x.src1 = d.op_vreg(_vk(av, UJ_U - 1));
+    x.src2 = d.op_vreg(av);
+    x.cast_to = cast(*u8, ast.type_i64);
+    _link(head, tail, x);
+    let is *d.IRInst as e = d.new_inst(d.IR_EQ);
+    e.dest = d.op_vreg(c);
+    e.src1 = d.op_vreg(t);
+    e.src2 = d.op_imm(cast(i64, uj_ls) * cast(i64, UJ_U - 1));
+    e.cast_to = cast(*u8, ast.type_i64);
+    _link(head, tail, e);
+    let is *d.IRInst as j = d.new_inst(d.IR_JZ);
+    j.src1 = d.op_vreg(c);
+    j.dest = d.op_label(lh);
+    _link(head, tail, j);
+}
+
+fn _v_emit(func as *d.IRFunction, h as i32, z as i32, ih as i32, iz as i32, ib as i32, ie as i32, b as i32,
+           jv as i32, cmp as *d.IRInst, lh as i32, izi as *d.IRInst) as i32 {
+    let is *d.IRInst as hl = _I(h);
+    let is i32 as nv = uj_nv;
+    let is i32 as l_j = func.label_count;
+    let is i32 as l_ji = l_j + 1;
+    let is i32 as l_je = l_j + 2;
+    func.label_count = func.label_count + 3;
+    let is *d.IRInst as head with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as x with mut = d.new_inst(d.IR_LABEL);
+    x.dest = d.op_label(l_j);
+    _link(&head, &tail, x);
+    let is i32 as v with mut = 0;
+    // the carried variables at the last column, for the check
+    if (uj_narrow == 1) {
+        while (v < nv) {
+            if (uj_isc[v] == cast(u8, 1)) {
+                let is *d.IRInst as sa = cast(*d.IRInst, uj_sadd[v]);
+                x = d.new_inst(d.IR_ADD);
+                x.dest = d.op_vreg(_vk(v, UJ_U - 1));
+                x.src1 = d.op_vreg(v);
+                x.src2 = d.op_imm(uj_step[v] * cast(i64, UJ_U - 1));
+                x.cast_to = sa.cast_to;
+                x.line = sa.line;
+                _link(&head, &tail, x);
+            }
+            v = v + 1;
+        }
+    }
+    _emit_guard(func, jv, cmp, lh, &head, &tail);
+    _v_range(h + 1, z, h, uj_narrow, func, &head, &tail);
+    _v_range(z + 1, ih, h, uj_narrow, func, &head, &tail);
+    _v_moved(ie + 1, b, h, uj_narrow, func, &head, &tail);
+    if (uj_narrow == 1) {
+        let is i32 as p with mut = h + 1;
+        while (p < b) {
+            let is *d.IRInst as it = _I(p);
+            if (uj_need[p - h] == cast(u8, 1)) {
+                if (it.op == d.IR_LOAD && uj_vk[it.dest.vreg] == cast(u8, 1)) { _v_check(it.src1.vreg, lh, func, &head, &tail); }
+                if (it.op == d.IR_STORE) { _v_check(it.dest.vreg, lh, func, &head, &tail); }
+            }
+            p = p + 1;
+        }
+    }
+    x = d.new_inst(d.IR_LABEL);
+    x.dest = d.op_label(l_ji);
+    _link(&head, &tail, x);
+    _v_range(ih + 1, iz, h, 0, func, &head, &tail);
+    x = d.clone_inst(izi);
+    x.dest = d.op_label(l_je);
+    _link(&head, &tail, x);
+    _v_range(iz + 1, ib, h, 0, func, &head, &tail);
+    x = d.new_inst(d.IR_JMP);
+    x.dest = d.op_label(l_ji);
+    _link(&head, &tail, x);
+    x = d.new_inst(d.IR_LABEL);
+    x.dest = d.op_label(l_je);
+    _link(&head, &tail, x);
+    // past the inner loop: the float work, then the store
+    let is i32 as q with mut = ie + 1;
+    while (q < b) {
+        let is *d.IRInst as it = _I(q);
+        if (uj_need[q - h] == cast(u8, 1)) {
+            let is i32 as dv = _def(it);
+            if (it.op == d.IR_STORE) {
+                let is i32 as sv = _vec_of(it.src1.vreg, func);
+                let is i32 as m with mut = 0;
+                while (m < uj_nvec) {
+                    x = d.new_inst(d.IR_VSTOREQ);
+                    x.dest = d.op_imm(cast(i64, m) * 16);
+                    x.dest.label = 16;
+                    x.src1 = d.op_vreg(it.dest.vreg);
+                    x.src2 = d.op_vreg(sv + m);
+                    x.line = it.line;
+                    _link(&head, &tail, x);
+                    m = m + 1;
+                }
+            } else if (dv >= 0 && uj_vk[dv] == cast(u8, 1)) {
+                _v_float(it, func, &head, &tail);
+            }
+        }
+        q = q + 1;
+    }
+    // the steps, U at once
+    v = 0;
+    while (v < nv) {
+        if (uj_isc[v] == cast(u8, 1)) {
+            let is *d.IRInst as sa = cast(*d.IRInst, uj_sadd[v]);
+            x = d.new_inst(d.IR_ADD);
+            x.dest = d.op_vreg(v);
+            x.src1 = d.op_vreg(v);
+            x.src2 = d.op_imm(uj_step[v] * cast(i64, UJ_U));
+            x.cast_to = sa.cast_to;
+            x.line = sa.line;
+            _link(&head, &tail, x);
+        }
+        v = v + 1;
+    }
+    x = d.new_inst(d.IR_JMP);
+    x.dest = d.op_label(l_j);
+    _link(&head, &tail, x);
+    let is *d.IRInst as w with mut = func.instructions;
+    while (cast(i64, w) != 0 && cast(i64, w.next) != cast(i64, hl)) { w = w.next; }
+    if (cast(i64, w) == 0) { return 0; }
+    tail.next = hl;
+    w.next = head;
+    return 1;
 }
 
 fn _try(func as *d.IRFunction, h as i32, b as i32) as i32 {
@@ -463,6 +1077,10 @@ fn _try(func as *d.IRFunction, h as i32, b as i32) as i32 {
         v = v + 1;
     }
 
+    if (_v_plan(func, h, ih, iz, ib, ie, b) == 1) {
+        return _v_emit(func, h, z, ih, iz, ib, ie, b, jv, cmp, lh, izi);
+    }
+
     let is i32 as l_j = func.label_count;
     let is i32 as l_ji = l_j + 1;
     let is i32 as l_je = l_j + 2;
@@ -491,38 +1109,7 @@ fn _try(func as *d.IRFunction, h as i32, b as i32) as i32 {
         }
         v = v + 1;
     }
-    // the last of the U iterations still runs: j + (U-1)c, in 64 bits
-    let is i32 as jw with mut = jv;
-    if (_tsz(cmp.cast_to) != 8) {
-        jw = func.vreg_count; func.vreg_count = func.vreg_count + 1;
-        x = d.new_inst(d.IR_CAST);
-        x.dest = d.op_vreg(jw); x.src1 = d.op_vreg(jv);
-        x.cast_from = cmp.cast_to; x.cast_to = cast(*u8, ast.type_i64);
-        _link(&head, &tail, x);
-    }
-    let is i32 as jt = func.vreg_count; func.vreg_count = func.vreg_count + 1;
-    x = d.new_inst(d.IR_ADD);
-    x.dest = d.op_vreg(jt); x.src1 = d.op_vreg(jw); x.src2 = d.op_imm(uj_step[jv] * cast(i64, UJ_U - 1));
-    x.cast_to = cast(*u8, ast.type_i64);
-    _link(&head, &tail, x);
-    let is d.Operand as bnd with mut = cmp.src2;
-    if (cmp.src2.op_type == d.OP_VREG && _tsz(cmp.cast_to) != 8) {
-        let is i32 as bw = func.vreg_count; func.vreg_count = func.vreg_count + 1;
-        x = d.new_inst(d.IR_CAST);
-        x.dest = d.op_vreg(bw); x.src1 = cmp.src2;
-        x.cast_from = cmp.cast_to; x.cast_to = cast(*u8, ast.type_i64);
-        _link(&head, &tail, x);
-        bnd = d.op_vreg(bw);
-    }
-    let is i32 as jc = func.vreg_count; func.vreg_count = func.vreg_count + 1;
-    x = d.new_inst(cmp.op);
-    x.dest = d.op_vreg(jc); x.src1 = d.op_vreg(jt); x.src2 = bnd;
-    x.cast_to = cast(*u8, ast.type_i64);
-    x.line = cmp.line;
-    _link(&head, &tail, x);
-    x = d.new_inst(d.IR_JZ);
-    x.src1 = d.op_vreg(jc); x.dest = d.op_label(lh);
-    _link(&head, &tail, x);
+    _emit_guard(func, jv, cmp, lh, &head, &tail);
     // header, pre: interleaved
     _emit_ilv(h + 1, z, h, &head, &tail);
     _emit_ilv(z + 1, ih, h, &head, &tail);
@@ -634,6 +1221,11 @@ fn pass_unroll_jam(func as *d.IRFunction) as i32 {
         uj_cdef = cast(*i64, d.opt_alloc(cast(i64, uj_nv) * 8 + 8));
         uj_need = d.opt_alloc(cast(i64, uj_n) + 8);
         uj_map = cast(*i32, d.opt_alloc(cast(i64, uj_nv) * cast(i64, UJ_U) * 4 + 8));
+        uj_vk = d.opt_alloc(cast(i64, uj_nv) + 8);
+        uj_root = cast(*i32, d.opt_alloc(cast(i64, uj_nv) * 4 + 8));
+        uj_vv = cast(*i32, d.opt_alloc(cast(i64, uj_nv) * 4 + 8));
+        uj_der = cast(*i64, d.opt_alloc(cast(i64, uj_nv) * 8 + 8));
+        uj_dk = d.opt_alloc(cast(i64, uj_nv) + 8);
         // back edges, innermost first does not matter: one transform per call
         q = 0;
         while (q < uj_n && done == 0) {
@@ -649,6 +1241,8 @@ fn pass_unroll_jam(func as *d.IRFunction) as i32 {
         d.opt_free(uj_ind); d.opt_free(uj_isc); d.opt_free(uj_dep);
         d.opt_free(cast(*u8, uj_step)); d.opt_free(cast(*u8, uj_sadd)); d.opt_free(cast(*u8, uj_cdef));
         d.opt_free(uj_need); d.opt_free(cast(*u8, uj_map));
+        d.opt_free(uj_vk); d.opt_free(cast(*u8, uj_root)); d.opt_free(cast(*u8, uj_vv));
+        d.opt_free(cast(*u8, uj_der)); d.opt_free(uj_dk);
     }
     d.opt_free(cast(*u8, uj_a)); d.opt_free(cast(*u8, uj_lpos)); d.opt_free(cast(*u8, uj_lref));
     return done;
