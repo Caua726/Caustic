@@ -516,6 +516,64 @@ fn _frame_can_omit_fp(func as *d.IRFunction) as i32 {
 }
 
 // Labels some later jump goes back to: the heads of loops.
+// -O2: the labels to align on 16: the first of a run of labels that a forward
+// branch jumps into, when what follows is a few instructions and a
+// branch back. An iteration that jumps over the rest of its body runs that
+// little block every time, and split across a 32-byte fetch window it costs a
+// cycle more per iteration. Only where the pad is run rarely or never: right
+// after a jump or a return, or at the way out of an inner loop. An arm that
+// falls in from above could be half of the iterations.
+fn _latch_blocks(func as *d.IRFunction, heads as *u8, ctx as *al.AllocCtx) as *u8 {
+    let is i32 as nl = func.label_count;
+    if (nl <= 0) { return cast(*u8, 0); }
+    let is *u8 as mark = d.opt_alloc(cast(i64, nl));
+    let is *u8 as refd = d.opt_alloc(cast(i64, nl));
+    let is *u8 as placed = d.opt_alloc(cast(i64, nl));
+    let is i32 as k with mut = 0;
+    while (k < nl) { mark[k] = cast(u8, 0); refd[k] = cast(u8, 0); placed[k] = cast(u8, 0); k = k + 1; }
+    let is i32 as first with mut = 0 - 1;     // first label of the current run
+    let is i32 as fwd with mut = 0;           // a forward branch jumps into it
+    let is i32 as nohead with mut = 1;
+    let is i32 as since with mut = 0;
+    let is i32 as in_run with mut = 0;
+    let is i32 as pad_free with mut = 1;      // what comes before rarely falls through
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_LABEL && it.dest.label >= 0 && it.dest.label < nl) {
+                let is i32 as lb = it.dest.label;
+                if (in_run == 0) { first = lb; fwd = 0; nohead = pad_free; since = 0; in_run = 1; }
+                if (refd[lb] == cast(u8, 1)) { fwd = 1; }
+                if (cast(i64, heads) != 0 && heads[lb] == cast(u8, 1)) { nohead = 0; }
+                placed[lb] = cast(u8, 1);
+            } else if (op == d.IR_MOV && it.src1.op_type == d.OP_VREG && it.dest.op_type == d.OP_VREG
+                       && al.get_loc(it.src1.vreg, ctx) == al.get_loc(it.dest.vreg, ctx)) {
+                // a copy the allocation made nothing of
+            } else {
+                in_run = 0;
+                pad_free = cast(i32, op == d.IR_JMP || op == d.IR_RET
+                    || ((op == d.IR_JZ || op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+                        && it.dest.label >= 0 && it.dest.label < nl && placed[it.dest.label] == cast(u8, 1)));
+                if ((op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ) && it.dest.op_type == d.OP_LABEL
+                    && it.dest.label >= 0 && it.dest.label < nl) {
+                    let is i32 as t = it.dest.label;
+                    if (placed[t] == cast(u8, 1)) {
+                        if (first >= 0 && fwd == 1 && nohead == 1 && since <= 6) { mark[first] = cast(u8, 1); }
+                    } else { refd[t] = cast(u8, 1); }
+                    first = 0 - 1;
+                } else if (op == d.IR_RET || op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL) {
+                    first = 0 - 1;
+                } else { since = since + 1; }
+            }
+        }
+        it = it.next;
+    }
+    d.opt_free(refd);
+    d.opt_free(placed);
+    return mark;
+}
+
 fn _loop_heads(func as *d.IRFunction) as *u8 {
     let is i32 as lc = func.label_count;
     let is *u8 as seen = d.opt_alloc(cast(i64, lc));
@@ -1330,9 +1388,11 @@ fn gen_func(func as *d.IRFunction) as void {
     // g_align_funcs) and so do loop heads below, as gcc does: where a hot loop
     // lands relative to the fetch blocks moves its speed by tens of percent.
     let is *u8 as loop_head with mut = cast(*u8, 0);
+    let is *u8 as latch_block with mut = cast(*u8, 0);
     if (al.al_opt_level >= 2 && func.label_count > 0) {
         eo.out_str(".p2align 4\n", 11);
         loop_head = _loop_heads(func);
+        latch_block = _latch_blocks(func, loop_head, ctx);
     }
 
     // Function label
@@ -1412,11 +1472,16 @@ fn gen_func(func as *d.IRFunction) as void {
                 && inst.dest.label < func.label_count && loop_head[inst.dest.label] == cast(u8, 1)) {
                 eo.out_str(".loopalign\n", 11);
             }
+            if (cast(i64, latch_block) != 0 && inst.op == d.IR_LABEL && inst.dest.label >= 0
+                && inst.dest.label < func.label_count && latch_block[inst.dest.label] == cast(u8, 1)) {
+                eo.out_str(".p2align 4,,10\n", 15);
+            }
             gen_inst(inst, ctx);
         }
         inst = inst.next;
     }
     if (cast(i64, loop_head) != 0) { d.opt_free(loop_head); }
+    if (cast(i64, latch_block) != 0) { d.opt_free(latch_block); }
     ctx.sw_frameless = 0;
     eo.fp_omit = 0;
 
