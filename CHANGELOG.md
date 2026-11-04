@@ -9,6 +9,13 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 ## Unreleased
 
 ### Added
+- **`--cpu=`: what `-O2` may assume about an x86_64 CPU.** `x86-64` is the new
+  default: SSE2 only, no cpuid test, no code layout tuned for one CPU. `auto` is
+  what `-O2` did before, AVX2 and SSE2 paths chosen at run time; `x86-64-v3` is AVX2
+  with no test; `znver3` adds the code layout tuned on Zen 3 (`.loopalign`,
+  short-latch alignment, functions kept in place within a 64-byte line). Programs
+  that want AVX2 now ask for it: vector loops on the default use 128-bit registers.
+- **`with noinline` on a function:** every call to it stays a call.
 - **Exceptions — `std/exceptions.cst`.** `try`/`catch`/`throw` as a stdlib
   facility: there is no `_Unwind_*` runtime to link (static binaries, no libc
   or libgcc), so the module carries its own non-local exit. `begin` is a naked
@@ -76,6 +83,14 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   9% longer (wall) and the compiler's code grows 19%.
 
 ### Fixed
+- **`-O2` vector loops wrote to the wrong array without AVX2.** On a CPU without
+  AVX2, a loop such as `x[i] = x[i] + z[i]` stored into `z`: the address of the
+  store had been folded away, and the plain store did not know. AVX2 machines never
+  ran that path, so nothing showed it.
+- **The AVX2 test now asks whether AVX2 can be used,** not only whether the CPU
+  lists it: leaf 7 must exist, and the OS must have enabled the `ymm` state.
+- **Code without an AVX2 test used SSE3:** `movddup` and `addsubpd` could fault on
+  an x86-64 CPU with only SSE2. `addsubpd` now needs `--cpu=x86-64-v3` or `znver3`.
 - **`add QWORD PTR [rbp-8], 1` no longer reaches the assembler.** The
   load-add-store fusion for a counter kept in memory emitted the word, dword
   and qword forms, which caustic-as does not encode, and the build failed. It

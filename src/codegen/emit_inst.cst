@@ -825,11 +825,14 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     let is i32 as op = inst.op;
     // the loop widener's generic ops and sized stores (emit_vec.cst)
     if (op == d.IR_VOP || op == d.IR_VOPG) { ev.gen_vop(inst, ctx); return; }
-    if (op == d.IR_VSTOREQ && inst.dest.label != 0) { ev.gen_vstore(inst, ctx); return; }
+    // every vector store here: try_vec_lea may have left its address in the addressing
+    if (op == d.IR_VSTOREQ) { ev.gen_vstore(inst, ctx); return; }
     // ---- AVX2 (256-bit) ----
     if (op == d.IR_HASAVX2) {
-        // result = cpuid.7:0.ebx bit 5, cached: the first call runs cpuid (the
-        // four registers it writes saved around it) and stores 1 + bit.
+        // result = can this program use AVX2, cached: the first call asks (the
+        // four registers written saved around it) and stores 1 + answer. Leaf 7
+        // must exist, and besides the AVX2 bit the CPU must have AVX and OSXSAVE
+        // and the OS must save xmm and ymm (XCR0 bits 1, 2), or vex code faults.
         isa_cache_used = 1;
         let is i32 as dloc = al.get_loc(inst.dest.vreg, ctx);
         let is i32 as ri with mut = 0;
@@ -842,8 +845,22 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         eo.out_str("  test ", 7); eo.out_cstr(r64); eo.out_str(", ", 2); eo.out_cstr(r64); eo.out_char(10);
         eo.out_str("  jnz .Lhv", 10); eo.out_int(cast(i64, lbl)); eo.out_char(10);
         eo.out_line("push rax"); eo.out_line("push rbx"); eo.out_line("push rcx"); eo.out_line("push rdx");
-        eo.out_line("mov eax, 7"); eo.out_line("xor ecx, ecx"); eo.out_line(".byte 15, 162");   // cpuid
-        eo.out_line("shr ebx, 5"); eo.out_line("and ebx, 1"); eo.out_line("add ebx, 1");
+        eo.out_line("xor eax, eax"); eo.out_line(".byte 15, 162");                              // cpuid
+        eo.out_line("cmp eax, 7");
+        eo.out_str("  jb .Lhn", 9); eo.out_int(cast(i64, lbl)); eo.out_char(10);
+        eo.out_line("mov eax, 1"); eo.out_line(".byte 15, 162");
+        eo.out_line("and ecx, 402653184"); eo.out_line("cmp ecx, 402653184");                   // OSXSAVE, AVX
+        eo.out_str("  jne .Lhn", 10); eo.out_int(cast(i64, lbl)); eo.out_char(10);
+        eo.out_line("xor ecx, ecx"); eo.out_line(".byte 15, 1, 208");                           // xgetbv
+        eo.out_line("and eax, 6"); eo.out_line("cmp eax, 6");
+        eo.out_str("  jne .Lhn", 10); eo.out_int(cast(i64, lbl)); eo.out_char(10);
+        eo.out_line("mov eax, 7"); eo.out_line("xor ecx, ecx"); eo.out_line(".byte 15, 162");
+        eo.out_line("shr ebx, 5"); eo.out_line("and ebx, 1");
+        eo.out_str("  jmp .Lhd", 10); eo.out_int(cast(i64, lbl)); eo.out_char(10);
+        eo.out_str(".Lhn", 4); eo.out_int(cast(i64, lbl)); eo.out_str(":\n", 2);
+        eo.out_line("xor ebx, ebx");
+        eo.out_str(".Lhd", 4); eo.out_int(cast(i64, lbl)); eo.out_str(":\n", 2);
+        eo.out_line("add ebx, 1");
         eo.out_line("lea rcx, [rip+.Lcst_isa]"); eo.out_line("mov QWORD PTR [rcx], rbx");
         eo.out_line("pop rdx"); eo.out_line("pop rcx"); eo.out_line("pop rbx"); eo.out_line("pop rax");
         eo.out_str("  mov ", 6); eo.out_cstr(r64); eo.out_str(", QWORD PTR [rip+.Lcst_isa]\n", 28);
@@ -923,10 +940,10 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
     }
     if (op == d.IR_VSPLATPD) {
         // dst = [k, k]. Caustic keeps f64 scalars as bit-patterns in GPRs, so k is
-        // usually a GPR: movq the bits into the dst xmm, then movddup to both lanes.
-        // If k is already an xmm value, movddup straight from it.
+        // usually a GPR: movq the bits into the dst xmm, then unpcklpd to both lanes
+        // (SSE2; movddup would need SSE3). If k is already an xmm value, start from it.
         let is i32 as dn = _vec_num(inst.dest.vreg, ctx);
-        let is i32 as sn with mut = dn;                      // movddup source xmm num
+        let is i32 as sn with mut = dn;                      // source xmm num
         let is *d.IRFunction as fnc = cast(*d.IRFunction, ctx.func);
         if (d.vreg_class_get(fnc, inst.src1.vreg) == d.VR_XMM) {
             sn = _vec_num(inst.src1.vreg, ctx);
@@ -934,15 +951,21 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
             e.load_op(inst.src1.vreg, ctx, "rcx");           // k bits -> rcx (GPR or spill)
             let is *u8 as dx = eo.reg_xmm(dn + 16);
             eo.out_str("  movq ", 7); eo.out_cstr(dx); eo.out_cstr(", rcx"); eo.out_char(10);
-            sn = dn;                                          // movddup dst, dst
+            sn = dn;
         }
-        // movddup xmm[dn], xmm[sn] : F2 [REX] 0F 12 /r
-        eo.out_cstr("  .byte 242");
-        if (dn >= 8 || sn >= 8) {
-            let is i32 as rex with mut = 64; if (dn >= 8) { rex = rex + 4; } if (sn >= 8) { rex = rex + 1; }
-            eo.out_cstr(", "); eo.out_int(cast(i64, rex));
+        // movapd xmm[dn], xmm[sn] : 66 [REX] 0F 28 /r
+        if (sn != dn) {
+            eo.out_cstr("  .byte 102");
+            if (dn >= 8 || sn >= 8) {
+                let is i32 as rex with mut = 64; if (dn >= 8) { rex = rex + 4; } if (sn >= 8) { rex = rex + 1; }
+                eo.out_cstr(", "); eo.out_int(cast(i64, rex));
+            }
+            eo.out_cstr(", 15, 40, "); eo.out_int(cast(i64, 192 + (dn % 8) * 8 + (sn % 8))); eo.out_char(10);
         }
-        eo.out_cstr(", 15, 18, "); eo.out_int(cast(i64, 192 + (dn % 8) * 8 + (sn % 8))); eo.out_char(10);
+        // unpcklpd xmm[dn], xmm[dn] : 66 [REX] 0F 14 /r
+        eo.out_cstr("  .byte 102");
+        if (dn >= 8) { eo.out_cstr(", 69"); }
+        eo.out_cstr(", 15, 20, "); eo.out_int(cast(i64, 192 + (dn % 8) * 9)); eo.out_char(10);
         return;
     }
     if (op == d.IR_VSPLATPD256) {
@@ -1074,17 +1097,6 @@ fn gen_inst_vec(inst as *d.IRInst, ctx as *al.AllocCtx) as void {
         if (disp > 0) { eo.out_str(" + ", 3); eo.out_int(disp); }
         if (disp < 0) { eo.out_str(" - ", 3); eo.out_int(0 - disp); }
         eo.out_str("]\n", 2);
-        return;
-    }
-    if (op == d.IR_VSTOREQ) {
-        let is *u8 as bn = ev.vbase_name(inst.src1.vreg, ctx);
-        let is i64 as disp with mut = 0;
-        if (inst.dest.op_type == d.OP_IMM) { disp = inst.dest.imm; }
-        let is *u8 as sv = _vec_xmm(inst.src2.vreg, ctx);
-        eo.out_str("  movdqu [", 10); eo.out_cstr(bn);
-        if (disp > 0) { eo.out_str(" + ", 3); eo.out_int(disp); }
-        if (disp < 0) { eo.out_str(" - ", 3); eo.out_int(0 - disp); }
-        eo.out_str("], ", 3); eo.out_cstr(sv); eo.out_char(10);
         return;
     }
     if (op == d.IR_VADDQ || op == d.IR_VADDD || op == d.IR_VADDPD

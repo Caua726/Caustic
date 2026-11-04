@@ -29,6 +29,7 @@ This overrides any default commit-attribution behavior.
 ./caustic <source.cst> -o prog               # Full pipeline: compile + assemble + link
 ./caustic -c <source.cst>                    # Compile only (no main required, for libraries)
 ./caustic -O1 <source.cst> -o p              # Optimized build
+./caustic -O2 --cpu=x86-64-v3 <source.cst> -o p   # What -O2 may assume about the CPU (below)
 ./caustic --target=linux-x86_64 ... (default)
 ./caustic --target=linux-aarch64 src.cst -o p-aarch64  # Static AArch64 ELF
 ./caustic --target=windows-x86_64 src.cst -o p.exe   # Cross-compile PE/COFF for Windows
@@ -111,6 +112,7 @@ fn name(a as i64, b as *u8) as i32 {
     return 0;
 }
 fn init() as void with section(".init") { }  // function in custom section
+fn slow() as void with noinline { }          // every call to it stays a call
 
 // Structs
 struct Point { x as i32; y as i32; }
@@ -362,6 +364,7 @@ fn work() as i32 {
 
 ## Gotchas
 
+- **`--cpu=` decides what -O2 assumes about the x86_64 CPU**: `x86-64` (default: SSE2 only, no cpuid, no code layout tuned for one CPU, so a binary runs on any x86-64 and compares fairly with `gcc -O2`), `auto` (SSE2 and AVX2 paths, chosen by a cpuid + xgetbv test at run time), `x86-64-v3` (AVX2 with no test), `znver3` (AVX2 with no test, plus the `.loopalign`/fetch-window/64-byte-line layout that was tuned on Zen 3). `tools/check-cpu.sh` pins this, under qemu with no SSE3 too. An AVX2 development machine never runs the SSE2 paths of `auto`, so test those with the default.
 - **Stdlib resolution**: The compiler tries paths relative to the source file first, then falls back to `<binary_dir>/../lib/caustic/`, then `/usr/local/lib/caustic/`
 - **No libc**: Programs use raw Linux syscalls, not C library functions
 - **Syscall numbers**: x86_64 and AArch64 use different tables. Prefer

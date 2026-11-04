@@ -189,6 +189,7 @@ has  _caustic 'caustic --target=' linux-x86_64 windows-x86_64 caustic-x86_64 was
 has  _caustic 'caustic --target=w' windows-x86_64 windows-aarch64 wasm32-wasi wasm64-wasi
 hasnt _caustic 'caustic --target=w' linux-x86_64 hello.cst
 has  _caustic 'caustic --mode=' pure compat bundle
+has  _caustic 'caustic --cpu=' x86-64 auto x86-64-v3 znver3
 has  _caustic 'caustic --mode=c' compat
 has  _caustic 'caustic --extension=' exe cse
 has  _caustic 'caustic --stack-size=' 65536 1048576

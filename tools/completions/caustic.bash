@@ -129,7 +129,7 @@ _caustic() {
 --module-objects --module-only --emit-deps --csti-dir
 -O0 -O1 -O2 --path -q --quiet --emit-asm
 -debuglexer -debugparser -debugir --freestanding --allow-unsupported
---target= --mode= --entry= --base= --app-version= --stack-size= --extension="
+--target= --cpu= --mode= --entry= --base= --app-version= --stack-size= --extension="
     # Both are read straight off argv[1] and stop the compiler there, so they
     # are only ever the first word.
     [ "$COMP_CWORD" -eq 1 ] && flags="$flags --version --help"
@@ -140,6 +140,7 @@ _caustic() {
         # CSE flavours: pure = CausticOS only, compat = both OS paths chosen at
         # run time, bundle = a polyglot that every loader accepts.
         --mode)        __caustic_comp_words "pure compat bundle"; return ;;
+        --cpu)         __caustic_comp_words "x86-64 auto x86-64-v3 znver3"; return ;;
         --entry)       __caustic_comp_words "main"; return ;;
         --base)        __caustic_comp_words "0x400000 0x100000"; return ;;
         --stack-size)  __caustic_comp_words "65536 131072 262144 1048576 8388608"; return ;;
