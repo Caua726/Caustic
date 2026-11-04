@@ -7,9 +7,10 @@
 // Self-check: every simulation queues 23246 packets and holds 9297 times.
 use "../../std/io.cst" as io;
 use "../../std/mem.cst" as mem;
+use "../lib/args.cst" as args;
 
-let is i32 as ROUNDS with imut = 10;
-let is i32 as INNER with imut = 100;
+let is i32 as ROUNDS with mut = 10;
+let is i32 as INNER with mut = 100;
 
 let is i32 as IDLER with imut = 0;
 let is i32 as WORKER with imut = 1;
@@ -50,10 +51,24 @@ struct Task {
     handle as *u8;      // the task's data record
 }
 
-struct DeviceData { pending as *Packet; }
-struct HandlerData { work_in as *Packet; device_in as *Packet; }
-struct IdleData { control as i32; count as i32; }
-struct WorkerData { destination as i32; count as i32; }
+// Each task's data record says what it is, and its task's function checks that
+// when it reads the record back from the generic word it is handed.
+struct DeviceData { kind as i32; pending as *Packet; }
+struct HandlerData { kind as i32; work_in as *Packet; device_in as *Packet; }
+struct IdleData { kind as i32; control as i32; count as i32; }
+struct WorkerData { kind as i32; destination as i32; count as i32; }
+let is i32 as DEVICE_DATA with imut = 1;
+let is i32 as HANDLER_DATA with imut = 2;
+let is i32 as IDLE_DATA with imut = 3;
+let is i32 as WORKER_DATA with imut = 4;
+
+fn checked_data(word as *u8, kind as i32) as *u8 {
+    if (*cast(*i32, word) != kind) {
+        io.printf("scheduler: wrong task data\n");
+        io.exit(1);
+    }
+    return word;
+}
 
 struct Scheduler {
     task_list as *Task;
@@ -251,7 +266,7 @@ fn mark_waiting(s as *Scheduler) as *Task {
 // --- the four task functions ---
 
 fn device_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
-    let is *DeviceData as data = cast(*DeviceData, word);
+    let is *DeviceData as data = cast(*DeviceData, checked_data(word, DEVICE_DATA));
     let is *Packet as function_work with mut = work;
     if (cast(i64, function_work) == 0) {
         function_work = data.pending;
@@ -264,7 +279,7 @@ fn device_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
 }
 
 fn handler_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
-    let is *HandlerData as data = cast(*HandlerData, word);
+    let is *HandlerData as data = cast(*HandlerData, checked_data(word, HANDLER_DATA));
     if (cast(i64, work) != 0) {
         if (work.kind == WORK_PACKET_KIND) {
             data.work_in = append(work, data.work_in);
@@ -288,7 +303,7 @@ fn handler_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
 }
 
 fn idler_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
-    let is *IdleData as data = cast(*IdleData, word);
+    let is *IdleData as data = cast(*IdleData, checked_data(word, IDLE_DATA));
     data.count = data.count - 1;
     if (data.count == 0) { return hold_self(s); }
     if ((data.control & 1) == 0) {
@@ -300,7 +315,7 @@ fn idler_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
 }
 
 fn worker_fn(s as *Scheduler, work as *Packet, word as *u8) as *Task {
-    let is *WorkerData as data = cast(*WorkerData, word);
+    let is *WorkerData as data = cast(*WorkerData, checked_data(word, WORKER_DATA));
     if (cast(i64, work) == 0) { return mark_waiting(s); }
     if (data.destination == HANDLER_A) { data.destination = HANDLER_B; }
     else { data.destination = HANDLER_A; }
@@ -327,12 +342,14 @@ fn create_task(s as *Scheduler, identity as i32, priority as i32, work as *Packe
 
 fn create_device(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
     let is *DeviceData as data = cast(*DeviceData, new_object(sizeof(DeviceData)));
+    data.kind = DEVICE_DATA;
     data.pending = cast(*Packet, 0);
     create_task(s, identity, priority, work, state, fn_ptr(device_fn), cast(*u8, data));
 }
 
 fn create_handler(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
     let is *HandlerData as data = cast(*HandlerData, new_object(sizeof(HandlerData)));
+    data.kind = HANDLER_DATA;
     data.work_in = cast(*Packet, 0);
     data.device_in = cast(*Packet, 0);
     create_task(s, identity, priority, work, state, fn_ptr(handler_fn), cast(*u8, data));
@@ -340,6 +357,7 @@ fn create_handler(s as *Scheduler, identity as i32, priority as i32, work as *Pa
 
 fn create_idler(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
     let is *IdleData as data = cast(*IdleData, new_object(sizeof(IdleData)));
+    data.kind = IDLE_DATA;
     data.control = 1;
     data.count = 10000;
     create_task(s, identity, priority, work, state, fn_ptr(idler_fn), cast(*u8, data));
@@ -347,6 +365,7 @@ fn create_idler(s as *Scheduler, identity as i32, priority as i32, work as *Pack
 
 fn create_worker(s as *Scheduler, identity as i32, priority as i32, work as *Packet, state as *TaskState) as void {
     let is *WorkerData as data = cast(*WorkerData, new_object(sizeof(WorkerData)));
+    data.kind = WORKER_DATA;
     data.destination = HANDLER_A;
     data.count = 0;
     create_task(s, identity, priority, work, state, fn_ptr(worker_fn), cast(*u8, data));
@@ -408,7 +427,9 @@ fn benchmark() as i32 {
     return result;
 }
 
-fn main() as i32 {
+fn main(argc as i64, argv as *u8) as i32 {
+    ROUNDS = cast(i32, args.number(argc, argv, 1, 10));
+    INNER = cast(i32, args.number(argc, argv, 2, 100));
     let is i32 as r with mut = 0;
     while (r < ROUNDS) {
         let is i32 as k with mut = 0;

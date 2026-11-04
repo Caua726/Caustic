@@ -32,6 +32,10 @@ times it like -O2 (the ratios are then fastest against fastest), and
 fails to build or exits non-zero is reported and left out of the means; the
 runner's exit code is the number of such failures.
 
+A program whose size comes from its arguments elsewhere takes it from its
+arguments here too (`benchmarks/lib/args.cst`), with the usual size as the default:
+the compiler does not get to see it as a constant.
+
 A single benchmark runs on its own like any program:
 
 ```sh
