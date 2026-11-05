@@ -83,6 +83,11 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   9% longer (wall) and the compiler's code grows 19%.
 
 ### Fixed
+- **`-O2` vectorized loops with a way out besides their test, and passed it.** `if (p == i) { return k; }`
+  ahead of `if (s[k] == 10) { p = p + 1; }` was counted to the end of the text and the return
+  never seen; a sum read by its own early exit went the same way. `can_vectorize` now
+  refuses a loop with a return or a second branch out. `tests/vec_early_exit_test.cst`
+  pins the shapes.
 - **A float compare whose result is a value could send the next store to the wrong
   address at `-O1` and `-O2`.** It writes its parity flag through `cl`, and the
   register cache went on claiming a spilled pointer in `rcx`, so `s.v = cast(i32, d != 0.0)`

@@ -25,6 +25,7 @@ let is i32 as CV_OK            with imut = 0;
 let is i32 as CV_NOT_COUNTABLE with imut = 1;
 let is i32 as CV_HAS_BARRIER   with imut = 2;
 let is i32 as CV_UNSAFE_DEP    with imut = 3;
+let is i32 as CV_OTHER_EXIT    with imut = 4;
 
 let is i32 as VF_BIG with imut = 1000000;
 let is i32 as MAX_ACC with imut = 64;
@@ -138,6 +139,37 @@ fn dep_loop_maxsafevf(accs as *MemAcc, n as i32, needs_rt as *i32) as i64 {
     return cap;
 }
 
+// Whether the loop has a way out besides its own test: a return, or a second
+// branch to a label outside it. The vector paths run whole strides and would
+// pass it, and whatever it reads they only have up to date every stride.
+fn _leaves_early(blocks as *cfg.BasicBlock, L as *vl.VecLoop) as i32 {
+    let is *cfg.BasicBlock as hb = vl.bb_at(blocks, L.header);
+    let is *cfg.BasicBlock as lb = vl.bb_at(blocks, L.latch);
+    let is i32 as out with mut = 0;
+    let is *d.IRInst as b with mut = hb.first;
+    let is i32 as stop with mut = 0;
+    while (stop == 0 && cast(i64, b) != 0) {
+        if (b.is_dead == 0) {
+            if (b.op == d.IR_RET) { return 1; }
+            if ((b.op == d.IR_JMP || b.op == d.IR_JZ || b.op == d.IR_JNZ) && b.dest.op_type == d.OP_LABEL) {
+                let is i32 as inside with mut = 0;
+                let is *d.IRInst as q with mut = hb.first;
+                let is i32 as qstop with mut = 0;
+                while (qstop == 0 && inside == 0 && cast(i64, q) != 0) {
+                    if (q.is_dead == 0 && q.op == d.IR_LABEL && q.dest.label == b.dest.label) { inside = 1; }
+                    if (cast(i64, q) == cast(i64, lb.last)) { qstop = 1; } else { q = q.next; }
+                }
+                if (inside == 0) {
+                    out = out + 1;
+                    if (out > 1) { return 1; }
+                }
+            }
+        }
+        if (cast(i64, b) == cast(i64, lb.last)) { stop = 1; } else { b = b.next; }
+    }
+    return 0;
+}
+
 // Full legality gate. iv_found = did find_loop_iv succeed. Returns CV_OK + sets
 // *out_maxvf/*out_rt, or a CV_* rejection reason.
 fn can_vectorize(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecLoop,
@@ -145,6 +177,7 @@ fn can_vectorize(func as *d.IRFunction, blocks as *cfg.BasicBlock, L as *vl.VecL
                  out_maxvf as *i64, out_rt as *i32) as i32 {
     *out_maxvf = 0; *out_rt = 0;
     if (iv_found == 0) { return CV_NOT_COUNTABLE; }
+    if (_leaves_early(blocks, L) == 1) { return CV_OTHER_EXIT; }
     let is *MemAcc as accs = cast(*MemAcc, d.opt_alloc(cast(i64, MAX_ACC) * sizeof(MemAcc)));
     let is i32 as has_barrier with mut = 0;
     let is i32 as n = collect_accesses(func, blocks, L, iv, iv_step, def_inst, def_count, vc, accs, &has_barrier);
