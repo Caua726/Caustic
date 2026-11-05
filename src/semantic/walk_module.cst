@@ -369,6 +369,7 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
             sc.current_source_dir_ptr = cached.source_dir_ptr;
             sc.current_source_dir_len = cached.source_dir_len;
             analyze_bodies(cached.body);
+            if (ast.stream_active == 1) { mod.free_tokens_of(cached); }
         }
     }
     sc.sem_src = old_sem_src;
@@ -626,6 +627,38 @@ fn register_fns(node as *u8) as void {
     }
 }
 
+// === Streaming: syntax tree to IR, one function at a time ===
+// The function bodies of a large program are most of what a build holds in memory, and
+// they are only ever read between semantic analysis and IR generation. Here a body is
+// parsed at its turn, analyzed, lowered and dropped, with the bodies of the generic
+// instances it caused. `stream_hook` is the IR generator, which this module cannot name.
+let is *u8 as stream_hook with mut = cast(*u8, 0);
+let is *ast.Node as _stream_done with mut = cast(*ast.Node, 0);
+
+fn set_stream_hook(h as *u8) as void { stream_hook = h; }
+
+// Instances are added to the end of the root's chain as they are met.
+fn _stream_instances() as void {
+    if (cast(i64, _stream_done) == 0) { return; }
+    while (cast(i64, _stream_done.next) != 0) {
+        let is *ast.Node as x = _stream_done.next;
+        if (x.kind == ast.NK_FN && ast.nx_walked(x) == 0) { return; }
+        if (x.kind == ast.NK_FN) { call(stream_hook, x); }
+        _stream_done = x;
+    }
+}
+
+fn _stream_fn(n as *ast.Node) as void {
+    if (cast(i64, ast.nx_ir_func(n)) != 0) { return; }
+    top.force_body(n, sc.sem_token_list, sc.sem_src, sc.sem_src_len, sc.sem_filename);
+    w.walk(n);
+    call(stream_hook, n);
+    _stream_instances();
+    // An imut function's body is read again by every call the folder evaluates.
+    if (cast(i64, n.body) != 0 && ast.nx_is_imut(n) == 0) { n.body = top.no_body(); }
+    ast.reset_transient_nodes();
+}
+
 fn analyze_bodies(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
@@ -633,7 +666,8 @@ fn analyze_bodies(node as *u8) as void {
             visit_use_module(n, 6);
         } else if (n.kind == ast.NK_FN) {
             if (n.generic_param_count == 0 && n.is_extern == 0) {
-                w.walk(n);
+                if (ast.stream_active == 1) { _stream_fn(n); }
+                else { w.walk(n); }
             }
         }
         n = n.next;
@@ -706,6 +740,8 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
         }
     }
 
+    _stream_done = gn.ast_tail;
+
     // register_fns runs before register_vars so globals can reference
     // functions via fn_ptr() in their initializers, and prefold_consts runs
     // before resolve_fields so a struct field can be `[MAX]u8`.
@@ -724,6 +760,7 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
 
     // --emit-deps: now that every import has been resolved + loaded, write the
     // full module path list for the maker's incremental driver.
+    if (cast(i64, tgt.write_deps_path_get()) != 0) { mod.emit_deps(tgt.write_deps_path_get()); }
     let is *u8 as deps_path = tgt.emit_deps_path_get();
     if (cast(i64, deps_path) != 0) {
         mod.emit_deps(deps_path);

@@ -8,6 +8,7 @@ use "parser/ast.cst" as ast;
 use "parser/top.cst" as top;
 use "semantic/walk_module.cst" as sem;
 use "semantic/scope.cst" as sc;
+use "ir/opt_mem.cst" as om;
 use "semantic/modules.cst" as mod;
 use "ir/defs.cst" as ird;
 use "ir/gen.cst" as irg;
@@ -168,7 +169,10 @@ fn register_csl_libs() as i32 {
 // the common single-mode case (cse_mode == 0) this leaves the hash unchanged
 // up to the multiply, keeping behaviour identical to before for ELF/PE builds.
 fn cse_cache_hash(src_hash as i64) as i64 {
-    return src_hash * 1000003 + cast(i64, tgt.cse_mode_get());
+    // The parser folds the target's builtins into the tree, so a tree belongs to a target.
+    let is *tgt.Target as target = tgt.target_get();
+    return (src_hash * 1000003 + cast(i64, tgt.cse_mode_get())) * 1000003
+        + cast(i64, target.arch) * 16 + cast(i64, target.object_format);
 }
 
 // Returns 1 if `arg` (length arglen) begins with the literal prefix `pfx`
@@ -292,7 +296,7 @@ fn resolve_stdlib_dir() as void {
 //
 // The directory part is hashed rather than spelled out because a mangled deep
 // path runs past the 255-byte limit on a filename component. Eight hex digits
-// of djb2 over the full path, plus the basename to keep it readable.
+// of the source hash over the full path, plus the basename to keep it readable.
 fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len as i32) as *u8 {
     if (cast(i64, cache_dir) == 0) { return cast(*u8, 0); }
     let is i32 as fname_len = strlen(filename);
@@ -304,7 +308,7 @@ fn build_cache_path(cache_dir as *u8, filename as *u8, suffix as *u8, suffix_len
     }
     let is i32 as base_len = fname_len - base_start;
     let is i32 as dir_len = strlen(cache_dir);
-    let is i64 as h = tokcache.djb2_hash(filename, cast(i64, fname_len));
+    let is i64 as h = tokcache.source_hash(filename, cast(i64, fname_len));
 
     let is i32 as total = dir_len + 1 + 8 + 1 + base_len + suffix_len;
     let is *u8 as path = ird.opt_alloc(cast(i64, total) + 1);
@@ -381,6 +385,95 @@ let is i32 as g_emit_asm with mut = 0;
 let is [16]i64 as g_extra_paths with mut;
 let is i32 as g_extra_path_count with mut = 0;
 
+// --config-id: what a build's output depends on besides its sources, as 16 hex digits.
+// Everything on the command line counts unless listed here as not changing a byte of
+// the output, so a flag added later is covered without anyone remembering to. Flags
+// count in any order, since most are independent; the search path keeps its order, and
+// what was resolved from them settles the ones where the last one wins.
+let is i32 as g_config_id with mut = 0;
+let is i64 as g_obj_cache with mut = 0;
+
+fn _cfg_mix(h as i64, v as i64) as i64 {
+    return ((h ^ v) * 1099511628211) ^ ((h >> 31) & 8589934591);
+}
+
+fn _cfg_str(s as *u8) as i64 { return tokcache.source_hash(s, cast(i64, strlen(s))); }
+
+fn _cfg_self_hash() as i64 {
+    let is [4096]u8 as path;
+    let is i64 as n = io.get_self_path(&path, 4095);
+    if (n <= 0) { return 0; }
+    path[n] = cast(u8, 0);
+    let is i64 as fsize with mut = 0;
+    let is i64 as fd = io._open_read(cast(*u8, &path));
+    if (fd < 0) { return 0; }
+    let is i64 as h with mut = 0 - 3750763034362895579;
+    let is *u8 as buf = mem.core.mmap_anon(65536);
+    let is i64 as got with mut = io._read_fd(fd, buf, 65536);
+    while (got > 0) {
+        h = _cfg_mix(h, tokcache.source_hash(buf, got));
+        fsize = fsize + got;
+        got = io._read_fd(fd, buf, 65536);
+    }
+    io._close_fd(fd);
+    return _cfg_mix(h, fsize);
+}
+
+fn _cfg_skip(arg as *u8, arglen as i32) as i32 {
+    // Not part of the output, and take a value.
+    if (str_eq(arg, arglen, "-o", 2) == 1 || str_eq(arg, arglen, "-j", 2) == 1
+        || str_eq(arg, arglen, "--parallel", 10) == 1 || str_eq(arg, arglen, "--cache", 7) == 1
+        || str_eq(arg, arglen, "--max-ram", 9) == 1 || str_eq(arg, arglen, "--write-deps", 12) == 1
+        || str_eq(arg, arglen, "--obj-cache", 11) == 1) { return 2; }
+    // Not part of the output.
+    if (str_eq(arg, arglen, "-q", 2) == 1 || str_eq(arg, arglen, "--quiet", 7) == 1
+        || str_eq(arg, arglen, "--profile", 9) == 1 || str_eq(arg, arglen, "--stats", 7) == 1
+        || str_eq(arg, arglen, "--config-id", 11) == 1) { return 1; }
+    return 0;
+}
+
+fn _print_config_id(argc as i64, argv_arr as *i64) as i32 {
+    let is i64 as flags with mut = 0;
+    let is i64 as paths with mut = 0;
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as arg = cast(*u8, argv_arr[ai]);
+        let is i32 as arglen = strlen(arg);
+        let is i32 as skip = _cfg_skip(arg, arglen);
+        if (skip > 0) {
+            ai = ai + cast(i64, skip);
+        } else if (str_eq(arg, arglen, "--path", 6) == 1) {
+            if (ai + 1 < argc) { paths = _cfg_mix(paths, _cfg_str(cast(*u8, argv_arr[ai + 1]))); }
+            ai = ai + 2;
+        } else {
+            flags = flags + _cfg_mix(1469598103, _cfg_str(arg));   // any order
+            ai = ai + 1;
+        }
+    }
+    resolve_stdlib_dir();
+    let is i64 as h with mut = 1;                 // format of this id and of the caches
+    h = _cfg_mix(h, flags);
+    h = _cfg_mix(h, paths);
+    h = _cfg_mix(h, cast(i64, g_opt_level));
+    h = _cfg_mix(h, cast(i64, ird.ir_cpu));
+    h = _cfg_mix(h, cast(i64, tgt.target_get().arch));
+    h = _cfg_mix(h, cast(i64, tgt.target_get().object_format));
+    h = _cfg_mix(h, tokcache.source_hash(sc.stdlib_dir_ptr, cast(i64, sc.stdlib_dir_len)));
+    h = _cfg_mix(h, _cfg_self_hash());
+    let is [17]u8 as hex;
+    let is i32 as hi with mut = 15;
+    let is i64 as v with mut = h;
+    while (hi >= 0) {
+        let is i32 as nib = cast(i32, v & 15);
+        if (nib < 10) { hex[hi] = cast(u8, 48 + nib); } else { hex[hi] = cast(u8, 87 + nib); }
+        v = (v >> 4) & 1152921504606846975;
+        hi = hi - 1;
+    }
+    hex[16] = cast(u8, 10);
+    io._write_fd(io.STDOUT, cast(*u8, &hex), 17);
+    return 0;
+}
+
 fn parse_args(argc as i64, argv_arr as *i64) as i32 {
     let is i64 as ai with mut = 1;
     while (ai < argc) {
@@ -442,6 +535,16 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
             g_cache_flags = g_cache_flags + 4;
         } else if (str_eq(arg, arglen, "--emit-ir", 9) == 1) {
             g_cache_flags = g_cache_flags + 8;
+        } else if (str_eq(arg, arglen, "--config-id", 11) == 1) {
+            g_config_id = 1;
+        } else if (str_eq(arg, arglen, "--obj-cache", 11) == 1) {
+            ai = ai + 1;
+            if (ai < argc) { g_obj_cache = argv_arr[ai]; }
+        } else if (str_eq(arg, arglen, "--write-deps", 12) == 1) {
+            ai = ai + 1;
+            if (ai < argc) { tgt.write_deps_path_set(cast(*u8, argv_arr[ai])); }
+        } else if (str_eq(arg, arglen, "--stats", 7) == 1) {
+            _stats_begin();
         } else if (str_eq(arg, arglen, "--profile", 9) == 1) {
             prof.prof_enabled = 1;
             prof.prof_count = 0;
@@ -616,6 +719,7 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
         ai = ai + 1;
     }
 
+    if (g_config_id == 1) { _print_config_id(argc, argv_arr); io.exit(0); }
     if (g_file_count == 0) {
         io.write_str(io.STDERR, "Error: no input file\n");
         return 1;
@@ -664,6 +768,36 @@ fn write_module_interface(filename as *u8, fname_len as i32, root as *ast.Node, 
 
 // ── Compilation: frontend phases (lex → parse → semantic → IR → optimize) ──
 
+// --stats: counts of the work a build did, on stderr. See cg.stats_add.
+fn _stats_begin() as void {
+    if (os.current() == os.OS_LINUX) {
+        cg.stats_page = cast(i64, os.linux.mmap(cast(*u8, 0), 4096,
+            os.linux.PROT_READ | os.linux.PROT_WRITE,
+            os.linux.MAP_SHARED | os.linux.MAP_ANONYMOUS, 0 - 1, 0));
+    }
+}
+
+fn _stat_line(name as *u8, slot as i64) as void {
+    io.write_str(io.STDERR, "stats: ");
+    io.write_str(io.STDERR, name);
+    io.write_str(io.STDERR, " ");
+    io.write_int(io.STDERR, *cast(*i64, cg.stats_page + slot));
+    io.write_str(io.STDERR, "\n");
+}
+
+fn _stats_print() as void {
+    if (cg.stats_page == 0) { return; }
+    cg.stats_add(cg.STAT_LARGE_MAPS, om.large_maps);
+    _stat_line("modules", cg.STAT_MODULES);
+    _stat_line("funcs_emitted", cg.STAT_FUNCS_EMITTED);
+    _stat_line("rodata_global_visits", cg.STAT_RODATA_VISITS);
+    _stat_line("outside_callers_calls", cg.STAT_OUTSIDE_CALLS);
+    _stat_line("tokens_live_bytes", cg.STAT_TOKENS_LIVE);
+    _stat_line("large_maps", cg.STAT_LARGE_MAPS);
+    _stat_line("objects_reused", cg.STAT_OBJS_REUSED);
+    _stat_line("objects_emitted", cg.STAT_OBJS_EMITTED);
+}
+
 // One file, a static x86_64 ELF of its own: see d.params_canon_ok.
 fn _set_params_canon() as void {
     ird.params_canon_ok = 0;
@@ -671,6 +805,17 @@ fn _set_params_canon() as void {
         && g_lib_count == 0 && tgt.target_get().object_format == 1 && tgt.target_get().arch == 1) {
         ird.params_canon_ok = 1;
     }
+}
+
+// Streaming build: g_stream on, IR generated per function during semantic analysis.
+let is i32 as g_stream with mut = 0;
+let is *u8 as g_stream_root_tl with mut = cast(*u8, 0);
+
+fn _stream_gen(node as *u8) as void {
+    // Line info is the root module's, as it is without streaming.
+    if (cast(i64, sc.sem_token_list) == cast(i64, g_stream_root_tl)) { irg.ir_tl = g_stream_root_tl; }
+    else { irg.ir_tl = cast(*u8, 0); }
+    irp.gen_stream_fn(node);
 }
 
 fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
@@ -684,7 +829,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         io.write_str(io.STDERR, "\n");
         return 1;
     }
-    let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
+    let is i64 as src_hash = tokcache.source_hash(src, file_size);
     // CSE mode affects the parsed AST and IR (via the __compat_mode builtin),
     // so the IR/AST caches must not be shared across modes. Tokens are mode-
     // independent, so the token cache keeps using the raw src_hash.
@@ -706,10 +851,9 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     let is i32 as tok_cached with mut = 0;
     if (cast(i64, cache_dir) != 0) {
         let is *u8 as tok_path = build_cache_path(cache_dir, filename, ".tokens", 7);
-        let is i32 as hash32 = cast(i32, src_hash & cast(i64, 2147483647));
         let is i64 as cached_size with mut = 0;
         let is *u8 as cached_src with mut = cast(*u8, 0);
-        let is i32 as tok_err = tokcache.read_token_cache(tok_path, cast(*u8, &tokens), cast(*u8, &cached_src), &cached_size, hash32);
+        let is i32 as tok_err = tokcache.read_token_cache(tok_path, cast(*u8, &tokens), cast(*u8, &cached_src), &cached_size, src_hash);
         if (tok_err == 0) {
             src = cached_src;
             file_size = cached_size;
@@ -750,7 +894,8 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     ast.types_init();
     let is *ast.Node as root with mut = cast(*ast.Node, 0);
     let is i32 as ast_cached with mut = 0;
-    if (cast(i64, cache_dir) != 0) {
+    if (g_stream == 1) { top.set_lazy_bodies(1); ast.stream_active = 1; }
+    if (cast(i64, cache_dir) != 0 && g_stream == 0) {
         let is *u8 as ast_rpath = build_cache_path(cache_dir, filename, ".ast", 4);
         let is *ast.Node as cached_root = astcr.read_ast_cache(ast_rpath, cache_hash);
         if (cast(i64, cached_root) != 0) {
@@ -763,7 +908,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         let is i64 as t1 = get_time_us();
         root = top.parse_file(&tokens, src, file_size, filename);
         prof.prof_record("parse", get_time_us() - t1);
-        if (cast(i64, cache_dir) != 0) {
+        if (cast(i64, cache_dir) != 0 && g_stream == 0) {
             let is *u8 as ast_wpath = build_cache_path(cache_dir, filename, ".ast", 4);
             astcw.write_ast_cache(ast_wpath, root, cache_hash);
         }
@@ -785,6 +930,16 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         mem.memcpy(cast(*u8, cast(i64, ast_path) + cast(i64, fname_len)), ".ast", 5);
         astcw.write_ast_cache(ast_path, root, cache_hash);
         if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ast_path); io.write_str(io.STDOUT, "\n"); }
+    }
+
+    if (g_stream == 1) {
+        irg.ir_reset();
+        ird.ir_opt_level = g_opt_level;
+        _set_params_canon();
+        ird.ir_alloc_init();
+        if (tgt.target_get().arch == tgt.ARCH_X86_64) { ird.ir_pack = 1; }
+        g_stream_root_tl = cast(*u8, &tokens);
+        sem.set_stream_hook(fn_ptr(_stream_gen));
     }
 
     // Semantic
@@ -822,24 +977,26 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
 
     // Standalone --emit-csti: emit the interface and stop (no codegen). The
     // single-pass --module-only + --emit-csti path emits in run_single_file instead.
+    // With --module-only -o the object is wanted as well: one analysis, both outputs.
     if ((cache_flags & 16) != 0) {
         write_module_interface(filename, fname_len, root, cache_hash);
-        *prog_out = 0;
-        return 0;
+        if (tgt.module_only_get() == 0) {
+            *prog_out = 0;
+            return 0;
+        }
     }
 
     // IR generation
     let is i64 as t3 = get_time_us();
-    irg.ir_reset();
+    if (g_stream == 0) { irg.ir_reset(); }
     irg.ir_tl = cast(*u8, &tokens);
     ird.ir_opt_level = g_opt_level;
     // Imported modules' token arrays are dead now: IR-gen reads only the root's
     // tokens (ir_tl above) and nulls ir_tl for each submodule. Free them before
     // gen-IR so ~50 modules' tokens stop sitting resident through codegen.
-    // NOT in module-objects/-only mode: there codegen emits EVERY module's
-    // functions (each into its own .o) and reads their tokens for line info, so
-    // freeing an imported module's tokens would be a use-after-munmap.
-    if (tgt.module_only_get() == 0) { mod.free_module_tokens(); }
+    // Module-objects mode too: nothing past this point reads them. Line info comes
+    // from g.ir_tl, which is 0 for every imported module.
+    mod.free_module_tokens();
     _set_params_canon();
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), no_main);
     prof.prof_record("ir", get_time_us() - t3);
@@ -851,6 +1008,7 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         while (cast(i64, pf) != 0) {
             if (pf.is_reachable == 1) {
                 prof.prof_func_count = prof.prof_func_count + 1;
+                prof.prof_ir_insts = prof.prof_ir_insts + pf.ir_blob_count;
                 let is *ird.IRInst as pi with mut = pf.instructions;
                 while (cast(i64, pi) != 0) {
                     prof.prof_ir_insts = prof.prof_ir_insts + 1;
@@ -1095,7 +1253,7 @@ fn run_single_file(filename as *u8) as i32 {
         let is *u8 as ast_path = ird.opt_alloc(cast(i64, fname_len) + 8);
         mem.memcpy(ast_path, filename, cast(i64, fname_len));
         mem.memcpy(cast(*u8, cast(i64, ast_path) + cast(i64, fname_len)), ".ast", 5);
-        let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
+        let is i64 as src_hash = tokcache.source_hash(src, file_size);
         astcw.write_ast_cache(ast_path, root, cse_cache_hash(src_hash));
         if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ast_path); io.write_str(io.STDOUT, "\n"); }
     }
@@ -1104,6 +1262,11 @@ fn run_single_file(filename as *u8) as i32 {
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
     prof.prof_record("semantic", get_time_us() - t3);
     if (g_quiet == 0) { io.write_str(io.STDOUT, "semantic: ok\n"); }
+
+    // --emit-deps: analyze() wrote the module list, which is all that was asked. The
+    // caller wants the graph, and this path used to go on to generate the whole
+    // program and leave its assembly beside the source.
+    if (cast(i64, tgt.emit_deps_path_get()) != 0) { return 0; }
 
     // Stage 3 single-pass: with --emit-csti + --csti-dir (the maker passes both
     // alongside --module-only), emit this module's interface right after semantic —
@@ -1116,7 +1279,7 @@ fn run_single_file(filename as *u8) as i32 {
     let is i64 as t_ir = get_time_us();
     irg.ir_tl = cast(*u8, &tokens);
     ird.ir_opt_level = g_opt_level;
-    if (tgt.module_only_get() == 0) { mod.free_module_tokens(); }   // skip in module-objects mode (per-module codegen still reads tokens)
+    mod.free_module_tokens();
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), g_no_main);
     prof.prof_record("ir", get_time_us() - t_ir);
     if (g_quiet == 0) { io.write_str(io.STDOUT, "ir: ok\n"); }
@@ -1141,7 +1304,7 @@ fn run_single_file(filename as *u8) as i32 {
         let is *u8 as ir_path = ird.opt_alloc(cast(i64, fname_len) + 8);
         mem.memcpy(ir_path, filename, cast(i64, fname_len));
         mem.memcpy(cast(*u8, cast(i64, ir_path) + cast(i64, fname_len)), ".ir", 4);
-        let is i64 as src_hash = tokcache.djb2_hash(src, file_size);
+        let is i64 as src_hash = tokcache.source_hash(src, file_size);
         ircw.write_ir_cache(ir_path, cast(*u8, prog), cse_cache_hash(src_hash));
         if (g_quiet == 0) { io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, ir_path); io.write_str(io.STDOUT, "\n"); }
     }
@@ -1399,6 +1562,7 @@ fn _fork_emit(prog as *u8, dir as *u8, filename as *u8, flen as i32,
             let is i64 as pid = os.linux.fork();
             if (pid == 0) {
                 let is i32 as cst = _emit_dynamic(prog, dir, filename, flen, tp, tl, ntask, root_pp, root_pl, ctr);
+                cg.stats_add(cg.STAT_LARGE_MAPS, om.large_maps);
                 os.linux.exit(cast(i64, cst));   // child exits with its status
             }
             w = w + 1;
@@ -1455,6 +1619,7 @@ fn run_module_objects() as i32 {
     let is *u8 as prog = cast(*u8, prog_ptr);
 
     cgd.set_opt_level(g_opt_level);
+    cgd.prepare_program(prog);
     cg.cg_quiet = 1;
     let is *u8 as dir = cast(*u8, g_module_objects_dir);
 
@@ -1462,6 +1627,20 @@ fn run_module_objects() as i32 {
     // list right here (folds the separate --emit-deps frontend pass that the
     // maker would otherwise run on a cold build).
     mod.emit_deps(_mo_path(dir, "deps", 4, ".txt", 4));
+    // What each of those modules' object is called, line for line: only the compiler
+    // knows, since a stdlib module is named from where the stdlib root ends.
+    let is i64 as ofd = io._open_write(_mo_path(dir, "objects", 7, ".txt", 4));
+    if (ofd >= 0) {
+        let is i32 as di with mut = 0;
+        while (di < mod.dep_count()) {
+            let is *u8 as dp = mod.dep_path(di);
+            let is i32 as dl = mod.dep_len(di);
+            io._write_fd(ofd, sc.get_mod_prefix(dp, dl), cast(i64, sc.get_mod_prefix_len(dp, dl)));
+            io._write_fd(ofd, ".o\n", 3);
+            di = di + 1;
+        }
+        io._close_fd(ofd);
+    }
 
     let is [1024]i64 as task_ptr;
     let is [1024]i32 as task_len;
@@ -1479,6 +1658,37 @@ fn run_module_objects() as i32 {
         io.write_str(io.STDOUT, " objects ("); io.write_int(io.STDOUT, cast(i64, ws)); io.write_str(io.STDOUT, " workers)\n");
     }
     return status;
+}
+
+// <cache>/<16 hex digits of key>.o
+fn _key_path(dir as *u8, key as i64) as *u8 {
+    let is [17]u8 as hex;
+    let is i32 as hi with mut = 15;
+    let is i64 as v with mut = key;
+    while (hi >= 0) {
+        let is i32 as nib = cast(i32, v & 15);
+        if (nib < 10) { hex[hi] = cast(u8, 48 + nib); } else { hex[hi] = cast(u8, 87 + nib); }
+        v = (v >> 4) & 1152921504606846975;
+        hi = hi - 1;
+    }
+    return _mo_path(dir, cast(*u8, &hex), 16, ".o", 2);
+}
+
+// A file that can be an object: a torn or damaged one is simply built again.
+fn _obj_ok(path as *u8) as i32 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0; }
+    let is [64]u8 as hdr;
+    let is i64 as n = io._read_fd(fd, cast(*u8, &hdr), 64);
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._close_fd(fd);
+    if (n < 64 || hdr[0] != cast(u8, 127) || hdr[1] != cast(u8, 69) || hdr[2] != cast(u8, 76) || hdr[3] != cast(u8, 70)) { return 0; }
+    // e_shoff + e_shnum * e_shentsize is where an ELF object ends.
+    let is i64 as shoff = *cast(*i64, cast(i64, &hdr) + 40);
+    let is i64 as shnum = cast(i64, *cast(*u16, cast(i64, &hdr) + 60));
+    let is i64 as shent = cast(i64, *cast(*u16, cast(i64, &hdr) + 58));
+    if (shoff <= 0 || size < shoff + shnum * shent) { return 0; }
+    return 1;
 }
 
 // ── Parallel-by-default executable build ─────────────────────────────
@@ -1501,10 +1711,12 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     // the cheap inline metadata; the workers optimize each function post-inline
     // (snapshot mode). Halves total optimize work and parallelizes it.
     irp.set_defer_optimize(1);
+    if (g_cache_flags == 0 && g_debug_parser == 0 && g_debug_ir == 0) { g_stream = 1; }
     let is i64 as prog_ptr with mut = 0;
     if (compile_frontend(filename, flen, 1, g_cache_flags, cast(*u8, g_cache_dir), &prog_ptr) != 0) { return 1; }
     if (prog_ptr == 0) { io.write_str(io.STDERR, "Error: no program to emit\n"); return 1; }
     let is *u8 as prog = cast(*u8, prog_ptr);
+    irp.reach_from_entry(cast(*ird.IRProgram, prog), sc.get_mod_prefix(filename, flen), sc.get_mod_prefix_len(filename, flen));
 
     cgd.set_opt_level(g_opt_level);
     cg.cg_quiet = g_quiet;
@@ -1516,6 +1728,8 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     // used to do it whole-program) while moving the inline pass — the single
     // largest serial cost — into the parallel fan-out. Deterministic across -j.
     cgd.set_snapshot_inline(1);
+    cgd.prepare_program(prog);
+    cg.stats_add(cg.STAT_TOKENS_LIVE, mod.live_token_bytes());
 
     // Temp dir for per-module .o/.s (removed after linking).
     let is [4096]u8 as dirbuf;
@@ -1530,9 +1744,50 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     let is [1024]i32 as task_len;
     let is i32 as ntask = _build_module_tasks(cast(*i64, &task_ptr), cast(*i32, &task_len), 1024);
 
-    let is i32 as ws = _detect_jobs(ntask + 1);
     let is *u8 as root_pp = sc.get_mod_prefix(filename, flen);
     let is i32 as root_pl = sc.get_mod_prefix_len(filename, flen);
+
+    // --obj-cache: a module whose key has an object there is not emitted again. Index 0
+    // is the root, the rest the tasks; 0 in cached_path means emit into the temp dir only.
+    let is [1025]i64 as cached_path;
+    let is [1025]i32 as cached_hit;
+    mem.memset(cast(*u8, &cached_path), 0, 1025 * 8);
+    mem.memset(cast(*u8, &cached_hit), 0, 1025 * 4);
+    let is [1024]i64 as miss_ptr;
+    let is [1024]i32 as miss_len;
+    let is i32 as nmiss with mut = 0;
+    let is i32 as emit_root_pl with mut = root_pl;
+    if (g_obj_cache != 0 && ird.ir_pack == 1) {
+        cgd.prepare_module_keys(prog);
+        let is i64 as rk = cgd.module_key(prog, root_pp, root_pl);
+        if (rk != 0) {
+            cached_path[0] = cast(i64, _key_path(cast(*u8, g_obj_cache), rk));
+            if (_obj_ok(cast(*u8, cached_path[0])) == 1) { cached_hit[0] = 1; emit_root_pl = 0; }
+        }
+        let is i32 as tk with mut = 0;
+        while (tk < ntask) {
+            let is i64 as mk = cgd.module_key(prog, cast(*u8, task_ptr[tk]), task_len[tk]);
+            if (mk != 0) {
+                cached_path[tk + 1] = cast(i64, _key_path(cast(*u8, g_obj_cache), mk));
+                if (_obj_ok(cast(*u8, cached_path[tk + 1])) == 1) { cached_hit[tk + 1] = 1; }
+            }
+            if (cached_hit[tk + 1] == 0) {
+                miss_ptr[nmiss] = task_ptr[tk];
+                miss_len[nmiss] = task_len[tk];
+                nmiss = nmiss + 1;
+            }
+            tk = tk + 1;
+        }
+    } else {
+        let is i32 as tk with mut = 0;
+        while (tk < ntask) {
+            miss_ptr[tk] = task_ptr[tk];
+            miss_len[tk] = task_len[tk];
+            tk = tk + 1;
+        }
+        nmiss = ntask;
+    }
+    let is i32 as ws = _detect_jobs(nmiss + 1);
 
     // --profile: aggregate the forked workers' per-module codegen/assembler time
     // through a MAP_SHARED accumulator page (set before the fork so children
@@ -1552,7 +1807,10 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
         }
     }
 
-    let is i32 as st = _fork_emit(prog, dir, filename, flen, cast(*i64, &task_ptr), cast(*i32, &task_len), ntask, root_pp, root_pl, ws);
+    let is i32 as st with mut = 0;
+    if (nmiss > 0 || emit_root_pl > 0) {
+        st = _fork_emit(prog, dir, filename, flen, cast(*i64, &miss_ptr), cast(*i32, &miss_len), nmiss, root_pp, emit_root_pl, ws);
+    }
     if (st != 0) { io.write_str(io.STDERR, "Error: parallel emission failed\n"); return 1; }
 
     if (prof.prof_enabled == 1 && prof.emit_acc != 0) {
@@ -1574,11 +1832,29 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
 
     // Collect .o paths (root first) and link into the executable.
     let is [1025]i64 as obj_arr;
-    obj_arr[0] = cast(i64, _mo_path(dir, root_pp, root_pl, ".o", 2));
-    let is i32 as nobj with mut = 1;
-    let is i32 as ti with mut = 0;
+    let is [1025]i32 as obj_temp;
+    let is i32 as nobj with mut = 0;
+    let is i32 as ti with mut = 0 - 1;
     while (ti < ntask) {
-        obj_arr[nobj] = cast(i64, _mo_path(dir, cast(*u8, task_ptr[ti]), task_len[ti], ".o", 2));
+        let is *u8 as tp_ptr with mut = root_pp;
+        let is i32 as tp_len with mut = root_pl;
+        if (ti >= 0) { tp_ptr = cast(*u8, task_ptr[ti]); tp_len = task_len[ti]; }
+        let is *u8 as temp = _mo_path(dir, tp_ptr, tp_len, ".o", 2);
+        let is *u8 as kept = cast(*u8, cached_path[ti + 1]);
+        obj_temp[nobj] = 1;
+        obj_arr[nobj] = cast(i64, temp);
+        if (cached_hit[ti + 1] == 1) {
+            obj_arr[nobj] = cast(i64, kept);
+            obj_temp[nobj] = 0;
+            cg.stats_add(cg.STAT_OBJS_REUSED, 1);
+        } else {
+            cg.stats_add(cg.STAT_OBJS_EMITTED, 1);
+            // Rename is what makes a concurrent build see a whole object or none.
+            if (cast(i64, kept) != 0 && io.rename(temp, kept) == 0) {
+                obj_arr[nobj] = cast(i64, kept);
+                obj_temp[nobj] = 0;
+            }
+        }
         nobj = nobj + 1;
         ti = ti + 1;
     }
@@ -1600,7 +1876,10 @@ fn run_parallel_exe(filename as *u8, flen as i32) as i32 {
     // Cleanup .o, then the temp dir. (No .s files: the in-memory pipeline in
     // _emit_one_obj never writes them.)
     ti = 0;
-    while (ti < nobj) { io.unlink(cast(*u8, obj_arr[ti])); ti = ti + 1; }
+    while (ti < nobj) {
+        if (obj_temp[ti] == 1) { io.unlink(cast(*u8, obj_arr[ti])); }
+        ti = ti + 1;
+    }
     // rmdir has no portable io facade yet; gate the raw syscall so it dead-strips
     // on non-Linux targets (this whole parallel path is Linux-only anyway).
     if (os.current() == os.OS_LINUX) { os.linux.rmdir(dir); }
@@ -2003,6 +2282,7 @@ fn main(argc as i64, argv as i64) as i32 {
         io.write_str(io.STDOUT, "  -g              Emit DWARF debug info (ELF) for gdb/lldb\n");
         io.write_str(io.STDOUT, "  --target=<triple> linux-x86_64, linux-aarch64, windows-x86_64, caustic-x86_64, wasm32-wasi, wasm64-wasi\n");
         io.write_str(io.STDOUT, "  --parallel N    Parallel workers for --module-objects emission\n");
+        io.write_str(io.STDOUT, "  --stats         Print counts of the work done, on stderr\n");
         io.write_str(io.STDOUT, "  -j N            (Linux; default: number of cores)\n");
         io.write_str(io.STDOUT, "  -lname          Link dynamic library\n");
         io.write_str(io.STDOUT, "  --profile       Show per-phase timing\n");
@@ -2060,7 +2340,9 @@ fn main(argc as i64, argv as i64) as i32 {
     // --module-objects: batch separate compilation — one process emits one
     // object per module from a single whole-program frontend.
     if (g_module_objects_dir != 0) {
-        return run_module_objects();
+        let is i32 as orc = run_module_objects();
+        _stats_print();
+        return orc;
     }
 
     // --emit-interface: compile to semantic only
@@ -2087,7 +2369,9 @@ fn main(argc as i64, argv as i64) as i32 {
 
     // Single file, no -o, no --cache: legacy .s output
     if (g_file_count == 1 && g_output_path == 0 && g_cache_dir == 0) {
-        return run_single_file(cast(*u8, g_input_files[0]));
+        let is i32 as src = run_single_file(cast(*u8, g_input_files[0]));
+        _stats_print();
+        return src;
     }
 
     // Parallel-by-default: a single-source executable build forks per-module
@@ -2103,9 +2387,13 @@ fn main(argc as i64, argv as i64) as i32 {
         && tgt.target_get().object_format != 3
         && tgt.target_get().object_format != 4
         && tgt.debug_get() == 0) {
-        return run_parallel_exe(cast(*u8, g_input_files[0]), strlen(cast(*u8, g_input_files[0])));
+        let is i32 as prc = run_parallel_exe(cast(*u8, g_input_files[0]), strlen(cast(*u8, g_input_files[0])));
+        _stats_print();
+        return prc;
     }
 
     // Compile + assemble + link
-    return run_multi_file();
+    let is i32 as mrc = run_multi_file();
+    _stats_print();
+    return mrc;
 }

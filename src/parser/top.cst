@@ -136,6 +136,15 @@ fn parse_fn() as *ast.Node {
             pu.error_expected("expected 'imut', 'naked', 'noinline' or 'section' after 'with' in function declaration");
         }
     }
+    // A template or an imut function is read again after its own turn, by whoever
+    // instantiates or evaluates it, so its body has to outlive the function.
+    if (pu.p_lazy_bodies == 1) {
+        if (fn_node.generic_param_count > 0 || ast.nx_is_imut(fn_node) == 1 || _keep_bodies == 1) {
+            fn_node.body = ps.parse_block();
+            return fn_node;
+        }
+        if (_skip_body(fn_node) == 1) { return fn_node; }
+    }
     // Allocate the function body's nodes from the transient arena (freed after
     // IR-gen). The fn node + params + return type above stay persistent.
     ast.node_transient_begin();
@@ -143,6 +152,69 @@ fn parse_fn() as *ast.Node {
     ast.node_transient_end();
     return fn_node;
 }
+
+// The one placeholder for a body not parsed, or parsed and gone.
+let is *ast.Node as _no_body with mut = cast(*ast.Node, 0);
+
+fn no_body() as *ast.Node {
+    if (cast(i64, _no_body) == 0) { _no_body = ast.new_node(ast.NK_BLOCK); }
+    return _no_body;
+}
+
+// An impl with type parameters makes its methods templates after parse_fn returns.
+let is i32 as _keep_bodies with mut = 0;
+
+// Step over a balanced body. Unbalanced braces leave it to the parser, whose error
+// names the real problem.
+fn _skip_body(fn_node as *ast.Node) as i32 {
+    if (pu.cur().kind != tok.TK_LBRACE) { return 0; }
+    let is i32 as start = pu.p_pos;
+    let is i32 as depth with mut = 0;
+    while (1 == 1) {
+        let is i32 as k = pu.cur().kind;
+        if (k == tok.TK_EOF) { pu.p_pos = start; return 0; }
+        if (k == tok.TK_LBRACE) { depth = depth + 1; }
+        if (k == tok.TK_RBRACE) { depth = depth - 1; }
+        pu.p_pos = pu.p_pos + 1;
+        if (depth == 0) { break; }
+    }
+    ast.node_ensure_extra(fn_node).lazy_tok = start;
+    fn_node.body = no_body();
+    return 1;
+}
+
+// Parse the body _skip_body stepped over, against its own module's tokens.
+fn force_body(fn_node as *ast.Node, tl as *u8, src as *u8, src_len as i64, filename as *u8) as void {
+    let is i32 as at = ast.nx_lazy_tok(fn_node);
+    if (at == 0) { return; }
+    let is *tok.TokenList as s_tl = pu.p_tl;
+    let is i32 as s_pos = pu.p_pos;
+    let is *u8 as s_src = pu.p_src;
+    let is i64 as s_len = pu.p_src_len;
+    let is *u8 as s_fn = pu.p_filename;
+    pu.p_tl = cast(*tok.TokenList, tl);
+    pu.p_pos = at;
+    pu.p_src = src;
+    pu.p_src_len = src_len;
+    pu.p_filename = filename;
+    pu.p_had_error = 0;
+    pu.p_panic_mode = 0;
+    ast.node_transient_begin();
+    fn_node.body = ps.parse_block();
+    ast.node_transient_end();
+    fn_node.extra.lazy_tok = 0;
+    pu.p_tl = s_tl;
+    pu.p_pos = s_pos;
+    pu.p_src = s_src;
+    pu.p_src_len = s_len;
+    pu.p_filename = s_fn;
+    if (pu.p_had_error == 1) {
+        io.write_str(io.STDERR, "compilation aborted due to errors\n");
+        io.exit(1);
+    }
+}
+
+fn set_lazy_bodies(v as i32) as void { pu.p_lazy_bodies = v; }
 
 fn parse_extern_fn() as *ast.Node {
     let is i32 as tidx = pu.p_pos;
@@ -405,7 +477,9 @@ fn parse_impl(first as **ast.Node, last as **ast.Node) as void {
     while (pu.cur().kind != tok.TK_RBRACE && pu.cur().kind != tok.TK_EOF) {
         if (pu.cur().kind != tok.TK_FN) { pu.error_expected("expected 'fn' inside impl block"); }
         if (pu.p_panic_mode == 1) { pu.sync_toplevel(); break; }
+        if (igp_count > 0) { _keep_bodies = 1; }
         let is *ast.Node as fn_node = parse_fn();
+        _keep_bodies = 0;
         let is *u8 as mangled = pu.concat_underscore(type_ptr, type_len, fn_node.name_ptr, fn_node.name_len);
         fn_node.name_ptr = mangled;
         fn_node.name_len = pu.str_len(mangled);

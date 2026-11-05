@@ -237,6 +237,8 @@ struct IRFunction {
     //   1 = VR_XMM (f64, allocated to xmm0…xmm15)
     // Pointer is null until inferred.
     vreg_class as *i32;
+    // The function's pristine IR, packed (func_pack), while instructions is empty.
+    ir_blob as *u8;
     // Stack-usage analysis (computed at codegen, used to declare the CSE stack).
     // sa_frame: exact bytes this call level consumes (return addr + rbp +
     // callee-saved pushes + aligned locals/spills/allocs), recorded by gen_func.
@@ -257,6 +259,10 @@ struct IRFunction {
     // back from the IR cache), 1 void, 2 a value in a register, 3 a struct
     // through a hidden pointer. i64 so `next` stays 8-byte aligned.
     ret_kind as i64;
+    ir_blob_count as i64;     // instructions in ir_blob
+    ir_hash as i64;           // what the IR says, by value (func_value_hash)
+    key_a as i64;             // ir_hash folded with what callers can see of callees
+    key_b as i64;
     next as *IRFunction;
 }
 
@@ -492,6 +498,375 @@ fn op_label(l as i32) as Operand {
 
 // What the IR's allocators hand out, or the end of the compile: none of the
 // callers has anything to do with a null but write through it.
+// === Packed IR ===
+// The IR of a large program is a million instructions of 117 bytes each, and all of it
+// sits read-only in memory from IR generation to emission, shared by every worker, for
+// the sake of the one function each is working on. Packed, an instruction takes around
+// 15 bytes: zero fields are absent, integers are varints. A function is opened when it
+// is emitted or looked at by the inliner, and the opened copies are dropped in batches.
+
+let is i32 as ir_pack with mut = 0;
+let is *u8 as _pk_buf with mut = cast(*u8, 0);
+let is i64 as _pk_cap with mut = 0;
+let is i64 as _pk_len with mut = 0;
+let is *u8 as _blob_chunk with mut = cast(*u8, 0);
+let is i64 as _blob_left with mut = 0;
+let is i64 as BLOB_CHUNK with imut = 1048576;
+
+fn _pk_room(n as i64) as void {
+    if (_pk_len + n <= _pk_cap) { return; }
+    let is i64 as nc with mut = _pk_cap * 2;
+    if (nc < 65536) { nc = 65536; }
+    if (nc < _pk_len + n) { nc = _pk_len + n; }
+    let is *u8 as nb = opt_alloc(nc);
+    if (_pk_len > 0) { mem.core.memcpy(nb, _pk_buf, _pk_len); }
+    if (cast(i64, _pk_buf) != 0) { opt_free(_pk_buf); }
+    _pk_buf = nb;
+    _pk_cap = nc;
+}
+
+fn _pk_u8(v as i32) as void {
+    _pk_buf[_pk_len] = cast(u8, v);
+    _pk_len = _pk_len + 1;
+}
+
+// Unsigned LEB128 of the zigzag of v: small magnitudes of either sign are one byte.
+fn _pk_var(v as i64) as void {
+    let is i64 as u with mut = (v << 1) ^ (v >> 63);
+    while ((u & (0 - 128)) != 0) {
+        _pk_u8(cast(i32, (u & 127) | 128));
+        u = (u >> 7) & 144115188075855871;
+    }
+    _pk_u8(cast(i32, u));
+}
+
+fn _pk_ptr(v as *u8) as void {
+    *cast(*i64, _pk_buf + _pk_len) = cast(i64, v);
+    _pk_len = _pk_len + 8;
+}
+
+fn _pk_operand(o as *Operand) as void {
+    let is i32 as tag with mut = cast(i32, o.op_type);
+    if (o.vreg != 0) { tag = tag | 16; }
+    if (o.imm != 0) { tag = tag | 32; }
+    if (o.label != 0) { tag = tag | 64; }
+    _pk_u8(tag);
+    if (o.vreg != 0) { _pk_var(cast(i64, o.vreg)); }
+    if (o.imm != 0) { _pk_var(o.imm); }
+    if (o.label != 0) { _pk_var(cast(i64, o.label)); }
+}
+
+fn _blob_alloc(n as i64) as *u8 {
+    if (n > BLOB_CHUNK / 4) {
+        let is *u8 as own = mem.core.mmap_anon(n);
+        if (cast(i64, own) == 0 || cast(i64, own) == 0 - 1) { mem.core.oom("the intermediate code", n); }
+        return own;
+    }
+    if (n > _blob_left) {
+        _blob_chunk = mem.core.mmap_anon(BLOB_CHUNK);
+        if (cast(i64, _blob_chunk) == 0 || cast(i64, _blob_chunk) == 0 - 1) { mem.core.oom("the intermediate code", BLOB_CHUNK); }
+        _blob_left = BLOB_CHUNK;
+    }
+    let is *u8 as r = _blob_chunk;
+    _blob_chunk = _blob_chunk + n;
+    _blob_left = _blob_left - n;
+    return r;
+}
+
+// === Strings by id ===
+let is *i64 as _str_tab with mut = cast(*i64, 0);
+let is i32 as _str_tab_cap with mut = 0;
+
+fn str_table_put(id as i32, e as *StringEntry) as void {
+    if (id >= _str_tab_cap) {
+        let is i32 as nc with mut = _str_tab_cap * 2;
+        if (nc < 4096) { nc = 4096; }
+        while (nc <= id) { nc = nc * 2; }
+        let is *i64 as na = cast(*i64, opt_alloc(cast(i64, nc) * 8));
+        let is i32 as k with mut = 0;
+        while (k < _str_tab_cap) { na[k] = _str_tab[k]; k = k + 1; }
+        while (k < nc) { na[k] = 0; k = k + 1; }
+        if (cast(i64, _str_tab) != 0) { opt_free(cast(*u8, _str_tab)); }
+        _str_tab = na;
+        _str_tab_cap = nc;
+    }
+    _str_tab[id] = cast(i64, e);
+}
+
+fn str_entry(id as i32) as *StringEntry {
+    if (id < 0 || id >= _str_tab_cap) { return cast(*StringEntry, 0); }
+    return cast(*StringEntry, _str_tab[id]);
+}
+
+// === What a function's IR says ===
+// By value, so two builds that lower the same source agree whatever their allocators
+// did: names by their bytes, a string by its contents and not its id (which moves when
+// any module before it adds one), a type by its shape. Lines stay out: they reach only
+// debug info, and a comment moving code must not cost an object.
+
+fn hash_mix(h as i64, v as i64) as i64 {
+    let is i64 as m = (h ^ v) * 1099511628211;
+    return m ^ ((m >> 29) & 34359738367);
+}
+
+fn hash_bytes(p as *u8, n as i64) as i64 {
+    let is i64 as h with mut = 0 - 3750763034362895579;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = (h ^ cast(i64, p[i])) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _hash_operand(h as i64, o as *Operand) as i64 {
+    let is i64 as x with mut = hash_mix(h, cast(i64, o.op_type));
+    x = hash_mix(x, cast(i64, o.vreg));
+    x = hash_mix(x, o.imm);
+    return hash_mix(x, cast(i64, o.label));
+}
+
+fn _hash_type(h as i64, ty as *u8, depth as i32) as i64 {
+    if (cast(i64, ty) == 0) { return hash_mix(h, 1); }
+    let is *ast.Type as t = cast(*ast.Type, ty);
+    let is i64 as x with mut = hash_mix(h, cast(i64, t.kind));
+    x = hash_mix(x, cast(i64, t.size));
+    x = hash_mix(x, cast(i64, t.array_len));
+    if (t.name_len > 0 && cast(i64, t.name_ptr) != 0) { x = hash_mix(x, hash_bytes(t.name_ptr, cast(i64, t.name_len))); }
+    if (depth < 2) { x = _hash_type(x, cast(*u8, t.base), depth + 1); }
+    return x;
+}
+
+fn _hash_symbol(h as i64, p as *u8, n as i32) as i64 {
+    if (cast(i64, p) == 0 || n <= 0) { return hash_mix(h, 2); }
+    // A string literal's symbol, .LC<id>.
+    if (n > 3 && p[0] == 46 && p[1] == 76 && p[2] == 67) {
+        let is i32 as sid with mut = 0;
+        let is i32 as ci with mut = 3;
+        while (ci < n) { sid = sid * 10 + cast(i32, p[ci]) - 48; ci = ci + 1; }
+        let is *StringEntry as e = str_entry(sid);
+        if (cast(i64, e) != 0) { return hash_mix(hash_mix(h, 3), hash_bytes(e.ptr, cast(i64, e.len))); }
+    }
+    return hash_mix(h, hash_bytes(p, cast(i64, n)));
+}
+
+fn func_value_hash(f as *IRFunction) as i64 {
+    let is i64 as h with mut = hash_bytes(f.asm_name_ptr, cast(i64, f.asm_name_len));
+    h = hash_mix(h, cast(i64, f.vreg_count));
+    h = hash_mix(h, cast(i64, f.label_count));
+    h = hash_mix(h, cast(i64, f.alloc_stack_size));
+    h = hash_mix(h, cast(i64, f.stack_size));
+    h = hash_mix(h, cast(i64, f.num_args));
+    h = hash_mix(h, cast(i64, f.is_variadic) + cast(i64, f.is_noinline) * 2 + cast(i64, f.is_naked) * 4
+                    + cast(i64, f.has_stack_ops) * 8 + cast(i64, f.has_asm) * 16 + cast(i64, f.is_recursive) * 32);
+    h = hash_mix(h, cast(i64, f.live_inst_count));
+    h = hash_mix(h, f.ret_kind);
+    if (f.fn_section_len > 0) { h = hash_mix(h, hash_bytes(f.fn_section_ptr, cast(i64, f.fn_section_len))); }
+    let is *IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        h = hash_mix(h, cast(i64, i.op) + cast(i64, i.is_dead) * 256 + cast(i64, i.is_variadic_call) * 512
+                        + cast(i64, i.is_extern_call) * 1024 + cast(i64, i.is_extern_global) * 2048
+                        + cast(i64, i.disp_tail_bytes) * 4096);
+        h = _hash_operand(h, &i.dest);
+        h = _hash_operand(h, &i.src1);
+        h = _hash_operand(h, &i.src2);
+        if (i.asm_str_len > 0) { h = hash_mix(h, hash_bytes(i.asm_str_ptr, cast(i64, i.asm_str_len))); }
+        if (i.call_name_len != cast(i16, 0)) { h = _hash_symbol(h, i.call_name_ptr, cast(i32, i.call_name_len)); }
+        if (i.global_name_len != cast(i16, 0)) { h = _hash_symbol(h, i.global_name_ptr, cast(i32, i.global_name_len)); }
+        if (cast(i64, i.cast_to) != 0) { h = _hash_type(h, i.cast_to, 0); }
+        if (cast(i64, i.cast_from) != 0) { h = _hash_type(h, i.cast_from, 0); }
+        i = i.next;
+    }
+    return h;
+}
+
+// Move a function's instructions into its blob.
+fn func_pack(f as *IRFunction) as void {
+    _pk_len = 0;
+    let is i64 as count with mut = 0;
+    let is *IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        _pk_room(256);
+        _pk_u8(cast(i32, i.op));
+        let is i32 as fl with mut = 0;
+        if (i.line != 0) { fl = fl | 1; }
+        if (i.is_dead != cast(i8, 0)) { fl = fl | 2; }
+        if (cast(i64, i.asm_str_ptr) != 0 || i.asm_str_len != 0) { fl = fl | 4; }
+        if (cast(i64, i.call_name_ptr) != 0 || i.call_name_len != cast(i16, 0)) { fl = fl | 8; }
+        if (cast(i64, i.global_name_ptr) != 0 || i.global_name_len != cast(i16, 0)) { fl = fl | 16; }
+        if (cast(i64, i.cast_to) != 0) { fl = fl | 32; }
+        if (cast(i64, i.cast_from) != 0) { fl = fl | 64; }
+        if (i.is_variadic_call != cast(i8, 0) || i.is_extern_call != cast(i8, 0)
+            || i.is_extern_global != cast(i8, 0) || i.disp_tail_bytes != cast(i8, 0)) { fl = fl | 128; }
+        _pk_u8(fl);
+        if ((fl & 128) != 0) {
+            _pk_u8(cast(i32, i.is_variadic_call));
+            _pk_u8(cast(i32, i.is_extern_call));
+            _pk_u8(cast(i32, i.is_extern_global));
+            _pk_u8(cast(i32, i.disp_tail_bytes));
+        }
+        _pk_operand(&i.dest);
+        _pk_operand(&i.src1);
+        _pk_operand(&i.src2);
+        if ((fl & 1) != 0) { _pk_var(cast(i64, i.line)); }
+        if ((fl & 2) != 0) { _pk_u8(cast(i32, i.is_dead)); }
+        if ((fl & 4) != 0) { _pk_ptr(i.asm_str_ptr); _pk_var(cast(i64, i.asm_str_len)); }
+        if ((fl & 8) != 0) { _pk_ptr(i.call_name_ptr); _pk_var(cast(i64, i.call_name_len)); }
+        if ((fl & 16) != 0) { _pk_ptr(i.global_name_ptr); _pk_var(cast(i64, i.global_name_len)); }
+        if ((fl & 32) != 0) { _pk_ptr(i.cast_to); }
+        if ((fl & 64) != 0) { _pk_ptr(i.cast_from); }
+        count = count + 1;
+        i = i.next;
+    }
+    free_func_insts(f);
+    f.ir_blob_count = count;
+    if (_pk_len == 0) { f.ir_blob = cast(*u8, 0); return; }
+    f.ir_blob = _blob_alloc(_pk_len);
+    mem.core.memcpy(f.ir_blob, _pk_buf, _pk_len);
+}
+
+let is *u8 as _upk with mut = cast(*u8, 0);
+
+fn _upk_u8() as i32 {
+    let is i32 as v = cast(i32, _upk[0]);
+    _upk = _upk + 1;
+    return v;
+}
+
+fn _upk_var() as i64 {
+    let is i64 as u with mut = 0;
+    let is i64 as sh with mut = 0;
+    while (1 == 1) {
+        let is i64 as b = cast(i64, _upk[0]);
+        _upk = _upk + 1;
+        u = u | ((b & 127) << sh);
+        if ((b & 128) == 0) { break; }
+        sh = sh + 7;
+    }
+    let is i64 as half = (u >> 1) & 9223372036854775807;
+    return half ^ (0 - (u & 1));
+}
+
+fn _upk_ptr() as *u8 {
+    let is i64 as v = *cast(*i64, _upk);
+    _upk = _upk + 8;
+    return cast(*u8, v);
+}
+
+fn _upk_operand(o as *Operand) as void {
+    let is i32 as tag = _upk_u8();
+    o.op_type = cast(i8, tag & 15);
+    if ((tag & 16) != 0) { o.vreg = cast(i32, _upk_var()); }
+    if ((tag & 32) != 0) { o.imm = _upk_var(); }
+    if ((tag & 64) != 0) { o.label = cast(i32, _upk_var()); }
+}
+
+// A fresh instruction list out of a function's blob.
+fn func_unpack(f as *IRFunction) as *IRInst { return _unpack_into(f, &_inst_pool); }
+
+fn _unpack_into(f as *IRFunction, pool as *mem.pool.Pool) as *IRInst {
+    let is *IRInst as head with mut = cast(*IRInst, 0);
+    let is *IRInst as tail with mut = cast(*IRInst, 0);
+    _upk = f.ir_blob;
+    let is i64 as n with mut = f.ir_blob_count;
+    while (n > 0) {
+        let is *IRInst as i = cast(*IRInst, _ir_take(mem.pool.alloc(pool), sizeof(IRInst)));
+        memzero(cast(*u8, i), sizeof(IRInst));
+        i.op = cast(i8, _upk_u8());
+        let is i32 as fl = _upk_u8();
+        if ((fl & 128) != 0) {
+            i.is_variadic_call = cast(i8, _upk_u8());
+            i.is_extern_call = cast(i8, _upk_u8());
+            i.is_extern_global = cast(i8, _upk_u8());
+            i.disp_tail_bytes = cast(i8, _upk_u8());
+        }
+        _upk_operand(&i.dest);
+        _upk_operand(&i.src1);
+        _upk_operand(&i.src2);
+        if ((fl & 1) != 0) { i.line = cast(i32, _upk_var()); }
+        if ((fl & 2) != 0) { i.is_dead = cast(i8, _upk_u8()); }
+        if ((fl & 4) != 0) { i.asm_str_ptr = _upk_ptr(); i.asm_str_len = cast(i32, _upk_var()); }
+        if ((fl & 8) != 0) { i.call_name_ptr = _upk_ptr(); i.call_name_len = cast(i16, _upk_var()); }
+        if ((fl & 16) != 0) { i.global_name_ptr = _upk_ptr(); i.global_name_len = cast(i16, _upk_var()); }
+        if ((fl & 32) != 0) { i.cast_to = _upk_ptr(); }
+        if ((fl & 64) != 0) { i.cast_from = _upk_ptr(); }
+        if (cast(i64, tail) == 0) { head = i; } else { tail.next = i; }
+        tail = i;
+        n = n - 1;
+    }
+    return head;
+}
+
+fn free_inst_list(head as *IRInst) as void {
+    let is *IRInst as i with mut = head;
+    while (cast(i64, i) != 0) {
+        let is *IRInst as nx = i.next;
+        mem.pool.free(&_inst_pool, cast(*u8, i));
+        i = nx;
+    }
+}
+
+// Opened functions: f.instructions holds the pristine body until func_close_opened,
+// in a pool of their own, so the working pool can be emptied after every function.
+let is mem.pool.Pool as _open_pool with mut;
+let is i32 as _open_pool_ready with mut = 0;
+let is *i64 as _opened with mut = cast(*i64, 0);
+let is i32 as _opened_cap with mut = 0;
+let is i32 as _opened_n with mut = 0;
+let is i64 as _opened_insts with mut = 0;
+let is i64 as OPEN_KEEP_INSTS with imut = 4096;
+
+fn func_close_opened() as void {
+    let is i32 as k with mut = 0;
+    while (k < _opened_n) {
+        let is *IRFunction as f = cast(*IRFunction, _opened[k]);
+        f.instructions = cast(*IRInst, 0);
+        k = k + 1;
+    }
+    _opened_n = 0;
+    _opened_insts = 0;
+    if (_open_pool_ready == 1) {
+        _open_pool.freelist = cast(*u8, 0);
+        _open_pool.high_water = 0;
+        _open_pool.used_slots = 0;
+    }
+}
+
+fn func_open(f as *IRFunction) as void {
+    if (cast(i64, f) == 0 || cast(i64, f.instructions) != 0 || f.ir_blob_count == 0) { return; }
+    if (_open_pool_ready == 0) {
+        _open_pool = mem.pool.create(sizeof(IRInst), 16777216, 0);
+        _open_pool_ready = 1;
+    }
+    if (_opened_n >= _opened_cap) {
+        let is i32 as nc with mut = _opened_cap * 2;
+        if (nc < 1024) { nc = 1024; }
+        let is *i64 as na = cast(*i64, opt_alloc(cast(i64, nc) * 8));
+        let is i32 as k with mut = 0;
+        while (k < _opened_n) { na[k] = _opened[k]; k = k + 1; }
+        if (cast(i64, _opened) != 0) { opt_free(cast(*u8, _opened)); }
+        _opened = na;
+        _opened_cap = nc;
+    }
+    _opened[_opened_n] = cast(i64, f);
+    _opened_n = _opened_n + 1;
+    _opened_insts = _opened_insts + f.ir_blob_count;
+    f.instructions = _unpack_into(f, &_open_pool);
+}
+
+// Between functions, when no list is in use.
+fn func_trim_opened() as void {
+    if (_opened_insts > OPEN_KEEP_INSTS) { func_close_opened(); }
+}
+
+// Everything in the working pool is one function's: clones, what the passes made of
+// them, and the instructions they dropped along the way without giving them back.
+fn inst_pool_reset() as void {
+    _inst_pool.freelist = cast(*u8, 0);
+    _inst_pool.high_water = 0;
+    _inst_pool.used_slots = 0;
+}
+
 fn _ir_take(p as *u8, size as i64) as *u8 {
     if (cast(i64, p) == 0) { mem.core.oom("the intermediate code", size); }
     return p;

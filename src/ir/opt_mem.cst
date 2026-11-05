@@ -9,6 +9,26 @@ let is i32 as _opt_ready with mut = 0;
 // bytes 8-15: size (for mmap munmap)
 let is i64 as HDR with imut = 16;
 
+// Blocks past the bins' limit are working arrays that a pass takes and gives back for
+// every function: 188 000 mmap/munmap pairs and 7 million page faults on a large
+// program at -O2, a third of the CPU of the whole build. A few of them are kept, per
+// process, by power-of-two size. A mapping comes back zeroed and passes count on it
+// (a vectorizer table left unzeroed breaks register budgets), so a reused block is
+// zeroed up to what was asked for, and no further: the rest stays untouched pages.
+let is i64 as LARGE_MIN with imut = 131072;
+let is i64 as LARGE_MAX with imut = 8388608;
+let is i64 as LARGE_KEEP with imut = 2097152;
+let is [8]i64 as _large_free with mut;
+let is i64 as _large_kept with mut = 0;
+let is i64 as large_maps with mut = 0;       // real mappings made here (--stats)
+
+fn _large_class(total as i64) as i32 {
+    let is i32 as cl with mut = 0;
+    let is i64 as cs with mut = LARGE_MIN;
+    while (cs < total) { cs = cs * 2; cl = cl + 1; }
+    return cl;
+}
+
 fn opt_bins_init() as void {
     if (_opt_ready == 0) {
         _opt_bins = bins.bins_new(131072);
@@ -23,12 +43,49 @@ fn opt_bins_destroy() as void {
     }
 }
 
+// For what lives until the process ends and is never freed: declarations, types,
+// symbols. The bins round a 251-byte node plus its header up to 384, and there are
+// hundreds of thousands of these. Handed out zeroed, 8-aligned, with no header, so
+// nothing from here may reach opt_free.
+let is *u8 as _perm_chunk with mut = cast(*u8, 0);
+let is i64 as _perm_left with mut = 0;
+let is i64 as PERM_CHUNK with imut = 1048576;
+
+fn perm_alloc(size as i64) as *u8 {
+    let is i64 as n = (size + 7) & (0 - 8);
+    if (n > PERM_CHUNK / 8) { return core.mmap_anon(n); }
+    if (n > _perm_left) {
+        _perm_chunk = core.mmap_anon(PERM_CHUNK);
+        if (cast(i64, _perm_chunk) == 0 || cast(i64, _perm_chunk) < 0) { core.oom("the compiler's working memory", PERM_CHUNK); }
+        _perm_left = PERM_CHUNK;
+    }
+    let is *u8 as r = _perm_chunk;
+    _perm_chunk = cast(*u8, cast(i64, _perm_chunk) + n);
+    _perm_left = _perm_left - n;
+    return r;
+}
+
 fn opt_alloc(size as i64) as *u8 {
     if (_opt_ready == 0) { opt_bins_init(); }
     if (size > 65520) {
-        // mmap path: alloc size + HDR, store tag + size
-        let is i64 as total = size + HDR;
-        let is *u8 as raw = core.mmap_anon(total);
+        // Large path: alloc size + HDR, store tag + size
+        let is i64 as total with mut = size + HDR;
+        let is *u8 as raw with mut = cast(*u8, 0);
+        if (total <= LARGE_MAX) {
+            let is i32 as cl = _large_class(total);
+            total = LARGE_MIN << cast(i64, cl);
+            let is *i64 as heads = cast(*i64, &_large_free);
+            if (heads[cl] != 0) {
+                raw = cast(*u8, heads[cl]);
+                heads[cl] = *cast(*i64, cast(i64, raw) + 8);
+                _large_kept = _large_kept - total;
+                core.memzero(raw, size + HDR);
+            }
+        }
+        if (cast(i64, raw) == 0) {
+            raw = core.mmap_anon(total);
+            large_maps = large_maps + 1;
+        }
         if (cast(i64, raw) == 0 || cast(i64, raw) < 0) { core.oom("the compiler's working memory", total); }
         let is *i64 as tag = cast(*i64, raw);
         *tag = 1;
@@ -50,7 +107,16 @@ fn opt_free(ptr as *u8) as void {
     let is *i64 as tag = cast(*i64, raw);
     if (*tag == 1) {
         let is *i64 as sp = cast(*i64, cast(i64, raw) + 8);
-        core.munmap(raw, *sp);
+        let is i64 as total = *sp;
+        if (total <= LARGE_MAX && _large_kept + total <= LARGE_KEEP) {
+            let is i32 as cl = _large_class(total);
+            let is *i64 as heads = cast(*i64, &_large_free);
+            *sp = heads[cl];
+            heads[cl] = cast(i64, raw);
+            _large_kept = _large_kept + total;
+        } else {
+            core.munmap(raw, total);
+        }
     } else {
         bins.bins_free(&_opt_bins, raw);
     }

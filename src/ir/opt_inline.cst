@@ -199,7 +199,7 @@ fn _name_hash(p as *u8, n as i32) as i64 {
     return cast(i64, h >> 1);
 }
 
-fn _lookup(p as *u8, n as i32) as *d.IRFunction {
+fn _lookup_raw(p as *u8, n as i32) as *d.IRFunction {
     if (_ntab_cap == 0) { return cast(*d.IRFunction, 0); }
     let is i64 as i with mut = _name_hash(p, n) & (_ntab_cap - 1);
     while (_ntab[i] != 0) {
@@ -208,6 +208,13 @@ fn _lookup(p as *u8, n as i32) as *d.IRFunction {
         i = (i + 1) & (_ntab_cap - 1);
     }
     return cast(*d.IRFunction, 0);
+}
+
+// A function whose body is about to be read.
+fn _lookup(p as *u8, n as i32) as *d.IRFunction {
+    let is *d.IRFunction as f = _lookup_raw(p, n);
+    d.func_open(f);
+    return f;
 }
 
 fn _ensure_tables(prog as *u8) as void {
@@ -227,7 +234,7 @@ fn _ensure_tables(prog as *u8) as void {
     // First record of a name wins, as the linear lookup it replaces did.
     f = p.functions;
     while (cast(i64, f) != 0) {
-        if (f.asm_name_len > 0 && cast(i64, _lookup(f.asm_name_ptr, f.asm_name_len)) == 0) {
+        if (f.asm_name_len > 0 && cast(i64, _lookup_raw(f.asm_name_ptr, f.asm_name_len)) == 0) {
             let is i64 as j with mut = _name_hash(f.asm_name_ptr, f.asm_name_len) & (cap - 1);
             while (_ntab[j] != 0) { j = (j + 1) & (cap - 1); }
             _ntab[j] = cast(i64, f);
@@ -249,7 +256,7 @@ fn _ensure_tables(prog as *u8) as void {
             while (k < f.call_target_count) {
                 let is *i64 as pp = cast(*i64, cast(i64, f.call_targets) + cast(i64, k) * 12);
                 let is *i32 as pl = cast(*i32, cast(i64, f.call_targets) + cast(i64, k) * 12 + 8);
-                let is *d.IRFunction as t = _lookup(cast(*u8, *pp), *pl);
+                let is *d.IRFunction as t = _lookup_raw(cast(*u8, *pp), *pl);
                 if (cast(i64, t) != 0) { _pm_put(&_refs, cast(i64, t), _pm_get(&_refs, cast(i64, t)) + 1); }
                 k = k + 1;
             }
@@ -258,8 +265,21 @@ fn _ensure_tables(prog as *u8) as void {
     }
     // Read off the bodies as they are now, before any copy changes one.
     f = p.functions;
-    while (cast(i64, f) != 0) { _noreturn(f); f = f.next; }
+    while (cast(i64, f) != 0) {
+        _noreturn(f);
+        d.func_trim_opened();
+        f = f.next;
+    }
+    d.func_close_opened();
 }
+
+// What the inliner sees of a function besides its body, for the object cache.
+fn refs_of(f as *d.IRFunction) as i64 { return _pm_get(&_refs, cast(i64, f)); }
+fn noreturn_of(f as *d.IRFunction) as i64 { return _pm_get(&_nr_memo, cast(i64, f)); }
+fn lookup_quiet(p as *u8, n as i32) as *d.IRFunction { return _lookup_raw(p, n); }
+
+// Before a fork: the workers inherit the tables instead of each building them.
+fn prepare_tables(prog as *u8) as void { _ensure_tables(prog); }
 
 // === Callee size estimate ===
 
@@ -398,9 +418,11 @@ fn _name_ends(f as *d.IRFunction, s as *u8, n as i32) as i32 {
 }
 
 fn _noreturn(f as *d.IRFunction) as i32 {
-    if (cast(i64, f) == 0 || cast(i64, f.instructions) == 0 || f.is_naked != 0) { return 0; }
+    if (cast(i64, f) == 0 || f.is_naked != 0) { return 0; }
     let is i64 as m = _pm_get(&_nr_memo, cast(i64, f));
     if (m != 0) { return cast(i32, m - 1); }
+    d.func_open(f);
+    if (cast(i64, f.instructions) == 0) { return 0; }
     _pm_put(&_nr_memo, cast(i64, f), 1);            // a cycle proves nothing
     let is i32 as r with mut = 0;
     // std/os/linux.cst's exit wrappers: their one syscall does not come back
@@ -626,7 +648,10 @@ fn forget(f as *d.IRFunction) as void {
 fn _src_of(f as *d.IRFunction) as *d.IRFunction {
     if (_raw_bodies == 0 || cast(i64, _optimize_cb) == 0) { return f; }
     let is i64 as sh = _pm_get(&_shadow, cast(i64, f));
-    if (sh != 0) { return cast(*d.IRFunction, sh); }
+    if (sh != 0) {
+        d.func_open(cast(*d.IRFunction, sh));
+        return cast(*d.IRFunction, sh);
+    }
     let is *d.IRFunction as c = d.new_irfunc();
     core.memcpy(cast(*u8, c), cast(*u8, f), sizeof(d.IRFunction));
     c.next = cast(*d.IRFunction, 0);
@@ -634,6 +659,11 @@ fn _src_of(f as *d.IRFunction) as *d.IRFunction {
     c.instructions = d.clone_insts(f.instructions);
     call(_optimize_cb, cast(*u8, c));
     _pm_put(&_shadow, cast(i64, f), cast(i64, c));
+    // Kept for every later caller in this process, so it goes in packed as well.
+    if (d.ir_pack == 1) {
+        d.func_pack(c);
+        d.func_open(c);
+    }
     return c;
 }
 

@@ -180,14 +180,19 @@ fn _reach_build_index(prog as *d.IRProgram) as void {
     _reach_index_ready = 1;
 }
 
+// Bumped whenever a function or global turns reachable: the walk over the globals'
+// initializers repeats until a pass adds nothing.
+let is i64 as _reach_marks with mut = 0;
+
 fn _reach_global_by_name(tname as *u8, tlen as i32) as void {
     let is i32 as b = _reach_hash(tname, tlen);
     let is i32 as ix with mut = _reach_gl_buckets[b];
     while (ix >= 0) {
         let is *i64 as pp = cast(*i64, cast(i64, _reach_gl_ptrs) + cast(i64, ix) * 8);
         let is *d.IRGlobal as gg = cast(*d.IRGlobal, *pp);
-        if (d.str_eq(gg.name_ptr, gg.name_len, tname, tlen) == 1) {
+        if (d.str_eq(gg.name_ptr, gg.name_len, tname, tlen) == 1 && gg.is_reachable == 0) {
             gg.is_reachable = 1;
+            _reach_marks = _reach_marks + 1;
         }
         let is *i32 as np = cast(*i32, cast(i64, _reach_gl_next) + cast(i64, ix) * 4);
         ix = *np;
@@ -296,10 +301,52 @@ fn _reach_sincos(prog as *d.IRProgram) as void {
     }
 }
 
+// Inline asm names symbols in its text, where no call instruction shows them. Every
+// word that could be a symbol is looked up; a word that names nothing marks nothing.
+fn _reach_asm(prog as *d.IRProgram, inst as *d.IRInst) as void {
+    let is *u8 as s = inst.asm_str_ptr;
+    let is i32 as n = inst.asm_str_len;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is i32 as st = i;
+        while (i < n && (s[i] == cast(u8, 95) || s[i] == cast(u8, 46) || s[i] == cast(u8, 36)
+                || (s[i] >= cast(u8, 48) && s[i] <= cast(u8, 57))
+                || (s[i] >= cast(u8, 65) && s[i] <= cast(u8, 90))
+                || (s[i] >= cast(u8, 97) && s[i] <= cast(u8, 122)))) {
+            i = i + 1;
+        }
+        if (i > st) { _reach_by_name(prog, cast(*u8, cast(i64, s) + cast(i64, st)), i - st); }
+        else { i = i + 1; }
+    }
+}
+
 fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
     if (cast(i64, func) == 0) { return; }
     if (func.is_reachable == 1) { return; }
     func.is_reachable = 1;
+    _reach_marks = _reach_marks + 1;
+
+    if (func.ir_blob_count > 0 && cast(i64, func.instructions) == 0) {
+        // Packed: the targets were cached before packing, and the list is opened only
+        // for inline asm.
+        if (func.has_asm != 0) {
+            let is *d.IRInst as hd = d.func_unpack(func);
+            let is *d.IRInst as pi with mut = hd;
+            while (cast(i64, pi) != 0) {
+                if (pi.op == d.IR_ASM) { _reach_asm(prog, pi); }
+                pi = pi.next;
+            }
+            d.free_inst_list(hd);
+        }
+        let is i32 as pc with mut = 0;
+        while (pc < func.call_target_count) {
+            let is *i64 as ppk = cast(*i64, cast(i64, func.call_targets) + cast(i64, pc) * 12);
+            let is *i32 as plk = cast(*i32, cast(i64, func.call_targets) + cast(i64, pc) * 12 + 8);
+            _reach_by_name(prog, cast(*u8, *ppk), *plk);
+            pc = pc + 1;
+        }
+        return;
+    }
 
     // Use cached call targets if instructions were freed
     if (func.call_target_count > 0 && cast(i64, func.call_targets) != 0) {
@@ -309,6 +356,11 @@ fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
             let is *i32 as pl = cast(*i32, cast(i64, func.call_targets) + cast(i64, ci) * 12 + 8);
             _reach_by_name(prog, cast(*u8, *pp), *pl);
             ci = ci + 1;
+        }
+        let is *d.IRInst as ai with mut = func.instructions;
+        while (cast(i64, ai) != 0) {
+            if (ai.op == d.IR_ASM) { _reach_asm(prog, ai); }
+            ai = ai.next;
         }
         return;
     }
@@ -325,8 +377,74 @@ fn mark_reachable(prog as *d.IRProgram, func as *d.IRFunction) as void {
         if (inst.op == d.IR_ADDR_GLOBAL && inst.global_name_len > 0) {
             _reach_global_by_name(inst.global_name_ptr, inst.global_name_len);
         }
+        if (inst.op == d.IR_ASM) { _reach_asm(prog, inst); }
         inst = inst.next;
     }
+}
+
+// What keeps code alive other than being called from main. Repeats, since a function
+// reached through one global's initializer can name the next global.
+fn _reach_roots(prog as *d.IRProgram) as void {
+    // A section is there for a side effect: the named section in the output.
+    let is *d.IRGlobal as sg with mut = prog.globals;
+    while (cast(i64, sg) != 0) {
+        if (sg.section_len > 0 && sg.is_reachable == 0) {
+            sg.is_reachable = 1;
+            _reach_marks = _reach_marks + 1;
+        }
+        sg = sg.next;
+    }
+    let is *d.IRFunction as sf with mut = prog.functions;
+    while (cast(i64, sf) != 0) {
+        if (sf.fn_section_len > 0) { mark_reachable(prog, sf); }
+        sf = sf.next;
+    }
+    let is i64 as before with mut = _reach_marks - 1;
+    while (before != _reach_marks) {
+        before = _reach_marks;
+        let is *d.IRGlobal as fg with mut = prog.globals;
+        while (cast(i64, fg) != 0) {
+            if (fg.is_reachable == 1 && fg.is_fn_ptr_init == 1) {
+                _reach_by_name(prog, fg.init_fn_name_ptr, fg.init_fn_name_len);
+            }
+            if (fg.is_reachable == 1 && fg.is_struct_lit_init == 1) {
+                let is *ast.Node as lit = cast(*ast.Node, fg.struct_lit_ast);
+                let is *ast.Node as e with mut = lit.args;
+                while (cast(i64, e) != 0) {
+                    if (cast(i64, e.expr) != 0 && e.expr.kind == ast.NK_FN_PTR) {
+                        _reach_by_name(prog, e.expr.name_ptr, e.expr.name_len);
+                    }
+                    e = e.next;
+                }
+            }
+            fg = fg.next;
+        }
+        // -O2 turns sin(v) and cos(v) into one call of math.sincos
+        // (opt_sincos.cst): keep it when both are kept.
+        if (d.ir_opt_level >= 2) { _reach_sincos(prog); }
+    }
+}
+
+// The per-module path names main `<root prefix>_main`, which gen_ir does not know
+// for main and so left every function reachable, to be compiled and then dropped by
+// the linker: a third of a large program's functions. No such function (the root has
+// no main) leaves them all reachable, as a library needs.
+fn reach_from_entry(prog as *d.IRProgram, prefix as *u8, plen as i32) as void {
+    let is *d.IRFunction as root with mut = cast(*d.IRFunction, 0);
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) {
+        if (f.asm_name_len == plen + 5 && d.str_eq(f.asm_name_ptr, plen, prefix, plen) == 1
+            && d.str_eq(f.asm_name_ptr + cast(i64, plen), 5, "_main", 5) == 1) { root = f; }
+        f = f.next;
+    }
+    if (cast(i64, root) == 0) { return; }
+    f = prog.functions;
+    while (cast(i64, f) != 0) { f.is_reachable = 0; f = f.next; }
+    let is *d.IRGlobal as gv with mut = prog.globals;
+    while (cast(i64, gv) != 0) { gv.is_reachable = 0; gv = gv.next; }
+    _reach_build_index(prog);
+    mark_reachable(prog, root);
+    _reach_roots(prog);
 }
 
 fn get_string_head() as *u8 { return cast(*u8, g.string_head); }
@@ -471,6 +589,166 @@ fn regen_func_ir(func as *d.IRFunction) as void {
 
 // === gen_ir entry ===
 
+// One function's IR, with what the inliner wants to know about it.
+fn _gen_fn(node as *ast.Node) as *d.IRFunction {
+    // Reset context
+    g.ctx_head = cast(*d.IRInst, 0);
+    g.ctx_tail = cast(*d.IRInst, 0);
+    g.ctx_vreg = 0;
+    g.ctx_loop_depth = 0;
+    g.ctx_has_sret = 0;
+    g.ctx_has_returned = 0;
+    g.defer_count = 0;
+
+    let is *d.IRFunction as func = d.new_irfunc();
+    if (node.asm_name_len > 0) {
+        func.name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+        func.name_len = node.asm_name_len;
+        func.asm_name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
+        func.asm_name_len = node.asm_name_len;
+    } else {
+        func.name_ptr = d.str_dup(node.name_ptr, node.name_len);
+        func.name_len = node.name_len;
+        func.asm_name_ptr = d.str_dup(node.name_ptr, node.name_len);
+        func.asm_name_len = node.name_len;
+    }
+    func.is_variadic = node.is_variadic;
+    func.is_naked = ast.nx_is_naked(node);
+    func.is_noinline = ast.nx_is_noinline(node);
+    // `with section(".name")` — same annotation globals use.
+    func.fn_section_len = ast.nx_section_len(node);
+    if (func.fn_section_len > 0) {
+        func.fn_section_ptr = d.str_dup(ast.nx_section_ptr(node), func.fn_section_len);
+    }
+
+    let is i32 as param_count with mut = 0;
+    let is *ast.Node as p with mut = node.params;
+    while (cast(i64, p) != 0) { param_count = param_count + 1; p = p.next; }
+
+    g.ctx_func = func;
+    func.ret_kind = _ret_kind(node);
+    g.set_ret_float(node.return_type);
+
+    if (node.body.kind == ast.NK_BLOCK && func.is_naked == 1) {
+        // Naked: NO parameter materialization (the asm body reads args
+        // straight from rdi/rsi/...; there is no frame to store them
+        // in — rbp is unset). NO implicit return value. Just the body;
+        // a bare IR_RET that codegen drops (the asm terminates itself).
+        func.num_args = param_count;
+        gs.gen_stmt(node.body.stmts);
+        g.emit_return(cast(i32, 0 - 1), 0);
+    }
+    else if (node.body.kind == ast.NK_BLOCK) {
+        let is i32 as arg_idx with mut = 0;
+        // SRET check — hidden first arg for struct return > 8 bytes
+        if (cast(i64, node.return_type) != 0 && node.return_type.size > 8) {
+            g.ctx_has_sret = 1;
+            g.ctx_sret_vreg = g.emit_get_arg(arg_idx, g.tok_line(node.tok_idx));
+            arg_idx = arg_idx + 1;
+            param_count = param_count + 1;
+        }
+    func.num_args = param_count;
+        // Get ALL args first (before any COPY that clobbers regs)
+        let is i64 as avf_bytes with mut = cast(i64, func.num_args) * 4;
+        if (avf_bytes < 8) { avf_bytes = 8; }
+        let is *i32 as arg_vregs_fn = cast(*i32, d.opt_alloc(avf_bytes));
+        let is *i32 as pcodes_fn = _param_codes(node, g.ctx_has_sret, func.num_args);
+        let is i32 as arg_vi with mut = 0;
+        p = node.params;
+        while (cast(i64, p) != 0) {
+            arg_vregs_fn[arg_vi] = _param_get_arg(pcodes_fn, arg_idx, g.tok_line(p.tok_idx));
+            _param_type(p.ty);
+            arg_vi = arg_vi + 1;
+            arg_idx = arg_idx + 1;
+            p = p.next;
+        }
+        if (cast(i64, pcodes_fn) != 0) { d.opt_free(cast(*u8, pcodes_fn)); }
+        // Now store/copy args to local vars
+        arg_vi = 0;
+        p = node.params;
+        while (cast(i64, p) != 0) {
+            let is i32 as av = arg_vregs_fn[arg_vi];
+            let is *ast.Type as pty = p.ty;
+            if (cast(i64, pty) != 0 && pty.size > 8) {
+                // Struct param passed by pointer — copy to local stack
+                let is i32 as da = g.new_vreg();
+                let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
+                ai.dest = d.op_vreg(da);
+                ai.src1 = d.op_imm(cast(i64, p.var_offset));
+                ai.line = g.tok_line(p.tok_idx);
+                g.emit(ai);
+                let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
+                cp.dest = d.op_vreg(da);
+                cp.src1 = d.op_vreg(av);
+                cp.src2 = d.op_imm(cast(i64, pty.size));
+                cp.line = g.tok_line(p.tok_idx);
+                g.emit(cp);
+            } else {
+                let is *d.IRInst as si = d.new_inst(d.IR_STORE);
+                si.dest = d.op_imm(cast(i64, p.var_offset));
+                si.src1 = d.op_vreg(av);
+                si.cast_to = cast(*u8, p.ty);
+                si.line = g.tok_line(p.tok_idx);
+                g.emit(si);
+            }
+            arg_vi = arg_vi + 1;
+            p = p.next;
+        }
+        d.opt_free(cast(*u8, arg_vregs_fn));
+        gs.gen_stmt(node.body.stmts);
+        ge.emit_deferred_calls();
+        // Implicit return
+        let is i32 as zero = g.emit_imm(0, 0);
+        g.emit_return(zero, 0);
+    }
+
+    func.instructions = g.ctx_head;
+    func.vreg_count = g.ctx_vreg;
+    func.label_count = g.ctx_label;
+    func.stack_size = node.stack_size;
+    func.ast_node = cast(*u8, node);
+
+    // Per-function Phase 1: optimize + cache call targets. We KEEP
+    // every function's IR resident through codegen instead of freeing
+    // non-inline functions here and regenerating them from the AST at
+    // codegen time. That regen (regen_func_ir) is the ONLY reason the
+    // whole function-body AST had to stay live through codegen; with
+    // it gone, the body AST can be freed right after IR-gen. Keeping
+    // the IR costs a few MB; the freed body AST saves ~100MB.
+    if (d.ir_opt_level >= 1 && cast(i64, func.instructions) != 0) {
+        // Deferred-optimize (parallel-exe): skip the heavy per-function
+        // optimize here and let each worker do it post-inline (it does
+        // anyway), halving total optimize work and moving it off the
+        // serial frontend. Still compute the cheap inline-decision
+        // metadata so cross-module inlining fires in the workers.
+        if (g_defer_optimize == 1) {
+            opt.compute_inline_meta(func);
+        } else {
+            opt.optimize_func(func);
+        }
+        cache_call_targets(func);
+    }
+
+    return func;
+}
+
+// The streaming build's way in: lower a function now, for gen_ir to link later.
+fn gen_stream_fn(node_p as *u8) as void {
+    let is *ast.Node as node = cast(*ast.Node, node_p);
+    if (node.generic_param_count > 0 || cast(i64, node.body) == 0) { return; }
+    if (cast(i64, ast.nx_ir_func(node)) != 0) { return; }
+    let is *d.IRFunction as func = _gen_fn(node);
+    func.ast_node = cast(*u8, 0);
+    ast.node_ensure_extra(node).ir_func = cast(*u8, func);
+    if (d.ir_pack == 1) {
+        // What reachability will want, while the list is here: -O0 caches none of it.
+        if (func.call_target_count == 0) { cache_call_targets(func); }
+        func.has_asm = opt.inline_has_asm_of(func);
+        func.ir_hash = d.func_value_hash(func);
+        d.func_pack(func);
+    }
+}
+
 fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
     d.ir_alloc_init();
     g.ir_depth = g.ir_depth + 1;
@@ -543,122 +821,8 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
             // Skip extern / no body
             else if (cast(i64, node.body) == 0) { node = node.next; }
             else {
-                // Reset context
-                g.ctx_head = cast(*d.IRInst, 0);
-                g.ctx_tail = cast(*d.IRInst, 0);
-                g.ctx_vreg = 0;
-                g.ctx_loop_depth = 0;
-                g.ctx_has_sret = 0;
-                g.ctx_has_returned = 0;
-                g.defer_count = 0;
-
-                let is *d.IRFunction as func = d.new_irfunc();
-                if (node.asm_name_len > 0) {
-                    func.name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
-                    func.name_len = node.asm_name_len;
-                    func.asm_name_ptr = d.str_dup(node.asm_name_ptr, node.asm_name_len);
-                    func.asm_name_len = node.asm_name_len;
-                } else {
-                    func.name_ptr = d.str_dup(node.name_ptr, node.name_len);
-                    func.name_len = node.name_len;
-                    func.asm_name_ptr = d.str_dup(node.name_ptr, node.name_len);
-                    func.asm_name_len = node.name_len;
-                }
-                func.is_variadic = node.is_variadic;
-                func.is_naked = ast.nx_is_naked(node);
-                func.is_noinline = ast.nx_is_noinline(node);
-                // `with section(".name")` — same annotation globals use.
-                func.fn_section_len = ast.nx_section_len(node);
-                if (func.fn_section_len > 0) {
-                    func.fn_section_ptr = d.str_dup(ast.nx_section_ptr(node), func.fn_section_len);
-                }
-
-                let is i32 as param_count with mut = 0;
-                let is *ast.Node as p with mut = node.params;
-                while (cast(i64, p) != 0) { param_count = param_count + 1; p = p.next; }
-
-                g.ctx_func = func;
-                func.ret_kind = _ret_kind(node);
-                g.set_ret_float(node.return_type);
-
-                if (node.body.kind == ast.NK_BLOCK && func.is_naked == 1) {
-                    // Naked: NO parameter materialization (the asm body reads args
-                    // straight from rdi/rsi/...; there is no frame to store them
-                    // in — rbp is unset). NO implicit return value. Just the body;
-                    // a bare IR_RET that codegen drops (the asm terminates itself).
-                    func.num_args = param_count;
-                    gs.gen_stmt(node.body.stmts);
-                    g.emit_return(cast(i32, 0 - 1), 0);
-                }
-                else if (node.body.kind == ast.NK_BLOCK) {
-                    let is i32 as arg_idx with mut = 0;
-                    // SRET check — hidden first arg for struct return > 8 bytes
-                    if (cast(i64, node.return_type) != 0 && node.return_type.size > 8) {
-                        g.ctx_has_sret = 1;
-                        g.ctx_sret_vreg = g.emit_get_arg(arg_idx, g.tok_line(node.tok_idx));
-                        arg_idx = arg_idx + 1;
-                        param_count = param_count + 1;
-                    }
-                func.num_args = param_count;
-                    // Get ALL args first (before any COPY that clobbers regs)
-                    let is i64 as avf_bytes with mut = cast(i64, func.num_args) * 4;
-                    if (avf_bytes < 8) { avf_bytes = 8; }
-                    let is *i32 as arg_vregs_fn = cast(*i32, d.opt_alloc(avf_bytes));
-                    let is *i32 as pcodes_fn = _param_codes(node, g.ctx_has_sret, func.num_args);
-                    let is i32 as arg_vi with mut = 0;
-                    p = node.params;
-                    while (cast(i64, p) != 0) {
-                        arg_vregs_fn[arg_vi] = _param_get_arg(pcodes_fn, arg_idx, g.tok_line(p.tok_idx));
-                        _param_type(p.ty);
-                        arg_vi = arg_vi + 1;
-                        arg_idx = arg_idx + 1;
-                        p = p.next;
-                    }
-                    if (cast(i64, pcodes_fn) != 0) { d.opt_free(cast(*u8, pcodes_fn)); }
-                    // Now store/copy args to local vars
-                    arg_vi = 0;
-                    p = node.params;
-                    while (cast(i64, p) != 0) {
-                        let is i32 as av = arg_vregs_fn[arg_vi];
-                        let is *ast.Type as pty = p.ty;
-                        if (cast(i64, pty) != 0 && pty.size > 8) {
-                            // Struct param passed by pointer — copy to local stack
-                            let is i32 as da = g.new_vreg();
-                            let is *d.IRInst as ai = d.new_inst(d.IR_ADDR);
-                            ai.dest = d.op_vreg(da);
-                            ai.src1 = d.op_imm(cast(i64, p.var_offset));
-                            ai.line = g.tok_line(p.tok_idx);
-                            g.emit(ai);
-                            let is *d.IRInst as cp = d.new_inst(d.IR_COPY);
-                            cp.dest = d.op_vreg(da);
-                            cp.src1 = d.op_vreg(av);
-                            cp.src2 = d.op_imm(cast(i64, pty.size));
-                            cp.line = g.tok_line(p.tok_idx);
-                            g.emit(cp);
-                        } else {
-                            let is *d.IRInst as si = d.new_inst(d.IR_STORE);
-                            si.dest = d.op_imm(cast(i64, p.var_offset));
-                            si.src1 = d.op_vreg(av);
-                            si.cast_to = cast(*u8, p.ty);
-                            si.line = g.tok_line(p.tok_idx);
-                            g.emit(si);
-                        }
-                        arg_vi = arg_vi + 1;
-                        p = p.next;
-                    }
-                    d.opt_free(cast(*u8, arg_vregs_fn));
-                    gs.gen_stmt(node.body.stmts);
-                    ge.emit_deferred_calls();
-                    // Implicit return
-                    let is i32 as zero = g.emit_imm(0, 0);
-                    g.emit_return(zero, 0);
-                }
-
-                func.instructions = g.ctx_head;
-                func.vreg_count = g.ctx_vreg;
-                func.label_count = g.ctx_label;
-                func.stack_size = node.stack_size;
-                func.ast_node = cast(*u8, node);
+                let is *d.IRFunction as func with mut = cast(*d.IRFunction, ast.nx_ir_func(node));
+                if (cast(i64, func) == 0) { func = _gen_fn(node); }
 
                 if (cast(i64, func_tail) == 0) {
                     prog.functions = func;
@@ -670,27 +834,6 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                 // Check if main
                 if (d.str_eq(func.name_ptr, func.name_len, "main", 4) == 1) {
                     prog.main_func = func;
-                }
-
-                // Per-function Phase 1: optimize + cache call targets. We KEEP
-                // every function's IR resident through codegen instead of freeing
-                // non-inline functions here and regenerating them from the AST at
-                // codegen time. That regen (regen_func_ir) is the ONLY reason the
-                // whole function-body AST had to stay live through codegen; with
-                // it gone, the body AST can be freed right after IR-gen. Keeping
-                // the IR costs a few MB; the freed body AST saves ~100MB.
-                if (d.ir_opt_level >= 1 && cast(i64, func.instructions) != 0) {
-                    // Deferred-optimize (parallel-exe): skip the heavy per-function
-                    // optimize here and let each worker do it post-inline (it does
-                    // anyway), halving total optimize work and moving it off the
-                    // serial frontend. Still compute the cheap inline-decision
-                    // metadata so cross-module inlining fires in the workers.
-                    if (g_defer_optimize == 1) {
-                        opt.compute_inline_meta(func);
-                    } else {
-                        opt.optimize_func(func);
-                    }
-                    cache_call_targets(func);
                 }
 
                 node = node.next;
@@ -761,35 +904,7 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
     if (cast(i64, prog.main_func) != 0) {
         _reach_build_index(prog);
         mark_reachable(prog, prog.main_func);
-        // Globals placed in a custom ELF section are there for a side-effect
-        // (named section in the ELF/PE output) — keep them even if no
-        // reachable code references them.
-        let is *d.IRGlobal as sg with mut = prog.globals;
-        while (cast(i64, sg) != 0) {
-            if (sg.section_len > 0) { sg.is_reachable = 1; }
-            sg = sg.next;
-        }
-        // Functions referenced only via fn_ptr in global init need to be kept alive.
-        let is *d.IRGlobal as fg with mut = prog.globals;
-        while (cast(i64, fg) != 0) {
-            if (fg.is_reachable == 1 && fg.is_fn_ptr_init == 1) {
-                _reach_by_name(prog, fg.init_fn_name_ptr, fg.init_fn_name_len);
-            }
-            if (fg.is_reachable == 1 && fg.is_struct_lit_init == 1) {
-                let is *ast.Node as lit = cast(*ast.Node, fg.struct_lit_ast);
-                let is *ast.Node as e with mut = lit.args;
-                while (cast(i64, e) != 0) {
-                    if (cast(i64, e.expr) != 0 && e.expr.kind == ast.NK_FN_PTR) {
-                        _reach_by_name(prog, e.expr.name_ptr, e.expr.name_len);
-                    }
-                    e = e.next;
-                }
-            }
-            fg = fg.next;
-        }
-        // -O2 turns sin(v) and cos(v) into one call of math.sincos
-        // (opt_sincos.cst): keep it when both are kept.
-        if (d.ir_opt_level >= 2) { _reach_sincos(prog); }
+        _reach_roots(prog);
     } else if (no_main == 1 && g.ir_depth == 1) {
         // Top-level library mode (`-c` with no main): everything is a
         // potential entry point, so mark all functions/globals reachable.

@@ -8,7 +8,27 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
 ## Unreleased
 
+### Changed
+- **Building a large program: from 23 s and 537 MB to about 3 s and under 200 MB.**
+  Measured on a browser of 195 000 lines at `-O2 -j 4`. A body is now parsed, analyzed,
+  lowered and dropped in its turn, IR is kept packed until read, and only what `main`
+  reaches gets code. The quadratic walk in `emit_rodata` and a `mmap` per pass per
+  function are gone. `docs/build-perf.md` has the figures.
+
+### Fixed
+- **An edit could be built into the old program.** Source hashes were djb2, which cannot
+  tell `"0b"` from `"1A"`; the token and syntax-tree caches served the file from before
+  the edit. They are FNV-1a over 64 bits now.
+- **A cached syntax tree could belong to another target,** whose builtins the parser had
+  folded into it.
+- **`--emit-deps` compiled the whole program** on the path without `-o`, and left its
+  assembly beside the source. It stops after semantic analysis.
+
 ### Added
+- **`--obj-cache <dir>`:** a module whose object is there with the same key is not emitted
+  again, and the result is byte for byte a clean build.
+- **`--config-id`** prints what an output depends on besides its sources; **`--write-deps
+  <file>`** writes the module list during a build; **`--stats`** prints counts of the work.
 - **`--cpu=`: what `-O2` may assume about an x86_64 CPU.** `x86-64` is the new
   default: SSE2 only, no cpuid test, no code layout tuned for one CPU. `auto` is
   what `-O2` did before, AVX2 and SSE2 paths chosen at run time; `x86-64-v3` is AVX2

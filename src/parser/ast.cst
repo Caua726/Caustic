@@ -31,6 +31,9 @@ let is i64 as _NC_CHUNK with imut = 8388608;      // 8MB per chunk
 let is i64 as _NC_HDR   with imut = 32;
 let is i64 as _NC_STEP  with imut = 65536;       // commit granularity
 
+// Streaming build: each function goes from syntax tree to IR before the next is read.
+let is i32 as stream_active with mut = 0;
+
 fn node_transient_begin() as void { _node_t_active = 1; }
 fn node_transient_end() as void { _node_t_active = 0; }
 
@@ -66,6 +69,23 @@ fn _nc_commit_to(c as *u8, end as i64) as void {
         mem.core.oom("the syntax tree", newc - committed);
     }
     *cast(*i64, cast(i64, c) + 24) = newc;
+}
+
+// Back to empty, keeping the first chunk: nodes of the next function land on the same
+// pages. A streaming build calls this once per function, so the syntax tree of the
+// largest function is all that is ever resident.
+fn reset_transient_nodes() as void {
+    if (cast(i64, _nc_head) == 0) { return; }
+    let is *u8 as c with mut = cast(*u8, *cast(*i64, _nc_head));
+    while (cast(i64, c) != 0) {
+        let is *u8 as nxt = cast(*u8, *cast(*i64, c));
+        let is i64 as cap = *cast(*i64, cast(i64, c) + 16);
+        mem.core.munmap(c, cap + _NC_HDR);
+        c = nxt;
+    }
+    *cast(*i64, _nc_head) = 0;
+    *cast(*i64, cast(i64, _nc_head) + 8) = 0;
+    _nc_cur = _nc_head;
 }
 
 fn destroy_transient_nodes() as void {
@@ -237,6 +257,9 @@ struct Node_Extra {
     is_ginst as i8;           // NK_FN that is a generic instance clone
     is_noinline as i8;        // `with noinline` function: every call stays a call
     is_naked as i8;           // `with naked` function: no prologue/epilogue, asm-only body
+    lazy_tok as i32;          // token of a body not parsed yet (0 = parsed)
+    walked as i8;             // semantic analysis has seen this function
+    ir_func as *u8;           // its IR, already generated (streaming build)
 }
 
 // === Node struct ===
@@ -401,7 +424,7 @@ fn memzero(p as *u8, n as i64) as void {
 }
 
 fn new_type(kind as i32) as *Type {
-    let is *Type as t = cast(*Type, ast_alloc(sizeof(Type)));
+    let is *Type as t = cast(*Type, om.perm_alloc(sizeof(Type)));
     memzero(cast(*u8, t), sizeof(Type));
     t.kind = kind;
     return t;
@@ -433,7 +456,7 @@ fn node_alloc_raw() as *Node {
         *cast(*i64, cast(i64, c) + 8) = need;                 // top = need
         return cast(*Node, cast(i64, c) + _NC_HDR);
     }
-    return cast(*Node, ast_alloc(sizeof(Node)));
+    return cast(*Node, om.perm_alloc(sizeof(Node)));
 }
 
 fn new_node(kind as i32) as *Node {
@@ -449,12 +472,15 @@ fn new_node(kind as i32) as *Node {
 // null-safe and return the zero default body nodes would have had inline.
 fn node_ensure_extra(n as *Node) as *Node_Extra {
     if (cast(i64, n.extra) == 0) {
-        let is *Node_Extra as e = cast(*Node_Extra, ast_alloc(sizeof(Node_Extra)));
+        let is *Node_Extra as e = cast(*Node_Extra, om.perm_alloc(sizeof(Node_Extra)));
         memzero(cast(*u8, e), sizeof(Node_Extra));
         n.extra = e;
     }
     return n.extra;
 }
+fn nx_lazy_tok(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return n.extra.lazy_tok; }
+fn nx_walked(n as *Node) as i32 { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.walked); }
+fn nx_ir_func(n as *Node) as *u8 { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.ir_func; }
 fn nx_impl_ptr(n as *Node) as *u8    { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.impl_ptr; }
 fn nx_impl_len(n as *Node) as i32    { if (cast(i64, n.extra) == 0) { return 0; } return cast(i32, n.extra.impl_len); }
 fn nx_only_names(n as *Node) as *u8  { if (cast(i64, n.extra) == 0) { return cast(*u8, 0); } return n.extra.only_names; }
@@ -557,7 +583,7 @@ fn ga_get(buf as *u8, idx as i32) as *Type {
 }
 
 fn clone_node(n as *Node) as *Node {
-    let is *Node as c = cast(*Node, ast_alloc(sizeof(Node)));
+    let is *Node as c = cast(*Node, om.perm_alloc(sizeof(Node)));
     mem.memcpy(cast(*u8, c), cast(*u8, n), sizeof(Node));
     c.next = cast(*Node, 0);
     return c;
