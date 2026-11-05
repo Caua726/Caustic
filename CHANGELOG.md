@@ -83,6 +83,11 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   9% longer (wall) and the compiler's code grows 19%.
 
 ### Fixed
+- **A float compare whose result is a value could send the next store to the wrong
+  address at `-O1` and `-O2`.** It writes its parity flag through `cl`, and the
+  register cache went on claiming a spilled pointer in `rcx`, so `s.v = cast(i32, d != 0.0)`
+  wrote through a pointer with its low byte replaced. The cache now forgets `rcx`
+  there. `tests/float_cmp_cache_test.cst` pins it.
 - **`-O2` vector loops wrote to the wrong array without AVX2.** On a CPU without
   AVX2, a loop such as `x[i] = x[i] + z[i]` stored into `z`: the address of the
   store had been folded away, and the plain store did not know. AVX2 machines never
