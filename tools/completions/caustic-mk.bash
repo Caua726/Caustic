@@ -191,7 +191,7 @@ _caustic_mk() {
     local _caustic_mk_bin=$1
     __caustic_comp_init
 
-    local commands="build run test list info why graph watch install clean init doctor completions help version"
+    local commands="build run test list info why cache graph watch install clean init doctor completions help version"
     # main.cst reads argv[1] for these; as a later word _parse_opts rejects them.
     local global_flags="-h --help -V --version"
     local flags="-j --parallel --incremental --continue --force --no-deps

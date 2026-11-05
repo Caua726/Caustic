@@ -262,6 +262,10 @@ qemu-aarch64 ./program-aarch64
 | `-l<name>` | Link a dynamic library |
 | `--profile` | Per-phase timing |
 | `--cache <dir>` | Incremental build cache |
+| `--obj-cache <dir>` | Reuse the object of a module that did not change; the binary is a clean build's |
+| `--config-id` | Print what an output depends on besides its sources |
+| `--write-deps <file>` | Write the module list during a build |
+| `--stats` | Print counts of the work done |
 | `--path <dir>` | Extra module search path |
 | `-debuglexer` / `-debugparser` / `-debugir` | Inspect a phase |
 

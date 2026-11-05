@@ -27,6 +27,7 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 ### Added
 - **`--obj-cache <dir>`:** a module whose object is there with the same key is not emitted
   again, and the result is byte for byte a clean build.
+- **`std/os/linux.cst`: `flock` and `touch_now`.**
 - **`--config-id`** prints what an output depends on besides its sources; **`--write-deps
   <file>`** writes the module list during a build; **`--stats`** prints counts of the work.
 - **`--cpu=`: what `-O2` may assume about an x86_64 CPU.** `x86-64` is the new
