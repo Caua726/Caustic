@@ -125,7 +125,7 @@ _caustic() {
     __caustic_comp_init
 
     local flags="-c -o -j --parallel --max-ram --shared --emit-interface --emit-csti
---emit-tokens --emit-ast --emit-ir --profile --cache
+--emit-tokens --emit-ast --emit-ir --profile --mem-report --cache
 --module-objects --module-only --emit-deps --csti-dir
 -O0 -O1 -O2 --path -q --quiet --emit-asm
 -debuglexer -debugparser -debugir --freestanding --allow-unsupported

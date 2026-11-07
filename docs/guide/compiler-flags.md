@@ -88,6 +88,10 @@ Additional search path for module imports (`use` statements). Can be specified m
 
 Show per-phase timing breakdown: lex, parse, semantic, IR generation, optimization, codegen, assembler, linker. Also shows per-function codegen profiling and compilation statistics (source bytes, tokens, functions, IR instructions, assembly output, object size).
 
+### `--mem-report`
+
+Everything `--profile` shows, plus a table of this process's resident memory (`rss`), its peak so far (`peak`) and what the permanent allocator has handed out (`perm`) after each phase, in MiB. With parallel emission it adds a line for the workers: how many, the resident memory at the fork, the largest peak, and the sum of what each grew past the fork. A worker's peak counts pages it shares with the parent, so the growth is the number that adds up. Reads `/proc/self/status`; elsewhere the columns print `-`.
+
 ## Debug
 
 ### `-debuglexer`
