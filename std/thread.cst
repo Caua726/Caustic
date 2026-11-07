@@ -2,7 +2,8 @@
 // std/thread.cst — Portable 1:1 OS threads (B4)
 //
 // Model: one kernel thread per spawn, no runtime/scheduler. Linux uses a raw
-// clone(2) via a `with naked` trampoline; Windows uses CreateThread. The worker
+// clone(2) via a `with naked` trampoline; Windows uses CreateThread; CausticOS
+// its THREAD_SPAWN on a stack spawn() commits, with no futex to wait on. The worker
 // has the fixed signature `fn(arg as i64) as i64`; pass multiple values via a
 // pointer to a context struct. join() returns the worker's i64 result.
 //
@@ -41,6 +42,23 @@ fn _clone_thread(flags as i64, newsp as i64, ptid as i64, ctid as i64, tls as i6
         asm("mov r10, rcx\nmov eax, 56\nsyscall\ntest rax, rax\njz .Lcaustic_clone_child\nret\n.Lcaustic_clone_child:\nxor ebp, ebp\npop rax\npop rdi\npop rbx\ncall rax\nmov QWORD PTR [rbx+16], rax\nxor edi, edi\nmov eax, 60\nsyscall\nint 3\n");
     }
 }
+
+// --- CausticOS entry (naked: the thread starts here, on a stack of its own,
+// rsp 16-aligned, &t in rdi). Runs the worker with t.arg, stores its result at
+// +16, then zeroes t.state at +24 — the LAST thing it writes — and ends the
+// thread with THREAD_EXIT (47). Nothing between the store and the syscall
+// touches the stack, so join() may unmap the stack as soon as it reads 0.
+fn _caustic_entry(p as i64) as i64 with naked {
+    if (__target_is_aarch64 == 1) { asm("brk 0"); }
+    else {
+        asm("xor ebp, ebp\nmov rbx, rdi\nmov rax, QWORD PTR [rbx]\nmov rdi, QWORD PTR [rbx+8]\ncall rax\nmov QWORD PTR [rbx+16], rax\nmov DWORD PTR [rbx+24], 0\nxor edi, edi\nmov eax, 47\nsyscall\nint 3\n");
+    }
+}
+
+// CausticOS has no lazily backed memory: a stack is committed up front, and a
+// program without the dynamic-stack probes gets no more than that. 2 MiB, as
+// on Linux.
+let is i64 as _CAUSTIC_STACK with imut = 2097152;
 
 // --- Windows entry shim (naked: MS x64 -> SysV). CreateThread passes param in
 // rcx. Preserve rsi/rdi/rbx (MS callee-saved); read fn/arg from the Thread, call
@@ -106,6 +124,33 @@ fn spawn(t as *Thread, f as *u8, arg as i64) as i32 {
         t.handle = h;
         return 0;
     }
+
+    if (os.current() == os.OS_CAUSTIC) {
+        let is i64 as size = _CAUSTIC_STACK;
+        let is i64 as rw = os.caustic.PROT_READ | os.caustic.PROT_WRITE;
+        let is i64 as base = os.caustic.reserve(0, size, rw);
+        if (base < 0) { return cast(i32, 0 - 1); }
+        if (os.caustic.commit(base, size, rw) != 0) {
+            os.caustic.munmap(base, size);
+            return cast(i32, 0 - 1);
+        }
+        // The thread block in the top 64 bytes, the stack below it; the
+        // thread enters at block - 16, 16-aligned, so the worker the entry
+        // calls sees rsp % 16 == 8 as after any call.
+        let is i64 as block = os.caustic.thread_block_init(base, size, base);
+        t.stack_base = base;
+        t.stack_size = size;
+        atomic_store(&t.state, 1);
+        let is i64 as tid = os.caustic.thread_spawn(cast(i64, fn_ptr(_caustic_entry)), cast(i64, t),
+            block - 16, block);
+        if (tid < 0) {
+            atomic_store(&t.state, 0);
+            os.caustic.munmap(base, size);
+            t.stack_base = 0;
+            return cast(i32, 0 - 1);
+        }
+        return 0;
+    }
     return cast(i32, 0 - 1);
 }
 
@@ -136,6 +181,18 @@ fn join(t as *Thread) as i64 {
         }
         return t.result;
     }
+    if (os.current() == os.OS_CAUSTIC) {
+        // No futex: the kernel says nothing when a thread ends, so the entry
+        // zeroes t.state as its last store and this waits for it, giving the
+        // CPU away between looks.
+        while (atomic_load(&t.state) != 0) { os.caustic.yield_cpu(); }
+        let is i64 as r = t.result;
+        if (t.stack_base != 0) {
+            os.caustic.munmap(t.stack_base, t.stack_size);
+            t.stack_base = 0;   // double-join safe
+        }
+        return r;
+    }
     return t.result;
 }
 
@@ -148,6 +205,7 @@ fn current_id() as i64 {
 fn yield_now() as void {
     if (os.current() == os.OS_LINUX)   { os.linux.sched_yield(); return; }
     if (os.current() == os.OS_WINDOWS) { os.windows.SwitchToThread(); return; }
+    if (os.current() == os.OS_CAUSTIC) { os.caustic.yield_cpu(); return; }
 }
 
 // CPU spin-loop hint (x86 `pause`) — yields the pipeline in a busy-wait, cutting
@@ -176,6 +234,10 @@ fn futex_wait(addr as *u32, expect as u32) as void {
         os.windows.RtlWaitOnAddress(cast(*u8, addr), cast(*u8, &cmp), 4, cast(*u8, 0));
         return;
     }
+    // CausticOS has no futex: the waiter gives the CPU away and its caller
+    // looks again — the spurious wakeup every caller already allows for. The
+    // wakes below have nothing to do there.
+    if (os.current() == os.OS_CAUSTIC) { os.caustic.yield_cpu(); return; }
 }
 
 fn futex_wake_one(addr as *u32) as void {
