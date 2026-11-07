@@ -30,4 +30,16 @@ for level in 0 1 2; do
     [ "$linked" -lt 1024 ] || { echo "FAIL: -O$level a one-call program is $linked bytes"; exit 1; }
     echo "font: -O$level alone $alone B, linked $linked B"
 done
+
+# The program imports the library's globals and defines no copy of them.
+"$cc" -q --target=caustic-x86_64 --shared --base=0x33000000 "$src/data_root.cst" -o libcsldata.csl
+for level in 0 1 2; do
+    "$cc" -q "-O$level" --target=caustic-x86_64 -lcsldata -L. "$src/data_prog.cst" -o data.cse
+    if grep -qa 'abcdef' data.cse; then echo "FAIL: -O$level the program carries the library's string"; exit 1; fi
+    for name in counter seeded lib_table lib_pair lib_text; do
+        grep -qa "data_lib_cst_$name" data.cse || { echo "FAIL: -O$level '$name' is not imported"; exit 1; }
+    done
+done
+grep -qa 'abcdef' libcsldata.csl || { echo "FAIL: the library does not hold its string"; exit 1; }
+
 echo "csl-data: passed"
