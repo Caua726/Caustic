@@ -87,6 +87,18 @@ let is i32 as INL_VREG_CAP with imut = 8192;
 let is i32 as INL_FRAME_ONE with imut = 256;
 let is i32 as INL_FRAME_ALL with imut = 1024;
 let is i32 as INL_NEVER with imut = 1073741824;
+// An innermost loop that computes in floats and whose every call can go in stops
+// being a loop that calls. Every xmm register is caller-saved, so each call there
+// spills every float that lives through it, and the passes that leave a calling
+// loop alone (LICM, strength reduction, the vectorizer) take it once it is gone.
+// That is worth far more than a call in a loop that still calls, so these sites
+// have a budget of their own: per loop, and per caller. A loop with any call that
+// cannot go in gets nothing from it. Integer loops keep their values in
+// callee-saved registers across calls, and pay the growth without that gain.
+let is i64 as INL_FREE_ONE with imut = 40;
+let is i64 as INL_FREE_LOOP with imut = 1500;
+let is i64 as INL_FREE_MAX with imut = 3000;
+let is i32 as INL_FREE_DEPTH with imut = 2;
 
 // === Pointer-keyed hash map (open addressing, keys never 0) ===
 
@@ -192,6 +204,8 @@ let is *u8 as _optimize_cb with mut = cast(*u8, 0);
 fn set_raw_bodies(v as i32) as void { _raw_bodies = v; }
 fn set_optimizer(cb as *u8) as void { _optimize_cb = cb; }
 
+let is *u8 as _names_prog with mut = cast(*u8, 0);
+
 fn _name_hash(p as *u8, n as i32) as i64 {
     let is u64 as h with mut = 14695981039346656037;
     let is i32 as i with mut = 0;
@@ -217,9 +231,10 @@ fn _lookup(p as *u8, n as i32) as *d.IRFunction {
     return f;
 }
 
-fn _ensure_tables(prog as *u8) as void {
-    if (cast(i64, _prog) == cast(i64, prog)) { return; }
-    _prog = prog;
+// The name table alone: the -O1 inliner needs it and nothing else here.
+fn ensure_names(prog as *u8) as void {
+    if (cast(i64, _names_prog) == cast(i64, prog)) { return; }
+    _names_prog = prog;
     let is *d.IRProgram as p = cast(*d.IRProgram, prog);
     let is i64 as nf with mut = 0;
     let is *d.IRFunction as f with mut = p.functions;
@@ -241,6 +256,14 @@ fn _ensure_tables(prog as *u8) as void {
         }
         f = f.next;
     }
+}
+
+fn _ensure_tables(prog as *u8) as void {
+    if (cast(i64, _prog) == cast(i64, prog)) { return; }
+    _prog = prog;
+    ensure_names(prog);
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    let is *d.IRFunction as f with mut = p.functions;
     // References: every call, function address or global address naming a
     // function, over every function the program keeps.
     _pm_clear(&_refs);
@@ -720,6 +743,7 @@ struct Site {
     pos as i64;
     allow as i64;            // what calls inside this copy may still add
     inloop as i64;           // 1: the call is inside a loop
+    free as i64;             // 1: copying it helps leave an innermost loop with no call
 }
 
 // Chain of callees a copied call came through: entry k = (callee, parent,
@@ -1241,6 +1265,137 @@ fn _copy_inst(dst as *d.IRInst, src as *d.IRInst) as void {
     dst.is_dead = 0;
 }
 
+// Nothing f calls would stay a call once f is copied.
+fn _copies_callfree(f as *d.IRFunction, caller as *d.IRFunction, depth as i32) as i32 {
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            if (i.op == d.IR_CALL_INDIRECT || i.op == d.IR_FFI_CALL || i.op == d.IR_SYSCALL) { return 0; }
+            if (i.op == d.IR_ASM && _is_stack_adjust(i) == 0) { return 0; }
+            if (i.op == d.IR_CALL && _noreturn_call(i) == 0 && _report_call(i) == 0) {
+                if (depth >= INL_FREE_DEPTH || i.is_extern_call != 0 || i.is_variadic_call != 0) { return 0; }
+                let is *d.IRFunction as g = _lookup(i.call_name_ptr, i.call_name_len);
+                if (cast(i64, g) == 0 || cast(i64, g) == cast(i64, f) || _callee_ok(g, caller) == 0) { return 0; }
+                if (_est_raw_of(g) >= INL_NEVER || _copies_callfree(g, caller, depth + 1) == 0) { return 0; }
+            }
+        }
+        i = i.next;
+    }
+    return 1;
+}
+
+// Sets s.free on the n sites: those in an innermost loop every call of which
+// is one of them, inside the per-loop budget.
+fn _mark_free_loops(func as *d.IRFunction, n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) { _site_at(k).free = 0; k = k + 1; }
+    let is *d.IRInst as fi with mut = func.instructions;
+    let is i32 as has_float with mut = 0;
+    while (cast(i64, fi) != 0 && has_float == 0) {
+        if (fi.is_dead == 0 && (fi.op == d.IR_FADD || fi.op == d.IR_FSUB || fi.op == d.IR_FMUL
+                                || fi.op == d.IR_FDIV || fi.op == d.IR_FSQRT)) { has_float = 1; }
+        fi = fi.next;
+    }
+    if (has_float == 0) { return; }
+    // back jumps, as position intervals
+    let is i64 as lc = cast(i64, func.label_count) + 1;
+    let is *i64 as lpos = cast(*i64, d.opt_alloc(lc * 8));
+    k = 0;
+    while (k < lc) { lpos[k] = 0 - 1; k = k + 1; }
+    let is [128]i64 as lo;
+    let is [128]i64 as hi;
+    let is [128]i64 as sum;
+    let is [128]i32 as good;
+    let is i32 as nl with mut = 0;
+    let is i64 as pos with mut = 0;
+    let is *d.IRInst as i with mut = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            if (i.op == d.IR_LABEL && i.dest.label >= 0 && cast(i64, i.dest.label) < lc) { lpos[i.dest.label] = pos; }
+            if ((i.op == d.IR_JMP || i.op == d.IR_JZ || i.op == d.IR_JNZ) && i.dest.op_type == d.OP_LABEL
+                && i.dest.label >= 0 && cast(i64, i.dest.label) < lc && lpos[i.dest.label] >= 0 && nl < 128) {
+                lo[nl] = lpos[i.dest.label]; hi[nl] = pos; sum[nl] = 0; good[nl] = 0;
+                nl = nl + 1;
+            }
+        }
+        pos = pos + 1;
+        i = i.next;
+    }
+    d.opt_free(cast(*u8, lpos));
+    // floats in it, or in what it calls
+    let is i32 as a with mut = 0;
+    pos = 0;
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as fl with mut = 0;
+            if (i.op == d.IR_FADD || i.op == d.IR_FSUB || i.op == d.IR_FMUL || i.op == d.IR_FDIV || i.op == d.IR_FSQRT) { fl = 1; }
+            if (fl == 1) {
+                a = 0;
+                while (a < nl) { if (pos > lo[a] && pos < hi[a]) { good[a] = 1; } a = a + 1; }
+            }
+        }
+        pos = pos + 1;
+        i = i.next;
+    }
+    // innermost: holds no other
+    a = 0;
+    while (a < nl) {
+        let is i32 as b with mut = 0;
+        while (b < nl) {
+            if (a != b && lo[b] >= lo[a] && hi[b] <= hi[a] && (lo[b] != lo[a] || hi[b] != hi[a])) { good[a] = 0; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    // the calls in each
+    let is i64 as site with mut = 0;
+    pos = 0;
+    i = func.instructions;
+    while (cast(i64, i) != 0) {
+        if (i.is_dead == 0) {
+            let is i32 as op = i.op;
+            if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL
+                || (op == d.IR_ASM && _is_stack_adjust(i) == 0)) {
+                while (site < n && _site_at(site).pos < pos) { site = site + 1; }
+                let is *Site as s with mut = cast(*Site, 0);
+                if (site < n && _site_at(site).pos == pos) { s = _site_at(site); }
+                let is i32 as ok with mut = 1;
+                if (op == d.IR_CALL && _noreturn_call(i) == 1) { ok = 2; }
+                else if (op == d.IR_CALL && _report_call(i) == 1) { ok = 2; }
+                else if (cast(i64, s) == 0) { ok = 0; }
+                else if (s.est > INL_FREE_ONE || _copies_callfree(s.callee, func, 0) == 0) { ok = 0; }
+                if (ok != 2) {
+                    a = 0;
+                    while (a < nl) {
+                        if (good[a] == 1 && pos > lo[a] && pos < hi[a]) {
+                            if (ok == 0) { good[a] = 0; }
+                            else {
+                                let is i64 as g with mut = s.est - s.cost;
+                                if (g < 0) { g = 0; }
+                                sum[a] = sum[a] + g;
+                            }
+                        }
+                        a = a + 1;
+                    }
+                }
+            }
+        }
+        pos = pos + 1;
+        i = i.next;
+    }
+    k = 0;
+    while (k < n) {
+        let is *Site as s = _site_at(k);
+        a = 0;
+        while (a < nl) {
+            if (good[a] == 1 && sum[a] <= INL_FREE_LOOP && s.pos > lo[a] && s.pos < hi[a]) { s.free = 1; }
+            a = a + 1;
+        }
+        k = k + 1;
+    }
+}
+
 fn pass_inline_o2(func as *d.IRFunction, prog as *u8) as void {
     _rg_func = func;
     _rg_n = 0;
@@ -1253,6 +1408,7 @@ fn pass_inline_o2(func as *d.IRFunction, prog as *u8) as void {
 
     let is i64 as budget with mut = 0;
     let is i64 as lbudget with mut = 0;
+    let is i64 as fbudget with mut = INL_FREE_MAX;
     let is i64 as frame_used with mut = 0;
     let is i64 as round with mut = 0;
     while (round <= cast(i64, INL_MAX_DEPTH)) {
@@ -1266,6 +1422,7 @@ fn pass_inline_o2(func as *d.IRFunction, prog as *u8) as void {
         }
         if (n == 0) { round = cast(i64, INL_MAX_DEPTH) + 1; }
         else {
+            _mark_free_loops(func, n);
             let is *i64 as ord = _sort_sites(n);
             let is i64 as done with mut = 0;
             let is i64 as k with mut = 0;
@@ -1276,6 +1433,7 @@ fn pass_inline_o2(func as *d.IRFunction, prog as *u8) as void {
                 let is i32 as go with mut = 1;
                 let is i64 as avail with mut = budget;
                 if (s.prio == 1) { avail = budget + lbudget; }
+                if (s.free == 1) { avail = avail + fbudget; }
                 if (s.prio != 0 && grow > avail) { go = 0; }
                 if (go == 1 && _take(s) == 0) { go = 0; }
                 if (go == 1) {
@@ -1283,12 +1441,17 @@ fn pass_inline_o2(func as *d.IRFunction, prog as *u8) as void {
                     if (grow < 0) { grow = 0; }
                     avail = budget;
                     if (s.prio == 1 && _is_leaf(s.src) == 1) { avail = budget + lbudget; }
+                    if (s.free == 1) { avail = avail + fbudget; }
                     if (s.prio != 0 && grow > avail) { go = 0; }
                     if (cast(i64, func.vreg_count) + cast(i64, s.src.vreg_count) > cast(i64, INL_VREG_CAP)) { go = 0; }
                     if (s.sticky > 0 && (s.sticky > cast(i64, INL_FRAME_ONE) || frame_used + s.sticky > cast(i64, INL_FRAME_ALL))) { go = 0; }
                 }
                 if (go == 1 && _inline_site(func, s) == 1) {
                     let is i64 as rest with mut = grow;
+                    if (s.free == 1) {
+                        if (rest > fbudget) { rest = rest - fbudget; fbudget = 0; }
+                        else { fbudget = fbudget - rest; rest = 0; }
+                    }
                     if (s.prio == 1 && _is_leaf(s.src) == 1) {
                         if (rest > lbudget) { rest = rest - lbudget; lbudget = 0; }
                         else { lbudget = lbudget - rest; rest = 0; }
@@ -1462,6 +1625,7 @@ fn inline_order(prog as *u8, out_n as *i32) as **d.IRFunction {
 // A new program: every table describes the old one.
 fn reset() as void {
     _prog = cast(*u8, 0);
+    _names_prog = cast(*u8, 0);
     _rg_n = 0;
     _rg_func = cast(*d.IRFunction, 0);
 }

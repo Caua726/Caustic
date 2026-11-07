@@ -1,0 +1,830 @@
+use "defs.cst" as d;
+use "cfg.cst" as cfg;
+use "dom.cst" as dom;
+use "phi.cst" as phi;
+use "../parser/ast.cst" as ast;
+
+// === Loads of what a register already holds ===
+//
+// -O2, on the SSA form, after GVN. A load whose bytes were loaded or stored on
+// every path that reaches it, and written by nothing since, is a copy of that
+// value. A forward dataflow over the function: one bit per access ("site"), set
+// where the access has run and nothing since could have changed its bytes or
+// the registers that name them. A bit that survives every path to a load means
+// the site runs before it on all of them, so the site's value dominates it.
+//
+// Whether a write can reach a site's bytes (_may_alias) asks only what the code
+// itself proves, never a type: Caustic converts any pointer to any other.
+//   - An address is a root plus a constant: the frame, a global, or a register.
+//     Same root: the byte ranges decide.
+//   - Two different globals, or a global and the frame, are different objects.
+//   - No pointer from outside (a parameter, a loaded value, a call's result)
+//     reaches a frame whose address never left the function (frame_esc), and no
+//     call writes it either.
+//   - Anything else may be the same memory.
+//
+// Runs once a function has its callees in (opt.cst le_on): before that it would
+// only be undone and done again.
+//
+// There is no volatile in the language, and code polls devices and flags with
+// plain loads. So a load in a loop whose value decides a branch of that loop
+// with nothing that changes in it taking part (a status register, a flag) is
+// never replaced: dropping it would turn the wait into an endless loop, or skip
+// it. `while (i < a.len)` is not one: i takes part.
+
+let is i32 as ROOT_FRAME with imut = 0 - 2;
+let is i32 as ROOT_ALLOC with imut = 0 - 3;
+let is i32 as ROOT_GLOBAL with imut = 0 - 100;   // minus the global's number
+
+let is i32 as OBJ_UNKNOWN with imut = 0;
+let is i32 as OBJ_FRAME with imut = 1;
+let is i32 as OBJ_GLOBAL with imut = 2;          // plus the global's number
+
+let is i32 as LE_MAX_GLOBALS with imut = 128;
+let is i32 as LE_MAX_SITES with imut = 4096;
+// site count x block count: bits per dataflow matrix
+let is i64 as LE_MAX_BITS with imut = 2000000;
+// site count x writes through a pointer: alias questions per pass
+let is i64 as LE_MAX_ASK with imut = 2000000;
+
+struct Site {
+    inst as *d.IRInst;
+    root as i32;
+    obj as i32;
+    off as i64;
+    size as i32;
+    kind as i32;         // the type's kind
+    val as i32;          // the register holding the value
+    is_store as i32;
+    next_key as i32;     // next site of the same bytes, -1 at the end
+    next_root as i32;    // next site named by the same register
+    next_val as i32;     // next site whose value is the same register
+}
+
+struct Le {
+    func as *d.IRFunction;
+    nv as i32;
+    def_inst as *i64;
+    def_count as *i32;
+    a_root as *i32;
+    a_obj as *i32;
+    a_off as *i64;
+    a_done as *u8;
+    sites as *u8;
+    n as i32;
+    words as i32;
+    head_root as *i32;
+    head_val as *i32;
+    frame_esc as i32;
+    call_kill as *i64;   // what any call may change
+    all_kill as *i64;
+}
+
+let is [128]i64 as le_gptr with mut;
+let is [128]i32 as le_glen with mut;
+let is i32 as le_gn with mut = 0;
+
+fn _s(l as *Le, i as i32) as *Site {
+    return cast(*Site, cast(i64, l.sites) + cast(i64, i) * sizeof(Site));
+}
+
+fn _global_id(p as *u8, n as i32) as i32 {
+    if (cast(i64, p) == 0 || n <= 0) { return 0 - 1; }
+    let is i32 as k with mut = 0;
+    while (k < le_gn) {
+        if (le_glen[k] == n && d.str_eq(cast(*u8, le_gptr[k]), n, p, n) == 1) { return k; }
+        k = k + 1;
+    }
+    if (le_gn >= LE_MAX_GLOBALS) { return 0 - 1; }
+    le_gptr[le_gn] = cast(i64, p);
+    le_glen[le_gn] = n;
+    le_gn = le_gn + 1;
+    return le_gn - 1;
+}
+
+fn _size_of(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 8; }
+    return *cast(*i32, cast(i64, t) + 28);
+}
+
+fn _kind_of(t as *u8) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    return *cast(*i32, t);
+}
+
+fn _word_wide(t as *u8) as i32 {
+    return cast(i32, _size_of(t) == 8);
+}
+
+fn _single(l as *Le, v as i32) as *d.IRInst {
+    if (v < 0 || v >= l.nv || l.def_count[v] != 1) { return cast(*d.IRInst, 0); }
+    return cast(*d.IRInst, l.def_inst[v]);
+}
+
+// The constant a register holds, when one IMM is all that defines it.
+fn _const_of(l as *Le, o as *d.Operand, out as *i64) as i32 {
+    if (o.op_type == d.OP_IMM) { *out = o.imm; return 1; }
+    if (o.op_type != d.OP_VREG) { return 0; }
+    let is *d.IRInst as di = _single(l, o.vreg);
+    if (cast(i64, di) == 0 || di.op != d.IR_IMM || di.src1.op_type != d.OP_IMM) { return 0; }
+    *out = di.src1.imm;
+    return 1;
+}
+
+fn _set(l as *Le, v as i32, root as i32, off as i64, obj as i32) as void {
+    l.a_root[v] = root; l.a_off[v] = off; l.a_obj[v] = obj; l.a_done[v] = cast(u8, 1);
+}
+
+// Fills a_root/a_off/a_obj for the address held in v.
+fn _resolve(l as *Le, v as i32, depth as i32) as void {
+    if (l.a_done[v] == cast(u8, 1)) { return; }
+    let is *d.IRInst as di = _single(l, v);
+    if (cast(i64, di) == 0 || depth > 24) { _set(l, v, v, 0, OBJ_UNKNOWN); return; }
+    let is i32 as op = di.op;
+    if (op == d.IR_ADDR && di.src1.op_type == d.OP_IMM) {
+        _set(l, v, ROOT_FRAME, 0 - di.src1.imm, OBJ_FRAME);
+        return;
+    }
+    if (op == d.IR_GET_ALLOC_ADDR && di.src1.op_type == d.OP_IMM) {
+        _set(l, v, ROOT_ALLOC, 0 - di.src1.imm, OBJ_FRAME);
+        return;
+    }
+    if (op == d.IR_ADDR_GLOBAL) {
+        let is i32 as g = _global_id(di.global_name_ptr, cast(i32, di.global_name_len));
+        if (g >= 0) { _set(l, v, ROOT_GLOBAL - g, 0, OBJ_GLOBAL + g); return; }
+        _set(l, v, v, 0, OBJ_UNKNOWN);
+        return;
+    }
+    let is i32 as s1 with mut = 0 - 1;
+    if (di.src1.op_type == d.OP_VREG && di.src1.vreg >= 0 && di.src1.vreg < l.nv) { s1 = di.src1.vreg; }
+    if (op == d.IR_MOV && s1 >= 0) {
+        _resolve(l, s1, depth + 1);
+        _set(l, v, l.a_root[s1], l.a_off[s1], l.a_obj[s1]);
+        return;
+    }
+    if (op == d.IR_CAST && s1 >= 0 && _word_wide(di.cast_to) == 1 && _kind_of(di.cast_to) != ast.TY_F64) {
+        _resolve(l, s1, depth + 1);
+        _set(l, v, l.a_root[s1], l.a_off[s1], l.a_obj[s1]);
+        return;
+    }
+    if ((op == d.IR_ADD || op == d.IR_SUB) && s1 >= 0 && _word_wide(di.cast_to) == 1) {
+        _resolve(l, s1, depth + 1);
+        let is i64 as k with mut = 0;
+        if (_const_of(l, &di.src2, &k) == 1 && k > 0 - 1073741824 && k < 1073741824) {
+            if (op == d.IR_SUB) { k = 0 - k; }
+            _set(l, v, l.a_root[s1], l.a_off[s1] + k, l.a_obj[s1]);
+            return;
+        }
+        // an index: the same object, somewhere in it
+        _set(l, v, v, 0, l.a_obj[s1]);
+        return;
+    }
+    if ((op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) && s1 >= 0) {
+        _resolve(l, s1, depth + 1);
+        _set(l, v, v, 0, l.a_obj[s1]);
+        return;
+    }
+    _set(l, v, v, 0, OBJ_UNKNOWN);
+}
+
+fn _derives(op as i32) as i32 {
+    if (op == d.IR_MOV || op == d.IR_CAST || op == d.IR_ADD || op == d.IR_SUB
+        || op == d.IR_LEA2 || op == d.IR_LEA4 || op == d.IR_LEA8) { return 1; }
+    return 0;
+}
+
+fn _harmless_use(op as i32) as i32 {
+    if (op == d.IR_EQ || op == d.IR_NE || op == d.IR_LT || op == d.IR_LE || op == d.IR_GT || op == d.IR_GE
+        || op == d.IR_JZ || op == d.IR_JNZ) { return 1; }
+    return 0;
+}
+
+fn _is_der(der as *u8, nv as i32, o as *d.Operand) as i32 {
+    if (o.op_type != d.OP_VREG || o.vreg < 0 || o.vreg >= nv) { return 0; }
+    return cast(i32, der[o.vreg] == cast(u8, 1));
+}
+
+// Whether an address of the frame leaves what this analysis can follow.
+fn _frame_escapes(func as *d.IRFunction, nv as i32) as i32 {
+    let is *u8 as der = d.opt_alloc(cast(i64, nv) + 1);
+    let is i32 as i with mut = 0;
+    while (i < nv) { der[i] = cast(u8, 0); i = i + 1; }
+    let is i32 as any with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && (it.op == d.IR_ADDR || it.op == d.IR_GET_ALLOC_ADDR)
+            && it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < nv) {
+            der[it.dest.vreg] = cast(u8, 1);
+            any = 1;
+        }
+        it = it.next;
+    }
+    if (any == 0) { d.opt_free(der); return 0; }
+    let is i32 as chg with mut = 1;
+    while (chg == 1) {
+        chg = 0;
+        it = func.instructions;
+        while (cast(i64, it) != 0) {
+            if (it.is_dead == 0 && _derives(it.op) == 1 && it.dest.op_type == d.OP_VREG
+                && it.dest.vreg >= 0 && it.dest.vreg < nv && der[it.dest.vreg] == cast(u8, 0)
+                && (_is_der(der, nv, &it.src1) == 1 || _is_der(der, nv, &it.src2) == 1)) {
+                der[it.dest.vreg] = cast(u8, 1);
+                chg = 1;
+            }
+            it = it.next;
+        }
+    }
+    let is i32 as esc with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0 && esc == 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            if (op == d.IR_PHI) {
+                let is i32 as k with mut = 0;
+                while (k < phi.phi_nargs(it)) {
+                    let is i32 as pv = phi.phi_val(it, k);
+                    if (pv >= 0 && pv < nv && der[pv] == cast(u8, 1)) { esc = 1; }
+                    k = k + 1;
+                }
+            } else if (op == d.IR_LOAD) {
+                // read through it: fine
+            } else if (op == d.IR_STORE) {
+                if (_is_der(der, nv, &it.src1) == 1) { esc = 1; }
+            } else if (op == d.IR_COPY) {
+                // a block copy reads and writes through both: fine
+            } else if (_derives(op) == 1 || _harmless_use(op) == 1) {
+                // followed above, or only compared
+            } else if (_is_der(der, nv, &it.src1) == 1 || _is_der(der, nv, &it.src2) == 1
+                       || _is_der(der, nv, &it.dest) == 1) {
+                if (op != d.IR_ADDR && op != d.IR_GET_ALLOC_ADDR) { esc = 1; }
+            }
+        }
+        it = it.next;
+    }
+    d.opt_free(der);
+    return esc;
+}
+
+// 1 when a write of [root+off, size) (obj) may reach the site's bytes.
+fn _may_alias(l as *Le, root as i32, off as i64, size as i64, obj as i32, s as *Site) as i32 {
+    if (root == s.root) {
+        if (size < 0) { return 1; }
+        return cast(i32, off < s.off + cast(i64, s.size) && s.off < off + size);
+    }
+    if (obj == OBJ_UNKNOWN || s.obj == OBJ_UNKNOWN) {
+        let is i32 as other with mut = obj;
+        if (obj == OBJ_UNKNOWN) { other = s.obj; }
+        if (other == OBJ_FRAME && l.frame_esc == 0) { return 0; }
+        return 1;
+    }
+    return cast(i32, obj == s.obj);
+}
+
+fn _bit_set(row as *i64, i as i32) as void {
+    let is i32 as w = i >> 6;
+    row[w] = row[w] | (cast(i64, 1) << cast(i64, i & 63));
+}
+
+fn _bit_clr(row as *i64, i as i32) as void {
+    let is i32 as w = i >> 6;
+    row[w] = row[w] & ~(cast(i64, 1) << cast(i64, i & 63));
+}
+
+fn _bit_has(row as *i64, i as i32) as i32 {
+    return cast(i32, (row[i >> 6] >> cast(i64, i & 63)) & 1);
+}
+
+fn _is_barrier(i as *d.IRInst) as i32 {
+    let is i32 as op = i.op;
+    if (op == d.IR_ASM) { return cast(i32, d.is_stack_adjust(i) == 0); }
+    if (op == d.IR_ATOMIC_LOAD || op == d.IR_ATOMIC_STORE || op == d.IR_ATOMIC_ADD || op == d.IR_ATOMIC_XCHG
+        || op == d.IR_CAS_EXPECTED || op == d.IR_ATOMIC_CAS || op == d.IR_FENCE || op == d.IR_VA_START
+        || op == d.IR_SET_CTX) { return 1; }
+    return 0;
+}
+
+fn _is_call(op as i32) as i32 {
+    if (op == d.IR_CALL || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SYSCALL) { return 1; }
+    return 0;
+}
+
+fn _addr_of_store(l as *Le, it as *d.IRInst, root as *i32, off as *i64, obj as *i32) as void {
+    if (it.dest.op_type == d.OP_IMM) { *root = ROOT_FRAME; *off = 0 - it.dest.imm; *obj = OBJ_FRAME; return; }
+    if (it.dest.op_type == d.OP_VREG && it.dest.vreg >= 0 && it.dest.vreg < l.nv) {
+        _resolve(l, it.dest.vreg, 0);
+        *root = l.a_root[it.dest.vreg]; *off = l.a_off[it.dest.vreg]; *obj = l.a_obj[it.dest.vreg];
+        return;
+    }
+    *root = 0 - 1; *off = 0; *obj = OBJ_UNKNOWN;
+}
+
+// One instruction's effect on the set cur: it loses what is killed and gains
+// what is generated. With a kill row (a block's summary) that row collects it.
+fn _apply(l as *Le, it as *d.IRInst, site as i32, cur as *i64, kill as *i64) as void {
+    let is i32 as op = it.op;
+    let is i32 as w with mut = 0;
+    if (_is_barrier(it) == 1) {
+        while (w < l.words) {
+            cur[w] = 0;
+            if (cast(i64, kill) != 0) { kill[w] = l.all_kill[w]; }
+            w = w + 1;
+        }
+        // an atomic's dest is also a definition, handled below
+    } else if (_is_call(op) == 1) {
+        while (w < l.words) {
+            cur[w] = cur[w] & ~l.call_kill[w];
+            if (cast(i64, kill) != 0) { kill[w] = kill[w] | l.call_kill[w]; }
+            w = w + 1;
+        }
+    } else if (op == d.IR_STORE || op == d.IR_COPY) {
+        let is i32 as root with mut = 0;
+        let is i64 as off with mut = 0;
+        let is i32 as obj with mut = 0;
+        _addr_of_store(l, it, &root, &off, &obj);
+        let is i64 as size with mut = cast(i64, _size_of(it.cast_to));
+        if (op == d.IR_COPY) {
+            size = 0 - 1;
+            if (it.src2.op_type == d.OP_IMM) { size = it.src2.imm; }
+        }
+        let is i32 as s with mut = 0;
+        while (s < l.n) {
+            if (_may_alias(l, root, off, size, obj, _s(l, s)) == 1) {
+                _bit_clr(cur, s);
+                if (cast(i64, kill) != 0) { _bit_set(kill, s); }
+            }
+            s = s + 1;
+        }
+    }
+    // a definition: sites named by or holding that register are stale
+    if (it.dest.op_type == d.OP_VREG && op != d.IR_STORE && op != d.IR_COPY && op != d.IR_ATOMIC_STORE
+        && it.dest.vreg >= 0 && it.dest.vreg < l.nv) {
+        let is i32 as dv = it.dest.vreg;
+        let is i32 as q with mut = l.head_root[dv];
+        while (q >= 0) {
+            _bit_clr(cur, q);
+            if (cast(i64, kill) != 0) { _bit_set(kill, q); }
+            q = _s(l, q).next_root;
+        }
+        q = l.head_val[dv];
+        while (q >= 0) {
+            _bit_clr(cur, q);
+            if (cast(i64, kill) != 0) { _bit_set(kill, q); }
+            q = _s(l, q).next_val;
+        }
+    }
+    if (site >= 0) { _bit_set(cur, site); }
+}
+
+// The key of an access: same root, offset, size and kind name the same value.
+fn _key_hash(root as i32, off as i64, size as i32, kind as i32) as i64 {
+    let is i64 as h = cast(i64, root) * 1000003 + off * 131 + cast(i64, size) * 17 + cast(i64, kind);
+    return h ^ (h >> 17);
+}
+
+// A load's address as a site key. Returns 0 when it is no usable site.
+fn _site_of_load(l as *Le, it as *d.IRInst, root as *i32, off as *i64, obj as *i32) as i32 {
+    if (it.dest.op_type != d.OP_VREG || it.dest.vreg < 0 || it.dest.vreg >= l.nv) { return 0; }
+    let is i32 as k = _kind_of(it.cast_to);
+    if (k == 0 || k == ast.TY_ARRAY || k == ast.TY_STRUCT || k == ast.TY_ENUM || k == ast.TY_FN || k == ast.TY_VOID) { return 0; }
+    if (it.src1.op_type == d.OP_IMM) { *root = ROOT_FRAME; *off = 0 - it.src1.imm; *obj = OBJ_FRAME; return 1; }
+    if (it.src1.op_type != d.OP_VREG || it.src1.vreg < 0 || it.src1.vreg >= l.nv) { return 0; }
+    _resolve(l, it.src1.vreg, 0);
+    *root = l.a_root[it.src1.vreg]; *off = l.a_off[it.src1.vreg]; *obj = l.a_obj[it.src1.vreg];
+    if (*root == it.dest.vreg) { return 0; }
+    return 1;
+}
+
+// A stored value a load can become: a whole word, or a narrow integer (the load
+// re-extends it, so the copy is a cast).
+fn _fwd_kind(t as *u8) as i32 {
+    let is i32 as k = _kind_of(t);
+    let is i32 as sz = _size_of(t);
+    if (k == ast.TY_F64 || k == ast.TY_PTR) { return 1; }
+    if (k >= ast.TY_I8 && k <= ast.TY_U64) { if (sz == 8) { return 1; } return 2; }
+    return 0;
+}
+
+fn _site_of_store(l as *Le, it as *d.IRInst, root as *i32, off as *i64, obj as *i32) as i32 {
+    if (_fwd_kind(it.cast_to) == 0) { return 0; }
+    if (it.src1.op_type != d.OP_VREG || it.src1.vreg < 0 || it.src1.vreg >= l.nv) { return 0; }
+    if (it.dest.op_type != d.OP_IMM && it.dest.op_type != d.OP_VREG) { return 0; }
+    _addr_of_store(l, it, root, off, obj);
+    if (*root == it.src1.vreg) { return 0; }
+    return 1;
+}
+
+// Loads that decide a branch of a loop with nothing changing in it: marked.
+fn _cone(l as *Le, v as i32, depth as i32, found as *i64, nf as *i32, changes as *i32) as void {
+    if (*changes == 1 || depth > 12 || v < 0 || v >= l.nv) { return; }
+    let is *d.IRInst as di = _single(l, v);
+    if (cast(i64, di) == 0) { *changes = 1; return; }
+    let is i32 as op = di.op;
+    if (op == d.IR_PHI) { *changes = 1; return; }
+    if (op == d.IR_LOAD) {
+        if (*nf < 16) { found[*nf] = cast(i64, di); *nf = *nf + 1; }
+    }
+    if (op == d.IR_IMM || op == d.IR_ADDR || op == d.IR_ADDR_GLOBAL || op == d.IR_GET_ARG
+        || op == d.IR_GET_ALLOC_ADDR || op == d.IR_FN_ADDR) { return; }
+    if (di.src1.op_type == d.OP_VREG) { _cone(l, di.src1.vreg, depth + 1, found, nf, changes); }
+    if (di.src2.op_type == d.OP_VREG) { _cone(l, di.src2.vreg, depth + 1, found, nf, changes); }
+}
+
+fn pass_load_elim(func as *d.IRFunction) as i32 {
+    let is i32 as nv = func.vreg_count;
+    if (nv <= 0 || cast(i64, func.instructions) == 0) { return 0; }
+    // Two loads at least, or there is nothing to do.
+    let is i32 as nload with mut = 0;
+    let is i32 as nst with mut = 0;
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            if (it.op == d.IR_LOAD) { nload = nload + 1; }
+            else if (it.op == d.IR_STORE) { nst = nst + 1; }
+        }
+        it = it.next;
+    }
+    if (nload == 0 || nload + nst < 2 || nload + nst > LE_MAX_SITES) { return 0; }
+
+    let is Le as L;
+    let is *Le as l = &L;
+    l.func = func;
+    l.nv = nv;
+    le_gn = 0;
+    // One block for everything sized by the registers: a pass that often finds
+    // nothing should not make eight allocator calls to learn it.
+    let is i64 as vb = cast(i64, nv);
+    let is *u8 as vmem = d.opt_alloc(vb * 37 + 8);
+    l.def_inst = cast(*i64, vmem);
+    l.a_off = cast(*i64, cast(i64, vmem) + vb * 8);
+    l.def_count = cast(*i32, cast(i64, vmem) + vb * 16);
+    l.a_root = cast(*i32, cast(i64, vmem) + vb * 20);
+    l.a_obj = cast(*i32, cast(i64, vmem) + vb * 24);
+    l.head_root = cast(*i32, cast(i64, vmem) + vb * 28);
+    l.head_val = cast(*i32, cast(i64, vmem) + vb * 32);
+    l.a_done = cast(*u8, cast(i64, vmem) + vb * 36);
+    let is i32 as i with mut = 0;
+    while (i < nv) {
+        l.def_count[i] = 0; l.def_inst[i] = 0; l.a_done[i] = cast(u8, 0);
+        l.head_root[i] = 0 - 1; l.head_val[i] = 0 - 1;
+        i = i + 1;
+    }
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0 && it.dest.op_type == d.OP_VREG && it.op != d.IR_STORE && it.op != d.IR_COPY
+            && it.op != d.IR_ATOMIC_STORE && it.dest.vreg >= 0 && it.dest.vreg < nv) {
+            l.def_count[it.dest.vreg] = l.def_count[it.dest.vreg] + 1;
+            l.def_inst[it.dest.vreg] = cast(i64, it);
+        }
+        it = it.next;
+    }
+
+    // --- the sites, in list order ---
+    l.sites = d.opt_alloc(cast(i64, nload + nst + 1) * sizeof(Site));
+    l.n = 0;
+    let is i32 as cap with mut = 64;
+    while (cap < (nload + nst) * 2) { cap = cap * 2; }
+    let is *i32 as ktab = cast(*i32, d.opt_alloc(cast(i64, cap) * 4));
+    i = 0;
+    while (i < cap) { ktab[i] = 0 - 1; i = i + 1; }
+    let is i32 as pairs with mut = 0;
+    let is i32 as nwrite with mut = 0;
+    it = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as root with mut = 0;
+            let is i64 as off with mut = 0;
+            let is i32 as obj with mut = 0;
+            let is i32 as ok with mut = 0;
+            let is i32 as isst with mut = 0;
+            let is i32 as val with mut = 0;
+            if (it.op == d.IR_LOAD) {
+                ok = _site_of_load(l, it, &root, &off, &obj);
+                val = it.dest.vreg;
+            } else if (it.op == d.IR_STORE) {
+                nwrite = nwrite + 1;
+                ok = _site_of_store(l, it, &root, &off, &obj);
+                isst = 1;
+                val = it.src1.vreg;
+            } else if (it.op == d.IR_COPY) {
+                nwrite = nwrite + 1;
+            }
+            if (ok == 1) {
+                let is i32 as idx = l.n;
+                l.n = l.n + 1;
+                let is *Site as s = _s(l, idx);
+                s.inst = it; s.root = root; s.off = off; s.obj = obj;
+                s.size = _size_of(it.cast_to); s.kind = _kind_of(it.cast_to);
+                s.val = val; s.is_store = isst;
+                let is i32 as mask = cap - 1;
+                let is i32 as h with mut = cast(i32, _key_hash(root, off, s.size, s.kind) & cast(i64, mask));
+                s.next_key = 0 - 1;
+                let is i32 as done with mut = 0;
+                while (done == 0) {
+                    let is i32 as hd = ktab[h];
+                    if (hd < 0) { ktab[h] = idx; done = 1; }
+                    else {
+                        let is *Site as o = _s(l, hd);
+                        if (o.root == root && o.off == off && o.size == s.size && o.kind == s.kind) {
+                            s.next_key = hd;
+                            ktab[h] = idx;
+                            pairs = pairs + 1;
+                            done = 1;
+                        } else {
+                            h = (h + 1) & mask;
+                        }
+                    }
+                }
+                if (root >= 0) { s.next_root = l.head_root[root]; l.head_root[root] = idx; }
+                else { s.next_root = 0 - 1; }
+                s.next_val = l.head_val[val];
+                l.head_val[val] = idx;
+            }
+        }
+        it = it.next;
+    }
+    let is i32 as replaced with mut = 0;
+    // Nothing to replace without two accesses of the same bytes.
+    if (pairs > 0 && cast(i64, l.n) * cast(i64, nwrite) <= LE_MAX_ASK) {
+        replaced = _run(l, func, ktab, cap);
+    }
+    d.opt_free(cast(*u8, ktab));
+    d.opt_free(l.sites);
+    d.opt_free(vmem);
+    return replaced;
+}
+
+fn _run(l as *Le, func as *d.IRFunction, ktab as *i32, cap as i32) as i32 {
+    let is i32 as nb_cap = cfg.count_blocks(func) + 1;
+    if (cast(i64, l.n) * cast(i64, nb_cap) > LE_MAX_BITS) { return 0; }
+    let is *cfg.BasicBlock as blocks = cast(*cfg.BasicBlock, d.opt_alloc(cast(i64, nb_cap) * sizeof(cfg.BasicBlock)));
+    let is i32 as lc = func.label_count + 1;
+    let is *i32 as l2b = cast(*i32, d.opt_alloc(cast(i64, lc) * 4));
+    let is i32 as nb with mut = 0;
+    cfg.build_cfg(func, blocks, nb_cap, &nb, l2b);
+    let is *i32 as preds = cast(*i32, d.opt_alloc(cast(i64, nb * 2 + 4) * 4));
+    let is *i32 as pstart = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is *i32 as pcount = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    cfg.build_preds(blocks, nb, preds, pstart, pcount);
+    let is *i32 as rpo = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as rn with mut = 0;
+    cfg.compute_rpo(blocks, nb, rpo, &rn);
+
+    l.frame_esc = _frame_escapes(func, l.nv);
+    let is i32 as words = (l.n + 63) / 64;
+    l.words = words;
+    let is i64 as rowb = cast(i64, words) * 8;
+    let is *i64 as gens = cast(*i64, d.opt_alloc(rowb * cast(i64, nb)));
+    let is *i64 as kills = cast(*i64, d.opt_alloc(rowb * cast(i64, nb)));
+    let is *i64 as ins = cast(*i64, d.opt_alloc(rowb * cast(i64, nb)));
+    let is *i64 as outs = cast(*i64, d.opt_alloc(rowb * cast(i64, nb)));
+    let is *i64 as cur = cast(*i64, d.opt_alloc(rowb));
+    l.call_kill = cast(*i64, d.opt_alloc(rowb));
+    l.all_kill = cast(*i64, d.opt_alloc(rowb));
+    let is i32 as w with mut = 0;
+    while (w < words) { l.call_kill[w] = 0; l.all_kill[w] = 0 - 1; w = w + 1; }
+    let is i32 as s with mut = 0;
+    while (s < l.n) {
+        if (_s(l, s).obj != OBJ_FRAME || l.frame_esc == 1) { _bit_set(l.call_kill, s); }
+        s = s + 1;
+    }
+
+    // --- each block's gen and kill ---
+    let is i32 as next_site with mut = 0;
+    let is i32 as b with mut = 0;
+    while (b < nb) {
+        let is *i64 as grow = cast(*i64, cast(i64, gens) + cast(i64, b) * rowb);
+        let is *i64 as kill = cast(*i64, cast(i64, kills) + cast(i64, b) * rowb);
+        w = 0;
+        while (w < words) { grow[w] = 0; kill[w] = 0; w = w + 1; }
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+        let is *d.IRInst as it with mut = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0 && cast(i64, it) != 0) {
+            if (it.is_dead == 0) {
+                let is i32 as site with mut = 0 - 1;
+                if (next_site < l.n && cast(i64, _s(l, next_site).inst) == cast(i64, it)) {
+                    site = next_site;
+                    next_site = next_site + 1;
+                }
+                _apply(l, it, site, grow, kill);
+            }
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        b = b + 1;
+    }
+
+    // --- available on every path in ---
+    b = 0;
+    while (b < nb) {
+        let is *i64 as ir = cast(*i64, cast(i64, ins) + cast(i64, b) * rowb);
+        let is *i64 as orow = cast(*i64, cast(i64, outs) + cast(i64, b) * rowb);
+        w = 0;
+        while (w < words) { ir[w] = 0 - 1; orow[w] = 0 - 1; w = w + 1; }
+        b = b + 1;
+    }
+    let is i32 as chg with mut = 1;
+    while (chg == 1) {
+        chg = 0;
+        let is i32 as ri with mut = 0;
+        while (ri < rn) {
+            b = rpo[ri];
+            let is *i64 as ir = cast(*i64, cast(i64, ins) + cast(i64, b) * rowb);
+            let is *i64 as orow = cast(*i64, cast(i64, outs) + cast(i64, b) * rowb);
+            let is *i64 as grow = cast(*i64, cast(i64, gens) + cast(i64, b) * rowb);
+            let is *i64 as kill = cast(*i64, cast(i64, kills) + cast(i64, b) * rowb);
+            w = 0;
+            while (w < words) {
+                let is i64 as v with mut = 0 - 1;
+                if (b == 0) { v = 0; }
+                let is i32 as k with mut = 0;
+                while (k < pcount[b]) {
+                    let is i32 as p = preds[pstart[b] + k];
+                    v = v & *cast(*i64, cast(i64, outs) + cast(i64, p) * rowb + cast(i64, w) * 8);
+                    k = k + 1;
+                }
+                ir[w] = v;
+                let is i64 as nout = (v & ~kill[w]) | grow[w];
+                if (nout != orow[w]) { orow[w] = nout; chg = 1; }
+                w = w + 1;
+            }
+            ri = ri + 1;
+        }
+    }
+
+    // --- replace ---
+    let is *u8 as reach = d.opt_alloc(cast(i64, nb) + 1);
+    b = 0;
+    while (b < nb) { reach[b] = cast(u8, 0); b = b + 1; }
+    let is i32 as ri2 with mut = 0;
+    while (ri2 < rn) { reach[rpo[ri2]] = cast(u8, 1); ri2 = ri2 + 1; }
+    // Made when the first load finds a source: most functions never ask.
+    let is *u8 as ml with mut = cast(*u8, 0);
+    let is *u8 as guarded with mut = cast(*u8, 0);
+    let is i32 as replaced with mut = 0;
+    // list order for the running site number, the sets being per block
+    let is i32 as site_at with mut = 0;
+    b = 0;
+    while (b < nb) {
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+        let is *i64 as ir = cast(*i64, cast(i64, ins) + cast(i64, b) * rowb);
+        w = 0;
+        while (w < words) { cur[w] = ir[w]; w = w + 1; }
+        let is *d.IRInst as it with mut = bb.first;
+        let is i32 as done with mut = 0;
+        while (done == 0 && cast(i64, it) != 0) {
+            if (it.is_dead == 0) {
+                let is i32 as site with mut = 0 - 1;
+                if (site_at < l.n && cast(i64, _s(l, site_at).inst) == cast(i64, it)) {
+                    site = site_at;
+                    site_at = site_at + 1;
+                }
+                if (site >= 0 && reach[b] == cast(u8, 1) && it.op == d.IR_LOAD) {
+                    let is *Site as me = _s(l, site);
+                    let is i32 as q with mut = _find_key(l, ktab, cap, me);
+                    let is i32 as src with mut = 0 - 1;
+                    let is i32 as has with mut = 0;
+                    while (q >= 0 && has == 0) {
+                        if (q != site && _bit_has(cur, q) == 1) { has = 1; }
+                        q = _s(l, q).next_key;
+                    }
+                    if (has == 1 && cast(i64, ml) == 0) {
+                        ml = phi.ssa_multi_like(func);
+                        guarded = _guards(l, blocks, nb, preds, pstart, pcount, rpo, rn, reach);
+                    }
+                    if (has == 1 && guarded[site] == cast(u8, 0) && ml[it.dest.vreg] == cast(u8, 0)) {
+                        q = _find_key(l, ktab, cap, me);
+                        while (q >= 0 && src < 0) {
+                            if (q != site && _bit_has(cur, q) == 1 && ml[_s(l, q).val] == cast(u8, 0)
+                                && _s(l, q).val != it.dest.vreg) {
+                                src = q;
+                            }
+                            q = _s(l, q).next_key;
+                        }
+                    }
+                    if (src >= 0) {
+                        let is *Site as from = _s(l, src);
+                        if (from.is_store == 1 && _fwd_kind(it.cast_to) == 2) {
+                            it.op = cast(i8, d.IR_CAST);
+                            it.cast_from = it.cast_to;
+                        } else {
+                            it.op = cast(i8, d.IR_MOV);
+                        }
+                        it.src1 = d.op_vreg(from.val);
+                        it.src2 = d.op_none();
+                        replaced = replaced + 1;
+                    }
+                }
+                _apply(l, it, site, cur, cast(*i64, 0));
+            }
+            if (cast(i64, it) == cast(i64, bb.last)) { done = 1; } else { it = it.next; }
+        }
+        b = b + 1;
+    }
+
+    if (cast(i64, ml) != 0) { d.opt_free(ml); d.opt_free(guarded); }
+    d.opt_free(reach);
+    d.opt_free(cast(*u8, gens)); d.opt_free(cast(*u8, kills)); d.opt_free(cast(*u8, ins)); d.opt_free(cast(*u8, outs));
+    d.opt_free(cast(*u8, cur)); d.opt_free(cast(*u8, l.call_kill)); d.opt_free(cast(*u8, l.all_kill));
+    d.opt_free(cast(*u8, rpo)); d.opt_free(cast(*u8, preds)); d.opt_free(cast(*u8, pstart)); d.opt_free(cast(*u8, pcount));
+    d.opt_free(cast(*u8, l2b)); d.opt_free(cast(*u8, blocks));
+    return replaced;
+}
+
+// Per site, 1 for the loads a wait depends on: those in a loop whose value decides
+// one of its branches with nothing that changes taking part.
+fn _guards(l as *Le, blocks as *cfg.BasicBlock, nb as i32, preds as *i32, pstart as *i32, pcount as *i32,
+           rpo as *i32, rn as i32, reach as *u8) as *u8 {
+    dom.compute_idom(blocks, nb, rpo, rn, preds, pstart, pcount);
+    let is *u8 as inl = d.opt_alloc(cast(i64, nb) + 1);
+    let is *u8 as seen = d.opt_alloc(cast(i64, nb) + 1);
+    let is *i32 as stk = cast(*i32, d.opt_alloc(cast(i64, nb + 1) * 4));
+    let is i32 as b with mut = 0;
+    while (b < nb) { inl[b] = cast(u8, 0); b = b + 1; }
+    let is i32 as h with mut = 0;
+    while (h < nb) {
+        let is i32 as k with mut = 0;
+        while (k < pcount[h]) {
+            let is i32 as p = preds[pstart[h] + k];
+            if (reach[h] == cast(u8, 1) && reach[p] == cast(u8, 1) && _dom(blocks, h, p) == 1) {
+                // a back edge p -> h: everything that reaches p without h
+                inl[h] = cast(u8, 1);
+                let is i32 as z with mut = 0;
+                while (z < nb) { seen[z] = cast(u8, 0); z = z + 1; }
+                seen[h] = cast(u8, 1);
+                let is i32 as sp with mut = 0;
+                if (p != h) { inl[p] = cast(u8, 1); seen[p] = cast(u8, 1); stk[0] = p; sp = 1; }
+                while (sp > 0) {
+                    sp = sp - 1;
+                    let is i32 as x = stk[sp];
+                    let is i32 as q with mut = 0;
+                    while (q < pcount[x]) {
+                        let is i32 as px = preds[pstart[x] + q];
+                        if (reach[px] == cast(u8, 1) && seen[px] == cast(u8, 0)) {
+                            seen[px] = cast(u8, 1);
+                            inl[px] = cast(u8, 1);
+                            stk[sp] = px;
+                            sp = sp + 1;
+                        }
+                        q = q + 1;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        h = h + 1;
+    }
+    let is *u8 as guarded = d.opt_alloc(cast(i64, l.n) + 1);
+    let is i32 as s with mut = 0;
+    while (s < l.n) { guarded[s] = cast(u8, 0); s = s + 1; }
+    b = 0;
+    while (b < nb) {
+        if (inl[b] == cast(u8, 1)) {
+            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, b) * sizeof(cfg.BasicBlock));
+            let is *d.IRInst as t = bb.last;
+            if (cast(i64, t) != 0 && t.is_dead == 0 && (t.op == d.IR_JZ || t.op == d.IR_JNZ) && t.src1.op_type == d.OP_VREG) {
+                let is [16]i64 as found;
+                let is i32 as nf with mut = 0;
+                let is i32 as changes with mut = 0;
+                _cone(l, t.src1.vreg, 0, cast(*i64, &found), &nf, &changes);
+                if (changes == 0) {
+                    let is i32 as fk with mut = 0;
+                    while (fk < nf) {
+                        // the site of this load
+                        let is i32 as si with mut = l.head_val[cast(*d.IRInst, found[fk]).dest.vreg];
+                        while (si >= 0) {
+                            if (cast(i64, _s(l, si).inst) == found[fk]) { guarded[si] = cast(u8, 1); }
+                            si = _s(l, si).next_val;
+                        }
+                        fk = fk + 1;
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+    d.opt_free(inl); d.opt_free(seen); d.opt_free(cast(*u8, stk));
+    return guarded;
+}
+
+fn _dom(blocks as *cfg.BasicBlock, x as i32, y0 as i32) as i32 {
+    let is i32 as y with mut = y0;
+    while (y >= 0) {
+        if (y == x) { return 1; }
+        let is i32 as id = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, y) * sizeof(cfg.BasicBlock)).idom;
+        if (id == y) { return 0; }
+        y = id;
+    }
+    return 0;
+}
+
+// The newest site of the same bytes as s: the head of its chain.
+fn _find_key(l as *Le, ktab as *i32, cap as i32, s as *Site) as i32 {
+    let is i32 as mask = cap - 1;
+    let is i32 as h with mut = cast(i32, _key_hash(s.root, s.off, s.size, s.kind) & cast(i64, mask));
+    while (ktab[h] >= 0) {
+        let is *Site as o = _s(l, ktab[h]);
+        if (o.root == s.root && o.off == s.off && o.size == s.size && o.kind == s.kind) { return ktab[h]; }
+        h = (h + 1) & mask;
+    }
+    return 0 - 1;
+}

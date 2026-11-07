@@ -614,6 +614,55 @@ fn pass_compact_vregs(func as *d.IRFunction) as void {
     d.opt_free(cast(*u8, vmap));
 }
 
+// Labels get the same treatment. Each inlined copy takes a span of numbers and
+// most of those labels go away with the copy's branches, while every pass sizes
+// its tables by label_count: a function that inlined much pays for labels it no
+// longer has, in time and in pages touched, in every pass from here on.
+fn pass_compact_labels(func as *d.IRFunction) as void {
+    let is i32 as old_n = func.label_count + 1;
+    if (old_n <= 64) { return; }
+    let is *i32 as lmap = cast(*i32, d.opt_alloc(cast(i64, old_n) * 4));
+    let is i32 as i with mut = 0;
+    while (i < old_n) { lmap[i] = 0 - 1; i = i + 1; }
+    let is i32 as nxt with mut = 0;
+    let is *d.IRInst as inst with mut = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.op == d.IR_PHI) { d.opt_free(cast(*u8, lmap)); return; }
+        inst = inst.next;
+    }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 0 && inst.op == d.IR_LABEL && inst.dest.label >= 0 && inst.dest.label < old_n) {
+            if (lmap[inst.dest.label] < 0) { lmap[inst.dest.label] = nxt; nxt = nxt + 1; }
+        }
+        inst = inst.next;
+    }
+    // Worth it only when most of the numbers are gone.
+    if (nxt * 2 > old_n) { d.opt_free(cast(*u8, lmap)); return; }
+    inst = func.instructions;
+    while (cast(i64, inst) != 0) {
+        if (inst.is_dead == 1 && inst.op == d.IR_LABEL) {
+            inst.dest.label = 0;
+        } else {
+            if (inst.dest.op_type == d.OP_LABEL && inst.dest.label >= 0 && inst.dest.label < old_n) {
+                if (inst.is_dead == 0 && lmap[inst.dest.label] < 0) { lmap[inst.dest.label] = nxt; nxt = nxt + 1; }
+                if (lmap[inst.dest.label] >= 0) { inst.dest.label = lmap[inst.dest.label]; } else { inst.dest.label = 0; }
+            }
+            if (inst.src1.op_type == d.OP_LABEL && inst.src1.label >= 0 && inst.src1.label < old_n) {
+                if (lmap[inst.src1.label] < 0) { lmap[inst.src1.label] = nxt; nxt = nxt + 1; }
+                inst.src1.label = lmap[inst.src1.label];
+            }
+            if (inst.src2.op_type == d.OP_LABEL && inst.src2.label >= 0 && inst.src2.label < old_n) {
+                if (lmap[inst.src2.label] < 0) { lmap[inst.src2.label] = nxt; nxt = nxt + 1; }
+                inst.src2.label = lmap[inst.src2.label];
+            }
+        }
+        inst = inst.next;
+    }
+    func.label_count = nxt;
+    d.opt_free(cast(*u8, lmap));
+}
+
 // === Pass 3: Final resolve (forward) ===
 
 fn pass_final_resolve(func as *d.IRFunction, copy_of as *i32) as void {

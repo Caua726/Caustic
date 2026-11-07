@@ -15,6 +15,7 @@ use "opt_jt.cst" as jt;
 use "opt_cse.cst" as cse;
 use "opt_reassoc.cst" as reassoc;
 use "opt_gvn.cst" as gvn;
+use "opt_loadelim.cst" as lelim;
 use "opt_tre.cst" as tre;
 use "opt_bits.cst" as bits;
 use "opt_selfinline.cst" as si;
@@ -115,6 +116,8 @@ fn opt_prof_print() as void {
 
 // Set while optimize_func runs itself again (the unroll / SROA round).
 let is i32 as opt_nest with mut = 0;
+// Set from inlining on: what opt_loadelim finds before it is mostly undone by it.
+let is i32 as le_on with mut = 0;
 
 fn optimize_func(func as *d.IRFunction) as void {
     let is i32 as vc with mut = func.vreg_count;
@@ -210,6 +213,8 @@ fn optimize_func(func as *d.IRFunction) as void {
     // The MOVs GVN leaves in place of the redundant computations: their
     // readers in the same block read the earlier value directly.
     if (d.ir_opt_level >= 2) { prop.pass_local_copy_prop(func); }
+    // -O2: loads of what a register already holds become copies of it.
+    if (d.ir_opt_level >= 2 && le_on == 1 && lelim.pass_load_elim(func) > 0) { prop.pass_local_copy_prop(func); }
 
     if (opt_prof_on == 1) { t0 = opt_prof_time(); }
     helpers.pass_dce(func);
@@ -237,6 +242,7 @@ fn optimize_func(func as *d.IRFunction) as void {
     // final_resolve (so dead defs are flagged) and BEFORE the metadata cache
     // below stays vreg-independent anyway.
     helpers.pass_compact_vregs(func);
+    if (d.ir_opt_level >= 2) { helpers.pass_compact_labels(func); }
 
     // -O2: small constant-trip loops unrolled, then local arrays and structs
     // reached only at constant offsets split into scalar slots; each change
@@ -314,6 +320,7 @@ fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
     if (opt_prof_on == 1) { opt_prof_times[9] = opt_prof_times[9] + opt_prof_time() - ti; }
 
     // Phase 3: re-optimize after inlining
+    le_on = 1;
     optimize_func(func);
     // -O2: calls of std's allocator and string functions, read for what they mean
     if (d.ir_opt_level >= 2) {
@@ -338,6 +345,7 @@ fn optimize_inline_func(func as *d.IRFunction, prog as *u8) as void {
         // Whatever was measured of this body as a callee no longer holds.
         inl.forget(func);
     }
+    le_on = 0;
 }
 
 // -O2, after every function's optimize_inline_func: the calls opt_inline kept
@@ -348,7 +356,9 @@ fn late_inline_func(func as *d.IRFunction, prog as *u8) as void {
     inl.pass_inline_o2(func, prog);
     inl.pass_noreturn_cut(func);
     inl.set_late_round(0);
+    le_on = 1;
     optimize_func(func);
+    le_on = 0;
     inl.compact_frame(func);
     inl.forget(func);
 }

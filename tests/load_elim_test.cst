@@ -1,0 +1,151 @@
+// What opt_loadelim may and may not treat as "the register already holds it".
+// Each of these reads memory twice with something in between; the answer is only
+// right if the second read happens, or if skipping it changes nothing.
+use "../std/thread.cst" as thread;
+
+struct P { a as i64; b as i64; c as i32; d as u8; }
+
+let is i64 as g1 with mut = 1;
+let is i64 as g2 with mut = 2;
+let is i32 as flag with mut = 0;
+
+fn set_g1(v as i64) as void with noinline { g1 = v; }
+fn id(p as *i64) as *i64 with noinline { return p; }
+
+// A write through a pointer that happens to name the same memory.
+fn through_pointer(p as *i64, q as *i64) as i64 with noinline {
+    let is i64 as x = *p;
+    *q = x + 10;
+    return *p;
+}
+
+// Across blocks, on one path only.
+fn one_path(p as *P, c as i32) as i64 with noinline {
+    let is i64 as x = p.a;
+    if (c != 0) { p.a = x + 1; }
+    return p.a + x;
+}
+
+// A store to another field leaves this one; both still right.
+fn other_field(p as *P) as i64 with noinline {
+    let is i64 as x = p.a;
+    p.b = 7;
+    return p.a + x + p.b;
+}
+
+// A narrow store: the load sign- or zero-extends what the register holds whole.
+fn narrow_int(p as *P, v as i64) as i64 with noinline {
+    p.c = cast(i32, v);
+    return cast(i64, p.c);
+}
+
+fn narrow_byte(p as *P, v as i64) as i64 with noinline {
+    p.d = cast(u8, v);
+    return cast(i64, p.d);
+}
+
+// Overlap: writing a byte of a word changes the word.
+fn overlap(p as *i64) as i64 with noinline {
+    let is i64 as x = *p;
+    let is *u8 as b = cast(*u8, p);
+    b[1] = cast(u8, 1);
+    return *p - x;
+}
+
+// A call may write a global.
+fn across_call() as i64 with noinline {
+    let is i64 as x = g1;
+    set_g1(x + 5);
+    return g1 - x;
+}
+
+// A local whose address left the function.
+fn escaped() as i64 with noinline {
+    let is i64 as v with mut = 3;
+    let is *i64 as p = id(&v);
+    let is i64 as x = v;
+    *p = x + 1;
+    return v;
+}
+
+// Around a loop: the value changes on the way back.
+fn around_loop(p as *i64, n as i32) as i64 with noinline {
+    let is i64 as s with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        s = s + *p;
+        *p = *p + 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+// A pointer that changes each iteration: the same register name, other memory.
+fn walking(a as *i64, n as i32) as i64 with noinline {
+    let is i64 as s with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is *i64 as q = cast(*i64, cast(i64, a) + cast(i64, i) * 8);
+        s = s + *q;
+        s = s + *q;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn setter(arg as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < 2000000) { k = k + 1; }
+    flag = 1;
+    k = 0;
+    while (k < 2000000) { k = k + 1; }
+    flag = 2;
+    return arg;
+}
+
+// A wait on plain memory: a device register or a flag, with no volatile in the
+// language. The read before the loop must not stand in for the reads in it. An
+// alarm kills the test if it does.
+fn wait_flag() as i32 with noinline {
+    if (flag != 0) { return 1; }
+    while (flag == 0) { }
+    return 2;
+}
+
+// The same wait with work in its body, and with no read before it.
+fn wait_counting() as i64 with noinline {
+    let is i64 as n with mut = 0;
+    while (flag == 1) { n = n + 1; }
+    return n;
+}
+
+fn main() as i32 {
+    syscall(37, 20);    // alarm: a wait that never ends fails the test
+    let is i64 as w with mut = 5;
+    if (through_pointer(&w, &w) != 15) { return 1; }
+    let is P as p;
+    p.a = 1; p.b = 2; p.c = 3; p.d = cast(u8, 4);
+    if (one_path(&p, 0) != 2) { return 2; }
+    p.a = 1;
+    if (one_path(&p, 1) != 3) { return 3; }
+    p.a = 1;
+    if (other_field(&p) != 9) { return 4; }
+    if (narrow_int(&p, 0x1FFFFFFFF) != 0 - 1) { return 5; }
+    if (narrow_byte(&p, 511) != 255) { return 6; }
+    let is i64 as ov with mut = 0;
+    if (overlap(&ov) != 256) { return 7; }
+    g1 = 10;
+    if (across_call() != 5) { return 8; }
+    if (escaped() != 4) { return 9; }
+    let is i64 as q with mut = 1;
+    if (around_loop(&q, 4) != 10) { return 10; }
+    let is [4]i64 as arr;
+    arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4;
+    if (walking(&arr[0], 4) != 20) { return 11; }
+    let is thread.Thread as t;
+    if (thread.spawn(&t, fn_ptr(setter), 0) != 0) { return 12; }
+    if (wait_flag() != 2) { return 13; }
+    if (wait_counting() < 0) { return 14; }
+    thread.join(&t);
+    return 0;
+}

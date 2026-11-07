@@ -174,6 +174,9 @@ fn _rot_one(func as *d.IRFunction, latch as *d.IRInst, hdr_lbl as i32) as i32 {
 
     // H' and the inverted test, in place of the jmp.
     let is *d.IRInst as tail with mut = lprev;
+    // An empty body: the latch came right after the test, so Lb is what comes
+    // before it now.
+    if (cast(i64, tail) == cast(i64, g)) { tail = lbi; }
     w = lh.next;
     stop = 0;
     while (stop == 0) {
@@ -582,6 +585,27 @@ fn _fwd_one(func as *d.IRFunction, prev as *d.IRInst, lbl as *d.IRInst, njumps a
 // register held across it.
 let is i32 as FWD_MAX_INV with imut = 4;
 
+// Whether the branch br decides on what ld reads with nothing that changes in
+// the loop taking part: a wait on a flag or a device register, in a language
+// with no volatile. Taken out of the loop, that load makes the wait endless.
+fn _fwd_wait_walk(v as i32, ld as *d.IRInst, depth as i32, hit as *i32, varies as *i32) as void {
+    if (*varies == 1 || depth > 12) { return; }
+    if (v < 0 || v >= fo_vc || fo_one[v] <= 0) { *varies = 1; return; }
+    let is *d.IRInst as di = cast(*d.IRInst, fo_one[v]);
+    if (cast(i64, di) == cast(i64, ld)) { *hit = 1; }
+    if (di.op == d.IR_IMM || di.op == d.IR_ADDR_GLOBAL || di.op == d.IR_ADDR || di.op == d.IR_GET_ARG) { return; }
+    if (di.src1.op_type == d.OP_VREG) { _fwd_wait_walk(di.src1.vreg, ld, depth + 1, hit, varies); }
+    if (di.src2.op_type == d.OP_VREG) { _fwd_wait_walk(di.src2.vreg, ld, depth + 1, hit, varies); }
+}
+
+fn _fwd_is_wait(br as *d.IRInst, ld as *d.IRInst) as i32 {
+    if (br.src1.op_type != d.OP_VREG) { return 0; }
+    let is i32 as hit with mut = 0;
+    let is i32 as varies with mut = 0;
+    _fwd_wait_walk(br.src1.vreg, ld, 0, &hit, &varies);
+    return cast(i32, hit == 1 && varies == 0);
+}
+
 fn _fwd_inv_loads(func as *d.IRFunction, lbl as *d.IRInst, br as *d.IRInst, sts as *i64, nst as i32) as void {
     let is i32 as nh with mut = 0;
     let is *d.IRInst as w with mut = lbl.next;
@@ -591,6 +615,7 @@ fn _fwd_inv_loads(func as *d.IRFunction, lbl as *d.IRInst, br as *d.IRInst, sts 
             let is i32 as oq = _fo_get(q);
             let is i32 as ok with mut = 0;
             if (oq > 0 && q < fo_vc && fo_one[q] > 0 && cast(*d.IRInst, fo_one[q]).op == d.IR_ADDR_GLOBAL) { ok = 1; }
+            if (ok == 1 && _fwd_is_wait(br, w) == 1) { ok = 0; }
             // q's definition inside the body: the way in computes the address too
             let is i32 as qin with mut = 0;
             if (ok == 1) {
