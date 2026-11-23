@@ -1,0 +1,201 @@
+// =======================================================
+// std/mem/grow.cst — an array that grows without moving
+//
+//   use "std/mem/grow.cst" as grow;
+//   let is grow.Grow gen i64 as xs with mut = grow.grow_new gen i64 (0);
+//   let is *i64 as first = xs.push(10);   // stays valid after more pushes
+//   xs.push(20);
+//   xs.free();
+//
+// grow_new reserves `max_bytes` of address space up front (0 = 1 GiB) and the
+// array never leaves it, so growing never copies and a pointer to an element
+// stays valid until free(). The cost is that address space is spent per array:
+// use it for a few large arrays, not for thousands of small ones (Slice wins
+// there). Growing past the reservation ends the process with a message.
+//
+// Per target:
+//   Linux    — one lazy mmap; the kernel backs pages on first touch, so a
+//              push never makes a system call.
+//   Windows  — MEM_RESERVE once, then MEM_COMMIT in 64 KiB steps, so only
+//              what is used counts against the commit limit.
+//   CausticOS — reserve once, commit in 64 KiB steps (no demand paging).
+//   wasm     — no address-space reservation exists (memory.grow only appends),
+//              so the array doubles and copies like Slice. Pointers into it are
+//              NOT stable on wasm.
+// =======================================================
+
+use "core.cst" as core;
+use "../os.cst" as os;
+if (__target_is_wasm + __compat_mode) use "../os/wasm.cst" as wasi;
+
+let is i64 as CHUNK       with imut = 65536;        // commit step, bytes
+let is i64 as DEFAULT_MAX with imut = 1073741824;   // 1 GiB
+
+let is u32 as _W_RESERVE  with imut = 8192;   // MEM_RESERVE
+let is u32 as _W_COMMIT   with imut = 4096;   // MEM_COMMIT
+let is u32 as _W_RELEASE  with imut = 32768;  // MEM_RELEASE
+let is u32 as _W_NOACCESS with imut = 1;      // PAGE_NOACCESS
+let is u32 as _W_RW       with imut = 4;      // PAGE_READWRITE
+
+struct Grow gen T {
+    ptr as *T;
+    len as i64;         // elements in use
+    committed as i64;   // bytes backed (on wasm: bytes allocated)
+    reserved as i64;    // bytes of address space; the hard size limit
+}
+
+fn _die(msg as *u8) as void {
+    core.write_str(2, msg);
+    if (os.current() == os.OS_LINUX)   { os.linux.exit(1); }
+    if (os.current() == os.OS_WINDOWS) { os.windows.ExitProcess(cast(u32, 1)); }
+    if (os.current() == os.OS_CAUSTIC) { os.caustic.exit(1); }
+    if (os.current() == os.OS_WASM)    { wasi.exit(1); }
+}
+
+fn _bad(p as *u8) as i32 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0 || v == 0 - 1) { return 1; }
+    if (v < 0 && v > 0 - 4096) { return 1; }   // raw -errno from mmap
+    return 0;
+}
+
+// Claim `bytes` of address space. Returns 0 on failure.
+fn _reserve(bytes as i64) as *u8 {
+    let is *u8 as p with mut = cast(*u8, 0);
+    if (os.current() == os.OS_WINDOWS) {
+        p = os.windows.VirtualAlloc(cast(*u8, 0), bytes, _W_RESERVE, _W_NOACCESS);
+    } else if (os.current() == os.OS_WASM) {
+        p = core.mmap_anon(CHUNK);   // copy mode: start with one chunk
+    } else {
+        p = core.reserve_anon(bytes);
+    }
+    if (_bad(p) == 1) { return cast(*u8, 0); }
+    return p;
+}
+
+// Back [p, p+bytes). Returns 0 on success.
+fn _commit(p as *u8, bytes as i64) as i32 {
+    if (os.current() == os.OS_WINDOWS) {
+        let is *u8 as r = os.windows.VirtualAlloc(p, bytes, _W_COMMIT, _W_RW);
+        if (cast(i64, r) == 0) { return cast(i32, 0 - 1); }
+        return cast(i32, 0);
+    }
+    return core.commit_anon(p, bytes);
+}
+
+fn _release(p as *u8, reserved as i64) as void {
+    if (os.current() == os.OS_WINDOWS) { os.windows.VirtualFree(p, 0, _W_RELEASE); return; }
+    if (os.current() == os.OS_WASM) { return; }   // linear memory never shrinks
+    core.munmap(p, reserved);
+}
+
+// The layout every Grow gen T shares, whatever T is. The work that touches
+// this module's globals lives in these non-generic functions: a generic body
+// instantiated from another module does not see them.
+struct _Hdr {
+    ptr as *u8;
+    len as i64;
+    committed as i64;
+    reserved as i64;
+}
+
+fn _init(h as *_Hdr, max_bytes as i64) as void {
+    let is i64 as want with mut = max_bytes;
+    if (want <= 0) { want = DEFAULT_MAX; }
+    want = core.align_up(want, CHUNK);
+    let is *u8 as p = _reserve(want);
+    if (cast(i64, p) == 0) { core.oom("grow: reserving address space", want); }
+    h.ptr = p;
+    h.len = 0;
+    h.reserved = want;
+    if (os.current() == os.OS_LINUX) {
+        h.committed = want;     // lazy mmap: everything is already usable
+    } else if (os.current() == os.OS_WASM) {
+        h.committed = CHUNK;
+    } else {
+        h.committed = 0;
+    }
+}
+
+// Make room for `need` bytes. The slow path of push.
+fn _extend(h as *_Hdr, need as i64, elem as i64) as void {
+    if (need > h.reserved) {
+        _die("grow: array is full (pass a larger max_bytes to grow_new)\n");
+    }
+    if (os.current() == os.OS_WASM) {
+        let is i64 as newc with mut = h.committed * 2;
+        while (newc < need) { newc = newc * 2; }
+        if (newc > h.reserved) { newc = h.reserved; }
+        let is *u8 as np = core.mmap_anon(newc);
+        if (_bad(np) == 1) { core.oom("grow: copying to a larger block", newc); }
+        core.memcpy(np, h.ptr, h.len * elem);
+        h.ptr = np;
+        h.committed = newc;
+        return;
+    }
+    let is i64 as target with mut = core.align_up(need, CHUNK);
+    if (target > h.reserved) { target = h.reserved; }
+    if (_commit(core.ptr_add(h.ptr, h.committed), target - h.committed) != cast(i32, 0)) {
+        core.oom("grow: committing pages", target - h.committed);
+    }
+    h.committed = target;
+}
+
+fn _free(h as *_Hdr) as void {
+    if (cast(i64, h.ptr) != 0) { _release(h.ptr, h.reserved); }
+    h.ptr = cast(*u8, 0);
+    h.len = 0;
+    h.committed = 0;
+    h.reserved = 0;
+}
+
+// `max_bytes` <= 0 picks 1 GiB. Rounded up to 64 KiB.
+fn grow_new gen T (max_bytes as i64) as Grow gen T {
+    let is Grow gen T as g;
+    _init(cast(*_Hdr, &g), max_bytes);
+    return g;
+}
+
+impl Grow gen T {
+    // Append and return a pointer to the new element. The pointer stays
+    // valid until free() (except on wasm, see the header).
+    fn push(self as *Grow gen T, val as T) as *T {
+        let is i64 as need = (self.len + 1) * sizeof(T);
+        if (need > self.committed) { _extend(cast(*_Hdr, self), need, sizeof(T)); }
+        self.ptr[self.len] = val;
+        self.len = self.len + 1;
+        return &self.ptr[self.len - 1];
+    }
+
+    fn at(self as *Grow gen T, idx as i64) as *T {
+        if (idx < 0 || idx >= self.len) { _die("grow: index out of bounds\n"); }
+        return &self.ptr[idx];
+    }
+
+    fn get(self as *Grow gen T, idx as i64) as T {
+        if (idx < 0 || idx >= self.len) { _die("grow: index out of bounds\n"); }
+        return self.ptr[idx];
+    }
+
+    fn set(self as *Grow gen T, idx as i64, val as T) as void {
+        if (idx < 0 || idx >= self.len) { _die("grow: index out of bounds\n"); }
+        self.ptr[idx] = val;
+    }
+
+    fn pop(self as *Grow gen T) as T {
+        if (self.len <= 0) { _die("grow: pop on an empty array\n"); }
+        self.len = self.len - 1;
+        return self.ptr[self.len];
+    }
+
+    // Drop elements from the end; the pages stay backed for reuse.
+    fn truncate(self as *Grow gen T, n as i64) as void {
+        if (n < 0 || n > self.len) { _die("grow: truncate past the length\n"); }
+        self.len = n;
+    }
+
+    fn clear(self as *Grow gen T) as void { self.len = 0; }
+
+    // Give the whole reservation back. The array is empty and unusable after.
+    fn free(self as *Grow gen T) as void { _free(cast(*_Hdr, self)); }
+}
