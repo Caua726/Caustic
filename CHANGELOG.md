@@ -15,7 +15,19 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   reaches gets code. The quadratic walk in `emit_rodata` and a `mmap` per pass per
   function are gone. `docs/build-perf.md` has the figures.
 
+### Added
+- **`std/mem/grow.cst`: an array that grows without moving.** `Grow gen T` reserves its
+  address space once and backs it as it grows, so a push never copies and the pointer
+  `push` returns stays valid until `free()`. On wasm, which has no reservation, it
+  doubles and copies like `Slice`.
+
 ### Fixed
+- **A generic from another module did not compile when its body used that module.** The
+  body was checked in the caller's scope, so its globals, its import aliases and (off the
+  Linux `-o` path, where it was checked a second time) its helper functions were missing,
+  and a struct of the caller's given as `T` was looked up in the library. `std/slice.cst`
+  failed this way in every program. The body is now checked in its own module, with the
+  type arguments resolved where they were written.
 - **An edit could be built into the old program.** Source hashes were djb2, which cannot
   tell `"0b"` from `"1A"`; the token and syntax-tree caches served the file from before
   the edit. They are FNV-1a over 64 bits now.
