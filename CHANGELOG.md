@@ -6,7 +6,7 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
-## Unreleased
+## [v0.1.12](https://github.com/Caua726/Caustic/releases/tag/v0.1.12) — 2026-11-22
 
 ### Changed
 - **Building a large program: from 23 s and 537 MB to about 3 s and under 200 MB.**
@@ -22,6 +22,16 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
   doubles and copies like `Slice`.
 
 ### Fixed
+- **`-g` at `-O2`: a breakpoint on a function found no line, and its variables read
+  garbage.** Three faults, each hiding the next. The dead strip repacks `.text`, at
+  `-O2` with each function on a 16-byte boundary, and moved the relocations but not
+  the line rows, so every function after the first had its rows where the padding
+  before it began. No function had a row at its own address, and a frameless one's
+  first row comes after its `sub rsp`, so gdb found no line there and never read the
+  prologue end. And `-O2` drops rbp from leaf functions while every debug location is
+  rbp-relative. The rows now move with their functions, each function has a row at
+  its entry, and `-g` keeps rbp, as it already keeps locals out of registers.
+  `tools/check-debuginfo.sh` caught it; it runs on CI, not in the pre-commit gate.
 - **A generic from another module did not compile when its body used that module.** The
   body was checked in the caller's scope, so its globals, its import aliases and (off the
   Linux `-o` path, where it was checked a second time) its helper functions were missing,
