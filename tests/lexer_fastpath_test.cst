@@ -1,0 +1,93 @@
+// tests/lexer_fastpath_test.cst — the tokenizer's fast paths.
+//
+// Identifiers are classified by a packed-integer keyword compare, `( ) { } [ ]
+// , ; ~` and a lone `.` are emitted before the operator chain, and `//`
+// comments are skipped eight bytes at a time. Each case here is a place one
+// of those could go wrong: a word one byte off a keyword, `..` against `...`
+// and a `.` at the very end, a comment running into the end of the input with
+// no newline, a newline found in each byte of a word. Exit 0 = every token's
+// kind, length, line and column is the expected one.
+use "../src/lexer/lexer.cst" as lex;
+use "../src/lexer/tokens.cst" as tok;
+use "../src/ir/opt_mem.cst" as om;
+use "../std/io.cst" as io;
+
+let is i32 as fails with mut = 0;
+
+fn cstrlen(p as *u8) as i64 { let is i64 as n with mut = 0; while (p[n] != 0) { n = n + 1; } return n; }
+
+// Expected tokens as (kind, len, line, col) quadruples, EOF excluded.
+fn check(name as *u8, src as *u8, exp as *i32, n as i32) as void {
+    let is tok.TokenList as tl = lex.tokenize(src, cstrlen(src), name);
+    if (tl.count != n + 1) {
+        io.printf("FAIL %s: %d tokens, expected %d\n", name, cast(i64, tl.count - 1), cast(i64, n));
+        fails = fails + 1;
+        return;
+    }
+    let is i32 as k with mut = 0;
+    while (k < n) {
+        let is *tok.Token as t = cast(*tok.Token, cast(i64, tl.data) + cast(i64, k) * sizeof(tok.Token));
+        if (t.kind != exp[k * 4] || t.len != exp[k * 4 + 1] || t.line != exp[k * 4 + 2] || t.col != exp[k * 4 + 3]) {
+            io.printf("FAIL %s token %d: kind %d len %d at %d:%d\n", name, cast(i64, k), cast(i64, t.kind), cast(i64, t.len), cast(i64, t.line), cast(i64, t.col));
+            fails = fails + 1;
+            return;
+        }
+        k = k + 1;
+    }
+    let is *tok.Token as e = cast(*tok.Token, cast(i64, tl.data) + cast(i64, n) * sizeof(tok.Token));
+    if (e.kind != tok.TK_EOF) { io.printf("FAIL %s: no EOF\n", name); fails = fails + 1; }
+}
+
+fn main() as i32 {
+    om.opt_bins_init();
+    let is [64]i32 as e with mut;
+    // keywords and words next to them
+    e[0] = tok.TK_FN; e[1] = 2; e[2] = 1; e[3] = 1;
+    e[4] = tok.TK_IDENT; e[5] = 3; e[6] = 1; e[7] = 4;          // fnx
+    e[8] = tok.TK_FN_PTR; e[9] = 6; e[10] = 1; e[11] = 8;
+    e[12] = tok.TK_IDENT; e[13] = 7; e[14] = 1; e[15] = 15;     // fn_ptrx
+    e[16] = tok.TK_CONTINUE; e[17] = 8; e[18] = 1; e[19] = 23;
+    e[20] = tok.TK_IDENT; e[21] = 9; e[22] = 1; e[23] = 32;     // continuex
+    e[24] = tok.TK_IDENT; e[25] = 2; e[26] = 1; e[27] = 42;     // Fn
+    e[28] = tok.TK_IDENT; e[29] = 1; e[30] = 1; e[31] = 45;     // f
+    check("keywords", "fn fnx fn_ptr fn_ptrx continue continuex Fn f", &e[0], 8);
+    // dots
+    e[0] = tok.TK_IDENT; e[1] = 1; e[2] = 1; e[3] = 1;
+    e[4] = tok.TK_DOT; e[5] = 1; e[6] = 1; e[7] = 2;
+    e[8] = tok.TK_DOT; e[9] = 1; e[10] = 1; e[11] = 3;
+    e[12] = tok.TK_IDENT; e[13] = 1; e[14] = 1; e[15] = 4;
+    e[16] = tok.TK_ELLIPSIS; e[17] = 3; e[18] = 1; e[19] = 6;
+    e[20] = tok.TK_DOT; e[21] = 1; e[22] = 1; e[23] = 9;
+    check("dots", "a..b ....", &e[0], 6);
+    // punctuation that is always one byte, against its neighbours
+    e[0] = tok.TK_LPAREN; e[1] = 1; e[2] = 1; e[3] = 1;
+    e[4] = tok.TK_RBRACE; e[5] = 1; e[6] = 1; e[7] = 2;
+    e[8] = tok.TK_SEMICOLON; e[9] = 1; e[10] = 1; e[11] = 3;
+    e[12] = tok.TK_BITNOT; e[13] = 1; e[14] = 1; e[15] = 4;
+    e[16] = tok.TK_ASSIGN; e[17] = 2; e[18] = 1; e[19] = 5;
+    e[20] = tok.TK_COLON; e[21] = 1; e[22] = 1; e[23] = 7;
+    e[24] = tok.TK_COMMA; e[25] = 1; e[26] = 1; e[27] = 8;
+    check("punct", "(};~:=:,", &e[0], 7);
+    // line comments: short, longer than 8 bytes, at end of input without newline
+    e[0] = tok.TK_IDENT; e[1] = 1; e[2] = 1; e[3] = 1;
+    e[4] = tok.TK_IDENT; e[5] = 1; e[6] = 2; e[7] = 1;
+    e[8] = tok.TK_IDENT; e[9] = 1; e[10] = 3; e[11] = 3;
+    check("comments", "a //\nb // a comment longer than one word ......\n  c // to the end", &e[0], 3);
+    // newline at each offset of a word after //
+    let is [32]u8 as buf with mut;
+    let is i32 as off with mut = 0;
+    while (off < 12) {
+        let is i32 as p with mut = 0;
+        buf[p] = cast(u8, 47); p = p + 1; buf[p] = cast(u8, 47); p = p + 1;
+        let is i32 as q with mut = 0;
+        while (q < off) { buf[p] = cast(u8, 120); p = p + 1; q = q + 1; }
+        buf[p] = cast(u8, 10); p = p + 1;
+        buf[p] = cast(u8, 122); p = p + 1;   // z
+        buf[p] = cast(u8, 0);
+        e[0] = tok.TK_IDENT; e[1] = 1; e[2] = 2; e[3] = 1;
+        check("comment-offset", &buf[0], &e[0], 1);
+        off = off + 1;
+    }
+    if (fails != 0) { return 1; }
+    return 0;
+}

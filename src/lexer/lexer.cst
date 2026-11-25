@@ -51,43 +51,78 @@ fn error_at(src as *u8, src_len as i64, filename as *u8, line as i32, col as i32
 
 // Helper to push a single-char token
 fn push1(tl as *tok.TokenList, kind as i32, src as *u8, i as i64, line as i32, col as i32) as void {
-    tok.tl_push(tl, tok.make_tok(kind, cast(*u8, cast(i64, src) + i), 1, line, col, 0));
+    tok.tl_push6(tl, kind, cast(*u8, cast(i64, src) + i), 1, line, col, 0);
 }
 
 // Helper to push a two-char token
 fn push2(tl as *tok.TokenList, kind as i32, src as *u8, i as i64, line as i32, col as i32) as void {
-    tok.tl_push(tl, tok.make_tok(kind, cast(*u8, cast(i64, src) + i), 2, line, col, 0));
+    tok.tl_push6(tl, kind, cast(*u8, cast(i64, src) + i), 2, line, col, 0);
 }
 
 // Helper to push a three-char token
 fn push3(tl as *tok.TokenList, kind as i32, src as *u8, i as i64, line as i32, col as i32) as void {
-    tok.tl_push(tl, tok.make_tok(kind, cast(*u8, cast(i64, src) + i), 3, line, col, 0));
+    tok.tl_push6(tl, kind, cast(*u8, cast(i64, src) + i), 3, line, col, 0);
 }
 
 // === Main tokenizer ===
 
-fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
-    let is tok.TokenList as tl = tok.tl_init();
-    let is i64 as i with mut = 0;
-    let is i32 as line with mut = 1;
-    let is i32 as col with mut = 1;
+// 1 for the bytes that continue an identifier: letters, digits, underscore.
+let is [256]u8 as _ident_cls with mut;
+let is i32 as _ident_ready with mut = 0;
+// The token kind of a byte that is always a one-byte token on its own — no
+// longer operator starts with it — else 0.
+let is [256]u8 as _single_kind with mut;
 
-    while (i < src_len) {
-        let is u8 as c = src[i];
+fn _ident_init() as void {
+    let is i32 as b with mut = 0;
+    while (b < 256) {
+        if (lu.is_alnum(cast(u8, b)) == 1) { _ident_cls[b] = cast(u8, 1); }
+        b = b + 1;
+    }
+    _single_kind[cast(i64, lu.CH_LPAREN)] = cast(u8, tok.TK_LPAREN);
+    _single_kind[cast(i64, lu.CH_RPAREN)] = cast(u8, tok.TK_RPAREN);
+    _single_kind[cast(i64, lu.CH_LBRACE)] = cast(u8, tok.TK_LBRACE);
+    _single_kind[cast(i64, lu.CH_RBRACE)] = cast(u8, tok.TK_RBRACE);
+    _single_kind[cast(i64, lu.CH_LBRACK)] = cast(u8, tok.TK_LBRACKET);
+    _single_kind[cast(i64, lu.CH_RBRACK)] = cast(u8, tok.TK_RBRACKET);
+    _single_kind[cast(i64, lu.CH_COMMA)] = cast(u8, tok.TK_COMMA);
+    _single_kind[cast(i64, lu.CH_SEMI)] = cast(u8, tok.TK_SEMICOLON);
+    _single_kind[cast(i64, lu.CH_TILDE)] = cast(u8, tok.TK_BITNOT);
+    _ident_ready = 1;
+}
 
-        // Whitespace
-        if (c == lu.CH_SPACE || c == lu.CH_TAB || c == lu.CH_CR) {
-            col = col + 1; i = i + 1;
-        }
-        else if (c == lu.CH_NL) {
-            line = line + 1; col = 1; i = i + 1;
-        }
-        // Line comment: //
-        else if (c == lu.CH_SLASH && i + 1 < src_len && src[i + 1] == lu.CH_SLASH) {
-            while (i < src_len && src[i] != lu.CH_NL) { i = i + 1; }
-        }
+// The index of the first newline at or after i (src_len when none), eight
+// bytes at a time while eight remain: a word has a zero byte where it held
+// '\n' after XOR with 0x0A in every byte.
+fn _skip_to_nl(src as *u8, from as i64, src_len as i64) as i64 {
+    let is i64 as i with mut = from;
+    let is i64 as ones = 72340172838076673;              // 0x0101010101010101
+    let is i64 as highs = 0 - 9187201950435737472;       // 0x8080808080808080
+    let is i64 as nls = 723401728380766730;              // 0x0A0A0A0A0A0A0A0A
+    while (i + 8 <= src_len) {
+        let is i64 as w = *cast(*i64, cast(i64, src) + i) ^ nls;
+        if (((w - ones) & (w ^ (0 - 1)) & highs) != 0) { break; }
+        i = i + 8;
+    }
+    while (i < src_len && src[i] != lu.CH_NL) { i = i + 1; }
+    return i;
+}
+
+// Everything but whitespace, newlines, line comments and identifiers: rarer,
+// and kept out of tokenize so its loop keeps its position in registers.
+struct LexPos {
+    i as i64;
+    line as i32;
+    col as i32;
+}
+
+fn _lex_other(tl as *tok.TokenList, src as *u8, src_len as i64, filename as *u8, st as *LexPos) as void with noinline {
+    let is i64 as i with mut = st.i;
+    let is i32 as line with mut = st.line;
+    let is i32 as col with mut = st.col;
+    let is u8 as c = src[i];
         // Block comment: /* ... */ (nestable)
-        else if (c == lu.CH_SLASH && i + 1 < src_len && src[i + 1] == lu.CH_STAR) {
+        if (c == lu.CH_SLASH && i + 1 < src_len && src[i + 1] == lu.CH_STAR) {
             let is i32 as sc = col;
             let is i32 as sl = line;
             i = i + 2; col = col + 2;
@@ -105,15 +140,6 @@ fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
             }
             if (depth > 0) { error_at(src, src_len, filename, sl, sc, "unterminated block comment"); }
         }
-        // Identifiers and keywords
-        else if (lu.is_alpha(c) == 1) {
-            let is i64 as start = i;
-            let is i32 as sc = col;
-            while (i < src_len && lu.is_alnum(src[i]) == 1) { i = i + 1; col = col + 1; }
-            let is i32 as tlen = cast(i32, i - start);
-            let is *u8 as tptr = cast(*u8, cast(i64, src) + start);
-            tok.tl_push(&tl, tok.make_tok(tok.keyword_lookup(tptr, tlen), tptr, tlen, line, sc, 0));
-        }
         // Numbers: decimal, hex (0x), binary (0b), octal (0o), float
         // Underscores allowed as digit separators (1_000, 0xFF_FF, etc.)
         else if (lu.is_digit(c) == 1) {
@@ -124,19 +150,19 @@ fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
                 i = i + 2; col = col + 2;
                 while (i < src_len && (lu.is_hex(src[i]) == 1 || src[i] == lu.CH_UNDER)) { i = i + 1; col = col + 1; }
                 let is i32 as tlen = cast(i32, i - start);
-                tok.tl_push(&tl, tok.make_tok(tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_hex_val(src, start + 2, i)));
+                tok.tl_push6(tl, tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_hex_val(src, start + 2, i));
             } else if (c == lu.CH_0 && i + 1 < src_len && (src[i + 1] == lu.CH_b || src[i + 1] == lu.CH_B)) {
                 // Binary: 0b...
                 i = i + 2; col = col + 2;
                 while (i < src_len && (lu.is_binary(src[i]) == 1 || src[i] == lu.CH_UNDER)) { i = i + 1; col = col + 1; }
                 let is i32 as tlen = cast(i32, i - start);
-                tok.tl_push(&tl, tok.make_tok(tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_binary_val(src, start + 2, i)));
+                tok.tl_push6(tl, tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_binary_val(src, start + 2, i));
             } else if (c == lu.CH_0 && i + 1 < src_len && (src[i + 1] == lu.CH_o || src[i + 1] == lu.CH_O)) {
                 // Octal: 0o...
                 i = i + 2; col = col + 2;
                 while (i < src_len && (lu.is_octal(src[i]) == 1 || src[i] == lu.CH_UNDER)) { i = i + 1; col = col + 1; }
                 let is i32 as tlen = cast(i32, i - start);
-                tok.tl_push(&tl, tok.make_tok(tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_octal_val(src, start + 2, i)));
+                tok.tl_push6(tl, tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_octal_val(src, start + 2, i));
             } else {
                 // Decimal or float
                 while (i < src_len && (lu.is_digit(src[i]) == 1 || src[i] == lu.CH_UNDER)) { i = i + 1; col = col + 1; }
@@ -160,10 +186,10 @@ fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
                 }
                 if (is_flt == 1) {
                     let is i32 as tlen = cast(i32, i - start);
-                    tok.tl_push(&tl, tok.make_tok(tok.TK_FLOAT, cast(*u8, cast(i64, src) + start), tlen, line, sc, 0));
+                    tok.tl_push6(tl, tok.TK_FLOAT, cast(*u8, cast(i64, src) + start), tlen, line, sc, 0);
                 } else {
                     let is i32 as tlen = cast(i32, i - start);
-                    tok.tl_push(&tl, tok.make_tok(tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_decimal(src, start, i)));
+                    tok.tl_push6(tl, tok.TK_INTEGER, cast(*u8, cast(i64, src) + start), tlen, line, sc, lu.parse_decimal(src, start, i));
                 }
             }
         }
@@ -179,7 +205,7 @@ fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
             }
             if (i >= src_len) { error_at(src, src_len, filename, line, sc, "unterminated string literal"); }
             i = i + 1; col = col + 1;
-            tok.tl_push(&tl, tok.make_tok(tok.TK_STRING, cast(*u8, cast(i64, src) + start), cast(i32, i - start), line, sc, 0));
+            tok.tl_push6(tl, tok.TK_STRING, cast(*u8, cast(i64, src) + start), cast(i32, i - start), line, sc, 0);
         }
         // Char literal
         else if (c == lu.CH_SQUOTE) {
@@ -214,121 +240,173 @@ fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
             } else if (i < src_len) { cv = cast(i64, src[i]); i = i + 1; col = col + 1; }
             if (i >= src_len || src[i] != lu.CH_SQUOTE) { error_at(src, src_len, filename, line, sc, "unterminated char literal"); }
             i = i + 1; col = col + 1;
-            tok.tl_push(&tl, tok.make_tok(tok.TK_CHAR, cast(*u8, 0), 0, line, sc, cv));
+            tok.tl_push6(tl, tok.TK_CHAR, cast(*u8, 0), 0, line, sc, cv);
         }
         // 3-char operators (must come before 2-char prefixes)
         // <<=
         else if (c == lu.CH_LT && i + 2 < src_len && src[i + 1] == lu.CH_LT && src[i + 2] == lu.CH_EQ) {
-            push3(&tl, tok.TK_SHL_EQ, src, i, line, col); i = i + 3; col = col + 3;
+            push3(tl, tok.TK_SHL_EQ, src, i, line, col); i = i + 3; col = col + 3;
         }
         // >>=
         else if (c == lu.CH_GT && i + 2 < src_len && src[i + 1] == lu.CH_GT && src[i + 2] == lu.CH_EQ) {
-            push3(&tl, tok.TK_SHR_EQ, src, i, line, col); i = i + 3; col = col + 3;
+            push3(tl, tok.TK_SHR_EQ, src, i, line, col); i = i + 3; col = col + 3;
         }
         // ...
         else if (c == lu.CH_DOT && i + 2 < src_len && src[i + 1] == lu.CH_DOT && src[i + 2] == lu.CH_DOT) {
-            push3(&tl, tok.TK_ELLIPSIS, src, i, line, col); i = i + 3; col = col + 3;
+            push3(tl, tok.TK_ELLIPSIS, src, i, line, col); i = i + 3; col = col + 3;
         }
         // 2-char operators
         // ==
         else if (c == lu.CH_EQ && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_EQEQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_EQEQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // !=
         else if (c == lu.CH_BANG && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_NE, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_NE, src, i, line, col); i = i + 2; col = col + 2;
         }
         // <=
         else if (c == lu.CH_LT && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_LE, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_LE, src, i, line, col); i = i + 2; col = col + 2;
         }
         // <<
         else if (c == lu.CH_LT && i + 1 < src_len && src[i + 1] == lu.CH_LT) {
-            push2(&tl, tok.TK_SHL, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_SHL, src, i, line, col); i = i + 2; col = col + 2;
         }
         // >=
         else if (c == lu.CH_GT && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_GE, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_GE, src, i, line, col); i = i + 2; col = col + 2;
         }
         // >>
         else if (c == lu.CH_GT && i + 1 < src_len && src[i + 1] == lu.CH_GT) {
-            push2(&tl, tok.TK_SHR, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_SHR, src, i, line, col); i = i + 2; col = col + 2;
         }
         // &&
         else if (c == lu.CH_AMP && i + 1 < src_len && src[i + 1] == lu.CH_AMP) {
-            push2(&tl, tok.TK_AND_AND, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_AND_AND, src, i, line, col); i = i + 2; col = col + 2;
         }
         // &=
         else if (c == lu.CH_AMP && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_AND_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_AND_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // ||
         else if (c == lu.CH_PIPE && i + 1 < src_len && src[i + 1] == lu.CH_PIPE) {
-            push2(&tl, tok.TK_OR_OR, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_OR_OR, src, i, line, col); i = i + 2; col = col + 2;
         }
         // |=
         else if (c == lu.CH_PIPE && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_OR_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_OR_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // ^=
         else if (c == lu.CH_CARET && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_XOR_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_XOR_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // :=
         else if (c == lu.CH_COLON && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_ASSIGN, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_ASSIGN, src, i, line, col); i = i + 2; col = col + 2;
         }
         // ->
         else if (c == lu.CH_MINUS && i + 1 < src_len && src[i + 1] == lu.CH_GT) {
-            push2(&tl, tok.TK_ARROW, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_ARROW, src, i, line, col); i = i + 2; col = col + 2;
         }
         // +=
         else if (c == lu.CH_PLUS && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_PLUS_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_PLUS_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // -=
         else if (c == lu.CH_MINUS && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_MINUS_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_MINUS_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // *=
         else if (c == lu.CH_STAR && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_STAR_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_STAR_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // /=
         else if (c == lu.CH_SLASH && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_SLASH_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_SLASH_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // %=
         else if (c == lu.CH_PERCENT && i + 1 < src_len && src[i + 1] == lu.CH_EQ) {
-            push2(&tl, tok.TK_PERCENT_EQ, src, i, line, col); i = i + 2; col = col + 2;
+            push2(tl, tok.TK_PERCENT_EQ, src, i, line, col); i = i + 2; col = col + 2;
         }
         // Single-char operators
-        else if (c == lu.CH_PLUS)    { push1(&tl, tok.TK_PLUS, src, i, line, col); i = i + 1; col = col + 1; }     // '+'
-        else if (c == lu.CH_MINUS)   { push1(&tl, tok.TK_MINUS, src, i, line, col); i = i + 1; col = col + 1; }    // '-'
-        else if (c == lu.CH_STAR)    { push1(&tl, tok.TK_STAR, src, i, line, col); i = i + 1; col = col + 1; }     // '*'
-        else if (c == lu.CH_SLASH)   { push1(&tl, tok.TK_SLASH, src, i, line, col); i = i + 1; col = col + 1; }    // '/'
-        else if (c == lu.CH_PERCENT) { push1(&tl, tok.TK_PERCENT, src, i, line, col); i = i + 1; col = col + 1; }  // '%'
-        else if (c == lu.CH_EQ)      { push1(&tl, tok.TK_EQ, src, i, line, col); i = i + 1; col = col + 1; }      // '='
-        else if (c == lu.CH_BANG)    { push1(&tl, tok.TK_NOT, src, i, line, col); i = i + 1; col = col + 1; }      // '!'
-        else if (c == lu.CH_LT)     { push1(&tl, tok.TK_LT, src, i, line, col); i = i + 1; col = col + 1; }      // '<'
-        else if (c == lu.CH_GT)     { push1(&tl, tok.TK_GT, src, i, line, col); i = i + 1; col = col + 1; }      // '>'
-        else if (c == lu.CH_AMP)    { push1(&tl, tok.TK_AND, src, i, line, col); i = i + 1; col = col + 1; }      // '&'
-        else if (c == lu.CH_PIPE)   { push1(&tl, tok.TK_OR, src, i, line, col); i = i + 1; col = col + 1; }       // '|'
-        else if (c == lu.CH_CARET)  { push1(&tl, tok.TK_XOR, src, i, line, col); i = i + 1; col = col + 1; }      // '^'
-        else if (c == lu.CH_TILDE)  { push1(&tl, tok.TK_BITNOT, src, i, line, col); i = i + 1; col = col + 1; }   // '~'
-        else if (c == lu.CH_LPAREN)  { push1(&tl, tok.TK_LPAREN, src, i, line, col); i = i + 1; col = col + 1; }  // '('
-        else if (c == lu.CH_RPAREN)  { push1(&tl, tok.TK_RPAREN, src, i, line, col); i = i + 1; col = col + 1; }  // ')'
-        else if (c == lu.CH_LBRACE)  { push1(&tl, tok.TK_LBRACE, src, i, line, col); i = i + 1; col = col + 1; }  // '{'
-        else if (c == lu.CH_RBRACE)  { push1(&tl, tok.TK_RBRACE, src, i, line, col); i = i + 1; col = col + 1; }  // '}'
-        else if (c == lu.CH_LBRACK)  { push1(&tl, tok.TK_LBRACKET, src, i, line, col); i = i + 1; col = col + 1; } // '['
-        else if (c == lu.CH_RBRACK)  { push1(&tl, tok.TK_RBRACKET, src, i, line, col); i = i + 1; col = col + 1; } // ']'
-        else if (c == lu.CH_COMMA)   { push1(&tl, tok.TK_COMMA, src, i, line, col); i = i + 1; col = col + 1; }   // ','
-        else if (c == lu.CH_DOT)     { push1(&tl, tok.TK_DOT, src, i, line, col); i = i + 1; col = col + 1; }     // '.'
-        else if (c == lu.CH_SEMI)    { push1(&tl, tok.TK_SEMICOLON, src, i, line, col); i = i + 1; col = col + 1; } // ';'
-        else if (c == lu.CH_COLON)   { push1(&tl, tok.TK_COLON, src, i, line, col); i = i + 1; col = col + 1; }   // ':'
+        else if (c == lu.CH_PLUS)    { push1(tl, tok.TK_PLUS, src, i, line, col); i = i + 1; col = col + 1; }     // '+'
+        else if (c == lu.CH_MINUS)   { push1(tl, tok.TK_MINUS, src, i, line, col); i = i + 1; col = col + 1; }    // '-'
+        else if (c == lu.CH_STAR)    { push1(tl, tok.TK_STAR, src, i, line, col); i = i + 1; col = col + 1; }     // '*'
+        else if (c == lu.CH_SLASH)   { push1(tl, tok.TK_SLASH, src, i, line, col); i = i + 1; col = col + 1; }    // '/'
+        else if (c == lu.CH_PERCENT) { push1(tl, tok.TK_PERCENT, src, i, line, col); i = i + 1; col = col + 1; }  // '%'
+        else if (c == lu.CH_EQ)      { push1(tl, tok.TK_EQ, src, i, line, col); i = i + 1; col = col + 1; }      // '='
+        else if (c == lu.CH_BANG)    { push1(tl, tok.TK_NOT, src, i, line, col); i = i + 1; col = col + 1; }      // '!'
+        else if (c == lu.CH_LT)     { push1(tl, tok.TK_LT, src, i, line, col); i = i + 1; col = col + 1; }      // '<'
+        else if (c == lu.CH_GT)     { push1(tl, tok.TK_GT, src, i, line, col); i = i + 1; col = col + 1; }      // '>'
+        else if (c == lu.CH_AMP)    { push1(tl, tok.TK_AND, src, i, line, col); i = i + 1; col = col + 1; }      // '&'
+        else if (c == lu.CH_PIPE)   { push1(tl, tok.TK_OR, src, i, line, col); i = i + 1; col = col + 1; }       // '|'
+        else if (c == lu.CH_CARET)  { push1(tl, tok.TK_XOR, src, i, line, col); i = i + 1; col = col + 1; }      // '^'
+        else if (c == lu.CH_TILDE)  { push1(tl, tok.TK_BITNOT, src, i, line, col); i = i + 1; col = col + 1; }   // '~'
+        else if (c == lu.CH_LPAREN)  { push1(tl, tok.TK_LPAREN, src, i, line, col); i = i + 1; col = col + 1; }  // '('
+        else if (c == lu.CH_RPAREN)  { push1(tl, tok.TK_RPAREN, src, i, line, col); i = i + 1; col = col + 1; }  // ')'
+        else if (c == lu.CH_LBRACE)  { push1(tl, tok.TK_LBRACE, src, i, line, col); i = i + 1; col = col + 1; }  // '{'
+        else if (c == lu.CH_RBRACE)  { push1(tl, tok.TK_RBRACE, src, i, line, col); i = i + 1; col = col + 1; }  // '}'
+        else if (c == lu.CH_LBRACK)  { push1(tl, tok.TK_LBRACKET, src, i, line, col); i = i + 1; col = col + 1; } // '['
+        else if (c == lu.CH_RBRACK)  { push1(tl, tok.TK_RBRACKET, src, i, line, col); i = i + 1; col = col + 1; } // ']'
+        else if (c == lu.CH_COMMA)   { push1(tl, tok.TK_COMMA, src, i, line, col); i = i + 1; col = col + 1; }   // ','
+        else if (c == lu.CH_DOT)     { push1(tl, tok.TK_DOT, src, i, line, col); i = i + 1; col = col + 1; }     // '.'
+        else if (c == lu.CH_SEMI)    { push1(tl, tok.TK_SEMICOLON, src, i, line, col); i = i + 1; col = col + 1; } // ';'
+        else if (c == lu.CH_COLON)   { push1(tl, tok.TK_COLON, src, i, line, col); i = i + 1; col = col + 1; }   // ':'
         else { error_at(src, src_len, filename, line, col, "unexpected character"); }
+    st.i = i;
+    st.line = line;
+    st.col = col;
+}
+
+fn tokenize(src as *u8, src_len as i64, filename as *u8) as tok.TokenList {
+    if (_ident_ready == 0) { _ident_init(); }
+    let is tok.TokenList as tl = tok.tl_init();
+    let is i64 as i with mut = 0;
+    let is i32 as line with mut = 1;
+    let is i32 as col with mut = 1;
+    let is LexPos as pos with mut;
+
+    while (i < src_len) {
+        let is u8 as c = src[i];
+
+        // Whitespace
+        if (c == lu.CH_SPACE || c == lu.CH_TAB || c == lu.CH_CR) {
+            col = col + 1; i = i + 1;
+            while (i < src_len && (src[i] == lu.CH_SPACE || src[i] == lu.CH_TAB || src[i] == lu.CH_CR)) { col = col + 1; i = i + 1; }
+        }
+        else if (c == lu.CH_NL) {
+            line = line + 1; col = 1; i = i + 1;
+        }
+        // Line comment: //
+        else if (c == lu.CH_SLASH && i + 1 < src_len && src[i + 1] == lu.CH_SLASH) {
+            i = _skip_to_nl(src, i + 2, src_len);
+        }
+        // Identifiers and keywords
+        else if (lu.is_alpha(c) == 1) {
+            let is i64 as start = i;
+            let is i32 as sc = col;
+            i = i + 1;
+            while (i < src_len && _ident_cls[cast(i64, src[i])] != 0) { i = i + 1; }
+            col = col + cast(i32, i - start);
+            let is i32 as tlen = cast(i32, i - start);
+            let is *u8 as tptr = cast(*u8, cast(i64, src) + start);
+            tok.tl_push6(&tl, tok.keyword_lookup(tptr, tlen), tptr, tlen, line, sc, 0);
+        }
+        else if (_single_kind[cast(i64, c)] != 0) {
+            tok.tl_push6(&tl, cast(i32, _single_kind[cast(i64, c)]), cast(*u8, cast(i64, src) + i), 1, line, col, 0);
+            i = i + 1; col = col + 1;
+        }
+        else if (c == lu.CH_DOT && (i + 2 >= src_len || src[i + 1] != lu.CH_DOT || src[i + 2] != lu.CH_DOT)) {
+            tok.tl_push6(&tl, tok.TK_DOT, cast(*u8, cast(i64, src) + i), 1, line, col, 0);
+            i = i + 1; col = col + 1;
+        }
+        else {
+            pos.i = i; pos.line = line; pos.col = col;
+            _lex_other(&tl, src, src_len, filename, &pos);
+            i = pos.i; line = pos.line; col = pos.col;
+        }
     }
 
-    tok.tl_push(&tl, tok.make_tok(tok.TK_EOF, cast(*u8, 0), 0, line, col, 0));
+    tok.tl_push6(&tl, tok.TK_EOF, cast(*u8, 0), 0, line, col, 0);
     return tl;
 }
