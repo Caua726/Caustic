@@ -178,6 +178,17 @@ if have llvm-pdbutil; then
         llvm-pdbutil dump --modules "$TMP/dbg.pdb" 2>/dev/null | grep -q '# files: 1' \
             && ok "module reports its source file" || bad "module reports no files"
     else bad "dbg.cst failed to cross-build (windows)"; fi
+    # every instruction carrying a constant of tests/pdb/gen.py must come back,
+    # through llvm-pdbutil and llvm-symbolizer, as the file and line that wrote it
+    if have python3 && have llvm-symbolizer && have llvm-objdump; then
+        ( mkdir -p "$TMP/pl" && cd "$TMP/pl" && python3 "$ROOT/tests/pdb/gen.py"
+          for o in -O0 -O1 -O2; do
+              "$CC" -q -g $o --target=windows-x86_64 b.cst -o l.exe && python3 "$ROOT/tests/pdb/check.py" l.exe l.pdb consts.json || exit 1
+              "$CC" -q -g $o -c --target=windows-x86_64 b.cst -o b.obj && "$ROOT/caustic-ld" --target=windows-x86_64 b.obj -o c.exe >/dev/null \
+                  && python3 "$ROOT/tests/pdb/check.py" c.exe c.pdb consts.json || exit 1
+          done ) > "$TMP/pl.out" 2>&1 && ok "PDB lines: every constant on its own file and line (-O0/-O1/-O2, -o and -c)" \
+            || bad "PDB lines: $(grep -m1 FAIL "$TMP/pl.out")"
+    else skip "PDB lines (python3, llvm-symbolizer, llvm-objdump)"; fi
     # multi-file: one module per object, each with its own source
     if cst --target=windows-x86_64 "$TMP/lib.cst" "$TMP/main.cst" -o "$TMP/multi.exe"; then
         n="$(llvm-pdbutil dump --modules "$TMP/multi.pdb" 2>/dev/null | grep -c 'debug stream:')"
