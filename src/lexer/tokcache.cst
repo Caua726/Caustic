@@ -1,0 +1,142 @@
+// Token lists of imported modules, kept beside the cached objects: a warm
+// compile of a small program spends a quarter of its time lexing std modules
+// that have not changed. The directory is already specific to this compiler
+// (main._default_obj_cache); the file is named by a hash of the source text
+// and carries a second one, the source length and the token count.
+//
+// A token's ptr is stored as its offset in the source (-1 for null); a list
+// with a pointer anywhere else is not kept. Any mismatch is a miss.
+use "tokens.cst" as tok;
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+use "../../std/os.cst" as os;
+
+let is i64 as tc_dir with mut = 0;        // NUL-terminated; 0 = off
+let is i32 as TC_HDR with imut = 32;
+
+fn set_dir(dir as i64) as void { tc_dir = dir; }
+
+let is i64 as _h1 with mut = 0;
+let is i64 as _h2 with mut = 0;
+
+fn _hash(src as *u8, n as i64) as void {
+    let is i64 as a with mut = 0 - 3750763034362895579;
+    let is i64 as b with mut = n * 7046029254386353131;
+    let is i64 as k with mut = 0;
+    while (k + 8 <= n) {
+        let is i64 as w = *cast(*i64, cast(i64, src) + k);
+        a = (a ^ w) * 1099511628211;
+        a = a ^ ((a >> 29) & 34359738367);
+        b = (b + w) * 6238072747940578789;
+        b = b ^ ((b >> 31) & 8589934591);
+        k = k + 8;
+    }
+    let is i64 as t with mut = 0;
+    while (k < n) { t = (t << 8) | cast(i64, src[k]); k = k + 1; }
+    a = (a ^ t ^ n) * 1099511628211;
+    b = (b + t) * 6238072747940578789;
+    _h1 = a ^ ((a >> 32) & 4294967295);
+    _h2 = b ^ ((b >> 32) & 4294967295);
+}
+
+fn _path(out as *u8) as i32 {
+    let is *u8 as dir = cast(*u8, tc_dir);
+    let is i32 as n with mut = 0;
+    while (dir[n] != 0 && n < 4000) { out[n] = dir[n]; n = n + 1; }
+    out[n] = cast(u8, 47);
+    n = n + 1;
+    let is i64 as v with mut = _h1;
+    let is i32 as hi with mut = 15;
+    while (hi >= 0) {
+        let is i32 as nib = cast(i32, v & 15);
+        if (nib < 10) { out[n + hi] = cast(u8, 48 + nib); } else { out[n + hi] = cast(u8, 87 + nib); }
+        v = (v >> 4) & 1152921504606846975;
+        hi = hi - 1;
+    }
+    n = n + 16;
+    out[n] = cast(u8, 46); out[n + 1] = cast(u8, 116); out[n + 2] = cast(u8, 107); out[n + 3] = cast(u8, 0);   // .tk
+    return n + 3;
+}
+
+fn _read_all(fd as i64, buf as *u8, n as i64) as i32 {
+    let is i64 as got with mut = 0;
+    while (got < n) {
+        let is i64 as r = io._read_fd(fd, cast(*u8, cast(i64, buf) + got), n - got);
+        if (r <= 0) { return 0; }
+        got = got + r;
+    }
+    return 1;
+}
+
+// 1 and *out filled in, or 0.
+fn load(src as *u8, n as i64, out as *tok.TokenList) as i32 {
+    if (tc_dir == 0 || n < 512) { return 0; }
+    _hash(src, n);
+    let is [4096]u8 as path with mut;
+    _path(&path[0]);
+    let is i64 as fd = io._open_read(&path[0]);
+    if (fd < 0) { return 0; }
+    let is [4]i64 as hd with mut;
+    let is i32 as ok with mut = _read_all(fd, cast(*u8, &hd), cast(i64, TC_HDR));
+    if (ok == 1 && (hd[0] != _h1 || hd[1] != _h2 || hd[2] != n || hd[3] <= 0 || hd[3] > n + 1)) { ok = 0; }
+    if (ok == 1) {
+        let is i64 as bytes = hd[3] * sizeof(tok.Token);
+        out.data = tok.tok_alloc(bytes);
+        out.count = cast(i32, hd[3]);
+        out.cap = cast(i32, hd[3]);
+        ok = _read_all(fd, out.data, bytes);
+        let is *tok.Token as t with mut = cast(*tok.Token, out.data);
+        let is i64 as end = cast(i64, out.data) + bytes;
+        while (ok == 1 && cast(i64, t) < end) {
+            let is i64 as off = cast(i64, t.ptr);
+            if (off < 0 - 1 || off > n || t.len < 0 || off + cast(i64, t.len) > n) { ok = 0; }
+            if (off < 0) { t.ptr = cast(*u8, 0); } else { t.ptr = cast(*u8, cast(i64, src) + off); }
+            t = cast(*tok.Token, cast(i64, t) + sizeof(tok.Token));
+        }
+        if (ok == 0) { tok.om.opt_free(out.data); }
+    }
+    io._close_fd(fd);
+    return ok;
+}
+
+// Keep the list just lexed from src (the hashes are load's).
+fn store(src as *u8, n as i64, tl as *tok.TokenList) as void {
+    if (tc_dir == 0 || n < 512) { return; }
+    let is i64 as bytes = cast(i64, tl.count) * sizeof(tok.Token);
+    let is *u8 as buf = tok.tok_alloc(bytes + cast(i64, TC_HDR));
+    let is *i64 as hd = cast(*i64, buf);
+    hd[0] = _h1; hd[1] = _h2; hd[2] = n; hd[3] = cast(i64, tl.count);
+    mem.memcpy(cast(*u8, cast(i64, buf) + cast(i64, TC_HDR)), tl.data, bytes);
+    let is i32 as ok with mut = 1;
+    let is i32 as i with mut = 0;
+    while (i < tl.count) {
+        let is *tok.Token as t = cast(*tok.Token, cast(i64, buf) + cast(i64, TC_HDR) + cast(i64, i) * sizeof(tok.Token));
+        if (cast(i64, t.ptr) == 0) { t.ptr = cast(*u8, 0 - 1); }
+        else {
+            let is i64 as off = cast(i64, t.ptr) - cast(i64, src);
+            if (off < 0 || off > n || off + cast(i64, t.len) > n) { ok = 0; }
+            t.ptr = cast(*u8, off);
+        }
+        i = i + 1;
+    }
+    if (ok == 1) {
+        let is [4096]u8 as path with mut;
+        let is [4128]u8 as tmp with mut;
+        let is i32 as pl = _path(&path[0]);
+        let is i32 as k with mut = 0;
+        while (k < pl) { tmp[k] = path[k]; k = k + 1; }
+        tmp[k] = cast(u8, 46);
+        k = k + 1;
+        let is i64 as id with mut = 0;
+        if (os.current() == os.OS_LINUX) { id = os.linux.getpid(); }
+        while (id > 0) { tmp[k] = cast(u8, 48 + id % 10); id = id / 10; k = k + 1; }
+        tmp[k] = cast(u8, 0);
+        let is i64 as fd = io._open_write(&tmp[0]);
+        if (fd >= 0) {
+            let is i64 as w = io._write_fd(fd, buf, bytes + cast(i64, TC_HDR));
+            io._close_fd(fd);
+            if (w == bytes + cast(i64, TC_HDR)) { io.rename(&tmp[0], &path[0]); } else { io.unlink(&tmp[0]); }
+        }
+    }
+    tok.om.opt_free(buf);
+}

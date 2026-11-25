@@ -263,10 +263,38 @@ touch -d '40 days ago' "$keep"
 "$cc" -q -O1 -j 2 top.cst -o d7
 check "collected at most once a day" "$([ -e "$keep" ] && echo 1 || echo 0)"
 touch -d '2 days ago' "$objs/.collected"
-for f in "$objs"/*/*.o; do touch -d '10 minutes ago' "$f"; done
+for f in "$objs"/*/*.o "$objs"/*/*.tk; do touch -d '10 minutes ago' "$f"; done
 CAUSTIC_CACHE_MAX_MB=0 "$cc" -q -O1 -j 2 top.cst -o d8
 check "over the size limit, the oldest go" "$([ -z "$(ls "$d2dir")" ] && echo 1 || echo 0)"
 check "the build still links" "$(cmp -s d8 d3 && echo 1 || echo 0)"
+
+# Imported modules' token lists (src/lexer/tokcache.cst) are kept in the same
+# directory: a warm build reads them, and a damaged or stale one is a miss.
+printf 'use "std/io.cst" as io;\nuse "tmod.cst" as m;\nfn main() as i32 { io.printf("%%d\\n", m.val()); return 0; }\n' > tk.cst
+{ for i in $(seq 40); do echo "// a comment line so that the module is worth keeping"; done; echo 'fn val() as i64 { return 41; }'; } > tmod.cst
+"$cc" -q -O1 tk.cst -o t1
+ntk=$(ls "$objs"/*/*.tk 2>/dev/null | wc -l)
+check "token lists are kept ($ntk)" "$([ "$ntk" -ge 5 ] && echo 1 || echo 0)"
+"$cc" -q -O1 tk.cst -o t2; "$cc" -q -O1 --no-obj-cache tk.cst -o t3
+check "warm token lists: same output" "$(cmp -s t2 t3 && cmp -s t1 t3 && echo 1 || echo 0)"
+for f in "$objs"/*/*.tk; do head -c 700 "$f" > cut; cat cut > "$f"; done
+"$cc" -q -O1 tk.cst -o t4
+check "truncated token lists are lexed again" "$(cmp -s t4 t3 && echo 1 || echo 0)"
+"$cc" -q -O1 tk.cst -o t5
+for f in "$objs"/*/*.tk; do printf '\377\377\377\377\377\377\377\177' | dd of="$f" bs=1 seek=36 conv=notrunc 2>/dev/null; done
+"$cc" -q -O1 tk.cst -o t6
+check "a token outside its source is refused" "$(cmp -s t6 t3 && echo 1 || echo 0)"
+sed -i 's/return 41/return 42/' tmod.cst
+"$cc" -q -O1 tk.cst -o t7
+check "an edited module is lexed again" "$([ "$(./t7)" = 42 ] && echo 1 || echo 0)"
+printf 'let is i64 as bad = 1 \140 2;\n' >> tmod.cst
+r1=0; "$cc" -q -O1 tk.cst -o t9 2> e1 || r1=1
+r2=0; "$cc" -q -O1 tk.cst -o t9 2> e2 || r2=1
+check "a lexer error is reported again when warm" "$([ $r1 = 1 ] && [ $r2 = 1 ] && [ -s e1 ] && cmp -s e1 e2 && echo 1 || echo 0)"
+sed -i '$d' tmod.cst
+rm -f "$objs"/*/*.tk
+"$cc" -q -O1 --no-obj-cache tk.cst -o t8
+check "--no-obj-cache keeps no token lists" "$([ -z "$(ls "$objs"/*/*.tk 2>/dev/null)" ] && echo 1 || echo 0)"
 cd ..
 
 [ "$fail" = 0 ] && echo 'build-perf: all counts within limits' || exit 1
