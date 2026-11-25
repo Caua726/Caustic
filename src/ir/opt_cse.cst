@@ -28,19 +28,38 @@ let is i32 as CSE_ENTRY_BYTES with imut = 40;
 let is *u8 as cse_table with mut;
 let is i32 as cse_count with mut = 0;
 
+// A block's entries are "alive" when their generation equals cse_cur_gen.
+// Resetting the table per block is then one increment instead of 256 stores;
+// a slot whose generation is older is treated as empty on the next probe.
+let is *i32 as cse_gen_tbl with mut;   // [CSE_BUCKETS]
+let is i32 as cse_cur_gen with mut = 1;
+
 fn cse_init_table() as void {
     if (cast(i64, cse_table) == 0) {
         cse_table = d.opt_alloc(cast(i64, CSE_BUCKETS) * cast(i64, CSE_ENTRY_BYTES));
+        cse_gen_tbl = cast(*i32, d.opt_alloc(cast(i64, CSE_BUCKETS) * 4));
+        let is i32 as i with mut = 0;
+        while (i < CSE_BUCKETS) {
+            let is *i32 as gp = cast(*i32, cast(i64, cse_gen_tbl) + cast(i64, i) * 4);
+            *gp = 0;
+            i = i + 1;
+        }
+        cse_cur_gen = 1;
     }
 }
 
 fn cse_reset() as void {
     if (cast(i64, cse_table) == 0) { return; }
-    let is i32 as i with mut = 0;
-    while (i < CSE_BUCKETS) {
-        let is *i32 as op_p = cast(*i32, cast(i64, cse_table) + cast(i64, i) * cast(i64, CSE_ENTRY_BYTES));
-        *op_p = 0 - 1;
-        i = i + 1;
+    cse_cur_gen = cse_cur_gen + 1;
+    if (cse_cur_gen <= 0) {
+        // Wrapped: no live generation exists, so clear and start again.
+        let is i32 as i with mut = 0;
+        while (i < CSE_BUCKETS) {
+            let is *i32 as gp = cast(*i32, cast(i64, cse_gen_tbl) + cast(i64, i) * 4);
+            *gp = 0;
+            i = i + 1;
+        }
+        cse_cur_gen = 1;
     }
     cse_count = 0;
 }
@@ -63,9 +82,11 @@ fn cse_lookup_or_insert(op as i32, s1t as i32, s1v as i64, s2t as i32, s2v as i6
     let is i32 as tries with mut = 0;
     while (tries < CSE_BUCKETS) {
         let is i64 as off = cast(i64, cse_table) + cast(i64, h) * cast(i64, CSE_ENTRY_BYTES);
+        let is *i32 as gp = cast(*i32, cast(i64, cse_gen_tbl) + cast(i64, h) * 4);
         let is *i32 as op_p = cast(*i32, off);
-        if (*op_p == 0 - 1) {
-            // Empty slot — insert.
+        if (*gp != cse_cur_gen) {
+            // Empty slot (or one left over from an earlier block) — insert.
+            *gp = cse_cur_gen;
             *op_p = op;
             let is *i32 as s1t_p = cast(*i32, off + 4);  *s1t_p = s1t;
             let is *i64 as s1v_p = cast(*i64, off + 8);  *s1v_p = s1v;
