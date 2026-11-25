@@ -10,6 +10,8 @@ export CAUSTIC_LIB="${CAUSTIC_LIB:-$PWD}"
 work=$(mktemp -d "${TMPDIR:-/tmp}/caustic-perf.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 cd "$work"
+# The default object cache would otherwise be the user's ~/.cache.
+export XDG_CACHE_HOME="$work/xdg"     # not created: the compiler makes it
 fail=0
 check() { # what, ok(0/1)
     if [ "$2" = 1 ]; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi
@@ -199,7 +201,7 @@ EOT
 warm_check() { # what, level, edit command, max emitted
     eval "$3"
     "$cc" -q -O$2 --stats --obj-cache oc$2 -j 2 top.cst -o w$2 2> ws || { sed -n 1,4p ws; check "$1: builds" 0; return; }
-    "$cc" -q -O$2 -j 2 top.cst -o c$2 2> /dev/null
+    "$cc" -q -O$2 --no-obj-cache -j 2 top.cst -o c$2 2> /dev/null
     if cmp -s w$2 c$2; then r=1; else r=0; fi
     check "-O$2 $1: warm equals clean" $r
     emitted=$(stat_of ws objects_emitted)
@@ -226,6 +228,45 @@ for level in 0 1 2; do
     warm_check "nothing changed again" $level ":" 0
     cd ..
 done
+cd ..
+
+# The default object cache: one directory per configuration, reused warm, off
+# under --no-obj-cache and the checking switches, and collected by age (30 days)
+# then by size, at most once a day.
+mkdir dflt && cd dflt
+warm_sources
+objs="$XDG_CACHE_HOME/caustic/objs"
+"$cc" -q -O1 --stats -j 2 top.cst -o d1 2> s1
+"$cc" -q -O1 --stats -j 2 top.cst -o d2 2> s2
+before=$(ls -d "$objs"/*/)
+d1dir=$(ls -td "$objs"/*/ | head -1)
+check "default cache: cold emits 4" "$([ "$(stat_of s1 objects_emitted)" = 4 ] && echo 1 || echo 0)"
+check "default cache: warm emits 0" "$([ "$(stat_of s2 objects_emitted)" = 0 ] && echo 1 || echo 0)"
+"$cc" -q -O1 --no-obj-cache -j 2 top.cst -o d3
+check "default cache: warm equals uncached" "$(cmp -s d2 d3 && echo 1 || echo 0)"
+"$cc" -q -O1 --no-obj-cache --stats -j 2 top.cst -o d4 2> s4
+check "--no-obj-cache reuses nothing" "$([ "$(stat_of s4 objects_emitted)" = 4 ] && echo 1 || echo 0)"
+CAUSTIC_PRINT_CHECK=1 "$cc" -q -O1 --stats -j 2 top.cst -o d5 2> s5
+check "a checking switch reuses nothing" "$([ "$(stat_of s5 objects_emitted)" = 4 ] && echo 1 || echo 0)"
+"$cc" -q -O2 -j 2 top.cst -o e1
+d2dir=$(ls -d "$objs"/*/ | grep -vxF "$before")
+check "-O2 gets a directory of its own" "$([ "$(echo "$d2dir" | wc -w)" = 1 ] && echo 1 || echo 0)"
+old=$(ls "$d2dir"*.o | head -2); keep=$(ls "$d2dir"*.o | sed -n 3p)
+touch -d '40 days ago' $old; touch -d '29 days ago' "$keep"
+touch -d '2 days ago' "$objs/.collected"
+# Built at -O1, so nothing it emits replaces what was collected from -O2's directory.
+"$cc" -q -O1 -j 2 top.cst -o d6
+gone=1; for f in $old; do [ -e "$f" ] && gone=0; done
+check "objects 40 days old are collected" $gone
+check "an object 29 days old stays" "$([ -e "$keep" ] && echo 1 || echo 0)"
+touch -d '40 days ago' "$keep"
+"$cc" -q -O1 -j 2 top.cst -o d7
+check "collected at most once a day" "$([ -e "$keep" ] && echo 1 || echo 0)"
+touch -d '2 days ago' "$objs/.collected"
+for f in "$objs"/*/*.o; do touch -d '10 minutes ago' "$f"; done
+CAUSTIC_CACHE_MAX_MB=0 "$cc" -q -O1 -j 2 top.cst -o d8
+check "over the size limit, the oldest go" "$([ -z "$(ls "$d2dir")" ] && echo 1 || echo 0)"
+check "the build still links" "$(cmp -s d8 d3 && echo 1 || echo 0)"
 cd ..
 
 [ "$fail" = 0 ] && echo 'build-perf: all counts within limits' || exit 1
