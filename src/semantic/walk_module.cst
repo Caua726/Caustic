@@ -663,16 +663,70 @@ fn _stream_fn(n as *ast.Node) as void {
     ast.reset_transient_nodes();
 }
 
-// === Demand-driven bodies (opt-in: CAUSTIC_LAZY_BODIES=1) ===
+// === Demand-driven bodies (stdlib by default; CAUSTIC_LAZY_BODIES=1: all, =0: off) ===
 // A function of an imported module is not parsed, analysed or lowered when its
 // module is walked; it is recorded with the module context it needs and
 // streamed only once something reachable names it (the driver's worklist in
 // main.cst). Unreached bodies are never analysed, so an error inside an unused
-// imported function is not reported — the reason this is opt-in.
+// imported function is not reported — which is why, by default, only the
+// shipped stdlib defers (lazy_on = 2) and user modules are analysed whole.
 // Entry: node, asm name ptr/len, scope, prefix ptr/len, dir ptr/len, src,
 // src len, filename, token list, done — 13 words.
+// lazy_on: 0 = off, 1 = every imported module (CAUSTIC_LAZY_BODIES=1),
+// 2 = only the toolchain's own standard library (the default; see _lz_is_std).
 let is i32 as lazy_on with mut = 0;
 fn set_lazy_on(v as i32) as void { lazy_on = v; }
+
+// 1 when the module being walked lives in <stdlib dir>/std — the stdlib that
+// ships with this compiler, whose every body its release gate analyses (the
+// libcaustic build is a -c compile, which never defers). A user module, or a
+// copy of std/ anywhere else, is analysed in full, so its errors are reported
+// whether or not anything calls the function. Relative module directories are
+// made absolute against the working directory first; when that is not
+// available the answer is 0 (nothing deferred).
+let is *u8 as _lzs_last with mut = cast(*u8, 0);
+let is i32 as _lzs_last_len with mut = 0 - 1;
+let is i32 as _lzs_last_ans with mut = 0;
+
+fn _lz_is_std() as i32 {
+    let is *u8 as dp = sc.current_source_dir_ptr;
+    let is i32 as dl = sc.current_source_dir_len;
+    if (cast(i64, dp) == 0 || dl <= 0) { return 0; }
+    if (dp == _lzs_last && dl == _lzs_last_len) { return _lzs_last_ans; }
+    let is i32 as ans with mut = 0;
+    let is *u8 as abs with mut = dp;
+    let is i32 as al with mut = dl;
+    if (dp[0] != 47) {
+        let is [4096]u8 as cwd;
+        let is i64 as cn = io.get_cwd(&cwd, 4096);
+        abs = cast(*u8, 0);
+        if (cn > 0) {
+            let is i32 as cl with mut = 0;
+            while (cl < 4095 && cwd[cl] != 0) { cl = cl + 1; }
+            let is *u8 as joined = d.sem_alloc(cast(i64, cl) + cast(i64, dl) + 2);
+            mem.memcpy(joined, &cwd, cast(i64, cl));
+            joined[cl] = cast(u8, 47);
+            mem.memcpy(cast(*u8, cast(i64, joined) + cast(i64, cl) + 1), dp, cast(i64, dl));
+            abs = sc.normalize_path(joined, cl + 1 + dl, &al);
+        }
+    }
+    let is *u8 as sd = sc.stdlib_dir_ptr;
+    let is i32 as sl = sc.stdlib_dir_len;
+    if (cast(i64, abs) != 0 && cast(i64, sd) != 0 && sl > 0 && sd[0] == 47) {
+        // abs must be <sd>/std or below it.
+        let is i32 as base with mut = sl;
+        if (sl == 1) { base = 0; }                 // stdlib dir "/": "/std"
+        if (al >= base + 4 && mem.memcmp(abs, sd, cast(i64, base)) == 0
+            && abs[base] == 47 && abs[base + 1] == 115 && abs[base + 2] == 116 && abs[base + 3] == 100
+            && (al == base + 4 || abs[base + 4] == 47)) {
+            ans = 1;
+        }
+    }
+    _lzs_last = dp;
+    _lzs_last_len = dl;
+    _lzs_last_ans = ans;
+    return ans;
+}
 let is i32 as _lz_depth with mut = 0;
 let is i32 as _lz_n with mut = 0;
 let is i32 as _lz_cap with mut = 0;
@@ -681,6 +735,7 @@ let is *ast.Node as _lz_root with mut = cast(*ast.Node, 0);
 
 fn _lz_defer(n as *ast.Node) as i32 {
     if (lazy_on == 0 || _lz_depth == 0) { return 0; }
+    if (lazy_on == 2 && _lz_is_std() == 0) { return 0; }
     if (ast.nx_is_imut(n) == 1 || ast.nx_section_len(n) > 0 || ast.nx_is_naked(n) == 1
         || ast.nx_is_ginst(n) == 1) { return 0; }
     let is *d.Function as fs = sc.lookup_fn(n.name_ptr, n.name_len);

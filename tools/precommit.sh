@@ -281,6 +281,21 @@ for f in examples/*.cst; do
 done
 ok "$nex examples identical across -O0/-O1/-O2"
 
+# ─── 4b. every stdlib body analysed ─────────────────────────────────────────
+# A program's build analyses only the stdlib functions it reaches (the rest
+# are deferred and dropped), so an error in an unused std function would not
+# show in any program. --emit-deps is a library compile: it never defers, and
+# it stops after the semantic pass.
+step "stdlib analysed whole (--emit-deps on every std/*.cst)"
+nstd=0
+for f in $(find std -name '*.cst' | sort); do
+    if ! "$CUR" -q --emit-deps "$TMP/std.deps" "$f" >"$TMP/std.out" 2>&1; then
+        head -5 "$TMP/std.out"; die "$f does not analyse"
+    fi
+    nstd=$((nstd+1))
+done
+ok "$nstd std modules analyse"
+
 # ─── 5. test suite ──────────────────────────────────────────────────────────
 step "test suite (tests/run_tests.cst)"
 if ! "$CUR" -q "tests/run_tests.cst" -o "$TMP/tests" >/dev/null 2>&1; then die "test runner failed to build"; fi
