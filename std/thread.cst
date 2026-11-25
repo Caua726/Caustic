@@ -55,10 +55,11 @@ fn _caustic_entry(p as i64) as i64 with naked {
     }
 }
 
-// CausticOS has no lazily backed memory: a stack is committed up front, and a
-// program without the dynamic-stack probes gets no more than that. 2 MiB, as
-// on Linux.
+// CausticOS has no lazily backed memory. A program with the dynamic-stack
+// probes commits its stack as it goes deeper, so a thread starts with 64 KiB
+// of its 2 MiB; one without them gets all of it, committed, up front.
 let is i64 as _CAUSTIC_STACK with imut = 2097152;
+let is i64 as _CAUSTIC_FIRST with imut = 65536;
 
 // --- Windows entry shim (naked: MS x64 -> SysV). CreateThread passes param in
 // rcx. Preserve rsi/rdi/rbx (MS callee-saved); read fn/arg from the Thread, call
@@ -130,14 +131,16 @@ fn spawn(t as *Thread, f as *u8, arg as i64) as i32 {
         let is i64 as rw = os.caustic.PROT_READ | os.caustic.PROT_WRITE;
         let is i64 as base = os.caustic.reserve(0, size, rw);
         if (base < 0) { return cast(i32, 0 - 1); }
-        if (os.caustic.commit(base, size, rw) != 0) {
+        let is i64 as first with mut = size;
+        if (os.caustic.stack_grows() == 1) { first = _CAUSTIC_FIRST; }
+        if (os.caustic.commit(base + size - first, first, rw) != 0) {
             os.caustic.munmap(base, size);
             return cast(i32, 0 - 1);
         }
         // The thread block in the top 64 bytes, the stack below it; the
         // thread enters at block - 16, 16-aligned, so the worker the entry
         // calls sees rsp % 16 == 8 as after any call.
-        let is i64 as block = os.caustic.thread_block_init(base, size, base);
+        let is i64 as block = os.caustic.thread_block_init(base, size, base + size - first);
         t.stack_base = base;
         t.stack_size = size;
         atomic_store(&t.state, 1);

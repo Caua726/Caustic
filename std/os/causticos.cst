@@ -425,7 +425,65 @@ fn exit(code as i32) as void { syscall(3, cast(i64, code)); }
 fn getpid() as i64 { return syscall(4); }
 fn yield_cpu() as i64 { return syscall(5); }
 fn sleep_ns(ns as i64) as i64 { return syscall(2, ns); }
-fn time_ns() as i64 { return syscall(1); }
+// Nanoseconds since boot. Read from the clock page when the kernel can give
+// one — its clock's parameters, mapped read-only (SYS_CLOCK_PAGE), so reading
+// the time is a few instructions — and from SYS_TIME_NS otherwise: an older
+// kernel, a clock a process cannot read (the HPET), another architecture.
+let is i64 as SYS_CLOCK_PAGE with imut = 67;
+let is i64 as _clock_page with mut = 0;        // 0 not asked for, -1 none to be had
+
+fn _rdtsc() as i64 with naked {
+    if (__target_is_aarch64 == 1) { asm("brk 0"); }
+    else { asm(".byte 0x0F, 0x31\n.byte 0x48, 0xC1, 0xE2, 0x20\n.byte 0x48, 0x09, 0xD0\nret\n"); }
+}
+
+// (a * b) >> 32, through 128 bits.
+fn _mulshr32(a as i64, b as i64) as i64 with naked {
+    if (__target_is_aarch64 == 1) { asm("brk 0"); }
+    else { asm(".byte 0x48, 0x89, 0xF8\n.byte 0x48, 0xF7, 0xE6\n.byte 0x48, 0x0F, 0xAC, 0xD0, 0x20\nret\n"); }
+}
+
+// The clock page read; -1 when its clock is not one to read here.
+fn _page_ns(page as i64) as i64 {
+    let is *i64 as w = cast(*i64, page);
+    let is i64 as mode = w[0];
+    if (mode == 1) {
+        let is i64 as d with mut = _rdtsc() - w[1];
+        if (d < 0) { d = 0; }
+        return _mulshr32(d, w[2]) + w[3];
+    }
+    if (mode != 2) { return 0 - 1; }
+    // the hypervisor's own record: its version is odd while it writes it
+    let is i64 as pv = page + w[4];
+    while (1 == 1) {
+        let is u32 as v = *cast(*u32, pv);
+        let is i64 as ts = *cast(*i64, pv + 8);
+        let is i64 as st = *cast(*i64, pv + 16);
+        let is i64 as mul = cast(i64, *cast(*u32, pv + 24)) & 0xFFFFFFFF;
+        let is i64 as sh with mut = cast(i64, *cast(*u8, pv + 28)) & 0xFF;
+        let is i64 as tt = _rdtsc();
+        if ((v & cast(u32, 1)) == cast(u32, 0) && *cast(*u32, pv) == v) {
+            if (sh >= 128) { sh = sh - 256; }
+            let is i64 as d with mut = tt - ts;
+            if (d < 0) { d = 0; }
+            if (sh >= 0) { d = d << sh; } else { d = d >> (0 - sh); }
+            return st + _mulshr32(d, mul) + w[3];
+        }
+    }
+    return 0 - 1;
+}
+
+fn time_ns() as i64 {
+    if (_clock_page == 0) {
+        let is i64 as page with mut = 0 - 1;
+        if (__target_is_aarch64 == 0) { page = syscall(SYS_CLOCK_PAGE); }
+        if (page <= 0) { page = 0 - 1; }
+        else if (_page_ns(page) < 0) { page = 0 - 1; }
+        _clock_page = page;
+    }
+    if (_clock_page > 0) { return _page_ns(_clock_page); }
+    return syscall(1);
+}
 fn kern_info(buf as *u8, size as i64) as i64 { return syscall(0, buf, size); }
 fn write_serial(buf as *u8, len as i64) as i64 { return syscall(6, buf, len); }
 
@@ -734,6 +792,20 @@ struct ThreadStack {
     size as i64;
     block as i64;    // its thread block, at the top
     tid as i64;
+}
+
+// This thread's block (fs:[TB_SELF]).
+fn thread_block() as *i64 with naked {
+    if (__target_is_aarch64 == 1) { asm("brk 0"); }
+    else { asm("mov rax, QWORD PTR fs:[8]\nret\n"); }
+}
+
+// 1 when this thread's stack is committed as it grows — the program carries
+// the probes that do it — and 0 when all of it is committed already.
+fn stack_grows() as i64 {
+    if (__target_is_aarch64 == 1) { return 0; }
+    let is *i64 as tb = thread_block();
+    return cast(i64, tb[TB_STACK_LOW / 8] > tb[TB_STACK_FLOOR / 8]);
 }
 
 // thread_block_init — lay a thread block at the top of the stack
