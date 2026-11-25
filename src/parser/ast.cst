@@ -588,3 +588,74 @@ fn clone_node(n as *Node) as *Node {
     c.next = cast(*Node, 0);
     return c;
 }
+
+// === Constant arithmetic ===
+//
+// Every constant folder goes through const_op, so a folded operation gives what
+// the generated code would: 64-bit registers, unsigned when an operand is u64
+// (or a pointer), and the result put back into its type's width. Narrower
+// unsigned values are never negative as held, so signed arithmetic suits them.
+
+fn const_unsigned(t as *Type) as i32 {
+    return cast(i32, cast(i64, t) != 0 && (t.kind == TY_U64 || t.kind == TY_PTR));
+}
+
+// v as a value of integer type t (null, or another type: unchanged).
+fn const_narrow(v as i64, t as *Type) as i64 {
+    if (cast(i64, t) == 0) { return v; }
+    let is i32 as w with mut = 0;
+    let is i32 as sg with mut = 1;
+    if (t.kind == TY_I8 || t.kind == TY_CHAR) { w = 8; }
+    else if (t.kind == TY_I16) { w = 16; }
+    else if (t.kind == TY_I32) { w = 32; }
+    else if (t.kind == TY_U8) { w = 8; sg = 0; }
+    else if (t.kind == TY_U16) { w = 16; sg = 0; }
+    else if (t.kind == TY_U32) { w = 32; sg = 0; }
+    if (w == 0) { return v; }
+    let is i64 as m = v & ((cast(i64, 1) << w) - 1);
+    if (sg == 1 && (m & (cast(i64, 1) << (w - 1))) != 0) { return m - (cast(i64, 1) << w); }
+    return m;
+}
+
+// l <k> r, operand types lt and rt, result type t (any may be null: i64).
+// 0 = not a value the program has (division by zero, i64 minimum by -1).
+fn const_op(k as i32, l as i64, r as i64, lt as *Type, rt as *Type, t as *Type, out as *i64) as i32 {
+    let is i32 as un with mut = const_unsigned(lt);
+    if (const_unsigned(rt) == 1) { un = 1; }
+    if (k == NK_EQ) { *out = cast(i64, l == r); return 1; }
+    if (k == NK_NE) { *out = cast(i64, l != r); return 1; }
+    if (k == NK_LT || k == NK_LE || k == NK_GT || k == NK_GE) {
+        let is i32 as lt_ with mut = cast(i32, l < r);
+        if (un == 1) { lt_ = cast(i32, cast(u64, l) < cast(u64, r)); }
+        if (k == NK_LT) { *out = cast(i64, lt_); }
+        else if (k == NK_GE) { *out = cast(i64, lt_ == 0); }
+        else if (k == NK_LE) { *out = cast(i64, lt_ == 1 || l == r); }
+        else { *out = cast(i64, lt_ == 0 && l != r); }
+        return 1;
+    }
+    let is i64 as v with mut = 0;
+    if (k == NK_ADD) { v = l + r; }
+    else if (k == NK_SUB) { v = l - r; }
+    else if (k == NK_MUL) { v = l * r; }
+    else if (k == NK_BAND) { v = l & r; }
+    else if (k == NK_BOR) { v = l | r; }
+    else if (k == NK_BXOR) { v = l ^ r; }
+    else if (k == NK_SHL) { v = l << (r & 63); }
+    else if (k == NK_SHR) {
+        if (const_unsigned(lt) == 1) { v = cast(i64, cast(u64, l) >> cast(u64, r & 63)); }
+        else { v = l >> (r & 63); }
+    }
+    else if (k == NK_DIV || k == NK_MOD) {
+        if (r == 0) { return 0; }
+        if (un == 1) {
+            if (k == NK_DIV) { v = cast(i64, cast(u64, l) / cast(u64, r)); }
+            else { v = cast(i64, cast(u64, l) % cast(u64, r)); }
+        } else {
+            if (r == 0 - 1 && l == 0 - 9223372036854775807 - 1) { return 0; }
+            if (k == NK_DIV) { v = l / r; } else { v = l % r; }
+        }
+    }
+    else { return 0; }
+    *out = const_narrow(v, t);
+    return 1;
+}

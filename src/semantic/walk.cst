@@ -136,6 +136,7 @@ fn walk_block(node as *ast.Node) as void {
 let is [256]i64 as imut_slot_val;          // 8 frames × 32 slots = 256
 let is [256]i64 as imut_slot_name_ptr;     // i64 stash of *u8 name
 let is [256]i32 as imut_slot_name_len;
+let is [256]i64 as imut_slot_ty;           // i64 stash of *ast.Type
 let is i32 as imut_sp with mut = 0;        // slot stack pointer
 let is i32 as imut_depth with mut = 0;     // current recursion depth
 
@@ -155,8 +156,18 @@ fn imut_lookup(frame_base as i32, name_ptr as *u8, name_len as i32, out as *i64)
     return 0;
 }
 
-fn imut_bind(name_ptr as *u8, name_len as i32, val as i64) as i32 {
-    if (imut_sp >= 256) { return 0; }
+// Integer values only: 0 for a type the interpreter cannot hold (a float, an
+// aggregate, an alias not resolved yet).
+fn _imut_int_ty(t as *ast.Type) as i32 {
+    if (cast(i64, t) == 0) { return 0; }
+    return cast(i32, (t.kind >= ast.TY_I8 && t.kind <= ast.TY_U64)
+        || t.kind == ast.TY_BOOL || t.kind == ast.TY_CHAR);
+}
+
+fn imut_bind(name_ptr as *u8, name_len as i32, v as i64, t as *ast.Type) as i32 {
+    if (imut_sp >= 256 || _imut_int_ty(t) == 0) { return 0; }
+    let is i64 as val = ast.const_narrow(v, t);
+    imut_slot_ty[imut_sp] = cast(i64, t);
     imut_slot_name_ptr[imut_sp] = cast(i64, name_ptr);
     imut_slot_name_len[imut_sp] = name_len;
     imut_slot_val[imut_sp] = val;
@@ -164,12 +175,55 @@ fn imut_bind(name_ptr as *u8, name_len as i32, val as i64) as i32 {
     return 1;
 }
 
+// The type an operation on l and r has: an untyped literal takes the other's,
+// u64 wins, then the larger.
+fn _imut_wider(lt as *ast.Type, rt as *ast.Type) as *ast.Type {
+    if (cast(i64, lt) == 0) { return rt; }
+    if (cast(i64, rt) == 0) { return lt; }
+    if (lt.kind == ast.TY_U64) { return lt; }
+    if (lt.size > rt.size) { return lt; }
+    return rt;
+}
+
+// The type of an expression of the body, which may not have been walked yet.
+fn _imut_ty(n as *ast.Node, frame_base as i32) as *ast.Type {
+    if (cast(i64, n) == 0) { return cast(*ast.Type, 0); }
+    if (n.kind == ast.NK_IDENT) {
+        let is i32 as i with mut = imut_sp - 1;
+        while (i >= frame_base) {
+            if (imut_slot_name_len[i] == n.name_len
+                && d.str_eq(cast(*u8, imut_slot_name_ptr[i]), n.name_len, n.name_ptr, n.name_len) == 1) {
+                return cast(*ast.Type, imut_slot_ty[i]);
+            }
+            i = i - 1;
+        }
+        let is *d.Variable as v = sc.lookup_var(n.name_ptr, n.name_len);
+        if (cast(i64, v) != 0) { return cast(*ast.Type, v.ty); }
+        return cast(*ast.Type, 0);
+    }
+    if (cast(i64, n.ty) != 0) { return n.ty; }
+    if (n.kind == ast.NK_FNCALL) {
+        let is *d.Function as f = sc.lookup_fn(n.name_ptr, n.name_len);
+        if (cast(i64, f) != 0) { return cast(*ast.Type, f.return_type); }
+        return cast(*ast.Type, 0);
+    }
+    if (n.kind == ast.NK_ADD || n.kind == ast.NK_SUB || n.kind == ast.NK_MUL
+        || n.kind == ast.NK_DIV || n.kind == ast.NK_MOD) {
+        return _imut_wider(_imut_ty(n.lhs, frame_base), _imut_ty(n.rhs, frame_base));
+    }
+    return cast(*ast.Type, 0);
+}
+
 // Evaluate an expression node in the current imut frame. Returns 1 on
 // success (value in *out), 0 on any non-foldable construct.
 fn imut_eval_expr(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
     if (cast(i64, n) == 0) { return 0; }
     let is i32 as k = n.kind;
-    if (k == ast.NK_NUM) { *out = n.val; return 1; }
+    if (k == ast.NK_NUM) {
+        if (num_is_float(n) == 1) { return 0; }
+        *out = n.val;
+        return 1;
+    }
     if (k == ast.NK_IDENT) {
         if (imut_lookup(frame_base, n.name_ptr, n.name_len, out) == 1) { return 1; }
         // Fall back to const-folded imut globals.
@@ -189,17 +243,9 @@ fn imut_eval_expr(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
         let is i64 as r with mut = 0;
         if (imut_eval_expr(n.lhs, frame_base, &l) == 0) { return 0; }
         if (imut_eval_expr(n.rhs, frame_base, &r) == 0) { return 0; }
-        if (k == ast.NK_ADD) { *out = l + r; return 1; }
-        if (k == ast.NK_SUB) { *out = l - r; return 1; }
-        if (k == ast.NK_MUL) { *out = l * r; return 1; }
-        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
-        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
-        if (k == ast.NK_EQ)  { *out = 0; if (l == r) { *out = 1; } return 1; }
-        if (k == ast.NK_NE)  { *out = 0; if (l != r) { *out = 1; } return 1; }
-        if (k == ast.NK_LT)  { *out = 0; if (l <  r) { *out = 1; } return 1; }
-        if (k == ast.NK_LE)  { *out = 0; if (l <= r) { *out = 1; } return 1; }
-        if (k == ast.NK_GT)  { *out = 0; if (l >  r) { *out = 1; } return 1; }
-        if (k == ast.NK_GE)  { *out = 0; if (l >= r) { *out = 1; } return 1; }
+        let is *ast.Type as lt = _imut_ty(n.lhs, frame_base);
+        let is *ast.Type as rt = _imut_ty(n.rhs, frame_base);
+        return ast.const_op(k, l, r, lt, rt, _imut_wider(lt, rt), out);
     }
     if (k == ast.NK_FNCALL) {
         // Recursive imut call: fold by re-entering the interpreter.
@@ -240,7 +286,7 @@ fn imut_exec_stmt(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
         if (cast(i64, n.init_expr) != 0) {
             if (imut_eval_expr(n.init_expr, frame_base, &v) == 0) { return 2; }
         }
-        if (imut_bind(n.name_ptr, n.name_len, v) == 0) { return 2; }
+        if (imut_bind(n.name_ptr, n.name_len, v, n.ty) == 0) { return 2; }
         return 0;
     }
     if (k == ast.NK_IF) {
@@ -273,7 +319,7 @@ fn imut_exec_stmt(n as *ast.Node, frame_base as i32, out as *i64) as i32 {
             let is i64 as np = imut_slot_name_ptr[i];
             let is i32 as nl = imut_slot_name_len[i];
             if (nl == n.lhs.name_len && d.str_eq(cast(*u8, np), nl, n.lhs.name_ptr, n.lhs.name_len) == 1) {
-                imut_slot_val[i] = rv;
+                imut_slot_val[i] = ast.const_narrow(rv, cast(*ast.Type, imut_slot_ty[i]));
                 return 0;
             }
             i = i - 1;
@@ -324,7 +370,7 @@ fn try_fold_imut_fn(f as *d.Function, cn as *ast.Node, out as *i64) as i32 {
     let is *ast.Node as p with mut = fn_node.params;
     let is i32 as pi with mut = 0;
     while (cast(i64, p) != 0) {
-        if (imut_bind(p.name_ptr, p.name_len, arg_vals[pi]) == 0) {
+        if (imut_bind(p.name_ptr, p.name_len, arg_vals[pi], p.ty) == 0) {
             imut_sp = saved_sp;
             return 0;
         }
@@ -336,7 +382,10 @@ fn try_fold_imut_fn(f as *d.Function, cn as *ast.Node, out as *i64) as i32 {
     let is i32 as r = imut_exec_stmt(fn_node.body, saved_sp, &rv);
     imut_depth = imut_depth - 1;
     imut_sp = saved_sp;
-    if (r == 1) { *out = rv; return 1; }
+    if (r == 1 && _imut_int_ty(cast(*ast.Type, f.return_type)) == 1) {
+        *out = ast.const_narrow(rv, cast(*ast.Type, f.return_type));
+        return 1;
+    }
     return 0;
 }
 
@@ -384,17 +433,7 @@ fn try_fold_const(n as *ast.Node, out as *i64, depth as i32) as i32 {
         let is i64 as r with mut = 0;
         if (try_fold_const(n.lhs, &l, depth + 1) == 0) { return 0; }
         if (try_fold_const(n.rhs, &r, depth + 1) == 0) { return 0; }
-        if (k == ast.NK_ADD) { *out = l + r; return 1; }
-        if (k == ast.NK_SUB) { *out = l - r; return 1; }
-        if (k == ast.NK_MUL) { *out = l * r; return 1; }
-        if (k == ast.NK_DIV) { if (r == 0) { return 0; } *out = l / r; return 1; }
-        if (k == ast.NK_MOD) { if (r == 0) { return 0; } *out = l % r; return 1; }
-        if (k == ast.NK_EQ)  { *out = 0; if (l == r) { *out = 1; } return 1; }
-        if (k == ast.NK_NE)  { *out = 0; if (l != r) { *out = 1; } return 1; }
-        if (k == ast.NK_LT)  { *out = 0; if (l <  r) { *out = 1; } return 1; }
-        if (k == ast.NK_LE)  { *out = 0; if (l <= r) { *out = 1; } return 1; }
-        if (k == ast.NK_GT)  { *out = 0; if (l >  r) { *out = 1; } return 1; }
-        if (k == ast.NK_GE)  { *out = 0; if (l >= r) { *out = 1; } return 1; }
+        return ast.const_op(k, l, r, n.lhs.ty, n.rhs.ty, n.ty, out);
     }
     return 0;
 }
@@ -555,16 +594,8 @@ fn walk_cmp(node as *ast.Node) as void {
     // their value in fval, so comparing val would compare 0 with 0.
     if (node.lhs.kind == ast.NK_NUM && node.rhs.kind == ast.NK_NUM
         && num_is_float(node.lhs) == 0 && num_is_float(node.rhs) == 0) {
-        let is i64 as a = node.lhs.val;
-        let is i64 as b = node.rhs.val;
-        let is i32 as k = node.kind;
         let is i64 as r with mut = 0;
-        if (k == ast.NK_EQ) { if (a == b) { r = 1; } }
-        else if (k == ast.NK_NE) { if (a != b) { r = 1; } }
-        else if (k == ast.NK_LT) { if (a <  b) { r = 1; } }
-        else if (k == ast.NK_LE) { if (a <= b) { r = 1; } }
-        else if (k == ast.NK_GT) { if (a >  b) { r = 1; } }
-        else if (k == ast.NK_GE) { if (a >= b) { r = 1; } }
+        ast.const_op(node.kind, node.lhs.val, node.rhs.val, node.lhs.ty, node.rhs.ty, cast(*ast.Type, 0), &r);
         node.kind = ast.NK_NUM;
         node.val = r;
     }
