@@ -1009,20 +1009,14 @@ fn resolve_method_call(node as *ast.Node, recv as *ast.Node) as *d.Function {
             let is *u8 as mangled = gn.mangle_generic(tmname, tmlen, base_ty.gen_args, base_ty.gen_arg_count);
             let is i32 as mglen = gn.str_len(mangled);
             // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+            resolve_gen_args(base_ty.gen_args, base_ty.gen_arg_count);
             let is *u8 as omp = sc.current_mod_prefix_ptr;
             let is i32 as oml = sc.current_mod_prefix_len;
             if (tmpl.mod_prefix_len > 0) {
                 sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
                 sc.current_mod_prefix_len = tmpl.mod_prefix_len;
             }
-            let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, base_ty.gen_args, base_ty.gen_arg_count, mangled, mglen);
-            if (cast(i64, fn_clone) != 0) {
-                let is i32 as so = sc.stack_offset;
-                let is *d.Scope as ss = sc.current_scope;
-                walk(fn_clone);
-                sc.stack_offset = so;
-                sc.current_scope = ss;
-            }
+            walk_instance(tmpl, gn.instantiate_fn(tmpl, base_ty.gen_args, base_ty.gen_arg_count, mangled, mglen));
             // Lookup with template's module prefix
             if (tmpl.mod_prefix_len > 0) {
                 func = sc.lookup_fn_qualified(mangled, mglen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
@@ -1117,20 +1111,14 @@ fn walk_fncall(node as *ast.Node) as void {
                 node.lhs.name_ptr = d.str_dup(mangled, mlen);
                 node.lhs.name_len = mlen;
                 // Set module prefix before instantiate_fn (it calls resolve_type_ref + declare_fn)
+                resolve_gen_args(ga_args, ga_count);
                 let is *u8 as old_mp = sc.current_mod_prefix_ptr;
                 let is i32 as old_ml = sc.current_mod_prefix_len;
                 if (tmpl.mod_prefix_len > 0) {
                     sc.current_mod_prefix_ptr = tmpl.mod_prefix_ptr;
                     sc.current_mod_prefix_len = tmpl.mod_prefix_len;
                 }
-                let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, ga_args, ga_count, mangled, mlen);
-                if (cast(i64, fn_clone) != 0) {
-                    let is i32 as so = sc.stack_offset;
-                    let is *d.Scope as ss = sc.current_scope;
-                    walk(fn_clone);
-                    sc.stack_offset = so;
-                    sc.current_scope = ss;
-                }
+                walk_instance(tmpl, gn.instantiate_fn(tmpl, ga_args, ga_count, mangled, mlen));
                 // Lookup with template's module prefix
                 if (tmpl.mod_prefix_len > 0) {
                     func = sc.lookup_fn_qualified(mangled, mlen, tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
@@ -1527,6 +1515,38 @@ fn walk_struct_lit(node as *ast.Node) as void {
     }
 }
 
+// A generic body is checked where it was written, not where it is used: in
+// its own module's scope, so its globals and its imports resolve, and under
+// that module's prefix (the call sites switch it). It used to run in the
+// caller's scope, so `std/slice.cst` did not compile at all from a program —
+// its body says `mem.` and only slice.cst imports `mem`.
+fn walk_instance(tmpl as *d.GenericTemplate, fn_clone as *ast.Node) as void {
+    if (cast(i64, fn_clone) == 0) { return; }
+    let is i32 as so = sc.stack_offset;
+    let is *d.Scope as ss = sc.current_scope;
+    sc.current_scope = sc.global_scope;
+    if (tmpl.mod_prefix_len > 0) {
+        let is *d.Module as m = mod.find_module(tmpl.mod_prefix_ptr, tmpl.mod_prefix_len);
+        if (cast(i64, m) != 0 && cast(i64, m.scope) != 0) { sc.current_scope = m.scope; }
+    }
+    walk(fn_clone);
+    sc.stack_offset = so;
+    sc.current_scope = ss;
+}
+
+// The type arguments belong to the caller: `Slice gen Item` names the
+// caller's Item. Resolve them before the switch to the template's module, or
+// the lookup searches the template's module and does not find it.
+fn resolve_gen_args(args as *u8, count as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is *u8 as a = cast(*u8, ast.ga_get(args, i));
+        wt.try_instantiate_generic_struct(a);
+        ty.resolve_type_ref(a);
+        i = i + 1;
+    }
+}
+
 fn walk_fn_ptr_node(node as *ast.Node) as void {
     let is *d.Function as func with mut = cast(*d.Function, 0);
 
@@ -1540,14 +1560,7 @@ fn walk_fn_ptr_node(node as *ast.Node) as void {
                 let is i32 as mlen = gn.str_len(mangled);
                 node.name_ptr = d.str_dup(mangled, mlen);
                 node.name_len = mlen;
-                let is *ast.Node as fn_clone = gn.instantiate_fn(tmpl, node.generic_args, node.generic_arg_count, mangled, mlen);
-                if (cast(i64, fn_clone) != 0) {
-                    let is i32 as so = sc.stack_offset;
-                    let is *d.Scope as ss = sc.current_scope;
-                    walk(fn_clone);
-                    sc.stack_offset = so;
-                    sc.current_scope = ss;
-                }
+                walk_instance(tmpl, gn.instantiate_fn(tmpl, node.generic_args, node.generic_arg_count, mangled, mlen));
                 func = sc.lookup_fn(mangled, mlen);
             }
         }
