@@ -431,11 +431,15 @@ fn _cfg_skip(arg as *u8, arglen as i32) as i32 {
     if (str_eq(arg, arglen, "-q", 2) == 1 || str_eq(arg, arglen, "--quiet", 7) == 1
         || str_eq(arg, arglen, "--profile", 9) == 1 || str_eq(arg, arglen, "--stats", 7) == 1
         || str_eq(arg, arglen, "--mem-report", 12) == 1
-        || str_eq(arg, arglen, "--config-id", 11) == 1) { return 1; }
+        || str_eq(arg, arglen, "--config-id", 11) == 1
+        || str_eq(arg, arglen, "--no-obj-cache", 14) == 1) { return 1; }
     return 0;
 }
 
-fn _print_config_id(argc as i64, argv_arr as *i64) as i32 {
+// What decides the bytes of an object besides its module: every flag but those
+// that cannot (_cfg_skip), the optimisation level, CPU, target, stdlib
+// directory, and the compiler itself (`self_id`).
+fn _cfg_hash(argc as i64, argv_arr as *i64, self_id as i64) as i64 {
     let is i64 as flags with mut = 0;
     let is i64 as paths with mut = 0;
     let is i64 as ai with mut = 1;
@@ -462,7 +466,213 @@ fn _print_config_id(argc as i64, argv_arr as *i64) as i32 {
     h = _cfg_mix(h, cast(i64, tgt.target_get().arch));
     h = _cfg_mix(h, cast(i64, tgt.target_get().object_format));
     h = _cfg_mix(h, tokcache.source_hash(sc.stdlib_dir_ptr, cast(i64, sc.stdlib_dir_len)));
-    h = _cfg_mix(h, _cfg_self_hash());
+    h = _cfg_mix(h, self_id);
+    return h;
+}
+
+// The compiler's identity for the default object cache: its size, date, and
+// its first and last 64 KiB (ELF header, section headers, symbol tail). Reading
+// all 5 MB, as --config-id does, would cost more than a small compile.
+fn _cfg_self_quick() as i64 {
+    let is [4096]u8 as path;
+    let is i64 as n = io.get_self_path(&path, 4095);
+    if (n <= 0) { return 0; }
+    path[n] = cast(u8, 0);
+    let is i64 as fd = io._open_read(cast(*u8, &path));
+    if (fd < 0) { return 0; }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    let is i64 as h with mut = _cfg_mix(0 - 3750763034362895579, size);
+    h = _cfg_mix(h, io.mtime(cast(*u8, &path)));
+    let is *u8 as buf = mem.core.mmap_anon(65536);
+    io._lseek(fd, 0, io._SEEK_SET);
+    let is i64 as got with mut = io._read_fd(fd, buf, 65536);
+    if (got > 0) { h = _cfg_mix(h, tokcache.source_hash(buf, got)); }
+    if (size > 131072) {
+        io._lseek(fd, size - 65536, io._SEEK_SET);
+        got = io._read_fd(fd, buf, 65536);
+        if (got > 0) { h = _cfg_mix(h, tokcache.source_hash(buf, got)); }
+    }
+    mem.core.munmap(buf, 65536);
+    io._close_fd(fd);
+    return h;
+}
+
+let is i32 as g_no_obj_cache with mut = 0;
+let is i32 as g_obj_cache_default with mut = 0;
+let is [4096]u8 as _occ_root with mut;      // <cache>/caustic/objs
+let is i32 as _occ_root_len with mut = 0;
+
+fn _occ_cat(dst as *u8, n as i32, s as *u8) as i32 {
+    let is i32 as k with mut = 0;
+    while (s[k] != 0 && n + k < 4000) { dst[n + k] = s[k]; k = k + 1; }
+    dst[n + k] = cast(u8, 0);
+    return n + k;
+}
+
+// The object cache is on by default for an executable build: objects go to
+// $XDG_CACHE_HOME/caustic/objs/<configuration>/ (else ~/.cache/...), one
+// directory per configuration (_cfg_hash with _cfg_self_quick), so different
+// flags, CPU settings or compilers never share an object. --no-obj-cache or
+// CAUSTIC_NO_OBJ_CACHE=1 turn it off; --obj-cache <dir> picks the directory.
+fn _env_set(name as *u8) as i32 {
+    let is *u8 as v = env.getenv(name);
+    if (cast(i64, v) != 0 && v[0] != 0) { return 1; }
+    return 0;
+}
+
+fn _default_obj_cache(argc as i64, argv_arr as *i64) as void {
+    if (g_obj_cache != 0 || g_no_obj_cache == 1) { return; }
+    let is *u8 as off = env.getenv("CAUSTIC_NO_OBJ_CACHE");
+    if (cast(i64, off) != 0 && off[0] == 49) { return; }
+    // The checking switches exist to make a pass run; a reused object would skip it.
+    if (_env_set("CAUSTIC_TEXT_PEEPHOLE") == 1 || _env_set("CAUSTIC_PRINT_CHECK") == 1
+        || _env_set("CAUSTIC_HINT_CHECK") == 1 || _env_set("CAUSTIC_NO_HINTS") == 1
+        || _env_set("CAUSTIC_IR_ROUNDTRIP") == 1 || _env_set("CAUSTIC_AS_SLOW") == 1
+        || _env_set("CAUSTIC_LAZY_BODIES") == 1) { return; }
+    let is *u8 as root = cast(*u8, &_occ_root);
+    let is i32 as n with mut = 0;
+    let is *u8 as xdg = env.getenv("XDG_CACHE_HOME");
+    if (cast(i64, xdg) != 0 && xdg[0] == 47) {
+        n = _occ_cat(root, 0, xdg);
+    } else {
+        let is *u8 as home = env.getenv("HOME");
+        if (cast(i64, home) == 0 || home[0] != 47) { return; }
+        n = _occ_cat(root, 0, home);
+        n = _occ_cat(root, n, "/.cache");
+        io.mkdir(root);
+    }
+    n = _occ_cat(root, n, "/caustic");
+    io.mkdir(root);
+    n = _occ_cat(root, n, "/objs");
+    io.mkdir(root);
+    _occ_root_len = n;
+    let is i64 as h = _cfg_hash(argc, argv_arr, _cfg_self_quick());
+    let is *u8 as dir = cast(*u8, mem.core.mmap_anon(4096));
+    let is i32 as m with mut = _occ_cat(dir, 0, root);
+    m = _occ_cat(dir, m, "/");
+    let is i32 as hi with mut = 15;
+    let is i64 as v with mut = h;
+    while (hi >= 0) {
+        let is i32 as nib = cast(i32, v & 15);
+        if (nib < 10) { dir[m + hi] = cast(u8, 48 + nib); } else { dir[m + hi] = cast(u8, 87 + nib); }
+        v = (v >> 4) & 1152921504606846975;
+        hi = hi - 1;
+    }
+    dir[m + 16] = cast(u8, 0);
+    if (io.mkdir(dir) != 0 && io.mtime(dir) <= 0) { return; }
+    g_obj_cache = cast(i64, dir);
+    g_obj_cache_default = 1;
+    _collect_obj_cache();
+}
+
+// The default cache's collector, at most once a day (the date of <root>/.collected):
+// objects older than CAUSTIC_CACHE_MAX_AGE_DAYS (30) go, then the oldest until
+// the total is under CAUSTIC_CACHE_MAX_MB (1024) — the maker's limits. An object
+// a build reuses is dated then (_obj_used), so a running build's objects are the
+// newest and go last.
+fn _env_num(name as *u8, dflt as i64) as i64 {
+    let is *u8 as v = env.getenv(name);
+    if (cast(i64, v) == 0 || v[0] < 48 || v[0] > 57) { return dflt; }
+    let is i64 as x with mut = 0;
+    let is i32 as k with mut = 0;
+    while (v[k] >= 48 && v[k] <= 57) { x = x * 10 + cast(i64, v[k]) - 48; k = k + 1; }
+    return x;
+}
+
+fn _collect_obj_cache() as void {
+    if (g_obj_cache_default == 0 || _occ_root_len <= 0) { return; }
+    if (os.current() != os.OS_LINUX) { return; }
+    let is [4200]u8 as mark;
+    let is *u8 as mk = cast(*u8, &mark);
+    let is i32 as ml with mut = _occ_cat(mk, 0, cast(*u8, &_occ_root));
+    ml = _occ_cat(mk, ml, "/.collected");
+    let is i64 as now = time.unix_time();
+    let is i64 as last = io.mtime(mk);
+    if (last > 0 && now - last < 86400) { return; }
+    let is i64 as wfd = io._open_write(mk);
+    if (wfd >= 0) { io._close_fd(wfd); }
+    _obj_used(mk);
+    let is i64 as max_age = _env_num("CAUSTIC_CACHE_MAX_AGE_DAYS", 30) * 86400;
+    let is i64 as max_size = _env_num("CAUSTIC_CACHE_MAX_MB", 1024) * 1048576;
+    // path (heap), mtime, size per object
+    let is i64 as cap = 65536;
+    let is *i64 as tab = cast(*i64, mem.core.mmap_anon(cap * 24));
+    let is i64 as cnt with mut = 0;
+    let is i64 as total with mut = 0;
+    let is *u8 as arena = cast(*u8, mem.core.mmap_anon(cap * 160));   // the paths, one after another
+    let is i64 as apos with mut = 0;
+    let is *io.DirEntry as dents = cast(*io.DirEntry, mem.core.mmap_anon(4096 * sizeof(io.DirEntry)));
+    let is *io.DirEntry as oents = cast(*io.DirEntry, mem.core.mmap_anon(65536 * sizeof(io.DirEntry)));
+    let is i32 as nd = io.list_dir(cast(*u8, &_occ_root), dents, 4096);
+    let is i32 as di with mut = 0;
+    while (di < nd) {
+        let is *io.DirEntry as de = cast(*io.DirEntry, cast(i64, dents) + cast(i64, di) * sizeof(io.DirEntry));
+        if (de.name_len == 16) {
+            let is [4200]u8 as sub;
+            let is *u8 as sp = cast(*u8, &sub);
+            let is i32 as sl with mut = _occ_cat(sp, 0, cast(*u8, &_occ_root));
+            sl = _occ_cat(sp, sl, "/");
+            let is i32 as q with mut = 0;
+            while (q < 16) { sp[sl + q] = de.name_ptr[q]; q = q + 1; }
+            sl = sl + 16; sp[sl] = cast(u8, 0);
+            let is i32 as no = io.list_dir(sp, oents, 65536);
+            let is i32 as oi with mut = 0;
+            while (oi < no && cnt < cap) {
+                let is *io.DirEntry as oe = cast(*io.DirEntry, cast(i64, oents) + cast(i64, oi) * sizeof(io.DirEntry));
+                if (oe.name_len > 2 && oe.name_ptr[oe.name_len - 1] == 111 && oe.name_ptr[oe.name_len - 2] == 46) {
+                    if (cast(i64, sl) + oe.name_len + 2 > 160) { oi = oi + 1; continue; }
+                    let is *u8 as fp = cast(*u8, cast(i64, arena) + apos);
+                    apos = apos + 160;
+                    let is i32 as fl with mut = _occ_cat(fp, 0, sp);
+                    fp[fl] = cast(u8, 47); fl = fl + 1;
+                    let is i64 as c2 with mut = 0;
+                    while (c2 < oe.name_len) { fp[cast(i64, fl) + c2] = oe.name_ptr[c2]; c2 = c2 + 1; }
+                    fp[cast(i64, fl) + oe.name_len] = cast(u8, 0);
+                    tab[cnt * 3] = cast(i64, fp);
+                    tab[cnt * 3 + 1] = io.mtime(fp);
+                    tab[cnt * 3 + 2] = io.file_size(fp);
+                    total = total + tab[cnt * 3 + 2];
+                    cnt = cnt + 1;
+                }
+                oi = oi + 1;
+            }
+        }
+        di = di + 1;
+    }
+    // oldest first (shell sort on mtime)
+    let is i64 as gap with mut = cnt / 2;
+    while (gap > 0) {
+        let is i64 as i with mut = gap;
+        while (i < cnt) {
+            let is i64 as tp = tab[i * 3];
+            let is i64 as tm = tab[i * 3 + 1];
+            let is i64 as ts = tab[i * 3 + 2];
+            let is i64 as j with mut = i;
+            while (j >= gap && tab[(j - gap) * 3 + 1] > tm) {
+                tab[j * 3] = tab[(j - gap) * 3]; tab[j * 3 + 1] = tab[(j - gap) * 3 + 1]; tab[j * 3 + 2] = tab[(j - gap) * 3 + 2];
+                j = j - gap;
+            }
+            tab[j * 3] = tp; tab[j * 3 + 1] = tm; tab[j * 3 + 2] = ts;
+            i = i + 1;
+        }
+        gap = gap / 2;
+    }
+    let is i64 as k with mut = 0;
+    while (k < cnt) {
+        let is i64 as age = now - tab[k * 3 + 1];
+        if (age > max_age || total > max_size) {
+            // never what this build has just used: it is dated now
+            if (age > 60) {
+                io.unlink(cast(*u8, tab[k * 3]));
+                total = total - tab[k * 3 + 2];
+            }
+        }
+        k = k + 1;
+    }
+}
+
+fn _print_config_id(argc as i64, argv_arr as *i64) as i32 {
+    let is i64 as h = _cfg_hash(argc, argv_arr, _cfg_self_hash());
     let is [17]u8 as hex;
     let is i32 as hi with mut = 15;
     let is i64 as v with mut = h;
@@ -540,6 +750,8 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
             g_cache_flags = g_cache_flags + 8;
         } else if (str_eq(arg, arglen, "--config-id", 11) == 1) {
             g_config_id = 1;
+        } else if (str_eq(arg, arglen, "--no-obj-cache", 14) == 1) {
+            g_no_obj_cache = 1;
         } else if (str_eq(arg, arglen, "--obj-cache", 11) == 1) {
             ai = ai + 1;
             if (ai < argc) { g_obj_cache = argv_arr[ai]; }
@@ -727,6 +939,7 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
     }
 
     if (g_config_id == 1) { _print_config_id(argc, argv_arr); io.exit(0); }
+    _default_obj_cache(argc, argv_arr);
     if (g_file_count == 0) {
         io.write_str(io.STDERR, "Error: no input file\n");
         return 1;
@@ -2542,6 +2755,9 @@ fn main(argc as i64, argv as i64) as i32 {
         io.write_str(io.STDOUT, "  --profile       Show per-phase timing\n");
         io.write_str(io.STDOUT, "  --mem-report    Show memory after each phase, and per-phase timing\n");
         io.write_str(io.STDOUT, "  --cache <dir>   Cache directory for incremental builds\n");
+        io.write_str(io.STDOUT, "  --obj-cache <dir> Reuse module objects from <dir> (default: $XDG_CACHE_HOME or\n");
+        io.write_str(io.STDOUT, "                  ~/.cache/caustic/objs/<configuration>, 30 days / 1 GiB)\n");
+        io.write_str(io.STDOUT, "  --no-obj-cache  Build every module object again (also CAUSTIC_NO_OBJ_CACHE=1)\n");
         io.write_str(io.STDOUT, "  --path <dir>    Extra module search path\n");
         io.write_str(io.STDOUT, "  --max-ram <MB>  Memory limit\n");
         io.write_str(io.STDOUT, "  --window        (caustic-x86_64) the program opens its own window\n");

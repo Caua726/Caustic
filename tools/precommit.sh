@@ -161,6 +161,10 @@ for c in "$ROOT/caustic" "$ROOT/caustic.exe"; do [ -x "$c" ] && { CC="$c"; break
 [ -n "$CC" ] || die "caustic binary not found — build it first ( ./caustic-mk build caustic )"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/caustic-precommit.XXXXXX")"
+# The object cache is on by default (~/.cache/caustic/objs); the gate keeps its
+# own, so what it checks never depends on what an earlier build left there.
+export XDG_CACHE_HOME="$TMP/xdg-cache"
+mkdir -p "$XDG_CACHE_HOME"
 trap 'rm -rf "$TMP"' EXIT
 PROBE="$TMP/probe.cst"; printf 'fn main() as i32 { return 42; }\n' > "$PROBE"
 

@@ -40,6 +40,16 @@ A build is up to date when the stamp in `.caustic/stamps/` still holds: the conf
 from `caustic --config-id`, the output, and the content of every module. An edit reuses the
 object of each module whose key did not change (`--obj-cache`, in `.caustic/objs/<config>/`).
 
+The compiler itself now keeps such a cache by default for an executable
+build: `$XDG_CACHE_HOME/caustic/objs/<configuration>/` (else
+`~/.cache/caustic/objs/...`), one directory per configuration — flags,
+optimisation level, `--cpu=`, target, stdlib directory and the compiler
+binary — so different settings never share an object. A collector runs at
+most once a day (30 days, then 1 GiB oldest first; `CAUSTIC_CACHE_MAX_AGE_DAYS`,
+`CAUSTIC_CACHE_MAX_MB`). `--no-obj-cache` or `CAUSTIC_NO_OBJ_CACHE=1` turn it
+off. A small program compiles about 3× faster warm (hello -O1 68.5 → 24.5 M
+instructions), with the same binary.
+
 ## What the time was
 
 | Cause | Effect on browser -O2 |

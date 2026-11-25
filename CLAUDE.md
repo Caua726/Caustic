@@ -369,6 +369,7 @@ fn work() as i32 {
 
 ## Gotchas
 
+- **Object cache on by default**: an executable build reuses module objects from `$XDG_CACHE_HOME/caustic/objs/<configuration>/` (or `~/.cache/...`); the configuration hash covers flags, opt level, `--cpu=`, target, stdlib dir and the compiler binary. `--no-obj-cache` / `CAUSTIC_NO_OBJ_CACHE=1` turn it off; `tools/precommit.sh` points `XDG_CACHE_HOME` at its temp dir.
 - **`--cpu=` decides what -O2 assumes about the x86_64 CPU**: `x86-64` (default: SSE2 only, no cpuid, no code layout tuned for one CPU, so a binary runs on any x86-64 and compares fairly with `gcc -O2`), `auto` (SSE2 and AVX2 paths, chosen by a cpuid + xgetbv test at run time), `x86-64-v3` (AVX2 with no test), `znver3` (AVX2 with no test, plus the `.loopalign`/fetch-window/64-byte-line layout that was tuned on Zen 3). `tools/check-cpu.sh` pins this, under qemu with no SSE3 too. An AVX2 development machine never runs the SSE2 paths of `auto`, so test those with the default.
 - **Stdlib resolution**: The compiler tries paths relative to the source file first, then falls back to `<binary_dir>/../lib/caustic/`, then `/usr/local/lib/caustic/`
 - **No libc**: Programs use raw Linux syscalls, not C library functions
