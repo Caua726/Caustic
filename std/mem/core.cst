@@ -12,13 +12,51 @@ use "../os.cst" as os;
 if (__target_is_linux + __compat_mode)   use "linux.cst"   as mem_linux;
 if (__target_is_windows + __compat_mode) use "windows.cst" as mem_windows;
 if (__target_is_caustic + __compat_mode) use "caustic.cst" as mem_caustic;
+if (__target_is_x86_64) use "x86rep.cst" as xrep;
 if (__target_is_wasm + __compat_mode)    use "wasm.cst"    as mem_wasm;
 if (__target_is_linux + __compat_mode)   use "../io/linux.cst"   as io_linux;
 if (__target_is_windows + __compat_mode) use "../io/windows.cst" as io_windows;
 
 // --- Memory operations ---
 
+// rep movsb / rep stosb on x86_64, measured on Zen 3 against the loops below
+// (cycles, 2 GiB moved per size): from 2 KiB to 512 KiB they win (4 KiB copy
+// 172 M -> 92 M at -O2; 16 KiB fill 149 M -> 83 M at -O2, 609 M -> 102 M at
+// -O1). Outside that range they lose: the start-up cost below it, and above
+// it the fill turns into stores that miss the cache for a reader (1 MiB fill
+// 153 M -> 340 M). A copy wins only when source and destination agree mod
+// 32; otherwise rep movsb ran 14x slower than the loop. Both align the
+// destination to 64 bytes first.
+let is i64 as _REP_MIN with imut = 2048;
+let is i64 as _REP_MAX with imut = 524288;
+
+fn _rep_copy(dst as *u8, src as *u8, n as i64) as i32 {
+    if (n < _REP_MIN || n > _REP_MAX) { return 0; }
+    let is i64 as d = cast(i64, dst);
+    let is i64 as s = cast(i64, src);
+    if (((d ^ s) & 31) != 0) { return 0; }
+    let is i64 as head = (64 - (d & 63)) & 63;
+    let is i64 as i with mut = 0;
+    while (i < head) { dst[i] = src[i]; i = i + 1; }
+    if (__target_is_x86_64 == 1) { xrep.rep_movsb(cast(*u8, d + head), cast(*u8, s + head), n - head); }
+    return 1;
+}
+
+fn _rep_fill(dst as *u8, c as i32, n as i64) as i32 {
+    if (n < _REP_MIN || n > _REP_MAX) { return 0; }
+    let is i64 as d = cast(i64, dst);
+    let is i64 as head = (64 - (d & 63)) & 63;
+    let is u8 as cb = cast(u8, c);
+    let is i64 as i with mut = 0;
+    while (i < head) { dst[i] = cb; i = i + 1; }
+    if (__target_is_x86_64 == 1) { xrep.rep_stosb(cast(*u8, d + head), c, n - head); }
+    return 1;
+}
+
 fn memcpy(dst as *u8, src as *u8, n as i64) as *u8 {
+    if (__target_is_x86_64 == 1) {
+        if (_rep_copy(dst, src, n) == 1) { return dst; }
+    }
     // -O2: one word per iteration. The loop vectorizer recognises this
     // induction (`i < words`, step 1) and widens it; a 32-byte body reads as
     // four strided accesses and is rejected as not countable.
@@ -57,6 +95,9 @@ fn memcpy(dst as *u8, src as *u8, n as i64) as *u8 {
 }
 
 fn memset(dst as *u8, c as i32, n as i64) as *u8 {
+    if (__target_is_x86_64 == 1) {
+        if (_rep_fill(dst, c, n) == 1) { return dst; }
+    }
     let is u8 as cb = cast(u8, c);
     if (__opt_level >= 2) {
         if (cb == 0) {
@@ -124,6 +165,9 @@ fn memcmp(a as *u8, b as *u8, n as i64) as i32 {
 }
 
 fn memzero(dst as *u8, n as i64) as void {
+    if (__target_is_x86_64 == 1) {
+        if (_rep_fill(dst, 0, n) == 1) { return; }
+    }
     if (__opt_level >= 2) {
         // One word per iteration: the shape the -O2 vectorizer widens.
         let is i64 as words = n / 8;
