@@ -1,0 +1,60 @@
+// tests/bins_mmap_fail_cold_test.cst — out of memory before the first heap.
+//
+// The shared default size table does not exist yet, so bins_new falls back to
+// a per-heap table, and that mmap fails too. The heap must come back with its
+// lookup fields zeroed: a non-zero lookup_entries with a failed pointer made
+// the next bins_alloc read through -errno (Linux) or NULL (Windows/wasm).
+// Linux only; exit code = number of failures.
+use "../std/mem.cst" only bins, core as mem;
+use "../std/os.cst" as os;
+
+fn main() as i32 {
+    if (os.current() != os.OS_LINUX) { return 0; }
+    let is i32 as fails with mut = 0;
+    // Soft RLIMIT_AS only (hard stays unlimited, so it can go back up). First
+    // halve until one page fails, then step up a page at a time until one page
+    // fits again: that leaves room for bins_new's small bin table but not for
+    // the 16 KiB lookup table — the path that used to keep lookup_entries.
+    let is i64 as lim with mut = 1048576;
+    let is i32 as forced with mut = 0;
+    while (lim >= 65536) {
+        let is [2]i64 as rl;
+        rl[0] = lim;
+        rl[1] = 0 - 1;
+        if (syscall(160, 9, cast(**i64, &rl)) < 0) { break; }
+        let is *u8 as probe = mem.core.mmap_anon(4096);
+        if (cast(i64, probe) < 0) { forced = 1; break; }
+        mem.core.munmap(probe, 4096);
+        lim = lim / 2;
+    }
+    if (forced == 0) { return 0; }   // could not force ENOMEM: nothing to check
+    let is i32 as room with mut = 0;
+    let is i32 as steps with mut = 0;
+    while (room == 0 && steps < 4096) {
+        lim = lim + 4096;
+        let is [2]i64 as rl2;
+        rl2[0] = lim;
+        rl2[1] = 0 - 1;
+        if (syscall(160, 9, cast(**i64, &rl2)) < 0) { return 0; }
+        let is *u8 as p1 = mem.core.mmap_anon(4096);
+        if (cast(i64, p1) > 0) {
+            let is *u8 as p4 = mem.core.mmap_anon(16384);
+            if (cast(i64, p4) > 0) { mem.core.munmap(p4, 16384); return 0; }  // overshot: skip
+            mem.core.munmap(p1, 4096);
+            room = 1;
+        }
+        steps = steps + 1;
+    }
+    if (room == 0) { return 0; }
+    let is mem.Bins as b = mem.bins.bins_new(65536);
+    if (b.lookup_entries != 0) { fails = fails + 1; }
+    if (cast(i64, b.lookup) != 0) { fails = fails + 1; }
+    if (b.bin_count != 0) { fails = fails + 1; }
+    // A zeroed heap re-initialises on first use. With a page of room the
+    // allocation may succeed through a direct mapping; either way it must not
+    // fault, and a non-null result must be writable.
+    let is *u8 as p = mem.bins.bins_alloc(&b, 8);
+    if (cast(i64, p) != 0) { p[0] = 7; p[7] = 9; if (p[0] != 7 || p[7] != 9) { fails = fails + 1; } }
+    mem.bins.bins_destroy(&b);
+    return fails;
+}
