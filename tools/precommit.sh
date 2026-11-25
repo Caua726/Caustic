@@ -365,6 +365,8 @@ ok "$nrt builds byte-identical"
 
 # ─── 5. test suite ──────────────────────────────────────────────────────────
 step "test suite (tests/run_tests.cst)"
+# The suite writes under build/, which is ignored, so a fresh clone (CI's) has none.
+mkdir -p build
 if ! "$CUR" -q "tests/run_tests.cst" -o "$TMP/tests" >/dev/null 2>&1; then die "test runner failed to build"; fi
 if ! CAUSTIC_TEST_COMPILER="$CUR" CAUSTIC_TEST_ASSEMBLER="$TMP/caustic-as" \
         CAUSTIC_TEST_LINKER="$TMP/caustic-ld" "$TMP/tests" > "$TMP/testout.txt" 2>&1; then

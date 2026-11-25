@@ -113,7 +113,9 @@ ok "caustic-x86_64-linux.tar.gz — $(tar tzf caustic-x86_64-linux.tar.gz | wc -
 step "Package caustic-x86_64-windows.zip"
 ./caustic-mk run dist-windows >/dev/null 2>&1 || die "windows packaging failed"
 [ -f caustic-x86_64-windows.zip ] || die "dist-windows did not produce the zip"
-unzip -l caustic-x86_64-windows.zip | grep -q "libcaustic.dll" \
+# grep -c, not -q: -q stops at the first match, unzip dies of SIGPIPE writing the
+# rest of the listing, and pipefail turns that into a missing dll.
+unzip -l caustic-x86_64-windows.zip | grep -c "libcaustic.dll" >/dev/null \
     || die "the windows zip carries no libcaustic.dll"
 ok "caustic-x86_64-windows.zip — $(unzip -l caustic-x86_64-windows.zip | tail -1 | awk '{print $2}') files"
 
