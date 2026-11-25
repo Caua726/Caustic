@@ -58,6 +58,215 @@ fn _belongs_to_target_module(f as *d.IRFunction) as i32 {
     return 1;
 }
 
+// === What one module owns, without a pass over the program per module ===
+//
+// --module-only and the batch emission (--module-objects, the parallel-exe
+// workers) emit one object per module from the same program: the functions
+// and globals whose mangled name is `<prefix>_...`. codegen() used to find
+// them by testing every function three times and every global three times,
+// once per module. Instead the program's names are sorted once; the names a
+// prefix owns are then one contiguous range, found by binary search, and put
+// back in list order (the order everything is emitted in). The answer is the
+// same set _belongs_to_target_module / _global_belongs give, in the same
+// order. The lists do not change once codegen starts (inlining copies bodies
+// into shadow records outside them), so the index lives for the program.
+let is i64 as _ix_prog with mut = 0;       // program the index was built for
+let is i64 as _ix_fhead with mut = 0;      // its functions / globals heads then
+let is i64 as _ix_ghead with mut = 0;
+let is i32 as _ix_nf with mut = 0;
+let is i32 as _ix_ng with mut = 0;
+let is *i64 as _ix_fsorted with mut;       // IRFunction*, by name
+let is *i32 as _ix_ford with mut;          // list position of each
+let is *i64 as _ix_flist with mut;         // IRFunction*, list order
+let is *i64 as _ix_gsorted with mut;
+let is *i32 as _ix_gord with mut;
+let is *i64 as _ix_glist with mut;
+let is *i32 as _ix_tmp with mut;           // merge scratch / range ordinals
+let is i32 as _ix_tmp_cap with mut = 0;
+let is *i64 as _ix_out with mut;           // the module's items, list order
+let is i32 as _ix_out_cap with mut = 0;
+
+// Name order: bytes unsigned, a proper prefix first.
+fn _ix_cmp(ap as *u8, al as i32, bp as *u8, bl as i32) as i32 {
+    let is i32 as n with mut = al;
+    if (bl < n) { n = bl; }
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is i32 as x = cast(i32, ap[i]);
+        let is i32 as y = cast(i32, bp[i]);
+        if (x != y) { return x - y; }
+        i = i + 1;
+    }
+    return al - bl;
+}
+
+fn _ix_fname(f as i64, out_len as *i32) as *u8 {
+    let is *d.IRFunction as fn_ = cast(*d.IRFunction, f);
+    *out_len = fn_.asm_name_len;
+    return fn_.asm_name_ptr;
+}
+fn _ix_gname(g as i64, out_len as *i32) as *u8 {
+    let is *d.IRGlobal as gl = cast(*d.IRGlobal, g);
+    *out_len = gl.name_len;
+    return gl.name_ptr;
+}
+
+fn _ix_key(items as *i64, k as i32, is_fn as i32, out_len as *i32) as *u8 {
+    if (is_fn == 1) { return _ix_fname(items[k], out_len); }
+    return _ix_gname(items[k], out_len);
+}
+
+fn _ix_tmp_reserve(n as i32) as void {
+    if (n <= _ix_tmp_cap) { return; }
+    if (_ix_tmp_cap > 0) { d.opt_free(cast(*u8, _ix_tmp)); }
+    _ix_tmp = cast(*i32, d.opt_alloc(cast(i64, n) * 8 + 8));
+    _ix_tmp_cap = n * 2;
+}
+
+// Sort positions 0..n-1 of items by name, stable (bottom-up merge); ord[k]
+// ends as the list position of the k-th name.
+fn _ix_sort(items as *i64, ord as *i32, n as i32, is_fn as i32) as void {
+    _ix_tmp_reserve(n);
+    let is i32 as w with mut = 1;
+    while (w < n) {
+        let is i32 as lo with mut = 0;
+        while (lo < n) {
+            let is i32 as mid with mut = lo + w;
+            if (mid > n) { mid = n; }
+            let is i32 as hi with mut = lo + 2 * w;
+            if (hi > n) { hi = n; }
+            let is i32 as a with mut = lo;
+            let is i32 as b with mut = mid;
+            let is i32 as o with mut = lo;
+            while (a < mid || b < hi) {
+                let is i32 as take_a with mut = 0;
+                if (b >= hi) { take_a = 1; }
+                else if (a < mid) {
+                    let is i32 as la with mut = 0;
+                    let is i32 as lb with mut = 0;
+                    let is *u8 as pa = _ix_key(items, ord[a], is_fn, &la);
+                    let is *u8 as pb = _ix_key(items, ord[b], is_fn, &lb);
+                    if (_ix_cmp(pa, la, pb, lb) <= 0) { take_a = 1; }
+                }
+                if (take_a == 1) { _ix_tmp[o] = ord[a]; a = a + 1; }
+                else { _ix_tmp[o] = ord[b]; b = b + 1; }
+                o = o + 1;
+            }
+            lo = lo + 2 * w;
+        }
+        let is i32 as k with mut = 0;
+        while (k < n) { ord[k] = _ix_tmp[k]; k = k + 1; }
+        w = w * 2;
+    }
+}
+
+fn _ix_build(p as *d.IRProgram) as void {
+    if (_ix_prog == cast(i64, p) && _ix_fhead == cast(i64, p.functions) && _ix_ghead == cast(i64, p.globals)) { return; }
+    if (_ix_prog != 0) {
+        d.opt_free(cast(*u8, _ix_fsorted)); d.opt_free(cast(*u8, _ix_ford)); d.opt_free(cast(*u8, _ix_flist));
+        d.opt_free(cast(*u8, _ix_gsorted)); d.opt_free(cast(*u8, _ix_gord)); d.opt_free(cast(*u8, _ix_glist));
+    }
+    let is i32 as nf with mut = 0;
+    let is *d.IRFunction as f with mut = p.functions;
+    while (cast(i64, f) != 0) { nf = nf + 1; f = f.next; }
+    let is i32 as ng with mut = 0;
+    let is *d.IRGlobal as g with mut = p.globals;
+    while (cast(i64, g) != 0) { ng = ng + 1; g = g.next; }
+    _ix_flist = cast(*i64, d.opt_alloc(cast(i64, nf) * 8 + 8));
+    _ix_ford = cast(*i32, d.opt_alloc(cast(i64, nf) * 4 + 4));
+    _ix_fsorted = cast(*i64, d.opt_alloc(cast(i64, nf) * 8 + 8));
+    _ix_glist = cast(*i64, d.opt_alloc(cast(i64, ng) * 8 + 8));
+    _ix_gord = cast(*i32, d.opt_alloc(cast(i64, ng) * 4 + 4));
+    _ix_gsorted = cast(*i64, d.opt_alloc(cast(i64, ng) * 8 + 8));
+    let is i32 as k with mut = 0;
+    f = p.functions;
+    while (cast(i64, f) != 0) { _ix_flist[k] = cast(i64, f); _ix_ford[k] = k; k = k + 1; f = f.next; }
+    k = 0;
+    g = p.globals;
+    while (cast(i64, g) != 0) { _ix_glist[k] = cast(i64, g); _ix_gord[k] = k; k = k + 1; g = g.next; }
+    _ix_sort(_ix_flist, _ix_ford, nf, 1);
+    _ix_sort(_ix_glist, _ix_gord, ng, 0);
+    k = 0;
+    while (k < nf) { _ix_fsorted[k] = _ix_flist[_ix_ford[k]]; k = k + 1; }
+    k = 0;
+    while (k < ng) { _ix_gsorted[k] = _ix_glist[_ix_gord[k]]; k = k + 1; }
+    _ix_nf = nf;
+    _ix_ng = ng;
+    _ix_prog = cast(i64, p);
+    _ix_fhead = cast(i64, p.functions);
+    _ix_ghead = cast(i64, p.globals);
+}
+
+// 1 when name starts with the prefix and the '_' after it.
+fn _ix_owned(name as *u8, len as i32, pre as *u8, plen as i32) as i32 {
+    if (len < plen + 1) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < plen) { if (name[i] != pre[i]) { return 0; } i = i + 1; }
+    if (name[plen] != 95) { return 0; }
+    return 1;
+}
+
+// The items (functions when is_fn = 1, else globals) the target module owns,
+// in list order, in _ix_out; returns how many.
+fn _ix_range(is_fn as i32) as i32 {
+    let is *u8 as pre = tgt.module_prefix_ptr_get();
+    let is i32 as plen = tgt.module_prefix_len_get();
+    if (plen == 0) { return 0; }
+    let is *i64 as sorted with mut = _ix_gsorted;
+    let is *i32 as ord with mut = _ix_gord;
+    let is i32 as n with mut = _ix_ng;
+    if (is_fn == 1) { sorted = _ix_fsorted; ord = _ix_ford; n = _ix_nf; }
+    // First name not below prefix + "_".
+    let is i32 as lo with mut = 0;
+    let is i32 as hi with mut = n;
+    while (lo < hi) {
+        let is i32 as mid = (lo + hi) >> 1;
+        let is i32 as ml with mut = 0;
+        let is *u8 as mp = _ix_key(sorted, mid, is_fn, &ml);
+        // compare name with prefix + '_' (plen + 1 bytes)
+        let is i32 as c with mut = 0;
+        let is i32 as m with mut = ml;
+        if (plen + 1 < m) { m = plen + 1; }
+        let is i32 as i with mut = 0;
+        while (c == 0 && i < m) {
+            let is i32 as kb with mut = 95;
+            if (i < plen) { kb = cast(i32, pre[i]); }
+            c = cast(i32, mp[i]) - kb;
+            i = i + 1;
+        }
+        if (c == 0) { c = ml - (plen + 1); }
+        if (c < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    let is i32 as cnt with mut = 0;
+    let is i32 as k with mut = lo;
+    _ix_tmp_reserve(n);
+    while (k < n) {
+        let is i32 as ml with mut = 0;
+        let is *u8 as mp = _ix_key(sorted, k, is_fn, &ml);
+        if (_ix_owned(mp, ml, pre, plen) == 0) { k = n; }
+        else { _ix_tmp[cnt] = ord[k]; cnt = cnt + 1; k = k + 1; }
+    }
+    // Back to list order (insertion sort on list positions: a module owns few).
+    let is i32 as a with mut = 1;
+    while (a < cnt) {
+        let is i32 as v = _ix_tmp[a];
+        let is i32 as b with mut = a - 1;
+        while (b >= 0 && _ix_tmp[b] > v) { _ix_tmp[b + 1] = _ix_tmp[b]; b = b - 1; }
+        _ix_tmp[b + 1] = v;
+        a = a + 1;
+    }
+    if (cnt + 1 > _ix_out_cap) {
+        if (_ix_out_cap > 0) { d.opt_free(cast(*u8, _ix_out)); }
+        _ix_out_cap = cnt * 2 + 16;
+        _ix_out = cast(*i64, d.opt_alloc(cast(i64, _ix_out_cap) * 8));
+    }
+    let is *i64 as list with mut = _ix_glist;
+    if (is_fn == 1) { list = _ix_flist; }
+    a = 0;
+    while (a < cnt) { _ix_out[a] = list[_ix_tmp[a]]; a = a + 1; }
+    return cnt;
+}
+
 // A global a library we read exports. It exists once, in the library, and this
 // program imports it. The library's export table is the authority, as for functions.
 fn _global_is_library(name as *u8, len as i32) as i32 {
@@ -1811,18 +2020,85 @@ fn _emit_global_value(g as *d.IRGlobal) as void {
     _emit_align8(g.size);
 }
 
+// The globals codegen considers: in module-only emission the ones the target
+// module owns (by the name index above), minus those a library we read exports
+// — the same set _global_belongs picks, in list order; otherwise 0 (walk the
+// list). Returns the count in *n.
+fn _owned_globals(prog as *d.IRProgram, n as *i32) as *i64 {
+    *n = 0;
+    if (tgt.module_only_get() == 0) { return cast(*i64, 0); }
+    _ix_build(prog);
+    let is i32 as cnt = _ix_range(0);
+    let is i32 as k with mut = 0;
+    let is i32 as m with mut = 0;
+    while (k < cnt) {
+        let is *d.IRGlobal as g = cast(*d.IRGlobal, _ix_out[k]);
+        if (_global_is_library(g.name_ptr, g.name_len) == 0) { _ix_out[m] = _ix_out[k]; m = m + 1; }
+        k = k + 1;
+    }
+    *n = m;
+    return _ix_out;
+}
+
+fn _emit_section_global(sg as *d.IRGlobal) as void {
+    eo.out_str(".section ", 9);
+    eo.out_str(sg.section_ptr, sg.section_len);
+    eo.out_str(", \"aw\", @progbits\n", 18);
+    _emit_global_value(sg);
+}
+
+fn _emit_bss_global(g as *d.IRGlobal) as void {
+    eo.out_str(".globl ", 7);
+    eo.out_str(g.name_ptr, g.name_len);
+    eo.out_char(10);
+    eo.out_str(g.name_ptr, g.name_len);
+    eo.out_str(":\n", 2);
+    eo.out_str("  .zero ", 8);
+    eo.out_int(cast(i64, g.size));
+    eo.out_char(10);
+    _emit_align8(g.size);
+}
+
 fn emit_data(prog as *d.IRProgram) as void {
     let is i32 as has_data with mut = 0;
     let is i32 as has_bss with mut = 0;
+    let is i32 as on with mut = 0;
+    let is *i64 as own = _owned_globals(prog, &on);
+
+    if (cast(i64, own) != 0) {
+        // Module-only: the same three passes over this module's globals only.
+        let is i32 as k with mut = 0;
+        while (k < on) {
+            let is *d.IRGlobal as sg = cast(*d.IRGlobal, own[k]);
+            if (sg.is_reachable == 1 && sg.section_len > 0) { _emit_section_global(sg); }
+            k = k + 1;
+        }
+        k = 0;
+        while (k < on) {
+            let is *d.IRGlobal as g = cast(*d.IRGlobal, own[k]);
+            if (g.is_reachable == 1 && g.is_initialized == 1 && g.is_string_const == 0 && g.section_len == 0) {
+                if (has_data == 0) { eo.out_str(".data\n", 6); has_data = 1; }
+                _emit_global_value(g);
+            }
+            k = k + 1;
+        }
+        k = 0;
+        while (k < on) {
+            let is *d.IRGlobal as g = cast(*d.IRGlobal, own[k]);
+            if (g.is_reachable == 1 && g.is_initialized == 0 && g.section_len == 0) {
+                if (has_bss == 0) { eo.out_str(".bss\n", 5); has_bss = 1; }
+                _emit_bss_global(g);
+            }
+            k = k + 1;
+        }
+        return;
+    }
 
     // Custom sections first (globals with section attribute)
     let is *d.IRGlobal as sg with mut = prog.globals;
     while (cast(i64, sg) != 0) {
         if (sg.is_reachable == 1 && sg.section_len > 0 && _global_belongs(sg) == 1) {
-            eo.out_str(".section ", 9);
-            eo.out_str(sg.section_ptr, sg.section_len);
-            eo.out_str(", \"aw\", @progbits\n", 18);
-            _emit_global_value(sg);
+            _emit_section_global(sg);
         }
         sg = sg.next;
     }
@@ -1847,15 +2123,7 @@ fn emit_data(prog as *d.IRProgram) as void {
                 eo.out_str(".bss\n", 5);
                 has_bss = 1;
             }
-            eo.out_str(".globl ", 7);
-            eo.out_str(g.name_ptr, g.name_len);
-            eo.out_char(10);
-            eo.out_str(g.name_ptr, g.name_len);
-            eo.out_str(":\n", 2);
-            eo.out_str("  .zero ", 8);
-            eo.out_int(cast(i64, g.size));
-            eo.out_char(10);
-            _emit_align8(g.size);
+            _emit_bss_global(g);
         }
         g = g.next;
     }
@@ -2301,6 +2569,55 @@ fn prepare_program(p as *d.IRProgram) as void {
     if (d.params_canon_ok == 1 && al.al_opt_level >= 2 && _outside_callers(p) == 0) { d.params_canon_prog = 1; }
 }
 
+// The functions codegen visits: in module-only emission the target module's
+// (the index above), else every function. A cursor, not a list: the loops in
+// codegen() run one after another, never nested.
+let is *i64 as _it_own with mut;
+let is i32 as _it_own_cap with mut = 0;
+let is i32 as _it_n with mut = 0;
+let is i32 as _it_i with mut = 0;
+let is i32 as _it_on with mut = 0;          // 1 = iterate _it_own
+let is i64 as _it_dyn_prog with mut = 0;    // program is_dyn_import was set for
+
+fn _cg_funcs_prepare(p as *d.IRProgram) as void {
+    _it_on = 0;
+    if (tgt.module_only_get() == 0) { return; }
+    _ix_build(p);
+    // is_dyn_import depends only on the program and the libraries read, so
+    // one pass per program instead of one per module.
+    if (_it_dyn_prog != cast(i64, p)) {
+        let is *d.IRFunction as f with mut = p.functions;
+        while (cast(i64, f) != 0) { f.is_dyn_import = _is_dyn_library(f); f = f.next; }
+        _it_dyn_prog = cast(i64, p);
+    }
+    let is i32 as cnt = _ix_range(1);
+    if (cnt + 1 > _it_own_cap) {
+        if (_it_own_cap > 0) { d.opt_free(cast(*u8, _it_own)); }
+        _it_own_cap = cnt * 2 + 16;
+        _it_own = cast(*i64, d.opt_alloc(cast(i64, _it_own_cap) * 8));
+    }
+    let is i32 as k with mut = 0;
+    while (k < cnt) { _it_own[k] = _ix_out[k]; k = k + 1; }
+    _it_n = cnt;
+    _it_on = 1;
+}
+
+fn _cg_first(p as *d.IRProgram) as *d.IRFunction {
+    if (_it_on == 0) { return p.functions; }
+    _it_i = 0;
+    if (_it_n == 0) { return cast(*d.IRFunction, 0); }
+    _it_i = 1;
+    return cast(*d.IRFunction, _it_own[0]);
+}
+
+fn _cg_next(f as *d.IRFunction) as *d.IRFunction {
+    if (_it_on == 0) { return f.next; }
+    if (_it_i >= _it_n) { return cast(*d.IRFunction, 0); }
+    let is *d.IRFunction as r = cast(*d.IRFunction, _it_own[_it_i]);
+    _it_i = _it_i + 1;
+    return r;
+}
+
 fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as void {
     let is *d.IRProgram as p = cast(*d.IRProgram, prog);
     eo.stats_add(eo.STAT_MODULES, 1);
@@ -2352,17 +2669,18 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
 
     // Emit .globl for all reachable functions
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: globl\n"); }
-    let is *d.IRFunction as f with mut = p.functions;
+    _cg_funcs_prepare(p);
+    let is *d.IRFunction as f with mut = _cg_first(p);
     while (cast(i64, f) != 0) {
         // Inlining a shared-runtime body would bind its globals to a private
         // copy in this image instead of the library's state.
-        f.is_dyn_import = _is_dyn_library(f);
+        if (_it_on == 0) { f.is_dyn_import = _is_dyn_library(f); }
         if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
             eo.out_str(".globl ", 7);
             eo.out_str(f.asm_name_ptr, f.asm_name_len);
             eo.out_char(10);
         }
-        f = f.next;
+        f = _cg_next(f);
     }
 
     // Phase 2+3 per-function: inline → re-optimize (only with -O1). This is the
@@ -2374,13 +2692,13 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     // nothing to do here for it. (g_preinlined is the reserved "already inlined,
     // skip" off-switch, currently always 0.)
     if (al.al_opt_level >= 1 && g_preinlined == 0 && g_snapshot_inline == 0) {
-        f = p.functions;
+        f = _cg_first(p);
         while (cast(i64, f) != 0) {
             if (f.is_reachable == 1 && _is_dyn_extern(f) == 0 && cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {
                 irp.regen_func_ir(f);
                 opt.optimize_func(f);
             }
-            f = f.next;
+            f = _cg_next(f);
         }
         if (al.al_opt_level >= 2) {
             // -O2 visits callees before their callers, so what gets copied
@@ -2401,12 +2719,12 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
             }
             d.opt_free(cast(*u8, order));
         } else {
-            f = p.functions;
+            f = _cg_first(p);
             while (cast(i64, f) != 0) {
                 if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
                     opt.optimize_inline_func(f, prog);
                 }
-                f = f.next;
+                f = _cg_next(f);
             }
         }
     }
@@ -2418,7 +2736,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
 
     // Codegen per-function: regen freed functions, then codegen + free
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: funcs\n"); }
-    f = p.functions;
+    f = _cg_first(p);
     while (cast(i64, f) != 0) {
         if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
             d.func_trim_opened();
@@ -2508,7 +2826,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
                 f.has_asm = snap_asm;
             }
         }
-        f = f.next;
+        f = _cg_next(f);
     }
 
     d.func_close_opened();
