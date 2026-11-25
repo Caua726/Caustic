@@ -825,6 +825,121 @@ fn _stream_gen(node as *u8) as void {
     if (cast(i64, sc.sem_token_list) == cast(i64, g_stream_root_tl)) { irg.ir_tl = g_stream_root_tl; }
     else { irg.ir_tl = cast(*u8, 0); }
     irp.gen_stream_fn(node);
+    if (g_lazy == 1) { _lz_names_of(cast(*ird.IRFunction, ast.nx_ir_func(cast(*ast.Node, node)))); }
+}
+
+// === Demand-driven bodies (CAUSTIC_LAZY_BODIES=1; see walk_module.cst) ===
+// Every streamed function's call targets, taken addresses and inline-asm words
+// go on a queue; a queued name that is a deferred function streams it, whose
+// own names join the queue, until it is empty. What is never named is dropped.
+let is i32 as g_lazy with mut = 0;
+let is *i64 as _lzq with mut = cast(*i64, 0);   // pairs: name ptr, len
+let is i64 as _lzq_n with mut = 0;
+let is i64 as _lzq_cap with mut = 0;
+
+fn _lz_push(p as *u8, n as i64) as void {
+    if (n <= 0) { return; }
+    if (_lzq_n >= _lzq_cap) {
+        let is i64 as nc with mut = _lzq_cap * 2;
+        if (nc < 4096) { nc = 4096; }
+        let is *i64 as nb = cast(*i64, mem.core.mmap_anon(nc * 16));
+        let is i64 as k with mut = 0;
+        while (k < _lzq_n * 2) { nb[k] = _lzq[k]; k = k + 1; }
+        if (_lzq_cap > 0) { mem.core.munmap(cast(*u8, _lzq), _lzq_cap * 16); }
+        _lzq = nb;
+        _lzq_cap = nc;
+    }
+    _lzq[_lzq_n * 2] = cast(i64, p);
+    _lzq[_lzq_n * 2 + 1] = n;
+    _lzq_n = _lzq_n + 1;
+    // -O2 turns sin(v) and cos(v) into math.sincos (opt_sincos.cst): whenever
+    // either is named, so is the sincos beside it.
+    if (n >= 16 && (str_eq(p + (n - 16), 16, "std_math_cst_sin", 16) == 1
+                    || str_eq(p + (n - 16), 16, "std_math_cst_cos", 16) == 1)) {
+        let is *u8 as sc_name = ird.opt_alloc(n + 4);
+        mem.memcpy(sc_name, p, n - 3);
+        mem.memcpy(sc_name + (n - 3), "sincos", 6);
+        _lz_push(sc_name, n + 3);
+    }
+}
+
+fn _lz_asm_words(s as *u8, n as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is i32 as st = i;
+        while (i < n && (s[i] == cast(u8, 95) || s[i] == cast(u8, 46) || s[i] == cast(u8, 36)
+                || (s[i] >= cast(u8, 48) && s[i] <= cast(u8, 57))
+                || (s[i] >= cast(u8, 65) && s[i] <= cast(u8, 90))
+                || (s[i] >= cast(u8, 97) && s[i] <= cast(u8, 122)))) { i = i + 1; }
+        if (i > st) { _lz_push(ird.str_dup(s + cast(i64, st), i - st), cast(i64, i - st)); }
+        else { i = i + 1; }
+    }
+}
+
+fn _lz_names_of(f as *ird.IRFunction) as void {
+    if (cast(i64, f) == 0) { return; }
+    let is i32 as k with mut = 0;
+    while (k < f.call_target_count) {
+        let is *i64 as pp = cast(*i64, cast(i64, f.call_targets) + cast(i64, k) * 12);
+        let is *i32 as pl = cast(*i32, cast(i64, f.call_targets) + cast(i64, k) * 12 + 8);
+        _lz_push(cast(*u8, *pp), cast(i64, *pl));
+        k = k + 1;
+    }
+    if (f.has_asm != 0 && f.ir_blob_count > 0 && cast(i64, f.instructions) == 0) {
+        let is *ird.IRInst as hd = ird.func_unpack(f);
+        let is *ird.IRInst as pi with mut = hd;
+        while (cast(i64, pi) != 0) {
+            if (pi.op == ird.IR_ASM) { _lz_asm_words(pi.asm_str_ptr, pi.asm_str_len); }
+            pi = pi.next;
+        }
+        ird.free_inst_list(hd);
+    }
+}
+
+fn _lz_global_name(p as *u8, n as i64) as void { _lz_push(p, n); }
+
+fn _lz_hash(p as *u8, n as i64) as i64 {
+    let is i64 as h with mut = 5381;
+    let is i64 as i with mut = 0;
+    while (i < n) { h = h * 33 + cast(i64, p[i]); i = i + 1; }
+    return h & 9223372036854775807;
+}
+
+fn _lz_run() as void {
+    sem.lazy_global_names(fn_ptr(_lz_global_name));
+    let is i32 as nd = sem.lazy_count();
+    let is i64 as tsz with mut = 1024;
+    while (tsz < cast(i64, nd) * 2) { tsz = tsz * 2; }
+    let is *i32 as tbl = cast(*i32, mem.core.mmap_anon(tsz * 4));   // entry index + 1, 0 = empty
+    let is i32 as i with mut = 0;
+    while (i < nd) {
+        let is i64 as h with mut = _lz_hash(sem.lazy_name_ptr(i), cast(i64, sem.lazy_name_len(i))) & (tsz - 1);
+        while (tbl[h] != 0) { h = (h + 1) & (tsz - 1); }
+        tbl[h] = i + 1;
+        i = i + 1;
+    }
+    let is i64 as qi with mut = 0;
+    let is i32 as streamed with mut = 0;
+    while (qi < _lzq_n) {
+        let is *u8 as p = cast(*u8, _lzq[qi * 2]);
+        let is i64 as n = _lzq[qi * 2 + 1];
+        qi = qi + 1;
+        let is i64 as h with mut = _lz_hash(p, n) & (tsz - 1);
+        while (tbl[h] != 0) {
+            let is i32 as ei = tbl[h] - 1;
+            if (cast(i64, sem.lazy_name_len(ei)) == n && str_eq(sem.lazy_name_ptr(ei), cast(i32, n), p, cast(i32, n)) == 1) {
+                if (sem.lazy_done(ei) == 0) { sem.lazy_stream(ei); streamed = streamed + 1; }
+            }
+            h = (h + 1) & (tsz - 1);
+        }
+    }
+    let is i32 as dropped = sem.lazy_drop_rest();
+    mem.core.munmap(cast(*u8, tbl), tsz * 4);
+    let is *u8 as ev = env.getenv("CAUSTIC_LAZY_BODIES");
+    if (cast(i64, ev) != 0 && ev[0] == 50) {
+        io.printf("lazy bodies: deferred %d, streamed %d, dropped %d, names %d\n",
+            cast(i64, nd), cast(i64, streamed), cast(i64, dropped), _lzq_n);
+    }
 }
 
 fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
@@ -949,11 +1064,20 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
         if (tgt.target_get().arch == tgt.ARCH_X86_64) { ird.ir_pack = 1; }
         g_stream_root_tl = cast(*u8, &tokens);
         sem.set_stream_hook(fn_ptr(_stream_gen));
+        // Opt-in prototype: defer imported bodies until named (see _lz_run).
+        let is *u8 as lzv = env.getenv("CAUSTIC_LAZY_BODIES");
+        if (cast(i64, lzv) != 0 && lzv[0] != 48 && g_no_main == 0 && g_file_count == 1 && g_lib_count == 0
+            && ldmod.g_shared == 0 && ldmod.g_freestanding == 0
+            && ird.ir_pack == 1) {
+            g_lazy = 1;
+            sem.set_lazy_on(1);
+        }
     }
 
     // Semantic
     let is i64 as t2 = get_time_us();
     sem.analyze(cast(*u8, root), filename, fname_len, src, file_size, cast(*u8, &tokens));
+    if (g_lazy == 1) { _lz_run(); }
     prof.prof_record("semantic", get_time_us() - t2);
     if (g_quiet == 0) { io.write_str(io.STDOUT, "semantic: ok\n"); }
 

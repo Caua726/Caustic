@@ -368,8 +368,12 @@ fn visit_use_module(n as *ast.Node, pass_id as i32) as void {
             cached.bodies_done = 1;
             sc.current_source_dir_ptr = cached.source_dir_ptr;
             sc.current_source_dir_len = cached.source_dir_len;
+            _lz_depth = _lz_depth + 1;
             analyze_bodies(cached.body);
-            if (ast.stream_active == 1) { mod.free_tokens_of(cached); }
+            _lz_depth = _lz_depth - 1;
+            // Deferred bodies are parsed from these tokens later; the driver
+            // frees every module's tokens after its worklist.
+            if (ast.stream_active == 1 && lazy_on == 0) { mod.free_tokens_of(cached); }
         }
     }
     sc.sem_src = old_sem_src;
@@ -659,6 +663,148 @@ fn _stream_fn(n as *ast.Node) as void {
     ast.reset_transient_nodes();
 }
 
+// === Demand-driven bodies (opt-in: CAUSTIC_LAZY_BODIES=1) ===
+// A function of an imported module is not parsed, analysed or lowered when its
+// module is walked; it is recorded with the module context it needs and
+// streamed only once something reachable names it (the driver's worklist in
+// main.cst). Unreached bodies are never analysed, so an error inside an unused
+// imported function is not reported — the reason this is opt-in.
+// Entry: node, asm name ptr/len, scope, prefix ptr/len, dir ptr/len, src,
+// src len, filename, token list, done — 13 words.
+let is i32 as lazy_on with mut = 0;
+fn set_lazy_on(v as i32) as void { lazy_on = v; }
+let is i32 as _lz_depth with mut = 0;
+let is i32 as _lz_n with mut = 0;
+let is i32 as _lz_cap with mut = 0;
+let is *i64 as _lz with mut = cast(*i64, 0);
+let is *ast.Node as _lz_root with mut = cast(*ast.Node, 0);
+
+fn _lz_defer(n as *ast.Node) as i32 {
+    if (lazy_on == 0 || _lz_depth == 0) { return 0; }
+    if (ast.nx_is_imut(n) == 1 || ast.nx_section_len(n) > 0 || ast.nx_is_naked(n) == 1
+        || ast.nx_is_ginst(n) == 1) { return 0; }
+    let is *d.Function as fs = sc.lookup_fn(n.name_ptr, n.name_len);
+    if (cast(i64, fs) == 0 || fs.asm_name_len <= 0) { return 0; }
+    if (_lz_n >= _lz_cap) {
+        let is i32 as nc with mut = _lz_cap * 2;
+        if (nc < 1024) { nc = 1024; }
+        let is *i64 as nb = cast(*i64, mem.core.mmap_anon(cast(i64, nc) * 13 * 8));
+        if (cast(i64, nb) <= 0) { return 0; }
+        let is i64 as k with mut = 0;
+        while (k < cast(i64, _lz_n) * 13) { nb[k] = _lz[k]; k = k + 1; }
+        if (_lz_cap > 0) { mem.core.munmap(cast(*u8, _lz), cast(i64, _lz_cap) * 13 * 8); }
+        _lz = nb;
+        _lz_cap = nc;
+    }
+    let is *i64 as e = cast(*i64, cast(i64, _lz) + cast(i64, _lz_n) * 13 * 8);
+    e[0] = cast(i64, n);
+    e[1] = cast(i64, fs.asm_name_ptr);
+    e[2] = cast(i64, fs.asm_name_len);
+    e[3] = cast(i64, sc.current_scope);
+    e[4] = cast(i64, sc.current_mod_prefix_ptr);
+    e[5] = cast(i64, sc.current_mod_prefix_len);
+    e[6] = cast(i64, sc.current_source_dir_ptr);
+    e[7] = cast(i64, sc.current_source_dir_len);
+    e[8] = cast(i64, sc.sem_src);
+    e[9] = sc.sem_src_len;
+    e[10] = cast(i64, sc.sem_filename);
+    e[11] = cast(i64, sc.sem_token_list);
+    e[12] = 0;
+    _lz_n = _lz_n + 1;
+    return 1;
+}
+
+fn lazy_count() as i32 { return _lz_n; }
+fn _lz_e(i as i32) as *i64 { return cast(*i64, cast(i64, _lz) + cast(i64, i) * 13 * 8); }
+fn lazy_name_ptr(i as i32) as *u8 { return cast(*u8, _lz_e(i)[1]); }
+fn lazy_name_len(i as i32) as i32 { return cast(i32, _lz_e(i)[2]); }
+fn lazy_done(i as i32) as i32 { return cast(i32, _lz_e(i)[12]); }
+
+// Analyse and lower entry i now, in the module context it was recorded with.
+fn lazy_stream(i as i32) as void {
+    let is *i64 as e = _lz_e(i);
+    if (e[12] != 0) { return; }
+    e[12] = 1;
+    let is *d.Scope as o_scope = sc.current_scope;
+    let is *u8 as o_pp = sc.current_mod_prefix_ptr;
+    let is i32 as o_pl = sc.current_mod_prefix_len;
+    let is *u8 as o_dp = sc.current_source_dir_ptr;
+    let is i32 as o_dl = sc.current_source_dir_len;
+    let is *u8 as o_src = sc.sem_src;
+    let is i64 as o_sl = sc.sem_src_len;
+    let is *u8 as o_fn = sc.sem_filename;
+    let is *u8 as o_tl = sc.sem_token_list;
+    sc.current_scope = cast(*d.Scope, e[3]);
+    sc.current_mod_prefix_ptr = cast(*u8, e[4]);
+    sc.current_mod_prefix_len = cast(i32, e[5]);
+    sc.current_source_dir_ptr = cast(*u8, e[6]);
+    sc.current_source_dir_len = cast(i32, e[7]);
+    sc.sem_src = cast(*u8, e[8]);
+    sc.sem_src_len = e[9];
+    sc.sem_filename = cast(*u8, e[10]);
+    sc.sem_token_list = cast(*u8, e[11]);
+    _stream_fn(cast(*ast.Node, e[0]));
+    sc.current_scope = o_scope;
+    sc.current_mod_prefix_ptr = o_pp;
+    sc.current_mod_prefix_len = o_pl;
+    sc.current_source_dir_ptr = o_dp;
+    sc.current_source_dir_len = o_dl;
+    sc.sem_src = o_src;
+    sc.sem_src_len = o_sl;
+    sc.sem_filename = o_fn;
+    sc.sem_token_list = o_tl;
+}
+
+// Every entry still unreached loses its body, so IR generation skips it like an
+// extern declaration. Returns how many were dropped.
+fn lazy_drop_rest() as i32 {
+    let is i32 as dropped with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < _lz_n) {
+        let is *i64 as e = _lz_e(i);
+        if (e[12] == 0) {
+            let is *ast.Node as n = cast(*ast.Node, e[0]);
+            n.body = cast(*ast.Node, 0);
+            e[12] = 2;
+            dropped = dropped + 1;
+        }
+        i = i + 1;
+    }
+    return dropped;
+}
+
+// Names a global initializer takes the address of (`fn_ptr(f)` as the value or
+// a struct-literal field), in every loaded module and the root: roots that no
+// function body shows.
+fn _lz_globals_of(body as *ast.Node, cb as *u8) as void {
+    let is *ast.Node as n with mut = body;
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_LET && n.is_global == 1 && cast(i64, n.init_expr) != 0) {
+            if (n.init_expr.kind == ast.NK_FN_PTR) {
+                call(cb, n.init_expr.name_ptr, cast(i64, n.init_expr.name_len));
+            } else if (n.init_expr.kind == ast.NK_STRUCT_LIT) {
+                let is *ast.Node as a with mut = n.init_expr.args;
+                while (cast(i64, a) != 0) {
+                    if (cast(i64, a.expr) != 0 && a.expr.kind == ast.NK_FN_PTR) {
+                        call(cb, a.expr.name_ptr, cast(i64, a.expr.name_len));
+                    }
+                    a = a.next;
+                }
+            }
+        }
+        n = n.next;
+    }
+}
+
+fn lazy_global_names(cb as *u8) as void {
+    _lz_globals_of(_lz_root, cb);
+    let is *d.Module as m with mut = mod.module_list;
+    while (cast(i64, m) != 0) {
+        _lz_globals_of(cast(*ast.Node, m.body), cb);
+        m = m.next;
+    }
+}
+
 fn analyze_bodies(node as *u8) as void {
     let is *ast.Node as n with mut = cast(*ast.Node, node);
     while (cast(i64, n) != 0) {
@@ -670,7 +816,7 @@ fn analyze_bodies(node as *u8) as void {
                 // own module's scope (walk_instance). Walking it again would
                 // check it in the root's scope, where its module's names are
                 // not visible.
-                if (ast.stream_active == 1) { _stream_fn(n); }
+                if (ast.stream_active == 1) { if (_lz_defer(n) == 0) { _stream_fn(n); } }
                 else if (ast.nx_is_ginst(n) == 0) { w.walk(n); }
             }
         }
@@ -745,6 +891,7 @@ fn analyze(root as *u8, filename_ptr as *u8, filename_len as i32, src as *u8, sr
     }
 
     _stream_done = gn.ast_tail;
+    _lz_root = cast(*ast.Node, root);
 
     // register_fns runs before register_vars so globals can reference
     // functions via fn_ptr() in their initializers, and prefold_consts runs
