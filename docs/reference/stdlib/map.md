@@ -21,8 +21,7 @@ use "std/mem.cst" as mem;
 ```cst
 struct MapI64 {
     states as *u8;    // per-slot state: 0=EMPTY, 1=OCCUPIED, 2=TOMBSTONE
-    keys   as *i64;   // key storage
-    values as *i64;   // value storage
+    kv     as *i64;   // key at kv[2*i], value at kv[2*i+1]: one cache line per hit
     cap    as i64;    // current capacity (always a power of two)
     count  as i64;    // number of occupied entries
 }

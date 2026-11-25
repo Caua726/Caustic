@@ -1,0 +1,95 @@
+// tests/mapi64_test.cst — MapI64 against a plain array model.
+//
+// Keys come from a small range (so sets overwrite, deletes hit and miss, and
+// tombstones get reused) plus a few far keys (0, -1, the extremes); 200,000
+// mixed operations cross several grows. After every 1,000 operations the map
+// is checked whole: count, every key's presence and value, and an iteration
+// that sees each live key exactly once. Exit 0 = the map matched throughout.
+use "../std/map.cst" as map;
+use "../std/mem.cst" as mem;
+use "../std/io.cst" as io;
+
+let is i64 as N with imut = 5000;
+
+fn key_of(i as i64) as i64 {
+    if (i == 0) { return 0; }
+    if (i == 1) { return 0 - 1; }
+    if (i == 2) { return 9223372036854775807; }
+    if (i == 3) { return 0 - 9223372036854775807 - 1; }
+    return i * 2654435761 - 77;
+}
+
+let is *i64 as seen with mut;
+
+fn check(m as *map.MapI64, live as *i64, val as *i64) as i32 {
+    let is i64 as cnt with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < N) {
+        let is i64 as k = key_of(i);
+        if (live[i] == 1) {
+            cnt = cnt + 1;
+            if (map.mapi64_has(m, k) != 1) { return 1; }
+            if (map.mapi64_get(m, k, 0 - 5) != val[i]) { return 2; }
+        } else {
+            if (map.mapi64_has(m, k) != 0) { return 3; }
+            if (map.mapi64_get(m, k, 0 - 5) != 0 - 5) { return 4; }
+        }
+        i = i + 1;
+    }
+    if (map.mapi64_count(m) != cnt) { return 5; }
+    // iteration: every live key once
+    let is i64 as z with mut = 0;
+    while (z < N) { seen[z] = 0; z = z + 1; }
+    let is i64 as pos with mut = 0;
+    let is i64 as it with mut = 0;
+    while (map.mapi64_next(m, &pos) == 1) {
+        let is i64 as k = map.mapi64_key_at(m, pos - 1);
+        let is i64 as v = map.mapi64_val_at(m, pos - 1);
+        let is i64 as j with mut = 0;
+        let is i64 as hit with mut = 0 - 1;
+        while (j < N && hit < 0) { if (key_of(j) == k) { hit = j; } j = j + 1; }
+        if (hit < 0 || live[hit] != 1 || val[hit] != v || seen[hit] != 0) { return 6; }
+        seen[hit] = 1;
+        it = it + 1;
+    }
+    if (it != cnt) { return 7; }
+    return 0;
+}
+
+fn main() as i32 {
+    let is map.MapI64 as m with mut = map.mapi64_new();
+    let is *i64 as live = cast(*i64, mem.core.mmap_anon(N * 8));
+    let is *i64 as val = cast(*i64, mem.core.mmap_anon(N * 8));
+    seen = cast(*i64, mem.core.mmap_anon(N * 8));
+    let is i64 as s with mut = 88172645463325252;
+    let is i64 as op with mut = 0;
+    while (op < 200000) {
+        s = s ^ (s << 13); s = s ^ ((s >> 7) & 144115188075855871); s = s ^ (s << 17);
+        let is i64 as r = s & 9223372036854775807;
+        let is i64 as lim with mut = 300 + op / 40;      // the live range grows over time
+        if (lim > N) { lim = N; }
+        let is i64 as i = r % lim;
+        let is i64 as kind = (r >> 20) % 10;
+        let is i64 as k = key_of(i);
+        if (kind < 6) {
+            let is i64 as v = (r >> 8) ^ op;
+            map.mapi64_set(&m, k, v);
+            live[i] = 1; val[i] = v;
+        } else if (kind < 9) {
+            let is i64 as got = map.mapi64_del(&m, k);
+            if (got != live[i]) { io.printf("FAIL del op %ld\n", op); return 1; }
+            live[i] = 0;
+        } else if (op % 50000 == 49999) {
+            map.mapi64_clear(&m);
+            let is i64 as z with mut = 0;
+            while (z < N) { live[z] = 0; z = z + 1; }
+        }
+        op = op + 1;
+        if (op % 1000 == 0) {
+            let is i32 as c = check(&m, live, val);
+            if (c != 0) { io.printf("FAIL check %d at op %ld\n", c, op); return 1; }
+        }
+    }
+    map.mapi64_free(&m);
+    return 0;
+}

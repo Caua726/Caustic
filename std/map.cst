@@ -72,10 +72,12 @@ fn _str_eq(a as *u8, b as *u8) as i64 {
 // MapI64 -- i64 -> i64 hash map
 // =======================================================
 
+// Each entry's key and value sit side by side in one array (kv[2i], kv[2i+1]),
+// so a hit reads one cache line, not one in a key array and one in a value
+// array; the one-byte states stay apart, so a probe walks them densely.
 struct MapI64 {
     states as *u8;
-    keys as *i64;
-    values as *i64;
+    kv as *i64;
     cap as i64;
     count as i64;
 }
@@ -85,19 +87,16 @@ fn mapi64_new() as MapI64 {
     m.cap = _INITIAL_CAP;
     m.count = 0;
     m.states = _alloc(m.cap);
-    m.keys = cast(*i64, _alloc(m.cap * 8));
-    m.values = cast(*i64, _alloc(m.cap * 8));
+    m.kv = cast(*i64, _alloc(m.cap * 16));
     mem.core.memset(m.states, cast(i32, 0), m.cap);
     return m;
 }
 
 fn mapi64_free(m as *MapI64) as void {
     if (cast(i64, m.states) != 0) { _free(m.states); }
-    if (cast(i64, m.keys) != 0) { _free(cast(*u8, m.keys)); }
-    if (cast(i64, m.values) != 0) { _free(cast(*u8, m.values)); }
+    if (cast(i64, m.kv) != 0) { _free(cast(*u8, m.kv)); }
     m.states = cast(*u8, 0);
-    m.keys = cast(*i64, 0);
-    m.values = cast(*i64, 0);
+    m.kv = cast(*i64, 0);
     m.cap = 0;
     m.count = 0;
 }
@@ -107,19 +106,20 @@ fn _mapi64_find(m as *MapI64, key as i64) as i64 {
     let is i64 as mask = m.cap - 1;
     let is i64 as idx with mut = (_hash_i64(key)) & mask;
     let is i64 as first_tomb with mut = 0 - 1;
+    let is *u8 as st = m.states;
+    let is *i64 as kv = m.kv;
 
     let is i64 as probes with mut = 0;
     while (probes < m.cap) {
-        let is i64 as state = cast(i64, m.states[idx]);
+        let is i64 as state = cast(i64, st[idx]);
         if (state == _EMPTY) {
             if (first_tomb >= 0) { return first_tomb; }
             return idx;
         }
-        if (state == _TOMBSTONE) {
-            if (first_tomb < 0) { first_tomb = idx; }
-        }
         if (state == _OCCUPIED) {
-            if (m.keys[idx] == key) { return idx; }
+            if (kv[idx * 2] == key) { return idx; }
+        } else if (first_tomb < 0) {
+            first_tomb = idx;
         }
         idx = (idx + 1) & mask;
         probes = probes + 1;
@@ -133,41 +133,42 @@ fn _mapi64_find(m as *MapI64, key as i64) as i64 {
 fn _mapi64_grow(m as *MapI64) as void {
     let is i64 as old_cap = m.cap;
     let is *u8 as old_states = m.states;
-    let is *i64 as old_keys = m.keys;
-    let is *i64 as old_values = m.values;
+    let is *i64 as old_kv = m.kv;
     let is i64 as old_count = m.count;
 
     let is i64 as new_cap = old_cap * 2;
-    m.cap = new_cap;
-    m.count = 0;
-    m.states = _alloc(new_cap);
-    m.keys = cast(*i64, _alloc(new_cap * 8));
-    m.values = cast(*i64, _alloc(new_cap * 8));
-
-    // Null check: if allocation failed, restore old state
-    if (cast(i64, m.states) == 0) {
-        m.cap = old_cap;
-        m.count = old_count;
-        m.states = old_states;
-        m.keys = old_keys;
-        m.values = old_values;
+    let is *u8 as ns = _alloc(new_cap);
+    let is *i64 as nkv = cast(*i64, _alloc(new_cap * 16));
+    // Allocation failed: keep the old table.
+    if (cast(i64, ns) == 0 || cast(i64, nkv) == 0) {
+        if (cast(i64, ns) != 0) { _free(ns); }
+        if (cast(i64, nkv) != 0) { _free(cast(*u8, nkv)); }
         return;
     }
+    mem.core.memset(ns, cast(i32, 0), new_cap);
 
-    mem.core.memset(m.states, cast(i32, 0), new_cap);
-
-    // Reinsert all occupied entries
+    // Reinsert every occupied entry: no key repeats and there are no
+    // tombstones yet, so the first empty slot is the place.
+    let is i64 as mask = new_cap - 1;
     let is i64 as i with mut = 0;
     while (i < old_cap) {
         if (cast(i64, old_states[i]) == _OCCUPIED) {
-            mapi64_set(m, old_keys[i], old_values[i]);
+            let is i64 as k = old_kv[i * 2];
+            let is i64 as idx with mut = (_hash_i64(k)) & mask;
+            while (ns[idx] != 0) { idx = (idx + 1) & mask; }
+            ns[idx] = cast(u8, _OCCUPIED);
+            nkv[idx * 2] = k;
+            nkv[idx * 2 + 1] = old_kv[i * 2 + 1];
         }
         i = i + 1;
     }
+    m.states = ns;
+    m.kv = nkv;
+    m.cap = new_cap;
+    m.count = old_count;
 
     _free(old_states);
-    _free(cast(*u8, old_keys));
-    _free(cast(*u8, old_values));
+    _free(cast(*u8, old_kv));
 }
 
 // Set key->value. Overwrites if key exists.
@@ -177,7 +178,7 @@ fn mapi64_set(m as *MapI64, key as i64, value as i64) as void {
 
     if (cast(i64, m.states[idx]) == _OCCUPIED) {
         // Update existing -- no grow needed
-        m.values[idx] = value;
+        m.kv[idx * 2 + 1] = value;
         return;
     }
 
@@ -189,8 +190,8 @@ fn mapi64_set(m as *MapI64, key as i64, value as i64) as void {
     }
 
     m.states[idx] = cast(u8, _OCCUPIED);
-    m.keys[idx] = key;
-    m.values[idx] = value;
+    m.kv[idx * 2] = key;
+    m.kv[idx * 2 + 1] = value;
     m.count = m.count + 1;
 }
 
@@ -200,8 +201,8 @@ fn mapi64_get(m as *MapI64, key as i64, default_val as i64) as i64 {
     let is i64 as idx = _mapi64_find(m, key);
     if (idx < 0) { return default_val; }
     if (cast(i64, m.states[idx]) == _OCCUPIED) {
-        if (m.keys[idx] == key) {
-            return m.values[idx];
+        if (m.kv[idx * 2] == key) {
+            return m.kv[idx * 2 + 1];
         }
     }
     return default_val;
@@ -213,7 +214,7 @@ fn mapi64_has(m as *MapI64, key as i64) as i64 {
     let is i64 as idx = _mapi64_find(m, key);
     if (idx < 0) { return 0; }
     if (cast(i64, m.states[idx]) == _OCCUPIED) {
-        if (m.keys[idx] == key) { return 1; }
+        if (m.kv[idx * 2] == key) { return 1; }
     }
     return 0;
 }
@@ -224,7 +225,7 @@ fn mapi64_del(m as *MapI64, key as i64) as i64 {
     let is i64 as idx = _mapi64_find(m, key);
     if (idx < 0) { return 0; }
     if (cast(i64, m.states[idx]) == _OCCUPIED) {
-        if (m.keys[idx] == key) {
+        if (m.kv[idx * 2] == key) {
             m.states[idx] = cast(u8, _TOMBSTONE);
             m.count = m.count - 1;
             return 1;
@@ -265,11 +266,11 @@ fn mapi64_next(m as *MapI64, pos as *i64) as i64 {
 }
 
 fn mapi64_key_at(m as *MapI64, idx as i64) as i64 {
-    return m.keys[idx];
+    return m.kv[idx * 2];
 }
 
 fn mapi64_val_at(m as *MapI64, idx as i64) as i64 {
-    return m.values[idx];
+    return m.kv[idx * 2 + 1];
 }
 
 // =======================================================
