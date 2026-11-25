@@ -106,6 +106,37 @@ if cst -g -O2 "$TMP/dbg.cst" -o "$TMP/dbg"; then
     else skip "gdb not installed"; fi
 else bad "dbg.cst failed to build (-g -O2)"; fi
 
+# Lines after the linker drops a dead function: separate -c -g objects, the
+# library's first function unused. Its rows used to stay at the object's old
+# offsets, so used_b reported unused_a's lines.
+step "ELF lines after linker dead-code elimination"
+cat > "$TMP/dlib.cst" <<'EOF'
+fn unused_a(x as i64) as i64 {
+    let is i64 as y with mut = x * 3;
+    y = y + 7;
+    return y;
+}
+
+fn used_b(x as i64) as i64 {
+    let is i64 as z with mut = x + 1;
+    z = z * 2;
+    return z;
+}
+EOF
+cat > "$TMP/dmain.cst" <<'EOF'
+extern fn used_b(x as i64) as i64;
+fn main() as i32 { return cast(i32, used_b(20)); }
+EOF
+LD="$ROOT/caustic-ld"
+if [ -x "$LD" ] && cst -c -g "$TMP/dlib.cst" -o "$TMP/dlib.o" && cst -c -g "$TMP/dmain.cst" -o "$TMP/dmain.o" \
+   && "$LD" -g "$TMP/dmain.o" "$TMP/dlib.o" -o "$TMP/dce" >/dev/null 2>&1; then
+    if have gdb; then
+        gdb -q -batch -ex 'break used_b' -ex run "$TMP/dce" 2>&1 \
+            | grep -qE 'used_b .* at .*dlib\.cst:8' && ok "breakpoint in used_b at dlib.cst:8" \
+            || bad "used_b's breakpoint line is wrong after dead-code elimination"
+    else skip "gdb not installed"; fi
+else bad "separate -g objects failed to build or link"; fi
+
 # ─── PE PDB ─────────────────────────────────────────────────────────────────
 step "PE PDB"
 if have llvm-pdbutil; then
