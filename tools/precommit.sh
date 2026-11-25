@@ -313,6 +313,21 @@ for lv in -O1 -O2; do
 done
 ok "$npe builds byte-identical"
 
+# ─── 4d. IR bodies survive their serialized form ───────────────────────────
+# CAUSTIC_IR_ROUNDTRIP=1 replaces every function body by the decode of its
+# encode (src/ir/body_ser.cst) just before code generation. Nothing may change.
+step "IR body image round trip"
+nrt=0
+for lv in -O0 -O1 -O2; do
+    for f in src/main.cst tests/float_abi_test.cst tests/inline_asm_test.cst; do
+        "$CUR" -q $lv "$f" -o "$TMP/rt.a" >/dev/null 2>&1 || die "$f $lv does not build"
+        CAUSTIC_IR_ROUNDTRIP=1 "$CUR" -q $lv "$f" -o "$TMP/rt.b" >/dev/null 2>&1 || die "$f $lv does not build with the IR round trip"
+        cmp -s "$TMP/rt.a" "$TMP/rt.b" || die "$f $lv: output changed after the IR body round trip"
+        nrt=$((nrt+1))
+    done
+done
+ok "$nrt builds byte-identical"
+
 # ─── 5. test suite ──────────────────────────────────────────────────────────
 step "test suite (tests/run_tests.cst)"
 if ! "$CUR" -q "tests/run_tests.cst" -o "$TMP/tests" >/dev/null 2>&1; then die "test runner failed to build"; fi

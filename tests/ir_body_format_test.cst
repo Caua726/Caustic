@@ -1,0 +1,64 @@
+// tests/ir_body_format_test.cst — the IR body image (src/ir/body_ser.cst).
+//
+// A three-instruction body whose two casts share one Type (a pointer whose
+// base is another Type) is encoded and decoded: every field comes back, the
+// two casts still share one Type, and the pointer's base is the decoded base.
+// The reader refuses an image of another version and one cut short, and
+// leaves the function untouched both times.
+// Exit 0 = all of that.
+use "../src/ir/defs.cst" as d;
+use "../src/ir/body_ser.cst" as bs;
+use "../src/parser/ast.cst" as ast;
+use "../std/io.cst" as io;
+
+let is ast.Type as base_t with mut;
+let is ast.Type as ptr_t with mut;
+
+fn fail(why as *u8) as i32 { io.printf("FAIL %s\n", why); return 1; }
+
+fn main() as i32 {
+    d.ir_alloc_init();
+    base_t.kind = 7; base_t.size = 4; base_t.name_ptr = "i32"; base_t.name_len = 3;
+    ptr_t.kind = 20; ptr_t.size = 8; ptr_t.base = &base_t;
+    let is *d.IRInst as a = d.new_inst(d.IR_CAST);
+    a.dest.op_type = cast(i8, d.OP_VREG); a.dest.vreg = 3;
+    a.src1.op_type = cast(i8, d.OP_IMM); a.src1.imm = 0 - 123456789012;
+    a.cast_to = cast(*u8, &ptr_t); a.cast_from = cast(*u8, &ptr_t);
+    a.line = 42; a.disp_tail_bytes = cast(i8, 3);
+    let is *d.IRInst as b = d.new_inst(d.IR_CALL);
+    b.call_name_ptr = "callee_name"; b.call_name_len = cast(i16, 11); b.is_extern_call = cast(i8, 1);
+    b.dest.label = 9;
+    let is *d.IRInst as c = d.new_inst(d.IR_RET);
+    c.is_dead = cast(i8, 1); c.asm_str_ptr = "nop"; c.asm_str_len = 3;
+    a.next = b; b.next = c;
+    let is *d.IRFunction as f = d.new_irfunc();
+    f.instructions = a; f.vreg_count = 5; f.label_count = 10; f.num_args = 2; f.is_naked = 1; f.ret_kind = 2;
+
+    let is i64 as len with mut = 0;
+    let is i64 as cap with mut = 0;
+    let is *u8 as img = bs.body_encode(f, &len, &cap);
+    if (cast(i64, img) == 0) { return fail("encode"); }
+
+    // Refusals first: each leaves f as it was.
+    img[4] = cast(u8, cast(i32, img[4]) + 1);
+    if (bs.body_decode(f, img, len) != 0 || cast(i64, f.instructions) != cast(i64, a)) { return fail("another version accepted"); }
+    img[4] = cast(u8, cast(i32, img[4]) - 1);
+    if (bs.body_decode(f, img, len - 3) != 0 || cast(i64, f.instructions) != cast(i64, a)) { return fail("truncated image accepted"); }
+
+    let is *d.IRFunction as g = d.new_irfunc();
+    if (bs.body_decode(g, img, len) != 1) { return fail("decode"); }
+    let is *d.IRInst as x = g.instructions;
+    let is *d.IRInst as y = x.next;
+    let is *d.IRInst as z = y.next;
+    if (cast(i64, z.next) != 0) { return fail("instruction count"); }
+    if (x.op != a.op || x.dest.vreg != 3 || x.src1.imm != 0 - 123456789012 || x.line != 42 || x.disp_tail_bytes != 3) { return fail("first instruction"); }
+    if (cast(i64, x.cast_to) != cast(i64, x.cast_from)) { return fail("shared type split"); }
+    let is *ast.Type as pt = cast(*ast.Type, x.cast_to);
+    if (pt.kind != 20 || pt.size != 8 || cast(i64, pt.base) == 0) { return fail("pointer type"); }
+    if (pt.base.kind != 7 || pt.base.size != 4 || pt.base.name_len != 3 || pt.base.name_ptr[2] != 50) { return fail("base type"); }
+    if (y.call_name_len != 11 || y.call_name_ptr[7] != 110 || y.is_extern_call != 1 || y.dest.label != 9) { return fail("call"); }
+    if (z.is_dead != 1 || z.asm_str_len != 3 || z.asm_str_ptr[0] != 110) { return fail("asm"); }
+    if (g.vreg_count != 5 || g.label_count != 10 || g.num_args != 2 || g.is_naked != 1 || g.ret_kind != 2) { return fail("function fields"); }
+    bs.body_free(img, cap);
+    return 0;
+}

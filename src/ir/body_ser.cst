@@ -1,0 +1,365 @@
+// body_ser.cst — a function's IR body as a self-contained byte image.
+//
+// The building block for reusing IR across compilations (IR bodies kept
+// beside a module's interface, the stdlib's bodies shared between programs):
+// every field of every instruction and the function fields code generation
+// reads, with no pointer into the compiler's memory. Strings (inline asm, call
+// and global names, type names) go to a string table; the types an instruction
+// carries (cast_to / cast_from) go to a type table with one entry per distinct
+// Type object, so two instructions that shared a type still share one after a
+// round trip, and a pointer's base type is an index into the same table.
+//
+// Format, all integers as zigzag varints unless noted:
+//   magic "CIRB" (4 bytes), version (4 bytes, BODY_VERSION)
+//   function fields: vreg_count label_count alloc_stack_size stack_size
+//     num_args is_variadic is_noinline is_naked has_stack_ops has_asm
+//     is_recursive live_inst_count ret_kind
+//   strings: count, then per string: length, bytes
+//   types: count, then per type: kind size array_len base(index+1, 0 none)
+//     name(string index+1, 0 none)
+//   instructions: count, then per instruction: op(byte) flags(byte), the four
+//     narrow flags (bytes) when flags has 128, dest src1 src2 (op_type byte,
+//     vreg, imm, label), then by flag bit: 1 line, 2 is_dead, 4 asm string,
+//     8 call name, 16 global name, 32 cast_to type, 64 cast_from type —
+//     the bit layout of func_pack, with indices where it keeps pointers.
+//
+// A reader that meets another magic or version refuses the image (0): the
+// format is part of the cache key, never guessed at.
+//
+// CAUSTIC_IR_ROUNDTRIP=1 makes code generation replace every function's body
+// with the decode of its encode before generating it; the output must not
+// change (tools/precommit.sh checks it).
+use "../../std/mem.cst" only pool, bins, core as mem;
+use "defs.cst" as d;
+use "../parser/ast.cst" as ast;
+
+let is i32 as BODY_VERSION with imut = 1;
+
+// ── Output buffer ──────────────────────────────────────────────────
+
+let is *u8 as _ob with mut = cast(*u8, 0);
+let is i64 as _ol with mut = 0;
+let is i64 as _oc with mut = 0;
+
+fn _ensure(n as i64) as void {
+    if (_ol + n <= _oc) { return; }
+    let is i64 as nc with mut = _oc * 2;
+    if (nc < 4096) { nc = 4096; }
+    while (nc < _ol + n) { nc = nc * 2; }
+    let is *u8 as nb = mem.core.mmap_anon(nc);
+    let is i64 as k with mut = 0;
+    while (k < _ol) { nb[k] = _ob[k]; k = k + 1; }
+    if (_oc > 0) { mem.core.munmap(_ob, _oc); }
+    _ob = nb;
+    _oc = nc;
+}
+
+fn _w8(v as i32) as void { _ensure(1); _ob[_ol] = cast(u8, v); _ol = _ol + 1; }
+
+fn _wv(v as i64) as void {
+    _ensure(10);
+    let is i64 as z with mut = (v << 1) ^ (v >> 63);   // zigzag
+    while (1 == 1) {
+        let is i64 as low = z & 127;
+        z = (z >> 7) & 144115188075855871;              // logical shift (0x01FF...F)
+        if (z == 0) { _ob[_ol] = cast(u8, low); _ol = _ol + 1; return; }
+        _ob[_ol] = cast(u8, low | 128); _ol = _ol + 1;
+    }
+}
+
+fn _wbytes(p as *u8, n as i64) as void {
+    _ensure(n);
+    let is i64 as k with mut = 0;
+    while (k < n) { _ob[_ol + k] = p[k]; k = k + 1; }
+    _ol = _ol + n;
+}
+
+// ── Tables built while encoding ─────────────────────────────────────
+
+let is [4096]i64 as _sp with mut;      // string pointers
+let is [4096]i32 as _sn with mut;      // string lengths
+let is i32 as _scount with mut = 0;
+let is [1024]i64 as _tp with mut;      // Type pointers
+let is i32 as _tcount with mut = 0;
+let is i32 as _overflow with mut = 0;
+
+fn _str_index(p as *u8, n as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < _scount) {
+        if (_sn[k] == n) {
+            let is *u8 as q = cast(*u8, _sp[k]);
+            let is i32 as j with mut = 0;
+            while (j < n && q[j] == p[j]) { j = j + 1; }
+            if (j == n) { return k; }
+        }
+        k = k + 1;
+    }
+    if (_scount >= 4096) { _overflow = 1; return 0; }
+    _sp[_scount] = cast(i64, p);
+    _sn[_scount] = n;
+    _scount = _scount + 1;
+    return _scount - 1;
+}
+
+// Index of Type t in the table, adding it (and its base chain) when new.
+fn _type_index(t as *u8) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < _tcount) {
+        if (_tp[k] == cast(i64, t)) { return k; }
+        k = k + 1;
+    }
+    if (_tcount >= 1024) { _overflow = 1; return 0; }
+    _tp[_tcount] = cast(i64, t);
+    _tcount = _tcount + 1;
+    let is i32 as me = _tcount - 1;
+    let is *ast.Type as ty = cast(*ast.Type, t);
+    if (cast(i64, ty.base) != 0) { _type_index(cast(*u8, ty.base)); }
+    if (cast(i64, ty.name_ptr) != 0 && ty.name_len > 0) { _str_index(ty.name_ptr, ty.name_len); }
+    return me;
+}
+
+fn _flags(i as *d.IRInst) as i32 {
+    let is i32 as fl with mut = 0;
+    if (i.line != 0) { fl = fl | 1; }
+    if (i.is_dead != 0) { fl = fl | 2; }
+    if (cast(i64, i.asm_str_ptr) != 0) { fl = fl | 4; }
+    if (cast(i64, i.call_name_ptr) != 0) { fl = fl | 8; }
+    if (cast(i64, i.global_name_ptr) != 0) { fl = fl | 16; }
+    if (cast(i64, i.cast_to) != 0) { fl = fl | 32; }
+    if (cast(i64, i.cast_from) != 0) { fl = fl | 64; }
+    if (i.is_variadic_call != 0 || i.is_extern_call != 0 || i.is_extern_global != 0 || i.disp_tail_bytes != 0) { fl = fl | 128; }
+    return fl;
+}
+
+fn _woperand(o as *d.Operand) as void {
+    _w8(cast(i32, o.op_type));
+    _wv(cast(i64, o.vreg));
+    _wv(o.imm);
+    _wv(cast(i64, o.label));
+}
+
+// ── Encode ─────────────────────────────────────────────────────────
+
+// The image of f's body (instructions in f.instructions). *out_len gets its
+// length and *out_cap the size of the mmap'd buffer, which the caller owns
+// (body_free). Null when a table overflowed (the caller keeps the body).
+fn body_encode(f as *d.IRFunction, out_len as *i64, out_cap as *i64) as *u8 {
+    _scount = 0;
+    _tcount = 0;
+    _overflow = 0;
+    // pass 1: tables
+    let is i64 as n with mut = 0;
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        if (cast(i64, i.asm_str_ptr) != 0) { _str_index(i.asm_str_ptr, i.asm_str_len); }
+        if (cast(i64, i.call_name_ptr) != 0) { _str_index(i.call_name_ptr, cast(i32, i.call_name_len)); }
+        if (cast(i64, i.global_name_ptr) != 0) { _str_index(i.global_name_ptr, cast(i32, i.global_name_len)); }
+        if (cast(i64, i.cast_to) != 0) { _type_index(i.cast_to); }
+        if (cast(i64, i.cast_from) != 0) { _type_index(i.cast_from); }
+        n = n + 1;
+        i = i.next;
+    }
+    if (_overflow == 1) { return cast(*u8, 0); }
+    _ob = cast(*u8, 0); _ol = 0; _oc = 0;
+    _w8(67); _w8(73); _w8(82); _w8(66);                 // "CIRB"
+    _w8(BODY_VERSION & 255); _w8((BODY_VERSION >> 8) & 255); _w8(0); _w8(0);
+    _wv(cast(i64, f.vreg_count));
+    _wv(cast(i64, f.label_count));
+    _wv(cast(i64, f.alloc_stack_size));
+    _wv(cast(i64, f.stack_size));
+    _wv(cast(i64, f.num_args));
+    _wv(cast(i64, f.is_variadic));
+    _wv(cast(i64, f.is_noinline));
+    _wv(cast(i64, f.is_naked));
+    _wv(cast(i64, f.has_stack_ops));
+    _wv(cast(i64, f.has_asm));
+    _wv(cast(i64, f.is_recursive));
+    _wv(cast(i64, f.live_inst_count));
+    _wv(f.ret_kind);
+    _wv(cast(i64, _scount));
+    let is i32 as k with mut = 0;
+    while (k < _scount) { _wv(cast(i64, _sn[k])); _wbytes(cast(*u8, _sp[k]), cast(i64, _sn[k])); k = k + 1; }
+    _wv(cast(i64, _tcount));
+    k = 0;
+    while (k < _tcount) {
+        let is *ast.Type as ty = cast(*ast.Type, _tp[k]);
+        _wv(cast(i64, ty.kind));
+        _wv(cast(i64, ty.size));
+        _wv(cast(i64, ty.array_len));
+        if (cast(i64, ty.base) != 0) { _wv(cast(i64, _type_index(cast(*u8, ty.base)) + 1)); } else { _wv(0); }
+        if (cast(i64, ty.name_ptr) != 0 && ty.name_len > 0) { _wv(cast(i64, _str_index(ty.name_ptr, ty.name_len) + 1)); } else { _wv(0); }
+        k = k + 1;
+    }
+    _wv(n);
+    i = f.instructions;
+    while (cast(i64, i) != 0) {
+        let is i32 as fl = _flags(i);
+        _w8(cast(i32, i.op));
+        _w8(fl);
+        if ((fl & 128) != 0) {
+            _w8(cast(i32, i.is_variadic_call)); _w8(cast(i32, i.is_extern_call));
+            _w8(cast(i32, i.is_extern_global)); _w8(cast(i32, i.disp_tail_bytes));
+        }
+        _woperand(&i.dest);
+        _woperand(&i.src1);
+        _woperand(&i.src2);
+        if ((fl & 1) != 0) { _wv(cast(i64, i.line)); }
+        if ((fl & 2) != 0) { _w8(cast(i32, i.is_dead)); }
+        if ((fl & 4) != 0) { _wv(cast(i64, _str_index(i.asm_str_ptr, i.asm_str_len))); }
+        if ((fl & 8) != 0) { _wv(cast(i64, _str_index(i.call_name_ptr, cast(i32, i.call_name_len)))); }
+        if ((fl & 16) != 0) { _wv(cast(i64, _str_index(i.global_name_ptr, cast(i32, i.global_name_len)))); }
+        if ((fl & 32) != 0) { _wv(cast(i64, _type_index(i.cast_to))); }
+        if ((fl & 64) != 0) { _wv(cast(i64, _type_index(i.cast_from))); }
+        i = i.next;
+    }
+    *out_len = _ol;
+    *out_cap = _oc;
+    let is *u8 as res = _ob;
+    _ob = cast(*u8, 0); _ol = 0; _oc = 0;
+    return res;
+}
+
+fn body_free(img as *u8, cap as i64) as void { mem.core.munmap(img, cap); }
+
+// ── Decode ─────────────────────────────────────────────────────────
+
+let is *u8 as _rb with mut = cast(*u8, 0);
+let is i64 as _rp with mut = 0;
+let is i64 as _rl with mut = 0;
+let is i32 as _bad with mut = 0;
+
+fn _r8() as i32 {
+    if (_rp >= _rl) { _bad = 1; return 0; }
+    let is i32 as v = cast(i32, _rb[_rp]);
+    _rp = _rp + 1;
+    return v;
+}
+
+fn _rv() as i64 {
+    let is i64 as z with mut = 0;
+    let is i64 as sh with mut = 0;
+    while (sh < 70) {
+        let is i64 as b = cast(i64, _r8());
+        z = z | ((b & 127) << sh);
+        if ((b & 128) == 0) { return ((z >> 1) & 9223372036854775807) ^ (0 - (z & 1)); }
+        sh = sh + 7;
+    }
+    _bad = 1;
+    return 0;
+}
+
+// A table index below n (0 and the image marked bad when out of range).
+fn _ridx(n as i32) as i64 {
+    let is i64 as v = _rv();
+    if (v < 0 || v >= cast(i64, n)) { _bad = 1; return 0; }
+    return v;
+}
+
+fn _roperand(o as *d.Operand) as void {
+    o.op_type = cast(i8, _r8());
+    o.vreg = cast(i32, _rv());
+    o.imm = _rv();
+    o.label = cast(i32, _rv());
+}
+
+// Rebuild f's body from img. Strings and types are copied into the IR's own
+// memory, so img may be freed afterwards. 1 = done; 0 = not a CIRB image of
+// this version or truncated, f untouched.
+fn body_decode(f as *d.IRFunction, img as *u8, len as i64) as i32 {
+    _rb = img; _rp = 0; _rl = len; _bad = 0;
+    if (len < 8 || img[0] != 67 || img[1] != 73 || img[2] != 82 || img[3] != 66) { return 0; }
+    if (cast(i32, img[4]) + cast(i32, img[5]) * 256 != BODY_VERSION) { return 0; }
+    _rp = 8;
+    let is i32 as vc = cast(i32, _rv());
+    let is i32 as lc = cast(i32, _rv());
+    let is i32 as ass = cast(i32, _rv());
+    let is i32 as ss = cast(i32, _rv());
+    let is i32 as na = cast(i32, _rv());
+    let is i32 as iv = cast(i32, _rv());
+    let is i32 as nin = cast(i32, _rv());
+    let is i32 as nak = cast(i32, _rv());
+    let is i32 as hso = cast(i32, _rv());
+    let is i32 as has = cast(i32, _rv());
+    let is i32 as rec = cast(i32, _rv());
+    let is i32 as lic = cast(i32, _rv());
+    let is i64 as rk = _rv();
+    let is i32 as sc = cast(i32, _rv());
+    if (sc < 0 || sc > 4096) { return 0; }
+    let is *i64 as sptr = cast(*i64, d.opt_alloc(cast(i64, sc) * 12 + 16));
+    let is *i32 as slen = cast(*i32, cast(i64, sptr) + cast(i64, sc) * 8 + 8);
+    let is i32 as k with mut = 0;
+    while (k < sc) {
+        let is i64 as l = _rv();
+        if (l < 0 || _rp + l > _rl) { return 0; }
+        let is *u8 as cp = d.opt_alloc(l + 1);
+        let is i64 as q with mut = 0;
+        while (q < l) { cp[q] = img[_rp + q]; q = q + 1; }
+        sptr[k] = cast(i64, cp);
+        slen[k] = cast(i32, l);
+        _rp = _rp + l;
+        k = k + 1;
+    }
+    let is i32 as tc = cast(i32, _rv());
+    if (tc < 0 || tc > 1024) { return 0; }
+    let is *i64 as tptr = cast(*i64, d.opt_alloc(cast(i64, tc) * 8 + 8));
+    let is *u8 as tblock = d.opt_alloc(cast(i64, tc) * sizeof(ast.Type) + 8);
+    mem.core.memzero(tblock, cast(i64, tc) * sizeof(ast.Type) + 8);
+    k = 0;
+    while (k < tc) {
+        tptr[k] = cast(i64, tblock) + cast(i64, k) * sizeof(ast.Type);
+        k = k + 1;
+    }
+    k = 0;
+    while (k < tc) {
+        let is *ast.Type as ty = cast(*ast.Type, tptr[k]);
+        ty.kind = cast(i32, _rv());
+        ty.size = cast(i32, _rv());
+        ty.array_len = cast(i32, _rv());
+        let is i64 as bi = _rv();
+        if (bi > 0 && bi <= cast(i64, tc)) { ty.base = cast(*ast.Type, tptr[bi - 1]); }
+        let is i64 as ni = _rv();
+        if (ni > 0 && ni <= cast(i64, sc)) { ty.name_ptr = cast(*u8, sptr[ni - 1]); ty.name_len = slen[ni - 1]; }
+        k = k + 1;
+    }
+    let is i64 as n = _rv();
+    let is *d.IRInst as head with mut = cast(*d.IRInst, 0);
+    let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
+    let is i64 as c with mut = 0;
+    while (c < n && _bad == 0) {
+        let is *d.IRInst as i = d.new_inst(_r8());
+        let is i32 as fl = _r8();
+        if ((fl & 128) != 0) {
+            i.is_variadic_call = cast(i8, _r8()); i.is_extern_call = cast(i8, _r8());
+            i.is_extern_global = cast(i8, _r8()); i.disp_tail_bytes = cast(i8, _r8());
+        }
+        _roperand(&i.dest);
+        _roperand(&i.src1);
+        _roperand(&i.src2);
+        if ((fl & 1) != 0) { i.line = cast(i32, _rv()); }
+        if ((fl & 2) != 0) { i.is_dead = cast(i8, _r8()); }
+        if ((fl & 4) != 0) { let is i64 as a = _ridx(sc); i.asm_str_ptr = cast(*u8, sptr[a]); i.asm_str_len = slen[a]; }
+        if ((fl & 8) != 0) { let is i64 as b = _ridx(sc); i.call_name_ptr = cast(*u8, sptr[b]); i.call_name_len = cast(i16, slen[b]); }
+        if ((fl & 16) != 0) { let is i64 as g = _ridx(sc); i.global_name_ptr = cast(*u8, sptr[g]); i.global_name_len = cast(i16, slen[g]); }
+        if ((fl & 32) != 0) { i.cast_to = cast(*u8, tptr[_ridx(tc)]); }
+        if ((fl & 64) != 0) { i.cast_from = cast(*u8, tptr[_ridx(tc)]); }
+        if (cast(i64, tail) == 0) { head = i; } else { tail.next = i; }
+        tail = i;
+        c = c + 1;
+    }
+    if (_bad == 1 || c != n) { return 0; }
+    f.instructions = head;
+    f.vreg_count = vc;
+    f.label_count = lc;
+    f.alloc_stack_size = ass;
+    f.stack_size = ss;
+    f.num_args = na;
+    f.is_variadic = iv;
+    f.is_noinline = nin;
+    f.is_naked = nak;
+    f.has_stack_ops = hso;
+    f.has_asm = has;
+    f.is_recursive = rec;
+    f.live_inst_count = lic;
+    f.ret_kind = rk;
+    return 1;
+}
