@@ -23,6 +23,7 @@ use "dynsyms.cst" as dyns;
 use "shrinkwrap.cst" as sw;
 use "fsplit.cst" as fs;
 use "nowrap.cst" as nw;
+use "../semantic/modules.cst" as dbg_smod;
 
 // Dynamic-stdlib mode (-lcaustic on an ELF/PE target): functions whose mangled
 // name starts with "_std_" are provided by libcaustic.so at runtime, so we
@@ -1483,6 +1484,37 @@ fn _ir_roundtrip(func as *d.IRFunction) as void {
     bser.body_free(img, bcap);
 }
 
+// -g: one object holds every module's functions; each function's lines belong to
+// its module's file. A `.file 1` before a function from another module switches
+// the file the following `.loc` rows name (the assembler records the switch).
+let is *u8 as _dbg_cur_file with mut = cast(*u8, 0);
+let is i32 as _dbg_cur_len with mut = 0;
+
+fn _dbg_file_for(f as *d.IRFunction) as void {
+    let is *u8 as path with mut = eo.cg_filename;
+    let is i32 as plen with mut = eo.cg_filename_len;
+    let is i32 as best with mut = 0;
+    let is *u8 as nm = f.asm_name_ptr;
+    let is i32 as nl = f.asm_name_len;
+    let is *dbg_smod.d.Module as m with mut = dbg_smod.module_list;
+    while (cast(i64, m) != 0) {
+        let is i32 as pl = m.prefix_len;
+        if (pl > best && pl < nl && m.path_len > 0 && nm[pl] == 95) {
+            let is i32 as k with mut = 0;
+            while (k < pl && nm[k] == m.prefix_ptr[k]) { k = k + 1; }
+            if (k == pl) { best = pl; path = m.path_ptr; plen = m.path_len; }
+        }
+        m = m.next;
+    }
+    if (cast(i64, path) == cast(i64, _dbg_cur_file) && plen == _dbg_cur_len) { return; }
+    if (plen == _dbg_cur_len && mem.memcmp(path, _dbg_cur_file, cast(i64, plen)) == 0) { return; }
+    eo.out_str(".file 1 \"", 9);
+    eo.out_str(path, plen);
+    eo.out_str("\"\n", 2);
+    _dbg_cur_file = path;
+    _dbg_cur_len = plen;
+}
+
 fn gen_func(func as *d.IRFunction) as void {
     _ir_roundtrip(func);
     d.params_canonical = 0;
@@ -2704,6 +2736,8 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
         eo.out_str(eo.cg_filename, eo.cg_filename_len);
         eo.out_str("\"\n", 2);
     }
+    _dbg_cur_file = eo.cg_filename;
+    _dbg_cur_len = eo.cg_filename_len;
 
     // Emit .globl for all reachable functions
     if (eo.cg_quiet == 0) { io.write_str(io.STDERR, "codegen: globl\n"); }
@@ -2833,6 +2867,7 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
                 eo.out_str(f.fn_section_ptr, f.fn_section_len);
                 eo.out_str(", \"ax\", @progbits\n", 18);
             }
+            if (tgt.debug_get() == 1) { _dbg_file_for(f); }
             if (eo.cg_prof_enabled == 1) {
                 let is i64 as t0 = eo.cg_prof_get_time_us();
                 gen_func(f);

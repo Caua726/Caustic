@@ -137,6 +137,32 @@ if [ -x "$LD" ] && cst -c -g "$TMP/dlib.cst" -o "$TMP/dlib.o" && cst -c -g "$TMP
     else skip "gdb not installed"; fi
 else bad "separate -g objects failed to build or link"; fi
 
+# A module imported with `use`: its functions are built in the same run as the
+# root, and used to have no lines (line numbers came only from the root's
+# tokens, and the one object named only the root file).
+step "ELF lines in an imported module (-g, -O0/-O2)"
+cat > "$TMP/ulib.cst" <<'EOF'
+fn twice(x as i64) as i64 {
+    let is i64 as y = x * 2;
+    return y;
+}
+EOF
+cat > "$TMP/umain.cst" <<'EOF'
+use "ulib.cst" as ulib;
+fn main() as i32 {
+    return cast(i32, ulib.twice(21));
+}
+EOF
+for lv in -O0 -O2; do
+    if cst -g $lv "$TMP/umain.cst" -o "$TMP/use$lv"; then
+        if have gdb; then
+            gdb -q -batch -ex 'break ulib.cst:2' -ex run -ex bt "$TMP/use$lv" 2>&1 \
+                | grep -qE 'at .*ulib\.cst:2' && ok "$lv breakpoint at ulib.cst:2" \
+                || bad "$lv no line in the imported module"
+        else skip "gdb not installed"; fi
+    else bad "$lv two-module -g build failed"; fi
+done
+
 # ─── PE PDB ─────────────────────────────────────────────────────────────────
 step "PE PDB"
 if have llvm-pdbutil; then
