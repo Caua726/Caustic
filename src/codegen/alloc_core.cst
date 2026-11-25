@@ -81,6 +81,13 @@ fn copy_is_rep(inst as *d.IRInst) as i32 {
     return 1;
 }
 
+// a + b, saturating at the i32 maximum (loop-weighted costs grow fast).
+fn _ls_cost_add(a as i32, b as i32) as i32 {
+    let is i64 as t = cast(i64, a) + cast(i64, b);
+    if (t > 2147483647) { return 2147483647; }
+    return cast(i32, t);
+}
+
 fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
     let is i32 as vc = func.vreg_count;
     ctx.intervals = cast(*LiveInterval, d.opt_alloc(cast(i64, vc) * sizeof(LiveInterval)));
@@ -135,6 +142,29 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         pos = pos + 1;
         inst = inst.next;
     }
+    // Loop depth per position (-O1 and up): every backward jump encloses
+    // [target, jump] in one more loop. A use counts 10^depth (depth capped at
+    // 4) toward its interval's spill cost, as in graph colouring, so the
+    // value evicted under pressure is not the one a hot loop reads. -O0 keeps
+    // the unweighted cost.
+    let is *i32 as ls_depth with mut = cast(*i32, 0);
+    if (al_opt_level >= 1) {
+        ls_depth = cast(*i32, d.opt_alloc(cast(i64, pos + 2) * 4));
+        memzero(cast(*u8, ls_depth), cast(i64, pos + 2) * 4);
+        let is i32 as dp with mut = 0;
+        let is *d.IRInst as dj with mut = func.instructions;
+        while (cast(i64, dj) != 0) {
+            if (dj.is_dead == 0 && (dj.op == d.IR_JMP || dj.op == d.IR_JZ || dj.op == d.IR_JNZ)) {
+                let is i32 as tp = label_pos[dj.dest.label];
+                if (tp <= dp) { ls_depth[tp] = ls_depth[tp] + 1; ls_depth[dp + 1] = ls_depth[dp + 1] - 1; }
+            }
+            dp = dp + 1;
+            dj = dj.next;
+        }
+        let is i32 as run with mut = 0;
+        dp = 0;
+        while (dp <= pos) { run = run + ls_depth[dp]; ls_depth[dp] = run; dp = dp + 1; }
+    }
     // Allocate call_positions; collection + interval scan fused below.
     let is i32 as ci with mut = 0;
     if (n_calls > 0) {
@@ -183,13 +213,19 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         }
         if (inst.is_dead == 1) { inst = inst.next; pos = pos + 1; }
         else {
+        let is i32 as lw with mut = 1;
+        if (cast(i64, ls_depth) != 0) {
+            let is i32 as dd with mut = ls_depth[pos];
+            if (dd > 4) { dd = 4; }
+            while (dd > 0) { lw = lw * 10; dd = dd - 1; }
+        }
         if (inst.src1.op_type == d.OP_VREG) {
             let is i32 as v = inst.src1.vreg;
             let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, v) * sizeof(LiveInterval));
             if (iv.start > pos) { iv.start = pos; }
             iv.end_pos = pos;
             iv.use_count = iv.use_count + 1;
-            iv.spill_cost = iv.spill_cost + 10;
+            iv.spill_cost = _ls_cost_add(iv.spill_cost, 10 * lw);
         }
         if (inst.src2.op_type == d.OP_VREG) {
             let is i32 as v = inst.src2.vreg;
@@ -197,14 +233,14 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
             if (iv.start > pos) { iv.start = pos; }
             iv.end_pos = pos;
             iv.use_count = iv.use_count + 1;
-            iv.spill_cost = iv.spill_cost + 10;
+            iv.spill_cost = _ls_cost_add(iv.spill_cost, 10 * lw);
         }
         if (inst.dest.op_type == d.OP_VREG) {
             let is i32 as v = inst.dest.vreg;
             let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, v) * sizeof(LiveInterval));
             if (iv.start > pos) { iv.start = pos; }
             iv.end_pos = pos;
-            iv.spill_cost = iv.spill_cost + 1;
+            iv.spill_cost = _ls_cost_add(iv.spill_cost, lw);
         }
         // Extend intervals for backward jumps (loops)
         if (inst.op == d.IR_JMP || inst.op == d.IR_JZ || inst.op == d.IR_JNZ) {
@@ -235,7 +271,9 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         if (iv.use_count > 0) {
             let is i32 as span = iv.end_pos - iv.start + 1;
             if (span > 0) {
-                iv.spill_cost = iv.spill_cost * 100 / span;
+                let is i64 as sc with mut = cast(i64, iv.spill_cost) * 100 / cast(i64, span);
+                if (sc > 2147483647) { sc = 2147483647; }
+                iv.spill_cost = cast(i32, sc);
             }
         }
         i = i + 1;
@@ -247,6 +285,7 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
         d.opt_free(cast(*u8, tmp));
     }
     d.opt_free(cast(*u8, label_pos));   // local scratch — last used in the scan above
+    if (cast(i64, ls_depth) != 0) { d.opt_free(cast(*u8, ls_depth)); }
 }
 
 // Bottom-up merge sort: same comparator and same stable merge as the old
@@ -559,6 +598,67 @@ fn spill_register(ctx as *AllocCtx, pos as i32, crosses_call as i32) as i32 {
     return cast(i32, 0 - 1);
 }
 
+// An xmm (0..15) for a float interval, or -1 to spill it: the move partner's
+// xmm when free, else the first free one of xmm2..xmm15. Every xmm is
+// caller-saved, so a value live across a call goes to the stack. With none
+// free, the active interval that is cheapest to spill (ties: the one ending
+// last) gives up its xmm when it is cheaper than this one — the general-
+// register rule of spill_register.
+fn _ls_xmm_pick(ctx as *AllocCtx, iv as *LiveInterval, xact as *i32, gx as *i32, mov_partner as *i32) as i32 {
+    if (spans_call(iv.start, iv.end_pos, ctx) == 1) { return cast(i32, 0 - 1); }
+    let is [16]i32 as busy;
+    let is i32 as k with mut = 0;
+    while (k < 16) {
+        busy[k] = 0;
+        if (xact[k] >= 0) {
+            let is *LiveInterval as a = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, xact[k]) * sizeof(LiveInterval));
+            if (a.end_pos >= iv.start) { busy[k] = 1; } else { xact[k] = cast(i32, 0 - 1); }
+        }
+        k = k + 1;
+    }
+    busy[0] = 1;
+    busy[1] = 1;
+    let is i32 as own = gx[iv.vreg];
+    if (own >= 0) {
+        k = 2;
+        while (k < 8) { if (k != own) { busy[k] = 1; } k = k + 1; }
+    }
+    let is i32 as partner = mov_partner[iv.vreg];
+    if (partner >= 0) {
+        let is i32 as pl = ctx.vreg_to_loc[partner];
+        if (pl >= 18 && pl <= 31 && busy[pl - 16] == 0) { return pl - 16; }
+    }
+    k = 2;
+    while (k < 16) {
+        if (busy[k] == 0) { return k; }
+        k = k + 1;
+    }
+    let is i32 as victim with mut = cast(i32, 0 - 1);
+    let is i32 as vcost with mut = 2147483647;
+    let is i32 as vend with mut = cast(i32, 0 - 1);
+    k = 2;
+    while (k < 16) {
+        if (xact[k] >= 0 && (own < 0 || k >= 8 || k == own)) {
+            let is *LiveInterval as a = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, xact[k]) * sizeof(LiveInterval));
+            if (a.spill_cost < vcost || (a.spill_cost == vcost && a.end_pos > vend)) {
+                vcost = a.spill_cost;
+                vend = a.end_pos;
+                victim = k;
+            }
+        }
+        k = k + 1;
+    }
+    if (victim < 0 || vcost >= iv.spill_cost) { return cast(i32, 0 - 1); }
+    let is *LiveInterval as vi = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, xact[victim]) * sizeof(LiveInterval));
+    let is i32 as slot = ctx.next_spill;
+    ctx.next_spill = ctx.next_spill + 1;
+    ctx.vreg_to_loc[vi.vreg] = 0 - slot;
+    vi.spill_loc = slot;
+    vi.reg = cast(i32, 0 - 1);
+    xact[victim] = cast(i32, 0 - 1);
+    return victim;
+}
+
 fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
     let is i32 as vc = func.vreg_count;
     ctx.vreg_to_loc = cast(*i32, d.opt_alloc(cast(i64, vc) * 4));
@@ -600,10 +700,43 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
         *ap = cast(i32, 0 - 1);
         ai = ai + 1;
     }
+    // Float values (class XMM, which only -O1 and up assign: at -O0 every
+    // vreg is general) get xmm2..xmm15 — xmm0/xmm1 are the codegen's scratch.
+    // A parameter arriving in xmm k keeps out of the other argument xmms
+    // until they are read, as in graph colouring.
+    let is [16]i32 as xact;
+    let is i32 as xk with mut = 0;
+    while (xk < 16) { xact[xk] = cast(i32, 0 - 1); xk = xk + 1; }
+    let is *i32 as ls_gx = cast(*i32, d.opt_alloc(cast(i64, vc) * 4 + 4));
+    i = 0;
+    while (i < vc) { ls_gx[i] = cast(i32, 0 - 1); i = i + 1; }
+    let is *d.IRInst as gxs with mut = func.instructions;
+    while (cast(i64, gxs) != 0) {
+        if (gxs.is_dead == 0 && gxs.op == d.IR_GET_ARG && gxs.src2.op_type == d.OP_IMM
+            && gxs.src2.imm >= 100 && gxs.dest.vreg >= 0 && gxs.dest.vreg < vc) {
+            ls_gx[gxs.dest.vreg] = cast(i32, gxs.src2.imm - 100);
+        }
+        gxs = gxs.next;
+    }
     i = 0;
     while (i < ctx.count) {
         let is *LiveInterval as iv = cast(*LiveInterval, cast(i64, ctx.intervals) + cast(i64, i) * sizeof(LiveInterval));
         if (iv.start == INT_MAX) { i = i + 1; }
+        else if (iv.reg_class == d.VR_XMM) {
+            let is i32 as xr = _ls_xmm_pick(ctx, iv, xact, ls_gx, mov_partner);
+            let is *i32 as xvp = cast(*i32, cast(i64, ctx.vreg_to_loc) + cast(i64, iv.vreg) * 4);
+            if (xr >= 0) {
+                iv.reg = 16 + xr;
+                *xvp = 16 + xr;
+                xact[xr] = i;
+            } else {
+                let is i32 as xsp = ctx.next_spill;
+                ctx.next_spill = ctx.next_spill + 1;
+                *xvp = 0 - xsp;
+                iv.spill_loc = xsp;
+            }
+            i = i + 1;
+        }
         else {
             // Expire active intervals that ended before current start
             let is i32 as ei with mut = 0;
@@ -658,6 +791,7 @@ fn linear_scan_alloc(func as *d.IRFunction, ctx as *AllocCtx) as void {
     }
     ctx.stack_slots = ctx.next_spill - 1;
     d.opt_free(cast(*u8, mov_partner));
+    d.opt_free(cast(*u8, ls_gx));
     let is i32 as ci with mut = 0;
     while (ci < 16) { ls_argpos[ci] = cast(i32, 0 - 1); ci = ci + 1; }
 }
