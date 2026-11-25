@@ -327,6 +327,23 @@ for spec in "-O1 src/main.cst" "-O2 src/main.cst" "--target=caustic-x86_64 -O2 t
 done
 ok "$npc builds, every instruction identical"
 
+# ─── 4c''. record hints equal the parse of their text ─────────────────────
+# Codegen writes, before its most frequent lines, the record the text parses to
+# (emit_output.cst, caustic-assembler parser/fastline.cst hint_line).
+# CAUSTIC_HINT_CHECK=1 parses the text anyway and compares; CAUSTIC_NO_HINTS=1
+# must build the same binary.
+step "record hints equal their text"
+nh=0
+for lv in -O0 -O1 -O2; do
+    out=$(CAUSTIC_HINT_CHECK=1 "$CUR" -q $lv src/main.cst -o "$TMP/hn.a" 2>"$TMP/hn.err" | grep "hint check" | tail -1)
+    [ -n "$out" ] || die "no hint check at $lv"
+    if grep -q "hint differs" "$TMP/hn.err"; then die "a record hint differs from its text at $lv: $(head -1 "$TMP/hn.err")"; fi
+    CAUSTIC_NO_HINTS=1 "$CUR" -q $lv src/main.cst -o "$TMP/hn.b" >/dev/null 2>&1 || die "no build without hints at $lv"
+    cmp -s "$TMP/hn.a" "$TMP/hn.b" || die "hints change the compiler's output at $lv"
+    nh=$((nh+1))
+done
+ok "$nh levels: hints equal their text, output unchanged"
+
 # ─── 4d. IR bodies survive their serialized form ───────────────────────────
 # CAUSTIC_IR_ROUNDTRIP=1 replaces every function body by the decode of its
 # encode (src/ir/body_ser.cst) just before code generation. Nothing may change.
