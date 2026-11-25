@@ -122,6 +122,14 @@ struct Term {
     //    as long as the text is on the grid — what a selection holds on to
     //    while output scrolls it up. clear() moves it past every line there was.
     scrolled as i64;
+    // -- appended (all i64): a TEXT holder that can move what it already shows
+    //    (set_scroll_hint). With the hint on, a scroll of the live view marks
+    //    only the row it opens and counts itself in scroll_pend; the holder
+    //    drains the count with take_scroll() and shifts its picture up by that
+    //    many rows before painting the dirty rect. Off (the default), a scroll
+    //    marks the whole text area, as it always did.
+    scroll_hint as i64;
+    scroll_pend as i64;
 }
 
 // A lazy grid commits this much more each time the ring reaches its end.
@@ -133,8 +141,18 @@ let is i64 as GRID_CHUNK with imut = 65536;
 // (up to grid_rows - rows lines of it). view_off slides the visible
 // window up into that history; any output snaps it back to live.
 fn _phys_row(t as *Term, r as i64) as i64 {
-    let is i64 as p = t.live_top + t.grid_rows - t.view_off + r;
-    return p - (p / t.grid_rows) * t.grid_rows;     // p % grid_rows
+    return _ring(t, t.live_top + t.grid_rows - t.view_off + r);
+}
+
+// p mod grid_rows for the small non-negative p a ring index takes (live_top
+// and every row are below grid_rows, so p is a few rings at most): a
+// subtraction or two where the division cost one per cell written.
+fn _ring(t as *Term, p_in as i64) as i64 {
+    let is i64 as p with mut = p_in;
+    let is i64 as n = t.grid_rows;
+    if (n <= 0) { return p; }
+    while (p >= n) { p = p - n; }
+    return p;
 }
 
 // A grid cell packs everything needed to repaint it after a resize:
@@ -164,6 +182,26 @@ fn _mark(t as *Term, x as i64, y as i64, w as i64, h as i64) as void {
     if (y + h > t.d_y1) { t.d_y1 = y + h; }
 }
 
+// set_scroll_hint — for a TEXT holder (init_text) that can move the picture it
+// already shows (the compositor's OP_MOVE_REGION, a scroll message). With the
+// hint on, a scroll of the live view no longer marks the whole text area:
+// take_scroll() says how many rows to move up first, then take_dirty() what to
+// paint after the move. The alternate screen, scrollback and resize still
+// mark everything. Off by default; pixel terminals ignore it (their pixels
+// really move).
+fn set_scroll_hint(t as *Term, on as i64) as void {
+    t.scroll_hint = on;
+    t.scroll_pend = 0;
+}
+
+// Rows the live view scrolled since the last call (set_scroll_hint), and
+// resets the count. Take it before take_dirty().
+fn take_scroll(t as *Term) as i64 {
+    let is i64 as n = t.scroll_pend;
+    t.scroll_pend = 0;
+    return n;
+}
+
 // Drain the dirty rect: writes {x, y, w, h} to out and resets the
 // accumulator. Returns 1 if there was anything to take, 0 if clean.
 fn take_dirty(t as *Term, out as *i64) as i64 {
@@ -191,9 +229,30 @@ fn _celly(t as *Term, cy as i64) as i64 { return PAD_Y + cy * GLYPH_H; }
 // fgc, clear bits → bgc, so the cell is fully repainted (erasing whatever was
 // there). MSB = leftmost.
 fn _glyph_c(t as *Term, ch as i64, px as i64, py as i64, fgc as u32, bgc as u32) as void {
+    if (t.present_mode == 2) {               // TEXT: no pixels; the rect still counts
+        _mark(t, px, py, GLYPH_W, GLYPH_H);
+        return;
+    }
     let is i64 as cp with mut = ch;
     if (cp == CELL_WIDE_TAIL || cp == 0) { cp = 0x20; }     // a wide character's tail is its blank half
     let is *u8 as g = font.glyph(cp);
+    if (px >= 0 && py >= 0 && px + GLYPH_W <= t.width && py + GLYPH_H <= t.height && t.bpp == 4) {
+        // The whole cell is on screen: write each row straight, as _putpix
+        // would pixel by pixel.
+        let is i64 as y with mut = 0;
+        while (y < GLYPH_H) {
+            let is i64 as bits = cast(i64, g[y]);
+            let is *u32 as d = cast(*u32, cast(i64, t.base) + (py + y) * t.pitch + px * 4);
+            let is i64 as x with mut = 0;
+            while (x < GLYPH_W) {
+                if ((bits & (128 >> x)) != 0) { d[x] = fgc; } else { d[x] = bgc; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        _mark(t, px, py, GLYPH_W, GLYPH_H);
+        return;
+    }
     let is i64 as row with mut = 0;
     while (row < GLYPH_H) {
         let is i64 as bits = cast(i64, g[row]);
@@ -218,8 +277,7 @@ fn _glyph(t as *Term, ch as i64, px as i64, py as i64) as void {
 fn _grid_set(t as *Term, col as i64, row as i64, ch as i64) as void {
     if (t.grid == 0) { return; }
     if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
-    let is i64 as p = t.live_top + row;
-    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is i64 as phys = _ring(t, t.live_top + row);
     let is *i64 as g = cast(*i64, t.grid);
     g[phys * t.grid_stride + col] = _cell_pack(ch, t.fg, t.bg);
 }
@@ -229,8 +287,7 @@ fn _grid_set(t as *Term, col as i64, row as i64, ch as i64) as void {
 fn _grid_set_c(t as *Term, col as i64, row as i64, cp as i64, fgc as u32, bgc as u32) as void {
     if (t.grid == 0) { return; }
     if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return; }
-    let is i64 as p = t.live_top + row;
-    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is i64 as phys = _ring(t, t.live_top + row);
     let is *i64 as g = cast(*i64, t.grid);
     g[phys * t.grid_stride + col] = _cell_pack(cp, fgc, bgc);
 }
@@ -239,8 +296,7 @@ fn _grid_set_c(t as *Term, col as i64, row as i64, cp as i64, fgc as u32, bgc as
 fn _grid_get(t as *Term, col as i64, row as i64) as i64 {
     if (t.grid == 0) { return 0; }
     if (col < 0 || row < 0 || col >= t.grid_stride || row >= t.grid_rows) { return 0; }
-    let is i64 as p = t.live_top + row;
-    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+    let is i64 as phys = _ring(t, t.live_top + row);
     let is *i64 as g = cast(*i64, t.grid);
     return g[phys * t.grid_stride + col];
 }
@@ -284,8 +340,7 @@ fn _grid_blank_phys(t as *Term, phys as i64) as void {
 
 // The physical grid row of LIVE visible row r (whatever view_off says).
 fn _live_phys(t as *Term, r as i64) as i64 {
-    let is i64 as p = t.live_top + r;
-    return p - (p / t.grid_rows) * t.grid_rows;
+    return _ring(t, t.live_top + r);
 }
 
 fn _grid_copy_row(t as *Term, from as i64, to as i64) as void {
@@ -308,8 +363,7 @@ fn _ring_advance(t as *Term) as void {
     let is i64 as p = t.live_top + t.rows - 1;
     _grid_reach(t, p);
     if (t.live_top >= t.grid_rows) { t.live_top = t.live_top - t.grid_rows; }
-    let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
-    _grid_blank_phys(t, phys);
+    _grid_blank_phys(t, _ring(t, p));
     let is i64 as hmax = t.grid_rows - t.rows;
     if (t.hist_count < hmax) { t.hist_count = t.hist_count + 1; }
     if (t.hist_count > hmax) { t.hist_count = hmax; }
@@ -372,7 +426,18 @@ fn _scroll(t as *Term) as void {
         let is *i64 as dst = cast(*i64, top);
         let is *i64 as src = cast(*i64, top + rowbytes);
         let is i64 as words = (span - rowbytes) / 8;
+        // Four words a step: the source runs a whole text row (>= 32 bytes)
+        // ahead of the destination, so each step reads before it can write
+        // over anything still to be read.
         let is i64 as i with mut = 0;
+        while (i + 4 <= words) {
+            let is i64 as w0 = src[i];
+            let is i64 as w1 = src[i + 1];
+            let is i64 as w2 = src[i + 2];
+            let is i64 as w3 = src[i + 3];
+            dst[i] = w0; dst[i + 1] = w1; dst[i + 2] = w2; dst[i + 3] = w3;
+            i = i + 4;
+        }
         while (i < words) { dst[i] = src[i]; i = i + 1; }
         // clear the bottom text row to bg, as u32 pixels
         let is *u32 as p = cast(*u32, top + (span - rowbytes));
@@ -393,7 +458,26 @@ fn _scroll(t as *Term) as void {
             _ring_advance(t);
         }
     }
-    _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
+    if (t.present_mode == 2 && t.scroll_hint == 1 && t.alt == 0) {
+        // The holder moves what it shows up a row; what is new is the row this
+        // opened, and whatever was dirty before, one row higher now.
+        t.scroll_pend = t.scroll_pend + 1;
+        let is i64 as top = _celly(t, 0);
+        let is i64 as bot = _celly(t, t.rows);
+        if (t.d_x1 > t.d_x0) {
+            if (t.d_y0 >= top && t.d_y1 <= bot) {
+                t.d_y0 = t.d_y0 - GLYPH_H;
+                t.d_y1 = t.d_y1 - GLYPH_H;
+                if (t.d_y0 < top) { t.d_y0 = top; }
+                if (t.d_y1 <= t.d_y0) { t.d_x0 = 0; t.d_y0 = 0; t.d_x1 = 0; t.d_y1 = 0; }
+            } else {
+                _mark(t, 0, top, t.width, bot - top);
+            }
+        }
+        _mark(t, 0, _celly(t, t.rows - 1), t.width, GLYPH_H);
+    } else {
+        _mark(t, 0, PAD_Y, t.width, t.rows * GLYPH_H);
+    }
     if (t.cy > 0) { t.cy = t.cy - 1; }
 }
 
@@ -423,6 +507,7 @@ fn init(base as *u8, fd as i64, width as i64, height as i64, pitch as i64, bpp a
     t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
     t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
     t.wraps = 0; t.wraps_n = 0; t.scrolled = 0;
+    t.scroll_hint = 0; t.scroll_pend = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     // clear the whole backbuffer to bg
     let is *u32 as p = cast(*u32, cast(i64, base));
@@ -457,6 +542,7 @@ fn init_buffer(base as *u8, width as i64, height as i64, pitch as i64, bpp as i6
     t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
     t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
     t.wraps = 0; t.wraps_n = 0; t.scrolled = 0;
+    t.scroll_hint = 0; t.scroll_pend = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _fill_bg(&t, width, height);
     _mark(&t, 0, 0, width, height);
@@ -495,6 +581,7 @@ fn init_text(width as i64, height as i64) as Term {
     t.u8_need = 0; t.u8_cp = 0; t.u8_min = 0;
     t.last_cp = 0; t.last_x = 0; t.last_y = 0; t.last_fg = 0; t.last_bg = 0;
     t.wraps = 0; t.wraps_n = 0; t.scrolled = 0;
+    t.scroll_hint = 0; t.scroll_pend = 0;
     t.def_fg = cast(i64, t.fg); t.def_bg = cast(i64, t.bg);
     _mark(&t, 0, 0, width, height);
     return t;
@@ -725,6 +812,10 @@ fn _cursor(t as *Term, on as i64) as void {
     if (t.view_off != 0) { return; }     // the cursor lives at the live view only
     let is i64 as px = _cellx(t, t.cx);
     let is i64 as py = _celly(t, t.cy);
+    if (t.present_mode == 2) {               // TEXT: the holder draws the cursor
+        _mark(t, px, py + GLYPH_H - 2, GLYPH_W, 2);
+        return;
+    }
     let is u32 as color with mut = t.bg;
     if (on != 0) { color = t.fg; }
     let is i64 as ry with mut = GLYPH_H - 2;
@@ -1206,13 +1297,27 @@ fn puts(t as *Term, s as *u8, n as i64) as void {
     while (i < n) { putc(t, cast(i64, s[i])); i = i + 1; }
 }
 
-// flush — paint the cursor, then (fullscreen mode) publish to the scanout.
-// In render-only mode (init_buffer) presenting is the holder's job: it drains
-// take_dirty() and routes the rect to its compositor instead.
+// flush — paint the cursor, then (fullscreen mode) publish to the scanout
+// what changed since the last flush: the dirty rect, drained here, which every
+// pixel this file writes is counted in. Presenting the whole screen copied
+// 3.7 MB at 1280x720 for every chunk of output a shell read. In render-only
+// mode (init_buffer) presenting is the holder's job: it drains take_dirty()
+// and routes the rect to its compositor instead.
 fn flush(t as *Term) as void {
     if (t.cur_vis != 0) { _cursor(t, 1); }       // a TUI hides it via CSI ?25l
     if (t.present_mode == 1) {
-        cos.present(t.fd, 0, 0, t.width, t.height);
+        let is [4]i64 as d;
+        if (take_dirty(t, cast(*i64, &d)) == 0) { return; }
+        let is i64 as x0 with mut = d[0];
+        let is i64 as y0 with mut = d[1];
+        let is i64 as x1 with mut = d[0] + d[2];
+        let is i64 as y1 with mut = d[1] + d[3];
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > t.width) { x1 = t.width; }
+        if (y1 > t.height) { y1 = t.height; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+        cos.present(t.fd, x0, y0, x1 - x0, y1 - y0);
     }
 }
 
@@ -1299,8 +1404,7 @@ fn resize(t as *Term, new_w as i64, new_h as i64) as void {
         if (t.cy >= new_rows) {
             let is i64 as shift = t.cy - new_rows + 1;
             t.scrolled = t.scrolled + shift;
-            let is i64 as p = t.live_top + shift;
-            t.live_top = p - (p / t.grid_rows) * t.grid_rows;
+            t.live_top = _ring(t, t.live_top + shift);
             t.hist_count = t.hist_count + shift;
             t.cy = new_rows - 1;
         }
@@ -1309,8 +1413,7 @@ fn resize(t as *Term, new_w as i64, new_h as i64) as void {
         if (new_rows > t.rows) {
             let is i64 as r with mut = t.rows;
             while (r < new_rows) {
-                let is i64 as q = t.live_top + r;
-                _grid_blank_phys(t, q - (q / t.grid_rows) * t.grid_rows);
+                _grid_blank_phys(t, _ring(t, t.live_top + r));
                 r = r + 1;
             }
         }

@@ -126,6 +126,9 @@ def main():
     entries = sorted((cp, renum[g]) for cp, g in cmap.items())
     gdata = b"".join(glyphs[g] for g in used)
     mdata = b"".join(struct.pack("<HH", cp, g) for cp, g in entries)
+    # ASCII straight to its glyph (0xFFFF = none), so text skips the search.
+    amap = dict(entries)
+    adata = b"".join(struct.pack("<H", amap.get(cp, 0xFFFF)) for cp in range(128))
 
     name = os.path.basename(path)
     for ext in (".gz", ".psfu", ".psf"):
@@ -152,13 +155,21 @@ def main():
     out.append("let is i64 as REPLACEMENT with imut = {};\n\n".format(renum[cmap[0xFFFD]]))
     out.append("let is *u8 as GLYPHS with imut = \"{}\";\n\n".format(hexbytes(gdata)))
     out.append("let is *u8 as MAP with imut = \"{}\";\n\n".format(hexbytes(mdata)))
+    out.append("// U+0000..U+007F: glyph u16 LE, 0xFFFF where the font has none.\n")
+    out.append("let is *u8 as ASCII with imut = \"{}\";\n\n".format(hexbytes(adata)))
     out.append("""// The glyph cp draws with, or -1 when the font has none.
 fn glyph_index(cp as i64) as i64 {
+    if (cp >= 0 && cp < 128) {
+        let is *u8 as a = ASCII;
+        let is i64 as v = cast(i64, a[cp * 2]) | (cast(i64, a[cp * 2 + 1]) << 8);
+        if (v == 65535) { return 0 - 1; }
+        return v;
+    }
     let is *u8 as m = MAP;
     let is i64 as lo with mut = 0;
     let is i64 as hi with mut = N_MAP - 1;
     while (lo <= hi) {
-        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as mid = (lo + hi) >> 1;
         let is i64 as c = cast(i64, m[mid * 4]) | (cast(i64, m[mid * 4 + 1]) << 8);
         if (cp < c) { hi = mid - 1; }
         else if (cp > c) { lo = mid + 1; }
