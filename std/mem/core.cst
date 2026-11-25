@@ -19,36 +19,78 @@ if (__target_is_windows + __compat_mode) use "../io/windows.cst" as io_windows;
 // --- Memory operations ---
 
 fn memcpy(dst as *u8, src as *u8, n as i64) as *u8 {
-    // Word-at-a-time copy (8x faster for large buffers)
-    let is i64 as words = n / 8;
-    let is i64 as i with mut = 0;
-    while (i < words) {
-        let is *i64 as dp = cast(*i64, cast(i64, dst) + i * 8);
-        let is *i64 as sp = cast(*i64, cast(i64, src) + i * 8);
-        *dp = *sp;
-        i = i + 1;
+    // -O2: one word per iteration. The loop vectorizer recognises this
+    // induction (`i < words`, step 1) and widens it; a 32-byte body reads as
+    // four strided accesses and is rejected as not countable.
+    if (__opt_level >= 2) {
+        let is i64 as words = n / 8;
+        let is i64 as i with mut = 0;
+        while (i < words) {
+            let is *i64 as dp = cast(*i64, cast(i64, dst) + i * 8);
+            let is *i64 as sp = cast(*i64, cast(i64, src) + i * 8);
+            *dp = *sp;
+            i = i + 1;
+        }
+        i = words * 8;
+        while (i < n) { dst[i] = src[i]; i = i + 1; }
+    } else {
+        // -O0/-O1: no vectorizer. Four independent word copies per iteration
+        // amortise the loop overhead; unaligned word accesses are legal on
+        // every target.
+        let is i64 as d = cast(i64, dst);
+        let is i64 as s = cast(i64, src);
+        let is i64 as i with mut = 0;
+        while (i + 32 <= n) {
+            *cast(*i64, d + i) = *cast(*i64, s + i);
+            *cast(*i64, d + i + 8) = *cast(*i64, s + i + 8);
+            *cast(*i64, d + i + 16) = *cast(*i64, s + i + 16);
+            *cast(*i64, d + i + 24) = *cast(*i64, s + i + 24);
+            i = i + 32;
+        }
+        while (i + 8 <= n) {
+            *cast(*i64, d + i) = *cast(*i64, s + i);
+            i = i + 8;
+        }
+        while (i < n) { dst[i] = src[i]; i = i + 1; }
     }
-    // Remaining bytes
-    i = words * 8;
-    while (i < n) { dst[i] = src[i]; i = i + 1; }
     return dst;
 }
 
 fn memset(dst as *u8, c as i32, n as i64) as *u8 {
     let is u8 as cb = cast(u8, c);
-    if (cb == 0) {
-        // Fast zero path — word-at-a-time
-        let is i64 as words = n / 8;
-        let is i64 as i with mut = 0;
-        while (i < words) {
-            let is *i64 as dp = cast(*i64, cast(i64, dst) + i * 8);
-            *dp = 0;
-            i = i + 1;
+    if (__opt_level >= 2) {
+        if (cb == 0) {
+            // Fast zero path — word-at-a-time, vectorized by -O2.
+            let is i64 as words = n / 8;
+            let is i64 as i with mut = 0;
+            while (i < words) {
+                let is *i64 as dp = cast(*i64, cast(i64, dst) + i * 8);
+                *dp = 0;
+                i = i + 1;
+            }
+            i = words * 8;
+            while (i < n) { dst[i] = 0; i = i + 1; }
+        } else {
+            let is i64 as i with mut = 0;
+            while (i < n) { dst[i] = cb; i = i + 1; }
         }
-        i = words * 8;
-        while (i < n) { dst[i] = 0; i = i + 1; }
     } else {
+        // The byte repeated across a word (0x0101010101010101 * c), so a fill
+        // of any value moves eight bytes per store instead of one.
+        let is i64 as w = cast(i64, cb) * 72340172838076673;
+        let is i64 as d = cast(i64, dst);
         let is i64 as i with mut = 0;
+        while (i + 32 <= n) {
+            *cast(*i64, d + i) = w;
+            *cast(*i64, d + i + 8) = w;
+            *cast(*i64, d + i + 16) = w;
+            *cast(*i64, d + i + 24) = w;
+            i = i + 32;
+        }
+        while (i + 8 <= n) {
+            *cast(*i64, d + i) = w;
+            i = i + 8;
+        }
         while (i < n) { dst[i] = cb; i = i + 1; }
     }
     return dst;
@@ -82,15 +124,34 @@ fn memcmp(a as *u8, b as *u8, n as i64) as i32 {
 }
 
 fn memzero(dst as *u8, n as i64) as void {
-    let is i64 as words = n / 8;
-    let is i64 as i with mut = 0;
-    while (i < words) {
-        let is *i64 as dp = cast(*i64, cast(i64, dst) + i * 8);
-        *dp = 0;
-        i = i + 1;
+    if (__opt_level >= 2) {
+        // One word per iteration: the shape the -O2 vectorizer widens.
+        let is i64 as words = n / 8;
+        let is i64 as i with mut = 0;
+        while (i < words) {
+            let is *i64 as dp = cast(*i64, cast(i64, dst) + i * 8);
+            *dp = 0;
+            i = i + 1;
+        }
+        i = words * 8;
+        while (i < n) { dst[i] = cast(u8, 0); i = i + 1; }
+    } else {
+        // -O0/-O1: four words per iteration.
+        let is i64 as d = cast(i64, dst);
+        let is i64 as i with mut = 0;
+        while (i + 32 <= n) {
+            *cast(*i64, d + i) = 0;
+            *cast(*i64, d + i + 8) = 0;
+            *cast(*i64, d + i + 16) = 0;
+            *cast(*i64, d + i + 24) = 0;
+            i = i + 32;
+        }
+        while (i + 8 <= n) {
+            *cast(*i64, d + i) = 0;
+            i = i + 8;
+        }
+        while (i < n) { dst[i] = cast(u8, 0); i = i + 1; }
     }
-    i = words * 8;
-    while (i < n) { dst[i] = cast(u8, 0); i = i + 1; }
 }
 
 fn memmove(dst as *u8, src as *u8, n as i64) as *u8 {

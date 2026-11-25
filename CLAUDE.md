@@ -220,11 +220,16 @@ The compiler injects target literals at parse time:
 - `__target_is_windows` — `1` on `--target=windows-x86_64`, `0` otherwise
 - `__target_is_x86_64` — `1` on an x86_64 target
 - `__target_is_aarch64` — `1` on `--target=linux-aarch64`
+- `__opt_level` — the `-O` level this build is compiled at (`0`, `1` or `2`)
 
 User code should generally **not** touch these directly — they exist as
 implementation primitives for `os.cst`'s `current` computation. Same
 mechanism as `__builtin_va_start` (parser intercepts the identifier and
-emits a literal NK_NUM in its place).
+emits a literal NK_NUM in its place). `__opt_level` exists so a routine
+whose best shape depends on the optimiser can select one: `std/mem/core.cst`
+keeps the one-word-per-iteration loop at `-O2` (the loop vectorizer widens
+it) and a manually unrolled 32-byte loop at `-O0`/`-O1`, where the same
+loop would run one word per branch.
 
 ## Standard Library (`std/`)
 

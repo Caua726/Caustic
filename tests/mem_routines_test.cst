@@ -1,0 +1,185 @@
+// memcpy / memset / memzero: every tail length, unaligned pointers, guard
+// bytes on both sides, negative lengths, and writes that end exactly at a
+// mapped page edge. The -O2 run exercises the word-loop bodies, the -O0/-O1
+// runs the manually unrolled ones.
+// Exit code = number of failures (0 means pass).
+use "../std/mem.cst" as mem;
+use "../std/io.cst" as io;
+
+let is i32 as bad with mut = 0;
+
+fn fill(p as *u8, n as i32, seed as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        p[i] = cast(u8, (i * 37 + seed * 11 + 5) & 255);
+        i = i + 1;
+    }
+}
+
+fn setc(p as *u8, n as i32, v as u8) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) { p[i] = v; i = i + 1; }
+}
+
+fn same(a as *u8, b as *u8, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn all_eq(p as *u8, n as i32, v as u8) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (p[i] != v) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Bytes outside [lo, hi) must still hold the guard value.
+fn guarded(p as *u8, lo as i32, hi as i32, v as u8, total as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < total) {
+        if (i < lo || i >= hi) {
+            if (p[i] != v) { return 0; }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn copy_case(n as i32, soff as i32, doff as i32, seed as i32) as void {
+    let is [192]u8 as a;
+    let is [192]u8 as b;
+    let is [192]u8 as a0;
+    fill(cast(*u8, &a), 192, seed);
+    setc(cast(*u8, &b), 192, 91);
+    mem.core.memcpy(cast(*u8, &a0), cast(*u8, &a), 192);
+    mem.core.memcpy(cast(*u8, cast(i64, &b) + cast(i64, doff)),
+                    cast(*u8, cast(i64, &a) + cast(i64, soff)), cast(i64, n));
+    if (same(cast(*u8, cast(i64, &b) + cast(i64, doff)),
+             cast(*u8, cast(i64, &a) + cast(i64, soff)), n) != 1) {
+        io.printf("FAIL memcpy n=%ld so=%ld do=%ld\n", cast(i64, n), cast(i64, soff), cast(i64, doff));
+        bad = bad + 1;
+    }
+    if (guarded(cast(*u8, &b), doff, doff + n, 91, 192) != 1) {
+        io.printf("FAIL memcpy guard n=%ld so=%ld do=%ld\n", cast(i64, n), cast(i64, soff), cast(i64, doff));
+        bad = bad + 1;
+    }
+    if (same(cast(*u8, &a), cast(*u8, &a0), 192) != 1) {
+        io.printf("FAIL memcpy changed source n=%ld\n", cast(i64, n));
+        bad = bad + 1;
+    }
+}
+
+fn fill_case(c as i32, n as i32, off as i32) as void {
+    let is [192]u8 as b;
+    setc(cast(*u8, &b), 192, 77);
+    mem.core.memset(cast(*u8, cast(i64, &b) + cast(i64, off)), c, cast(i64, n));
+    if (all_eq(cast(*u8, cast(i64, &b) + cast(i64, off)), n, cast(u8, c)) != 1) {
+        io.printf("FAIL memset c=%ld n=%ld off=%ld\n", cast(i64, c), cast(i64, n), cast(i64, off));
+        bad = bad + 1;
+    }
+    if (guarded(cast(*u8, &b), off, off + n, 77, 192) != 1) {
+        io.printf("FAIL memset guard c=%ld n=%ld off=%ld\n", cast(i64, c), cast(i64, n), cast(i64, off));
+        bad = bad + 1;
+    }
+}
+
+fn zero_case(n as i32, off as i32) as void {
+    let is [192]u8 as b;
+    setc(cast(*u8, &b), 192, 88);
+    mem.core.memzero(cast(*u8, cast(i64, &b) + cast(i64, off)), cast(i64, n));
+    if (all_eq(cast(*u8, cast(i64, &b) + cast(i64, off)), n, 0) != 1) {
+        io.printf("FAIL memzero n=%ld off=%ld\n", cast(i64, n), cast(i64, off));
+        bad = bad + 1;
+    }
+    if (guarded(cast(*u8, &b), off, off + n, 88, 192) != 1) {
+        io.printf("FAIL memzero guard n=%ld off=%ld\n", cast(i64, n), cast(i64, off));
+        bad = bad + 1;
+    }
+}
+
+fn sweep() as void {
+    let is i32 as n with mut = 0;
+    while (n <= 80) {
+        let is i32 as so with mut = 0;
+        while (so < 8) {
+            let is i32 as doff with mut = 0;
+            while (doff < 8) {
+                // Four alignments is enough to cover every word offset; all
+                // eight makes the -O0 run needlessly long.
+                if (so == 0 || so == 1 || so == 3 || so == 7) {
+                    if (doff == 0 || doff == 1 || doff == 3 || doff == 7) {
+                        copy_case(n, so, doff, n + so + doff);
+                    }
+                }
+                doff = doff + 1;
+            }
+            so = so + 1;
+        }
+        fill_case(0, n, n & 7);
+        fill_case(1, n, n & 7);
+        fill_case(171, n, n & 7);
+        fill_case(255, n, n & 7);
+        zero_case(n, n & 7);
+        zero_case(n, 0);
+        n = n + 1;
+    }
+}
+
+fn page_edge() as void {
+    let is *u8 as p = cast(*u8, mem.core.mmap_anon(8192));
+    fill(p, 4096, 21);
+    let is [128]u8 as ref;
+    mem.core.munmap(cast(*u8, cast(i64, p) + 4096), 4096);
+
+    let is i32 as n with mut = 1;
+    while (n <= 64) {
+        fill(p, 4096, n);
+        let is *u8 as end = cast(*u8, cast(i64, p) + cast(i64, 4096 - n));
+        let is *u8 as from = cast(*u8, cast(i64, p) + cast(i64, 2048));
+        mem.core.memcpy(cast(*u8, &ref), from, cast(i64, n));
+        mem.core.memcpy(end, from, cast(i64, n));
+        if (same(end, cast(*u8, &ref), n) != 1) {
+            io.printf("FAIL page memcpy n=%ld\n", cast(i64, n));
+            bad = bad + 1;
+        }
+        mem.core.memset(end, 171, cast(i64, n));
+        if (all_eq(end, n, 171) != 1) {
+            io.printf("FAIL page memset n=%ld\n", cast(i64, n));
+            bad = bad + 1;
+        }
+        mem.core.memzero(end, cast(i64, n));
+        if (all_eq(end, n, 0) != 1) {
+            io.printf("FAIL page memzero n=%ld\n", cast(i64, n));
+            bad = bad + 1;
+        }
+        n = n + 1;
+    }
+}
+
+fn negative_n() as void {
+    let is [64]u8 as a;
+    let is [64]u8 as ref;
+    fill(cast(*u8, &a), 64, 33);
+    mem.core.memcpy(cast(*u8, &ref), cast(*u8, &a), 64);
+    mem.core.memcpy(cast(*u8, cast(i64, &a) + 8), cast(*u8, &a), cast(i64, 0 - 3));
+    mem.core.memset(cast(*u8, &a), 9, cast(i64, 0 - 5));
+    mem.core.memzero(cast(*u8, &a), cast(i64, 0 - 1));
+    if (same(cast(*u8, &a), cast(*u8, &ref), 64) != 1) {
+        io.printf("FAIL negative n\n");
+        bad = bad + 1;
+    }
+}
+
+fn main() as i32 {
+    sweep();
+    page_edge();
+    negative_n();
+    io.printf("memory routines failures=%ld\n", cast(i64, bad));
+    return bad;
+}
