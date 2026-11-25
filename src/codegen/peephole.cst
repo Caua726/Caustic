@@ -84,7 +84,63 @@ fn _is_marker(buf as *u8, off as i64, len as i32, word as *u8) as i32 {
     return 1;
 }
 
+// The line table holds absolute addresses (the pattern helpers are called with
+// a null base), a flag byte per line (LF_REPL: rewritten, its text in repl_buf;
+// LF_LAZY: a record hint with no text, printed from its record on first read)
+// and lengths (-1: removed). alive() reads the length without printing.
+let is *u8 as line_flag with mut;
+let is i32 as LF_REPL with imut = 1;
+let is i32 as LF_LAZY with imut = 2;
+let is i32 as LF_RECMOD with imut = 4;     // rewritten in its record: nothing to re-parse
+let is *u8 as ph_lines with mut;          // the ParsedLines, for LF_LAZY lines
+let is *u8 as rend_buf with mut;
+let is i64 as rend_len with mut = 0;
+let is i64 as rend_cap with mut = 0;
+let is i64 as stat_rendered with mut = 0;
+
+fn is_repl(i as i32) as i32 { return cast(i32, (cast(i32, line_flag[i]) & LF_REPL) != 0); }
+fn is_lazy(i as i32) as i32 { return cast(i32, (cast(i32, line_flag[i]) & LF_LAZY) != 0); }
+fn set_repl(i as i32) as void { line_flag[i] = cast(u8, (cast(i32, line_flag[i]) | LF_REPL) & (255 - LF_LAZY)); }
+
+fn _raw_len(i as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
+    return *p;
+}
+
+fn alive(i as i32) as i32 {
+    let is *i32 as p = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
+    return cast(i32, *p >= 0);
+}
+
+// Print a lazy line's record into rend_buf: what codegen would have written
+// (CAUSTIC_PRINT_CHECK holds the printer to that text).
+fn _render(i as i32) as void {
+    if (is_lazy(i) == 0) { return; }
+    line_flag[i] = cast(u8, cast(i32, line_flag[i]) & (255 - LF_LAZY));
+    if (_raw_len(i) < 0) { return; }
+    if (rend_len + 256 > rend_cap) {
+        let is i64 as nc with mut = rend_cap * 2;
+        if (nc < 1048576) { nc = 1048576; }
+        rend_buf = mem.core.mmap_anon(nc);      // the old block stays: lines point into it
+        rend_len = 0;
+        rend_cap = nc;
+    }
+    let is *u8 as at = cast(*u8, cast(i64, rend_buf) + rend_len);
+    let is i32 as n = aprint.print_line(apl.pl_get(cast(*apl.ParsedLines, ph_lines), i), at);
+    if (n < 0) {
+        io.write_str(io.STDERR, "internal error: peephole cannot print a hinted record\n");
+        io.exit(1);
+    }
+    rend_len = rend_len + cast(i64, n) + 1;
+    stat_rendered = stat_rendered + 1;
+    let is *i64 as po = cast(*i64, cast(i64, line_offs) + cast(i64, i) * 8);
+    *po = cast(i64, at);
+    let is *i32 as pl = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
+    *pl = n;
+}
+
 fn get_off(i as i32) as i64 {
+    if ((cast(i32, line_flag[i]) & 2) != 0) { _render(i); }
     let is *i64 as p = cast(*i64, cast(i64, line_offs) + cast(i64, i) * 8);
     return *p;
 }
@@ -95,6 +151,7 @@ fn set_off(i as i32, v as i64) as void {
 }
 
 fn get_len(i as i32) as i32 {
+    if ((cast(i32, line_flag[i]) & 2) != 0) { _render(i); }
     let is *i32 as p = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
     return *p;
 }
@@ -195,7 +252,6 @@ let is i32 as stat_removed with mut = 0;
 let is i32 as stat_fused with mut = 0;
 let is [128]u8 as pat_tmp with mut;
 
-let is i64 as REPL_MARKER with imut = 1000000000;
 
 // ── Pattern 1: MOV + movsxd fusion ──────────────────────────────────
 
@@ -245,7 +301,7 @@ fn try_pat1(buf as *u8, i as i32, p1 as i32) as i32 {
     let is i64 as roff = repl_line(cast(*u8, &pat_tmp), tp);
     if (roff < 0) { return 0; }
     set_len(i, cast(i32, 0 - 1));
-    set_off(i + 1, REPL_MARKER + roff);
+    set_off(i + 1, cast(i64, repl_buf) + roff); set_repl(i + 1);
     set_len(i + 1, tp);
     stat_fused = stat_fused + 1;
     return 1;
@@ -309,7 +365,7 @@ fn try_pat2(buf as *u8, i as i32, p1 as i32) as i32 {
     if (tp >= 128) { return 0; }
     let is i64 as roff = repl_line(cast(*u8, &pat_tmp), tp);
     if (roff < 0) { return 0; }
-    set_off(i + 1, REPL_MARKER + roff);
+    set_off(i + 1, cast(i64, repl_buf) + roff); set_repl(i + 1);
     set_len(i + 1, tp);
     stat_fused = stat_fused + 1;
     return 1;
@@ -447,7 +503,7 @@ fn try_pat5(buf as *u8, i as i32, p1 as i32) as i32 {
     let is i64 as roff = repl_line(cast(*u8, &pat_tmp), tp);
     if (roff < 0) { return 0; }
     set_len(i, cast(i32, 0 - 1));
-    set_off(i + 1, REPL_MARKER + roff);
+    set_off(i + 1, cast(i64, repl_buf) + roff); set_repl(i + 1);
     set_len(i + 1, tp);
     stat_fused = stat_fused + 1;
     return 1;
@@ -470,8 +526,8 @@ fn try_jmp_next(buf as *u8, i as i32) as i32 {
     // else arm leaves `jmp .Lb` / `.La:` / `.Lb:`): nothing runs in between.
     let is i32 as j with mut = i + 1;
     while (j < line_count) {
-        if (get_len(j) >= 0) {
-            if (get_off(j) >= REPL_MARKER || hand_written(j) == 1) { return 0; }
+        if (alive(j) == 1) {
+            if (is_repl(j) == 1 || hand_written(j) == 1) { return 0; }
             let is i64 as noff = get_off(j);
             let is i32 as nlen = get_len(j);
             let is i32 as nws = skip_ws(buf, noff, nlen);
@@ -526,7 +582,7 @@ fn _ph_is_xmm(op as *u8, ol as i32) as i32 {
 fn _ph_low_only(buf as *u8, j as i32) as i32 {
     let is i64 as off = get_off(j);
     let is i32 as len = get_len(j);
-    if (off >= REPL_MARKER || hand_written(j) == 1) { return 0; }
+    if (is_repl(j) == 1 || hand_written(j) == 1) { return 0; }
     if (match_inst(buf, off, len, "ucomisd", 7) != 99999) { return 1; }
     if (match_inst(buf, off, len, "comisd", 6) != 99999) { return 1; }
     if (match_inst(buf, off, len, "addsd", 5) != 99999) { return 1; }
@@ -543,15 +599,15 @@ fn _ph_low_only(buf as *u8, j as i32) as i32 {
 
 // A line that only tells the debugger where it is.
 fn _ph_is_loc(buf as *u8, j as i32) as i32 {
-    if (get_len(j) < 0 || get_off(j) >= REPL_MARKER) { return 0; }
+    if (alive(j) == 0 || is_repl(j) == 1) { return 0; }
     return cast(i32, match_inst(buf, get_off(j), get_len(j), ".loc", 4) != 99999);
 }
 
 fn try_pat6(buf as *u8, i as i32) as i32 {
     // the reload may come after .loc lines
     let is i32 as k with mut = i + 1;
-    while (k < line_count && (get_len(k) < 0 || _ph_is_loc(buf, k) == 1)) { k = k + 1; }
-    if (k >= line_count || get_off(k) >= REPL_MARKER || hand_written(k) == 1) { return 0; }
+    while (k < line_count && (alive(k) == 0 || _ph_is_loc(buf, k) == 1)) { k = k + 1; }
+    if (k >= line_count || is_repl(k) == 1 || hand_written(k) == 1) { return 0; }
     let is i64 as off1 = get_off(i);
     let is i32 as len1 = get_len(i);
     let is i64 as off2 = get_off(k);
@@ -581,7 +637,7 @@ fn try_pat6(buf as *u8, i as i32) as i32 {
     if (xmm == 1) {
         if (_ph_is_xmm(r1, r1l) == 0) { return 0; }
         let is i32 as j with mut = k + 1;
-        while (j < line_count && get_len(j) < 0) { j = j + 1; }
+        while (j < line_count && alive(j) == 0) { j = j + 1; }
         if (j >= line_count || _ph_low_only(buf, j) == 0) { return 0; }
     }
     // the address must not use the register itself
@@ -624,10 +680,14 @@ fn optimize_asm(path as *u8) as void {
 // the immediately preceding one. Same rule here, over the line table: compare
 // against the last KEPT line, so a run of three identical lines keeps one.
 fn _dup_dedupable(buf as *u8, i as i32) as i32 {
+    if (is_lazy(i) == 1) {     // a hint: always a short `mov`
+        let is *apl.ParsedLine as r = apl.pl_get(cast(*apl.ParsedLines, ph_lines), i);
+        return cast(i32, r.kind == apl.LINE_INST && cast(i32, r.inst_id) == adef.INST_MOV);
+    }
     let is i32 as len = get_len(i);
     if (len < 6 || len >= 128) { return 0; }
     let is i64 as off = get_off(i);
-    if (off >= REPL_MARKER) { return 0; }
+    if (is_repl(i) == 1) { return 0; }
     if (buf[off] != 32 || buf[off + 1] != 32) { return 0; }
     if (buf[off + 2] != 109 || buf[off + 3] != 111 || buf[off + 4] != 118) { return 0; }
     if (buf[off + 5] == 32) { return 1; }
@@ -645,6 +705,10 @@ fn _dup_dedupable(buf as *u8, i as i32) as i32 {
 // out_str("]\n"), which reset it. Asked only of a line that already matched
 // its predecessor, so ordinary lines are not scanned twice.
 fn _dup_is_load(buf as *u8, i as i32) as i32 {
+    if (is_lazy(i) == 1) {
+        let is *apl.ParsedLine as r = apl.pl_get(cast(*apl.ParsedLines, ph_lines), i);
+        return cast(i32, _is_memk(cast(i32, r.op1_kind)) == 1 || _is_memk(cast(i32, r.op2_kind)) == 1);
+    }
     let is i32 as len = get_len(i);
     let is i64 as off = get_off(i);
     let is i32 as k with mut = 5;
@@ -659,6 +723,13 @@ fn _dup_is_load(buf as *u8, i as i32) as i32 {
 }
 
 fn _dup_same(buf as *u8, a as i32, b as i32) as i32 {
+    if (is_lazy(a) == 1 || is_lazy(b) == 1) {
+        let is *apl.ParsedLines as ls = cast(*apl.ParsedLines, ph_lines);
+        let is *apl.ParsedLine as ra = apl.pl_get(ls, a);
+        let is *apl.ParsedLine as rb = apl.pl_get(ls, b);
+        if (ra.kind != apl.LINE_INST || rb.kind != apl.LINE_INST || ra.inst_id != rb.inst_id) { return 0; }
+        return cast(i32, _op_same(ra, 1, rb, 1) == 1 && _op_same(ra, 2, rb, 2) == 1);
+    }
     let is i32 as la = get_len(a);
     if (la != get_len(b)) { return 0; }
     let is i64 as oa = get_off(a);
@@ -675,8 +746,9 @@ fn dedup_mov_lines(buf as *u8) as void {
     let is i32 as last with mut = 0 - 1;
     let is i32 as i with mut = 0;
     while (i < line_count) {
-        if (get_len(i) >= 0) {
-            if (hand_written(i) == 1 || _dup_dedupable(buf, i) == 0) {
+        let is *i32 as lenp = cast(*i32, cast(i64, line_lens) + cast(i64, i) * 4);
+        if (*lenp >= 0) {
+            if (line_hand[i] != cast(u8, 0) || _dup_dedupable(buf, i) == 0) {
                 last = 0 - 1;
             } else if (last >= 0 && _dup_same(buf, last, i) == 1 && _dup_is_load(buf, i) == 0) {
                 set_len(i, 0 - 1);
@@ -696,15 +768,16 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
     if (size <= 0) { return buf; }
 
     let is i64 as max_lines = size / 4 + 1024;
-    let is i64 as tbl_size = max_lines * 13 + 131072;
+    let is i64 as tbl_size = max_lines * 14 + 131072;
     let is *u8 as tbl = mem.core.mmap_anon(tbl_size);
     if (cast(i64, tbl) <= 0) { return buf; }
 
     line_offs = tbl;
     line_lens = cast(*u8, cast(i64, tbl) + max_lines * 8);
     line_hand = cast(*u8, cast(i64, tbl) + max_lines * 12);
+    line_flag = cast(*u8, cast(i64, tbl) + max_lines * 13);    // mmap: zeroed
     line_count = 0;
-    repl_buf = cast(*u8, cast(i64, tbl) + max_lines * 13);
+    repl_buf = cast(*u8, cast(i64, tbl) + max_lines * 14);
     repl_len = 0;
     repl_cap = 131072;
     stat_removed = 0;
@@ -716,7 +789,7 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
         if (cast(i64, line_count) >= max_lines) { mem.core.munmap(tbl, tbl_size); return buf; }
         let is i64 as start = pos;
         while (pos < size && buf[pos] != 10) { pos = pos + 1; }
-        set_off(line_count, start);
+        set_off(line_count, cast(i64, buf) + start);
         let is i32 as llen with mut = cast(i32, pos - start);
         if (llen > 0 && buf[start + cast(i64, llen) - 1] == 13) { llen = llen - 1; }
         set_len(line_count, llen);
@@ -728,7 +801,9 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
         if (pos < size) { pos = pos + 1; }
     }
 
-    dedup_mov_lines(buf);
+    // From here on, line addresses are absolute: the helpers get a null base.
+    let is *u8 as tb = cast(*u8, 0);
+    dedup_mov_lines(tb);
 
     let is i32 as changed with mut = 1;
     let is i32 as pass with mut = 0;
@@ -736,30 +811,30 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
         changed = 0;
         let is i32 as i with mut = 0;
         while (i < line_count - 1) {
-            if (get_len(i) >= 0 && get_len(i + 1) >= 0 && get_off(i) < REPL_MARKER && get_off(i + 1) < REPL_MARKER
+            if (alive(i) == 1 && alive(i + 1) == 1 && is_repl(i) == 0 && is_repl(i + 1) == 0
                 && hand_written(i) == 0 && hand_written(i + 1) == 0) {
                 // 8.3: pre-filter — only mov/movsxd start with 'm' (109)
                 let is i64 as pf_off = get_off(i);
                 let is i32 as pf_len = get_len(i);
-                let is i32 as pf_ws = skip_ws(buf, pf_off, pf_len);
-                if (pf_ws < pf_len && buf[pf_off + cast(i64, pf_ws)] == 109) {
+                let is i32 as pf_ws = skip_ws(tb, pf_off, pf_len);
+                if (pf_ws < pf_len && tb[pf_off + cast(i64, pf_ws)] == 109) {
                     // Parse line i's mnemonic once and dispatch. Trying the
                     // five `mov` patterns on every `m*` line (movzx, movsx,
                     // movsxd, mul, ...) only ever failed their first check.
-                    let is i32 as movp = match_inst(buf, pf_off, pf_len, "mov", 3);
+                    let is i32 as movp = match_inst(tb, pf_off, pf_len, "mov", 3);
                     if (movp != 99999) {
-                        if (try_pat1(buf, i, movp) == 1) { changed = 1; }
-                        if (get_len(i) >= 0 && try_pat2(buf, i, movp) == 1) { changed = 1; }
-                        if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat3(buf, i, movp) == 1) { changed = 1; }
-                        if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat5(buf, i, movp) == 1) { changed = 1; }
-                        if (get_len(i) >= 0 && try_pat6(buf, i) == 1) { changed = 1; }
-                    } else if (match_inst(buf, pf_off, pf_len, "movsd", 5) != 99999) {
+                        if (try_pat1(tb, i, movp) == 1) { changed = 1; }
+                        if (alive(i) == 1 && try_pat2(tb, i, movp) == 1) { changed = 1; }
+                        if (alive(i) == 1 && is_repl(i + 1) == 0 && try_pat3(tb, i, movp) == 1) { changed = 1; }
+                        if (alive(i) == 1 && is_repl(i + 1) == 0 && try_pat5(tb, i, movp) == 1) { changed = 1; }
+                        if (alive(i) == 1 && try_pat6(tb, i) == 1) { changed = 1; }
+                    } else if (match_inst(tb, pf_off, pf_len, "movsd", 5) != 99999) {
                         // Only pattern 6 handles a `movsd` first line.
-                        if (try_pat6(buf, i) == 1) { changed = 1; }
+                        if (try_pat6(tb, i) == 1) { changed = 1; }
                     }
-                } else if (pf_ws < pf_len && buf[pf_off + cast(i64, pf_ws)] == 106) {
+                } else if (pf_ws < pf_len && tb[pf_off + cast(i64, pf_ws)] == 106) {
                     // 'j' — unconditional jump-to-next removal
-                    if (try_jmp_next(buf, i) == 1) { changed = 1; }
+                    if (try_jmp_next(tb, i) == 1) { changed = 1; }
                 }
             }
             i = i + 1;
@@ -787,11 +862,7 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
         if (llen >= 0) {
             let is i64 as loff = get_off(li);
             let is *u8 as lptr with mut = cast(*u8, 0);
-            if (loff >= REPL_MARKER) {
-                lptr = cast(*u8, cast(i64, repl_buf) + loff - REPL_MARKER);
-            } else {
-                lptr = cast(*u8, cast(i64, buf) + loff);
-            }
+            lptr = cast(*u8, loff);
             ph_memcpy(cast(*u8, cast(i64, out_buf) + out_pos), lptr, cast(i64, llen));
             out_pos = out_pos + cast(i64, llen);
             out_buf[out_pos] = 10;
@@ -836,17 +907,172 @@ fn _is_memk(k as i32) as i32 { return cast(i32, k == adef.OP_MEM || k == adef.OP
 
 let is i32 as _pchk with mut = 0 - 1;
 
+// ── Patterns 1-3 on the records ──
+// The same decisions as try_pat1/2/3, from the registers' names (so the text
+// predicates, quirks included, apply unchanged); a rewrite goes into the record
+// and the line is marked rewritten (LF_REPL, so no later pattern takes it, as
+// with a rewritten text) and LF_LAZY (any later read prints the new record).
+// The replacement buffer is charged what the text rewrite would have used.
+
+fn _rn(id as i32) as *u8 { return aprint.reg_name(id); }
+
+fn _rn_len(id as i32) as i32 {
+    let is *u8 as p = aprint.reg_name(id);
+    if (cast(i64, p) == 0) { return 0; }
+    return ph_strlen(p);
+}
+
+fn _charge(n as i64) as i32 {
+    if (n >= 128 || repl_len + n > repl_cap) { return 0; }
+    repl_len = repl_len + n;
+    return 1;
+}
+
+fn _rec_rewritten(i as i32) as void {
+    line_flag[i] = cast(u8, cast(i32, line_flag[i]) | LF_REPL | LF_LAZY | LF_RECMOD);
+}
+
+fn _r64(id as i32) as i32 {
+    let is *u8 as nm = _rn(id);
+    if (cast(i64, nm) == 0) { return 0; }
+    return is_reg64(nm, ph_strlen(nm));
+}
+
+// The 32-bit id reg64_to_32 names, or -1.
+fn _r32(id as i32) as i32 {
+    let is *u8 as nm = _rn(id);
+    if (cast(i64, nm) == 0) { return 0 - 1; }
+    let is *u8 as e = reg64_to_32(nm, ph_strlen(nm));
+    if (cast(i64, e) == 0) { return 0 - 1; }
+    return id + 16;
+}
+
+// mov rA, rB ; movsxd rA, rAd  ->  movsxd rA, rBd
+fn rec_pat1(lines as *apl.ParsedLines, i as i32) as i32 {
+    let is *apl.ParsedLine as a = apl.pl_get(lines, i);
+    let is *apl.ParsedLine as b = apl.pl_get(lines, i + 1);
+    let is i32 as ra = cast(i32, a.op1_reg_id);
+    let is i32 as rb = cast(i32, a.op2_reg_id);
+    if (_r64(ra) == 0 || _r64(rb) == 0) { return 0; }
+    if (cast(i32, b.op1_kind) != adef.OP_REG || cast(i32, b.op1_reg_id) != ra) { return 0; }
+    let is i32 as e32 = _r32(ra);
+    if (e32 < 0 || cast(i32, b.op2_kind) != adef.OP_REG || cast(i32, b.op2_reg_id) != e32) { return 0; }
+    let is i32 as rbd = _r32(rb);
+    if (rbd < 0) { return 0; }
+    if (_charge(2 + 7 + _rn_len(ra) + 2 + _rn_len(rbd)) == 0) { return 0; }
+    apl.set_op_reg(b, 2, rbd);
+    set_len(i, cast(i32, 0 - 1));
+    _rec_rewritten(i + 1);
+    stat_fused = stat_fused + 1;
+    return 1;
+}
+
+// mov rA, rB ; mov rC, rA  ->  mov rA, rB ; mov rC, rB  (or drop the second if rC is rB)
+fn rec_pat2(lines as *apl.ParsedLines, i as i32) as i32 {
+    let is *apl.ParsedLine as a = apl.pl_get(lines, i);
+    let is *apl.ParsedLine as b = apl.pl_get(lines, i + 1);
+    let is i32 as ra = cast(i32, a.op1_reg_id);
+    let is i32 as rs = cast(i32, a.op2_reg_id);
+    let is i32 as rc = cast(i32, b.op1_reg_id);
+    if (_r64(ra) == 0 || _r64(rs) == 0 || ra == rs) { return 0; }
+    if (_r64(rc) == 0 || cast(i32, b.op2_reg_id) != ra || ra == rc) { return 0; }
+    if (rc == rs) {
+        set_len(i + 1, cast(i32, 0 - 1));
+        stat_removed = stat_removed + 1;
+        return 1;
+    }
+    if (_charge(2 + 4 + _rn_len(rc) + 2 + _rn_len(rs)) == 0) { return 0; }
+    apl.set_op_reg(b, 2, rs);
+    _rec_rewritten(i + 1);
+    stat_fused = stat_fused + 1;
+    return 1;
+}
+
+let is [160]u8 as _p3buf with mut;
+
+// mov rA, X ; mov rA, Y (Y does not name rA or rAd)  ->  mov rA, Y
+fn rec_pat3(lines as *apl.ParsedLines, i as i32) as i32 {
+    let is *apl.ParsedLine as a = apl.pl_get(lines, i);
+    let is *apl.ParsedLine as b = apl.pl_get(lines, i + 1);
+    let is i32 as rd = cast(i32, a.op1_reg_id);
+    if (_r64(rd) == 0) { return 0; }
+    let is i32 as n = aprint._operand(b, 2, cast(*u8, &_p3buf), 0, cast(i32, b.inst_id));
+    if (n < 0) { return try_pat3(cast(*u8, 0), i, _movp(i)); }      // not printable: the text decides
+    let is *u8 as d1 = _rn(rd);
+    let is i32 as d1l = ph_strlen(d1);
+    if (str_contains(cast(*u8, &_p3buf), n, d1, d1l) == 1) { return 0; }
+    let is *u8 as d32 = reg64_to_32(d1, d1l);
+    if (cast(i64, d32) != 0 && str_contains(cast(*u8, &_p3buf), n, d32, ph_strlen(d32)) == 1) { return 0; }
+    set_len(i, cast(i32, 0 - 1));
+    stat_removed = stat_removed + 1;
+    return 1;
+}
+
+fn _movp(i as i32) as i32 { return match_inst(cast(*u8, 0), get_off(i), get_len(i), "mov", 3); }
+
+// Operand `which` of r is memory with base or index `reg` (a 64-bit id).
+fn _uses_reg(r as *apl.ParsedLine, which as i32, reg as i32) as i32 {
+    if (which == 1) { return cast(i32, cast(i32, r.op1_mem_base) == reg || cast(i32, r.op1_mem_index) == reg); }
+    return cast(i32, cast(i32, r.op2_mem_base) == reg || cast(i32, r.op2_mem_index) == reg);
+}
+
+fn _lbl_same(a as *u8, al as i32, b as *u8, bl as i32) as i32 {
+    if (al != bl) { return 0; }
+    let is i32 as k with mut = 0;
+    while (k < al) { if (a[k] != b[k]) { return 0; } k = k + 1; }
+    return 1;
+}
+
+// Operand x of a equals operand y of b, field by field (what printing them equal means).
+fn _op_same(a as *apl.ParsedLine, x as i32, b as *apl.ParsedLine, y as i32) as i32 {
+    let is i32 as ka with mut = cast(i32, a.op1_kind);
+    let is i32 as kb with mut = cast(i32, b.op1_kind);
+    if (x == 2) { ka = cast(i32, a.op2_kind); }
+    if (y == 2) { kb = cast(i32, b.op2_kind); }
+    if (ka != kb) { return 0; }
+    if (ka == adef.OP_NONE) { return 1; }
+    if (ka == adef.OP_REG) { return cast(i32, _rr(a, x) == _rr(b, y)); }
+    if (ka == adef.OP_MEM) {
+        if (x == 1 && y == 1) { return cast(i32, a.op1_mem_base == b.op1_mem_base && a.op1_mem_index == b.op1_mem_index && a.op1_mem_scale == b.op1_mem_scale && a.op1_mem_disp == b.op1_mem_disp && a.op1_mem_size == b.op1_mem_size && a.op1_mem_seg == b.op1_mem_seg && a.op1_label_len == 0 && b.op1_label_len == 0); }
+        if (x == 1 && y == 2) { return cast(i32, a.op1_mem_base == b.op2_mem_base && a.op1_mem_index == b.op2_mem_index && a.op1_mem_scale == b.op2_mem_scale && a.op1_mem_disp == b.op2_mem_disp && a.op1_mem_size == b.op2_mem_size && a.op1_mem_seg == b.op2_mem_seg && a.op1_label_len == 0 && b.op2_label_len == 0); }
+        if (x == 2 && y == 1) { return _op_same(b, 1, a, 2); }
+        return cast(i32, a.op2_mem_base == b.op2_mem_base && a.op2_mem_index == b.op2_mem_index && a.op2_mem_scale == b.op2_mem_scale && a.op2_mem_disp == b.op2_mem_disp && a.op2_mem_size == b.op2_mem_size && a.op2_mem_seg == b.op2_mem_seg && a.op2_label_len == 0 && b.op2_label_len == 0);
+    }
+    return 0;      // other kinds: never a hint's, so never equal to one
+}
+
+// Line i is `mov [M], rA`; the next live line (past .loc) is `mov rA, [M]`.
+fn _reload_next(lines as *apl.ParsedLines, i as i32) as i32 {
+    let is i32 as k with mut = i + 1;
+    while (k < line_count) {
+        let is *apl.ParsedLine as x = apl.pl_get(lines, k);
+        let is i32 as is_loc = cast(i32, x.kind == apl.LINE_DIRECTIVE && cast(i32, x.dir_kind) == apl.DIR_LOC);
+        if (alive(k) == 1 && is_loc == 0) {
+            if (x.kind != apl.LINE_INST || cast(i32, x.inst_id) != adef.INST_MOV) { return 0; }
+            let is *apl.ParsedLine as a = apl.pl_get(lines, i);
+            if (_op_same(a, 2, x, 1) == 0) { return 0; }
+            if (cast(i32, x.op2_kind) != adef.OP_MEM) { return 1; }   // labels: the text decides
+            return _op_same(a, 1, x, 2);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
 fn optimize_records(lp as *u8, src as *u8) as void {
     let is *apl.ParsedLines as lines = cast(*apl.ParsedLines, lp);
     let is i32 as n = lines.count;
     if (n <= 0) { return; }
-    let is i64 as tbl_size = cast(i64, n) * 13 + 131072 + 4096;
+    let is i64 as tbl_size = cast(i64, n) * 14 + 131072 + 4096;
     let is *u8 as tbl = mem.core.mmap_anon(tbl_size);
     if (cast(i64, tbl) <= 0) { return; }
     line_offs = tbl;
     line_lens = cast(*u8, cast(i64, tbl) + cast(i64, n) * 8);
     line_hand = cast(*u8, cast(i64, tbl) + cast(i64, n) * 12);
-    repl_buf = cast(*u8, cast(i64, tbl) + cast(i64, n) * 13);
+    line_flag = cast(*u8, cast(i64, tbl) + cast(i64, n) * 13);
+    repl_buf = cast(*u8, cast(i64, tbl) + cast(i64, n) * 14);
+    ph_lines = lp;
+    rend_buf = cast(*u8, 0); rend_len = 0; rend_cap = 0; stat_rendered = 0;
     repl_len = 0;
     repl_cap = 131072;
     stat_removed = 0;
@@ -854,11 +1080,16 @@ fn optimize_records(lp as *u8, src as *u8) as void {
     line_count = n;
     let is i32 as r with mut = 0;
     while (r < n) {
-        set_off(r, cast(i64, apar.span_off[r]));
+        let is i32 as sf = cast(i32, apar.span_flag[r]);
+        set_off(r, cast(i64, src) + cast(i64, apar.span_off[r]));
         set_len(r, apar.span_len[r]);
-        line_hand[r] = cast(u8, cast(i32, apar.span_flag[r]) & apar.SPAN_HAND);
+        line_hand[r] = cast(u8, sf & apar.SPAN_HAND);
+        line_flag[r] = cast(u8, 0);
+        // a record hint written without its text: printed when a pattern reads it
+        if ((sf & apar.SPAN_HINT) != 0 && apar.span_len[r] == 0) { line_flag[r] = cast(u8, LF_LAZY); }
         r = r + 1;
     }
+    let is *u8 as tb = cast(*u8, 0);
 
     if (_pchk < 0) {
         _pchk = 0;
@@ -868,11 +1099,11 @@ fn optimize_records(lp as *u8, src as *u8) as void {
     if (_pchk == 1) {
         r = 0;
         while (r < n) {
-            if (get_len(r) > 0 && hand_written(r) == 0) {
+            if (is_lazy(r) == 0 && get_len(r) > 0 && hand_written(r) == 0) {
                 let is *apl.ParsedLine as cur = apl.pl_get(lines, r);
                 let is *apl.ParsedLine as nx with mut = cast(*apl.ParsedLine, 0);
                 if (r + 1 < n && get_off(r + 1) == get_off(r)) { nx = apl.pl_get(lines, r + 1); }
-                aprint.check_line(cur, nx, src, get_off(r), get_len(r));
+                aprint.check_line(cur, nx, tb, get_off(r), get_len(r));
                 if (cast(i64, nx) != 0 && aprint.is_prefix(cur) == 1) { r = r + 1; }
             }
             r = r + 1;
@@ -880,7 +1111,7 @@ fn optimize_records(lp as *u8, src as *u8) as void {
         aprint.check_report();
     }
 
-    dedup_mov_lines(src);
+    dedup_mov_lines(tb);
 
     let is i32 as changed with mut = 1;
     let is i32 as pass with mut = 0;
@@ -888,45 +1119,45 @@ fn optimize_records(lp as *u8, src as *u8) as void {
         changed = 0;
         let is i32 as i with mut = 0;
         while (i < line_count - 1) {
-            if (get_len(i) >= 0 && get_len(i + 1) >= 0 && get_off(i) < REPL_MARKER && get_off(i + 1) < REPL_MARKER
+            if (alive(i) == 1 && alive(i + 1) == 1 && is_repl(i) == 0 && is_repl(i + 1) == 0
                 && hand_written(i) == 0 && hand_written(i + 1) == 0) {
                 let is *apl.ParsedLine as a = apl.pl_get(lines, i);
                 if (a.kind == apl.LINE_INST) {
                     let is i32 as id = cast(i32, a.inst_id);
                     if (id == adef.INST_MOV) {
-                        let is i32 as movp = match_inst(src, get_off(i), get_len(i), "mov", 3);
-                        if (movp != 99999) {
-                            let is *apl.ParsedLine as b = apl.pl_get(lines, i + 1);
-                            let is i32 as binst with mut = 0 - 1;
-                            if (b.kind == apl.LINE_INST) { binst = cast(i32, b.inst_id); }
-                            let is i32 as rr = cast(i32, _rk(a, 1) == adef.OP_REG && _rk(a, 2) == adef.OP_REG);
-                            if (rr == 1 && binst == adef.INST_MOVSXD && _rk(b, 1) == adef.OP_REG && _rr(b, 1) == _rr(a, 1)) {
-                                if (try_pat1(src, i, movp) == 1) { changed = 1; }
-                            }
-                            if (get_len(i) >= 0 && rr == 1 && binst == adef.INST_MOV && _rk(b, 1) == adef.OP_REG
-                                && _rk(b, 2) == adef.OP_REG && _rr(b, 2) == _rr(a, 1)) {
-                                if (try_pat2(src, i, movp) == 1) { changed = 1; }
-                            }
-                            if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && _rk(a, 1) == adef.OP_REG
-                                && binst == adef.INST_MOV && _rk(b, 1) == adef.OP_REG && _rr(b, 1) == _rr(a, 1)) {
-                                if (try_pat3(src, i, movp) == 1) { changed = 1; }
-                            }
-                            if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && rr == 1
-                                && (binst == adef.INST_MOV || binst == adef.INST_MOVZX || binst == adef.INST_MOVSX
-                                    || binst == adef.INST_MOVSXD || binst == adef.INST_LEA)
-                                && _is_memk(_rk(b, 2)) == 1) {
-                                if (try_pat5(src, i, movp) == 1) { changed = 1; }
-                            }
-                            if (get_len(i) >= 0 && _is_memk(_rk(a, 1)) == 1 && a.op1_mem_size == 64 && _rk(a, 2) == adef.OP_REG) {
-                                if (try_pat6(src, i) == 1) { changed = 1; }
-                            }
+                        // Shapes from the records first; a line's text (printed, for
+                        // a hint without it) is read only when a pattern may apply.
+                        let is *apl.ParsedLine as b = apl.pl_get(lines, i + 1);
+                        let is i32 as binst with mut = 0 - 1;
+                        if (b.kind == apl.LINE_INST) { binst = cast(i32, b.inst_id); }
+                        let is i32 as rr = cast(i32, _rk(a, 1) == adef.OP_REG && _rk(a, 2) == adef.OP_REG);
+                        if (rr == 1 && binst == adef.INST_MOVSXD && _rk(b, 1) == adef.OP_REG && _rr(b, 1) == _rr(a, 1)) {
+                            if (rec_pat1(lines, i) == 1) { changed = 1; }
+                        }
+                        if (alive(i) == 1 && rr == 1 && binst == adef.INST_MOV && _rk(b, 1) == adef.OP_REG
+                            && _rk(b, 2) == adef.OP_REG && _rr(b, 2) == _rr(a, 1)) {
+                            if (rec_pat2(lines, i) == 1) { changed = 1; }
+                        }
+                        if (alive(i) == 1 && is_repl(i + 1) == 0 && _rk(a, 1) == adef.OP_REG
+                            && binst == adef.INST_MOV && _rk(b, 1) == adef.OP_REG && _rr(b, 1) == _rr(a, 1)) {
+                            if (rec_pat3(lines, i) == 1) { changed = 1; }
+                        }
+                        if (alive(i) == 1 && is_repl(i + 1) == 0 && rr == 1
+                            && (binst == adef.INST_MOV || binst == adef.INST_MOVZX || binst == adef.INST_MOVSX
+                                || binst == adef.INST_MOVSXD || binst == adef.INST_LEA)
+                            && _is_memk(_rk(b, 2)) == 1 && _uses_reg(b, 2, _rr(a, 1)) == 1) {
+                            if (try_pat5(tb, i, _movp(i)) == 1) { changed = 1; }
+                        }
+                        if (alive(i) == 1 && _is_memk(_rk(a, 1)) == 1 && a.op1_mem_size == 64 && _rk(a, 2) == adef.OP_REG
+                            && _reload_next(lines, i) == 1) {
+                            if (try_pat6(tb, i) == 1) { changed = 1; }
                         }
                     } else if (id == adef.INST_MOVSD) {
                         if (_is_memk(_rk(a, 1)) == 1 && a.op1_mem_size == 64 && _rk(a, 2) == adef.OP_REG) {
-                            if (match_inst(src, get_off(i), get_len(i), "movsd", 5) != 99999 && try_pat6(src, i) == 1) { changed = 1; }
+                            if (match_inst(tb, get_off(i), get_len(i), "movsd", 5) != 99999 && try_pat6(tb, i) == 1) { changed = 1; }
                         }
                     } else if (id == adef.INST_JMP) {
-                        if (try_jmp_next(src, i) == 1) { changed = 1; }
+                        if (try_jmp_next(tb, i) == 1) { changed = 1; }
                     }
                 }
             }
@@ -939,9 +1170,9 @@ fn optimize_records(lp as *u8, src as *u8) as void {
     r = 0;
     while (r < n) {
         let is *apl.ParsedLine as x = apl.pl_get(lines, r);
-        if (get_len(r) < 0) { x.kind = apl.LINE_EMPTY; }
-        else if (get_off(r) >= REPL_MARKER) {
-            let is *u8 as t = cast(*u8, cast(i64, repl_buf) + get_off(r) - REPL_MARKER);
+        if (alive(r) == 0) { x.kind = apl.LINE_EMPTY; }
+        else if (is_repl(r) == 1 && (cast(i32, line_flag[r]) & LF_RECMOD) == 0) {
+            let is *u8 as t = cast(*u8, get_off(r));
             if (apar.reparse_into(lines, r, t, cast(i64, get_len(r))) == 0) {
                 io.write_str(io.STDERR, "internal error: peephole rewrote a line the assembler cannot read back\n");
             }
