@@ -313,6 +313,20 @@ for lv in -O1 -O2; do
 done
 ok "$npe builds byte-identical"
 
+# ─── 4c'. every instruction record prints back as codegen's text ──────────
+# Direct object emission relies on src/codegen/asm_print.cst spelling a record
+# exactly as codegen would have written it. CAUSTIC_PRINT_CHECK=1 compares the
+# two on every instruction the record peephole sees.
+step "records print back as codegen's text"
+npc=0
+for spec in "-O1 src/main.cst" "-O2 src/main.cst" "--target=caustic-x86_64 -O2 tests/exceptions_test.cst" "-O1 tests/float_abi_test.cst"; do
+    out=$(CAUSTIC_PRINT_CHECK=1 "$CUR" -q $spec -o "$TMP/pc.out" 2>/dev/null | grep "print check" | tail -1)
+    [ -n "$out" ] || die "no print check from: $spec"
+    echo "$out" | grep -q " 0 different, 0 unprintable" || die "printer and codegen disagree ($spec): $out"
+    npc=$((npc+1))
+done
+ok "$npc builds, every instruction identical"
+
 # ─── 4d. IR bodies survive their serialized form ───────────────────────────
 # CAUSTIC_IR_ROUNDTRIP=1 replaces every function body by the decode of its
 # encode (src/ir/body_ser.cst) just before code generation. Nothing may change.

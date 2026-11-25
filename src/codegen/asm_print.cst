@@ -1,0 +1,246 @@
+// asm_print.cst — an assembler record back to the text codegen writes for it.
+//
+// Direct object emission needs this: when codegen appends records instead of
+// text, the peephole's text predicates (on the few candidate lines) and
+// --emit-asm still need the line as codegen would have written it.
+// print_line must therefore reproduce codegen's spelling exactly, not just
+// some valid syntax; CAUSTIC_PRINT_CHECK=1 compares it with the source text of
+// every instruction the record peephole sees and reports each difference.
+//
+// Codegen's spelling, which this follows: `  mnemonic op1, op2`; a frame
+// address without spaces (`[rbp-8]`, `[rsp+16]`), any other base with them
+// (`[rbx + 8]`, `[rax + rcx * 8 - 4]`, no `* 1`), no zero displacement;
+// `BYTE/WORD/DWORD/QWORD/XMMWORD PTR` before a sized operand, none on lea;
+// `fs:[0]` for a segment-relative absolute address; immediates in decimal;
+// a lock or rep prefix on the instruction's line.
+use "../../std/io.cst" as io;
+use "../../caustic-assembler/parser/parsed_line.cst" as apl;
+use "../../caustic-assembler/core/asm_defs.cst" as adef;
+
+fn _put(out as *u8, n as i32, s as *u8) as i32 {
+    let is i32 as k with mut = 0;
+    while (s[k] != 0) { out[n + k] = s[k]; k = k + 1; }
+    return n + k;
+}
+
+fn _putn(out as *u8, n as i32, p as *u8, len as i32) as i32 {
+    let is i32 as k with mut = 0;
+    while (k < len) { out[n + k] = p[k]; k = k + 1; }
+    return n + len;
+}
+
+fn _putdec(out as *u8, n as i32, v as i64) as i32 {
+    let is [24]u8 as t with mut;
+    let is i32 as m with mut = n;
+    let is i64 as x with mut = v;
+    if (x < 0) {
+        out[m] = cast(u8, 45); m = m + 1;
+        if (x == 0 - 9223372036854775807 - 1) { return _put(out, m, "9223372036854775808"); }
+        x = 0 - x;
+    }
+    let is i32 as k with mut = 0;
+    if (x == 0) { t[0] = cast(u8, 48); k = 1; }
+    while (x > 0) { t[k] = cast(u8, 48 + cast(i32, x % 10)); x = x / 10; k = k + 1; }
+    while (k > 0) { k = k - 1; out[m] = t[k]; m = m + 1; }
+    return m;
+}
+
+let is *u8 as _r64 with mut = cast(*u8, 0);
+
+fn reg_name(id as i32) as *u8 {
+    if (id < 0) { return cast(*u8, 0); }
+    if (id < 16) {
+        if (id == 0) { return "rax"; } if (id == 1) { return "rcx"; } if (id == 2) { return "rdx"; } if (id == 3) { return "rbx"; }
+        if (id == 4) { return "rsp"; } if (id == 5) { return "rbp"; } if (id == 6) { return "rsi"; } if (id == 7) { return "rdi"; }
+        if (id == 8) { return "r8"; } if (id == 9) { return "r9"; } if (id == 10) { return "r10"; } if (id == 11) { return "r11"; }
+        if (id == 12) { return "r12"; } if (id == 13) { return "r13"; } if (id == 14) { return "r14"; } return "r15";
+    }
+    if (id < 32) {
+        let is i32 as k = id - 16;
+        if (k == 0) { return "eax"; } if (k == 1) { return "ecx"; } if (k == 2) { return "edx"; } if (k == 3) { return "ebx"; }
+        if (k == 4) { return "esp"; } if (k == 5) { return "ebp"; } if (k == 6) { return "esi"; } if (k == 7) { return "edi"; }
+        if (k == 8) { return "r8d"; } if (k == 9) { return "r9d"; } if (k == 10) { return "r10d"; } if (k == 11) { return "r11d"; }
+        if (k == 12) { return "r12d"; } if (k == 13) { return "r13d"; } if (k == 14) { return "r14d"; } return "r15d";
+    }
+    if (id < 48) {
+        let is i32 as k = id - 32;
+        if (k == 0) { return "ax"; } if (k == 1) { return "cx"; } if (k == 2) { return "dx"; } if (k == 3) { return "bx"; }
+        if (k == 4) { return "sp"; } if (k == 5) { return "bp"; } if (k == 6) { return "si"; } if (k == 7) { return "di"; }
+        if (k == 8) { return "r8w"; } if (k == 9) { return "r9w"; } if (k == 10) { return "r10w"; } if (k == 11) { return "r11w"; }
+        if (k == 12) { return "r12w"; } if (k == 13) { return "r13w"; } if (k == 14) { return "r14w"; } return "r15w";
+    }
+    if (id < 64) {
+        let is i32 as k = id - 48;
+        if (k == 0) { return "al"; } if (k == 1) { return "cl"; } if (k == 2) { return "dl"; } if (k == 3) { return "bl"; }
+        if (k == 4) { return "spl"; } if (k == 5) { return "bpl"; } if (k == 6) { return "sil"; } if (k == 7) { return "dil"; }
+        if (k == 8) { return "r8b"; } if (k == 9) { return "r9b"; } if (k == 10) { return "r10b"; } if (k == 11) { return "r11b"; }
+        if (k == 12) { return "r12b"; } if (k == 13) { return "r13b"; } if (k == 14) { return "r14b"; } return "r15b";
+    }
+    if (id < 80) {
+        let is i32 as k = id - 64;
+        if (k == 0) { return "xmm0"; } if (k == 1) { return "xmm1"; } if (k == 2) { return "xmm2"; } if (k == 3) { return "xmm3"; }
+        if (k == 4) { return "xmm4"; } if (k == 5) { return "xmm5"; } if (k == 6) { return "xmm6"; } if (k == 7) { return "xmm7"; }
+        if (k == 8) { return "xmm8"; } if (k == 9) { return "xmm9"; } if (k == 10) { return "xmm10"; } if (k == 11) { return "xmm11"; }
+        if (k == 12) { return "xmm12"; } if (k == 13) { return "xmm13"; } if (k == 14) { return "xmm14"; } return "xmm15";
+    }
+    return cast(*u8, 0);
+}
+
+fn _size_word(sz as i32) as *u8 {
+    if (sz == 8) { return "BYTE PTR "; }
+    if (sz == 16) { return "WORD PTR "; }
+    if (sz == 32) { return "DWORD PTR "; }
+    if (sz == 64) { return "QWORD PTR "; }
+    if (sz == 128) { return "XMMWORD PTR "; }
+    return "";
+}
+
+// One operand of r (which = 1 or 2) at out[n]; the new length, or -1.
+fn _operand(r as *apl.ParsedLine, which as i32, out as *u8, n as i32, inst as i32) as i32 {
+    let is i32 as kind with mut = cast(i32, r.op1_kind);
+    let is i32 as reg with mut = cast(i32, r.op1_reg_id);
+    let is i64 as imm with mut = r.op1_imm;
+    let is i32 as base with mut = cast(i32, r.op1_mem_base);
+    let is i64 as disp with mut = r.op1_mem_disp;
+    let is i32 as sz with mut = cast(i32, r.op1_mem_size);
+    let is i32 as idx with mut = cast(i32, r.op1_mem_index);
+    let is i32 as sc with mut = cast(i32, r.op1_mem_scale);
+    let is i32 as seg with mut = cast(i32, r.op1_mem_seg);
+    let is *u8 as lp with mut = r.op1_label_ptr;
+    let is i32 as ll with mut = cast(i32, r.op1_label_len);
+    if (which == 2) {
+        kind = cast(i32, r.op2_kind); reg = cast(i32, r.op2_reg_id); imm = r.op2_imm;
+        base = cast(i32, r.op2_mem_base); disp = r.op2_mem_disp; sz = cast(i32, r.op2_mem_size);
+        idx = cast(i32, r.op2_mem_index); sc = cast(i32, r.op2_mem_scale); seg = cast(i32, r.op2_mem_seg);
+        lp = r.op2_label_ptr; ll = cast(i32, r.op2_label_len);
+    }
+    if (kind == adef.OP_REG) {
+        let is *u8 as nm = reg_name(reg);
+        if (cast(i64, nm) == 0) { return 0 - 1; }
+        return _put(out, n, nm);
+    }
+    if (kind == adef.OP_IMM) { return _putdec(out, n, imm); }
+    if (kind == adef.OP_LABEL) { return _putn(out, n, lp, ll); }
+    if (kind == adef.OP_RIP_LABEL) {
+        let is i32 as m with mut = n;
+        if (inst != adef.INST_LEA) { m = _put(out, m, _size_word(sz)); }
+        m = _put(out, m, "[rip+");
+        m = _putn(out, m, lp, ll);
+        if (disp > 0) { m = _put(out, m, "+"); m = _putdec(out, m, disp); }
+        if (disp < 0) { m = _putdec(out, m, disp); }
+        return _put(out, m, "]");
+    }
+    if (kind == adef.OP_MEM) {
+        let is i32 as m with mut = n;
+        if (inst != adef.INST_LEA) { m = _put(out, m, _size_word(sz)); }
+        if (seg == adef.SEG_FS) { m = _put(out, m, "fs:"); }
+        else if (seg == adef.SEG_GS) { m = _put(out, m, "gs:"); }
+        else if (seg != 0) { return 0 - 1; }
+        m = _put(out, m, "[");
+        if ((base == adef.REG_NONE || base < 0) && (idx == adef.REG_NONE || idx < 0)) {
+            // an absolute address, as in the stack guard's fs:[0]
+            m = _putdec(out, m, disp);
+            return _put(out, m, "]");
+        }
+        let is *u8 as bn = reg_name(base);
+        if (cast(i64, bn) == 0) { return 0 - 1; }
+        m = _put(out, m, bn);
+        if (idx != adef.REG_NONE && idx >= 0) {
+            let is *u8 as xn = reg_name(idx);
+            if (cast(i64, xn) == 0) { return 0 - 1; }
+            m = _put(out, m, " + ");
+            m = _put(out, m, xn);
+            if (sc != 1) { m = _put(out, m, " * "); m = _putdec(out, m, cast(i64, sc)); }
+            if (disp > 0) { m = _put(out, m, " + "); m = _putdec(out, m, disp); }
+            if (disp < 0) { m = _put(out, m, " - "); m = _putdec(out, m, 0 - disp); }
+        } else if (base == 4 || base == 5) {
+            // a frame address: rbp-8, rsp+16
+            if (disp > 0) { m = _put(out, m, "+"); m = _putdec(out, m, disp); }
+            if (disp < 0) { m = _putdec(out, m, disp); }
+        } else {
+            if (disp > 0) { m = _put(out, m, " + "); m = _putdec(out, m, disp); }
+            if (disp < 0) { m = _put(out, m, " - "); m = _putdec(out, m, 0 - disp); }
+        }
+        return _put(out, m, "]");
+    }
+    return 0 - 1;
+}
+
+// The text of instruction record r in out (at least 256 bytes), without a
+// newline; its length, or -1 when this printer cannot spell it.
+fn print_line(r as *apl.ParsedLine, out as *u8) as i32 {
+    if (r.kind != apl.LINE_INST || r.aux != 0) { return 0 - 1; }
+    let is i32 as id = cast(i32, r.inst_id);
+    let is *u8 as nm = adef.inst_name(id);
+    if (cast(i64, nm) == 0) { return 0 - 1; }
+    let is i32 as n with mut = _put(out, 0, "  ");
+    n = _put(out, n, nm);
+    if (r.op1_kind == adef.OP_NONE) { return n; }
+    n = _put(out, n, " ");
+    n = _operand(r, 1, out, n, id);
+    if (n < 0) { return 0 - 1; }
+    if (r.op2_kind == adef.OP_NONE) { return n; }
+    n = _put(out, n, ", ");
+    n = _operand(r, 2, out, n, id);
+    return n;
+}
+
+// ── CAUSTIC_PRINT_CHECK ────────────────────────────────────────────
+
+let is i64 as chk_total with mut = 0;
+let is i64 as chk_same with mut = 0;
+let is i64 as chk_unprint with mut = 0;
+let is i64 as chk_diff with mut = 0;
+
+// A prefix on its own record (`lock`, `rep`): the assembler splits `lock xadd
+// ...` into the prefix and the instruction, both from one source line.
+fn is_prefix(r as *apl.ParsedLine) as i32 {
+    if (r.kind != apl.LINE_INST || r.op1_kind != adef.OP_NONE) { return 0; }
+    let is *u8 as nm = adef.inst_name(cast(i32, r.inst_id));
+    if (cast(i64, nm) == 0) { return 0; }
+    if (nm[0] == 108 && nm[1] == 111 && nm[2] == 99 && nm[3] == 107 && nm[4] == 0) { return 1; }   // lock
+    if (nm[0] == 114 && nm[1] == 101 && nm[2] == 112 && nm[3] == 0) { return 1; }                  // rep
+    return 0;
+}
+
+// r's text, joined with the instruction after it when r is a prefix of the
+// same source line (next may be null).
+fn print_group(r as *apl.ParsedLine, next as *apl.ParsedLine, out as *u8) as i32 {
+    let is i32 as n = print_line(r, out);
+    if (n < 0 || is_prefix(r) == 0 || cast(i64, next) == 0) { return n; }
+    let is [512]u8 as t with mut;
+    let is i32 as m = print_line(next, &t[0]);
+    if (m < 0) { return 0 - 1; }
+    out[n] = cast(u8, 32);
+    let is i32 as k with mut = 2;
+    while (k < m) { out[n + k - 1] = t[k]; k = k + 1; }
+    return n + m - 1;
+}
+
+fn check_line(r as *apl.ParsedLine, next as *apl.ParsedLine, src as *u8, off as i64, len as i32) as void {
+    if (r.kind != apl.LINE_INST) { return; }
+    chk_total = chk_total + 1;
+    let is [512]u8 as b with mut;
+    let is i32 as n = print_group(r, next, &b[0]);
+    if (n < 0) {
+        chk_unprint = chk_unprint + 1;
+        if (chk_unprint <= 40) { io.write_str(io.STDERR, "unprintable: "); io.write_bytes(io.STDERR, cast(*u8, cast(i64, src) + off), cast(i64, len)); io.write_str(io.STDERR, "\n"); }
+        return;
+    }
+    let is i32 as same with mut = cast(i32, n == len);
+    let is i32 as k with mut = 0;
+    while (same == 1 && k < n) { if (b[k] != src[off + cast(i64, k)]) { same = 0; } k = k + 1; }
+    if (same == 1) { chk_same = chk_same + 1; return; }
+    chk_diff = chk_diff + 1;
+    if (chk_diff <= 1000000) {
+        io.write_str(io.STDERR, "source:  [");
+        io.write_bytes(io.STDERR, cast(*u8, cast(i64, src) + off), cast(i64, len));
+        io.write_str(io.STDERR, "]\nprinted: [");
+        io.write_bytes(io.STDERR, &b[0], cast(i64, n));
+        io.write_str(io.STDERR, "]\n");
+    }
+}
+
+fn check_report() as void {
+    io.printf("print check: %d instructions, %d same, %d different, %d unprintable\n", chk_total, chk_same, chk_diff, chk_unprint);
+}
