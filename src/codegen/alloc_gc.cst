@@ -100,6 +100,7 @@ fn gc2_resolve(alias as *i32, v as i32) as i32 {
 // --- Worklist helpers with O(1) membership ---
 // Tags: 0=none, 1=simplify, 2=freeze, 3=spill
 let is *u8 as _wl_tag with mut;
+let is *i32 as _wl_pos with mut;   // index+1 of the vreg's entry in its list, 0 = absent
 let is i32 as _wl_n with mut = 0;
 let is *i32 as _wl_simp with mut;
 let is *i32 as _wl_freeze with mut;
@@ -109,6 +110,8 @@ fn wl_init_tags(n as i32, sw as *i32, fw as *i32, pw as *i32) as void {
     _wl_n = n;
     _wl_tag = cast(*u8, d.opt_alloc(cast(i64, n)));
     core.memzero(_wl_tag, cast(i64, n));
+    _wl_pos = cast(*i32, d.opt_alloc(cast(i64, n) * 4));
+    core.memzero(cast(*u8, _wl_pos), cast(i64, n) * 4);
     _wl_simp = sw; _wl_freeze = fw; _wl_spill = pw;
 }
 
@@ -124,19 +127,46 @@ fn wl_add(wl as *i32, cnt as *i32, v as i32) as void {
     let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, c) * 4);
     *wp = v;
     *cnt = c + 1;
-    if (v >= 0 && v < _wl_n) { _wl_tag[v] = _wl_tag_for(wl); }
+    if (v >= 0 && v < _wl_n) {
+        _wl_tag[v] = _wl_tag_for(wl);
+        _wl_pos[v] = c + 1;
+    }
 }
 
+// O(1): every vreg remembers the index of its (last) entry in whichever list
+// holds it. The appended order and the swap-with-last removal are the same as
+// the old linear scan; the position of the element swapped in is updated. The
+// linear fallback covers an entry whose position was lost (a stale duplicate
+// left by a pop-by-decrement path, which the tag also leaves behind).
 fn wl_remove(wl as *i32, cnt as *i32, v as i32) as void {
     let is i32 as c = *cnt;
+    if (v >= 0 && v < _wl_n) {
+        let is i32 as p = _wl_pos[v];
+        if (p > 0 && p <= c) {
+            let is i32 as idx = p - 1;
+            let is *i32 as slot = cast(*i32, cast(i64, wl) + cast(i64, idx) * 4);
+            if (*slot == v) {
+                let is *i32 as last = cast(*i32, cast(i64, wl) + cast(i64, c - 1) * 4);
+                let is i32 as lv = *last;
+                *slot = lv;
+                if (lv >= 0 && lv < _wl_n) { _wl_pos[lv] = idx + 1; }
+                *cnt = c - 1;
+                _wl_pos[v] = 0;
+                _wl_tag[v] = 0;
+                return;
+            }
+        }
+    }
     let is i32 as i with mut = 0;
     while (i < c) {
         let is *i32 as wp = cast(*i32, cast(i64, wl) + cast(i64, i) * 4);
         if (*wp == v) {
             let is *i32 as last = cast(*i32, cast(i64, wl) + cast(i64, c - 1) * 4);
-            *wp = *last;
+            let is i32 as lv = *last;
+            *wp = lv;
+            if (lv >= 0 && lv < _wl_n) { _wl_pos[lv] = i + 1; }
             *cnt = c - 1;
-            if (v >= 0 && v < _wl_n) { _wl_tag[v] = 0; }
+            if (v >= 0 && v < _wl_n) { _wl_pos[v] = 0; _wl_tag[v] = 0; }
             return;
         }
         i = i + 1;
