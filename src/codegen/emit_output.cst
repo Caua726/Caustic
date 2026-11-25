@@ -1,4 +1,9 @@
 use "../../std/mem.cst" as mem;
+use "../../caustic-assembler/parser/parsed_line.cst" as _pl;
+use "../../caustic-assembler/parser/fastline.cst" as _fl;
+use "../../caustic-assembler/lexer/lexer.cst" as _lex;
+use "../../caustic-assembler/core/asm_defs.cst" as _ad;
+use "asm_print.cst" as _aprint;
 use "../../std/io.cst" as io;
 use "../../std/time.cst" as time;
 use "../parser/ast.cst" as ast;
@@ -456,9 +461,53 @@ fn out_int(n as i64) as void {
 }
 
 fn out_line(s as *u8) as void {
+    if (hints_on == 1 && lit_line(s) == 1 && hint_textless == 1) { return; }
     out_str("  ", 2);
     out_cstr(s);
     out_char(10);
+}
+
+// `  <mn>.L<num>` as a general hint: instruction id, the label, no second
+// operand. mn is the text form, mnemonic and blank ("  jne "); the text
+// follows unless the hint ends the line.
+fn _hz_var(v as i64) as void {
+    let is i64 as x with mut = v << 1;             // never negative here
+    while (x > 31) { out_char(cast(u8, 48 + 32 + cast(i32, x & 31))); x = x >> 5; }
+    out_char(cast(u8, 48 + cast(i32, x)));
+}
+
+fn _hz_begin(id as i32) as void { out_char(1); out_char(90); _hz_var(cast(i64, id)); }
+
+fn out_jump(id as i32, mn as *u8, num as i64) as void {
+    if (hints_on == 1 && num >= 0) {
+        _hz_begin(id);
+        out_char(cast(u8, 48 + _ad.OP_LABEL));
+        let is i64 as len with mut = 3;
+        let is i64 as t with mut = num;
+        while (t > 9) { len = len + 1; t = t / 10; }
+        _hz_var(len);
+        out_str(".L", 2); out_int(num);
+        out_char(48);
+        if (hint_textless == 1) { out_char(10); return; }
+    }
+    out_cstr(mn); out_str(".L", 2); out_int(num); out_char(10);
+}
+
+// `  call <name>`, a plain symbol.
+fn out_call(name as *u8, len as i32) as void {
+    let is i32 as plain with mut = cast(i32, hints_on == 1 && len > 2);
+    // Names the tokenizer reads as something else (a register, a mnemonic)
+    // are left to the parser.
+    if (plain == 1 && name[0] != 95) { plain = 0; }
+    if (plain == 1) {
+        _hz_begin(_ad.INST_CALL);
+        out_char(cast(u8, 48 + _ad.OP_LABEL));
+        _hz_var(cast(i64, len));
+        out_str(name, len);
+        out_char(48);
+        if (hint_textless == 1) { out_char(10); return; }
+    }
+    out_str("  call ", 7); out_str(name, len); out_char(10);
 }
 
 fn out_line2(a as *u8, b as *u8) as void {
@@ -474,6 +523,189 @@ fn out_line3(a as *u8, b as *u8, c as *u8) as void {
     out_cstr(b);
     out_cstr(c);
     out_char(10);
+}
+
+// === Whole constant lines as record hints ===
+//
+// out_line writes "  <s>" for a literal s. The first time a literal is seen it
+// is parsed by the assembler's own fast parser; when the record prints back to
+// exactly that text, the general hint (fastline.hint_z) for it is kept, and
+// every later out_line of that literal copies the hint. Entries are keyed by
+// address and checked against the bytes they were built from.
+
+let is i32 as LIT_MAX with imut = 2048;        // power of two
+let is *i64 as lit_key with mut = cast(*i64, 0);     // literal address, 0 = empty
+let is *i32 as lit_txt with mut;               // offset of its text in lit_buf
+let is *i32 as lit_tlen with mut;
+let is *i32 as lit_hoff with mut;              // offset of its hint; -1 = no hint
+let is *i32 as lit_hlen with mut;
+let is i32 as lit_count with mut = 0;
+let is *u8 as lit_buf with mut;
+let is i32 as lit_blen with mut = 0;
+let is i32 as LIT_BUF with imut = 524288;
+
+fn _lit_init() as void {
+    lit_key = cast(*i64, mem.core.mmap_anon(cast(i64, LIT_MAX) * 8));
+    lit_txt = cast(*i32, mem.core.mmap_anon(cast(i64, LIT_MAX) * 4));
+    lit_tlen = cast(*i32, mem.core.mmap_anon(cast(i64, LIT_MAX) * 4));
+    lit_hoff = cast(*i32, mem.core.mmap_anon(cast(i64, LIT_MAX) * 4));
+    lit_hlen = cast(*i32, mem.core.mmap_anon(cast(i64, LIT_MAX) * 4));
+    lit_buf = mem.core.mmap_anon(cast(i64, LIT_BUF));
+}
+
+let is _pl.ParsedLines as _lit_pl with mut;
+let is [1024]u8 as _lit_recs with mut;       // two ParsedLines
+let is [512]u8 as _lz with mut;
+let is i32 as _lzn with mut = 0;
+
+fn _lz_var(v as i64) as i32 {
+    let is i64 as x with mut = (v << 1) ^ (v >> 63);
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        if (_lzn >= 500) { return 0; }
+        let is i32 as c with mut = cast(i32, x & 31);
+        x = (x >> 5) & 576460752303423487;
+        if (x != 0) { c = c + 32; } else { more = 0; }
+        _lz[_lzn] = cast(u8, c + 48);
+        _lzn = _lzn + 1;
+    }
+    return 1;
+}
+
+fn _lz_op(r as *_pl.ParsedLine, which as i32) as i32 {
+    let is i32 as k with mut = cast(i32, r.op1_kind);
+    if (which == 2) { k = cast(i32, r.op2_kind); }
+    if (k < 0 || k > 20 || _lzn >= 500) { return 0; }
+    _lz[_lzn] = cast(u8, k + 48);
+    _lzn = _lzn + 1;
+    if (k == _ad.OP_NONE) { return 1; }
+    if (k == _ad.OP_REG) {
+        if (which == 1) { return _lz_var(cast(i64, r.op1_reg_id)); }
+        return _lz_var(cast(i64, r.op2_reg_id));
+    }
+    if (k == _ad.OP_IMM) {
+        if (which == 1) { return _lz_var(r.op1_imm); }
+        return _lz_var(r.op2_imm);
+    }
+    if (k == _ad.OP_MEM) {
+        if (which == 1) {
+            if (r.op1_label_len != 0) { return 0; }
+            return cast(i32, _lz_var(cast(i64, r.op1_mem_base)) == 1 && _lz_var(cast(i64, r.op1_mem_index)) == 1
+                && _lz_var(cast(i64, r.op1_mem_scale)) == 1 && _lz_var(r.op1_mem_disp) == 1
+                && _lz_var(cast(i64, r.op1_mem_size)) == 1 && _lz_var(cast(i64, r.op1_mem_seg)) == 1);
+        }
+        if (r.op2_label_len != 0) { return 0; }
+        return cast(i32, _lz_var(cast(i64, r.op2_mem_base)) == 1 && _lz_var(cast(i64, r.op2_mem_index)) == 1
+            && _lz_var(cast(i64, r.op2_mem_scale)) == 1 && _lz_var(r.op2_mem_disp) == 1
+            && _lz_var(cast(i64, r.op2_mem_size)) == 1 && _lz_var(cast(i64, r.op2_mem_seg)) == 1);
+    }
+    if (k == _ad.OP_LABEL) {
+        let is *u8 as lp with mut = r.op1_label_ptr;
+        let is i32 as ll with mut = cast(i32, r.op1_label_len);
+        if (which == 2) { lp = r.op2_label_ptr; ll = cast(i32, r.op2_label_len); }
+        if (_lz_var(cast(i64, ll)) == 0 || _lzn + ll >= 500) { return 0; }
+        let is i32 as q with mut = 0;
+        while (q < ll) { _lz[_lzn] = lp[q]; _lzn = _lzn + 1; q = q + 1; }
+        return 1;
+    }
+    return 0;
+}
+
+// Build the hint of the literal text t[0..n) (whole line, "  " included) into _lz.
+fn _lit_encode(t as *u8, n as i32) as i32 {
+    if (n < 3 || n >= 200) { return 0; }
+    if (t[n - 1] == 58 || t[2] == 46) { return 0; }      // a label or directive: a side table, not a record
+    let is [256]u8 as tb with mut;
+    let is i32 as i with mut = 0;
+    while (i < n) { tb[i] = t[i]; i = i + 1; }
+    tb[n] = cast(u8, 0);
+    // Its own storage: the shared heap is torn down before the assembler runs,
+    // and pl_init would reset the assembler's side table.
+    _lit_pl.data = cast(*u8, &_lit_recs);
+    _lit_pl.cap = 2;
+    let is *_pl.ParsedLines as tmpp = &_lit_pl;
+    tmpp.count = 0;
+    _lex.lex_init();
+    _fl.lookup_begin(cast(i64, &tb) + cast(i64, n));
+    let is i64 as eol = _fl.fast_line(cast(*u8, &tb), 0, cast(i64, n), tmpp, 0, 1);
+    let is i32 as ok with mut = 0;
+    if (eol == cast(i64, n) && tmpp.count == 1) {
+        let is *_pl.ParsedLine as r = _pl.pl_get(tmpp, 0);
+        if (r.kind == _pl.LINE_INST && r.aux == 0) {
+            let is [300]u8 as pb with mut;
+            let is i32 as pn = _aprint.print_line(r, cast(*u8, &pb));
+            if (pn == n) {
+                let is i32 as same with mut = 1;
+                i = 0;
+                while (i < n) { if (pb[i] != tb[i]) { same = 0; } i = i + 1; }
+                if (same == 1) {
+                    _lzn = 0;
+                    _lz[0] = cast(u8, 1); _lz[1] = cast(u8, 90); _lzn = 2;
+                    ok = cast(i32, _lz_var(cast(i64, r.inst_id)) == 1 && _lz_op(r, 1) == 1 && _lz_op(r, 2) == 1);
+                }
+            }
+        }
+    }
+    return ok;
+}
+
+// Emit the hint of out_line(s)'s line, if it has one: 1 = the line is written
+// (a newline ends it when the caller writes no text).
+fn lit_line(s as *u8) as i32 {
+    if (lit_count < 0) { return 0; }
+    if (cast(i64, lit_key) == 0) { _lit_init(); }
+    let is i64 as key = cast(i64, s);
+    let is i32 as h with mut = cast(i32, (key >> 3) & cast(i64, LIT_MAX - 1));
+    let is i32 as slot with mut = 0 - 1;
+    while (slot < 0) {
+        if (lit_key[h] == key) { slot = h; }
+        else if (lit_key[h] == 0) { slot = h; }
+        else { h = (h + 1) & (LIT_MAX - 1); }
+    }
+    // built from these bytes? (one pass; a shorter or different s stops it)
+    if (lit_key[slot] == key) {
+        let is i32 as tn = lit_tlen[slot] - 2;
+        let is *u8 as bp = cast(*u8, cast(i64, lit_buf) + cast(i64, lit_txt[slot]) + 2);
+        let is i32 as i with mut = 0;
+        while (i < tn && bp[i] == s[i]) { i = i + 1; }
+        if (i == tn && s[i] == 0) {
+            if (lit_hoff[slot] < 0) { return 0; }
+            return _lit_emit(slot);
+        }
+    }
+    let is i32 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    if (lit_count >= LIT_MAX - 64) { return 0; }
+    // (re)build
+    let is [300]u8 as line with mut;
+    if (n + 2 >= 250) { return 0; }
+    line[0] = cast(u8, 32); line[1] = cast(u8, 32);
+    let is i32 as k with mut = 0;
+    while (k < n) { line[k + 2] = s[k]; k = k + 1; }
+    let is i32 as total = n + 2;
+    if (lit_blen + total + 600 > LIT_BUF) { return 0; }
+    if (lit_key[slot] != key) { lit_key[slot] = key; lit_count = lit_count + 1; }
+    lit_txt[slot] = lit_blen;
+    lit_tlen[slot] = total;
+    mem.memcpy(cast(*u8, cast(i64, lit_buf) + cast(i64, lit_blen)), cast(*u8, &line), cast(i64, total));
+    lit_blen = lit_blen + total;
+    if (_lit_encode(cast(*u8, &line), total) == 0) {
+        lit_hoff[slot] = 0 - 1;
+        lit_hlen[slot] = 0;
+        return 0;
+    }
+    lit_hoff[slot] = lit_blen;
+    lit_hlen[slot] = _lzn;
+    mem.memcpy(cast(*u8, cast(i64, lit_buf) + cast(i64, lit_blen)), cast(*u8, &_lz), cast(i64, _lzn));
+    lit_blen = lit_blen + _lzn;
+    return _lit_emit(slot);
+}
+
+fn _lit_emit(slot as i32) as i32 {
+    let is i64 as hb = cast(i64, lit_buf) + cast(i64, lit_hoff[slot]);
+    out_str(cast(*u8, hb), lit_hlen[slot]);
+    if (hint_textless == 1) { out_char(10); }
+    return 1;
 }
 
 // === Register name tables ===
