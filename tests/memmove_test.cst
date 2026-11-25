@@ -1,0 +1,125 @@
+// memmove: non-overlap, every overlap direction/distance, and page boundaries.
+// Exit code = number of failures (0 means pass).
+use "../std/mem.cst" as mem;
+use "../std/io.cst" as io;
+
+let is i32 as bad with mut = 0;
+
+fn fill(p as *u8, n as i32, seed as i32) as void {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        p[i] = cast(u8, (i * 37 + seed * 11 + 5) & 255);
+        i = i + 1;
+    }
+}
+
+fn same(a as *u8, b as *u8, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn one(name as *u8, dst_off as i32, src_off as i32, n as i32, seed as i32) as void {
+    let is [256]u8 as a;
+    let is [256]u8 as ref;
+    let is [128]u8 as tmp;
+    fill(cast(*u8, &a), 256, seed);
+    mem.core.memcpy(cast(*u8, &ref), cast(*u8, &a), 256);
+    mem.core.memcpy(cast(*u8, &tmp), cast(*u8, cast(i64, &ref) + cast(i64, src_off)), cast(i64, n));
+    mem.core.memcpy(cast(*u8, cast(i64, &ref) + cast(i64, dst_off)), cast(*u8, &tmp), cast(i64, n));
+    mem.core.memmove(cast(*u8, cast(i64, &a) + cast(i64, dst_off)),
+                     cast(*u8, cast(i64, &a) + cast(i64, src_off)), cast(i64, n));
+    if (same(cast(*u8, &a), cast(*u8, &ref), 256) != 1) {
+        io.printf("FAIL %s dst=%ld src=%ld n=%ld\n", name, cast(i64, dst_off), cast(i64, src_off), cast(i64, n));
+        bad = bad + 1;
+    }
+}
+
+fn sweep() as void {
+    let is i32 as delta with mut = 1;
+    while (delta <= 17) {
+        let is i32 as n with mut = 0;
+        while (n <= 40) {
+            one("forward overlap", 64 - delta, 64, n, delta);
+            one("backward overlap", 64 + delta, 64, n, delta + 40);
+            one("forward overlap unaligned", 64, 65, n, delta + 80);
+            n = n + 1;
+        }
+        delta = delta + 1;
+    }
+    let is i32 as n2 with mut = 0;
+    while (n2 <= 64) {
+        one("no overlap hi", 128, 0, n2, 3);
+        one("no overlap lo", 0, 128, n2, 7);
+        one("same pointer", 64, 64, n2, 9);
+        n2 = n2 + 1;
+    }
+}
+
+fn page_edge() as void {
+    let is *u8 as p = cast(*u8, mem.core.mmap_anon(8192));
+    fill(p, 8192, 21);
+    // Keep the reference before the second page goes away.
+    let is [256]u8 as ref;
+    mem.core.memcpy(cast(*u8, &ref), p, 256);
+    mem.core.munmap(cast(*u8, cast(i64, p) + 4096), 4096);
+
+    let is i32 as n with mut = 1;
+    while (n <= 64) {
+        // Copy ending exactly at the page end; any word read past n faults.
+        fill(p, 4096, n);
+        mem.core.memcpy(cast(*u8, &ref), cast(*u8, cast(i64, p) + cast(i64, 2048 - n)), cast(i64, n));
+        mem.core.memmove(cast(*u8, cast(i64, p) + cast(i64, 4096 - n)),
+                         cast(*u8, cast(i64, p) + cast(i64, 2048 - n)), cast(i64, n));
+        if (same(cast(*u8, cast(i64, p) + cast(i64, 4096 - n)), cast(*u8, &ref), n) != 1) {
+            io.printf("FAIL page end n=%ld\n", cast(i64, n));
+            bad = bad + 1;
+        }
+        // Overlap ending at the page end, both directions.
+        fill(p, 4096, n + 1);
+        mem.core.memcpy(cast(*u8, &ref), cast(*u8, cast(i64, p) + cast(i64, 4000)), 64);
+        mem.core.memmove(cast(*u8, cast(i64, p) + cast(i64, 4032)),
+                         cast(*u8, cast(i64, p) + cast(i64, 4000)), 64);
+        if (same(cast(*u8, cast(i64, p) + cast(i64, 4032)), cast(*u8, &ref), 64) != 1) {
+            io.printf("FAIL page overlap fwd n=%ld\n", cast(i64, n));
+            bad = bad + 1;
+        }
+        fill(p, 4096, n + 2);
+        mem.core.memcpy(cast(*u8, &ref), cast(*u8, cast(i64, p) + cast(i64, 4032)), 64);
+        mem.core.memmove(cast(*u8, cast(i64, p) + cast(i64, 4000)),
+                         cast(*u8, cast(i64, p) + cast(i64, 4032)), 64);
+        if (same(cast(*u8, cast(i64, p) + cast(i64, 4000)), cast(*u8, &ref), 64) != 1) {
+            io.printf("FAIL page overlap back n=%ld\n", cast(i64, n));
+            bad = bad + 1;
+        }
+        n = n + 1;
+    }
+}
+
+fn negative_n() as void {
+    let is [64]u8 as a;
+    let is [64]u8 as ref;
+    fill(cast(*u8, &a), 64, 33);
+    mem.core.memcpy(cast(*u8, &ref), cast(*u8, &a), 64);
+    mem.core.memmove(cast(*u8, cast(i64, &a) + 8), cast(*u8, &a), cast(i64, 0 - 3));
+    if (same(cast(*u8, &a), cast(*u8, &ref), 64) != 1) {
+        io.printf("FAIL negative n\n");
+        bad = bad + 1;
+    }
+    mem.core.memmove(cast(*u8, &a), cast(*u8, &a), cast(i64, 0 - 1));
+    if (same(cast(*u8, &a), cast(*u8, &ref), 64) != 1) {
+        io.printf("FAIL negative n same\n");
+        bad = bad + 1;
+    }
+}
+
+fn main() as i32 {
+    sweep();
+    page_edge();
+    negative_n();
+    io.printf("memmove failures=%ld\n", cast(i64, bad));
+    return bad;
+}
