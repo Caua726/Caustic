@@ -368,6 +368,9 @@ step "test suite (tests/run_tests.cst)"
 if ! "$CUR" -q "tests/run_tests.cst" -o "$TMP/tests" >/dev/null 2>&1; then die "test runner failed to build"; fi
 if ! CAUSTIC_TEST_COMPILER="$CUR" CAUSTIC_TEST_ASSEMBLER="$TMP/caustic-as" \
         CAUSTIC_TEST_LINKER="$TMP/caustic-ld" "$TMP/tests" > "$TMP/testout.txt" 2>&1; then
+    # Each failure with what it printed before it: the tail alone misses one that
+    # ran early, and on CI this log is all there is.
+    grep -E -B8 '^[[:space:]]*FAIL[[:space:]]' "$TMP/testout.txt"; echo "..."
     tail -20 "$TMP/testout.txt"; die "test suite FAILED"
 fi
 grep -q "ALL PASSED" "$TMP/testout.txt" || { tail -20 "$TMP/testout.txt"; die "test suite did not report ALL PASSED"; }
