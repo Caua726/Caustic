@@ -151,6 +151,61 @@ fn _extern_let_objects(name as *u8, flag as *u8) as void {
     _check(name, cast(i32, _run("build/ct_el", cast(*u8, &r)) == 0));
 }
 
+// eh_frame layout sweep: programs with 0, 1, 2, ... filler functions, each
+// checking its own segments and unwinding through .eh_frame_hdr (see
+// tests/eh_layout_check.cst). Exit 0 / 3 = fine with the table inside one page
+// / across a boundary. Passes when every program is fine and at least two
+// crossed a boundary — the case that once mapped .rodata over the table.
+let is [131072]u8 as _ehs_src with mut;
+let is i64 as _ehs_len with mut = 0;
+
+fn _ehs_put(t as *u8) as void {
+    let is i64 as n = _slen(t);
+    let is i64 as i with mut = 0;
+    while (i < n && _ehs_len < 131000) { _ehs_src[_ehs_len] = t[i]; _ehs_len = _ehs_len + 1; i = i + 1; }
+}
+
+fn _ehs_num(v as i32) as void {
+    let is [12]u8 as d;
+    let is i32 as n with mut = v;
+    let is i32 as c with mut = 0;
+    if (n == 0) { d[0] = cast(u8, 48); c = 1; }
+    while (n > 0) { d[c] = cast(u8, 48 + n % 10); c = c + 1; n = n / 10; }
+    while (c > 0) { c = c - 1; _ehs_src[_ehs_len] = d[c]; _ehs_len = _ehs_len + 1; }
+}
+
+fn _eh_sweep(name as *u8) as void {
+    let is i32 as crossed with mut = 0;
+    let is i32 as nf with mut = 0;
+    while (nf < 120 && crossed < 2) {
+        _ehs_len = 0;
+        _ehs_put("use \"../tests/eh_layout_check.cst\" as chk;\n");
+        let is i32 as k with mut = 0;
+        while (k < nf) {
+            _ehs_put("fn f"); _ehs_num(k); _ehs_put("(x as i64) as i64 { return x * "); _ehs_num(k + 3); _ehs_put(" + 1; }\n");
+            k = k + 1;
+        }
+        _ehs_put("fn main() as i32 {\n    let is i64 as s with mut = 0;\n");
+        k = 0;
+        while (k < nf) { _ehs_put("    s = s + f"); _ehs_num(k); _ehs_put("(s);\n"); k = k + 1; }
+        _ehs_put("    if (s == 0 - 7) { return 9; }\n    return chk.check();\n}\n");
+        if (io.write_file_atomic("build/ct_ehsweep.cst", cast(*u8, &_ehs_src), _ehs_len) != 0) { _check(name, 0); return; }
+        let is [6]i64 as c;
+        c[0] = cast(i64, "./caustic"); c[1] = cast(i64, "-q"); c[2] = cast(i64, "build/ct_ehsweep.cst"); c[3] = cast(i64, "-o"); c[4] = cast(i64, "build/ct_ehsweep"); c[5] = 0;
+        if (_run("./caustic", cast(*u8, &c)) != 0) { _check(name, 0); return; }
+        let is [2]i64 as r; r[0] = cast(i64, "build/ct_ehsweep"); r[1] = 0;
+        let is i32 as rc = _run("build/ct_ehsweep", cast(*u8, &r));
+        if (rc == 3) { crossed = crossed + 1; }
+        else if (rc != 0) {
+            _p("  eh sweep: filler functions = "); _ehs_len = 0; _ehs_num(nf); _ehs_src[_ehs_len] = cast(u8, 0); _p(cast(*u8, &_ehs_src)); _p("\n");
+            _check(name, 0);
+            return;
+        }
+        nf = nf + 1;
+    }
+    _check(name, cast(i32, crossed >= 2));
+}
+
 // Compile `src`, run it, and require the EXACT program exit code `want`.
 //
 // Some behaviour cannot be observed from inside the program under test — an
@@ -253,6 +308,9 @@ fn main(argc as i64, argv as i64) as i32 {
     _unit("string_find", "tests/string_find_test.cst");
     _unit_opt("string_find -O1", "tests/string_find_test.cst");
     _unit_o2("string_find -O2", "tests/string_find_test.cst");
+    _unit("strlen", "tests/strlen_test.cst");
+    _unit_opt("strlen -O1", "tests/strlen_test.cst");
+    _unit_o2("strlen -O2", "tests/strlen_test.cst");
     _unit("memmove", "tests/memmove_test.cst");
     _unit_opt("memmove -O1", "tests/memmove_test.cst");
     _unit_o2("memmove -O2", "tests/memmove_test.cst");
@@ -316,6 +374,7 @@ fn main(argc as i64, argv as i64) as i32 {
     _unit_exit("leave in order is fine", "tests/exceptions/leave_ok.cst", 0);
     _unit_exit("backtrace walks the whole chain", "tests/exceptions/backtrace.cst", 0);
     _unit_o2("backtrace at -O2 unwinds frames without rbp", "tests/exceptions/backtrace_o2.cst");
+    _eh_sweep("eh_frame_hdr across a page stays mapped");
 
     // --- Sources that must be REFUSED (each with its accepted twin) ---
     _p("\n--- Rejected ---\n");
