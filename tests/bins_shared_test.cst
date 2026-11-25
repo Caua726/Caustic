@@ -1,0 +1,108 @@
+// tests/bins_shared_test.cst — default heaps share one immutable size table.
+//
+// Every default `bins_new` maps the same 8193-entry size→bin table, so building
+// it per heap cost 16 KiB of writes per instance (the compiler makes several).
+// The table is now built once and read by all default heaps. The property that
+// matters for correctness is that destroying one heap must not take the table
+// away from the others, and that each heap's slabs stay its own.
+//
+// Exit code = number of failures (0 means pass).
+use "../std/mem.cst" only bins as mem;
+use "../std/io.cst" as io;
+
+let is i32 as fails with mut = 0;
+
+fn put(p as *u8, size as i64, v as u8) as void {
+    if (cast(i64, p) == 0) { fails = fails + 1; io.printf("  FAIL alloc %d\n", size); return; }
+    p[0] = v;
+    p[size - 1] = v;
+}
+
+fn holds(p as *u8, size as i64, v as u8) as void {
+    if (p[0] != v || p[size - 1] != v) {
+        fails = fails + 1;
+        io.printf("  FAIL slot %d lost its pattern\n", size);
+    }
+}
+
+fn one_size(b1 as *mem.Bins, b2 as *mem.Bins, size as i64) as void {
+    let is *u8 as a = mem.bins.bins_alloc(b1, size);
+    let is *u8 as b = mem.bins.bins_alloc(b2, size);
+    put(a, size, 161);
+    put(b, size, 178);
+    holds(a, size, 161);
+    holds(b, size, 178);
+    mem.bins.bins_free(b1, a);
+    mem.bins.bins_free(b2, b);
+}
+
+fn main() as i32 {
+    let is mem.Bins as b1 = mem.bins.bins_new(16384);
+    let is mem.Bins as b2 = mem.bins.bins_new(65536);
+
+    // Every default class plus both edges (below 8, above 65536).
+    one_size(&b1, &b2, 1);
+    one_size(&b1, &b2, 7);
+    one_size(&b1, &b2, 8);
+    one_size(&b1, &b2, 9);
+    one_size(&b1, &b2, 15);
+    one_size(&b1, &b2, 16);
+    one_size(&b1, &b2, 17);
+    one_size(&b1, &b2, 24);
+    one_size(&b1, &b2, 32);
+    one_size(&b1, &b2, 48);
+    one_size(&b1, &b2, 64);
+    one_size(&b1, &b2, 96);
+    one_size(&b1, &b2, 128);
+    one_size(&b1, &b2, 192);
+    one_size(&b1, &b2, 256);
+    one_size(&b1, &b2, 384);
+    one_size(&b1, &b2, 512);
+    one_size(&b1, &b2, 768);
+    one_size(&b1, &b2, 1024);
+    one_size(&b1, &b2, 2048);
+    one_size(&b1, &b2, 4096);
+    one_size(&b1, &b2, 8192);
+    one_size(&b1, &b2, 65536);
+    one_size(&b1, &b2, 70000);
+
+    // Keep live allocations in b2, destroy b1, then keep using b2: if the
+    // shared table were freed with b1, the next b2 allocation would fault or
+    // pick the wrong bin.
+    let is [8]*u8 as kept;
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        kept[i] = mem.bins.bins_alloc(&b2, 64);
+        put(kept[i], 64, cast(u8, 200 + i));
+        i = i + 1;
+    }
+    mem.bins.bins_destroy(&b1);
+    i = 0;
+    while (i < 8) { holds(kept[i], 64, cast(u8, 200 + i)); i = i + 1; }
+    one_size(&b2, &b2, 128);
+    i = 0;
+    while (i < 8) { mem.bins.bins_free(&b2, kept[i]); i = i + 1; }
+    mem.bins.bins_destroy(&b2);
+
+    // A custom heap still builds its own table and still allocates.
+    let is [3]i64 as sizes;
+    sizes[0] = 16; sizes[1] = 64; sizes[2] = 512;
+    let is mem.Bins as c = mem.bins.bins_custom(65536, cast(*i64, &sizes), 3);
+    let is i64 as sz with mut = 1;
+    while (sz <= 600) {
+        let is *u8 as p = mem.bins.bins_alloc(&c, sz);
+        put(p, sz, cast(u8, sz & 255));
+        holds(p, sz, cast(u8, sz & 255));
+        mem.bins.bins_free(&c, p);
+        sz = sz + 1;
+    }
+    mem.bins.bins_destroy(&c);
+
+    // Construct after the earlier heaps are gone and use it.
+    let is mem.Bins as b3 = mem.bins.bins_new(4096);
+    one_size(&b3, &b3, 4096);
+    mem.bins.bins_destroy(&b3);
+
+    io.printf("bins shared failures=%d\n", fails);
+    return fails;
+}

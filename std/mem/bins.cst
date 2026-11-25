@@ -59,6 +59,7 @@ struct Bins {
     page_size as i64;
     lookup as *u8;
     lookup_entries as i64;
+    lookup_shared as i64; // 1 = the immutable table shared by default heaps
     lock as u32;          // B6: lazy futex lock (no-op until mem.set_mt())
     _pad as u32;
 }
@@ -208,6 +209,39 @@ fn _lookup_bin(b as *Bins, size as i64) as i64 {
     return bin_idx;
 }
 
+// Every default heap maps a size to the same bin, so the 8193-entry table is
+// identical for all of them. Build it once and point every default Bins at it:
+// bins_new used to write 16 KiB per instance (the compiler creates several).
+// The table is never modified after publication, so sharing it is safe; a
+// caller that races the first build maps a second copy, which is identical.
+let is *u8 as _default_lookup with mut = cast(*u8, 0);
+let is u32 as _default_lu_lock with mut = 0;
+
+fn _default_lookup_get() as *u8 {
+    if (cast(i64, _default_lookup) != 0) { return _default_lookup; }
+    core._lk(&_default_lu_lock);
+    if (cast(i64, _default_lookup) == 0) {
+        // Reuse the ordinary setup/lookup builders on a throwaway Bins.
+        let is Bins as tb;
+        tb.bin_count = NUM_DEFAULT_BINS;
+        tb.page_size = 4096;
+        tb.lookup_entries = LOOKUP_SIZE;
+        tb.bin_data = core.mmap_anon(NUM_DEFAULT_BINS * sizeof(Bin));
+        tb.lookup = core.mmap_anon(LOOKUP_SIZE * 2);
+        if (cast(i64, tb.bin_data) >= 0 && cast(i64, tb.lookup) >= 0) {
+            _setup_default(&tb);
+            _build_lookup(&tb);
+            core.munmap(tb.bin_data, NUM_DEFAULT_BINS * sizeof(Bin));
+            _default_lookup = tb.lookup;   // publish only when complete
+        } else {
+            if (cast(i64, tb.bin_data) >= 0) { core.munmap(tb.bin_data, NUM_DEFAULT_BINS * sizeof(Bin)); }
+            if (cast(i64, tb.lookup) >= 0) { core.munmap(tb.lookup, LOOKUP_SIZE * 2); }
+        }
+    }
+    core._unlk(&_default_lu_lock);
+    return _default_lookup;
+}
+
 fn _setup_default(b as *Bins) as void {
     let is [20]i64 as sizes;
     sizes[0] = 8;     sizes[1] = 16;    sizes[2] = 24;    sizes[3] = 32;
@@ -244,6 +278,12 @@ fn bins_new(page_size as i64) as Bins {
     // just a process that stops.
     b.lock = cast(u32, 0);
     b._pad = cast(u32, 0);
+    // Zeroed before any early return, so a failed construction is a heap that
+    // bins_destroy/bins_alloc can still see (the old failure paths left the
+    // lookup fields uninitialised).
+    b.lookup = cast(*u8, 0);
+    b.lookup_entries = 0;
+    b.lookup_shared = 0;
     b.bin_count = NUM_DEFAULT_BINS;
     b.page_size = page_size;
 
@@ -256,16 +296,22 @@ fn bins_new(page_size as i64) as Bins {
     }
 
     b.lookup_entries = LOOKUP_SIZE;
-    b.lookup = core.mmap_anon(LOOKUP_SIZE * 2);
-    if (cast(i64, b.lookup) < 0) {
-        core.munmap(b.bin_data, meta_size);
-        b.bin_data = cast(*u8, 0);
-        b.bin_count = 0;
-        return b;
+    b.lookup_shared = 1;
+    b.lookup = _default_lookup_get();
+    if (cast(i64, b.lookup) == 0) {
+        // Shared table unavailable: fall back to this heap's own copy.
+        b.lookup_shared = 0;
+        b.lookup = core.mmap_anon(LOOKUP_SIZE * 2);
+        if (cast(i64, b.lookup) < 0) {
+            core.munmap(b.bin_data, meta_size);
+            b.bin_data = cast(*u8, 0);
+            b.bin_count = 0;
+            return b;
+        }
     }
 
     _setup_default(&b);
-    _build_lookup(&b);
+    if (b.lookup_shared == 0) { _build_lookup(&b); }
     return b;
 }
 
@@ -273,6 +319,9 @@ fn bins_custom(page_size as i64, sizes as *i64, count as i64) as Bins {
     let is Bins as b;
     b.lock = cast(u32, 0);      // see bins_new
     b._pad = cast(u32, 0);
+    b.lookup_shared = 0;        // custom tables are per instance
+    b.lookup = cast(*u8, 0);    // zeroed for every early-return path
+    b.lookup_entries = 0;
     if (count <= 0) {
         b.bin_data = cast(*u8, 0);
         b.bin_count = 0;
@@ -497,8 +546,12 @@ fn bins_destroy(b as *Bins) as void {
         bin.slab_cap = 0;
         i = i + 1;
     }
-    if (cast(i64, b.lookup) != 0) { core.munmap(b.lookup, b.lookup_entries * 2); }
+    // The default heaps share one immutable table; only a private one is freed.
+    if (cast(i64, b.lookup) != 0 && b.lookup_shared == 0) { core.munmap(b.lookup, b.lookup_entries * 2); }
     if (cast(i64, b.bin_data) != 0) { core.munmap(b.bin_data, b.bin_count * sizeof(Bin)); }
+    b.lookup = cast(*u8, 0);
+    b.lookup_entries = 0;
+    b.lookup_shared = 0;
     b.bin_data = cast(*u8, 0);
     b.bin_count = 0;
 }
