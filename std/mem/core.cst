@@ -273,13 +273,25 @@ let is i64 as _mem_counted with mut = 0;   // fallback byte counter (non-Linux)
 
 fn set_mem_limit(bytes as i64) as void { _mem_limit = bytes; }
 
+// /proc/self/statm, opened once per process: each check is one pread at
+// offset 0 (procfs regenerates the text) instead of open + read + close. The
+// descriptor names the process that opened it, so a forked child — a compile
+// worker — reopens its own. A race between two threads opening it at once
+// only costs a descriptor; the value read is the same.
+let is i64 as _statm_fd  with mut = 0 - 1;
+let is i64 as _statm_pid with mut = 0;
+
 fn _mem_rss() as i64 {
     if (os.current() == os.OS_LINUX) {
-        let is i64 as fd = io_linux.open_read("/proc/self/statm");
-        if (fd < 0) { return _mem_counted; }
+        let is i64 as pid = os.linux.getpid();
+        if (_statm_fd < 0 || pid != _statm_pid) {
+            if (_statm_fd >= 0) { io_linux.close(_statm_fd); }
+            _statm_fd = io_linux.open_read("/proc/self/statm");
+            _statm_pid = pid;
+        }
+        if (_statm_fd < 0) { return _mem_counted; }
         let is [128]u8 as sbuf;
-        let is i64 as n = io_linux.read(fd, &sbuf, 128);
-        io_linux.close(fd);
+        let is i64 as n = os.linux.pread(_statm_fd, &sbuf, 128, 0);
         if (n <= 0) { return _mem_counted; }
         // "size resident shared text lib data dt" — resident is field 1 (pages).
         let is i64 as i with mut = 0;

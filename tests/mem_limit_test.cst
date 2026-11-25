@@ -1,0 +1,55 @@
+// tests/mem_limit_test.cst — the --max-ram cap (mem.core.set_mem_limit).
+//
+// The cap is checked against the process's real resident memory each time the
+// allocator backs more pages, and a process past it ends with exit 1. The RSS
+// comes from /proc/self/statm, kept open between checks; a forked child must
+// measure itself, not the parent that opened the file.
+//
+//   1. A parent with a 96 MB cap touches 16 MB: fine.
+//   2. A child forked after that (the parent's descriptor already open)
+//      touches 32 MB more in 1 MB steps: still under the cap, exit 0.
+//   3. Another child touches up to 256 MB: it must stop with exit 1 before
+//      getting there.
+//   4. A child whose parent stayed small: the child alone goes past the cap
+//      and must stop, which a check reading the parent's statm would miss.
+// Exit 0 = all four as described.
+use "../std/mem.cst" as mem;
+use "../std/os.cst" as os;
+use "../std/io.cst" as io;
+
+let is i64 as MB with imut = 1048576;
+
+fn touch(mb as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < mb) {
+        let is *u8 as p = mem.core.mmap_anon(MB);
+        let is i64 as i with mut = 0;
+        while (i < MB) { p[i] = cast(u8, 1); i = i + 4096; }
+        k = k + 1;
+    }
+}
+
+// Run touch(mb) in a child; its exit code.
+fn child(mb as i64) as i64 {
+    let is i64 as pid = os.linux.fork();
+    if (pid == 0) {
+        touch(mb);
+        os.linux.exit(0);
+    }
+    let is i32 as st with mut = 0;
+    os.linux.wait4(pid, &st, 0, cast(*u8, 0));
+    return cast(i64, (st >> 8) & 255);
+}
+
+fn main() as i32 {
+    let is i32 as bad with mut = 0;
+    mem.core.set_mem_limit(96 * MB);
+    let is i64 as c4 = child(200);              // the parent has checked nothing yet
+    if (c4 != 1) { io.printf("FAIL child past the cap (small parent): exit %ld\n", c4); bad = bad + 1; }
+    touch(16);
+    let is i64 as c2 = child(32);
+    if (c2 != 0) { io.printf("FAIL child under the cap: exit %ld\n", c2); bad = bad + 1; }
+    let is i64 as c3 = child(256);
+    if (c3 != 1) { io.printf("FAIL child past the cap: exit %ld\n", c3); bad = bad + 1; }
+    return bad;
+}
