@@ -492,26 +492,45 @@ fn _hz_begin(id as i32) as void { out_ensure(256); _hz_c(1); _hz_c(90); _hz_var(
 // A register's id from its 64- or 32-bit name, or -1 (other widths, a
 // `rip+symbol` address, xmm): the caller writes the text.
 fn hint_reg(nm as *u8) as i32 {
-    if (nm[1] == 108 && nm[2] == 0) {                       // al cl dl bl
-        if (nm[0] == 97) { return 48; } if (nm[0] == 99) { return 49; }
-        if (nm[0] == 100) { return 50; } if (nm[0] == 98) { return 51; }
+    let is u8 as c = nm[0];
+    if (c == 114) {                                         // r..: the 64-bit names first
+        if (nm[1] >= 97) { return hint_id(nm); }
+        let is i32 as n with mut = cast(i32, nm[1]) - 48;
+        let is u8 as suf with mut = nm[2];
+        if (n == 1) {
+            if (suf < 48 || suf > 53) { return 0 - 1; }
+            n = 10 + cast(i32, suf) - 48;
+            suf = nm[3];
+        } else if (n != 8 && n != 9) { return 0 - 1; }
+        if (suf == 0) { return n; }
+        let is i32 as end with mut = 3;
+        if (n >= 10) { end = 4; }
+        if (nm[end] != 0) { return 0 - 1; }
+        if (suf == 100) { return n + 16; }                  // r8d
+        if (suf == 98) { return n + 48; }                   // r8b
         return 0 - 1;
     }
-    if (nm[1] == 105 && nm[2] == 108 && nm[3] == 0) {       // sil dil
-        if (nm[0] == 115) { return 54; }
-        if (nm[0] == 100) { return 55; }
-    }
-    if (nm[0] == 101) {                                     // e..
+    if (c == 101) {                                         // e..
         if (nm[1] == 97) { return 16; } if (nm[1] == 99) { return 17; }
         if (nm[1] == 100 && nm[2] == 120) { return 18; } if (nm[1] == 98 && nm[2] == 120) { return 19; }
         if (nm[1] == 115 && nm[2] == 105) { return 22; } if (nm[1] == 100 && nm[2] == 105) { return 23; }
         return 0 - 1;
     }
-    if (nm[0] == 114) {
-        if ((nm[1] == 56 || nm[1] == 57) && nm[2] == 100 && nm[3] == 0) { return cast(i32, nm[1]) - 48 + 16; }
-        if (nm[1] == 49 && nm[2] >= 48 && nm[2] <= 53 && nm[3] == 100 && nm[4] == 0) { return 26 + cast(i32, nm[2]) - 48; }
+    if (nm[1] == 108 && nm[2] == 0) {                       // al cl dl bl
+        if (c == 97) { return 48; } if (c == 99) { return 49; }
+        if (c == 100) { return 50; } if (c == 98) { return 51; }
+        return 0 - 1;
     }
-    return hint_id(nm);
+    if (nm[1] == 120 && nm[2] == 0) {                       // ax cx dx bx
+        if (c == 97) { return 32; } if (c == 99) { return 33; }
+        if (c == 100) { return 34; } if (c == 98) { return 35; }
+        return 0 - 1;
+    }
+    if (nm[1] == 105 && nm[2] == 108 && nm[3] == 0) {       // sil dil
+        if (c == 115) { return 54; }
+        if (c == 100) { return 55; }
+    }
+    return 0 - 1;
 }
 
 fn _hz_reg(r as i32) as void { _hz_c(49); _hz_var(cast(i64, r)); }
@@ -597,7 +616,43 @@ fn _ha_int(b as *u8, at as i32) as i32 {       // digits; the position after the
     return k;
 }
 
+// `rip+symbol`: the symbol's length, or 0 (a plain address, or a name the
+// parser might read as something else: the text).
+let is *u8 as ha_rip with mut = cast(*u8, 0);
+fn _ha_sym(p as *u8, n as i32) as i32 {
+    if (n < 2 || n > 4000 || (p[0] != 95 && (p[0] != 46 || p[1] != 76))) { return 0; }
+    return n;
+}
+
+fn _hz_rip(p as *u8, n as i32, sz as i32) as void {
+    out_ensure(cast(i64, n) + 64);
+    _hz_c(48 + _ad.OP_RIP_LABEL); _hz_var(cast(i64, sz * 8)); _hz_var(cast(i64, n));
+    out_str(p, n);
+}
+
+// mn a, [rip+sym]  (lea)  or  mn a, SIZE PTR [rip+sym]
+fn i_rsym(id as i32, mn as *u8, a as *u8, sz as i32, p as *u8, n as i32) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        if (x >= 0 && _ha_sym(p, n) > 0) {
+            _hz_begin(id); _hz_reg(x); _hz_rip(p, n, sz);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); out_cstr(a); out_str(", ", 2); _ptr(sz); out_str("rip+", 4); out_str(p, n); out_str("]\n", 2);
+}
+
+let is i32 as ha_rlen with mut = 0;
 fn hint_addr(b as *u8) as i32 {
+    ha_rlen = 0;
+    if (b[0] == 114 && b[1] == 105 && b[2] == 112 && b[3] == 43) {
+        ha_rip = cast(*u8, cast(i64, b) + 4);
+        let is i32 as rn with mut = 0;
+        while (ha_rip[rn] != 0) { rn = rn + 1; }
+        ha_rlen = _ha_sym(ha_rip, rn);
+        if (ha_rlen == 0) { return 0 - 1; }
+        return 0;
+    }
     ha_index = _ad.REG_NONE; ha_scale = 0; ha_disp = 0;
     ha_base = _ha_word(b, 0);
     if (ha_base < 0) { return 0 - 1; }
@@ -629,6 +684,7 @@ fn hint_addr(b as *u8) as i32 {
 }
 
 fn _hz_addr(sz as i32) as void {
+    if (ha_rlen > 0) { _hz_rip(ha_rip, ha_rlen, sz); return; }
     _hz_c(51); _hz_var(cast(i64, ha_base)); _hz_var(cast(i64, ha_index)); _hz_var(ha_scale);
     _hz_var(ha_disp); _hz_var(cast(i64, sz * 8)); _hz_c(48);
 }
@@ -677,6 +733,68 @@ fn i_mr(id as i32, mn as *u8, sz as i32, b as *u8, a as *u8) as void {
         }
     }
     out_cstr(mn); _ptr(sz); out_cstr(b); out_str("], ", 3); out_cstr(a); out_char(10);
+}
+
+fn _out_off(b as *u8, off as i64) as void {
+    out_cstr(b);
+    if (off > 0) { out_str(" + ", 3); out_int(off); }
+}
+
+// mn a, SIZE PTR [b + off]   (b a register, off >= 0)
+fn i_ro(id as i32, mn as *u8, a as *u8, sz as i32, b as *u8, off as i64) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        let is i32 as y = hint_id(b);
+        if (x >= 0 && y >= 0) {
+            _hz_begin(id); _hz_reg(x); _hz_mem(y, off, sz);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); out_cstr(a); out_str(", ", 2); _ptr(sz); _out_off(b, off); out_str("]\n", 2);
+}
+
+// mn SIZE PTR [b + off], a
+fn i_or(id as i32, mn as *u8, sz as i32, b as *u8, off as i64, a as *u8) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        let is i32 as y = hint_id(b);
+        if (x >= 0 && y >= 0) {
+            _hz_begin(id); _hz_mem(y, off, sz); _hz_reg(x);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); _ptr(sz); _out_off(b, off); out_str("], ", 3); out_cstr(a); out_char(10);
+}
+
+// mn SIZE PTR [b], imm
+fn i_mi(id as i32, mn as *u8, sz as i32, b as *u8, v as i64) as void {
+    if (hints_on == 1 && hint_addr(b) >= 0) {
+        _hz_begin(id); _hz_addr(sz); _hz_c(50); _hz_var(v);
+        if (_hz_done() == 1) { return; }
+    }
+    out_cstr(mn); _ptr(sz); out_cstr(b); out_str("], ", 3); out_int(v); out_char(10);
+}
+
+// lea a, [b + x] (x a register, or null) / [b + d] / [b - d]
+fn i_lea(a as *u8, b as *u8, x as *u8, d as i64) as void {
+    if (hints_on == 1) {
+        let is i32 as ar = hint_reg(a);
+        let is i32 as br = hint_id(b);
+        let is i32 as xr with mut = _ad.REG_NONE;
+        if (cast(i64, x) != 0) { xr = hint_id(x); }
+        if (ar >= 0 && br >= 0 && xr >= 0) {
+            _hz_begin(_ad.INST_LEA); _hz_reg(ar); _hz_c(51); _hz_var(cast(i64, br));
+            _hz_var(cast(i64, xr));
+            if (cast(i64, x) != 0) { _hz_var(1); } else { _hz_c(48); }
+            _hz_var(d); _hz_c(48); _hz_c(48);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_str("  lea ", 6); out_cstr(a); out_str(", [", 3); out_cstr(b);
+    if (cast(i64, x) != 0) { out_str(" + ", 3); out_cstr(x); }
+    else if (d >= 0) { out_str(" + ", 3); out_int(d); }
+    else { out_str(" - ", 3); out_int(0 - d); }
+    out_str("]\n", 2);
 }
 
 // mn a, SIZE PTR [frame n]
