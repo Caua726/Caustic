@@ -1,4 +1,5 @@
 use "../../std/io.cst" as io;
+use "../../caustic-assembler/core/asm_defs.cst" as _aid;
 use "../parser/ast.cst" as ast;
 use "../ir/defs.cst" as d;
 use "alloc_core.cst" as al;
@@ -32,11 +33,7 @@ fn load_op_xmm(vreg as i32, ctx as *al.AllocCtx, xmm_target as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     if (loc < 0) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-        eo.out_str("  movsd ", 8);
-        eo.out_cstr(xmm_target);
-        eo.out_str(", QWORD PTR [", 13);
-        eo.out_fp(off);
-        eo.out_str("]\n", 2);
+        eo.i_rf(_aid.INST_MOVSD, "  movsd ", xmm_target, 8, off);
         return;
     }
     if (loc >= 16 && loc <= 31) {
@@ -45,49 +42,29 @@ fn load_op_xmm(vreg as i32, ctx as *al.AllocCtx, xmm_target as *u8) as void {
         if (eo.reg_same(src_xmm, xmm_target) == 1) { return; }
         // movaps copies the whole register; movsd xmm, xmm would merge into
         // the target's upper lane and wait for its last writer.
-        eo.out_str("  movaps ", 9);
-        eo.out_cstr(xmm_target);
-        eo.out_str(", ", 2);
-        eo.out_cstr(src_xmm);
-        eo.out_char(10);
+        eo.i_rr(_aid.INST_MOVAPS, "  movaps ", xmm_target, src_xmm);
         return;
     }
     // GPR-allocated — bit-cast via movq.
     let is *u8 as rn = eo.reg64(loc);
-    eo.out_str("  movq ", 7);
-    eo.out_cstr(xmm_target);
-    eo.out_str(", ", 2);
-    eo.out_cstr(rn);
-    eo.out_char(10);
+    eo.i_rr(_aid.INST_MOVQ, "  movq ", xmm_target, rn);
 }
 
 fn store_op_xmm(vreg as i32, ctx as *al.AllocCtx, xmm_src as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     if (loc < 0) {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-        eo.out_str("  movsd QWORD PTR [", 19);
-        eo.out_fp(off);
-        eo.out_str("], ", 3);
-        eo.out_cstr(xmm_src);
-        eo.out_char(10);
+        eo.i_fr(_aid.INST_MOVSD, "  movsd ", 8, off, xmm_src);
         return;
     }
     if (loc >= 16 && loc <= 31) {
         let is *u8 as dst_xmm = eo.reg_xmm(loc);
         if (eo.reg_same(dst_xmm, xmm_src) == 1) { return; }
-        eo.out_str("  movaps ", 9);
-        eo.out_cstr(dst_xmm);
-        eo.out_str(", ", 2);
-        eo.out_cstr(xmm_src);
-        eo.out_char(10);
+        eo.i_rr(_aid.INST_MOVAPS, "  movaps ", dst_xmm, xmm_src);
         return;
     }
     let is *u8 as rn = eo.reg64(loc);
-    eo.out_str("  movq ", 7);
-    eo.out_cstr(rn);
-    eo.out_str(", ", 2);
-    eo.out_cstr(xmm_src);
-    eo.out_char(10);
+    eo.i_rr(_aid.INST_MOVQ, "  movq ", rn, xmm_src);
     if (al.al_opt_level >= 1) {
         eo.rc_invalidate_reg(eo.reg_name_to_idx(rn));
     }
@@ -100,24 +77,14 @@ fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
     // XMM-allocated vreg being read as raw 64-bit value (e.g. for a cast to
     // i64 or for IR_MOV into a GPR slot): bridge with `movq gpr, xmm`.
     if (loc >= 16 && loc <= 31) {
-        eo.out_str("  movq ", 7);
-        eo.out_cstr(target);
-        eo.out_str(", ", 2);
-        eo.out_cstr(eo.reg_xmm(loc));
-        eo.out_char(10);
+        eo.i_rr(_aid.INST_MOVQ, "  movq ", target, eo.reg_xmm(loc));
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(eo.reg_name_to_idx(target)); }
         return;
     }
     if (loc >= 0) {
         let is *u8 as rn = eo.reg64(loc);
         if (eo.reg_same(rn, target) == 0) {
-            if (eo.hints_on == 1 && eo.out_hint_rr(target, rn) == 1) { } else {
-                eo.out_str("  mov ", 6);
-                eo.out_cstr(target);
-                eo.out_str(", ", 2);
-                eo.out_cstr(rn);
-                eo.out_char(10);
-            }
+            eo.i_rr(_aid.INST_MOV, "  mov ", target, rn);
         }
         if (al.al_opt_level >= 1) {
             eo.rc_invalidate_reg(eo.reg_name_to_idx(target));
@@ -129,34 +96,16 @@ fn load_op(vreg as i32, ctx as *al.AllocCtx, target as *u8) as void {
             let is i32 as cached = eo.rc_find(vreg);
             if (cached >= 0) {
                 if (cached == tidx) { return; }
-                if (eo.hints_on == 1 && eo.out_hint_rr(target, eo.reg64(cached)) == 1) { } else {
-                    eo.out_str("  mov ", 6);
-                    eo.out_cstr(target);
-                    eo.out_str(", ", 2);
-                    eo.out_cstr(eo.reg64(cached));
-                    eo.out_char(10);
-                }
+                eo.i_rr(_aid.INST_MOV, "  mov ", target, eo.reg64(cached));
                 eo.rc_set(tidx, vreg);
                 return;
             }
             let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-            if (eo.hints_on == 1 && eo.out_hint_fp(66, target, off) == 1) { } else {
-                eo.out_str("  mov ", 6);
-                eo.out_cstr(target);
-                eo.out_str(", QWORD PTR [", 13);
-                eo.out_fp(off);
-                eo.out_str("]\n", 2);
-            }
+            eo.i_rf(_aid.INST_MOV, "  mov ", target, 8, off);
             eo.rc_set(tidx, vreg);
         } else {
             let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-            if (eo.hints_on == 1 && eo.out_hint_fp(66, target, off) == 1) { } else {
-                eo.out_str("  mov ", 6);
-                eo.out_cstr(target);
-                eo.out_str(", QWORD PTR [", 13);
-                eo.out_fp(off);
-                eo.out_str("]\n", 2);
-            }
+            eo.i_rf(_aid.INST_MOV, "  mov ", target, 8, off);
         }
     }
 }
@@ -180,11 +129,7 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
     let is i32 as loc = al.get_loc(vreg, ctx);
     // XMM-allocated dest receiving a 64-bit value from a GPR — bridge via movq.
     if (loc >= 16 && loc <= 31) {
-        eo.out_str("  movq ", 7);
-        eo.out_cstr(eo.reg_xmm(loc));
-        eo.out_str(", ", 2);
-        eo.out_cstr(source);
-        eo.out_char(10);
+        eo.i_rr(_aid.INST_MOVQ, "  movq ", eo.reg_xmm(loc), source);
         // source was just written with the value being stored: whatever
         // spilled vreg the cache last saw in it is gone.
         if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(eo.reg_name_to_idx(source)); }
@@ -193,13 +138,7 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
     if (loc >= 0) {
         let is *u8 as rn = eo.reg64(loc);
         if (eo.reg_same(rn, source) == 0) {
-            if (eo.hints_on == 1 && eo.out_hint_rr(rn, source) == 1) { } else {
-                eo.out_str("  mov ", 6);
-                eo.out_cstr(rn);
-                eo.out_str(", ", 2);
-                eo.out_cstr(source);
-                eo.out_char(10);
-            }
+            eo.i_rr(_aid.INST_MOV, "  mov ", rn, source);
         }
         if (al.al_opt_level >= 1) {
             let is i32 as sidx = eo.reg_name_to_idx(source);
@@ -208,13 +147,7 @@ fn store_op(vreg as i32, ctx as *al.AllocCtx, source as *u8) as void {
         }
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
-        if (eo.hints_on == 1 && eo.out_hint_fp(67, source, off) == 1) { } else {
-            eo.out_str("  mov QWORD PTR [", 17);
-            eo.out_fp(off);
-            eo.out_str("], ", 3);
-            eo.out_cstr(source);
-            eo.out_char(10);
-        }
+        eo.i_fr(_aid.INST_MOV, "  mov ", 8, off, source);
         if (al.al_opt_level >= 1) {
             eo.rc_invalidate_vreg(vreg);
             eo.rc_set(eo.reg_name_to_idx(source), vreg);
@@ -251,34 +184,18 @@ fn emit_mov_imm(vreg as i32, ctx as *al.AllocCtx, val as i64) as void {
     if (val > 2147483647 || val < 0 - 2147483647) { is_large = 1; }
     if (loc >= 0) {
         if (is_large == 1) {
-            eo.out_str("  mov ", 6);
-            eo.out_cstr(eo.reg64(loc));
-            eo.out_str(", ", 2);
-            eo.out_int(val);
-            eo.out_char(10);
+            eo.i_ri(_aid.INST_MOV, "  mov ", eo.reg64(loc), val);
         } else {
-            eo.out_str("  mov ", 6);
-            eo.out_cstr(eo.reg64(loc));
-            eo.out_str(", ", 2);
-            eo.out_int(val);
-            eo.out_char(10);
+            eo.i_ri(_aid.INST_MOV, "  mov ", eo.reg64(loc), val);
         }
     } else {
         let is i64 as off = cast(i64, ctx.arg_spill_base) + cast(i64, 0 - loc) * 8;
         if (is_large == 1) {
-            eo.out_str("  mov rax, ", 11);
-            eo.out_int(val);
-            eo.out_char(10);
-            eo.out_str("  mov QWORD PTR [", 17);
-            eo.out_fp(off);
-            eo.out_str("], rax\n", 7);
+            eo.i_ri(_aid.INST_MOV, "  mov ", "rax", val);
+            eo.i_fr(_aid.INST_MOV, "  mov ", 8, off, "rax");
             if (al.al_opt_level >= 1) { eo.rc_invalidate_reg(0); }
         } else {
-            eo.out_str("  mov QWORD PTR [", 17);
-            eo.out_fp(off);
-            eo.out_str("], ", 3);
-            eo.out_int(val);
-            eo.out_char(10);
+            eo.i_fi(_aid.INST_MOV, "  mov ", 8, off, val);
         }
     }
 }
@@ -328,9 +245,9 @@ fn emit_narrow_truncate(reg_idx as i32, cast_to as *u8) as void {
     let is *u8 as r64 = eo.reg64(reg_idx);
     if (sz == 4) {
         if (sgn == 1) {
-            eo.out_str("  movsxd ", 9); eo.out_cstr(r64); eo.out_str(", ", 2); eo.out_cstr(eo.reg32(reg_idx)); eo.out_char(10);
+            eo.i_rr(_aid.INST_MOVSXD, "  movsxd ", r64, eo.reg32(reg_idx));
         } else {
-            eo.out_str("  mov ", 6); eo.out_cstr(eo.reg32(reg_idx)); eo.out_str(", ", 2); eo.out_cstr(eo.reg32(reg_idx)); eo.out_char(10);
+            eo.i_rr(_aid.INST_MOV, "  mov ", eo.reg32(reg_idx), eo.reg32(reg_idx));
         }
         return;
     }

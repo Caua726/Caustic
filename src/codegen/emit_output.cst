@@ -471,12 +471,162 @@ fn out_line(s as *u8) as void {
 // operand. mn is the text form, mnemonic and blank ("  jne "); the text
 // follows unless the hint ends the line.
 fn _hz_var(v as i64) as void {
-    let is i64 as x with mut = v << 1;             // never negative here
-    while (x > 31) { out_char(cast(u8, 48 + 32 + cast(i32, x & 31))); x = x >> 5; }
-    out_char(cast(u8, 48 + cast(i32, x)));
+    let is i64 as x with mut = (v << 1) ^ (0 - ((v >> 63) & 1));
+    let is *u8 as o = out_buf;
+    let is i64 as k with mut = out_len;
+    while (x > 31 || x < 0) {
+        o[k] = cast(u8, 80 + cast(i32, x & 31));
+        x = (x >> 5) & 576460752303423487;
+        k = k + 1;
+    }
+    o[k] = cast(u8, 48 + cast(i32, x));
+    out_len = k + 1;
 }
 
-fn _hz_begin(id as i32) as void { out_char(1); out_char(90); _hz_var(cast(i64, id)); }
+// Room for a whole hint without a label (two operands, 13 bytes a number);
+// _hz_var and _hz_c write without checking.
+fn _hz_c(c as i32) as void { out_buf[out_len] = cast(u8, c); out_len = out_len + 1; }
+
+fn _hz_begin(id as i32) as void { out_ensure(256); _hz_c(1); _hz_c(90); _hz_var(cast(i64, id)); }
+
+// A register's id from its 64- or 32-bit name, or -1 (other widths, a
+// `rip+symbol` address, xmm): the caller writes the text.
+fn hint_reg(nm as *u8) as i32 {
+    if (nm[0] == 101) {                                     // e..
+        if (nm[1] == 97) { return 16; } if (nm[1] == 99) { return 17; }
+        if (nm[1] == 100 && nm[2] == 120) { return 18; } if (nm[1] == 98 && nm[2] == 120) { return 19; }
+        if (nm[1] == 115 && nm[2] == 105) { return 22; } if (nm[1] == 100 && nm[2] == 105) { return 23; }
+        return 0 - 1;
+    }
+    if (nm[0] == 114) {
+        if ((nm[1] == 56 || nm[1] == 57) && nm[2] == 100 && nm[3] == 0) { return cast(i32, nm[1]) - 48 + 16; }
+        if (nm[1] == 49 && nm[2] >= 48 && nm[2] <= 53 && nm[3] == 100 && nm[4] == 0) { return 26 + cast(i32, nm[2]) - 48; }
+    }
+    return hint_id(nm);
+}
+
+fn _hz_reg(r as i32) as void { _hz_c(49); _hz_var(cast(i64, r)); }
+
+fn _hz_mem(base as i32, disp as i64, sz as i32) as void {
+    _hz_c(51);
+    _hz_var(cast(i64, base));
+    _hz_var(cast(i64, _ad.REG_NONE)); _hz_c(48);            // no index, no scale
+    _hz_var(disp); _hz_var(cast(i64, sz * 8)); _hz_c(48);       // no segment
+}
+
+fn _hz_frame(n as i64, sz as i32) as void {
+    if (fp_omit == 1) { _hz_mem(4, fp_bias - n, sz); } else { _hz_mem(5, 0 - n, sz); }
+}
+
+// The line is written by its hint alone: end it.
+fn _hz_done() as i32 {
+    if (hint_textless == 1) { _hz_c(10); return 1; }
+    return 0;
+}
+
+// Each writes one instruction line. mn is the text up to the first operand
+// ("  add "); id its instruction. They are one line of text otherwise.
+
+// mn a, b
+fn i_rr(id as i32, mn as *u8, a as *u8, b as *u8) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        let is i32 as y = hint_reg(b);
+        if (x >= 0 && y >= 0) {
+            if (id == _ad.INST_MOV && x < 16 && y < 16) {
+                out_ensure(8); _hz_c(1); _hz_c(65); _hz_c(x + 32); _hz_c(y + 32);
+            } else { _hz_begin(id); _hz_reg(x); _hz_reg(y); }
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); out_cstr(a); out_str(", ", 2); out_cstr(b); out_char(10);
+}
+
+// mn a, imm
+fn i_ri(id as i32, mn as *u8, a as *u8, v as i64) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        if (x >= 0) {
+            _hz_begin(id); _hz_reg(x); _hz_c(50); _hz_var(v);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); out_cstr(a); out_str(", ", 2); out_int(v); out_char(10);
+}
+
+fn _ptr(sz as i32) as void {
+    if (sz == 8) { out_str("QWORD PTR [", 11); }
+    else if (sz == 4) { out_str("DWORD PTR [", 11); }
+    else if (sz == 2) { out_str("WORD PTR [", 10); }
+    else { out_str("BYTE PTR [", 10); }
+}
+
+// mn a, SIZE PTR [b]      (b a register, or a rip+symbol text)
+fn i_rm(id as i32, mn as *u8, a as *u8, sz as i32, b as *u8) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        let is i32 as y = hint_id(b);
+        if (x >= 0 && y >= 0) {
+            _hz_begin(id); _hz_reg(x); _hz_mem(y, 0, sz);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); out_cstr(a); out_str(", ", 2); _ptr(sz); out_cstr(b); out_str("]\n", 2);
+}
+
+// mn SIZE PTR [b], a
+fn i_mr(id as i32, mn as *u8, sz as i32, b as *u8, a as *u8) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        let is i32 as y = hint_id(b);
+        if (x >= 0 && y >= 0) {
+            _hz_begin(id); _hz_mem(y, 0, sz); _hz_reg(x);
+            if (_hz_done() == 1) { return; }
+        }
+    }
+    out_cstr(mn); _ptr(sz); out_cstr(b); out_str("], ", 3); out_cstr(a); out_char(10);
+}
+
+// mn a, SIZE PTR [frame n]
+fn i_rf(id as i32, mn as *u8, a as *u8, sz as i32, n as i64) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        if (x >= 0) {
+            if (id == _ad.INST_MOV && x < 16 && sz == 8) {
+                if (out_hint_fp(66, a, n) == 1) { return; }
+            } else {
+                _hz_begin(id); _hz_reg(x); _hz_frame(n, sz);
+                if (_hz_done() == 1) { return; }
+            }
+        }
+    }
+    out_cstr(mn); out_cstr(a); out_str(", ", 2); _ptr(sz); out_fp(n); out_str("]\n", 2);
+}
+
+// mn SIZE PTR [frame n], a
+fn i_fr(id as i32, mn as *u8, sz as i32, n as i64, a as *u8) as void {
+    if (hints_on == 1) {
+        let is i32 as x = hint_reg(a);
+        if (x >= 0) {
+            if (id == _ad.INST_MOV && x < 16 && sz == 8) {
+                if (out_hint_fp(67, a, n) == 1) { return; }
+            } else {
+                _hz_begin(id); _hz_frame(n, sz); _hz_reg(x);
+                if (_hz_done() == 1) { return; }
+            }
+        }
+    }
+    out_cstr(mn); _ptr(sz); out_fp(n); out_str("], ", 3); out_cstr(a); out_char(10);
+}
+
+// mn SIZE PTR [frame n], imm
+fn i_fi(id as i32, mn as *u8, sz as i32, n as i64, v as i64) as void {
+    if (hints_on == 1) {
+        _hz_begin(id); _hz_frame(n, sz); _hz_c(50); _hz_var(v);
+        if (_hz_done() == 1) { return; }
+    }
+    out_cstr(mn); _ptr(sz); out_fp(n); out_str("], ", 3); out_int(v); out_char(10);
+}
 
 fn out_jump(id as i32, mn as *u8, num as i64) as void {
     if (hints_on == 1 && num >= 0) {
