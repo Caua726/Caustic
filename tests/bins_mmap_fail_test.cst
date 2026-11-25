@@ -1,0 +1,68 @@
+// tests/bins_mmap_fail_test.cst — a heap whose mmaps fail is still a valid
+// object to call: construction leaves the lookup fields zeroed (no stale
+// stack values), allocation returns null, destroy does not touch a mapping
+// that was never made.
+//
+// The failure is produced for real: RLIMIT_AS is lowered below the process's
+// current address space, so the next mmap returns ENOMEM. Linux only.
+// Exit code = number of failures (0 means pass).
+use "../std/mem.cst" only bins, core as mem;
+use "../std/io.cst" as io;
+use "../std/os.cst" as os;
+
+let is i32 as fails with mut = 0;
+
+fn check_failed(b as *mem.Bins, what as *u8) as void {
+    if (b.bin_count != 0) { fails = fails + 1; io.printf("FAIL %s: bin_count=%d\n", what, b.bin_count); }
+    if (b.lookup_entries != 0) { fails = fails + 1; io.printf("FAIL %s: lookup_entries=%d\n", what, b.lookup_entries); }
+    if (cast(i64, b.lookup) != 0) { fails = fails + 1; io.printf("FAIL %s: lookup not null\n", what); }
+    if (cast(i64, b.bin_data) != 0) { fails = fails + 1; io.printf("FAIL %s: bin_data not null\n", what); }
+    let is *u8 as p = mem.bins.bins_alloc(b, 8);
+    if (cast(i64, p) != 0) { fails = fails + 1; io.printf("FAIL %s: small alloc not null\n", what); }
+    let is *u8 as q = mem.bins.bins_alloc(b, 1048576);
+    if (cast(i64, q) != 0) { fails = fails + 1; io.printf("FAIL %s: large alloc not null\n", what); }
+    mem.bins.bins_destroy(b);
+}
+
+fn main() as i32 {
+    if (os.current() != os.OS_LINUX) {
+        io.printf("bins mmap fail: skip (not Linux)\n");
+        return 0;
+    }
+    // A healthy heap first, so the failure below is not "nothing ever worked".
+    let is mem.Bins as ok = mem.bins.bins_new(65536);
+    let is *u8 as op = mem.bins.bins_alloc(&ok, 8);
+    if (cast(i64, op) == 0) { fails = fails + 1; io.printf("FAIL healthy alloc\n"); }
+    else { op[0] = 42; if (op[0] != 42) { fails = fails + 1; io.printf("FAIL healthy write\n"); } }
+    mem.bins.bins_destroy(&ok);
+
+    // Lower RLIMIT_AS until a 4 KiB mapping fails with ENOMEM. The exact
+    // address-space size of the test binary depends on the build, so halving
+    // from 1 MiB is more robust than a fixed cap. setrlimit(2) is 160 on
+    // x86_64 Linux and RLIMIT_AS is 9.
+    let is i64 as lim with mut = 1048576;
+    let is i32 as forced with mut = 0;
+    while (lim >= 65536) {
+        let is [2]i64 as rl;
+        rl[0] = lim;
+        rl[1] = lim;
+        let is i64 as rc = syscall(160, 9, cast(**i64, &rl));
+        if (rc < 0) { break; }
+        let is *u8 as probe = mem.core.mmap_anon(4096);
+        if (cast(i64, probe) < 0) { forced = 1; break; }
+        mem.core.munmap(probe, 4096);
+        lim = lim / 2;
+    }
+    if (forced == 0) {
+        io.printf("bins mmap fail: skip (could not force ENOMEM)\n");
+        return fails;
+    }
+    let is mem.Bins as bad = mem.bins.bins_new(131072);
+    check_failed(&bad, "bins_new");
+    let is [1]i64 as sizes;
+    sizes[0] = 16;
+    let is mem.Bins as bad2 = mem.bins.bins_custom(4096, cast(*i64, &sizes), 1);
+    check_failed(&bad2, "bins_custom");
+    io.printf("bins mmap fail failures=%d\n", fails);
+    return fails;
+}
