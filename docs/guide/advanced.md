@@ -225,6 +225,7 @@ fn rdtsc_low() as i64 {
 
 - **Register clobbering**: The compiler does not track which registers inline assembly uses. If you modify registers that the compiler expects to be preserved (rbx, r12-r15, rbp, rsp), your program will break.
 - **No input/output constraints**: Unlike GCC's `asm()` with constraints, Caustic simply emits the string. You must manually coordinate with the compiler's register allocation.
+- **Registers**: the compiler saves nothing for an `asm` block. Between two statements it may keep values in `rbx`, `r12`-`r15` (callee-saved: a function that writes one must restore it) and, outside calls, in `rsi`, `rdi`, `r8`-`r10`. `rax`, `rcx`, `rdx` and `r11` are free.
 - **Calling convention**: If used inside a function, be aware that the compiler may have values in any GPR or SSE register.
 - **Syntax**: Uses Intel syntax (destination first), matching the rest of Caustic's assembly output.
 
@@ -1197,3 +1198,7 @@ Both `char` and `u8` are 1 byte. Use `char` when working with text and `u8` when
 /* This is a block comment */
 /* Block comments can be /* nested */ */
 ```
+
+## Kernel code: `--no-sse`
+
+`--no-sse` (x86_64 only) compiles without xmm and ymm registers, for code that runs before SSE is enabled or where interrupts do not save them. Integer code is compiled with general registers at every level (no vectorizer; -O2 takes std/mem's word copies). Any floating point in a function that reaches the output is an error naming the function; a float function nothing calls is not. `asm` blocks are not checked. It cannot be combined with a `--cpu=` that has AVX2.

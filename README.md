@@ -27,6 +27,7 @@ fn main() as i32 {
 ```sh
 ./caustic hello.cst -o hello && ./hello                       # Linux  (ELF)
 ./caustic -O2 --cpu=x86-64-v3 hello.cst -o hello              # Assume AVX2 (default: any x86-64, SSE2 only)
+./caustic -O2 --no-sse -c kernel.cst                         # No xmm registers (kernel code)
 ./caustic --target=linux-aarch64 hello.cst -o hello-aarch64   # Linux AArch64 (static ELF64)
 ./caustic --target=windows-x86_64 hello.cst -o hello.exe      # Windows (PE32+)
 ./caustic --target=caustic-x86_64  hello.cst -o hello.cse     # Universal CSE: one binary for Linux + Windows + CausticOS

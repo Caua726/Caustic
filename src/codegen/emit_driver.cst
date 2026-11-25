@@ -1524,6 +1524,38 @@ fn _dbg_file_for(f as *d.IRFunction) as void {
     _dbg_cur_len = plen;
 }
 
+// --no-sse: refuse a function that would need an xmm register. Every float
+// value is either in an xmm-class vreg or named by the type of the load, store,
+// conversion, argument or result it goes through; vector operations exist only
+// when a pass that --no-sse turns off made them.
+fn _no_sse_check(func as *d.IRFunction) as void {
+    let is *d.IRInst as it with mut = func.instructions;
+    while (cast(i64, it) != 0) {
+        if (it.is_dead == 0) {
+            let is i32 as op = it.op;
+            let is i32 as bad with mut = 0;
+            if (it.dest.op_type == d.OP_VREG && d.vreg_class_get(func, it.dest.vreg) == d.VR_XMM) { bad = 1; }
+            if (it.src1.op_type == d.OP_VREG && d.vreg_class_get(func, it.src1.vreg) == d.VR_XMM) { bad = 1; }
+            if (it.src2.op_type == d.OP_VREG && d.vreg_class_get(func, it.src2.vreg) == d.VR_XMM) { bad = 1; }
+            if ((op >= d.IR_FADD && op <= d.IR_FNEG) || op == d.IR_FSQRT || (op >= d.IR_VZERO && op <= d.IR_VSPLATPD256)
+                || (op >= d.IR_VMULQ && op <= d.IR_VOPG)) { bad = 1; }
+            if ((op == d.IR_GET_ARG || op == d.IR_SET_ARG) && it.src2.op_type == d.OP_IMM && it.src2.imm >= 100) { bad = 1; }
+            if ((op == d.IR_LOAD || op == d.IR_STORE || op == d.IR_CAST || op == d.IR_RET || op == d.IR_CALL
+                 || op == d.IR_CALL_INDIRECT || op == d.IR_FFI_CALL || op == d.IR_SET_ARG || op == d.IR_GET_ARG)
+                && d._ty_is_float(it.cast_to) == 1) { bad = 1; }
+            if (bad == 1) {
+                io.write_str(io.STDERR, "Error: --no-sse: function '");
+                io.write_bytes(io.STDERR, func.name_ptr, cast(i64, func.name_len));
+                io.write_str(io.STDERR, "' uses floating point");
+                if (it.line > 0) { io.write_str(io.STDERR, " (line "); io.write_int(io.STDERR, cast(i64, it.line)); io.write_str(io.STDERR, ")"); }
+                io.write_str(io.STDERR, "\n");
+                io.exit(1);
+            }
+        }
+        it = it.next;
+    }
+}
+
 fn gen_func(func as *d.IRFunction) as void {
     _ir_roundtrip(func);
     d.params_canonical = 0;
@@ -1539,15 +1571,15 @@ fn gen_func(func as *d.IRFunction) as void {
         // an outer loop whose inner loop sums floats: four of its iterations
         // share one inner loop (opt_uj.cst)
         let is i32 as jcount with mut = 0;
-        while (jcount < 4 && uj.pass_unroll_jam(func) == 1) { jcount = jcount + 1; }
+        while (d.ir_no_sse == 0 && jcount < 4 && uj.pass_unroll_jam(func) == 1) { jcount = jcount + 1; }
         let is i32 as vcount with mut = 0;
-        while (vcount < 16 && vec2.pass_vectorize2(func) == 1) { vcount = vcount + 1; }
+        while (d.ir_no_sse == 0 && vcount < 16 && vec2.pass_vectorize2(func) == 1) { vcount = vcount + 1; }
         vec2.resolve_isa(func);
         let is i32 as ucount with mut = 0;
         while (ucount < 16 && unroll.pass_unroll(func) == 1) { ucount = ucount + 1; }
         // two f64 stores side by side computed as one pair (opt_slp.cst)
         let is i32 as scount with mut = 0;
-        while (scount < 64 && slp.pass_slp(func) == 1) { scount = scount + 1; }
+        while (d.ir_no_sse == 0 && scount < 64 && slp.pass_slp(func) == 1) { scount = scount + 1; }
     }
     // -O2, on what the vectorizer left scalar: an i32 index that provably
     // never wraps addresses through a pointer that steps with it; a load of an
@@ -1623,6 +1655,7 @@ fn gen_func(func as *d.IRFunction) as void {
 
     if (attempt == 1 && cast(i64, func.vreg_class) != 0) { d.opt_free(cast(*u8, func.vreg_class)); func.vreg_class = cast(*i32, 0); }
     d.infer_vreg_classes(func);
+    if (d.ir_no_sse == 1) { _no_sse_check(func); }
     if (al.al_opt_level >= 2) { e.casts_to_moves(func); }
     e.f32s_init(func);
     al.build_intervals(func, ctx);
