@@ -296,6 +296,23 @@ for f in $(find std -name '*.cst' | sort); do
 done
 ok "$nstd std modules analyse"
 
+# ─── 4c. record peephole == text peephole ──────────────────────────────────
+# The in-memory pipeline runs the peephole on the assembler's records
+# (peephole.optimize_records); CAUSTIC_TEXT_PEEPHOLE=1 runs the text pass it
+# replaced. Both must give the same bytes: the compiler itself at -O1 and -O2,
+# and the tests that exercise inline asm and every pattern's shapes.
+step "record peephole matches the text peephole"
+npe=0
+for lv in -O1 -O2; do
+    for f in src/main.cst tests/inline_asm_test.cst tests/f32_spill_cache_test.cst tests/float_abi_test.cst; do
+        "$CUR" -q $lv "$f" -o "$TMP/pe.rec" >/dev/null 2>&1 || die "$f $lv does not build"
+        CAUSTIC_TEXT_PEEPHOLE=1 "$CUR" -q $lv "$f" -o "$TMP/pe.txt" >/dev/null 2>&1 || die "$f $lv does not build with the text peephole"
+        cmp -s "$TMP/pe.rec" "$TMP/pe.txt" || die "$f $lv: record peephole output differs from the text peephole"
+        npe=$((npe+1))
+    done
+done
+ok "$npe builds byte-identical"
+
 # ─── 5. test suite ──────────────────────────────────────────────────────────
 step "test suite (tests/run_tests.cst)"
 if ! "$CUR" -q "tests/run_tests.cst" -o "$TMP/tests" >/dev/null 2>&1; then die "test runner failed to build"; fi

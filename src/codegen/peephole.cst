@@ -15,6 +15,9 @@
 
 use "../../std/io.cst" as io;
 use "../../std/mem.cst" as mem;
+use "../../caustic-assembler/parser/parsed_line.cst" as apl;
+use "../../caustic-assembler/parser/parser.cst" as apar;
+use "../../caustic-assembler/core/asm_defs.cst" as adef;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -797,4 +800,141 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
     mem.core.munmap(tbl, tbl_size);
     *out_len = out_pos;
     return out_buf;
+}
+
+// ── The same peephole over the assembler's records ──────────────────
+//
+// The compiler's in-memory pipeline no longer rewrites the assembly text: the
+// assembler parses codegen's buffer once, and this runs on the parsed records
+// (assemble_buf's line_hook) before pass1. Decisions are still the text
+// patterns above, applied to the original source lines (the records carry
+// their spans), so what is removed or rewritten is exactly what the text pass
+// does; the records only spare the work around them:
+//   - the line table comes from the spans (no scan of the buffer),
+//   - a pattern is tried only when the records show its shape (opcodes and
+//     operand kinds every match requires),
+//   - a removed line becomes LINE_EMPTY and a rewritten one is re-parsed from
+//     the replacement text into its record, so no new buffer is written and
+//     nothing is parsed twice.
+// --emit-asm still runs optimize_asm_buf (the .s must be the optimized text),
+// and CAUSTIC_TEXT_PEEPHOLE=1 forces it everywhere: the reference this path is
+// compared against.
+
+fn _rk(r as *apl.ParsedLine, which as i32) as i32 {
+    if (which == 1) { return cast(i32, r.op1_kind); }
+    return cast(i32, r.op2_kind);
+}
+
+fn _rr(r as *apl.ParsedLine, which as i32) as i32 {
+    if (which == 1) { return cast(i32, r.op1_reg_id); }
+    return cast(i32, r.op2_reg_id);
+}
+
+fn _is_memk(k as i32) as i32 { return cast(i32, k == adef.OP_MEM || k == adef.OP_RIP_LABEL); }
+
+fn optimize_records(lp as *u8, src as *u8) as void {
+    let is *apl.ParsedLines as lines = cast(*apl.ParsedLines, lp);
+    let is i32 as n = lines.count;
+    if (n <= 0) { return; }
+    let is i64 as tbl_size = cast(i64, n) * 13 + 131072 + 4096;
+    let is *u8 as tbl = mem.core.mmap_anon(tbl_size);
+    if (cast(i64, tbl) <= 0) { return; }
+    line_offs = tbl;
+    line_lens = cast(*u8, cast(i64, tbl) + cast(i64, n) * 8);
+    line_hand = cast(*u8, cast(i64, tbl) + cast(i64, n) * 12);
+    repl_buf = cast(*u8, cast(i64, tbl) + cast(i64, n) * 13);
+    repl_len = 0;
+    repl_cap = 131072;
+    stat_removed = 0;
+    stat_fused = 0;
+    line_count = n;
+    let is i32 as r with mut = 0;
+    while (r < n) {
+        set_off(r, cast(i64, apar.span_off[r]));
+        set_len(r, apar.span_len[r]);
+        line_hand[r] = cast(u8, cast(i32, apar.span_flag[r]) & apar.SPAN_HAND);
+        r = r + 1;
+    }
+
+    dedup_mov_lines(src);
+
+    let is i32 as changed with mut = 1;
+    let is i32 as pass with mut = 0;
+    while (changed == 1 && pass < 2) {
+        changed = 0;
+        let is i32 as i with mut = 0;
+        while (i < line_count - 1) {
+            if (get_len(i) >= 0 && get_len(i + 1) >= 0 && get_off(i) < REPL_MARKER && get_off(i + 1) < REPL_MARKER
+                && hand_written(i) == 0 && hand_written(i + 1) == 0) {
+                let is *apl.ParsedLine as a = apl.pl_get(lines, i);
+                if (a.kind == apl.LINE_INST) {
+                    let is i32 as id = cast(i32, a.inst_id);
+                    if (id == adef.INST_MOV) {
+                        let is i32 as movp = match_inst(src, get_off(i), get_len(i), "mov", 3);
+                        if (movp != 99999) {
+                            let is *apl.ParsedLine as b = apl.pl_get(lines, i + 1);
+                            let is i32 as binst with mut = 0 - 1;
+                            if (b.kind == apl.LINE_INST) { binst = cast(i32, b.inst_id); }
+                            let is i32 as rr = cast(i32, _rk(a, 1) == adef.OP_REG && _rk(a, 2) == adef.OP_REG);
+                            if (rr == 1 && binst == adef.INST_MOVSXD && _rk(b, 1) == adef.OP_REG && _rr(b, 1) == _rr(a, 1)) {
+                                if (try_pat1(src, i, movp) == 1) { changed = 1; }
+                            }
+                            if (get_len(i) >= 0 && rr == 1 && binst == adef.INST_MOV && _rk(b, 1) == adef.OP_REG
+                                && _rk(b, 2) == adef.OP_REG && _rr(b, 2) == _rr(a, 1)) {
+                                if (try_pat2(src, i, movp) == 1) { changed = 1; }
+                            }
+                            if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && _rk(a, 1) == adef.OP_REG
+                                && binst == adef.INST_MOV && _rk(b, 1) == adef.OP_REG && _rr(b, 1) == _rr(a, 1)) {
+                                if (try_pat3(src, i, movp) == 1) { changed = 1; }
+                            }
+                            if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && rr == 1
+                                && (binst == adef.INST_MOV || binst == adef.INST_MOVZX || binst == adef.INST_MOVSX
+                                    || binst == adef.INST_MOVSXD || binst == adef.INST_LEA)
+                                && _is_memk(_rk(b, 2)) == 1) {
+                                if (try_pat5(src, i, movp) == 1) { changed = 1; }
+                            }
+                            if (get_len(i) >= 0 && _is_memk(_rk(a, 1)) == 1 && a.op1_mem_size == 64 && _rk(a, 2) == adef.OP_REG) {
+                                if (try_pat6(src, i) == 1) { changed = 1; }
+                            }
+                        }
+                    } else if (id == adef.INST_MOVSD) {
+                        if (_is_memk(_rk(a, 1)) == 1 && a.op1_mem_size == 64 && _rk(a, 2) == adef.OP_REG) {
+                            if (match_inst(src, get_off(i), get_len(i), "movsd", 5) != 99999 && try_pat6(src, i) == 1) { changed = 1; }
+                        }
+                    } else if (id == adef.INST_JMP) {
+                        if (try_jmp_next(src, i) == 1) { changed = 1; }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+
+    // Apply: removed lines leave, rewritten ones take their new text's parse.
+    r = 0;
+    while (r < n) {
+        let is *apl.ParsedLine as x = apl.pl_get(lines, r);
+        if (get_len(r) < 0) { x.kind = apl.LINE_EMPTY; }
+        else if (get_off(r) >= REPL_MARKER) {
+            let is *u8 as t = cast(*u8, cast(i64, repl_buf) + get_off(r) - REPL_MARKER);
+            if (apar.reparse_into(lines, r, t, cast(i64, get_len(r))) == 0) {
+                io.write_str(io.STDERR, "internal error: peephole rewrote a line the assembler cannot read back\n");
+            }
+        }
+        r = r + 1;
+    }
+    // Compact: drop LINE_EMPTY (removed lines and the parser's placeholders).
+    let is i32 as w with mut = 0;
+    r = 0;
+    while (r < n) {
+        let is *apl.ParsedLine as y = apl.pl_get(lines, r);
+        if (y.kind != apl.LINE_EMPTY) {
+            if (w != r) { *apl.pl_get(lines, w) = *y; }
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    lines.count = w;
+    mem.core.munmap(tbl, tbl_size);
 }

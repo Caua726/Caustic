@@ -1260,7 +1260,8 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     let is *u8 as s_ptr = cg.capture_ptr();
     let is i64 as s_len with mut = cg.capture_len();
     let is *u8 as opt_ptr with mut = s_ptr;
-    if (g_opt_level >= 1 && tgt.target_get().arch == tgt.ARCH_X86_64) {
+    let is i32 as rec_peep = _record_peephole(g_emit_asm);
+    if (g_opt_level >= 1 && tgt.target_get().arch == tgt.ARCH_X86_64 && rec_peep == 0) {
         let is i64 as olen with mut = 0;
         opt_ptr = ph.optimize_asm_buf(s_ptr, s_len, &olen);
         s_len = olen;
@@ -1302,7 +1303,9 @@ fn compile_backend(prog as *ird.IRProgram, filename as *u8, fname_len as i32,
     // Assemble straight from the in-memory assembly (no .s read-back).
     if (prof.prof_enabled == 1) { asmmod.asm_prof_enabled = 1; }
     let is i64 as t5 = get_time_us();
+    if (rec_peep == 1) { _hook_on(); }
     let is i32 as asm_err = asmmod.assemble_buf(opt_ptr, s_len, obj_path);
+    _hook_off();
     if (cast(i64, opt_ptr) != cast(i64, s_ptr)) { mem.core.munmap(opt_ptr, s_len + 4096); }
     cg.capture_free();
     if (asm_err != 0) {
@@ -1549,6 +1552,32 @@ fn _mo_path(dir as *u8, prefix as *u8, plen as i32, suffix as *u8, suffix_len as
     return p;
 }
 
+// Whether the peephole runs on the assembler's records (ph.optimize_records,
+// through asmmod.line_hook) instead of rewriting the text: at -O1 and up on
+// x86_64 when no optimized .s is wanted on disk. CAUSTIC_TEXT_PEEPHOLE=1 keeps
+// the text pass, the reference the record pass is checked against.
+let is i32 as _text_peep_env with mut = cast(i32, 0 - 1);
+
+fn _record_peephole(emit_asm as i32) as i32 {
+    if (g_opt_level < 1 || tgt.target_get().arch != tgt.ARCH_X86_64 || emit_asm == 1) { return 0; }
+    if (_text_peep_env < 0) {
+        _text_peep_env = 0;
+        let is *u8 as tv = env.getenv("CAUSTIC_TEXT_PEEPHOLE");
+        if (cast(i64, tv) != 0 && tv[0] == 49) { _text_peep_env = 1; }
+    }
+    return cast(i32, _text_peep_env == 0);
+}
+
+fn _hook_on() as void {
+    asmmod.line_hook = fn_ptr(ph.optimize_records);
+    asmmod.parser.span_on = 1;
+}
+
+fn _hook_off() as void {
+    asmmod.line_hook = cast(*u8, 0);
+    asmmod.parser.span_on = 0;
+}
+
 fn _emit_one_obj(prog as *u8, prefix as *u8, plen as i32, dir as *u8, filename as *u8, fname_len as i32) as i32 {
     if (plen <= 0) { return 0; }
     tgt.module_prefix_set(prefix, plen);
@@ -1566,14 +1595,17 @@ fn _emit_one_obj(prog as *u8, prefix as *u8, plen as i32, dir as *u8, filename a
     let is *u8 as s_ptr = cg.capture_ptr();
     let is i64 as s_len with mut = cg.capture_len();
     let is *u8 as opt_ptr with mut = s_ptr;
-    if (g_opt_level >= 1 && tgt.target_get().arch == tgt.ARCH_X86_64) {
+    let is i32 as rec_peep = _record_peephole(0);
+    if (g_opt_level >= 1 && tgt.target_get().arch == tgt.ARCH_X86_64 && rec_peep == 0) {
         let is i64 as olen with mut = 0;
         opt_ptr = ph.optimize_asm_buf(s_ptr, s_len, &olen);
         s_len = olen;
     }
     let is i64 as cg_us = get_time_us() - t_cg;
     let is i64 as t_as = get_time_us();
+    if (rec_peep == 1) { _hook_on(); }
     let is i32 as asm_err = asmmod.assemble_buf(opt_ptr, s_len, opath);
+    _hook_off();
     if (cast(i64, opt_ptr) != cast(i64, s_ptr)) { mem.core.munmap(opt_ptr, s_len + 4096); }
     // Keep the capture buffer alive across modules: capture_begin just resets the
     // length, so the next module reuses the grown buffer instead of re-mmapping.
