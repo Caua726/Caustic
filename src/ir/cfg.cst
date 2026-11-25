@@ -1,5 +1,6 @@
 use "defs.cst" as d;
 use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
 
 // === CFG construction: basic blocks, predecessors, reverse postorder ===
 //
@@ -41,22 +42,106 @@ fn insert_before(prev as *d.IRInst, target as *d.IRInst, newinst as *d.IRInst) a
 // does to mark block starts — kept identical on purpose, since callers size
 // their block array with `count_blocks(func) + 1` and build_cfg asserts the two
 // agree rather than quietly dropping blocks.
+// Every caller does count_blocks(func), allocates, then build_cfg(func) with no
+// change to the instruction list in between (all 13 call sites were checked).
+// So count_blocks records what it walked — each block's first and last
+// instruction and each label's block — and the build_cfg that follows for the
+// same function copies that instead of walking the list a second time. The
+// record is consumed by that build_cfg, and keyed on the function and its
+// first instruction; anything else walks as before. The buffers are mmap'd,
+// not opt_alloc'd: the optimizer's pool is destroyed and rebuilt between
+// phases, and these outlive it.
+let is i64 as _sc_func with mut = 0;
+let is i64 as _sc_head with mut = 0;
+let is i32 as _sc_valid with mut = 0;
+let is i32 as _sc_n with mut = 0;
+let is i32 as _sc_cap with mut = 0;
+let is *i64 as _sc_first with mut;
+let is *i64 as _sc_last with mut;
+let is i32 as _sc_nlab with mut = 0;
+let is i32 as _sc_lcap with mut = 0;
+let is *i32 as _sc_lab with mut;     // pairs: label id, block
+
+// Room for block index `n` (0-based) in the block record; 0 when out of memory.
+fn _sc_grow_blocks(n as i32) as i32 {
+    if (n < _sc_cap) { return 1; }
+    let is i32 as nc with mut = _sc_cap * 2;
+    if (nc < 256) { nc = 256; }
+    while (nc <= n) { nc = nc * 2; }
+    let is *i64 as nf = cast(*i64, mem.core.mmap_anon(cast(i64, nc) * 16));
+    if (cast(i64, nf) <= 0) { return 0; }
+    let is *i64 as nl = cast(*i64, cast(i64, nf) + cast(i64, nc) * 8);
+    // Entries 0..n-1 are live (count_blocks is mid-walk; _sc_n is set at its end).
+    let is i32 as i with mut = 0;
+    while (i < n) { nf[i] = _sc_first[i]; nl[i] = _sc_last[i]; i = i + 1; }
+    if (_sc_cap > 0) { mem.core.munmap(cast(*u8, _sc_first), cast(i64, _sc_cap) * 16); }
+    _sc_first = nf;
+    _sc_last = nl;
+    _sc_cap = nc;
+    return 1;
+}
+
+fn _sc_grow_labels(n as i32) as i32 {
+    if (n < _sc_lcap) { return 1; }
+    let is i32 as nc with mut = _sc_lcap * 2;
+    if (nc < 256) { nc = 256; }
+    while (nc <= n) { nc = nc * 2; }
+    let is *i32 as nb = cast(*i32, mem.core.mmap_anon(cast(i64, nc) * 8));
+    if (cast(i64, nb) <= 0) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < _sc_nlab * 2) { nb[i] = _sc_lab[i]; i = i + 1; }
+    if (_sc_lcap > 0) { mem.core.munmap(cast(*u8, _sc_lab), cast(i64, _sc_lcap) * 8); }
+    _sc_lab = nb;
+    _sc_lcap = nc;
+    return 1;
+}
+
 fn count_blocks(func as *d.IRFunction) as i32 {
     // One forward pass: an instruction starts a block when it is the first,
     // when it is a label, or when the instruction before it was a branch.
     // (The old form counted instructions, allocated and zeroed a leader map,
     // marked it in a second pass and counted it in a third.)
+    _sc_valid = 0;
+    _sc_n = 0;
+    _sc_nlab = 0;
+    let is i32 as rec with mut = 1;          // 0 once a buffer could not grow
     let is i32 as n with mut = 0;
     let is i32 as first with mut = 1;
     let is i32 as prev_branch with mut = 0;
+    let is *d.IRInst as prev with mut = cast(*d.IRInst, 0);
     let is *d.IRInst as inst with mut = func.instructions;
     while (cast(i64, inst) != 0) {
         let is i32 as op = inst.op;
-        if (first == 1 || op == d.IR_LABEL || prev_branch == 1) { n = n + 1; }
+        if (first == 1 || op == d.IR_LABEL || prev_branch == 1) {
+            if (rec == 1) {
+                if (_sc_grow_blocks(n) == 0) { rec = 0; }
+                else {
+                    if (n > 0) { _sc_last[n - 1] = cast(i64, prev); }
+                    _sc_first[n] = cast(i64, inst);
+                }
+            }
+            n = n + 1;
+        }
+        if (op == d.IR_LABEL && rec == 1) {
+            if (_sc_grow_labels(_sc_nlab) == 0) { rec = 0; }
+            else {
+                _sc_lab[_sc_nlab * 2] = inst.dest.label;
+                _sc_lab[_sc_nlab * 2 + 1] = n - 1;
+                _sc_nlab = _sc_nlab + 1;
+            }
+        }
         first = 0;
         if (op == d.IR_JMP || op == d.IR_JZ || op == d.IR_JNZ || op == d.IR_RET) { prev_branch = 1; }
         else { prev_branch = 0; }
+        prev = inst;
         inst = inst.next;
+    }
+    if (rec == 1) {
+        if (n > 0) { _sc_last[n - 1] = cast(i64, prev); }
+        _sc_n = n;
+        _sc_func = cast(i64, func);
+        _sc_head = cast(i64, func.instructions);
+        _sc_valid = 1;
     }
     return n;
 }
@@ -74,6 +159,42 @@ fn build_cfg(func as *d.IRFunction, blocks as *BasicBlock, capacity as i32,
     let is i32 as first with mut = 1;
     let is i32 as prev_branch with mut = 0;
     let is *d.IRInst as inst with mut = func.instructions;
+    // The count_blocks just before this call recorded the blocks: copy them
+    // (see the note above count_blocks) and skip the walk below.
+    let is i32 as reuse with mut = 0;
+    if (_sc_valid == 1 && _sc_func == cast(i64, func) && _sc_head == cast(i64, func.instructions)
+        && _sc_n <= capacity) {
+        reuse = 1;
+    }
+    _sc_valid = 0;
+    if (reuse == 1) {
+        let is i32 as bi with mut = 0;
+        while (bi < _sc_n) {
+            let is *BasicBlock as bb = cast(*BasicBlock, cast(i64, blocks) + cast(i64, bi) * sizeof(BasicBlock));
+            bb.first = cast(*d.IRInst, _sc_first[bi]);
+            bb.last = cast(*d.IRInst, _sc_last[bi]);
+            bb.succ0 = cast(i32, 0 - 1);
+            bb.succ1 = cast(i32, 0 - 1);
+            bb.idom = cast(i32, 0 - 1);
+            bb.rpo = cast(i32, 0 - 1);
+            bb.df_start = 0;
+            bb.df_count = 0;
+            bb.pred_start = 0;
+            bb.pred_count = 0;
+            bi = bi + 1;
+        }
+        let is i32 as k with mut = 0;
+        while (k < _sc_nlab) {
+            let is i32 as lid = _sc_lab[k * 2];
+            if (lid < lc) {
+                let is *i32 as lbp = cast(*i32, cast(i64, label_to_bb) + cast(i64, lid) * 4);
+                *lbp = _sc_lab[k * 2 + 1];
+            }
+            k = k + 1;
+        }
+        cur_block = _sc_n - 1;
+        inst = cast(*d.IRInst, 0);           // skip the walk
+    }
     while (cast(i64, inst) != 0) {
         let is i32 as op = inst.op;
         if (first == 1 || op == d.IR_LABEL || prev_branch == 1) {
