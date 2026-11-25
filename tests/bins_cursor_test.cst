@@ -1,0 +1,155 @@
+// tests/bins_cursor_test.cst — slots come from a slab as they are needed.
+//
+// Slab creation used to link every slot of the region, faulting in the whole
+// mapping. Allocation now bumps a cursor while the freed list is empty and
+// uses the freed list after that. The checks below prove the two paths agree:
+// every slot is distinct and writable, exhausting a slab grows to a second
+// one, and freeing then allocating reuses slots without corrupting the live
+// objects.
+// Exit code = number of failures (0 means pass).
+use "../std/mem.cst" only bins as mem;
+use "../std/io.cst" as io;
+
+let is i32 as fails with mut = 0;
+
+fn distinct(ps as **u8, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is i32 as j with mut = i + 1;
+        while (j < n) {
+            if (ps[i] == ps[j]) { return 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// A 4096-byte slab of the 16-byte class holds 170 slots of 24 bytes.
+fn exact_slab() as void {
+    let is [1]i64 as sizes;
+    sizes[0] = 16;
+    let is mem.Bins as b = mem.bins.bins_custom(4096, cast(*i64, &sizes), 1);
+    let is [170]*u8 as ps;
+    let is i32 as i with mut = 0;
+    while (i < 170) {
+        let is *u8 as p = mem.bins.bins_alloc(&b, 16);
+        if (cast(i64, p) == 0) {
+            fails = fails + 1;
+            io.printf("FAIL alloc 16 #%d\n", cast(i64, i));
+        } else {
+            p[0] = cast(u8, i);
+            p[15] = cast(u8, i + 1);
+        }
+        ps[i] = p;
+        i = i + 1;
+    }
+    if (distinct(cast(**u8, &ps), 170) != 1) {
+        fails = fails + 1;
+        io.printf("FAIL duplicate slot in first slab\n");
+    }
+    i = 0;
+    while (i < 170) {
+        if (cast(i64, ps[i]) != 0 && (ps[i][0] != cast(u8, i) || ps[i][15] != cast(u8, i + 1))) {
+            fails = fails + 1;
+            io.printf("FAIL slot %d lost its bytes\n", cast(i64, i));
+        }
+        i = i + 1;
+    }
+    // Exhausting the slab must grow to a second one, not hand out slot 169
+    // twice.
+    let is *u8 as extra = mem.bins.bins_alloc(&b, 16);
+    if (cast(i64, extra) == 0) {
+        fails = fails + 1;
+        io.printf("FAIL second slab alloc\n");
+    } else {
+        extra[0] = 222;
+        if (extra[0] != 222) { fails = fails + 1; io.printf("FAIL second slab write\n"); }
+    }
+    // Free every other slot, then allocate that many again. The live objects
+    // must keep their bytes and the new ones must be distinct from them.
+    i = 0;
+    while (i < 170) {
+        if ((i & 1) == 0) { mem.bins.bins_free(&b, ps[i]); ps[i] = cast(*u8, 0); }
+        i = i + 1;
+    }
+    let is [85]*u8 as again;
+    i = 0;
+    while (i < 85) {
+        let is *u8 as p = mem.bins.bins_alloc(&b, 16);
+        if (cast(i64, p) == 0) {
+            fails = fails + 1;
+            io.printf("FAIL reuse alloc #%d\n", cast(i64, i));
+        } else {
+            p[0] = cast(u8, 77);
+        }
+        again[i] = p;
+        i = i + 1;
+    }
+    if (distinct(cast(**u8, &again), 85) != 1) { fails = fails + 1; io.printf("FAIL duplicate reused slot\n"); }
+    i = 0;
+    while (i < 85) {
+        if (cast(i64, again[i]) != 0 && again[i][0] != 77) {
+            fails = fails + 1;
+            io.printf("FAIL reused slot %d not writable\n", cast(i64, i));
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while (i < 170) {
+        if (ps[i][0] != cast(u8, i)) {
+            fails = fails + 1;
+            io.printf("FAIL live slot %d corrupted\n", cast(i64, i));
+        }
+        i = i + 2;
+    }
+    i = 0;
+    while (i < 85) { mem.bins.bins_free(&b, again[i]); i = i + 1; }
+    mem.bins.bins_destroy(&b);
+}
+
+fn many_default() as void {
+    let is mem.Bins as b = mem.bins.bins_new(65536);
+    let is [3000]*u8 as ps;
+    let is i32 as i with mut = 0;
+    while (i < 3000) {
+        let is *u8 as p with mut = mem.bins.bins_alloc(&b, 8);
+        if (cast(i64, p) == 0) {
+            fails = fails + 1;
+            io.printf("FAIL default alloc #%d\n", cast(i64, i));
+            p = cast(*u8, 0);
+        } else {
+            p[0] = cast(u8, i & 255);
+            p[7] = cast(u8, (i + 3) & 255);
+        }
+        ps[i] = p;
+        i = i + 1;
+    }
+    if (distinct(cast(**u8, &ps), 3000) != 1) { fails = fails + 1; io.printf("FAIL default duplicate\n"); }
+    i = 0;
+    while (i < 3000) {
+        if (cast(i64, ps[i]) != 0 && (ps[i][0] != cast(u8, i & 255) || ps[i][7] != cast(u8, (i + 3) & 255))) {
+            fails = fails + 1;
+            io.printf("FAIL default slot %d bytes\n", cast(i64, i));
+        }
+        i = i + 3;
+    }
+    i = 0;
+    while (i < 3000) { mem.bins.bins_free(&b, ps[i]); i = i + 1; }
+    // Everything freed; one more round still works.
+    i = 0;
+    while (i < 3000) {
+        let is *u8 as p = mem.bins.bins_alloc(&b, 8);
+        if (cast(i64, p) == 0) { fails = fails + 1; io.printf("FAIL refill #%d\n", cast(i64, i)); }
+        else { p[0] = 5; }
+        i = i + 1;
+    }
+    mem.bins.bins_destroy(&b);
+}
+
+fn main() as i32 {
+    exact_slab();
+    many_default();
+    io.printf("bins cursor failures=%d\n", fails);
+    return fails;
+}
