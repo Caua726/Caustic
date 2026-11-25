@@ -1,9 +1,10 @@
 use "defs.cst" as d;
 use "cfg.cst" as cfg;
+use "../../std/mem.cst" as mem;
 
 // === Dominance: immediate dominators and dominance frontiers ===
 
-fn compute_idom(blocks as *cfg.BasicBlock, nblocks as i32, rpo_order as *i32, rpo_count as i32,
+fn _compute_idom_run(blocks as *cfg.BasicBlock, nblocks as i32, rpo_order as *i32, rpo_count as i32,
                 preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
     // Cooper-Harvey-Kennedy iterative dominance
     let is *cfg.BasicBlock as entry = cast(*cfg.BasicBlock, cast(i64, blocks));
@@ -147,4 +148,95 @@ fn compute_df(blocks as *cfg.BasicBlock, nblocks as i32,
     }
 
     d.opt_munmap(cast(*u8, df_tmp), df_tmp_size);
+}
+
+
+// === Memo of the last compute_idom ===
+// The result is a pure function of what the algorithm reads: rpo_count and
+// rpo_order, every block's pred_start/pred_count/rpo and starting idom, and
+// the predecessor lists. The key below is all of that, compared in full, so a
+// hit returns exactly what a run would compute: there is nothing to invalidate.
+let is i64 as _im_cap with mut = 0;
+let is *i32 as _im with mut;          // key words, then the nblocks results
+let is i32 as _im_len with mut = 0;   // key length in words (0 = empty)
+let is i32 as _im_nb with mut = 0;
+
+fn _im_key_len(nblocks as i32, rpo_count as i32, preds_total as i32) as i32 {
+    return 3 + rpo_count + nblocks * 4 + preds_total;
+}
+
+fn compute_idom(blocks as *cfg.BasicBlock, nblocks as i32, rpo_order as *i32, rpo_count as i32,
+                preds as *i32, pred_starts as *i32, pred_counts as *i32) as void {
+    // Every predecessor slot the run can read.
+    let is i32 as ptot with mut = 0;
+    let is i32 as b with mut = 0;
+    while (b < nblocks) {
+        let is i32 as e = pred_starts[b] + pred_counts[b];
+        if (e > ptot) { ptot = e; }
+        b = b + 1;
+    }
+    let is i32 as klen = _im_key_len(nblocks, rpo_count, ptot);
+    let is i64 as need = cast(i64, klen + nblocks) * 4;
+    // Compare with the stored call.
+    if (_im_len == klen && _im_nb == nblocks) {
+        let is i32 as same with mut = 1;
+        let is i32 as k with mut = 0;
+        if (_im[0] != nblocks || _im[1] != rpo_count || _im[2] != ptot) { same = 0; }
+        k = 3;
+        let is i32 as i with mut = 0;
+        while (same == 1 && i < rpo_count) { if (_im[k] != rpo_order[i]) { same = 0; } k = k + 1; i = i + 1; }
+        i = 0;
+        while (same == 1 && i < nblocks) {
+            let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, i) * sizeof(cfg.BasicBlock));
+            if (_im[k] != pred_starts[i] || _im[k + 1] != pred_counts[i] || _im[k + 2] != bb.rpo || _im[k + 3] != bb.idom) { same = 0; }
+            k = k + 4; i = i + 1;
+        }
+        i = 0;
+        while (same == 1 && i < ptot) { if (_im[k] != preds[i]) { same = 0; } k = k + 1; i = i + 1; }
+        if (same == 1) {
+            i = 0;
+            while (i < nblocks) {
+                let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, i) * sizeof(cfg.BasicBlock));
+                bb.idom = _im[klen + i];
+                i = i + 1;
+            }
+            return;
+        }
+    }
+    // Record the key (before the run changes the starting idoms), run, store.
+    if (need > _im_cap) {
+        let is i64 as nc with mut = _im_cap * 2;
+        if (nc < 65536) { nc = 65536; }
+        while (nc < need) { nc = nc * 2; }
+        let is *i32 as nb = cast(*i32, mem.core.mmap_anon(nc));
+        if (cast(i64, nb) <= 0) {
+            _im_len = 0;
+            _compute_idom_run(blocks, nblocks, rpo_order, rpo_count, preds, pred_starts, pred_counts);
+            return;
+        }
+        if (_im_cap > 0) { mem.core.munmap(cast(*u8, _im), _im_cap); }
+        _im = nb;
+        _im_cap = nc;
+    }
+    _im[0] = nblocks; _im[1] = rpo_count; _im[2] = ptot;
+    let is i32 as k with mut = 3;
+    let is i32 as i with mut = 0;
+    while (i < rpo_count) { _im[k] = rpo_order[i]; k = k + 1; i = i + 1; }
+    i = 0;
+    while (i < nblocks) {
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, i) * sizeof(cfg.BasicBlock));
+        _im[k] = pred_starts[i]; _im[k + 1] = pred_counts[i]; _im[k + 2] = bb.rpo; _im[k + 3] = bb.idom;
+        k = k + 4; i = i + 1;
+    }
+    i = 0;
+    while (i < ptot) { _im[k] = preds[i]; k = k + 1; i = i + 1; }
+    _compute_idom_run(blocks, nblocks, rpo_order, rpo_count, preds, pred_starts, pred_counts);
+    i = 0;
+    while (i < nblocks) {
+        let is *cfg.BasicBlock as bb = cast(*cfg.BasicBlock, cast(i64, blocks) + cast(i64, i) * sizeof(cfg.BasicBlock));
+        _im[klen + i] = bb.idom;
+        i = i + 1;
+    }
+    _im_len = klen;
+    _im_nb = nblocks;
 }
