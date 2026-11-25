@@ -249,49 +249,71 @@ fn build_intervals(func as *d.IRFunction, ctx as *AllocCtx) as void {
     d.opt_free(cast(*u8, label_pos));   // local scratch — last used in the scan above
 }
 
+// Bottom-up merge sort: same comparator and same stable merge as the old
+// recursive split, without 2*log2(n) levels of calls and the temp->arr copy
+// after every level. Passes alternate between arr and tmp, so only an odd
+// number of passes needs the final copy.
 fn merge_sort(arr as *LiveInterval, tmp as *LiveInterval, lo as i32, hi as i32) as void {
-    if (lo >= hi) { return; }
-    let is i32 as mid = lo + (hi - lo) / 2;
-    merge_sort(arr, tmp, lo, mid);
-    merge_sort(arr, tmp, mid + 1, hi);
-    let is i32 as i with mut = lo;
-    let is i32 as j with mut = mid + 1;
-    let is i32 as k with mut = lo;
-    while (i <= mid && j <= hi) {
-        let is *LiveInterval as a = cast(*LiveInterval, cast(i64, arr) + cast(i64, i) * sizeof(LiveInterval));
-        let is *LiveInterval as b = cast(*LiveInterval, cast(i64, arr) + cast(i64, j) * sizeof(LiveInterval));
-        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, tmp) + cast(i64, k) * sizeof(LiveInterval));
-        // A struct assignment lowers to inline moves (IR_COPY of 32 bytes);
-        // a memcpy call per element was the merge sort's dominant cost.
-        if (a.start < b.start || (a.start == b.start && a.end_pos <= b.end_pos)) {
-            *dst = *a;
-            i = i + 1;
-        } else {
-            *dst = *b;
-            j = j + 1;
+    let is i32 as n = hi - lo + 1;
+    if (n <= 1) { return; }
+    let is *LiveInterval as src with mut = arr;
+    let is *LiveInterval as dst with mut = tmp;
+    let is i32 as width with mut = 1;
+    let is i32 as passes with mut = 0;
+    while (width < n) {
+        let is i32 as base with mut = 0;
+        while (base < n) {
+            let is i32 as mid with mut = base + width;
+            if (mid > n) { mid = n; }
+            let is i32 as end with mut = base + width * 2;
+            if (end > n) { end = n; }
+            let is i32 as i with mut = base;
+            let is i32 as j with mut = mid;
+            let is i32 as k with mut = base;
+            while (i < mid && j < end) {
+                let is *LiveInterval as a = cast(*LiveInterval, cast(i64, src) + cast(i64, lo + i) * sizeof(LiveInterval));
+                let is *LiveInterval as b = cast(*LiveInterval, cast(i64, src) + cast(i64, lo + j) * sizeof(LiveInterval));
+                let is *LiveInterval as out = cast(*LiveInterval, cast(i64, dst) + cast(i64, lo + k) * sizeof(LiveInterval));
+                // Stable: on equal (start, end) the left run wins, as before.
+                if (a.start < b.start || (a.start == b.start && a.end_pos <= b.end_pos)) {
+                    *out = *a;
+                    i = i + 1;
+                } else {
+                    *out = *b;
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+            while (i < mid) {
+                let is *LiveInterval as a = cast(*LiveInterval, cast(i64, src) + cast(i64, lo + i) * sizeof(LiveInterval));
+                let is *LiveInterval as out = cast(*LiveInterval, cast(i64, dst) + cast(i64, lo + k) * sizeof(LiveInterval));
+                *out = *a;
+                i = i + 1;
+                k = k + 1;
+            }
+            while (j < end) {
+                let is *LiveInterval as b = cast(*LiveInterval, cast(i64, src) + cast(i64, lo + j) * sizeof(LiveInterval));
+                let is *LiveInterval as out = cast(*LiveInterval, cast(i64, dst) + cast(i64, lo + k) * sizeof(LiveInterval));
+                *out = *b;
+                j = j + 1;
+                k = k + 1;
+            }
+            base = end;
         }
-        k = k + 1;
+        let is *LiveInterval as t = src;
+        src = dst;
+        dst = t;
+        passes = passes + 1;
+        width = width * 2;
     }
-    while (i <= mid) {
-        let is *LiveInterval as src = cast(*LiveInterval, cast(i64, arr) + cast(i64, i) * sizeof(LiveInterval));
-        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, tmp) + cast(i64, k) * sizeof(LiveInterval));
-        *dst = *src;
-        i = i + 1;
-        k = k + 1;
-    }
-    while (j <= hi) {
-        let is *LiveInterval as src = cast(*LiveInterval, cast(i64, arr) + cast(i64, j) * sizeof(LiveInterval));
-        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, tmp) + cast(i64, k) * sizeof(LiveInterval));
-        *dst = *src;
-        j = j + 1;
-        k = k + 1;
-    }
-    i = lo;
-    while (i <= hi) {
-        let is *LiveInterval as src = cast(*LiveInterval, cast(i64, tmp) + cast(i64, i) * sizeof(LiveInterval));
-        let is *LiveInterval as dst = cast(*LiveInterval, cast(i64, arr) + cast(i64, i) * sizeof(LiveInterval));
-        *dst = *src;
-        i = i + 1;
+    if ((passes & 1) == 1) {
+        let is i32 as i with mut = 0;
+        while (i < n) {
+            let is *LiveInterval as from = cast(*LiveInterval, cast(i64, src) + cast(i64, lo + i) * sizeof(LiveInterval));
+            let is *LiveInterval as to = cast(*LiveInterval, cast(i64, arr) + cast(i64, lo + i) * sizeof(LiveInterval));
+            *to = *from;
+            i = i + 1;
+        }
     }
 }
 
