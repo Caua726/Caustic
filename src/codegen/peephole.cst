@@ -194,14 +194,12 @@ let is i64 as REPL_MARKER with imut = 1000000000;
 
 // ── Pattern 1: MOV + movsxd fusion ──────────────────────────────────
 
-fn try_pat1(buf as *u8, i as i32) as i32 {
+fn try_pat1(buf as *u8, i as i32, p1 as i32) as i32 {
     let is i64 as off1 = get_off(i);
     let is i32 as len1 = get_len(i);
     let is i64 as off2 = get_off(i + 1);
     let is i32 as len2 = get_len(i + 1);
 
-    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
-    if (p1 == 99999) { return 0; }
     let is i32 as a1l with mut = 0;
     let is *u8 as a1 = get_operand(buf, off1, p1, len1, &a1l);
     if (is_reg64(a1, a1l) == 0) { return 0; }
@@ -250,15 +248,14 @@ fn try_pat1(buf as *u8, i as i32) as i32 {
 
 // ── Pattern 2: MOV chain bypass ──────────────────────────────────────
 
-fn try_pat2(buf as *u8, i as i32) as i32 {
+fn try_pat2(buf as *u8, i as i32, p1 as i32) as i32 {
     let is i64 as off1 = get_off(i);
     let is i32 as len1 = get_len(i);
     let is i64 as off2 = get_off(i + 1);
     let is i32 as len2 = get_len(i + 1);
 
-    // Line i: mov rA, rB (both reg64)
-    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
-    if (p1 == 99999) { return 0; }
+    // Line i: mov rA, rB (both reg64); p1 is its parsed operand start.
+
     let is i32 as a1l with mut = 0;
     let is *u8 as a1 = get_operand(buf, off1, p1, len1, &a1l);
     if (is_reg64(a1, a1l) == 0) { return 0; }
@@ -315,14 +312,12 @@ fn try_pat2(buf as *u8, i as i32) as i32 {
 
 // ── Pattern 3: Dead MOV elimination ──────────────────────────────────
 
-fn try_pat3(buf as *u8, i as i32) as i32 {
+fn try_pat3(buf as *u8, i as i32, p1 as i32) as i32 {
     let is i64 as off1 = get_off(i);
     let is i32 as len1 = get_len(i);
     let is i64 as off2 = get_off(i + 1);
     let is i32 as len2 = get_len(i + 1);
 
-    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
-    if (p1 == 99999) { return 0; }
     let is i32 as p2 = match_inst(buf, off2, len2, "mov", 3);
     if (p2 == 99999) { return 0; }
 
@@ -378,14 +373,12 @@ fn _ph_find_reg(s as *u8, slen as i32, reg as *u8, rlen as i32, from as i32) as 
     return 0 - 1;
 }
 
-fn try_pat5(buf as *u8, i as i32) as i32 {
+fn try_pat5(buf as *u8, i as i32, p1 as i32) as i32 {
     let is i64 as off1 = get_off(i);
     let is i32 as len1 = get_len(i);
     let is i64 as off2 = get_off(i + 1);
     let is i32 as len2 = get_len(i + 1);
 
-    let is i32 as p1 = match_inst(buf, off1, len1, "mov", 3);
-    if (p1 == 99999) { return 0; }
     let is i32 as al with mut = 0;
     let is *u8 as a = get_operand(buf, off1, p1, len1, &al);
     if (is_reg64(a, al) == 0) { return 0; }
@@ -672,11 +665,20 @@ fn optimize_asm_buf(buf as *u8, size as i64, out_len as *i64) as *u8 {
                 let is i32 as pf_len = get_len(i);
                 let is i32 as pf_ws = skip_ws(buf, pf_off, pf_len);
                 if (pf_ws < pf_len && buf[pf_off + cast(i64, pf_ws)] == 109) {
-                    if (try_pat1(buf, i) == 1) { changed = 1; }
-                    if (get_len(i) >= 0 && try_pat2(buf, i) == 1) { changed = 1; }
-                    if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat3(buf, i) == 1) { changed = 1; }
-                    if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat5(buf, i) == 1) { changed = 1; }
-                    if (get_len(i) >= 0 && try_pat6(buf, i) == 1) { changed = 1; }
+                    // Parse line i's mnemonic once and dispatch. Trying the
+                    // five `mov` patterns on every `m*` line (movzx, movsx,
+                    // movsxd, mul, ...) only ever failed their first check.
+                    let is i32 as movp = match_inst(buf, pf_off, pf_len, "mov", 3);
+                    if (movp != 99999) {
+                        if (try_pat1(buf, i, movp) == 1) { changed = 1; }
+                        if (get_len(i) >= 0 && try_pat2(buf, i, movp) == 1) { changed = 1; }
+                        if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat3(buf, i, movp) == 1) { changed = 1; }
+                        if (get_len(i) >= 0 && get_off(i + 1) < REPL_MARKER && try_pat5(buf, i, movp) == 1) { changed = 1; }
+                        if (get_len(i) >= 0 && try_pat6(buf, i) == 1) { changed = 1; }
+                    } else if (match_inst(buf, pf_off, pf_len, "movsd", 5) != 99999) {
+                        // Only pattern 6 handles a `movsd` first line.
+                        if (try_pat6(buf, i) == 1) { changed = 1; }
+                    }
                 } else if (pf_ws < pf_len && buf[pf_off + cast(i64, pf_ws)] == 106) {
                     // 'j' — unconditional jump-to-next removal
                     if (try_jmp_next(buf, i) == 1) { changed = 1; }
