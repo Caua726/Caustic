@@ -206,6 +206,57 @@ fn _eh_sweep(name as *u8) as void {
     _check(name, cast(i32, crossed >= 2));
 }
 
+// A kernel links at a high-half --base, where every address is negative as an
+// i64. The linker once compared its "no unwind tables" sentinel 0 against
+// those addresses by order, decided the R+W segment had to move past it, and
+// mapped R+W at vaddr 0: the CausticOS kernel stopped booting with no output.
+fn _ld_le64(b as *u8, off as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 7;
+    while (k >= 0) { v = (v << 8) | cast(i64, b[off + k]); k = k - 1; }
+    return v;
+}
+
+fn _ld_highbase(name as *u8) as void {
+    let is [7]i64 as c;
+    c[0] = cast(i64, "./caustic"); c[1] = cast(i64, "-q"); c[2] = cast(i64, "-c"); c[3] = cast(i64, "tests/ld_highbase.cst");
+    c[4] = cast(i64, "-o"); c[5] = cast(i64, "build/ct_highbase.o"); c[6] = 0;
+    if (_run("./caustic", cast(*u8, &c)) != 0) { _check(name, 0); return; }
+    let is [8]i64 as l;
+    l[0] = cast(i64, "./caustic-ld"); l[1] = cast(i64, "build/ct_highbase.o"); l[2] = cast(i64, "--freestanding");
+    l[3] = cast(i64, "--entry=_kernel_start"); l[4] = cast(i64, "--base=0xFFFFFFFF80000000");
+    l[5] = cast(i64, "-o"); l[6] = cast(i64, "build/ct_highbase"); l[7] = 0;
+    if (_run("./caustic-ld", cast(*u8, &l)) != 0) { _check(name, 0); return; }
+    let is io.string.String as path with mut;
+    path.ptr = "build/ct_highbase"; path.len = 17; path.cap = 0;
+    let is io.string.String as img = io.read_file(path);
+    let is *u8 as b = img.ptr;
+    if (img.len < 64) { _check(name, 0); return; }
+    let is i64 as base = cast(i64, 0) - cast(i64, 2147483648);   // 0xFFFFFFFF80000000
+    let is i64 as phoff = _ld_le64(b, 32);
+    let is i64 as phn = cast(i64, b[56]) | (cast(i64, b[57]) << 8);
+    let is i64 as rx_end with mut = 0;
+    let is i64 as rw_start with mut = 0;
+    let is i32 as ok with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < phn) {
+        let is i64 as ph = phoff + i * 56;
+        let is i64 as ty = cast(i64, b[ph]);
+        let is i64 as fl = cast(i64, b[ph + 4]);
+        let is i64 as va = _ld_le64(b, ph + 16);
+        let is i64 as msz = _ld_le64(b, ph + 40);
+        if (ty == 1) {
+            // At or above the base means: negative (high half) and >= base.
+            if (va >= 0 || va < base) { ok = 0; }
+            if ((fl & 1) == 1) { rx_end = va + msz; }
+            else if ((fl & 2) == 2) { rw_start = va; }
+        }
+        i = i + 1;
+    }
+    if (rx_end == 0 || rw_start == 0 || rw_start < rx_end) { ok = 0; }
+    _check(name, ok);
+}
+
 // Compile `src`, run it, and require the EXACT program exit code `want`.
 //
 // Some behaviour cannot be observed from inside the program under test — an
@@ -383,6 +434,7 @@ fn main(argc as i64, argv as i64) as i32 {
     _unit_exit("backtrace walks the whole chain", "tests/exceptions/backtrace.cst", 0);
     _unit_o2("backtrace at -O2 unwinds frames without rbp", "tests/exceptions/backtrace_o2.cst");
     _eh_sweep("eh_frame_hdr across a page stays mapped");
+    _ld_highbase("freestanding link at a high-half --base keeps R+W above it");
 
     // --- Sources that must be REFUSED (each with its accepted twin) ---
     _p("\n--- Rejected ---\n");
