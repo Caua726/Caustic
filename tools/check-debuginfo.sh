@@ -183,7 +183,10 @@ if have llvm-pdbutil; then
     if have python3 && have llvm-symbolizer && have llvm-objdump; then
         ( mkdir -p "$TMP/pl" && cd "$TMP/pl" && python3 "$ROOT/tests/pdb/gen.py"
           for o in -O0 -O1 -O2; do
-              "$CC" -q -g $o --target=windows-x86_64 b.cst -o l.exe && python3 "$ROOT/tests/pdb/check.py" l.exe l.pdb consts.json || exit 1
+              for g in -g ""; do
+                  rm -f l.exe l.pdb
+                  "$CC" -q $g $o --target=windows-x86_64 b.cst -o l.exe && python3 "$ROOT/tests/pdb/check.py" l.exe l.pdb consts.json || exit 1
+              done
               "$CC" -q -g $o -c --target=windows-x86_64 b.cst -o b.obj && "$ROOT/caustic-ld" --target=windows-x86_64 b.obj -o c.exe >/dev/null \
                   && python3 "$ROOT/tests/pdb/check.py" c.exe c.pdb consts.json || exit 1
           done ) > "$TMP/pl.out" 2>&1 && ok "PDB lines: every constant on its own file and line (-O0/-O1/-O2, -o and -c)" \

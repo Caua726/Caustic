@@ -29,7 +29,7 @@ for (a, f, want), s in zip(ins, sym):
     off = a - base - va[0]; got = None
     for seg, lo, hi, fl, es in tab:
         c = [e for e in es if e[0] <= off]
-        if seg == 1 and lo <= off < hi and c: got = (fl, max(c)[1])
+        if seg == 1 and lo <= off < hi and c: got = (fl, max(c, key=lambda e: e[0])[1])
     if not got or got[1] != want or not got[0].endswith(f + '.cst'):
         bad += 1; print('FAIL %x: want %s.cst:%d, line table %s' % (a, f, want, got))
     fl = s.split('\n')[-1]

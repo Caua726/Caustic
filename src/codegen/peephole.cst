@@ -13,6 +13,7 @@
 // Inline asm (between the #APP / #NO_APP lines codegen brackets it with) is
 // never touched: only pairs of generated lines are candidates.
 
+use "target.cst" as tgt;
 use "asm_print.cst" as aprint;
 use "../../std/env.cst" as _pchk_env;
 use "../../std/io.cst" as io;
@@ -1079,13 +1080,49 @@ fn _reload_next(lines as *apl.ParsedLines, i as i32) as i32 {
     return 0;
 }
 
+fn _is_row(x as *apl.ParsedLine) as i32 {
+    return cast(i32, x.kind == apl.LINE_DIRECTIVE
+        && (cast(i32, x.dir_kind) == apl.DIR_LOC || cast(i32, x.dir_kind) == apl.DIR_FILE));
+}
+
 fn optimize_records(lp as *u8, src as *u8) as void {
     let is *apl.ParsedLines as lines = cast(*apl.ParsedLines, lp);
-    let is i32 as n = lines.count;
+    let is i32 as n with mut = lines.count;
     if (n <= 0) { return; }
-    let is i64 as tbl_size = cast(i64, n) * 14 + 131072 + 4096;
+    // Line rows (.loc, .file) step aside for the patterns, which match adjacent
+    // lines, and come back ahead of the line they preceded: without -g, asking
+    // for them does not change the code. (-g keeps its statements apart.)
+    let is i32 as nrow with mut = 0;
+    if (tgt.debug_get() == 0 && tgt.lines_wanted() == 1) {
+        let is i32 as q with mut = 0;
+        while (q < n) { nrow = nrow + _is_row(apl.pl_get(lines, q)); q = q + 1; }
+    }
+    let is i64 as rows_off = cast(i64, n) * 14 + 131072 + 4096;
+    let is i64 as tbl_size = rows_off + cast(i64, nrow) * (sizeof(apl.ParsedLine) + 4);
     let is *u8 as tbl = mem.core.mmap_anon(tbl_size);
     if (cast(i64, tbl) <= 0) { return; }
+    let is *apl.ParsedLine as rows = cast(*apl.ParsedLine, cast(i64, tbl) + rows_off);
+    let is *i32 as row_at = cast(*i32, cast(i64, rows) + cast(i64, nrow) * sizeof(apl.ParsedLine));
+    if (nrow > 0) {
+        let is i32 as q with mut = 0;
+        let is i32 as kept with mut = 0;
+        let is i32 as taken with mut = 0;
+        while (q < n) {
+            let is *apl.ParsedLine as x = apl.pl_get(lines, q);
+            if (_is_row(x) == 1) { rows[taken] = *x; row_at[taken] = kept; taken = taken + 1; }
+            else {
+                if (kept != q) {
+                    *apl.pl_get(lines, kept) = *x;
+                    apar.span_off[kept] = apar.span_off[q];
+                    apar.span_len[kept] = apar.span_len[q];
+                    apar.span_flag[kept] = apar.span_flag[q];
+                }
+                kept = kept + 1;
+            }
+            q = q + 1;
+        }
+        n = kept;
+    }
     line_offs = tbl;
     line_lens = cast(*u8, cast(i64, tbl) + cast(i64, n) * 8);
     line_hand = cast(*u8, cast(i64, tbl) + cast(i64, n) * 12);
@@ -1201,8 +1238,10 @@ fn optimize_records(lp as *u8, src as *u8) as void {
     }
     // Compact: drop LINE_EMPTY (removed lines and the parser's placeholders).
     let is i32 as w with mut = 0;
+    let is i32 as t with mut = 0;
     r = 0;
     while (r < n) {
+        while (t < nrow && row_at[t] <= r) { row_at[t] = w; t = t + 1; }
         let is *apl.ParsedLine as y = apl.pl_get(lines, r);
         if (y.kind != apl.LINE_EMPTY) {
             if (w != r) { *apl.pl_get(lines, w) = *y; }
@@ -1210,6 +1249,13 @@ fn optimize_records(lp as *u8, src as *u8) as void {
         }
         r = r + 1;
     }
-    lines.count = w;
+    while (t < nrow) { row_at[t] = w; t = t + 1; }
+    lines.count = w + nrow;
+    // Merge the rows back, from the end.
+    while (t > 0) {
+        while (w > row_at[t - 1]) { w = w - 1; *apl.pl_get(lines, w + t) = *apl.pl_get(lines, w); }
+        t = t - 1;
+        *apl.pl_get(lines, w + t) = rows[t];
+    }
     mem.core.munmap(tbl, tbl_size);
 }
