@@ -6,6 +6,26 @@ release; full notes for recent versions live under [`docs/releases/`](docs/relea
 
 Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 
+## Unreleased
+
+### Added
+- **Interface files carry function bodies.** `caustic-mk build --incremental` copies a
+  small function into its callers in other modules, as a whole-program build does. A
+  `.csti` names the compiler, the flags and target, the source it came from and every
+  interface it was made against; one that no longer holds, or is truncated or damaged,
+  is not read, and the module is compiled from source.
+- **`.weak` in `caustic-as`, weak symbols in `caustic-ld`.** Each object of an
+  incremental build holds the generic instances it uses; the linker keeps one.
+
+### Fixed
+- **`--incremental` kept objects built against an older dependency.** A struct's layout,
+  a constant or a signature could change and the modules using it were not rebuilt. An
+  object is now good only while the interfaces it was built against are the current ones.
+- **`--incremental`: rebuilding a generic's module alone failed to link** when another
+  module instantiated it.
+- **`--module-only` crashed at `-O2`** on a call to a function of another module.
+- **A binary `.csti` beside a source was read as interface text.**
+
 ## [v0.1.12](https://github.com/Caua726/Caustic/releases/tag/v0.1.12) — 2026-11-22
 
 ### Changed

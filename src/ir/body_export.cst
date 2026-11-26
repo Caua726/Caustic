@@ -1,0 +1,114 @@
+// body_export.cst: the function bodies a module's interface file carries.
+//
+// A small function's IR, as gen_program.cst first builds it and before any pass,
+// so a module that imports it can copy it into its own code, as a build of the
+// whole program does. What an importer takes is added to its program as a
+// function of another module: read by the inliner, never emitted.
+use "defs.cst" as d;
+use "body_ser.cst" as ser;
+use "../../std/mem.cst" only core as mem;
+
+let is i32 as MAX_INSTS with imut = 160;   // before any pass
+
+// Whose functions are being generated: the module's root node. `sole`, when
+// not 0, is the one module wanted (--module-only).
+let is i32 as wanted with mut = 0;
+let is i64 as owner with mut = 0;
+let is i64 as sole with mut = 0;
+
+let is *u8 as _buf with mut = cast(*u8, 0);      // i64 owner, i64 bytes, then a body record
+let is i64 as _len with mut = 0;
+let is i64 as _cap with mut = 0;
+
+fn _room(n as i64) as void {
+    if (_len + n <= _cap) { return; }
+    let is i64 as nc = (_len + n) * 2 + 65536;
+    let is *u8 as nb = mem.core.mmap_anon(nc);
+    if (_len > 0) { mem.core.memcpy(nb, _buf, _len); }
+    if (_cap > 0) { mem.core.munmap(_buf, _cap); }
+    _buf = nb;
+    _cap = nc;
+}
+
+fn take(f as *d.IRFunction) as void {
+    if (wanted == 0 || (sole != 0 && owner != sole)) { return; }
+    if (f.is_variadic == 1 || f.is_noinline == 1 || f.is_naked == 1 || f.fn_section_len > 0) { return; }
+    if (f.asm_name_len <= 0) { return; }
+    let is i32 as n with mut = 0;
+    let is i32 as lo with mut = 0 - 1;
+    let is i32 as hi with mut = 0 - 1;
+    let is *d.IRInst as i with mut = f.instructions;
+    while (cast(i64, i) != 0) {
+        n = n + 1;
+        if (n > MAX_INSTS) { return; }
+        let is i32 as op = cast(i32, i.op);
+        if (op == d.IR_VA_START || op == d.IR_FFI_CALL || i.is_extern_call != 0) { return; }
+        if (op == d.IR_ASM && d.is_stack_adjust(i) == 0) { return; }
+        let is i32 as k with mut = 0;
+        while (k < 3) {
+            let is *d.Operand as o with mut = &i.dest;
+            if (k == 1) { o = &i.src1; }
+            if (k == 2) { o = &i.src2; }
+            if (cast(i32, o.op_type) == d.OP_LABEL) {
+                if (lo < 0 || o.label < lo) { lo = o.label; }
+                if (o.label > hi) { hi = o.label; }
+            }
+            k = k + 1;
+        }
+        i = i.next;
+    }
+    let is i32 as labels = f.label_count;
+    if (lo < 0) { f.label_count = 0; ser.lab_base = 0; }
+    else { f.label_count = hi - lo + 1; ser.lab_base = lo; }
+    ser.exporting = 1;
+    ser.no_lines = 1;
+    if (keep_lines == 1) { ser.no_lines = 0; }
+    let is i64 as il with mut = 0;
+    let is i64 as ic with mut = 0;
+    let is *u8 as img = ser.body_encode(f, &il, &ic);
+    ser.lab_base = 0;
+    ser.no_lines = 0;
+    ser.exporting = 0;
+    f.label_count = labels;
+    if (cast(i64, img) == 0) { return; }
+    f.is_exported = 1;
+    let is i64 as nl = cast(i64, f.asm_name_len);
+    let is i64 as rec = 8 + nl + il;
+    _room(16 + rec);
+    let is i64 as p = cast(i64, _buf) + _len;
+    *cast(*i64, p) = owner;
+    *cast(*i64, p + 8) = rec;
+    *cast(*i32, p + 16) = cast(i32, nl);
+    *cast(*i32, p + 20) = cast(i32, il);
+    mem.core.memcpy(cast(*u8, p + 24), f.asm_name_ptr, nl);
+    mem.core.memcpy(cast(*u8, p + 24 + nl), img, il);
+    _len = _len + 16 + rec;
+    ser.body_free(img, ic);
+}
+
+let is i32 as keep_lines with mut = 0;
+
+// The bodies section of one module, its records in the order they were taken.
+fn section(of as i64, out_len as *i64) as *u8 {
+    let is i64 as total with mut = 0;
+    let is i64 as o with mut = 0;
+    while (o < _len) {
+        let is i64 as rec = *cast(*i64, cast(i64, _buf) + o + 8);
+        if (*cast(*i64, cast(i64, _buf) + o) == of) { total = total + rec; }
+        o = o + 16 + rec;
+    }
+    *out_len = total;
+    if (total == 0) { return cast(*u8, 0); }
+    let is *u8 as r = mem.core.mmap_anon(total);
+    let is i64 as w with mut = 0;
+    o = 0;
+    while (o < _len) {
+        let is i64 as rec = *cast(*i64, cast(i64, _buf) + o + 8);
+        if (*cast(*i64, cast(i64, _buf) + o) == of) {
+            mem.core.memcpy(cast(*u8, cast(i64, r) + w), cast(*u8, cast(i64, _buf) + o + 16), rec);
+            w = w + rec;
+        }
+        o = o + 16 + rec;
+    }
+    return r;
+}

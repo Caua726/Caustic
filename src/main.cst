@@ -15,6 +15,9 @@ use "ir/defs.cst" as ird;
 use "ir/gen.cst" as irg;
 use "ir/gen_program.cst" as irp;
 use "ir/opt.cst" as iropt;
+use "ir/body_export.cst" as bexp;
+use "parser/csti_file.cst" as cstif;
+use "semantic/defs.cst" as smd;
 use "ir/debug.cst" as irdebug;
 use "codegen/emit_output.cst" as cg;
 use "codegen/backend.cst" as cgd;
@@ -352,6 +355,11 @@ let is i64 as g_cache_dir with mut = 0;
 // whole-program frontend once, then loops codegen+assemble per module, writing
 // <dir>/<module_prefix>.o for each. Kills the per-module process-spawn floor.
 let is i64 as g_module_objects_dir with mut = 0;
+
+fn _mo_batch() as i32 {
+    if (g_module_objects_dir != 0) { return 1; }
+    return 0;
+}
 // IR-level cache (.ir): currently disabled. Its (de)serialization is lossy —
 // it round-trips only kind+size of cast_to/cast_from types and omits several
 // IRFunction fields (is_recursive, has_stack_ops, live_inst_count, ...), so a
@@ -963,6 +971,7 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
 
     if (g_config_id == 1) { _print_config_id(argc, argv_arr); io.exit(0); }
     _default_obj_cache(argc, argv_arr);
+    if ((g_cache_flags & 16) != 0 || cast(i64, tgt.csti_dir_get()) != 0) { _csti_config(argc, argv_arr); }
     if (g_file_count == 0) {
         io.write_str(io.STDERR, "Error: no input file\n");
         return 1;
@@ -996,7 +1005,8 @@ fn parse_args(argc as i64, argv_arr as *i64) as i32 {
 // <file>.csti. Best-effort: returns write_csti's rc (0 = ok; nonzero = not written,
 // e.g. AST too large → the importer transparently falls back to source). Shared by
 // the standalone --emit-csti path and the single-pass --module-only --emit-csti path.
-fn write_module_interface(filename as *u8, fname_len as i32, root as *ast.Node, hash as i64) as i32 {
+// The file a module's interface goes to (see csti_file.cst).
+fn _csti_path(filename as *u8, fname_len as i32) as *u8 {
     let is *u8 as path with mut = cast(*u8, 0);
     let is *u8 as cdir = tgt.csti_dir_get();
     if (cast(i64, cdir) != 0) {
@@ -1016,9 +1026,175 @@ fn write_module_interface(filename as *u8, fname_len as i32, root as *ast.Node, 
         path[fname_len] = 105; // 'i' : .cst -> .csti
         path[fname_len + 1] = cast(u8, 0);
     }
-    let is i32 as rc = astcw.write_csti(path, root, hash);
-    if (rc == 0 && g_quiet == 0) {
-        io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, path); io.write_str(io.STDOUT, "\n");
+    return path;
+}
+
+// An interface is written in two steps: its image right after semantic, when
+// the AST is whole, and the file once the bodies it carries have been generated.
+struct Iface {
+    root as i64;
+    path as *u8;
+    len as i32;
+    plen as i32;
+    prefix as *u8;
+    image as *u8;
+    ilen as i64;
+    bodies as *u8;
+    blen as i64;
+    id as i64;
+}
+
+let is *Iface as _ifs with mut = cast(*Iface, 0);
+let is i32 as _ifn with mut = 0;
+
+// What an interface depends on besides its module: the compiler and everything
+// its command line says of how to compile.
+fn _csti_config(argc as i64, argv_arr as *i64) as void {
+    let is i64 as h with mut = 0;
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as arg = cast(*u8, argv_arr[ai]);
+        let is i32 as al = strlen(arg);
+        let is i32 as skip with mut = _cfg_skip(arg, al);
+        if (skip == 0 && (str_eq(arg, al, "--csti-dir", 10) == 1 || str_eq(arg, al, "--module-objects", 16) == 1)) { skip = 2; }
+        if (skip == 0 && (str_eq(arg, al, "--module-only", 13) == 1 || str_eq(arg, al, "--emit-csti", 11) == 1 || arg[0] != 45)) { skip = 1; }
+        if (skip > 0) { ai = ai + cast(i64, skip); }
+        else if (str_eq(arg, al, "--path", 6) == 1) {
+            if (ai + 1 < argc) { h = h + _cfg_mix(97, _cfg_str(cast(*u8, argv_arr[ai + 1]))); }
+            ai = ai + 2;
+        } else { h = h + _cfg_mix(1469598103, _cfg_str(arg)); ai = ai + 1; }
+    }
+    resolve_stdlib_dir();
+    h = _cfg_mix(h, cast(i64, g_opt_level));
+    h = _cfg_mix(h, cast(i64, ird.ir_cpu + ird.ir_no_sse * 16));
+    h = _cfg_mix(h, cast(i64, tgt.target_get().arch));
+    h = _cfg_mix(h, cast(i64, tgt.target_get().object_format));
+    h = _cfg_mix(h, tokcache.source_hash(sc.stdlib_dir_ptr, cast(i64, sc.stdlib_dir_len)));
+    cstif.config = _cfg_mix(h, _cfg_self_quick());
+}
+
+fn _iface_add(root as *ast.Node, path as *u8, len as i32) as void {
+    if (cast(i64, _ifs) == 0) { _ifs = cast(*Iface, mem.core.mmap_anon(2048 * sizeof(Iface))); }
+    if (_ifn >= 2048) { return; }
+    let is i32 as k with mut = 0;
+    while (k < _ifn) { if (str_eq(_ifs[k].path, _ifs[k].len, path, len) == 1) { return; } k = k + 1; }
+    if (astcw.csti_image(root) != 0) { return; }
+    let is *Iface as f = &_ifs[_ifn];
+    _ifn = _ifn + 1;
+    f.root = cast(i64, root);
+    f.path = path;
+    f.len = len;
+    f.prefix = sc.get_mod_prefix(path, len);
+    f.plen = sc.get_mod_prefix_len(path, len);
+    f.image = astcw.image_ptr;
+    f.ilen = astcw.image_len;
+}
+
+// Before IR generation: the images, and the request for the bodies.
+fn _ifaces_begin(filename as *u8, fname_len as i32, root as *ast.Node, all as i32) as void {
+    _iface_add(root, filename, fname_len);
+    bexp.wanted = 0;
+    if (g_opt_level >= 1) { bexp.wanted = 1; }
+    bexp.owner = cast(i64, root);
+    bexp.sole = 0;
+    bexp.keep_lines = tgt.lines_wanted();
+    if (all == 0) { bexp.sole = cast(i64, root); return; }
+    let is *smd.Module as m with mut = mod.module_list;
+    while (cast(i64, m) != 0) {
+        if (cast(i64, m.body) != 0 && m.path_len > 0) { _iface_add(cast(*ast.Node, m.body), m.path_ptr, m.path_len); }
+        m = m.next;
+    }
+}
+
+let is *i64 as _cl with mut = cast(*i64, 0);       // roots the closure walk has seen
+let is i32 as _cln with mut = 0;
+
+fn _module_of(body as i64) as *smd.Module {
+    let is *smd.Module as m with mut = mod.module_list;
+    while (cast(i64, m) != 0) {
+        if (cast(i64, m.body) == body) { return m; }
+        m = m.next;
+    }
+    return cast(*smd.Module, 0);
+}
+
+fn _closure(root as *ast.Node) as void {
+    let is *ast.Node as n with mut = root;
+    while (cast(i64, n) != 0) {
+        if (n.kind == ast.NK_USE && cast(i64, n.body) != 0) {
+            let is i32 as k with mut = 0;
+            while (k < _cln && _cl[k] != cast(i64, n.body)) { k = k + 1; }
+            if (k == _cln && _cln < 4096) {
+                _cl[_cln] = cast(i64, n.body);
+                _cln = _cln + 1;
+                _closure(n.body);
+            }
+        }
+        n = n.next;
+    }
+}
+
+// One dependency of the interface being written.
+fn _iface_dep(m as *smd.Module) as void {
+    let is *u8 as pp = sc.get_mod_prefix(m.path_ptr, m.path_len);
+    let is i32 as pl = sc.get_mod_prefix_len(m.path_ptr, m.path_len);
+    let is i64 as id with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < _ifn && id == 0) {                          // written by this process
+        if (str_eq(_ifs[k].path, _ifs[k].len, m.path_ptr, m.path_len) == 1) { id = _ifs[k].id; }
+        k = k + 1;
+    }
+    if (id == 0 && cast(i64, tgt.csti_dir_get()) != 0) {
+        id = cstif.iface_of(tgt.csti_dir_get(), tgt.csti_dir_len_get(), m.path_ptr, m.path_len, pp, pl);
+    }
+    if (id != 0) { cstif.deps_add(m.path_ptr, m.path_len, pp, pl, 0, id); }
+    else { cstif.deps_add(m.path_ptr, m.path_len, pp, pl, 1, cstif.source_hash(m.path_ptr, m.path_len)); }
+}
+
+// After IR generation: the files. `beside`, when not 0, gets the first one's
+// path with ".csti" appended as well (--module-only -o: what the object needs to
+// be reused). A module whose interface does not fit has no file, and its
+// importers read its source. Returns 0 when the first was written.
+fn _ifaces_end(beside as *u8) as i32 {
+    if (_ifn == 0) { return 1; }
+    if (cast(i64, _cl) == 0) { _cl = cast(*i64, mem.core.mmap_anon(4096 * 8)); }
+    let is i32 as k with mut = 0;
+    while (k < _ifn) {
+        _ifs[k].bodies = bexp.section(_ifs[k].root, &_ifs[k].blen);
+        _ifs[k].id = cstif.id_of(_ifs[k].image, _ifs[k].ilen, _ifs[k].bodies, _ifs[k].blen);
+        k = k + 1;
+    }
+    let is i32 as rc with mut = 0;
+    k = 0;
+    while (k < _ifn) {
+        let is *Iface as f = &_ifs[k];
+        cstif.deps_begin();
+        _cln = 0;
+        _closure(cast(*ast.Node, f.root));
+        let is i32 as c with mut = 0;
+        while (c < _cln) {
+            let is *smd.Module as m = _module_of(_cl[c]);
+            if (cast(i64, m) != 0 && m.path_len > 0 && str_eq(m.path_ptr, m.path_len, f.path, f.len) == 0) { _iface_dep(m); }
+            c = c + 1;
+        }
+        let is *u8 as path = _csti_path(f.path, f.len);
+        let is i64 as src = cstif.source_hash(f.path, f.len);
+        let is i32 as w = cstif.write(path, src, f.prefix, f.plen, f.image, f.ilen, f.bodies, f.blen);
+        if (k == 0) {
+            rc = w;
+            if (cast(i64, beside) != 0) {
+                let is i32 as bl = strlen(beside);
+                let is *u8 as bp = ird.opt_alloc(cast(i64, bl) + 8);
+                mem.memcpy(bp, beside, cast(i64, bl));
+                mem.memcpy(cast(*u8, cast(i64, bp) + cast(i64, bl)), ".csti", 5);
+                bp[bl + 5] = cast(u8, 0);
+                cstif.write(bp, src, f.prefix, f.plen, f.image, f.ilen, f.bodies, f.blen);
+            }
+        }
+        if (w == 0 && g_quiet == 0) {
+            io.write_str(io.STDOUT, "wrote: "); io.write_str(io.STDOUT, path); io.write_str(io.STDOUT, "\n");
+        }
+        k = k + 1;
     }
     return rc;
 }
@@ -1365,8 +1541,10 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     // single-pass --module-only + --emit-csti path emits in run_single_file instead.
     // With --module-only -o the object is wanted as well: one analysis, both outputs.
     if ((cache_flags & 16) != 0) {
-        write_module_interface(filename, fname_len, root, cache_hash);
-        if (tgt.module_only_get() == 0) {
+        _ifaces_begin(filename, fname_len, root, _mo_batch());
+        if (tgt.module_only_get() == 0 && _mo_batch() == 0) {
+            bexp.wanted = 0;
+            _ifaces_end(cast(*u8, 0));
             *prog_out = 0;
             return 0;
         }
@@ -1385,7 +1563,22 @@ fn compile_frontend(filename as *u8, fname_len as i32, no_main as i32,
     // -g keeps them: an imported function's lines come from its module's tokens.
     if (tgt.lines_wanted() == 0) { mod.free_module_tokens(); }
     _set_params_canon();
+    if (tgt.module_only_get() == 1 && (cache_flags & 16) != 0
+        && tgt.target_get().arch == tgt.ARCH_X86_64 && tgt.target_get().object_format == 1) {
+        ird.weak_insts = 1;
+    }
+    if (g_opt_level >= 1 && tgt.module_only_get() == 1 && (cache_flags & 16) != 0
+        && tgt.target_get().arch == tgt.ARCH_X86_64) {
+        ird.bodies_mode = 1;
+        cgd.set_snapshot_inline(1);
+    }
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), no_main);
+    if ((cache_flags & 16) != 0) {
+        let is *u8 as beside with mut = cast(*u8, 0);
+        if (_mo_batch() == 0) { beside = cast(*u8, g_output_path); }
+        _ifaces_end(beside);
+    }
+    if (ird.bodies_mode == 1 && _mo_batch() == 0) { irp.load_imported_bodies(prog); }
     prof.prof_record("ir", get_time_us() - t3);
     if (g_quiet == 0) { io.write_str(io.STDOUT, "ir: ok\n"); }
     if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); io.exit(0); }
@@ -1664,7 +1857,7 @@ fn run_single_file(filename as *u8) as i32 {
     // alongside --module-only), emit this module's interface right after semantic —
     // analyzed ONCE — then fall through to codegen for its .o. Best-effort.
     if ((g_cache_flags & 16) != 0) {
-        write_module_interface(filename, fname_len, root, 0); // freshness via mtime, not this hash
+        _ifaces_begin(filename, fname_len, root, 0);
     }
 
     _set_params_canon();
@@ -1672,7 +1865,9 @@ fn run_single_file(filename as *u8) as i32 {
     irg.ir_tl = cast(*u8, &tokens);
     ird.ir_opt_level = g_opt_level;
     mod.free_module_tokens();
+    bexp.wanted = 0;       // a build to .s copies no body of another module
     let is *ird.IRProgram as prog = irp.gen_ir(cast(*u8, root), g_no_main);
+    if ((g_cache_flags & 16) != 0) { _ifaces_end(cast(*u8, 0)); }
     prof.prof_record("ir", get_time_us() - t_ir);
     if (g_quiet == 0) { io.write_str(io.STDOUT, "ir: ok\n"); }
     if (g_debug_ir == 1 && g_opt_level < 1) { irdebug.ir_print(cast(*u8, prog)); io.exit(0); }

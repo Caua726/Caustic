@@ -405,6 +405,13 @@ if [ -f "$NAME_DIR/dir.cse/x" ]; then die "the .cse convention ignored the reque
 ok "o.cse2 becomes o.cse2.cse, and a .cse directory stays a directory"
 
 
+# ─── 7b. incremental builds ────────────────────────────────────────────────
+step "incremental builds"
+mkdir -p "$TMP/incbin"
+cp "$CUR" "$TMP/incbin/caustic"; cp "$TMP/caustic-as" "$TMP/caustic-ld" "$TMP/caustic-mk" "$TMP/incbin/"
+"$ROOT/tools/check-incremental.sh" "$TMP/incbin" >"$TMP/inc.log" 2>&1 || { tail -20 "$TMP/inc.log"; die "an incremental build differs from a build from source"; }
+ok "54 incremental builds equal to a build from source (-O0/-O1/-O2)"
+
 # ─── 8. every target still builds ──────────────────────────────────────────
 # Compiling for another architecture or OS needs no external tool — only
 # RUNNING the result does, which is why check-cross.sh stays opt-in. Building

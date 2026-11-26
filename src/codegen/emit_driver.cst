@@ -46,6 +46,10 @@ fn set_dyn_stdlib(v as i32) as void { g_dyn_stdlib = v; }
 // defined in another object and must not be emitted here.
 fn _belongs_to_target_module(f as *d.IRFunction) as i32 {
     let is i32 as pgen = tgt.prefix_gen_get();
+    if (d.weak_insts == 1 && f.is_ginst == 1) {
+        if (f.weak_gen == pgen) { return 1; }
+        return 0;
+    }
     if (f.btm_gen == pgen) { return f.btm_ok; }
     f.btm_gen = pgen;
     f.btm_ok = 0;
@@ -210,6 +214,20 @@ fn _ix_owned(name as *u8, len as i32, pre as *u8, plen as i32) as i32 {
     while (i < plen) { if (name[i] != pre[i]) { return 0; } i = i + 1; }
     if (name[plen] != 95) { return 0; }
     return 1;
+}
+
+fn _ix_find(p as *u8, n as i32) as *d.IRFunction {
+    let is i32 as lo with mut = 0;
+    let is i32 as hi with mut = _ix_nf;
+    while (lo < hi) {
+        let is i32 as mid = (lo + hi) >> 1;
+        let is i32 as ml with mut = 0;
+        let is *u8 as mp = _ix_key(_ix_fsorted, mid, 1, &ml);
+        let is i32 as c = _ix_cmp(mp, ml, p, n);
+        if (c == 0) { return cast(*d.IRFunction, _ix_fsorted[mid]); }
+        if (c < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return cast(*d.IRFunction, 0);
 }
 
 // The items (functions when is_fn = 1, else globals) the target module owns,
@@ -2699,6 +2717,80 @@ let is i32 as _it_i with mut = 0;
 let is i32 as _it_on with mut = 0;          // 1 = iterate _it_own
 let is i64 as _it_dyn_prog with mut = 0;    // program is_dyn_import was set for
 
+fn _it_add(f as *d.IRFunction) as void {
+    if (cast(i64, f) == 0 || f.is_ginst == 0 || f.is_reachable == 0) { return; }
+    if (f.weak_gen == tgt.prefix_gen_get()) { return; }
+    f.weak_gen = tgt.prefix_gen_get();
+    if (_it_n + 1 > _it_own_cap) {
+        let is i32 as nc = _it_n * 2 + 16;
+        let is *i64 as nb = cast(*i64, d.opt_alloc(cast(i64, nc) * 8));
+        let is i32 as i with mut = 0;
+        while (i < _it_n) { nb[i] = _it_own[i]; i = i + 1; }
+        d.opt_free(cast(*u8, _it_own));
+        _it_own = nb;
+        _it_own_cap = nc;
+    }
+    _it_own[_it_n] = cast(i64, f);
+    _it_n = _it_n + 1;
+}
+
+// The generic instances the module's functions reach, after its own functions:
+// by name, so the order does not depend on who else was analysed.
+fn _it_weak(p as *d.IRProgram) as void {
+    let is i32 as n with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < _it_n) {
+        let is *d.IRFunction as f = cast(*d.IRFunction, _it_own[k]);
+        if (f.is_ginst == 0) { _it_own[n] = cast(i64, f); n = n + 1; }
+        k = k + 1;
+    }
+    _it_n = n;
+    let is *d.IRGlobal as g with mut = p.globals;
+    while (cast(i64, g) != 0) {
+        if (g.is_fn_ptr_init == 1 && g.is_reachable == 1 && _global_belongs(g) == 1) {
+            _it_add(_ix_find(g.init_fn_name_ptr, g.init_fn_name_len));
+        }
+        if (g.is_struct_lit_init == 1 && g.is_reachable == 1 && _global_belongs(g) == 1) {
+            let is *ast.Node as lit = cast(*ast.Node, g.struct_lit_ast);
+            let is *ast.Node as e with mut = lit.args;
+            while (cast(i64, e) != 0) {
+                if (cast(i64, e.expr) != 0 && e.expr.kind == ast.NK_FN_PTR) { _it_add(_ix_find(e.expr.name_ptr, e.expr.name_len)); }
+                e = e.next;
+            }
+        }
+        g = g.next;
+    }
+    k = 0;
+    while (k < _it_n) {
+        let is *d.IRFunction as f = cast(*d.IRFunction, _it_own[k]);
+        let is i32 as ci with mut = 0;
+        while (f.is_reachable == 1 && ci < f.call_target_count) {
+            let is *i64 as pp = cast(*i64, cast(i64, f.call_targets) + cast(i64, ci) * 12);
+            let is *i32 as pl = cast(*i32, cast(i64, f.call_targets) + cast(i64, ci) * 12 + 8);
+            _it_add(_ix_find(cast(*u8, *pp), *pl));
+            ci = ci + 1;
+        }
+        k = k + 1;
+    }
+    // Few: an insertion sort by name.
+    k = n + 1;
+    while (k < _it_n) {
+        let is i64 as v = _it_own[k];
+        let is i32 as vl with mut = 0;
+        let is *u8 as vp = _ix_fname(v, &vl);
+        let is i32 as b with mut = k - 1;
+        let is i32 as go with mut = 1;
+        while (go == 1 && b >= n) {
+            let is i32 as bl with mut = 0;
+            let is *u8 as bp = _ix_fname(_it_own[b], &bl);
+            if (_ix_cmp(bp, bl, vp, vl) > 0) { _it_own[b + 1] = _it_own[b]; b = b - 1; }
+            else { go = 0; }
+        }
+        _it_own[b + 1] = v;
+        k = k + 1;
+    }
+}
+
 fn _cg_funcs_prepare(p as *d.IRProgram) as void {
     _it_on = 0;
     if (tgt.module_only_get() == 0) { return; }
@@ -2719,6 +2811,7 @@ fn _cg_funcs_prepare(p as *d.IRProgram) as void {
     let is i32 as k with mut = 0;
     while (k < cnt) { _it_own[k] = _ix_out[k]; k = k + 1; }
     _it_n = cnt;
+    if (d.weak_insts == 1) { _it_weak(p); }
     _it_on = 1;
 }
 
@@ -2747,7 +2840,11 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
     // callees (cross-module callees are external here, exactly as in the warm
     // --module-only path). This makes per-module .o emission order-independent
     // (deterministic across -jN) and convergent with the warm per-module build.
-    if (g_snapshot_inline == 1) {
+    if (g_snapshot_inline == 1 && d.bodies_mode == 1) {
+        // ... plus the callees whose bodies their interface files carry.
+        d.set_inline_module(tgt.module_prefix_ptr_get(), tgt.module_prefix_len_get());
+        opt.inline_module_changed();
+    } else if (g_snapshot_inline == 1) {
         // Snapshot mode reads callees from frozen/pristine bodies, so cross-module
         // inlining is safe and deterministic — no same-module restriction.
         d.set_inline_module(cast(*u8, 0), 0);
@@ -2798,7 +2895,8 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
         // copy in this image instead of the library's state.
         if (_it_on == 0) { f.is_dyn_import = _is_dyn_library(f); }
         if (f.is_reachable == 1 && _is_dyn_extern(f) == 0) {
-            eo.out_symdir(_apl.DIR_GLOBL, ".globl ", f.asm_name_ptr, cast(i32, f.asm_name_len));
+            if (d.weak_insts == 1 && f.is_ginst == 1) { eo.out_symdir(_apl.DIR_WEAK, ".weak ", f.asm_name_ptr, cast(i32, f.asm_name_len)); }
+            else { eo.out_symdir(_apl.DIR_GLOBL, ".globl ", f.asm_name_ptr, cast(i32, f.asm_name_len)); }
         }
         f = _cg_next(f);
     }
@@ -2878,7 +2976,10 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
             let is i32 as snap_alloca with mut = 0;
             let is i32 as snap_asm with mut = 0;
             let is i32 as did_snap with mut = 0;
-            if (al.al_opt_level >= 1 && g_snapshot_inline == 1 && cast(i64, f.instructions) != 0) {
+            // An instance is emitted once per module that uses it: off a clone at every level.
+            let is i32 as snap_inl with mut = 0;
+            if (al.al_opt_level >= 1 && g_snapshot_inline == 1) { snap_inl = 1; }
+            if ((snap_inl == 1 || (d.weak_insts == 1 && f.is_ginst == 1)) && cast(i64, f.instructions) != 0) {
                 snap_insts = f.instructions;
                 snap_vreg = f.vreg_count;
                 snap_label = f.label_count;
@@ -2890,8 +2991,10 @@ fn codegen(prog as *u8, fd as i32, filename_ptr as *u8, filename_len as i32) as 
                 snap_asm = f.has_asm;
                 did_snap = 1;
                 f.instructions = d.clone_insts(snap_insts);
-                opt.optimize_inline_func(f, prog);
-                opt.late_inline_func(f, prog);
+                if (snap_inl == 1) {
+                    opt.optimize_inline_func(f, prog);
+                    opt.late_inline_func(f, prog);
+                }
             }
             // Regen IR + re-optimize for functions freed after Phase 1
             if (cast(i64, f.instructions) == 0 && cast(i64, f.ast_node) != 0) {

@@ -227,7 +227,7 @@ fn _lookup_raw(p as *u8, n as i32) as *d.IRFunction {
 
 // A function whose body is about to be read.
 fn _lookup(p as *u8, n as i32) as *d.IRFunction {
-    let is *d.IRFunction as f = _lookup_raw(p, n);
+    let is *d.IRFunction as f = _visible(_lookup_raw(p, n));
     d.func_open(f);
     return f;
 }
@@ -259,23 +259,14 @@ fn ensure_names(prog as *u8) as void {
     }
 }
 
-fn _ensure_tables(prog as *u8) as void {
-    if (cast(i64, _prog) == cast(i64, prog)) { return; }
-    _prog = prog;
-    ensure_names(prog);
-    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
-    let is *d.IRFunction as f with mut = p.functions;
-    // References: every call, function address or global address naming a
-    // function, over every function the program keeps.
+// References: every call, function address or global address naming a function,
+// over every function the program keeps; for modules compiled apart, over the
+// module's own, all that its object may depend on.
+fn _count_refs(p as *d.IRProgram) as void {
     _pm_clear(&_refs);
-    _pm_clear(&_est);
-    _pm_clear(&_stk);
-    _pm_clear(&_est_raw);
-    _pm_clear(&_shadow);
-    _pm_clear(&_nr_memo);
-    f = p.functions;
+    let is *d.IRFunction as f with mut = p.functions;
     while (cast(i64, f) != 0) {
-        if (f.is_reachable == 1 && cast(i64, f.call_targets) != 0) {
+        if (f.is_reachable == 1 && (d.bodies_mode == 0 || d.in_inline_module(f) == 1) && cast(i64, f.call_targets) != 0) {
             let is i32 as k with mut = 0;
             while (k < f.call_target_count) {
                 let is *i64 as pp = cast(*i64, cast(i64, f.call_targets) + cast(i64, k) * 12);
@@ -287,6 +278,20 @@ fn _ensure_tables(prog as *u8) as void {
         }
         f = f.next;
     }
+}
+
+fn _ensure_tables(prog as *u8) as void {
+    if (cast(i64, _prog) == cast(i64, prog)) { return; }
+    _prog = prog;
+    ensure_names(prog);
+    let is *d.IRProgram as p = cast(*d.IRProgram, prog);
+    let is *d.IRFunction as f with mut = p.functions;
+    _pm_clear(&_est);
+    _pm_clear(&_stk);
+    _pm_clear(&_est_raw);
+    _pm_clear(&_shadow);
+    _pm_clear(&_nr_memo);
+    _count_refs(p);
     // Read off the bodies as they are now, before any copy changes one.
     f = p.functions;
     while (cast(i64, f) != 0) {
@@ -300,7 +305,22 @@ fn _ensure_tables(prog as *u8) as void {
 // What the inliner sees of a function besides its body, for the object cache.
 fn refs_of(f as *d.IRFunction) as i64 { return _pm_get(&_refs, cast(i64, f)); }
 fn noreturn_of(f as *d.IRFunction) as i64 { return _pm_get(&_nr_memo, cast(i64, f)); }
-fn lookup_quiet(p as *u8, n as i32) as *d.IRFunction { return _lookup_raw(p, n); }
+fn lookup_quiet(p as *u8, n as i32) as *d.IRFunction { return _visible(_lookup_raw(p, n)); }
+
+fn _visible(f as *d.IRFunction) as *d.IRFunction {
+    if (cast(i64, f) == 0 || d.bodies_mode == 0 || d.callee_visible(f) == 1) { return f; }
+    return cast(*d.IRFunction, 0);
+}
+
+// What is known of a callee is read off the bodies the module may see.
+fn module_changed() as void {
+    _pm_clear(&_nr_memo);
+    _pm_clear(&_est);
+    _pm_clear(&_stk);
+    _pm_clear(&_est_raw);
+    _pm_clear(&_shadow);
+    if (cast(i64, _prog) != 0) { _count_refs(cast(*d.IRProgram, _prog)); }
+}
 
 // Before a fork: the workers inherit the tables instead of each building them.
 fn prepare_tables(prog as *u8) as void { _ensure_tables(prog); }
@@ -825,8 +845,8 @@ fn _site_new(n as i64) as *Site {
 
 // Can f's body be copied into a caller at all?
 fn _callee_ok(f as *d.IRFunction, caller as *d.IRFunction) as i32 {
-    if (f.is_noinline == 1) { return 0; }
     if (cast(i64, f) == 0 || cast(i64, f) == cast(i64, caller)) { return 0; }
+    if (f.is_noinline == 1) { return 0; }
     if (cast(i64, f.instructions) == 0) { return 0; }
     if (f.is_variadic != 0 || f.is_naked != 0 || f.is_recursive != 0) { return 0; }
     if (f.live_inst_count <= 0 || f.live_inst_count > INL_RAW_CAP) { return 0; }
@@ -919,7 +939,8 @@ fn _collect(func as *d.IRFunction, round as i64, out_size as *i64) as i64 {
                         let is i64 as thr with mut = cast(i64, INL_BASE);
                         if (hot >= 1) { thr = thr + cast(i64, INL_LOOP_BONUS); }
                         if (hot >= 2) { thr = thr + cast(i64, INL_LOOP2_BONUS); }
-                        let is i64 as nrefs = _pm_get(&_refs, cast(i64, callee));
+                        let is i64 as nrefs with mut = _pm_get(&_refs, cast(i64, callee));
+                        if (d.bodies_mode == 1 && d.in_inline_module(callee) == 0) { nrefs = 3; }   // others call it too
                         if (nrefs == 1) { thr = thr + cast(i64, INL_SINGLE_BONUS); }
                         if (nrefs == 2) { thr = thr + cast(i64, INL_DOUBLE_BONUS); }
                         thr = thr + nconst * cast(i64, INL_CONST_BONUS);

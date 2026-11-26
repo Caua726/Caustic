@@ -455,6 +455,8 @@ fn serialize_type(buf as *u8, off as i32, t as *ast.Type) as void {
 //152: stack_size(i32) 156: is_global(i32)   160: asm_off(i32)      164: asm_len(i32)
 // Total: 168 bytes
 
+let is i32 as g_skip_tok with mut = 0;
+
 fn serialize_node(buf as *u8, off as i32, n as *ast.Node) as void {
     let is i64 as base = cast(i64, buf) + cast(i64, off);
     let is *u8 as b = cast(*u8, base);
@@ -462,7 +464,9 @@ fn serialize_node(buf as *u8, off as i32, n as *ast.Node) as void {
     write_i32(b,   0, n.kind);
     write_i32(b,   4, node_to_idx(n.next));
     write_i32(b,   8, type_to_idx(n.ty));
-    write_i32(b,  12, n.tok_idx);
+    // An interface has no positions: its importers have no tokens to look one up
+    // in, and an edit that only moves things must not change it.
+    if (g_skip_tok == 1) { write_i32(b, 12, 0); } else { write_i32(b, 12, n.tok_idx); }
     write_i32(b,  16, node_to_idx(n.lhs));
     write_i32(b,  20, node_to_idx(n.rhs));
     write_i64(b,  24, n.val);
@@ -606,6 +610,9 @@ fn write_ast_cache(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
 // Image layout (v3):
 //   header(48) | string_table | type_table[64B] | node_table[184B] | GP[8B] | GA[4B]
 // ============================================================
+let is *u8 as image_ptr with mut = cast(*u8, 0);
+let is i64 as image_len with mut = 0;
+
 fn emit_image(path as *u8, root_idx as i32, magic as i32, source_hash as i64) as i32 {
     str_tab_init();
     gp_tab_init();
@@ -671,6 +678,10 @@ fn emit_image(path as *u8, root_idx as i32, magic as i32, source_hash as i64) as
         mem.memcpy(cast(*u8, cast(i64, out) + cast(i64, ga_off)), ga_buf, cast(i64, ga_table_size));
     }
 
+    image_ptr = out;
+    image_len = cast(i64, total_size);
+    if (cast(i64, path) == 0) { return 0; }        // the caller wants the bytes
+
     // Atomic. Parallel caustic-mk jobs share one cache directory, and an
     // in-place write there is a torn image for whoever reads it meanwhile —
     // one process's header over another's body, which passes magic, version,
@@ -680,7 +691,7 @@ fn emit_image(path as *u8, root_idx as i32, magic as i32, source_hash as i64) as
 }
 
 // ============================================================
-// write_csti: emit a per-module INTERFACE image (magic "CSTI").
+// csti_image: a per-module INTERFACE image (magic "CSTI"), in image_ptr/image_len.
 //
 // Same on-disk format as the AST cache, but filtered to what importers need:
 // types, signatures, globals, `with imut` bodies (folded at importer call sites)
@@ -689,9 +700,43 @@ fn emit_image(path as *u8, root_idx as i32, magic as i32, source_hash as i64) as
 // lives in that module's own .o. The strip is done by temporarily nulling the
 // fn body before collection (so the body subtree isn't serialized) and restoring
 // it afterwards, leaving the in-memory AST intact.
-// Returns 0 on success, -1 on error.
+// Returns 0 on success, nonzero when it does not fit. csti_file.cst writes it.
 // ============================================================
-fn write_csti(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
+// One set of tables for every interface a batch writes.
+let is *u8 as _saved_nodes with mut = cast(*u8, 0);
+let is *u8 as _saved_bodies with mut = cast(*u8, 0);
+
+fn _csti_tables() as void {
+    if (cast(i64, _saved_nodes) != 0) { return; }
+    _saved_nodes = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    _saved_bodies = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    node_ptrs = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    type_ptrs = ast.ast_alloc(cast(i64, MAX_TYPES) * 8);
+    node_count = 0;
+    type_count = 0;
+    ser_ht_init();
+}
+
+// Empty the hashes of the last interface: the keys it put there and no others.
+fn _csti_reset() as void {
+    let is i32 as i with mut = 0;
+    while (i < node_count) {
+        let is i32 as h with mut = cast(i32, (cast(i64, node_ptr_get(i)) >> 4) & cast(i64, HT_NODE_CAP - 1));
+        while (read_i64(nht_keys, h * 8) != 0) { write_i64(nht_keys, h * 8, 0); h = (h + 1) & (HT_NODE_CAP - 1); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < type_count) {
+        let is i32 as h with mut = cast(i32, (cast(i64, type_ptr_get(i)) >> 4) & cast(i64, HT_TYPE_CAP - 1));
+        while (read_i64(tht_keys, h * 8) != 0) { write_i64(tht_keys, h * 8, 0); h = (h + 1) & (HT_TYPE_CAP - 1); }
+        i = i + 1;
+    }
+    node_count = 0;
+    type_count = 0;
+    g_ser_overflow = 0;
+}
+
+fn csti_image(root as *ast.Node) as i32 {
     if (cast(i64, root) == 0) { return cast(i32, 0 - 1); }
 
     // 0. Truncate generic INSTANCES off the chain. instantiate_fn appends every
@@ -714,8 +759,9 @@ fn write_csti(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
     }
 
     // 1. Strip regular-function bodies (save originals for restore).
-    let is *u8 as saved_nodes = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
-    let is *u8 as saved_bodies = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
+    _csti_tables();
+    let is *u8 as saved_nodes = _saved_nodes;
+    let is *u8 as saved_bodies = _saved_bodies;
     let is i32 as saved_count with mut = 0;
     let is *ast.Node as cur with mut = root;
     while (cast(i64, cur) != 0) {
@@ -730,17 +776,15 @@ fn write_csti(path as *u8, root as *ast.Node, source_hash as i64) as i32 {
     }
 
     // 2. Collect (regular fns now body-less → bodies not collected) and emit.
-    node_ptrs = ast.ast_alloc(cast(i64, MAX_NODES) * 8);
-    type_ptrs = ast.ast_alloc(cast(i64, MAX_TYPES) * 8);
-    node_count = 0;
-    type_count = 0;
-    ser_ht_init();
+    _csti_reset();
     g_skip_use_body = 1;
     collect_node(root);
     g_skip_use_body = 0;
     let is i32 as rc with mut = cast(i32, 0 - 3); // overflow default
     if (g_ser_overflow == 0) {
-        rc = emit_image(path, node_to_idx(root), MAGIC_CSTI, source_hash);
+        g_skip_tok = 1;
+        rc = emit_image(cast(*u8, 0), node_to_idx(root), MAGIC_CSTI, 0);
+        g_skip_tok = 0;
     }
 
     // 3. Restore stripped bodies + the truncated generic-instance tail.

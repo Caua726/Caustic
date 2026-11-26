@@ -1,0 +1,368 @@
+// csti_file.cst: the file around a module's interface image (<csti-dir>/<prefix>.csti).
+//
+//   0  u32 magic "CSTF"        4  u32 version
+//   8  i64 configuration      16  i64 hash of the module's source
+//  24  i64 interface id       32  i32 dependencies   36  i32 bytes they take
+//  40  i64 image bytes        48  i64 body bytes
+//  56  i32 prefix length      60  u32 0
+//  then the prefix, the dependencies, the image (cache_write.cst) and the bodies.
+//
+// A dependency is every module the import graph reaches: i32 path length, i32
+// prefix length, i32 kind, i32 0, i64 id, the path, the prefix. Kind 0: `id` is
+// its interface id. Kind 1, when it had no interface to name: its source's hash.
+//
+// The interface id is the hash of image and bodies, which hold everything an
+// importer's object can depend on: types, signatures, constants, generic
+// templates and the bodies it may copy. Positions in the source are not in it,
+// so an edit inside any other function leaves it as it was.
+//
+// A file is used only when all of it still holds: version, configuration
+// (compiler, flags, target), the source's hash, the id, and every dependency's
+// id. Otherwise the module is read from its source.
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+
+let is i32 as MAGIC with imut = 1179931459;     // "CSTF"
+let is i32 as VERSION with imut = 1;
+let is i64 as HDR with imut = 64;
+
+let is i64 as config with mut = 0;
+
+// Memory that lives as long as the process: a bump over mappings.
+let is *u8 as _mp with mut = cast(*u8, 0);
+let is i64 as _ml with mut = 0;
+
+fn _alloc(n0 as i64) as *u8 {
+    let is i64 as n = (n0 + 7) & (0 - 8);
+    if (n > 65536) { return mem.core.mmap_anon(n); }
+    if (n > _ml) { _mp = mem.core.mmap_anon(262144); _ml = 262144; }
+    let is *u8 as r = _mp;
+    _mp = cast(*u8, cast(i64, _mp) + n);
+    _ml = _ml - n;
+    return r;
+}
+
+fn _r32(p as *u8, off as i64) as i32 { return *cast(*i32, cast(i64, p) + off); }
+fn _r64(p as *u8, off as i64) as i64 { return *cast(*i64, cast(i64, p) + off); }
+fn _w32(p as *u8, off as i64, v as i32) as void { *cast(*i32, cast(i64, p) + off) = v; }
+fn _w64(p as *u8, off as i64, v as i64) as void { *cast(*i64, cast(i64, p) + off) = v; }
+fn _at(p as *u8, off as i64) as *u8 { return cast(*u8, cast(i64, p) + off); }
+
+fn _eq(a as *u8, al as i32, b as *u8, bl as i32) as i32 {
+    if (al != bl) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < al) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+// Eight bytes a step.
+fn _hash(h0 as i64, p as *u8, n as i64) as i64 {
+    let is i64 as h with mut = h0 ^ n;
+    let is i64 as k with mut = 0;
+    while (k + 8 <= n) {
+        h = (h ^ _r64(p, k)) * 1099511628211;
+        h = h ^ ((h >> 29) & 34359738367);
+        k = k + 8;
+    }
+    while (k < n) { h = (h ^ cast(i64, p[k])) * 1099511628211; k = k + 1; }
+    return h ^ ((h >> 32) & 4294967295);
+}
+
+fn id_of(image as *u8, ilen as i64, bodies as *u8, blen as i64) as i64 {
+    let is i64 as h = _hash(_hash(0 - 3750763034362895579, image, ilen), bodies, blen);
+    if (h == 0) { return 1; }
+    return h;
+}
+
+// Read a whole file into its own mapping; 0 when it cannot be.
+fn _read(path as *u8, out as *i64) as *u8 {
+    *out = 0;
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as n = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (n <= 0) { io._close_fd(fd); return cast(*u8, 0); }
+    let is *u8 as b = mem.core.mmap_anon(n + 8);
+    if (cast(i64, b) <= 0) { io._close_fd(fd); return cast(*u8, 0); }
+    let is i64 as got = io._read_fd(fd, b, n);
+    io._close_fd(fd);
+    if (got != n) { mem.core.munmap(b, n + 8); return cast(*u8, 0); }
+    *out = n;
+    return b;
+}
+
+fn _zstr(p as *u8, n as i32) as *u8 {
+    let is *u8 as z = _alloc(cast(i64, n) + 1);
+    mem.memcpy(z, p, cast(i64, n));
+    z[n] = cast(u8, 0);
+    return z;
+}
+
+// ── What this process knows of each source path ─────────────────────
+
+struct Known {
+    path as *u8;
+    len as i32;
+    next as i32;
+    src as i64;              // hash of the source, 0 = cannot be read
+    iface as i64;            // interface id of its file, 0 = none that holds its source
+    has_iface as i32;
+    pad as i32;
+}
+
+let is *Known as _known with mut = cast(*Known, 0);
+let is i32 as _nknown with mut = 0;
+let is i32 as _cknown with mut = 0;
+let is [1024]i32 as _kheads with mut;
+
+fn _know(path as *u8, len as i32) as i32 {
+    if (cast(i64, _known) == 0) {
+        let is i32 as z with mut = 0;
+        while (z < 1024) { _kheads[z] = 0 - 1; z = z + 1; }
+    }
+    let is i64 as b = _hash(0, path, cast(i64, len)) & 1023;
+    let is i32 as k with mut = _kheads[b];
+    while (k >= 0) {
+        if (_eq(_known[k].path, _known[k].len, path, len) == 1) { return k; }
+        k = _known[k].next;
+    }
+    if (_nknown >= _cknown) {
+        let is i32 as nc with mut = _cknown * 2;
+        if (nc < 256) { nc = 256; }
+        let is *Known as nb = cast(*Known, _alloc(cast(i64, nc) * sizeof(Known)));
+        if (_nknown > 0) {
+            mem.memcpy(cast(*u8, nb), cast(*u8, _known), cast(i64, _nknown) * sizeof(Known));
+        }
+        _known = nb;
+        _cknown = nc;
+    }
+    k = _nknown;
+    _nknown = k + 1;
+    _known[k].path = _zstr(path, len);
+    _known[k].len = len;
+    _known[k].src = 0;
+    _known[k].iface = 0;
+    _known[k].has_iface = 0;
+    _known[k].next = _kheads[b];
+    _kheads[b] = k;
+    let is i64 as n with mut = 0;
+    let is *u8 as s = _read(_known[k].path, &n);
+    if (cast(i64, s) != 0) {
+        _known[k].src = _hash(7, s, n);
+        if (_known[k].src == 0) { _known[k].src = 1; }
+        mem.core.munmap(s, n + 8);
+    }
+    return k;
+}
+
+fn source_hash(path as *u8, len as i32) as i64 {
+    let is i32 as k = _know(path, len);
+    return _known[k].src;
+}
+
+// <dir>/<prefix>.csti
+// A file of this kind (and not interface text) at path?
+fn is_image(path as *u8) as i32 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0; }
+    let is [16]u8 as h with mut;
+    let is i64 as n = io._read_fd(fd, cast(*u8, &h), 16);
+    io._close_fd(fd);
+    if (n == 16 && _r32(cast(*u8, &h), 0) == MAGIC) { return 1; }
+    return 0;
+}
+
+fn path_of(dir as *u8, dlen as i32, prefix as *u8, plen as i32) as *u8 {
+    let is *u8 as p = _alloc(cast(i64, dlen + plen) + 8);
+    mem.memcpy(p, dir, cast(i64, dlen));
+    p[dlen] = cast(u8, 47);
+    mem.memcpy(_at(p, cast(i64, dlen) + 1), prefix, cast(i64, plen));
+    mem.memcpy(_at(p, cast(i64, dlen + plen) + 1), ".csti", 5);
+    p[dlen + plen + 6] = cast(u8, 0);
+    return p;
+}
+
+// Do the header's own claims hold for this source and prefix?
+fn _header_ok(h as *u8, src as i64) as i32 {
+    if (_r32(h, 0) != MAGIC || _r32(h, 4) != VERSION) { return 0; }
+    if (_r64(h, 8) != config || src == 0 || _r64(h, 16) != src) { return 0; }
+    return 1;
+}
+
+// A module's interface id by its file's header, 0 when there is none for its
+// source as it is now.
+fn iface_of(dir as *u8, dlen as i32, path as *u8, len as i32, prefix as *u8, plen as i32) as i64 {
+    let is i32 as k = _know(path, len);
+    if (_known[k].has_iface == 1) { return _known[k].iface; }
+    _known[k].has_iface = 1;
+    let is *u8 as cp = path_of(dir, dlen, prefix, plen);
+    let is i64 as fd = io._open_read(cp);
+    if (fd < 0) { return 0; }
+    let is [64]u8 as h with mut;
+    let is i64 as got = io._read_fd(fd, cast(*u8, &h), HDR);
+    io._close_fd(fd);
+    if (got == HDR && _header_ok(cast(*u8, &h), _known[k].src) == 1) { _known[k].iface = _r64(cast(*u8, &h), 24); }
+    return _known[k].iface;
+}
+
+// ── Bodies: name -> image, over every file opened ───────────────────
+
+let is *i64 as _bn with mut = cast(*i64, 0);    // name ptr, name len, image ptr, image len
+let is i64 as _bcap with mut = 0;               // slots, a power of two
+let is i64 as _bcount with mut = 0;
+
+fn _body_put(name as *u8, nlen as i32, img as *u8, ilen as i64) as void {
+    if ((_bcount + 1) * 2 > _bcap) {
+        let is i64 as oc = _bcap;
+        let is *i64 as ob = _bn;
+        _bcap = oc * 2;
+        if (_bcap < 1024) { _bcap = 1024; }
+        _bn = cast(*i64, mem.core.mmap_anon(_bcap * 32));
+        _bcount = 0;
+        let is i64 as i with mut = 0;
+        while (i < oc) {
+            if (ob[i * 4] != 0) { _body_put(cast(*u8, ob[i * 4]), cast(i32, ob[i * 4 + 1]), cast(*u8, ob[i * 4 + 2]), ob[i * 4 + 3]); }
+            i = i + 1;
+        }
+        if (oc > 0) { mem.core.munmap(cast(*u8, ob), oc * 32); }
+    }
+    let is i64 as j with mut = _hash(0, name, cast(i64, nlen)) & (_bcap - 1);
+    while (_bn[j * 4] != 0) {
+        if (_eq(cast(*u8, _bn[j * 4]), cast(i32, _bn[j * 4 + 1]), name, nlen) == 1) { return; }
+        j = (j + 1) & (_bcap - 1);
+    }
+    _bn[j * 4] = cast(i64, name); _bn[j * 4 + 1] = cast(i64, nlen);
+    _bn[j * 4 + 2] = cast(i64, img); _bn[j * 4 + 3] = ilen;
+    _bcount = _bcount + 1;
+}
+
+fn body_count() as i64 { return _bcount; }
+
+// The image of a function's body, 0 when no opened file has it.
+fn body_find(name as *u8, nlen as i32, out_len as *i64) as *u8 {
+    if (_bcap == 0) { return cast(*u8, 0); }
+    let is i64 as j with mut = _hash(0, name, cast(i64, nlen)) & (_bcap - 1);
+    while (_bn[j * 4] != 0) {
+        if (_eq(cast(*u8, _bn[j * 4]), cast(i32, _bn[j * 4 + 1]), name, nlen) == 1) {
+            *out_len = _bn[j * 4 + 3];
+            return cast(*u8, _bn[j * 4 + 2]);
+        }
+        j = (j + 1) & (_bcap - 1);
+    }
+    return cast(*u8, 0);
+}
+
+// Bodies section: per body i32 name length, i32 image length, name, image.
+fn _bodies_add(p as *u8, n as i64) as i32 {
+    let is i64 as pass with mut = 0;
+    while (pass < 2) {               // checked whole before any is taken
+        let is i64 as o with mut = 0;
+        while (o < n) {
+            if (o + 8 > n) { return 0; }
+            let is i64 as nl = cast(i64, _r32(p, o));
+            let is i64 as il = cast(i64, _r32(p, o + 4));
+            if (nl <= 0 || il <= 0 || o + 8 + nl + il > n) { return 0; }
+            if (pass == 1) { _body_put(_at(p, o + 8), cast(i32, nl), _at(p, o + 8 + nl), il); }
+            o = o + 8 + nl + il;
+        }
+        pass = pass + 1;
+    }
+    return 1;
+}
+
+// ── Opening ─────────────────────────────────────────────────────────
+
+// The interface image of the module at `path`, with its bodies made findable;
+// 0 when there is no file or any part of it no longer holds. The file stays
+// mapped: the image and the bodies are read in place.
+fn open(dir as *u8, dlen as i32, path as *u8, len as i32, prefix as *u8, plen as i32, out_len as *i64) as *u8 {
+    let is i32 as k = _know(path, len);
+    let is *u8 as cp = path_of(dir, dlen, prefix, plen);
+    let is i64 as n with mut = 0;
+    let is *u8 as f = _read(cp, &n);
+    if (cast(i64, f) == 0) { return cast(*u8, 0); }
+    let is i32 as ok with mut = 0;
+    let is i64 as img with mut = 0;
+    if (n >= HDR && _header_ok(f, _known[k].src) == 1) {
+        let is i64 as nd = cast(i64, _r32(f, 32));
+        let is i64 as dl = cast(i64, _r32(f, 36));
+        let is i64 as il = _r64(f, 40);
+        let is i64 as bl = _r64(f, 48);
+        let is i64 as pl = cast(i64, _r32(f, 56));
+        if (nd >= 0 && dl >= 0 && il > 0 && bl >= 0 && pl >= 0 && il <= n && bl <= n && dl <= n && pl <= n
+            && HDR + pl + dl + il + bl == n && _eq(_at(f, HDR), cast(i32, pl), prefix, plen) == 1) {
+            img = HDR + pl + dl;
+            ok = 1;
+            let is i64 as o with mut = HDR + pl;
+            let is i64 as i with mut = 0;
+            while (i < nd && ok == 1) {
+                if (o + 24 > img) { ok = 0; }
+                else {
+                    let is i64 as dpl = cast(i64, _r32(f, o));
+                    let is i64 as dxl = cast(i64, _r32(f, o + 4));
+                    if (dpl <= 0 || dxl <= 0 || dpl > n || dxl > n || o + 24 + dpl + dxl > img) { ok = 0; }
+                    else {
+                        let is *u8 as dp = _at(f, o + 24);
+                        let is i64 as now with mut = 0;
+                        if (_r32(f, o + 8) == 0) { now = iface_of(dir, dlen, dp, cast(i32, dpl), _at(dp, dpl), cast(i32, dxl)); }
+                        else { now = source_hash(dp, cast(i32, dpl)); }
+                        if (now == 0 || now != _r64(f, o + 16)) { ok = 0; }
+                        o = o + 24 + dpl + dxl;
+                    }
+                }
+                i = i + 1;
+            }
+            if (ok == 1 && o != img) { ok = 0; }
+            if (ok == 1 && id_of(_at(f, img), il, _at(f, img + il), bl) != _r64(f, 24)) { ok = 0; }
+            if (ok == 1) { ok = _bodies_add(_at(f, img + il), bl); }
+            if (ok == 1) { *out_len = il; return _at(f, img); }
+        }
+    }
+    mem.core.munmap(f, n + 8);
+    return cast(*u8, 0);
+}
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+let is *u8 as _deps with mut = cast(*u8, 0);
+let is i64 as _dlen with mut = 0;
+let is i64 as _dcap with mut = 0;
+let is i32 as _ndeps with mut = 0;
+
+fn deps_begin() as void { _dlen = 0; _ndeps = 0; }
+
+fn deps_add(path as *u8, len as i32, prefix as *u8, plen as i32, kind as i32, id as i64) as void {
+    let is i64 as need = _dlen + 24 + cast(i64, len) + cast(i64, plen);
+    if (need > _dcap) {
+        let is i64 as nc = need * 2 + 4096;
+        let is *u8 as nb = _alloc(nc);
+        if (_dlen > 0) { mem.memcpy(nb, _deps, _dlen); }
+        _deps = nb;
+        _dcap = nc;
+    }
+    let is *u8 as p = _at(_deps, _dlen);
+    _w32(p, 0, len); _w32(p, 4, plen); _w32(p, 8, kind); _w32(p, 12, 0); _w64(p, 16, id);
+    mem.memcpy(_at(p, 24), path, cast(i64, len));
+    mem.memcpy(_at(p, 24 + cast(i64, len)), prefix, cast(i64, plen));
+    _dlen = need;
+    _ndeps = _ndeps + 1;
+}
+
+fn write(cpath as *u8, src as i64, prefix as *u8, plen as i32, image as *u8, ilen as i64, bodies as *u8, blen as i64) as i32 {
+    let is i64 as total = HDR + cast(i64, plen) + _dlen + ilen + blen;
+    let is *u8 as f = mem.core.mmap_anon(total);
+    _w32(f, 0, MAGIC); _w32(f, 4, VERSION);
+    _w64(f, 8, config); _w64(f, 16, src);
+    _w64(f, 24, id_of(image, ilen, bodies, blen));
+    _w32(f, 32, _ndeps); _w32(f, 36, cast(i32, _dlen));
+    _w64(f, 40, ilen); _w64(f, 48, blen);
+    _w32(f, 56, plen); _w32(f, 60, 0);
+    let is i64 as o with mut = HDR;
+    mem.memcpy(_at(f, o), prefix, cast(i64, plen)); o = o + cast(i64, plen);
+    if (_dlen > 0) { mem.memcpy(_at(f, o), _deps, _dlen); o = o + _dlen; }
+    mem.memcpy(_at(f, o), image, ilen); o = o + ilen;
+    if (blen > 0) { mem.memcpy(_at(f, o), bodies, blen); }
+    let is i32 as rc = io.write_file_atomic(cpath, f, total);
+    mem.core.munmap(f, total);
+    return rc;
+}

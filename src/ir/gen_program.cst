@@ -9,6 +9,9 @@ use "gen.cst" as g;
 use "gen_expr.cst" as ge;
 use "gen_stmt.cst" as gs;
 use "opt.cst" as opt;
+use "body_export.cst" as bexp;
+use "body_ser.cst" as bser;
+use "../parser/csti_file.cst" as cf;
 use "../codegen/dynsyms.cst" as dyns;
 use "../semantic/modules.cst" as smod;
 use "../codegen/target.cst" as tgt;
@@ -623,6 +626,8 @@ fn _gen_fn(node as *ast.Node) as *d.IRFunction {
     func.is_variadic = node.is_variadic;
     func.is_naked = ast.nx_is_naked(node);
     func.is_noinline = ast.nx_is_noinline(node);
+    func.is_ginst = ast.nx_is_ginst(node);
+    func.weak_gen = 0;
     // `with section(".name")` — same annotation globals use.
     func.fn_section_len = ast.nx_section_len(node);
     if (func.fn_section_len > 0) {
@@ -716,6 +721,8 @@ fn _gen_fn(node as *ast.Node) as *d.IRFunction {
     func.stack_size = node.stack_size;
     func.ast_node = cast(*u8, node);
 
+    if (ast.nx_is_ginst(node) == 0) { bexp.take(func); }
+
     // Per-function Phase 1: optimize + cache call targets. We KEEP
     // every function's IR resident through codegen instead of freeing
     // non-inline functions here and regenerating them from the AST at
@@ -735,9 +742,81 @@ fn _gen_fn(node as *ast.Node) as *d.IRFunction {
             opt.optimize_func(func);
         }
         cache_call_targets(func);
+    } else if (d.weak_insts == 1) {
+        cache_call_targets(func);      // the generic instances the module's object holds
     }
 
     return func;
+}
+
+// --module-only, imports read from interface files: the bodies this module's
+// calls can copy, and those they call, join the program as functions of other
+// modules.
+fn load_imported_bodies(prog as *d.IRProgram) as i32 {
+    if (cf.body_count() == 0 || d.ir_opt_level < 1) { return 0; }
+    let is *d.IRFunction as tail with mut = prog.functions;
+    if (cast(i64, tail) == 0) { return 0; }
+    let is *d.IRFunction as f with mut = prog.functions;
+    while (cast(i64, f) != 0) { _have_add(f.asm_name_ptr, f.asm_name_len); tail = f; f = f.next; }
+    let is i32 as n with mut = 0;
+    f = prog.functions;
+    while (cast(i64, f) != 0) {               // reaches the ones it adds
+        let is i32 as k with mut = 0;
+        while (k < f.call_target_count) {
+            let is *u8 as name = cast(*u8, *cast(*i64, cast(i64, f.call_targets) + cast(i64, k) * 12));
+            let is i32 as nl = *cast(*i32, cast(i64, f.call_targets) + cast(i64, k) * 12 + 8);
+            let is i64 as il with mut = 0;
+            let is *u8 as img = cf.body_find(name, nl, &il);
+            if (cast(i64, img) != 0 && _have_add(name, nl) == 1) {
+                let is *d.IRFunction as x = d.new_irfunc();
+                x.asm_name_ptr = d.str_dup(name, nl);
+                x.asm_name_len = nl;
+                x.name_ptr = x.asm_name_ptr;
+                x.name_len = nl;
+                if (bser.body_decode(x, img, il) == 1) {
+                    x.is_reachable = 1;
+                    x.is_exported = 1;
+                    opt.optimize_func(x);
+                    cache_call_targets(x);
+                    tail.next = x;
+                    tail = x;
+                    n = n + 1;
+                }
+            }
+            k = k + 1;
+        }
+        f = f.next;
+    }
+    prog.strings = g.string_head;
+    return n;
+}
+
+// The names the program has, asked for once each: 1 when `p` was new.
+let is *i64 as _have with mut = cast(*i64, 0);
+let is i64 as _have_cap with mut = 0;
+let is i64 as _have_n with mut = 0;
+
+fn _have_add(p as *u8, n as i32) as i32 {
+    if ((_have_n + 1) * 2 > _have_cap) {
+        let is i64 as oc = _have_cap;
+        let is *i64 as ob = _have;
+        _have_cap = oc * 2;
+        if (_have_cap < 4096) { _have_cap = 4096; }
+        _have = cast(*i64, mem.core.mmap_anon(_have_cap * 16));
+        _have_n = 0;
+        let is i64 as i with mut = 0;
+        while (i < oc) { if (ob[i * 2] != 0) { _have_add(cast(*u8, ob[i * 2]), cast(i32, ob[i * 2 + 1])); } i = i + 1; }
+        if (oc > 0) { mem.core.munmap(cast(*u8, ob), oc * 16); }
+    }
+    let is i64 as j with mut = d.hash_bytes(p, cast(i64, n)) & (_have_cap - 1);
+    while (_have[j * 2] != 0) {
+        if (_have[j * 2 + 1] == cast(i64, n) && mem.memcmp(cast(*u8, _have[j * 2]), p, cast(i64, n)) == 0) { return 0; }
+        j = (j + 1) & (_have_cap - 1);
+    }
+    _have[j * 2] = cast(i64, p);
+    _have[j * 2 + 1] = cast(i64, n);
+    _have_n = _have_n + 1;
+    return 1;
 }
 
 // The streaming build's way in: lower a function now, for gen_ir to link later.
@@ -871,7 +950,10 @@ fn gen_ir(root as *u8, no_main as i32) as *d.IRProgram {
                     let is *u8 as saved_tl = g.ir_tl;
                     g.ir_tl = cast(*u8, 0);
                     if (tgt.lines_wanted() == 1) { g.ir_tl = _tl_of_body(cast(*u8, node.body)); }
+                    let is i64 as saved_owner = bexp.owner;
+                    bexp.owner = cast(i64, node.body);
                     let is *d.IRProgram as mod_prog = gen_ir(cast(*u8, node.body), 1);
+                    bexp.owner = saved_owner;
                     // Merge functions
                     if (cast(i64, mod_prog.functions) != 0) {
                         if (cast(i64, func_tail) == 0) {

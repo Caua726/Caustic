@@ -14,7 +14,8 @@
 //   function fields: vreg_count label_count alloc_stack_size stack_size
 //     num_args is_variadic is_noinline is_naked has_stack_ops has_asm
 //     is_recursive live_inst_count ret_kind
-//   strings: count, then per string: length, bytes
+//   strings: count, then per string: length, bytes; a string literal's symbol
+//     (.LC<id>) is -length - 1 and the literal, registered again when read
 //   types: count, then per type: kind size array_len base(index+1, 0 none)
 //     name(string index+1, 0 none)
 //   instructions: count, then per instruction: op(byte) flags(byte), the four
@@ -31,9 +32,18 @@
 // change (tools/precommit.sh checks it).
 use "../../std/mem.cst" only pool, bins, core as mem;
 use "defs.cst" as d;
+use "gen.cst" as g;
 use "../parser/ast.cst" as ast;
 
-let is i32 as BODY_VERSION with imut = 1;
+let is i32 as BODY_VERSION with imut = 2;
+
+// For an image other compilations read: labels count from lab_base (they are
+// numbered through a whole program) and lines are left out when no_lines is 1.
+let is i32 as lab_base with mut = 0;
+let is i32 as no_lines with mut = 0;
+// ... and a type reached only as what a pointer points to is its kind alone:
+// how much else of it is known by then depends on what was analysed first.
+let is i32 as exporting with mut = 0;
 
 // ── Output buffer ──────────────────────────────────────────────────
 
@@ -80,6 +90,7 @@ let is [4096]i64 as _sp with mut;      // string pointers
 let is [4096]i32 as _sn with mut;      // string lengths
 let is i32 as _scount with mut = 0;
 let is [1024]i64 as _tp with mut;      // Type pointers
+let is [1024]u8 as _tdirect with mut;   // an instruction names it, not just a pointer
 let is i32 as _tcount with mut = 0;
 let is i32 as _overflow with mut = 0;
 
@@ -110,17 +121,18 @@ fn _type_index(t as *u8) as i32 {
     }
     if (_tcount >= 1024) { _overflow = 1; return 0; }
     _tp[_tcount] = cast(i64, t);
+    _tdirect[_tcount] = cast(u8, 0);
     _tcount = _tcount + 1;
     let is i32 as me = _tcount - 1;
     let is *ast.Type as ty = cast(*ast.Type, t);
     if (cast(i64, ty.base) != 0) { _type_index(cast(*u8, ty.base)); }
-    if (cast(i64, ty.name_ptr) != 0 && ty.name_len > 0) { _str_index(ty.name_ptr, ty.name_len); }
+    if (exporting == 0 && cast(i64, ty.name_ptr) != 0 && ty.name_len > 0) { _str_index(ty.name_ptr, ty.name_len); }
     return me;
 }
 
 fn _flags(i as *d.IRInst) as i32 {
     let is i32 as fl with mut = 0;
-    if (i.line != 0) { fl = fl | 1; }
+    if (i.line != 0 && no_lines == 0) { fl = fl | 1; }
     if (i.is_dead != 0) { fl = fl | 2; }
     if (cast(i64, i.asm_str_ptr) != 0) { fl = fl | 4; }
     if (cast(i64, i.call_name_ptr) != 0) { fl = fl | 8; }
@@ -135,7 +147,20 @@ fn _woperand(o as *d.Operand) as void {
     _w8(cast(i32, o.op_type));
     _wv(cast(i64, o.vreg));
     _wv(o.imm);
-    _wv(cast(i64, o.label));
+    if (o.op_type == d.OP_LABEL) { _wv(cast(i64, o.label - lab_base)); } else { _wv(cast(i64, o.label)); }
+}
+
+// The literal a symbol .LC<id> names, 0 for any other string.
+fn _literal(p as *u8, n as i32) as *d.StringEntry {
+    if (n < 4 || n > 12 || p[0] != 46 || p[1] != 76 || p[2] != 67) { return cast(*d.StringEntry, 0); }
+    let is i32 as id with mut = 0;
+    let is i32 as k with mut = 3;
+    while (k < n) {
+        if (p[k] < 48 || p[k] > 57) { return cast(*d.StringEntry, 0); }
+        id = id * 10 + cast(i32, p[k]) - 48;
+        k = k + 1;
+    }
+    return d.str_entry(id);
 }
 
 // ── Encode ─────────────────────────────────────────────────────────
@@ -154,8 +179,8 @@ fn body_encode(f as *d.IRFunction, out_len as *i64, out_cap as *i64) as *u8 {
         if (cast(i64, i.asm_str_ptr) != 0) { _str_index(i.asm_str_ptr, i.asm_str_len); }
         if (cast(i64, i.call_name_ptr) != 0) { _str_index(i.call_name_ptr, cast(i32, i.call_name_len)); }
         if (cast(i64, i.global_name_ptr) != 0) { _str_index(i.global_name_ptr, cast(i32, i.global_name_len)); }
-        if (cast(i64, i.cast_to) != 0) { _type_index(i.cast_to); }
-        if (cast(i64, i.cast_from) != 0) { _type_index(i.cast_from); }
+        if (cast(i64, i.cast_to) != 0) { _tdirect[_type_index(i.cast_to)] = cast(u8, 1); }
+        if (cast(i64, i.cast_from) != 0) { _tdirect[_type_index(i.cast_from)] = cast(u8, 1); }
         n = n + 1;
         i = i.next;
     }
@@ -178,16 +203,21 @@ fn body_encode(f as *d.IRFunction, out_len as *i64, out_cap as *i64) as *u8 {
     _wv(f.ret_kind);
     _wv(cast(i64, _scount));
     let is i32 as k with mut = 0;
-    while (k < _scount) { _wv(cast(i64, _sn[k])); _wbytes(cast(*u8, _sp[k]), cast(i64, _sn[k])); k = k + 1; }
+    while (k < _scount) {
+        let is *d.StringEntry as lit = _literal(cast(*u8, _sp[k]), _sn[k]);
+        if (cast(i64, lit) != 0) { _wv(0 - cast(i64, lit.len) - 1); _wbytes(lit.ptr, cast(i64, lit.len)); }
+        else { _wv(cast(i64, _sn[k])); _wbytes(cast(*u8, _sp[k]), cast(i64, _sn[k])); }
+        k = k + 1;
+    }
     _wv(cast(i64, _tcount));
     k = 0;
     while (k < _tcount) {
         let is *ast.Type as ty = cast(*ast.Type, _tp[k]);
         _wv(cast(i64, ty.kind));
-        _wv(cast(i64, ty.size));
-        _wv(cast(i64, ty.array_len));
+        if (exporting == 1 && _tdirect[k] == 0) { _wv(0); _wv(0); }
+        else { _wv(cast(i64, ty.size)); _wv(cast(i64, ty.array_len)); }
         if (cast(i64, ty.base) != 0) { _wv(cast(i64, _type_index(cast(*u8, ty.base)) + 1)); } else { _wv(0); }
-        if (cast(i64, ty.name_ptr) != 0 && ty.name_len > 0) { _wv(cast(i64, _str_index(ty.name_ptr, ty.name_len) + 1)); } else { _wv(0); }
+        if (exporting == 0 && cast(i64, ty.name_ptr) != 0 && ty.name_len > 0) { _wv(cast(i64, _str_index(ty.name_ptr, ty.name_len) + 1)); } else { _wv(0); }
         k = k + 1;
     }
     _wv(n);
@@ -262,6 +292,25 @@ fn _roperand(o as *d.Operand) as void {
     o.label = cast(i32, _rv());
 }
 
+// The type everyone compares by address, where there is one.
+fn _canon(t as *ast.Type) as *ast.Type {
+    let is *ast.Type as c = ast.canon_type(t);
+    if (cast(i64, c) == 0) { return t; }
+    return c;
+}
+
+// ".LC<id>" at p; its length.
+fn _lc_name(p as *u8, id as i32) as i32 {
+    p[0] = cast(u8, 46); p[1] = cast(u8, 76); p[2] = cast(u8, 67);
+    let is i32 as n with mut = 1;
+    let is i32 as t with mut = id;
+    while (t >= 10) { t = t / 10; n = n + 1; }
+    let is i32 as k with mut = n + 2;
+    t = id;
+    while (k >= 3) { p[k] = cast(u8, 48 + t % 10); t = t / 10; k = k - 1; }
+    return n + 3;
+}
+
 // Rebuild f's body from img. Strings and types are copied into the IR's own
 // memory, so img may be freed afterwards. 1 = done; 0 = not a CIRB image of
 // this version or truncated, f untouched.
@@ -289,8 +338,19 @@ fn body_decode(f as *d.IRFunction, img as *u8, len as i64) as i32 {
     let is *i32 as slen = cast(*i32, cast(i64, sptr) + cast(i64, sc) * 8 + 8);
     let is i32 as k with mut = 0;
     while (k < sc) {
-        let is i64 as l = _rv();
-        if (l < 0 || _rp + l > _rl) { return 0; }
+        let is i64 as l with mut = _rv();
+        if (l < 0) {
+            l = 0 - l - 1;
+            if (l < 0 || _rp + l > _rl) { return 0; }
+            let is i32 as sid = g.register_string(cast(*u8, cast(i64, img) + _rp), cast(i32, l));
+            let is *u8 as sym = d.opt_alloc(16);
+            slen[k] = _lc_name(sym, sid);
+            sptr[k] = cast(i64, sym);
+            _rp = _rp + l;
+            k = k + 1;
+            continue;
+        }
+        if (_rp + l > _rl) { return 0; }
         let is *u8 as cp = d.opt_alloc(l + 1);
         let is i64 as q with mut = 0;
         while (q < l) { cp[q] = img[_rp + q]; q = q + 1; }
@@ -321,6 +381,12 @@ fn body_decode(f as *d.IRFunction, img as *u8, len as i64) as i32 {
         if (ni > 0 && ni <= cast(i64, sc)) { ty.name_ptr = cast(*u8, sptr[ni - 1]); ty.name_len = slen[ni - 1]; }
         k = k + 1;
     }
+    k = 0;
+    while (k < tc) {                 // every kind is known now
+        let is *ast.Type as ty = cast(*ast.Type, tptr[k]);
+        ty.base = _canon(ty.base);
+        k = k + 1;
+    }
     let is i64 as n = _rv();
     let is *d.IRInst as head with mut = cast(*d.IRInst, 0);
     let is *d.IRInst as tail with mut = cast(*d.IRInst, 0);
@@ -340,8 +406,8 @@ fn body_decode(f as *d.IRFunction, img as *u8, len as i64) as i32 {
         if ((fl & 4) != 0) { let is i64 as a = _ridx(sc); i.asm_str_ptr = cast(*u8, sptr[a]); i.asm_str_len = slen[a]; }
         if ((fl & 8) != 0) { let is i64 as b = _ridx(sc); i.call_name_ptr = cast(*u8, sptr[b]); i.call_name_len = cast(i16, slen[b]); }
         if ((fl & 16) != 0) { let is i64 as g = _ridx(sc); i.global_name_ptr = cast(*u8, sptr[g]); i.global_name_len = cast(i16, slen[g]); }
-        if ((fl & 32) != 0) { i.cast_to = cast(*u8, tptr[_ridx(tc)]); }
-        if ((fl & 64) != 0) { i.cast_from = cast(*u8, tptr[_ridx(tc)]); }
+        if ((fl & 32) != 0) { i.cast_to = cast(*u8, _canon(cast(*ast.Type, tptr[_ridx(tc)]))); }
+        if ((fl & 64) != 0) { i.cast_from = cast(*u8, _canon(cast(*ast.Type, tptr[_ridx(tc)]))); }
         if (cast(i64, tail) == 0) { head = i; } else { tail.next = i; }
         tail = i;
         c = c + 1;
