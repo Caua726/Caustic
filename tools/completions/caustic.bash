@@ -129,7 +129,7 @@ _caustic() {
 --module-objects --module-only --emit-deps --csti-dir
 -O0 -O1 -O2 --path -q --quiet --emit-asm
 -debuglexer -debugparser -debugir --freestanding --allow-unsupported
---target= --cpu= --mode= --entry= --base= --app-version= --stack-size= --extension="
+--no-sse --target= --cpu= --mode= --entry= --base= --app-version= --stack-size= --extension="
     # Both are read straight off argv[1] and stop the compiler there, so they
     # are only ever the first word.
     [ "$COMP_CWORD" -eq 1 ] && flags="$flags --version --help"

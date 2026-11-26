@@ -181,7 +181,7 @@ cd "$FIX" || exit 1
 head_ "caustic"
 has  _caustic 'caustic ' hello.cst other.cst
 hasnt _caustic 'caustic ' notes.txt hello.cst.s
-has  _caustic 'caustic -' -c -o -O1 -O2 --shared --target= --emit-csti --module-objects
+has  _caustic 'caustic -' -c -o -O1 -O2 --shared --no-sse --target= --emit-csti --module-objects
 has  _caustic 'caustic --version' --version                 # only as argv[1]
 hasnt _caustic 'caustic hello.cst --vers' --version
 # The '=' split: this is the case that used to fall through to file completion.
