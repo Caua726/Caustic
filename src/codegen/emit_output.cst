@@ -54,7 +54,7 @@ let is i64 as _cap_len with mut;
 let is i64 as _cap_cap with mut;
 let is i32 as _cap_on  with mut = 0;
 
-fn capture_begin() as void { _cap_on = 1; _cap_len = 0; }
+fn capture_begin() as void { apl.side_reset(); _cap_on = 1; _cap_len = 0; }
 fn capture_end()   as void { _cap_on = 0; }
 fn capture_ptr()   as *u8  { return _cap_buf; }
 fn capture_len()   as i64  { return _cap_len; }
@@ -488,7 +488,13 @@ fn _hz_var(v as i64) as void {
 // _hz_var and _hz_c write without checking.
 fn _hz_c(c as i32) as void { out_buf[out_len] = cast(u8, c); out_len = out_len + 1; }
 
-fn _hz_begin(id as i32) as void { out_ensure(256); _hz_c(1); _hz_c(90); _hz_var(cast(i64, id)); }
+fn _hz_bytes(id as i32) as void { out_ensure(256); _hz_c(1); _hz_c(90); _hz_var(cast(i64, id)); }
+fn _hz_begin_a(id as i32) as void { if (ha_rlen > 0) { _hz_bytes(id); return; } _hz_begin(id); }
+fn _hz_begin(id as i32) as void {
+    if (hint_textless == 0) { _hz_bytes(id); return; }
+    out_ensure(8); _hz_c(1); _hz_c(81);
+    _sl = apl.side_add(id); _sw = 1; _side = 1;
+}
 
 // A register's id from its 64- or 32-bit name, or -1 (other widths, a
 // `rip+symbol` address, xmm): the caller writes the text.
@@ -540,14 +546,27 @@ fn hint_reg(nm as *u8) as i32 {
     return 0 - 1;
 }
 
-fn _hz_reg(r as i32) as void { _hz_c(49); _hz_var(cast(i64, r)); }
+// An instruction of registers, immediates and addresses goes to the assembler as
+// the record itself (parsed_line.cst, side_add); the stream only marks its place
+// (`Q`). Names travel in the stream, as do all of them when something reads the
+// text of a hint (hint_textless 0). _side: a record is open, _sl, at operand _sw.
+let is i32 as _side with mut = 0;
+let is *apl.ParsedLine as _sl with mut = cast(*apl.ParsedLine, 0);
+let is i32 as _sw with mut = 1;
 
-fn _hz_mem(base as i32, disp as i64, sz as i32) as void {
-    _hz_c(51);
-    _hz_var(cast(i64, base));
-    _hz_var(cast(i64, _ad.REG_NONE)); _hz_c(48);            // no index, no scale
-    _hz_var(disp); _hz_var(cast(i64, sz * 8)); _hz_c(48);       // no segment
+fn _hz_reg(r as i32) as void {
+    if (_side == 1) { apl.set_op_reg(_sl, _sw, r); _sw = 2; return; }
+    _hz_c(49); _hz_var(cast(i64, r));
 }
+fn _hz_imm(v as i64) as void {
+    if (_side == 1) { apl.set_op_imm(_sl, _sw, v); _sw = 2; return; }
+    _hz_c(50); _hz_var(v);
+}
+fn _hz_sib(b as i32, x as i32, sc as i64, disp as i64, bits as i32) as void {
+    if (_side == 1) { apl.set_op_mem_sib(_sl, _sw, b, x, cast(i32, sc), disp, bits); _sw = 2; return; }
+    _hz_c(51); _hz_var(cast(i64, b)); _hz_var(cast(i64, x)); _hz_var(sc); _hz_var(disp); _hz_var(cast(i64, bits)); _hz_c(48);
+}
+fn _hz_mem(base as i32, disp as i64, sz as i32) as void { _hz_sib(base, _ad.REG_NONE, 0, disp, sz * 8); }
 
 fn _hz_frame(n as i64, sz as i32) as void {
     if (fp_omit == 1) { _hz_mem(4, fp_bias - n, sz); } else { _hz_mem(5, 0 - n, sz); }
@@ -555,6 +574,7 @@ fn _hz_frame(n as i64, sz as i32) as void {
 
 // The line is written by its hint alone: end it.
 fn _hz_done() as i32 {
+    _side = 0;
     if (hint_textless == 1) { _hz_c(10); return 1; }
     return 0;
 }
@@ -654,7 +674,7 @@ fn i_r(id as i32, mn as *u8, a as *u8) as void {
     if (hints_on == 1) {
         let is i32 as x = hint_reg(a);
         if (x >= 0) {
-            _hz_begin(id); _hz_reg(x); _hz_c(48);
+            _hz_begin(id); _hz_reg(x); if (_side == 0) { _hz_c(48); }
             if (_hz_done() == 1) { return; }
         }
     }
@@ -666,7 +686,7 @@ fn i_ri(id as i32, mn as *u8, a as *u8, v as i64) as void {
     if (hints_on == 1) {
         let is i32 as x = hint_reg(a);
         if (x >= 0) {
-            _hz_begin(id); _hz_reg(x); _hz_c(50); _hz_var(v);
+            _hz_begin(id); _hz_reg(x); _hz_imm(v);
             if (_hz_done() == 1) { return; }
         }
     }
@@ -726,7 +746,7 @@ fn i_rsym(id as i32, mn as *u8, a as *u8, sz as i32, p as *u8, n as i32) as void
     if (hints_on == 1) {
         let is i32 as x = hint_reg(a);
         if (x >= 0 && _ha_sym(p, n) > 0) {
-            _hz_begin(id); _hz_reg(x); _hz_rip(p, n, sz);
+            _hz_bytes(id); _hz_reg(x); _hz_rip(p, n, sz);
             if (_hz_done() == 1) { return; }
         }
     }
@@ -776,8 +796,7 @@ fn hint_addr(b as *u8) as i32 {
 
 fn _hz_addr(sz as i32) as void {
     if (ha_rlen > 0) { _hz_rip(ha_rip, ha_rlen, sz); return; }
-    _hz_c(51); _hz_var(cast(i64, ha_base)); _hz_var(cast(i64, ha_index)); _hz_var(ha_scale);
-    _hz_var(ha_disp); _hz_var(cast(i64, sz * 8)); _hz_c(48);
+    _hz_sib(ha_base, ha_index, ha_scale, ha_disp, sz * 8);
 }
 
 // mn a, SIZE PTR [b]      (b a register, or a rip+symbol text)
@@ -786,7 +805,7 @@ fn i_rm(id as i32, mn as *u8, a as *u8, sz as i32, b as *u8) as void {
         let is i32 as x = hint_reg(a);
         let is i32 as y = hint_addr(b);
         if (x >= 0 && y >= 0) {
-            _hz_begin(id); _hz_reg(x); _hz_addr(sz);
+            _hz_begin_a(id); _hz_reg(x); _hz_addr(sz);
             if (_hz_done() == 1) { return; }
         }
     }
@@ -800,9 +819,7 @@ fn i_rx(id as i32, mn as *u8, a as *u8, sz as i32, b as *u8, x as *u8, scale as 
         let is i32 as br = hint_id(b);
         let is i32 as xr = hint_id(x);
         if (ar >= 0 && br >= 0 && xr >= 0) {
-            _hz_begin(id); _hz_reg(ar); _hz_c(51);
-            _hz_var(cast(i64, br)); _hz_var(cast(i64, xr)); _hz_var(scale);
-            _hz_var(disp); _hz_var(cast(i64, sz * 8)); _hz_c(48);
+            _hz_begin(id); _hz_reg(ar); _hz_sib(br, xr, scale, disp, sz * 8);
             if (_hz_done() == 1) { return; }
         }
     }
@@ -819,7 +836,7 @@ fn i_mr(id as i32, mn as *u8, sz as i32, b as *u8, a as *u8) as void {
         let is i32 as x = hint_reg(a);
         let is i32 as y = hint_addr(b);
         if (x >= 0 && y >= 0) {
-            _hz_begin(id); _hz_addr(sz); _hz_reg(x);
+            _hz_begin_a(id); _hz_addr(sz); _hz_reg(x);
             if (_hz_done() == 1) { return; }
         }
     }
@@ -860,7 +877,7 @@ fn i_or(id as i32, mn as *u8, sz as i32, b as *u8, off as i64, a as *u8) as void
 // mn SIZE PTR [b], imm
 fn i_mi(id as i32, mn as *u8, sz as i32, b as *u8, v as i64) as void {
     if (hints_on == 1 && hint_addr(b) >= 0) {
-        _hz_begin(id); _hz_addr(sz); _hz_c(50); _hz_var(v);
+        _hz_begin_a(id); _hz_addr(sz); _hz_imm(v);
         if (_hz_done() == 1) { return; }
     }
     out_cstr(mn); _ptr(sz); out_cstr(b); out_str("], ", 3); out_int(v); out_char(10);
@@ -874,10 +891,8 @@ fn i_lea(a as *u8, b as *u8, x as *u8, d as i64) as void {
         let is i32 as xr with mut = _ad.REG_NONE;
         if (cast(i64, x) != 0) { xr = hint_id(x); }
         if (ar >= 0 && br >= 0 && xr >= 0) {
-            _hz_begin(_ad.INST_LEA); _hz_reg(ar); _hz_c(51); _hz_var(cast(i64, br));
-            _hz_var(cast(i64, xr));
-            if (cast(i64, x) != 0) { _hz_var(1); } else { _hz_c(48); }
-            _hz_var(d); _hz_c(48); _hz_c(48);
+            _hz_begin(_ad.INST_LEA); _hz_reg(ar);
+            if (cast(i64, x) != 0) { _hz_sib(br, xr, 1, d, 0); } else { _hz_sib(br, xr, 0, d, 0); }
             if (_hz_done() == 1) { return; }
         }
     }
@@ -936,7 +951,7 @@ fn i_fr(id as i32, mn as *u8, sz as i32, n as i64, a as *u8) as void {
 // mn SIZE PTR [frame n], imm
 fn i_fi(id as i32, mn as *u8, sz as i32, n as i64, v as i64) as void {
     if (hints_on == 1) {
-        _hz_begin(id); _hz_frame(n, sz); _hz_c(50); _hz_var(v);
+        _hz_begin(id); _hz_frame(n, sz); _hz_imm(v);
         if (_hz_done() == 1) { return; }
     }
     out_cstr(mn); _ptr(sz); out_fp(n); out_str("], ", 3); out_int(v); out_char(10);
@@ -944,7 +959,7 @@ fn i_fi(id as i32, mn as *u8, sz as i32, n as i64, v as i64) as void {
 
 fn out_jump(id as i32, mn as *u8, num as i64) as void {
     if (hints_on == 1 && num >= 0) {
-        _hz_begin(id);
+        _hz_bytes(id);
         out_char(cast(u8, 48 + _ad.OP_LABEL));
         let is i64 as len with mut = 3;
         let is i64 as t with mut = num;
@@ -964,7 +979,7 @@ fn out_call(name as *u8, len as i32) as void {
     // are left to the parser.
     if (plain == 1 && name[0] != 95) { plain = 0; }
     if (plain == 1) {
-        _hz_begin(_ad.INST_CALL);
+        _hz_bytes(_ad.INST_CALL);
         out_char(cast(u8, 48 + _ad.OP_LABEL));
         _hz_var(cast(i64, len));
         out_str(name, len);
