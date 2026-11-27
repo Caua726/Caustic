@@ -17,6 +17,10 @@ Versioning: **`v1.x` = stable · `v0.1.x` = beta · `v0.0.x` = alpha.**
 - **`.weak` in `caustic-as`, weak symbols in `caustic-ld`.** Each object of an
   incremental build holds the generic instances it uses; the linker keeps one.
 
+### Changed
+- **`-O2` keeps the index of a loop that also reads the next element by it**
+  (`a[j]` and `a[j+1]`): stepping pointers beside it cost a bubble sort 20 %.
+
 ### Fixed
 - **`--incremental` kept objects built against an older dependency.** A struct's layout,
   a constant or a signature could change and the modules using it were not rebuilt. An
